@@ -60,6 +60,7 @@ class ScBridge extends Feature {
     super(peer, config);
     this.key = 'sc-bridge';
     this.sidechannel = null;
+    this.directSession = null;
     this.server = null;
     this.started = false;
     this.clients = new Set();
@@ -83,6 +84,10 @@ class ScBridge extends Feature {
 
   attachSidechannel(sidechannel) {
     this.sidechannel = sidechannel;
+  }
+
+  attachDirectSession(directSession) {
+    this.directSession = directSession;
   }
 
   _broadcastToClient(client, payload) {
@@ -130,6 +135,31 @@ class ScBridge extends Feature {
       }
       if (this.debug) console.log('[sc-bridge] emit');
       this._broadcastToClient(client, event);
+    }
+  }
+
+  handleSessionFrame(event) {
+    const payload = {
+      type: 'session_frame',
+      session_id: event?.session_id ?? null,
+      channel: event?.channel ?? null,
+      protocol: event?.protocol ?? null,
+      remote: event?.remote ?? null,
+      direct: event?.direct === true,
+      relayed: event?.relayed === true,
+      frame: event?.frame ?? null,
+      ts: Date.now(),
+    };
+    for (const client of this.clients) {
+      if (!client.ready) continue;
+      if (
+        client.sessionIds &&
+        client.sessionIds.size > 0 &&
+        !client.sessionIds.has(payload.session_id)
+      ) {
+        continue;
+      }
+      this._broadcastToClient(client, payload);
     }
   }
 
@@ -239,6 +269,79 @@ class ScBridge extends Feature {
         if (!client.channels) client.channels = new Set();
         for (const ch of channels) client.channels.delete(String(ch));
         reply({ type: 'subscribed', channels: Array.from(client.channels) });
+        return;
+      }
+      case 'session_subscribe': {
+        const sessionIds = Array.isArray(message.session_ids)
+          ? message.session_ids
+          : message.session_id
+            ? [message.session_id]
+            : [];
+        if (!client.sessionIds) client.sessionIds = new Set();
+        for (const sessionId of sessionIds) client.sessionIds.add(String(sessionId));
+        reply({ type: 'session_subscribed', session_ids: Array.from(client.sessionIds) });
+        return;
+      }
+      case 'session_unsubscribe': {
+        const sessionIds = Array.isArray(message.session_ids)
+          ? message.session_ids
+          : message.session_id
+            ? [message.session_id]
+            : [];
+        if (!client.sessionIds) client.sessionIds = new Set();
+        for (const sessionId of sessionIds) client.sessionIds.delete(String(sessionId));
+        reply({ type: 'session_subscribed', session_ids: Array.from(client.sessionIds) });
+        return;
+      }
+      case 'session_open': {
+        if (!this.directSession) {
+          sendError('Direct session feature not ready.');
+          return;
+        }
+        const remote = String(message.remote || '').trim();
+        const sessionId = String(message.session_id || '').trim();
+        this.directSession
+          .open(remote, sessionId)
+          .then((session) => reply({ type: 'session_opened', ...session }))
+          .catch((err) => {
+            sendError(err?.message ? `Session open failed: ${err.message}` : 'Session open failed.');
+          });
+        return;
+      }
+      case 'session_send': {
+        if (!this.directSession) {
+          sendError('Direct session feature not ready.');
+          return;
+        }
+        const remote = String(message.remote || '').trim();
+        const sessionId = String(message.session_id || '').trim();
+        this.directSession
+          .send(remote, sessionId, message.frame)
+          .then((session) => reply({ type: 'session_sent', ...session }))
+          .catch((err) => {
+            sendError(err?.message ? `Session send failed: ${err.message}` : 'Session send failed.');
+          });
+        return;
+      }
+      case 'session_close': {
+        if (!this.directSession) {
+          sendError('Direct session feature not ready.');
+          return;
+        }
+        try {
+          const result = this.directSession.close(message.remote, message.session_id);
+          reply({ type: 'session_closed', ...result });
+        } catch (err) {
+          sendError(err?.message ? `Session close failed: ${err.message}` : 'Session close failed.');
+        }
+        return;
+      }
+      case 'session_stats': {
+        if (!this.directSession) {
+          sendError('Direct session feature not ready.');
+          return;
+        }
+        reply({ type: 'session_stats', ...this.directSession.stats() });
         return;
       }
       case 'send': {
@@ -550,6 +653,7 @@ class ScBridge extends Feature {
         authed: !this.requireAuth,
         filter: this.defaultFilter,
         channels: null,
+        sessionIds: null,
       };
       this.clients.add(client);
 

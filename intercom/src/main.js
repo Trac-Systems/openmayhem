@@ -13,6 +13,7 @@ import { Terminal } from 'trac-peer/src/terminal/index.js';
 import MayhemProtocol from '../contract/protocol.js';
 import MayhemContract from '../contract/contract.js';
 import Sidechannel from '../features/sidechannel/index.js';
+import DirectSession from '../features/direct-session/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
 
 const { env, storeLabel, flags } = getPearRuntime();
@@ -129,6 +130,10 @@ const sidechannelWelcomeRequired = parseBool(
   (flags['sidechannel-welcome-required'] && String(flags['sidechannel-welcome-required'])) ||
     env.SIDECHANNEL_WELCOME_REQUIRED ||
     '',
+  false
+);
+const directSessionDebug = parseBool(
+  (flags['session-debug'] && String(flags['session-debug'])) || env.SESSION_DEBUG || '',
   false
 );
 
@@ -363,6 +368,14 @@ if (scBridgeEnabled) {
   });
 }
 
+const directSession = new DirectSession(peer, {
+  debug: directSessionDebug,
+  onFrame: scBridgeEnabled
+    ? (event) => scBridge.handleSessionFrame(event)
+    : null,
+});
+peer.directSession = directSession;
+
 const sidechannel = new Sidechannel(peer, {
   channels: [sidechannelEntry, ...sidechannelExtras],
   debug: sidechannelDebug,
@@ -381,6 +394,7 @@ peer.sidechannel = sidechannel;
 
 if (scBridge) {
   scBridge.attachSidechannel(sidechannel);
+  scBridge.attachDirectSession(directSession);
   try {
     scBridge.start();
   } catch (err) {
@@ -399,6 +413,12 @@ if (rpcEnabled) {
     console.log('RPC: ready', `http://${rpcHost}:${rpcPort}/v1`);
   });
   peer.rpcServer = rpcServer;
+}
+
+try {
+  directSession.start();
+} catch (err) {
+  console.error('Direct session failed to start:', err?.message ?? err);
 }
 
 sidechannel

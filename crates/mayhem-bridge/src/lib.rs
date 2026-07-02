@@ -140,21 +140,114 @@ impl ScBridgeClient {
         self.request(json!({ "type": "info" }), "info").await
     }
 
+    pub async fn session_subscribe(
+        &mut self,
+        session_ids: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Value> {
+        let session_ids = session_ids
+            .into_iter()
+            .map(|session_id| session_id.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        self.request(
+            json!({ "type": "session_subscribe", "session_ids": session_ids }),
+            "session_subscribed",
+        )
+        .await
+    }
+
+    pub async fn session_open(
+        &mut self,
+        remote: impl AsRef<str>,
+        session_id: impl AsRef<str>,
+    ) -> Result<Value> {
+        self.request(
+            json!({
+                "type": "session_open",
+                "remote": remote.as_ref(),
+                "session_id": session_id.as_ref(),
+            }),
+            "session_opened",
+        )
+        .await
+    }
+
+    pub async fn session_send(
+        &mut self,
+        remote: impl AsRef<str>,
+        session_id: impl AsRef<str>,
+        frame: impl Serialize,
+    ) -> Result<Value> {
+        self.request(
+            json!({
+                "type": "session_send",
+                "remote": remote.as_ref(),
+                "session_id": session_id.as_ref(),
+                "frame": serde_json::to_value(frame)?,
+            }),
+            "session_sent",
+        )
+        .await
+    }
+
+    pub async fn session_close(
+        &mut self,
+        remote: impl AsRef<str>,
+        session_id: impl AsRef<str>,
+    ) -> Result<Value> {
+        self.request(
+            json!({
+                "type": "session_close",
+                "remote": remote.as_ref(),
+                "session_id": session_id.as_ref(),
+            }),
+            "session_closed",
+        )
+        .await
+    }
+
+    pub async fn session_stats(&mut self) -> Result<Value> {
+        self.request(json!({ "type": "session_stats" }), "session_stats")
+            .await
+    }
+
     pub async fn next_sidechannel_message(&mut self, wait: Duration) -> Result<Value> {
-        if let Some(event) = self.queued_events.pop_front() {
+        if let Some(event) = self.pop_queued_event("sidechannel_message") {
             return Ok(event);
         }
 
+        self.next_event_of_type("sidechannel_message", wait).await
+    }
+
+    pub async fn next_session_frame(&mut self, wait: Duration) -> Result<Value> {
+        if let Some(event) = self.pop_queued_event("session_frame") {
+            return Ok(event);
+        }
+
+        self.next_event_of_type("session_frame", wait).await
+    }
+
+    async fn next_event_of_type(&mut self, expected_type: &str, wait: Duration) -> Result<Value> {
         timeout(wait, async {
             loop {
                 let message = self.read_json().await?;
-                if message.get("type").and_then(Value::as_str) == Some("sidechannel_message") {
+                if message.get("type").and_then(Value::as_str) == Some(expected_type) {
                     return Ok(message);
+                }
+                if is_async_event(&message) {
+                    self.queued_events.push_back(message);
                 }
             }
         })
         .await
         .map_err(|_| BridgeError::Timeout)?
+    }
+
+    fn pop_queued_event(&mut self, expected_type: &str) -> Option<Value> {
+        let idx = self
+            .queued_events
+            .iter()
+            .position(|event| event.get("type").and_then(Value::as_str) == Some(expected_type))?;
+        self.queued_events.remove(idx)
     }
 
     async fn request(&mut self, mut request: Value, expected_type: &str) -> Result<Value> {
@@ -168,7 +261,7 @@ impl ScBridgeClient {
         loop {
             let message = self.read_json().await?;
             let message_id = message.get("id").and_then(Value::as_u64);
-            if message.get("type").and_then(Value::as_str) == Some("sidechannel_message") {
+            if is_async_event(&message) {
                 self.queued_events.push_back(message);
                 continue;
             }
@@ -204,6 +297,13 @@ impl ScBridgeClient {
         }
         Err(BridgeError::Closed)
     }
+}
+
+fn is_async_event(message: &Value) -> bool {
+    matches!(
+        message.get("type").and_then(Value::as_str),
+        Some("sidechannel_message" | "session_frame")
+    )
 }
 
 #[derive(Clone)]
