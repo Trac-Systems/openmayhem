@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -29,6 +30,7 @@ pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
 pub const TIER1_ATTESTATION_TIER: u8 = 1;
 pub const SANDBOX_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TCP_PROBE_TIMEOUT_MS: u64 = 2_000;
+pub const SATURATION_SHED_THRESHOLD: f64 = 0.9;
 
 type Result<T> = std::result::Result<T, EnclaveError>;
 
@@ -77,6 +79,15 @@ pub enum EnclaveError {
     OutboundTcpUnexpectedlySucceeded { addr: String },
     #[error("outbound TCP failed, but not with a sandbox denial: {addr}: {error}")]
     OutboundTcpNotDenied { addr: String, error: String },
+    #[error("session already active: {0}")]
+    SessionAlreadyActive(String),
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
+    #[error("scheduler queue is full: {queued_requests}/{max_queue}")]
+    SchedulerQueueFull {
+        queued_requests: u32,
+        max_queue: u32,
+    },
     #[error(
         "sealed chunk hash mismatch at chunk {chunk_index}: expected {expected}, got {actual}"
     )]
@@ -174,6 +185,107 @@ pub struct TcpProbeReport {
     pub denied: bool,
     pub error_kind: Option<String>,
     pub raw_os_error: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    pub max_sessions: u32,
+    pub max_queue: u32,
+    pub kv_cache_bytes_budget: u64,
+    pub target_wait_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub session_id: String,
+    pub in_tokens: u64,
+    pub out_tokens: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MeterCheckpoint {
+    pub session_id: String,
+    pub seq: u64,
+    pub final_checkpoint: bool,
+    pub usage: SessionUsage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub queued_at_ms: u64,
+    pub in_tokens_hint: u32,
+    pub max_out_tokens_hint: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SaturationInput {
+    pub active_sessions: u32,
+    pub max_sessions: u32,
+    pub queued_requests: u32,
+    pub max_queue: u32,
+    pub kv_cache_bytes_used: u64,
+    pub kv_cache_bytes_budget: u64,
+    pub ewma_batch_wait_ms: f64,
+    pub target_wait_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SaturationBreakdown {
+    pub slot_pressure: f64,
+    pub queue_pressure: f64,
+    pub memory_pressure: f64,
+    pub latency_pressure: f64,
+    pub saturation: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerSnapshot {
+    pub active_sessions: u32,
+    pub max_sessions: u32,
+    pub queued_requests: u32,
+    pub max_queue: u32,
+    pub kv_cache_bytes_used: u64,
+    pub kv_cache_bytes_budget: u64,
+    pub ewma_batch_wait_ms: f64,
+    pub target_wait_ms: u64,
+    pub saturation: SaturationBreakdown,
+    pub heartbeat_saturation: f64,
+    pub should_answer_want: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdmissionOutcome {
+    Accepted {
+        session_id: String,
+        active_sessions: u32,
+        max_sessions: u32,
+    },
+    RejectedBusy {
+        session_id: String,
+        active_sessions: u32,
+        max_sessions: u32,
+        queued_requests: u32,
+        retry_after_ms: u64,
+        alt_rooms: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct EnclaveScheduler {
+    config: SchedulerConfig,
+    sessions: BTreeMap<String, SessionState>,
+    request_queues: BTreeMap<String, VecDeque<ScheduledRequest>>,
+    ready_sessions: VecDeque<String>,
+    kv_cache_bytes_used: u64,
+    ewma_batch_wait_ms: f64,
+}
+
+#[derive(Clone, Debug)]
+struct SessionState {
+    usage: SessionUsage,
+    next_checkpoint_seq: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -345,6 +457,259 @@ impl SandboxConfig {
     }
 }
 
+impl SchedulerConfig {
+    pub fn new(
+        max_sessions: u32,
+        max_queue: u32,
+        kv_cache_bytes_budget: u64,
+        target_wait_ms: u64,
+    ) -> Self {
+        Self {
+            max_sessions,
+            max_queue,
+            kv_cache_bytes_budget,
+            target_wait_ms,
+        }
+    }
+}
+
+impl ScheduledRequest {
+    pub fn new(
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+        queued_at_ms: u64,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            session_id: session_id.into(),
+            queued_at_ms,
+            in_tokens_hint: 0,
+            max_out_tokens_hint: 0,
+        }
+    }
+}
+
+impl EnclaveScheduler {
+    pub fn new(config: SchedulerConfig) -> Result<Self> {
+        validate_scheduler_config(&config)?;
+        Ok(Self {
+            config,
+            sessions: BTreeMap::new(),
+            request_queues: BTreeMap::new(),
+            ready_sessions: VecDeque::new(),
+            kv_cache_bytes_used: 0,
+            ewma_batch_wait_ms: 0.0,
+        })
+    }
+
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
+
+    pub fn open_session(
+        &mut self,
+        session_id: impl Into<String>,
+        alt_rooms: Vec<String>,
+    ) -> Result<AdmissionOutcome> {
+        let session_id = session_id.into();
+        if self.sessions.contains_key(&session_id) {
+            return Err(EnclaveError::SessionAlreadyActive(session_id));
+        }
+        let active_sessions = self.active_sessions();
+        if active_sessions >= self.config.max_sessions {
+            return Ok(AdmissionOutcome::RejectedBusy {
+                session_id,
+                active_sessions,
+                max_sessions: self.config.max_sessions,
+                queued_requests: self.queued_requests(),
+                retry_after_ms: self.retry_after_ms(),
+                alt_rooms,
+            });
+        }
+
+        self.sessions.insert(
+            session_id.clone(),
+            SessionState {
+                usage: SessionUsage {
+                    session_id: session_id.clone(),
+                    in_tokens: 0,
+                    out_tokens: 0,
+                },
+                next_checkpoint_seq: 1,
+            },
+        );
+        Ok(AdmissionOutcome::Accepted {
+            session_id,
+            active_sessions: active_sessions + 1,
+            max_sessions: self.config.max_sessions,
+        })
+    }
+
+    pub fn close_session(&mut self, session_id: &str) -> Result<SessionUsage> {
+        let state = self
+            .sessions
+            .remove(session_id)
+            .ok_or_else(|| EnclaveError::SessionNotFound(session_id.to_owned()))?;
+        self.request_queues.remove(session_id);
+        self.ready_sessions.retain(|queued| queued != session_id);
+        Ok(state.usage)
+    }
+
+    pub fn enqueue_request(&mut self, request: ScheduledRequest) -> Result<()> {
+        if !self.sessions.contains_key(&request.session_id) {
+            return Err(EnclaveError::SessionNotFound(request.session_id));
+        }
+        let queued_requests = self.queued_requests();
+        if queued_requests >= self.config.max_queue {
+            return Err(EnclaveError::SchedulerQueueFull {
+                queued_requests,
+                max_queue: self.config.max_queue,
+            });
+        }
+
+        let queue = self
+            .request_queues
+            .entry(request.session_id.clone())
+            .or_default();
+        if queue.is_empty() && !self.ready_sessions.contains(&request.session_id) {
+            self.ready_sessions.push_back(request.session_id.clone());
+        }
+        queue.push_back(request);
+        Ok(())
+    }
+
+    pub fn next_batch(&mut self, max_items: usize, now_ms: u64) -> Vec<ScheduledRequest> {
+        let mut batch = Vec::new();
+        while batch.len() < max_items {
+            let Some(session_id) = self.ready_sessions.pop_front() else {
+                break;
+            };
+            if !self.sessions.contains_key(&session_id) {
+                self.request_queues.remove(&session_id);
+                continue;
+            }
+
+            let Some((request, has_more_for_session)) =
+                self.request_queues.get_mut(&session_id).and_then(|queue| {
+                    queue
+                        .pop_front()
+                        .map(|request| (request, !queue.is_empty()))
+                })
+            else {
+                continue;
+            };
+            let observed_wait = now_ms.saturating_sub(request.queued_at_ms);
+            self.record_batch_wait_ms(observed_wait as f64);
+            batch.push(request);
+
+            if has_more_for_session {
+                self.ready_sessions.push_back(session_id);
+            } else {
+                self.request_queues.remove(&session_id);
+            }
+        }
+        batch
+    }
+
+    pub fn record_tokens(
+        &mut self,
+        session_id: &str,
+        in_tokens: u64,
+        out_tokens: u64,
+    ) -> Result<SessionUsage> {
+        let state = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| EnclaveError::SessionNotFound(session_id.to_owned()))?;
+        state.usage.in_tokens = state.usage.in_tokens.saturating_add(in_tokens);
+        state.usage.out_tokens = state.usage.out_tokens.saturating_add(out_tokens);
+        Ok(state.usage.clone())
+    }
+
+    pub fn checkpoint_session(
+        &mut self,
+        session_id: &str,
+        final_checkpoint: bool,
+    ) -> Result<MeterCheckpoint> {
+        let state = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| EnclaveError::SessionNotFound(session_id.to_owned()))?;
+        let checkpoint = MeterCheckpoint {
+            session_id: session_id.to_owned(),
+            seq: state.next_checkpoint_seq,
+            final_checkpoint,
+            usage: state.usage.clone(),
+        };
+        state.next_checkpoint_seq = state.next_checkpoint_seq.saturating_add(1);
+        Ok(checkpoint)
+    }
+
+    pub fn update_kv_cache_bytes_used(&mut self, bytes: u64) {
+        self.kv_cache_bytes_used = bytes;
+    }
+
+    pub fn set_ewma_batch_wait_ms(&mut self, wait_ms: f64) {
+        self.ewma_batch_wait_ms = wait_ms.max(0.0);
+    }
+
+    pub fn active_sessions(&self) -> u32 {
+        self.sessions.len() as u32
+    }
+
+    pub fn queued_requests(&self) -> u32 {
+        self.request_queues
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>() as u32
+    }
+
+    pub fn snapshot(&self) -> SchedulerSnapshot {
+        let input = SaturationInput {
+            active_sessions: self.active_sessions(),
+            max_sessions: self.config.max_sessions,
+            queued_requests: self.queued_requests(),
+            max_queue: self.config.max_queue,
+            kv_cache_bytes_used: self.kv_cache_bytes_used,
+            kv_cache_bytes_budget: self.config.kv_cache_bytes_budget,
+            ewma_batch_wait_ms: self.ewma_batch_wait_ms,
+            target_wait_ms: self.config.target_wait_ms,
+        };
+        let saturation = calculate_saturation(&input);
+        let shedding = saturation.saturation > SATURATION_SHED_THRESHOLD;
+        SchedulerSnapshot {
+            active_sessions: input.active_sessions,
+            max_sessions: input.max_sessions,
+            queued_requests: input.queued_requests,
+            max_queue: input.max_queue,
+            kv_cache_bytes_used: input.kv_cache_bytes_used,
+            kv_cache_bytes_budget: input.kv_cache_bytes_budget,
+            ewma_batch_wait_ms: input.ewma_batch_wait_ms,
+            target_wait_ms: input.target_wait_ms,
+            heartbeat_saturation: if shedding { 1.0 } else { saturation.saturation },
+            should_answer_want: !shedding && input.active_sessions < input.max_sessions,
+            saturation,
+        }
+    }
+
+    fn retry_after_ms(&self) -> u64 {
+        let queue_factor = u64::from(self.queued_requests() + 1);
+        self.config
+            .target_wait_ms
+            .saturating_mul(queue_factor)
+            .max(1_000)
+    }
+
+    fn record_batch_wait_ms(&mut self, observed_wait_ms: f64) {
+        let observed = observed_wait_ms.max(0.0);
+        self.ewma_batch_wait_ms = if self.ewma_batch_wait_ms == 0.0 {
+            observed
+        } else {
+            (0.8 * self.ewma_batch_wait_ms) + (0.2 * observed)
+        };
+    }
+}
+
 impl SealOptions {
     pub fn new(
         plaintext_path: impl Into<PathBuf>,
@@ -385,6 +750,26 @@ impl fmt::Display for DownloadSource {
             Self::File(path) => write!(f, "{}", path.display()),
             Self::Http { url, .. } => f.write_str(url),
         }
+    }
+}
+
+pub fn calculate_saturation(input: &SaturationInput) -> SaturationBreakdown {
+    let slot_pressure = bounded_ratio_u32(input.active_sessions, input.max_sessions);
+    let queue_pressure = bounded_ratio_u32(input.queued_requests, input.max_queue);
+    let memory_pressure = bounded_ratio_u64(input.kv_cache_bytes_used, input.kv_cache_bytes_budget);
+    let latency_pressure = bounded_ratio_f64(input.ewma_batch_wait_ms, input.target_wait_ms as f64);
+    let saturation = slot_pressure
+        .max(queue_pressure)
+        .max(memory_pressure)
+        .max(latency_pressure)
+        .clamp(0.0, 1.0);
+
+    SaturationBreakdown {
+        slot_pressure,
+        queue_pressure,
+        memory_pressure,
+        latency_pressure,
+        saturation,
     }
 }
 
@@ -1157,6 +1542,20 @@ fn validate_sandbox_config(config: &SandboxConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_scheduler_config(config: &SchedulerConfig) -> Result<()> {
+    if config.max_sessions == 0 {
+        return Err(EnclaveError::InvalidInput(
+            "max_sessions must be greater than zero".to_owned(),
+        ));
+    }
+    if config.target_wait_ms == 0 {
+        return Err(EnclaveError::InvalidInput(
+            "target_wait_ms must be greater than zero".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hex_field(field: &str, value: &str, bytes: usize) -> Result<()> {
     if value.len() != bytes * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(EnclaveError::InvalidInput(format!(
@@ -1164,6 +1563,42 @@ fn validate_hex_field(field: &str, value: &str, bytes: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn bounded_ratio_u32(numerator: u32, denominator: u32) -> f64 {
+    if denominator == 0 {
+        if numerator == 0 {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        (f64::from(numerator) / f64::from(denominator)).clamp(0.0, 1.0)
+    }
+}
+
+fn bounded_ratio_u64(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        if numerator == 0 {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        (numerator as f64 / denominator as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn bounded_ratio_f64(numerator: f64, denominator: f64) -> f64 {
+    if denominator <= 0.0 {
+        if numerator <= 0.0 {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        (numerator / denominator).clamp(0.0, 1.0)
+    }
 }
 
 fn macos_sandbox_exec_profile(config: &SandboxConfig) -> String {
@@ -1578,6 +2013,10 @@ mod tests {
         SandboxConfig::new("/sealed/store", "/tmp/mayhem-ipc.sock")
     }
 
+    fn scheduler_config() -> SchedulerConfig {
+        SchedulerConfig::new(4, 8, 1_000, 100)
+    }
+
     #[test]
     fn merkle_manifest_changes_when_chunk_changes() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -1807,6 +2246,143 @@ mod tests {
         assert!(profile.policy.contains("\"capabilities\": []"));
         assert!(profile.policy.contains("no internetClient"));
         assert!(profile.policy.contains("read-only"));
+        Ok(())
+    }
+
+    #[test]
+    fn saturation_formula_uses_max_pressure_and_caps_at_one() {
+        let input = SaturationInput {
+            active_sessions: 1,
+            max_sessions: 4,
+            queued_requests: 2,
+            max_queue: 8,
+            kv_cache_bytes_used: 900,
+            kv_cache_bytes_budget: 1_000,
+            ewma_batch_wait_ms: 250.0,
+            target_wait_ms: 100,
+        };
+
+        let sat = calculate_saturation(&input);
+
+        assert_eq!(sat.slot_pressure, 0.25);
+        assert_eq!(sat.queue_pressure, 0.25);
+        assert_eq!(sat.memory_pressure, 0.9);
+        assert_eq!(sat.latency_pressure, 1.0);
+        assert_eq!(sat.saturation, 1.0);
+    }
+
+    #[test]
+    fn synthetic_slot_load_produces_expected_saturation_curve() -> Result<()> {
+        let mut scheduler = EnclaveScheduler::new(scheduler_config())?;
+        let mut curve = vec![scheduler.snapshot().saturation.saturation];
+
+        for session in ["s1", "s2", "s3", "s4"] {
+            assert!(matches!(
+                scheduler.open_session(session, vec![])?,
+                AdmissionOutcome::Accepted { .. }
+            ));
+            curve.push(scheduler.snapshot().saturation.saturation);
+        }
+
+        assert_eq!(curve, vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(scheduler.snapshot().heartbeat_saturation, 1.0);
+        assert!(!scheduler.snapshot().should_answer_want);
+        Ok(())
+    }
+
+    #[test]
+    fn max_sessions_hard_cap_is_enforced() -> Result<()> {
+        let mut scheduler = EnclaveScheduler::new(SchedulerConfig::new(2, 4, 1_000, 100))?;
+        scheduler.open_session("s1", vec![])?;
+        scheduler.open_session("s2", vec![])?;
+
+        let outcome = scheduler.open_session("s3", vec!["room-b".to_owned()])?;
+
+        assert!(matches!(
+            outcome,
+            AdmissionOutcome::RejectedBusy {
+                active_sessions: 2,
+                max_sessions: 2,
+                ..
+            }
+        ));
+        assert_eq!(scheduler.active_sessions(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn round_robin_batch_scheduler_is_fair_across_sessions() -> Result<()> {
+        let mut scheduler = EnclaveScheduler::new(scheduler_config())?;
+        scheduler.open_session("a", vec![])?;
+        scheduler.open_session("b", vec![])?;
+        for request in ["a1", "a2", "a3"] {
+            scheduler.enqueue_request(ScheduledRequest::new("a", request, 0))?;
+        }
+        for request in ["b1", "b2"] {
+            scheduler.enqueue_request(ScheduledRequest::new("b", request, 0))?;
+        }
+
+        let batch = scheduler.next_batch(4, 50);
+        let ids: Vec<_> = batch
+            .iter()
+            .map(|request| request.request_id.as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["a1", "b1", "a2", "b2"]);
+        assert_eq!(scheduler.queued_requests(), 1);
+        assert_eq!(scheduler.snapshot().ewma_batch_wait_ms, 50.0);
+        Ok(())
+    }
+
+    #[test]
+    fn queue_and_latency_pressure_drive_synthetic_load_curve() -> Result<()> {
+        let mut scheduler = EnclaveScheduler::new(SchedulerConfig::new(4, 4, 1_000, 100))?;
+        scheduler.open_session("a", vec![])?;
+        scheduler.enqueue_request(ScheduledRequest::new("a", "a1", 0))?;
+        scheduler.enqueue_request(ScheduledRequest::new("a", "a2", 0))?;
+
+        let queued = scheduler.snapshot().saturation;
+        assert_eq!(queued.slot_pressure, 0.25);
+        assert_eq!(queued.queue_pressure, 0.5);
+        assert_eq!(queued.saturation, 0.5);
+
+        let batch = scheduler.next_batch(1, 150);
+        assert_eq!(batch.len(), 1);
+        let waited = scheduler.snapshot().saturation;
+        assert_eq!(waited.latency_pressure, 1.0);
+        assert_eq!(waited.saturation, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn per_session_meter_counters_and_checkpoints_are_isolated() -> Result<()> {
+        let mut scheduler = EnclaveScheduler::new(scheduler_config())?;
+        scheduler.open_session("a", vec![])?;
+        scheduler.open_session("b", vec![])?;
+
+        let usage_a = scheduler.record_tokens("a", 11, 29)?;
+        let usage_b = scheduler.record_tokens("b", 3, 5)?;
+        scheduler.record_tokens("a", 7, 13)?;
+        let checkpoint_a1 = scheduler.checkpoint_session("a", false)?;
+        let checkpoint_a2 = scheduler.checkpoint_session("a", true)?;
+        let checkpoint_b1 = scheduler.checkpoint_session("b", true)?;
+
+        assert_eq!(
+            usage_a,
+            SessionUsage {
+                session_id: "a".to_owned(),
+                in_tokens: 11,
+                out_tokens: 29,
+            }
+        );
+        assert_eq!(usage_b.in_tokens, 3);
+        assert_eq!(checkpoint_a1.seq, 1);
+        assert_eq!(checkpoint_a1.usage.in_tokens, 18);
+        assert_eq!(checkpoint_a1.usage.out_tokens, 42);
+        assert_eq!(checkpoint_a2.seq, 2);
+        assert!(checkpoint_a2.final_checkpoint);
+        assert_eq!(checkpoint_b1.seq, 1);
+        assert_eq!(checkpoint_b1.usage.out_tokens, 5);
         Ok(())
     }
 }
