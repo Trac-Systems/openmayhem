@@ -113,10 +113,41 @@ async fn mock_create_payment_intent(
     }))
 }
 
+async fn mock_create_checkout_session(
+    State(capture): State<StripeCapture>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Json<Value> {
+    let body = String::from_utf8(body.to_vec()).expect("form body utf8");
+    capture.requests.lock().await.push(StripeRequest {
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        idempotency_key: headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        body,
+    });
+    Json(json!({
+        "id": "cs_test_123",
+        "object": "checkout.session",
+        "url": "https://checkout.stripe.com/c/pay/cs_test_123",
+        "amount_total": 250,
+        "currency": "usd",
+        "payment_intent": "pi_test_123",
+        "payment_status": "unpaid",
+        "status": "open",
+        "expires_at": 1_900_000_000u64
+    }))
+}
+
 async fn start_mock_stripe() -> (String, StripeCapture) {
     let capture = StripeCapture::default();
     let app = Router::new()
         .route("/v1/payment_intents", post(mock_create_payment_intent))
+        .route("/v1/checkout/sessions", post(mock_create_checkout_session))
         .with_state(capture.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -230,6 +261,72 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_denom%5D=mu_usd"));
+}
+
+#[tokio::test]
+async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_intent_metadata() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let poster = Arc::new(RecordingContractPoster::default());
+    let state = PaygateState::try_new_with_contract_poster(
+        test_config(stripe_base, temp.path().join("stripe-events.jsonl")),
+        OracleKeypair::from_seed_hex(&"12".repeat(32)).expect("oracle"),
+        poster,
+    )
+    .expect("state");
+    let app = paygate_router(state);
+
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        "/v1/stripe/checkout-sessions",
+        json!({
+            "who": "a".repeat(64),
+            "mu": 2_500_000u64,
+            "success_url": "http://127.0.0.1:11436/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}",
+            "cancel_url": "http://127.0.0.1:11436/v1/stripe/cancel",
+            "idempotency_key": "stripe-checkout-test-1"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["denom"], "mu_usd");
+    assert_eq!(body["checkout_session"]["id"], "cs_test_123");
+    assert_eq!(
+        body["checkout_session"]["url"],
+        "https://checkout.stripe.com/c/pay/cs_test_123"
+    );
+    assert_eq!(body["checkout_session"]["amount_total"], 250);
+
+    let requests = capture.requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .authorization
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("Basic "));
+    assert_eq!(
+        requests[0].idempotency_key.as_deref(),
+        Some("stripe-checkout-test-1")
+    );
+    assert!(requests[0].body.contains("mode=payment"));
+    assert!(requests[0]
+        .body
+        .contains("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=250"));
+    assert!(requests[0]
+        .body
+        .contains("metadata%5Bmayhem_denom%5D=mu_usd"));
+    assert!(requests[0]
+        .body
+        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_who%5D=aaaaaaaa"));
+    assert!(requests[0]
+        .body
+        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_mu%5D=2500000"));
+    assert!(requests[0]
+        .body
+        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_denom%5D=mu_usd"));
 }
 
 #[tokio::test]

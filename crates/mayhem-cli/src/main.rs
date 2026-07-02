@@ -8,7 +8,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -34,6 +34,7 @@ use tokio::process::Command;
 use tokio::time::sleep;
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
+const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
@@ -60,6 +61,11 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ProviderCommands>,
     },
+    /// Buy Mayhem credits through fiat/crypto rails.
+    Pay {
+        #[command(subcommand)]
+        command: PayCommands,
+    },
     /// Show provider payout evidence and treasury fee sweeps.
     Payouts(PayoutsArgs),
     /// Show provider earnings, holdback, paid, and released balances.
@@ -80,6 +86,14 @@ enum Commands {
 enum ProviderCommands {
     /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
     Start(ProviderStartArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PayCommands {
+    /// Buy credits via Stripe hosted checkout.
+    Stripe(PayRailArgs),
+    /// Buy credits via Coinbase hosted checkout.
+    Coinbase(PayRailArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,6 +213,65 @@ struct ReceiptsExportArgs {
     no_verify: bool,
 
     /// Print a machine-readable export report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PayRailArgs {
+    /// USD amount to buy, for example 10 or 10.25.
+    #[arg(long)]
+    amount: String,
+
+    /// Paygate base URL. Defaults to config.toml, MAYHEM_PAYGATE_URL, or local paygate.
+    #[arg(long)]
+    paygate_url: Option<String>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Idempotency key forwarded when the selected rail supports it.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+
+    /// Success redirect URL for hosted checkout.
+    #[arg(long)]
+    success_url: Option<String>,
+
+    /// Cancel/failure redirect URL for hosted checkout.
+    #[arg(long)]
+    cancel_url: Option<String>,
+
+    /// Print the checkout URL but do not launch a browser.
+    #[arg(long)]
+    no_open: bool,
+
+    /// Do not wait for the contract ledger balance to reflect the credit.
+    #[arg(long)]
+    no_wait: bool,
+
+    /// Maximum seconds to wait for ledger credit.
+    #[arg(long, default_value_t = 900)]
+    timeout_seconds: u64,
+
+    /// Poll interval in milliseconds while waiting for ledger credit.
+    #[arg(long, default_value_t = 2_000)]
+    poll_interval_ms: u64,
+
+    /// Print a machine-readable payment report.
     #[arg(long)]
     json: bool,
 }
@@ -498,6 +571,21 @@ enum WalletMode {
     Reuse,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PayRail {
+    Stripe,
+    Coinbase,
+}
+
+impl PayRail {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stripe => "stripe",
+            Self::Coinbase => "coinbase",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct WalletInfo {
     created: bool,
@@ -556,6 +644,7 @@ struct ConfigNetwork {
     rpc_url: Option<String>,
     sc_bridge_url: Option<String>,
     sc_bridge_token: Option<String>,
+    paygate_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -574,6 +663,10 @@ async fn main() -> Result<()> {
         },
         Commands::Provider { command } => match *command {
             ProviderCommands::Start(args) => provider_start(args).await,
+        },
+        Commands::Pay { command } => match command {
+            PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
+            PayCommands::Coinbase(args) => pay(PayRail::Coinbase, args).await,
         },
         Commands::Payouts(args) => payouts(args).await,
         Commands::Earnings(args) => earnings(args).await,
@@ -892,6 +985,119 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
     Ok(())
 }
 
+async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
+    if args.poll_interval_ms == 0 {
+        bail!("--poll-interval-ms must be positive");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        args.wallet_password.as_deref().unwrap_or(""),
+    )
+    .await?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let paygate_url = resolve_cli_paygate_url(config.as_ref(), args.paygate_url.as_deref());
+    let amount_mu = parse_usd_amount_to_mu(&args.amount)?;
+    let before_mu = read_user_balance_mu(&rpc, &wallet.public_key).await?;
+    let checkout = create_pay_checkout(
+        rail,
+        &paygate_url,
+        &wallet.public_key,
+        amount_mu,
+        args.idempotency_key.as_deref(),
+        args.success_url.as_deref(),
+        args.cancel_url.as_deref(),
+    )
+    .await?;
+    let opened = open_checkout_url(&checkout.url, args.no_open).await;
+    let target_mu = before_mu
+        .checked_add(amount_mu)
+        .context("target balance overflowed")?;
+    let status = if args.no_wait {
+        PayCreditStatus {
+            credited: false,
+            before_mu,
+            current_mu: before_mu,
+            target_mu,
+            waited_ms: 0,
+        }
+    } else {
+        wait_for_credit(
+            &rpc,
+            &wallet.public_key,
+            before_mu,
+            target_mu,
+            Duration::from_secs(args.timeout_seconds),
+            Duration::from_millis(args.poll_interval_ms),
+        )
+        .await?
+    };
+
+    let report = json!({
+        "ok": status.credited || args.no_wait,
+        "rail": rail.as_str(),
+        "denom": "mu_usd",
+        "amount_mu": amount_mu,
+        "amount_usd": mu_to_usd_amount(amount_mu),
+        "who": wallet.public_key,
+        "paygate_url": paygate_url,
+        "rpc_url": rpc_url,
+        "checkout": {
+            "id": checkout.id,
+            "url": checkout.url,
+            "reference": checkout.reference,
+        },
+        "opened": opened,
+        "credit": {
+            "credited": status.credited,
+            "before_mu": status.before_mu,
+            "current_mu": status.current_mu,
+            "target_mu": status.target_mu,
+            "waited_ms": status.waited_ms,
+        },
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Mayhem {} checkout for {}",
+            rail.as_str(),
+            mu_to_usd_amount(amount_mu)
+        );
+        println!("Copy/paste checkout URL: {}", checkout.url);
+        if opened {
+            println!("Opened checkout in your browser.");
+        } else if !args.no_open {
+            println!("Could not open a browser automatically; use the URL above.");
+        }
+        if args.no_wait {
+            println!("Not waiting for ledger credit (--no-wait).");
+        } else if status.credited {
+            println!(
+                "Credited: balance {} -> {} mu_usd.",
+                status.before_mu, status.current_mu
+            );
+        }
+    }
+
+    if !args.no_wait && !status.credited {
+        bail!(
+            "timed out waiting for {} mu_usd credit; current balance {} mu_usd, target {} mu_usd",
+            amount_mu,
+            status.current_mu,
+            status.target_mu
+        );
+    }
+
+    Ok(())
+}
+
 async fn payouts(args: PayoutsArgs) -> Result<()> {
     let rpc_url = resolve_cli_rpc_url(args.home.as_ref(), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
@@ -1062,6 +1268,303 @@ fn resolve_cli_rpc_url(home: Option<&PathBuf>, rpc_url: Option<&str>) -> Result<
         .and_then(|config| config.network)
         .and_then(|network| network.rpc_url)
         .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()))
+}
+
+fn resolve_cli_paygate_url(config: Option<&MayhemConfig>, paygate_url: Option<&str>) -> String {
+    if let Some(paygate_url) = paygate_url {
+        let paygate_url = paygate_url.trim();
+        if !paygate_url.is_empty() {
+            return paygate_url.trim_end_matches('/').to_owned();
+        }
+    }
+    if let Ok(paygate_url) = env::var("MAYHEM_PAYGATE_URL") {
+        let paygate_url = paygate_url.trim();
+        if !paygate_url.is_empty() {
+            return paygate_url.trim_end_matches('/').to_owned();
+        }
+    }
+    config
+        .and_then(|config| config.network.as_ref())
+        .and_then(|network| network.paygate_url.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim_end_matches('/').to_owned())
+        .unwrap_or_else(|| DEFAULT_PAYGATE_URL.to_owned())
+}
+
+async fn resolve_cli_wallet(
+    home: &Path,
+    config: Option<&MayhemConfig>,
+    peer_store_name: &str,
+    password: &str,
+) -> Result<WalletInfo> {
+    let store_name = config
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.store_name.as_deref())
+        .unwrap_or(peer_store_name);
+    let keypair_path = config
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.keypair_path.as_deref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.join("stores")
+                .join(store_name)
+                .join("db")
+                .join("keypair.json")
+        });
+    inspect_wallet(&keypair_path, password)
+        .await
+        .with_context(|| format!("reading wallet {}", keypair_path.display()))
+}
+
+#[derive(Debug)]
+struct PayCheckout {
+    id: String,
+    url: String,
+    reference: Option<String>,
+}
+
+#[derive(Debug)]
+struct PayCreditStatus {
+    credited: bool,
+    before_mu: u64,
+    current_mu: u64,
+    target_mu: u64,
+    waited_ms: u64,
+}
+
+async fn create_pay_checkout(
+    rail: PayRail,
+    paygate_url: &str,
+    who: &str,
+    amount_mu: u64,
+    idempotency_key: Option<&str>,
+    success_url: Option<&str>,
+    cancel_url: Option<&str>,
+) -> Result<PayCheckout> {
+    let client = reqwest::Client::new();
+    let endpoint = match rail {
+        PayRail::Stripe => "v1/stripe/checkout-sessions",
+        PayRail::Coinbase => "v1/coinbase/charges",
+    };
+    let success_url = success_url
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_checkout_success_url(paygate_url, rail));
+    let cancel_url = cancel_url
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_checkout_cancel_url(paygate_url, rail));
+    let mut body = json!({
+        "who": who,
+        "mu": amount_mu,
+    });
+    match rail {
+        PayRail::Stripe => {
+            body["success_url"] = Value::String(success_url);
+            body["cancel_url"] = Value::String(cancel_url);
+            if let Some(idempotency_key) = idempotency_key.filter(|value| !value.is_empty()) {
+                body["idempotency_key"] = Value::String(idempotency_key.to_owned());
+            }
+        }
+        PayRail::Coinbase => {
+            body["redirect_url"] = Value::String(success_url);
+            body["cancel_url"] = Value::String(cancel_url);
+        }
+    }
+
+    let response = client
+        .post(format!(
+            "{}/{}",
+            paygate_url.trim_end_matches('/'),
+            endpoint
+        ))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if !status.is_success() {
+        bail!("paygate returned {status}: {response_body}");
+    }
+    let value: Value = serde_json::from_str(&response_body)?;
+    checkout_from_paygate_response(rail, &value)
+}
+
+fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayCheckout> {
+    match rail {
+        PayRail::Stripe => {
+            let session = value
+                .get("checkout_session")
+                .ok_or_else(|| anyhow::anyhow!("paygate response missing checkout_session"))?;
+            Ok(PayCheckout {
+                id: required_json_string(session, "id")?,
+                url: required_json_string(session, "url")?,
+                reference: session
+                    .get("payment_intent")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        }
+        PayRail::Coinbase => {
+            let charge = value
+                .get("charge")
+                .ok_or_else(|| anyhow::anyhow!("paygate response missing charge"))?;
+            Ok(PayCheckout {
+                id: required_json_string(charge, "id")?,
+                url: required_json_string(charge, "hosted_url")?,
+                reference: charge
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        }
+    }
+}
+
+fn required_json_string(value: &Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("paygate response missing {field}"))
+}
+
+fn default_checkout_success_url(paygate_url: &str, rail: PayRail) -> String {
+    let base = paygate_url.trim_end_matches('/');
+    match rail {
+        PayRail::Stripe => {
+            format!("{base}/v1/stripe/return?session_id={{CHECKOUT_SESSION_ID}}")
+        }
+        PayRail::Coinbase => format!("{base}/v1/coinbase/return"),
+    }
+}
+
+fn default_checkout_cancel_url(paygate_url: &str, rail: PayRail) -> String {
+    let base = paygate_url.trim_end_matches('/');
+    match rail {
+        PayRail::Stripe => format!("{base}/v1/stripe/cancel"),
+        PayRail::Coinbase => format!("{base}/v1/coinbase/cancel"),
+    }
+}
+
+async fn open_checkout_url(url: &str, disabled: bool) -> bool {
+    if disabled {
+        return false;
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command.status().await.is_ok_and(|status| status.success())
+}
+
+async fn wait_for_credit(
+    rpc: &PeerRpcClient,
+    who: &str,
+    before_mu: u64,
+    target_mu: u64,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<PayCreditStatus> {
+    let started = Instant::now();
+    loop {
+        let current_mu = read_user_balance_mu(rpc, who).await?;
+        if current_mu >= target_mu {
+            return Ok(PayCreditStatus {
+                credited: true,
+                before_mu,
+                current_mu,
+                target_mu,
+                waited_ms: millis_since(started),
+            });
+        }
+        if started.elapsed() >= timeout {
+            return Ok(PayCreditStatus {
+                credited: false,
+                before_mu,
+                current_mu,
+                target_mu,
+                waited_ms: millis_since(started),
+            });
+        }
+        sleep(interval).await;
+    }
+}
+
+fn millis_since(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+async fn read_user_balance_mu(rpc: &PeerRpcClient, who: &str) -> Result<u64> {
+    let Some(value) = read_state_value(rpc, &format!("bal/{who}")).await? else {
+        return Ok(0);
+    };
+    if let Some(denom) = value.get("denom").and_then(Value::as_str) {
+        if denom != "mu_usd" {
+            bail!("balance record for {who} has unsupported denomination {denom}");
+        }
+    }
+    value
+        .get("mu")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("balance record for {who} is missing mu"))
+}
+
+fn parse_usd_amount_to_mu(amount: &str) -> Result<u64> {
+    let amount = amount.trim();
+    if amount.is_empty() {
+        bail!("--amount must be positive");
+    }
+    if amount.starts_with('-') || amount.starts_with('+') {
+        bail!("--amount must be positive USD");
+    }
+    let (dollars, cents) = match amount.split_once('.') {
+        Some((dollars, cents)) => {
+            if cents.is_empty() || cents.len() > 2 {
+                bail!("--amount supports at most two decimal places");
+            }
+            (dollars, cents)
+        }
+        None => (amount, ""),
+    };
+    if dollars.is_empty()
+        || !dollars.as_bytes().iter().all(u8::is_ascii_digit)
+        || !cents.as_bytes().iter().all(u8::is_ascii_digit)
+    {
+        bail!("--amount must be a USD decimal, for example 10 or 10.25");
+    }
+    let dollars = dollars.parse::<u64>()?;
+    let cents = match cents.len() {
+        0 => 0,
+        1 => cents.parse::<u64>()? * 10,
+        2 => cents.parse::<u64>()?,
+        _ => unreachable!("length checked above"),
+    };
+    let total_cents = dollars
+        .checked_mul(100)
+        .and_then(|value| value.checked_add(cents))
+        .context("--amount overflowed")?;
+    if total_cents == 0 {
+        bail!("--amount must be positive");
+    }
+    total_cents
+        .checked_mul(10_000)
+        .context("--amount overflowed mu_usd")
+}
+
+fn mu_to_usd_amount(mu: u64) -> String {
+    let cents = mu / 10_000;
+    format!("{}.{:02}", cents / 100, cents % 100)
 }
 
 fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
@@ -3022,7 +3525,8 @@ fn write_config(
             "[role]\n",
             "mode = {}\n\n",
             "[network]\n",
-            "rpc_url = {}\n"
+            "rpc_url = {}\n",
+            "paygate_url = {}\n"
         ),
         toml_string(&wallet.public_key),
         toml_string(address),
@@ -3032,6 +3536,7 @@ fn write_config(
         toml_string(&store_path.display().to_string()),
         toml_string(role.as_str()),
         toml_string(rpc_url),
+        toml_string(DEFAULT_PAYGATE_URL),
     );
     fs::write(&config_path, contents)
         .with_context(|| format!("writing {}", config_path.display()))?;
@@ -3425,6 +3930,53 @@ mod tests {
         assert!(checks.iter().any(|check| {
             check.key == "ev/pay/4.mu_total" && !check.ok && check.actual == json!(11)
         }));
+    }
+
+    #[test]
+    fn pay_amount_parser_uses_integer_micro_usd() {
+        assert_eq!(parse_usd_amount_to_mu("10").unwrap(), 10_000_000);
+        assert_eq!(parse_usd_amount_to_mu("10.25").unwrap(), 10_250_000);
+        assert_eq!(parse_usd_amount_to_mu("0.01").unwrap(), 10_000);
+        assert!(parse_usd_amount_to_mu("0").is_err());
+        assert!(parse_usd_amount_to_mu("1.001").is_err());
+        assert!(parse_usd_amount_to_mu("-1").is_err());
+    }
+
+    #[test]
+    fn pay_checkout_extraction_requires_hosted_urls() {
+        let stripe = checkout_from_paygate_response(
+            PayRail::Stripe,
+            &json!({
+                "checkout_session": {
+                    "id": "cs_test",
+                    "url": "https://checkout.stripe.com/c/pay/cs_test",
+                    "payment_intent": "pi_test"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(stripe.id, "cs_test");
+        assert_eq!(stripe.reference.as_deref(), Some("pi_test"));
+
+        let coinbase = checkout_from_paygate_response(
+            PayRail::Coinbase,
+            &json!({
+                "charge": {
+                    "id": "charge_test",
+                    "code": "CBTEST",
+                    "hosted_url": "https://commerce.coinbase.com/charges/CBTEST"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(coinbase.id, "charge_test");
+        assert_eq!(coinbase.reference.as_deref(), Some("CBTEST"));
+
+        assert!(checkout_from_paygate_response(
+            PayRail::Coinbase,
+            &json!({ "charge": { "id": "charge_test" } })
+        )
+        .is_err());
     }
 
     #[test]

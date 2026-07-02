@@ -17,7 +17,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -253,6 +253,16 @@ pub struct StripeCreatePaymentIntentRequest {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StripeCreateCheckoutSessionRequest {
+    pub who: String,
+    pub mu: u64,
+    pub success_url: String,
+    pub cancel_url: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StripeCreatePaymentIntentResponse {
     pub ok: bool,
@@ -263,6 +273,16 @@ pub struct StripeCreatePaymentIntentResponse {
     pub payment_intent: StripePaymentIntentSummary,
 }
 
+#[derive(Debug, Serialize)]
+pub struct StripeCreateCheckoutSessionResponse {
+    pub ok: bool,
+    pub rail: &'static str,
+    pub denom: &'static str,
+    pub who: String,
+    pub mu: u64,
+    pub checkout_session: StripeCheckoutSessionSummary,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StripePaymentIntentSummary {
     pub id: String,
@@ -270,6 +290,18 @@ pub struct StripePaymentIntentSummary {
     pub amount: u64,
     pub currency: String,
     pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StripeCheckoutSessionSummary {
+    pub id: String,
+    pub url: String,
+    pub amount_total: Option<u64>,
+    pub currency: Option<String>,
+    pub payment_intent: Option<String>,
+    pub payment_status: Option<String>,
+    pub status: Option<String>,
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1010,10 +1042,26 @@ pub fn paygate_router(state: PaygateState) -> Router {
             "/v1/stripe/payment-intents",
             post(create_stripe_payment_intent),
         )
+        .route(
+            "/stripe/checkout-sessions",
+            post(create_stripe_checkout_session),
+        )
+        .route(
+            "/v1/stripe/checkout-sessions",
+            post(create_stripe_checkout_session),
+        )
+        .route("/stripe/return", get(stripe_return))
+        .route("/v1/stripe/return", get(stripe_return))
+        .route("/stripe/cancel", get(stripe_cancel))
+        .route("/v1/stripe/cancel", get(stripe_cancel))
         .route("/stripe/webhook", post(stripe_webhook))
         .route("/v1/stripe/webhook", post(stripe_webhook))
         .route("/coinbase/charges", post(create_coinbase_charge))
         .route("/v1/coinbase/charges", post(create_coinbase_charge))
+        .route("/coinbase/return", get(coinbase_return))
+        .route("/v1/coinbase/return", get(coinbase_return))
+        .route("/coinbase/cancel", get(coinbase_cancel))
+        .route("/v1/coinbase/cancel", get(coinbase_cancel))
         .route("/coinbase/webhook", post(coinbase_webhook))
         .route("/v1/coinbase/webhook", post(coinbase_webhook))
         .with_state(Arc::new(state))
@@ -1038,6 +1086,24 @@ async fn create_stripe_payment_intent(
     }
 }
 
+async fn create_stripe_checkout_session(
+    State(state): State<Arc<PaygateState>>,
+    Json(request): Json<StripeCreateCheckoutSessionRequest>,
+) -> Response {
+    match create_checkout_session(&state, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+async fn stripe_return() -> Html<&'static str> {
+    Html("Mayhem payment submitted. You can return to the CLI while credit confirmation settles.")
+}
+
+async fn stripe_cancel() -> Html<&'static str> {
+    Html("Mayhem payment cancelled. You can return to the CLI.")
+}
+
 async fn stripe_webhook(
     State(state): State<Arc<PaygateState>>,
     headers: HeaderMap,
@@ -1057,6 +1123,14 @@ async fn create_coinbase_charge(
         Ok(response) => Json(response).into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
+}
+
+async fn coinbase_return() -> Html<&'static str> {
+    Html("Mayhem Coinbase payment submitted. You can return to the CLI while credit confirmation settles.")
+}
+
+async fn coinbase_cancel() -> Html<&'static str> {
+    Html("Mayhem Coinbase payment cancelled. You can return to the CLI.")
 }
 
 async fn coinbase_webhook(
@@ -1096,6 +1170,37 @@ async fn create_payment_intent(
         who: request.who,
         mu: request.mu,
         payment_intent: intent,
+    })
+}
+
+async fn create_checkout_session(
+    state: &PaygateState,
+    request: StripeCreateCheckoutSessionRequest,
+) -> Result<StripeCreateCheckoutSessionResponse> {
+    let stripe = &state.config.rails.stripe;
+    if !stripe.enabled {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe rail is not enabled".to_owned(),
+        ));
+    }
+    validate_safe_key_part("who", &request.who)?;
+    validate_checkout_url("success_url", &request.success_url)?;
+    validate_checkout_url("cancel_url", &request.cancel_url)?;
+    let amount_cents = mu_to_usd_cents(request.mu)?;
+    let secret_key = stripe
+        .secret_key
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("stripe.secret_key missing".to_owned()))?;
+    let session =
+        stripe_create_checkout_session(&state.http, stripe, secret_key, &request, amount_cents)
+            .await?;
+    Ok(StripeCreateCheckoutSessionResponse {
+        ok: true,
+        rail: "stripe",
+        denom: CREDIT_DENOM,
+        who: request.who,
+        mu: request.mu,
+        checkout_session: session,
     })
 }
 
@@ -1141,6 +1246,75 @@ async fn stripe_create_payment_intent(
     stripe_payment_intent_summary(value)
 }
 
+async fn stripe_create_checkout_session(
+    http: &reqwest::Client,
+    stripe: &StripeSettings,
+    secret_key: &str,
+    request: &StripeCreateCheckoutSessionRequest,
+    amount_cents: u64,
+) -> Result<StripeCheckoutSessionSummary> {
+    let form = [
+        ("mode".to_owned(), "payment".to_owned()),
+        ("success_url".to_owned(), request.success_url.to_owned()),
+        ("cancel_url".to_owned(), request.cancel_url.to_owned()),
+        (
+            "line_items[0][price_data][currency]".to_owned(),
+            "usd".to_owned(),
+        ),
+        (
+            "line_items[0][price_data][product_data][name]".to_owned(),
+            "Mayhem credits".to_owned(),
+        ),
+        (
+            "line_items[0][price_data][product_data][description]".to_owned(),
+            "Mayhem credit top-up".to_owned(),
+        ),
+        (
+            "line_items[0][price_data][unit_amount]".to_owned(),
+            amount_cents.to_string(),
+        ),
+        ("line_items[0][quantity]".to_owned(), "1".to_owned()),
+        ("client_reference_id".to_owned(), request.who.to_owned()),
+        ("metadata[mayhem_who]".to_owned(), request.who.to_owned()),
+        ("metadata[mayhem_mu]".to_owned(), request.mu.to_string()),
+        ("metadata[mayhem_denom]".to_owned(), CREDIT_DENOM.to_owned()),
+        (
+            "payment_intent_data[metadata][mayhem_who]".to_owned(),
+            request.who.to_owned(),
+        ),
+        (
+            "payment_intent_data[metadata][mayhem_mu]".to_owned(),
+            request.mu.to_string(),
+        ),
+        (
+            "payment_intent_data[metadata][mayhem_denom]".to_owned(),
+            CREDIT_DENOM.to_owned(),
+        ),
+    ];
+    let mut builder = http
+        .post(format!(
+            "{}/v1/checkout/sessions",
+            stripe.api_base_url.trim_end_matches('/')
+        ))
+        .basic_auth(secret_key, Some(""))
+        .form(&form);
+    if let Some(idempotency_key) = &request.idempotency_key {
+        if !idempotency_key.is_empty() {
+            builder = builder.header("Idempotency-Key", idempotency_key);
+        }
+    }
+    let response = builder.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(PaygateError::Stripe(format!(
+            "Stripe returned {status}: {body}"
+        )));
+    }
+    let value: Value = serde_json::from_str(&body)?;
+    stripe_checkout_session_summary(value)
+}
+
 fn stripe_payment_intent_summary(value: Value) -> Result<StripePaymentIntentSummary> {
     let id = value
         .get("id")
@@ -1169,6 +1343,39 @@ fn stripe_payment_intent_summary(value: Value) -> Result<StripePaymentIntentSumm
         amount,
         currency: currency.to_owned(),
         status: status.to_owned(),
+    })
+}
+
+fn stripe_checkout_session_summary(value: Value) -> Result<StripeCheckoutSessionSummary> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PaygateError::Stripe("Checkout Session response missing id".to_owned()))?;
+    let url = value
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PaygateError::Stripe("Checkout Session response missing url".to_owned()))?;
+    Ok(StripeCheckoutSessionSummary {
+        id: id.to_owned(),
+        url: url.to_owned(),
+        amount_total: value.get("amount_total").and_then(Value::as_u64),
+        currency: value
+            .get("currency")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        payment_intent: value
+            .get("payment_intent")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        payment_status: value
+            .get("payment_status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        expires_at: value.get("expires_at").and_then(Value::as_u64),
     })
 }
 
@@ -2133,6 +2340,20 @@ fn validate_safe_key_part(field: &str, value: &str) -> Result<()> {
     } else {
         Err(PaygateError::InvalidRequest(format!("{field} is invalid")))
     }
+}
+
+fn validate_checkout_url(field: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 2048
+        || trimmed.bytes().any(|byte| byte.is_ascii_control())
+        || !(trimmed.starts_with("https://")
+            || trimmed.starts_with("http://127.0.0.1")
+            || trimmed.starts_with("http://localhost"))
+    {
+        return Err(PaygateError::InvalidRequest(format!("{field} is invalid")));
+    }
+    Ok(())
 }
 
 fn is_safe_key_part(value: &str) -> bool {
