@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "launch_id": "mayhem-testnet-beta-v1",
+  "network": {
+    "name": "testnet1",
+    "denom": "mu_usd",
+    "msb": {
+      "address_prefix": "testtrac",
+      "network_id": 919
+    }
+  },
+  "window": {
+    "started_at": "<2026-07-03T00:00:00Z>",
+    "ended_at": "<2026-07-10T00:00:00Z>"
+  },
+  "controls": {
+    "admin_controls_economy": true,
+    "providers_set_prices": false,
+    "providers_submit_models": false,
+    "providers_create_canonical_rooms": false,
+    "providers_only_join_admin_rooms": true
+  },
+  "participants": {
+    "external_providers": {
+      "count": "<external-provider-count-at-least-20>",
+      "evidence": [
+        "<provider-roster-report-hash-or-url>"
+      ]
+    },
+    "users": {
+      "count": "<user-count-at-least-100>",
+      "evidence": [
+        "<user-activity-report-hash-or-url>"
+      ]
+    }
+  },
+  "audited_epoch": {
+    "epoch": "<audited-epoch-number>",
+    "committed": true,
+    "applied": true,
+    "commit_tx": "<epoch-commit-tx-hash-64-hex>",
+    "apply_tx": "<epoch-apply-tx-hash-64-hex>",
+    "roots": {
+      "dep": "<dep-root-64-hex>",
+      "use": "<use-root-64-hex>",
+      "earn": "<earn-root-64-hex>",
+      "fee": "<fee-root-64-hex>",
+      "pay": "<pay-root-64-hex>"
+    },
+    "receipt_batches_verified": true,
+    "payout_evidence_verified": true,
+    "auditors": [
+      "<auditor-public-key-64-hex>"
+    ]
+  },
+  "guardian": {
+    "trips": 0,
+    "conservation_ok": true,
+    "monotonic_epochs": true,
+    "notes": []
+  },
+  "canary": {
+    "set_id": "canary-launch-v1",
+    "probes": "<accepted-canary-probe-count>",
+    "failures": 0
+  },
+  "browser_handoffs": {
+    "copy_paste_urls_printed": true,
+    "samples": [
+      "<checkout-log-hash-or-url>"
+    ]
+  },
+  "tracker": {
+    "metrics_recorded": false,
+    "notes": "Set to true only after the validated metrics have been recorded in docs/TRACKER.md."
+  }
+}

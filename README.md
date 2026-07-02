@@ -52,4 +52,4 @@ cargo build --workspace
 MAYHEM_RUN_INTERCOM_TESTS=1 cargo test -p mayhem-bridge --test sc_bridge -- --nocapture
 ```
 
-See `docs/PLAN-2026-07-02-p2p-openrouter-on-intercom.md` and `docs/TRACKER.md` for the implementation roadmap and live execution state. Operator, provider, and user docs live in `docs/operator-runbook.md`, `docs/provider-guide.md`, and `docs/user-guide.md`. v2 groundwork lives in `docs/v2/README.md`.
+See `docs/PLAN-2026-07-02-p2p-openrouter-on-intercom.md` and `docs/TRACKER.md` for the implementation roadmap and live execution state. Operator, provider, and user docs live in `docs/operator-runbook.md`, `docs/provider-guide.md`, and `docs/user-guide.md`. Beta launch and metrics docs live in `docs/beta-launch.md` and `docs/beta-metrics.md`. v2 groundwork lives in `docs/v2/README.md`.
