@@ -10,10 +10,10 @@ members = [
     "crates/mayhem-pay",
     "crates/mayhem-proto",
     "crates/mayhemd",
+    "services/paygate",
 ]
 
 [workspace.package]
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
-

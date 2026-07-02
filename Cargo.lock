@@ -1451,6 +1451,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mayhem-paygate"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tower",
+]
+
+[[package]]
 name = "mayhem-proto"
 version = "0.1.0"
 dependencies = [
