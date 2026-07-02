@@ -22,6 +22,7 @@ mayhem setup --role user
 mayhem use
 # terminal 2
 mayhem models
+mayhem balance
 mayhem test --sync-models
 opencode run --model mayhem/<model-id> "Say hello from Mayhem."
 ```

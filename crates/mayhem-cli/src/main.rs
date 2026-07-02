@@ -82,6 +82,8 @@ enum Commands {
         #[command(subcommand)]
         command: PayCommands,
     },
+    /// Show a canonical contract credit balance.
+    Balance(BalanceArgs),
     /// Show provider payout evidence and treasury fee sweeps.
     Payouts(PayoutsArgs),
     /// Show provider earnings, holdback, paid, and released balances.
@@ -183,6 +185,33 @@ struct EarningsArgs {
     provider: Option<String>,
 
     /// Print machine-readable earnings.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct BalanceArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Public key to inspect. Defaults to the local wallet public key.
+    #[arg(long)]
+    who: Option<String>,
+
+    /// Print a machine-readable balance report.
     #[arg(long)]
     json: bool,
 }
@@ -976,6 +1005,7 @@ async fn main() -> Result<()> {
             PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
             PayCommands::Coinbase(args) => pay(PayRail::Coinbase, args).await,
         },
+        Commands::Balance(args) => balance(args).await,
         Commands::Payouts(args) => payouts(args).await,
         Commands::Earnings(args) => earnings(args).await,
         Commands::Auditor { command } => match command {
@@ -1470,6 +1500,51 @@ async fn models(args: ModelsArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_models_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn balance(args: BalanceArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let who = if let Some(who) = args.who.clone() {
+        who
+    } else {
+        resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            args.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await?
+        .public_key
+    };
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let balance_record = read_balance_record(&rpc, &who).await?;
+    let mu = balance_record
+        .get("mu")
+        .and_then(Value::as_u64)
+        .context("normalized balance record missing mu")?;
+    let frozen = read_state_value(&rpc, &format!("frozen/{who}")).await?;
+    let report = json!({
+        "ok": true,
+        "rpc_url": rpc_url,
+        "who": who,
+        "balance": balance_record,
+        "credit": {
+            "denom": "mu_usd",
+            "mu": mu,
+            "usd": mu_to_usd_amount(mu),
+        },
+        "frozen": frozen,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_balance_report(&report);
     }
     Ok(())
 }
@@ -2678,6 +2753,30 @@ fn print_models_report(report: &Value) -> Result<()> {
     Ok(())
 }
 
+fn print_balance_report(report: &Value) {
+    let balance = &report["balance"];
+    let mu = report["credit"]["mu"].as_u64().unwrap_or(0);
+    println!("Mayhem balance");
+    println!("Public key: {}", report["who"].as_str().unwrap_or(""));
+    println!(
+        "Credit: {} USD ({} mu_usd)",
+        report["credit"]["usd"].as_str().unwrap_or("0.00"),
+        mu
+    );
+    println!(
+        "Updated epoch: {}",
+        balance["updated_epoch"].as_u64().unwrap_or(0)
+    );
+    if let Some(updated_at) = balance.get("updated_at").and_then(Value::as_u64) {
+        println!("Updated at: {updated_at}");
+    }
+    if let Some(status) = report["frozen"].get("status").and_then(Value::as_str) {
+        println!("Frozen: {status}");
+    } else {
+        println!("Frozen: no");
+    }
+}
+
 fn bool_mark(value: bool) -> &'static str {
     if value {
         "yes"
@@ -3393,18 +3492,54 @@ fn millis_since(started: Instant) -> u64 {
 }
 
 async fn read_user_balance_mu(rpc: &PeerRpcClient, who: &str) -> Result<u64> {
-    let Some(value) = read_state_value(rpc, &format!("bal/{who}")).await? else {
-        return Ok(0);
-    };
-    if let Some(denom) = value.get("denom").and_then(Value::as_str) {
-        if denom != "mu_usd" {
-            bail!("balance record for {who} has unsupported denomination {denom}");
-        }
-    }
-    value
+    read_balance_record(rpc, who)
+        .await?
         .get("mu")
         .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("balance record for {who} is missing mu"))
+        .ok_or_else(|| anyhow::anyhow!("normalized balance record for {who} is missing mu"))
+}
+
+async fn read_balance_record(rpc: &PeerRpcClient, who: &str) -> Result<Value> {
+    let value = read_state_value(rpc, &format!("bal/{who}")).await?;
+    normalize_balance_record(who, value)
+}
+
+fn normalize_balance_record(who: &str, value: Option<Value>) -> Result<Value> {
+    let mut record = value.unwrap_or_else(|| {
+        json!({
+            "user": who,
+            "denom": "mu_usd",
+            "mu": 0,
+            "updated_epoch": 0,
+            "updated_at": null,
+        })
+    });
+    let object = record
+        .as_object_mut()
+        .context("balance record must be a JSON object")?;
+    match object.get("denom").and_then(Value::as_str) {
+        Some("mu_usd") | None => {
+            object
+                .entry("denom")
+                .or_insert_with(|| Value::String("mu_usd".to_owned()));
+        }
+        Some(denom) => bail!("balance record for {who} has unsupported denomination {denom}"),
+    }
+    match object.get("user").and_then(Value::as_str) {
+        Some(user) if user == who => {}
+        Some(user) => bail!("balance record user mismatch: expected {who}, got {user}"),
+        None => {
+            object.insert("user".to_owned(), Value::String(who.to_owned()));
+        }
+    }
+    if object.get("mu").and_then(Value::as_u64).is_none() {
+        bail!("balance record for {who} is missing non-negative integer mu");
+    }
+    object
+        .entry("updated_epoch")
+        .or_insert_with(|| Value::Number(0_u64.into()));
+    object.entry("updated_at").or_insert(Value::Null);
+    Ok(record)
 }
 
 fn parse_usd_amount_to_mu(amount: &str) -> Result<u64> {
@@ -5904,6 +6039,49 @@ mod tests {
         assert!(parse_usd_amount_to_mu("0").is_err());
         assert!(parse_usd_amount_to_mu("1.001").is_err());
         assert!(parse_usd_amount_to_mu("-1").is_err());
+    }
+
+    #[test]
+    fn balance_record_defaults_missing_contract_key_to_zero_mu_usd() {
+        let record = normalize_balance_record("user", None).unwrap();
+
+        assert_eq!(record["user"], "user");
+        assert_eq!(record["denom"], "mu_usd");
+        assert_eq!(record["mu"], 0);
+        assert_eq!(record["updated_epoch"], 0);
+        assert!(record["updated_at"].is_null());
+    }
+
+    #[test]
+    fn balance_record_validates_denom_user_and_mu() {
+        let record = normalize_balance_record(
+            "user",
+            Some(json!({
+                "user": "user",
+                "denom": "mu_usd",
+                "mu": 42,
+                "updated_epoch": 3,
+                "updated_at": 7
+            })),
+        )
+        .unwrap();
+        assert_eq!(record["mu"], 42);
+
+        assert!(normalize_balance_record(
+            "user",
+            Some(json!({ "user": "user", "denom": "provider_coin", "mu": 1 }))
+        )
+        .is_err());
+        assert!(normalize_balance_record(
+            "user",
+            Some(json!({ "user": "other", "denom": "mu_usd", "mu": 1 }))
+        )
+        .is_err());
+        assert!(normalize_balance_record(
+            "user",
+            Some(json!({ "user": "user", "denom": "mu_usd" }))
+        )
+        .is_err());
     }
 
     #[test]
