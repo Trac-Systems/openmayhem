@@ -616,6 +616,7 @@ dependencies = [
  "blake3",
  "clap",
  "mayhem-bridge",
+ "mayhem-hwprobe",
  "serde",
  "serde_json",
  "tokio",
@@ -637,6 +638,10 @@ version = "0.1.0"
 [[package]]
 name = "mayhem-hwprobe"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "mayhem-pay"

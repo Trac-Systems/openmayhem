@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use mayhem_bridge::{PeerRpcClient, DEFAULT_RPC_URL};
+use mayhem_hwprobe::{human_report, probe, FixtureProfile, ProbeOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -28,6 +29,8 @@ struct Cli {
 enum Commands {
     /// Choose a role, create or import a wallet, and sign current router rules.
     Setup(SetupArgs),
+    /// Probe local hardware and print enclave backend feasibility.
+    Doctor(DoctorArgs),
     /// Inspect, hash, and re-consent to router rules.
     Rules {
         #[command(subcommand)]
@@ -152,6 +155,29 @@ struct RulesReviewArgs {
     print_json: bool,
 }
 
+#[derive(Debug, Parser)]
+struct DoctorArgs {
+    /// Print the hardware report as JSON.
+    #[arg(long)]
+    json: bool,
+
+    /// Run against a deterministic reference profile: apple-silicon, linux-nvidia, or cpu-only.
+    #[arg(long)]
+    fixture: Option<String>,
+
+    /// Path used for disk free-space and write-throughput probes.
+    #[arg(long, value_name = "PATH")]
+    disk_path: Option<PathBuf>,
+
+    /// Skip the disk write-throughput benchmark.
+    #[arg(long)]
+    skip_disk_bench: bool,
+
+    /// Size of the temporary disk benchmark write.
+    #[arg(long, default_value_t = 16)]
+    disk_bench_mib: u64,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Role {
     Provider,
@@ -243,6 +269,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Setup(args) => setup(args).await,
+        Commands::Doctor(args) => doctor(args),
         Commands::Rules { command } => match command {
             RulesCommands::Hash(args) => rules_hash(args),
             RulesCommands::Review(args) => rules_review(args).await,
@@ -467,6 +494,36 @@ async fn rules_review(args: RulesReviewArgs) -> Result<()> {
         println!("Consent: submitted and observed for rules v{rules_ver}");
     }
 
+    Ok(())
+}
+
+fn doctor(args: DoctorArgs) -> Result<()> {
+    let fixture = args
+        .fixture
+        .as_deref()
+        .map(|value| {
+            FixtureProfile::parse(value).with_context(|| {
+                format!(
+                    "unknown fixture {value}; expected apple-silicon, linux-nvidia, or cpu-only"
+                )
+            })
+        })
+        .transpose()?;
+
+    let mut options = ProbeOptions::default();
+    if let Some(path) = args.disk_path {
+        options.disk_path = absolutize(path)?;
+    }
+    options.run_disk_bench = !args.skip_disk_bench;
+    options.disk_bench_mib = args.disk_bench_mib;
+    options.fixture = fixture;
+
+    let report = probe(options);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", human_report(&report));
+    }
     Ok(())
 }
 
