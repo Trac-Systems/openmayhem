@@ -182,14 +182,20 @@ test('MayhemContract guardian halts epochApply on negative balances', async () =
 
 test('MayhemContract guardian halts payoutConfirm on stale rates', async () => {
   const { admin, provider, storage, contract } = await setupGuardianContract();
-  await storage.put(`earn/${provider.publicKey}`, earningRecord(provider.publicKey));
+  await storage.put(`earn/${provider.publicKey}`, earningRecord(provider.publicKey, {
+    total_mu: 2_000_000,
+  }));
   const before = storage.snapshotBytes();
 
   const result = await execute(
     contract,
     storage,
     'payoutConfirm',
-    payoutConfirm(provider.publicKey, { at: 1_901 }),
+    payoutConfirm(provider.publicKey, {
+      at: 1_901,
+      mu: 1_000_000,
+      tnk_e18: '500000000000000000',
+    }),
     admin.publicKey,
     5
   );

@@ -551,8 +551,10 @@ class MayhemContract extends Contract {
         epoch: { type: 'number', integer: true, min: 1 },
         who: { type: 'string', min: 1, max: 128 },
         mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        tnk_e18: { type: 'string', min: 1, max: 80 },
-        msb_tx_hash: { type: 'string', min: 1, max: 128 },
+        rail: { type: 'string', min: 1, max: 32, optional: true },
+        tnk_e18: { type: 'string', min: 1, max: 80, optional: true },
+        msb_tx_hash: { type: 'string', min: 1, max: 128, optional: true },
+        external_ref: { type: 'string', min: 1, max: 256, optional: true },
         at: { type: 'number', integer: true, min: 0 },
       },
     });
@@ -2202,25 +2204,21 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid payout recipient.');
     const kind = this.value.kind ?? 'provider';
     if (!PAYOUT_CONFIRM_KINDS.has(kind)) return new Error('Unsupported payout confirmation kind.');
+    const rail = this.value.rail ?? 'tnk';
+    if (!PAYOUT_METHODS.has(rail)) return new Error('Unsupported payout rail.');
 
-    const rate = await this.guardianRequireFreshRate(this.value.at);
-    if (rate instanceof Error) return rate;
-    const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
-    if (tnkE18 instanceof Error) return tnkE18;
-    const convertedMu = this.tnkE18ToMu(tnkE18, rate.tnk_usd_e6);
-    if (convertedMu instanceof Error) return convertedMu;
-    if (convertedMu < this.value.mu) {
-      return new Error('Payout TNK amount is below the mu amount at the oracle rate.');
-    }
     if (kind === 'fee_sweep') {
-      return await this.confirmFeeSweepPayout(rate);
+      if (rail !== 'tnk') return new Error('Fee sweep payout rail must be tnk.');
+      const tnk = await this.validateTnkPayoutFields();
+      if (tnk instanceof Error) return tnk;
+      return await this.confirmFeeSweepPayout(tnk.rate);
     }
 
     const provider = await this.get(`prov/${this.value.who}`);
     if (!provider) return new Error('Provider not found.');
     if (provider.status !== 'active') return new Error('Provider is not active.');
-    if (!provider.payout || provider.payout.method !== 'tnk') {
-      return new Error('Provider TNK payout target is not set.');
+    if (!provider.payout || provider.payout.method !== rail) {
+      return new Error('Provider payout target for rail is not set.');
     }
 
     const earning = await this.earningRecord(this.value.who);
@@ -2246,14 +2244,15 @@ class MayhemContract extends Contract {
     if (releasedMu < this.value.mu) return new Error('Insufficient released earnings.');
     const paidCumMu = this.safeAddMu(refreshed.paid_cum_mu, this.value.mu);
     if (paidCumMu instanceof Error) return paidCumMu;
+    const payoutEvidence = await this.providerPayoutEvidence(provider, rail);
+    if (payoutEvidence instanceof Error) return payoutEvidence;
     const leaf = await this.payoutLeafHash({
       kind: 'provider',
+      rail,
       who_hash: await this.opaqueHash('payout-provider', this.value.who),
       target_hash: await this.opaqueHash('payout-target', provider.payout.addr),
       mu: this.value.mu,
-      tnk_e18: this.value.tnk_e18,
-      msb_tx_hash: this.value.msb_tx_hash,
-      rate_ts: rate.ts,
+      ...payoutEvidence.leaf,
     });
     const payoutRoot = await this.nextPayoutRoot({
       epoch: this.value.epoch,
@@ -2267,28 +2266,93 @@ class MayhemContract extends Contract {
       ...refreshed,
       paid_cum_mu: paidCumMu,
       updated_at: this.tx,
-      last_payout_rate_ts: rate.ts,
-      last_payout_msb_tx_hash: this.value.msb_tx_hash,
+      last_payout_rail: rail,
     };
+    delete updated.last_payout_rate_ts;
+    delete updated.last_payout_msb_tx_hash;
+    delete updated.last_payout_external_ref_hash;
+    Object.assign(updated, payoutEvidence.earning);
     await this.put(`earn/${this.value.who}`, updated);
     await this.put(`ev/pay/${this.value.epoch}`, payoutRoot);
     console.log('mayhem payoutConfirm', {
       kind: 'provider',
+      rail,
       who: this.value.who,
       mu: this.value.mu,
-      tnk_e18: this.value.tnk_e18,
-      rate_ts: rate.ts,
       epoch: this.value.epoch,
     });
     return {
       ok: true,
       op: 'payoutConfirm',
       kind: 'provider',
+      rail,
       who: this.value.who,
       mu: this.value.mu,
       epoch: this.value.epoch,
       payout_root: payoutRoot.merkle_root,
-      rate_ts: rate.ts,
+      ...payoutEvidence.result,
+    };
+  }
+
+  async validateTnkPayoutFields() {
+    if (this.value.tnk_e18 === undefined) return new Error('TNK payout requires tnk_e18.');
+    if (this.value.msb_tx_hash === undefined) return new Error('TNK payout requires msb_tx_hash.');
+    if (!this.isSafeKeyPart(this.value.msb_tx_hash)) return new Error('Invalid MSB tx hash.');
+    const rate = await this.guardianRequireFreshRate(this.value.at);
+    if (rate instanceof Error) return rate;
+    const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
+    if (tnkE18 instanceof Error) return tnkE18;
+    const convertedMu = this.tnkE18ToMu(tnkE18, rate.tnk_usd_e6);
+    if (convertedMu instanceof Error) return convertedMu;
+    if (convertedMu < this.value.mu) {
+      return new Error('Payout TNK amount is below the mu amount at the oracle rate.');
+    }
+    return { rate, tnk_e18: this.value.tnk_e18, msb_tx_hash: this.value.msb_tx_hash };
+  }
+
+  async providerPayoutEvidence(provider, rail) {
+    if (rail === 'tnk') {
+      const tnk = await this.validateTnkPayoutFields();
+      if (tnk instanceof Error) return tnk;
+      return {
+        leaf: {
+          tnk_e18: tnk.tnk_e18,
+          msb_tx_hash: tnk.msb_tx_hash,
+          rate_ts: tnk.rate.ts,
+        },
+        earning: {
+          last_payout_rate_ts: tnk.rate.ts,
+          last_payout_msb_tx_hash: tnk.msb_tx_hash,
+        },
+        result: {
+          rate_ts: tnk.rate.ts,
+        },
+      };
+    }
+
+    if (this.value.tnk_e18 !== undefined || this.value.msb_tx_hash !== undefined) {
+      return new Error('Fiat payout confirmation must not include TNK fields.');
+    }
+    if (this.value.external_ref === undefined) {
+      return new Error('Fiat payout confirmation requires external_ref.');
+    }
+    if (!this.isSafeExternalRef(this.value.external_ref)) {
+      return new Error('Invalid fiat payout external reference.');
+    }
+    const externalRefHash = await this.opaqueHash(
+      'payout-external-ref',
+      `${rail}:${this.value.external_ref}`
+    );
+    return {
+      leaf: {
+        external_ref_hash: externalRefHash,
+      },
+      earning: {
+        last_payout_external_ref_hash: externalRefHash,
+      },
+      result: {
+        external_ref_hash: externalRefHash,
+      },
     };
   }
 
@@ -3615,6 +3679,10 @@ class MayhemContract extends Contract {
 
   isSafeKeyPart(value) {
     return typeof value === 'string' && /^[a-zA-Z0-9._:-]{1,128}$/.test(value);
+  }
+
+  isSafeExternalRef(value) {
+    return typeof value === 'string' && /^[a-zA-Z0-9._:-]{1,256}$/.test(value);
   }
 
   isHexBytes(value, bytes) {

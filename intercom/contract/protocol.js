@@ -257,7 +257,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
     console.log('- /tx --command \'{ "op": "consent", "ver": 1, "hash": "<hash>", "sig": "<sig>" }\' --sim 1 | records consent.');
     console.log('- /tx --command \'{ "op": "register_provider" }\' --sim 1 | provider opts into serving admin-created enclaves.');
-    console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk" }\' --sim 1 | admin sets a provider payout target.');
+    console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|coinbase" }\' --sim 1 | admin sets a provider payout target.');
     console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
     console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | admin registers an enclave catalog entry.');
     console.log('- /tx --command \'{ "op": "join_enclave", "enclave_id": "<id>" }\' --sim 1 | provider opts into serving an existing enclave.');
@@ -281,6 +281,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "deposit_tnk", "memo_hash": "<hash>" }\' --sim 1 | user creates a memo-bound TNK deposit intent.');
     console.log('- /tx --command \'{ "op": "tnk_deposit", "memo_hash": "<hash>", "tnk_e18": "1000000000000000000", "msb_tx_hash": "<hash>", "epoch": 1, "at": 3600 }\' --sim 1 | admin/oracle credits a memo-bound TNK deposit using a fresh rate.');
     console.log('- /tx --command \'{ "op": "payout_confirm", "epoch": 7, "who": "<pk>", "mu": 1000000, "tnk_e18": "500000000000000000", "msb_tx_hash": "<hash>", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated TNK provider payout.');
+    console.log('- /tx --command \'{ "op": "payout_confirm", "rail": "stripe", "epoch": 7, "who": "<pk>", "mu": 1000000, "external_ref": "tr_...", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated Stripe Connect provider payout.');
+    console.log('- /tx --command \'{ "op": "payout_confirm", "rail": "coinbase", "epoch": 7, "who": "<pk>", "mu": 1000000, "external_ref": "transfer_...", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated Coinbase provider payout.');
     console.log('- /tx --command \'{ "op": "payout_confirm", "kind": "fee_sweep", "epoch": 7, "who": "treasury", "mu": 1000000, "tnk_e18": "500000000000000000", "msb_tx_hash": "<hash>", "at": 25200 }\' --sim 1 | admin/oracle confirms a router fee sweep.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');

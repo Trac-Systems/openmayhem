@@ -101,6 +101,17 @@ const payoutConfirm = (provider, overrides = {}) => ({
   ...overrides,
 });
 
+const fiatPayoutConfirm = (provider, rail, externalRef, overrides = {}) => ({
+  op: 'payout_confirm',
+  epoch: 169,
+  who: provider,
+  rail,
+  mu: 1_000_000,
+  external_ref: externalRef,
+  at: 1_900,
+  ...overrides,
+});
+
 test('MayhemContract payoutConfirm releases earnings only after challenge plus holdback lock', async () => {
   const { admin, provider, user, storage, contract } = await setupPayoutContract();
 
@@ -160,6 +171,7 @@ test('MayhemContract payoutConfirm releases earnings only after challenge plus h
     updated_epoch: 1,
     updated_at: makeTxKey(8),
     last_holdback_release_epoch: 169,
+    last_payout_rail: 'tnk',
     last_payout_rate_ts: 1_000,
     last_payout_msb_tx_hash: 'a'.repeat(64),
   });
@@ -169,6 +181,143 @@ test('MayhemContract payoutConfirm releases earnings only after challenge plus h
   assert.equal(payRoot.count, 1);
   assert.equal(payRoot.mu_total, 1_000_000);
   assert.equal(payRoot.merkle_root, paid.payout_root);
+});
+
+test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async () => {
+  for (const [rail, target, externalRef] of [
+    ['stripe', 'acct_test_provider', 'tr_test_provider_payout'],
+    ['coinbase', 'paymentMethod_test_provider', 'transfer_test_provider_payout'],
+  ]) {
+    const { admin, provider, user, storage, contract } = await setupPayoutContract();
+    const retargeted = await execute(
+      contract,
+      storage,
+      'setProviderPayout',
+      {
+        op: 'set_provider_payout',
+        provider: provider.publicKey,
+        payout_addr: target,
+        payout_method: rail,
+      },
+      admin.publicKey,
+      6
+    );
+    assert.equal(retargeted.ok, true, retargeted.message);
+
+    const settled = await execute(
+      contract,
+      storage,
+      'epochApply',
+      epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
+      admin.publicKey,
+      7
+    );
+    assert.equal(settled.ok, true, settled.message);
+
+    const wrongRail = await execute(
+      contract,
+      storage,
+      'payoutConfirm',
+      fiatPayoutConfirm(
+        provider.publicKey,
+        rail === 'stripe' ? 'coinbase' : 'stripe',
+        'wrong_rail_transfer'
+      ),
+      admin.publicKey,
+      8
+    );
+    assert.match(wrongRail.message, /payout target for rail/i);
+
+    const confirmed = await execute(
+      contract,
+      storage,
+      'payoutConfirm',
+      fiatPayoutConfirm(provider.publicKey, rail, externalRef),
+      admin.publicKey,
+      9
+    );
+    assert.equal(confirmed.ok, true, confirmed.message);
+    assert.equal(confirmed.op, 'payoutConfirm');
+    assert.equal(confirmed.kind, 'provider');
+    assert.equal(confirmed.rail, rail);
+    assert.equal(confirmed.who, provider.publicKey);
+    assert.equal(confirmed.mu, 1_000_000);
+    assert.equal(confirmed.epoch, 169);
+    assert.equal(confirmed.payout_root.length, 64);
+    assert.equal(confirmed.external_ref_hash.length, 64);
+
+    const earning = (await storage.get(`earn/${provider.publicKey}`)).value;
+    assert.equal(earning.paid_cum_mu, 1_000_000);
+    assert.equal(earning.held_mu, 0);
+    assert.equal(earning.last_payout_rail, rail);
+    assert.equal(earning.last_payout_external_ref_hash, confirmed.external_ref_hash);
+    assert.equal(earning.last_payout_rate_ts, undefined);
+    assert.equal(earning.last_payout_msb_tx_hash, undefined);
+
+    const payRoot = (await storage.get('ev/pay/169')).value;
+    assert.equal(payRoot.type, 'payout_root');
+    assert.equal(payRoot.count, 1);
+    assert.equal(payRoot.mu_total, 1_000_000);
+    assert.equal(payRoot.merkle_root, confirmed.payout_root);
+  }
+});
+
+test('MayhemContract payoutConfirm clears previous rail metadata on rail switch', async () => {
+  const { admin, provider, user, storage, contract } = await setupPayoutContract();
+  const settled = await execute(
+    contract,
+    storage,
+    'epochApply',
+    epochApply(1, user.publicKey, provider.publicKey, 3_000_000),
+    admin.publicKey,
+    6
+  );
+  assert.equal(settled.ok, true, settled.message);
+
+  const tnk = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey),
+    admin.publicKey,
+    7
+  );
+  assert.equal(tnk.ok, true, tnk.message);
+  let earning = (await storage.get(`earn/${provider.publicKey}`)).value;
+  assert.equal(earning.last_payout_rail, 'tnk');
+  assert.equal(earning.last_payout_msb_tx_hash, 'a'.repeat(64));
+  assert.equal(earning.last_payout_external_ref_hash, undefined);
+
+  const retargeted = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'acct_test_provider',
+      payout_method: 'stripe',
+    },
+    admin.publicKey,
+    8
+  );
+  assert.equal(retargeted.ok, true, retargeted.message);
+
+  const stripe = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    fiatPayoutConfirm(provider.publicKey, 'stripe', 'tr_second_payout'),
+    admin.publicKey,
+    9
+  );
+  assert.equal(stripe.ok, true, stripe.message);
+  earning = (await storage.get(`earn/${provider.publicKey}`)).value;
+  assert.equal(earning.paid_cum_mu, 2_000_000);
+  assert.equal(earning.last_payout_rail, 'stripe');
+  assert.equal(earning.last_payout_external_ref_hash, stripe.external_ref_hash);
+  assert.equal(earning.last_payout_rate_ts, undefined);
+  assert.equal(earning.last_payout_msb_tx_hash, undefined);
 });
 
 test('MayhemContract payoutConfirm sweeps router fees into fee evidence', async () => {

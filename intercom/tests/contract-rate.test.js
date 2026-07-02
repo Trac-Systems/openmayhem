@@ -165,6 +165,21 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
   assert.match(staleDeposit.message, /rate oracle is stale/i);
   assert.equal(await storage.get(`bal/${user.publicKey}`), null);
 
+  const staleTarget = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'trac1stalerateprovider',
+      payout_method: 'tnk',
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(staleTarget.ok, true, staleTarget.message);
+
   const stalePayout = await execute(
     contract,
     storage,
@@ -179,7 +194,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
       at: 1_901,
     },
     admin.publicKey,
-    6
+    7
   );
   assert.match(stalePayout.message, /rate oracle is stale/i);
   assert.equal((await storage.get(`earn/${provider.publicKey}`)).value.paid_cum_mu, 0);
@@ -292,6 +307,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     updated_epoch: 0,
     updated_at: makeTxKey(11),
     last_holdback_release_epoch: 200,
+    last_payout_rail: 'tnk',
     last_payout_rate_ts: 1_000,
     last_payout_msb_tx_hash: '1'.repeat(64),
   });
