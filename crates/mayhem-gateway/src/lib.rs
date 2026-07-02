@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod openai;
+
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};

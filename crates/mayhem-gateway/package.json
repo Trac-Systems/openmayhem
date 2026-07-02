@@ -1,0 +1,11 @@
+{
+  "name": "mayhem-gateway-openai-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:openai-sdk": "node tests/openai-sdk-smoke.mjs"
+  },
+  "devDependencies": {
+    "openai": "^6.45.0"
+  }
+}
