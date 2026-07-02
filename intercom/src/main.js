@@ -56,6 +56,33 @@ const parseCsvList = (raw) => {
     .filter((value) => value.length > 0);
 };
 
+const normalizeNetworkEnv = (raw) => {
+  const value = String(raw || 'mainnet').trim().toLowerCase();
+  if (value === 'mainnet') return 'mainnet';
+  if (value === 'development' || value === 'dev') return 'development';
+  if (value === 'testnet' || value === 'testnet1') return 'testnet1';
+  throw new Error(`Unsupported --network value "${raw}". Expected mainnet, testnet1, or development.`);
+};
+
+const networkEnv = normalizeNetworkEnv(
+  (flags.network && String(flags.network)) ||
+    (flags['network-env'] && String(flags['network-env'])) ||
+    env.MAYHEM_NETWORK ||
+    env.TRAC_NETWORK_ENV ||
+    ''
+);
+
+const msbEnvironment = {
+  mainnet: MSB_ENV.MAINNET,
+  development: MSB_ENV.DEVELOPMENT,
+  testnet1: MSB_ENV.TESTNET1,
+}[networkEnv];
+const peerEnvironment = {
+  mainnet: PEER_ENV.MAINNET,
+  development: PEER_ENV.DEVELOPMENT,
+  testnet1: PEER_ENV.TESTNET1,
+}[networkEnv];
+
 const peerStoreName =
   (flags['peer-store-name'] && String(flags['peer-store-name'])) ||
   env.PEER_STORE_NAME ||
@@ -219,6 +246,20 @@ const msbDhtBootstrap = parseCsvList(
     env.MSB_DHT_BOOTSTRAP ||
     ''
 );
+const msbBootstrapOverride =
+  (flags['msb-bootstrap'] && String(flags['msb-bootstrap'])) ||
+  env.MSB_BOOTSTRAP ||
+  null;
+const msbChannelOverride =
+  (flags['msb-channel'] && String(flags['msb-channel'])) ||
+  env.MSB_CHANNEL ||
+  null;
+
+if (networkEnv === 'testnet1' && (!msbBootstrapOverride || !msbChannelOverride)) {
+  throw new Error(
+    'Testnet1 requires explicit --msb-bootstrap and --msb-channel (or MSB_BOOTSTRAP/MSB_CHANNEL) so beta launches never fall back to mainnet defaults.'
+  );
+}
 
 const readHexFile = (filePath, byteLength) => {
   try {
@@ -252,10 +293,12 @@ if (subnetBootstrap) {
   subnetBootstrap = readHexFile(subnetBootstrapFile, 32);
 }
 
-const msbConfig = createMsbConfig(MSB_ENV.MAINNET, {
+const msbConfig = createMsbConfig(msbEnvironment, {
   storeName: msbStoreName,
   storesDirectory: msbStoresDirectory,
   enableInteractiveMode: false,
+  ...(msbBootstrapOverride ? { bootstrap: String(msbBootstrapOverride).trim().toLowerCase() } : {}),
+  ...(msbChannelOverride ? { channel: String(msbChannelOverride) } : {}),
   ...(msbDhtBootstrap ? { dhtBootstrap: msbDhtBootstrap } : {}),
 });
 
@@ -264,7 +307,7 @@ if (subnetBootstrap && subnetBootstrap === msbBootstrapHex) {
   throw new Error('Subnet bootstrap cannot equal MSB bootstrap.');
 }
 
-const peerConfig = createPeerConfig(PEER_ENV.MAINNET, {
+const peerConfig = createPeerConfig(peerEnvironment, {
   storesDirectory: peerStoresDirectory,
   storeName: peerStoreName,
   bootstrap: subnetBootstrap || null,
@@ -289,7 +332,7 @@ console.log('=============== STARTING MAYHEM PEER ===============');
 const peer = new Peer({
   config: peerConfig,
   msb,
-  wallet: new MayhemWallet(),
+  wallet: new MayhemWallet({ networkPrefix: msbConfig.addressPrefix }),
   protocol: MayhemProtocol,
   contract: MayhemContract,
 });
@@ -313,6 +356,9 @@ const peerWriterKey = peer.writerLocalKey ?? peer.base?.local?.key?.toString('he
 
 console.log('');
 console.log('==================== MAYHEM INTERCOM ====================');
+console.log('Network:', networkEnv);
+console.log('MSB address prefix:', msbConfig.addressPrefix);
+console.log('MSB network id:', msbConfig.networkId);
 console.log('MSB network bootstrap:', msbBootstrapHex);
 console.log('MSB channel:', msbChannel);
 console.log('MSB store:', msbStorePath);
@@ -353,6 +399,9 @@ if (scBridgeEnabled) {
     requireAuth: true,
     info: {
       app: 'mayhem',
+      network: networkEnv,
+      msbAddressPrefix: msbConfig.addressPrefix,
+      msbNetworkId: msbConfig.networkId,
       msbBootstrap: msbBootstrapHex,
       msbChannel,
       msbStore: msbStorePath,

@@ -82,6 +82,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'set_model_ref') {
+      return {
+        type: 'setModelRef',
+        value: json,
+      };
+    }
     if (json?.op === 'register_enclave') {
       return {
         type: 'registerEnclave',
@@ -259,6 +265,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "register_provider" }\' --sim 1 | provider opts into serving admin-created enclaves.');
     console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|coinbase" }\' --sim 1 | admin sets a provider payout target.');
     console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
+    console.log('- /tx --command \'{ "op": "set_model_ref", "model_id": "<catalog-model-id>", "price_ref_mu": { "in_per_1k": 18, "out_per_1k": 55 } }\' --sim 1 | admin seeds catalog reference pricing in mu_usd.');
     console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | admin registers an enclave catalog entry.');
     console.log('- /tx --command \'{ "op": "join_enclave", "enclave_id": "<id>" }\' --sim 1 | provider opts into serving an existing enclave.');
     console.log('- /tx --command \'{ "op": "leave_enclave", "enclave_id": "<id>" }\' --sim 1 | provider stops serving an enclave.');

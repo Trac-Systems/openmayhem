@@ -213,6 +213,17 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('setModelRef', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        model_id: { type: 'string', min: 1, max: 256 },
+        price_ref_mu: { type: 'any' },
+        source_hash: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
     this.addSchema('registerEnclave', {
       value: {
         $$strict: true,
@@ -774,6 +785,33 @@ class MayhemContract extends Contract {
     await this.put(key, updated);
     console.log('mayhem banProvider', updated);
     return { ok: true, op: 'banProvider', provider: this.value.provider };
+  }
+
+  async setModelRef() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const validationError = this.validateModelRef(this.value);
+    if (validationError) return validationError;
+
+    const key = `modelref/${this.value.model_id}`;
+    const current = await this.get(key);
+    const record = {
+      model_id: this.value.model_id,
+      denom: PRICE_DENOMINATION,
+      price_ref_mu: {
+        in_per_1k: this.value.price_ref_mu.in_per_1k,
+        out_per_1k: this.value.price_ref_mu.out_per_1k,
+      },
+      ver: (current?.ver ?? 0) + 1,
+      source_hash: this.value.source_hash ?? null,
+      updated_at: this.tx,
+      set_by: this.address,
+      set_by_role: 'admin',
+    };
+    await this.put(key, record);
+    console.log('mayhem setModelRef', record);
+    return { ok: true, op: 'setModelRef', model_id: record.model_id, ver: record.ver };
   }
 
   async registerEnclave() {
@@ -2516,6 +2554,24 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  validateModelRef(value) {
+    if (!this.isSafeModelId(value.model_id)) return new Error('Invalid model id.');
+    const ref = value.price_ref_mu;
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref)) {
+      return new Error('Model reference price must be an object.');
+    }
+    if (!Number.isInteger(ref.in_per_1k) || ref.in_per_1k <= 0) {
+      return new Error('Model reference input price must be positive.');
+    }
+    if (!Number.isInteger(ref.out_per_1k) || ref.out_per_1k <= 0) {
+      return new Error('Model reference output price must be positive.');
+    }
+    if (value.source_hash !== undefined && !this.isSafeKeyPart(value.source_hash)) {
+      return new Error('Invalid model reference source hash.');
+    }
+    return null;
+  }
+
   async priceSchedule(key, enclave) {
     const existing = await this.get(key);
     if (existing) return existing;
@@ -3679,6 +3735,14 @@ class MayhemContract extends Contract {
 
   isSafeKeyPart(value) {
     return typeof value === 'string' && /^[a-zA-Z0-9._:-]{1,128}$/.test(value);
+  }
+
+  isSafeModelId(value) {
+    return typeof value === 'string' &&
+      /^[a-zA-Z0-9._:@/+~-]{1,256}$/.test(value) &&
+      !value.startsWith('/') &&
+      !value.endsWith('/') &&
+      !value.includes('//');
   }
 
   isSafeExternalRef(value) {

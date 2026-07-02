@@ -232,6 +232,84 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
   assert.equal(afterSecond.price.ver, 2);
 });
 
+test('MayhemContract setModelRef is admin-only and forward-facing', async () => {
+  const provider = await makeIdentity();
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const modelRef = {
+    op: 'set_model_ref',
+    model_id: modelId,
+    price_ref_mu: {
+      in_per_1k: 20,
+      out_per_1k: 60,
+    },
+    source_hash: 'd'.repeat(64),
+  };
+
+  const providerAttempt = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    modelRef,
+    provider.publicKey,
+    1
+  );
+  assert.match(providerAttempt.message, /admin required/i);
+  assert.equal(await storage.get(`modelref/${modelId}`), null);
+
+  const seeded = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    modelRef,
+    admin.publicKey,
+    2
+  );
+  assert.deepEqual(seeded, {
+    ok: true,
+    op: 'setModelRef',
+    model_id: modelId,
+    ver: 1,
+  });
+
+  const updated = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      ...modelRef,
+      price_ref_mu: {
+        in_per_1k: 21,
+        out_per_1k: 63,
+      },
+    },
+    admin.publicKey,
+    3
+  );
+  assert.deepEqual(updated, {
+    ok: true,
+    op: 'setModelRef',
+    model_id: modelId,
+    ver: 2,
+  });
+
+  assert.deepEqual((await storage.get(`modelref/${modelId}`)).value, {
+    model_id: modelId,
+    denom: 'mu_usd',
+    price_ref_mu: {
+      in_per_1k: 21,
+      out_per_1k: 63,
+    },
+    ver: 2,
+    source_hash: 'd'.repeat(64),
+    updated_at: makeTxKey(3),
+    set_by: admin.publicKey,
+    set_by_role: 'admin',
+  });
+});
+
 test('MayhemContract contract admin can edit enclave pricing forward-facing', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
 

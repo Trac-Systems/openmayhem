@@ -2,6 +2,7 @@ import { Config } from "./config.js";
 
 export const ENV = {
   MAINNET: "mainnet",
+  TESTNET1: "testnet1",
   DEVELOPMENT: "development",
 };
 // TODO: CREATE TEST ENV CONFIG SIMILAR TO MAINNET AND USE IT IN TESTS.
@@ -55,9 +56,36 @@ const configData = {
         apiTxExposed: false,
         apiMsgExposed: false,
         bootstrap: null,
+    },
+    [ENV.TESTNET1]: {
+        channel: "0000trac0network0peer0testnet1",
+        storesDirectory: "stores/",
+        storeName: "testnet1",
+        txPoolMaxSize: 1_000,
+        maxTxDelay: 60,
+        maxMsbSignedLength: 1_000_000_000,
+        maxMsbApplyOperationBytes: 1024 * 1024,
+        enableInteractiveMode: true,
+        enableBackgroundTasks: true,
+        enableUpdater: true,
+        replicate: true,
+        dhtBootstrap: [
+            "116.202.214.149:10001",
+            "157.180.12.214:10001",
+            "node1.hyperdht.org:49737",
+            "node2.hyperdht.org:49737",
+            "node3.hyperdht.org:49737",
+        ],
+        enableTxlogs: false,
+        apiTxExposed: false,
+        apiMsgExposed: false,
+        bootstrap: null,
     }
 };
 
 export const createConfig = (environment, options = {}) => {
+  if (!configData[environment]) {
+    throw new Error(`Unknown peer environment: ${environment}`);
+  }
   return new Config(options, configData[environment]);
 };

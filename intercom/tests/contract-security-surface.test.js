@@ -126,6 +126,17 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
       },
     ],
     [
+      'setModelRef',
+      {
+        op: 'set_model_ref',
+        model_id: 'provider/arbitrary-model@q4',
+        price_ref_mu: {
+          in_per_1k: 1,
+          out_per_1k: 1,
+        },
+      },
+    ],
+    [
       'registerEnclave',
       {
         ...enclaveRegistration,
@@ -316,6 +327,7 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
   assert.equal((await storage.get(`enclave/${enclaveId}`)).value.created_by, admin.publicKey);
   assert.equal((await storage.get(`room/${roomId}`)).value.creator, admin.publicKey);
   assert.equal(await storage.get('rules/2'), null);
+  assert.equal(await storage.get('modelref/provider/arbitrary-model@q4'), null);
   assert.equal(await storage.get(`enclave/${'8'.repeat(64)}`), null);
   assert.equal(await storage.get(`price/${enclaveId}`), null);
   assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.joined_at, makeTxKey(txNo));

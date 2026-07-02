@@ -1,6 +1,8 @@
 import { TRAC_NETWORK_MSB_MAINNET_PREFIX } from 'trac-wallet/constants.js';
 import { Config } from './config.js';
 
+const TRAC_NETWORK_MSB_TESTNET1_PREFIX = 'testtrac';
+
 export const ENV = {
     MAINNET: 'mainnet',
     DEVELOPMENT: 'development',
@@ -55,9 +57,35 @@ const configData = {
         messageValidatorResponseTimeout: 3 * 3 * 1000, //Overall timeout for sending a message (ms). This is 3 * maxRetries * messageValidatorRetryDelay;
         networkId: 918,
         storesDirectory : 'stores/',
+    },
+    [ENV.TESTNET1]: {
+        addressLength: 67,
+        addressPrefix: TRAC_NETWORK_MSB_TESTNET1_PREFIX,
+        addressPrefixLength: TRAC_NETWORK_MSB_TESTNET1_PREFIX.length,
+        bech32mHrpLength: TRAC_NETWORK_MSB_TESTNET1_PREFIX.length + 1, // len(addressPrefix + separator)
+        bootstrap: null,
+        channel: '0000trac0network0msb0testnet100',
+        dhtBootstrap: ['116.202.214.149:10001', '157.180.12.214:10001', 'node1.hyperdht.org:49737', 'node2.hyperdht.org:49737', 'node3.hyperdht.org:49737'],
+        disableRateLimit: false,
+        enableErrorApplyLogs: false,
+        enableInteractiveMode: true,
+        enableRoleRequester: false,
+        enableTxApplyLogs: false,
+        enableValidatorObserver: true,
+        enableWallet: true,
+        maxValidators: 50,
+        maxRetries: 3,
+        messageThreshold: 3,
+        messageValidatorRetryDelay: 1000, //How long to wait before retrying (ms) MESSAGE_VALIDATOR_RETRY_DELAY_MS
+        messageValidatorResponseTimeout: 3 * 3 * 1000, //Overall timeout for sending a message (ms). This is 3 * maxRetries * messageValidatorRetryDelay;
+        networkId: 919,
+        storesDirectory: 'stores/',
     }
 }
 
 export const createConfig = (environment, options) => {
+    if (!configData[environment]) {
+        throw new Error(`Unknown MSB environment: ${environment}`);
+    }
     return new Config(options, configData[environment])
 }

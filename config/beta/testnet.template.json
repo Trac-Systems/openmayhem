@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "launch_id": "mayhem-testnet-beta-v1",
+  "network": {
+    "name": "testnet1",
+    "denom": "mu_usd",
+    "msb": {
+      "address_prefix": "testtrac",
+      "network_id": 919,
+      "bootstrap": "<testnet-msb-bootstrap-64-hex>",
+      "channel": "<testnet-msb-channel>"
+    },
+    "subnet": {
+      "channel": "mayhem-testnet-beta-v1",
+      "bootstrap": "<subnet-bootstrap-64-hex-after-admin-start>"
+    },
+    "dht": {
+      "peer_bootstrap": [
+        "node1.hyperdht.org:49737",
+        "node2.hyperdht.org:49737",
+        "node3.hyperdht.org:49737"
+      ],
+      "msb_bootstrap": [
+        "node1.hyperdht.org:49737",
+        "node2.hyperdht.org:49737",
+        "node3.hyperdht.org:49737"
+      ]
+    }
+  },
+  "controls": {
+    "admin_controls_economy": true,
+    "providers_set_prices": false,
+    "providers_submit_models": false,
+    "providers_create_canonical_rooms": false,
+    "providers_only_join_admin_rooms": true,
+    "browser_handoffs_print_copy_paste_url": true
+  },
+  "admin": {
+    "peer_pubkey": "<admin-peer-public-key-64-hex>",
+    "store_name": "mayhem-beta-admin",
+    "rpc_url": "http://127.0.0.1:49223/v1",
+    "sc_bridge_url": "ws://127.0.0.1:49222",
+    "sc_bridge_token_env": "MAYHEM_BETA_SC_TOKEN"
+  },
+  "paygate": {
+    "public_base_url": "<https://paygate.testnet.example>",
+    "health_path": "/v1/health",
+    "stripe_enabled": true,
+    "coinbase_enabled": true,
+    "checkout_success_url": "<https://paygate.testnet.example/stripe/return>",
+    "checkout_cancel_url": "<https://paygate.testnet.example/stripe/cancel>"
+  },
+  "epoch_wallet": {
+    "address": "<testtrac1-funded-epoch-wallet>",
+    "min_balance_tnk_e18": "1000000000000000000",
+    "funded": false,
+    "pays_for": [
+      "epoch_commit",
+      "sponsored_provider_registration",
+      "payout_fee_sweep"
+    ]
+  },
+  "canary": {
+    "set_id": "canary-launch-v1",
+    "path": "catalog/canaries/canary-launch-v1.json"
+  },
+  "canonical_enclaves": [
+    {
+      "enclave_id": "llama-3-1-8b-instruct-gguf-q4km-v1",
+      "model_id": "meta/llama-3.1-8b-instruct@4bit",
+      "backend": "llama.cpp",
+      "artifact_root": "7144a17813133c78ba2831b7926ff04cfef830a3ca86834baed2e8abc70bac02",
+      "manifest_hash": "<sealed-manifest-hash-64-hex>",
+      "binary_hash": "<release-binary-hash-64-hex>",
+      "att_tier": 1,
+      "caps": {
+        "chat": true,
+        "tools": true,
+        "json": true,
+        "ctx": 131072
+      },
+      "model_ref_mu": {
+        "in_per_1k": 18,
+        "out_per_1k": 55
+      },
+      "price_mu": {
+        "denom": "mu_usd",
+        "in_per_1k": 18,
+        "out_per_1k": 55,
+        "per_req": 0,
+        "min_session": 100,
+        "effective_at": 21600
+      },
+      "rooms": [
+        {
+          "label": "launch-us-east",
+          "nonce": "mayhem-testnet-beta-v1-llama-3-1-8b-us-east",
+          "admin_created": true,
+          "policy": {
+            "region_hint": "us-east",
+            "canary_set": "canary-launch-v1"
+          }
+        }
+      ]
+    }
+  ],
+  "seed_providers": [
+    {
+      "provider_pubkey": "<seed-provider-public-key-64-hex>",
+      "payout": {
+        "method": "tnk",
+        "addr": "<testtrac1-admin-approved-payout-target>"
+      },
+      "joins": [
+        {
+          "enclave_id": "llama-3-1-8b-instruct-gguf-q4km-v1",
+          "rooms": [
+            "launch-us-east"
+          ]
+        }
+      ]
+    }
+  ]
+}
