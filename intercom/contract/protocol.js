@@ -20,12 +20,36 @@ class MayhemProtocol extends Protocol {
         value: { op: 'noop' },
       };
     }
+    if (command === 'gated_noop') {
+      return {
+        type: 'gatedNoop',
+        value: { op: 'gated_noop' },
+      };
+    }
 
     const json = this.safeJsonParse(command);
     if (json?.op === 'noop') {
       return {
         type: 'noop',
         value: { op: 'noop' },
+      };
+    }
+    if (json?.op === 'gated_noop') {
+      return {
+        type: 'gatedNoop',
+        value: { op: 'gated_noop' },
+      };
+    }
+    if (json?.op === 'set_rules') {
+      return {
+        type: 'setRules',
+        value: json,
+      };
+    }
+    if (json?.op === 'consent') {
+      return {
+        type: 'consent',
+        value: json,
       };
     }
     if (json?.op === 'read_key') {
@@ -41,6 +65,9 @@ class MayhemProtocol extends Protocol {
     console.log(' ');
     console.log('- Mayhem Commands:');
     console.log('- /tx --command "noop" --sim 1 | round-trips the Mayhem no-op contract command.');
+    console.log('- /tx --command "gated_noop" --sim 1 | validates current-rules consent before no-op.');
+    console.log('- /tx --command \'{ "op": "set_rules", "ver": 1, "hash": "<hash>" }\' --sim 1 | sets the active rules version.');
+    console.log('- /tx --command \'{ "op": "consent", "ver": 1, "hash": "<hash>", "sig": "<sig>" }\' --sim 1 | records consent.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');

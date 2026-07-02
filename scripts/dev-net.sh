@@ -65,6 +65,8 @@ mkdir -p "$log_dir"
 
 token="mayhem-devnet-token-$(date +%s)-$$"
 subnet_channel="mayhem-devnet-local"
+startup_timeout_sec="${MAYHEM_DEVNET_STARTUP_TIMEOUT:-120}"
+connection_timeout_sec="${MAYHEM_DEVNET_CONNECTION_TIMEOUT:-120}"
 
 pids=()
 cleanup_processes() {
@@ -245,9 +247,9 @@ joiner_b_log="$log_dir/joiner-b.log"
 
 echo "Starting admin peer..."
 start_peer "admin" "mayhem-devnet-admin" "mayhem-devnet-admin-msb" "$admin_port" >/dev/null
-admin_bootstrap="$(wait_log_value "$admin_log" "Peer subnet bootstrap:" 60)"
-admin_pubkey="$(wait_log_value "$admin_log" "Peer pubkey (hex):" 60)"
-wait_log_contains "$admin_log" "Sidechannel: ready" 60
+admin_bootstrap="$(wait_log_value "$admin_log" "Peer subnet bootstrap:" "$startup_timeout_sec")"
+admin_pubkey="$(wait_log_value "$admin_log" "Peer pubkey (hex):" "$startup_timeout_sec")"
+wait_log_contains "$admin_log" "Sidechannel: ready" "$startup_timeout_sec"
 
 echo "Configuring admin and auto-add writers..."
 bridge_request "$admin_port" "{\"type\":\"cli\",\"command\":\"/add_admin --address \\\"$admin_pubkey\\\"\"}" >/dev/null
@@ -256,13 +258,13 @@ bridge_request "$admin_port" '{"type":"cli","command":"/set_auto_add_writers --e
 echo "Starting joiner peers..."
 start_peer "joiner-a" "mayhem-devnet-joiner-a" "mayhem-devnet-joiner-a-msb" "$joiner_a_port" "$admin_bootstrap" >/dev/null
 start_peer "joiner-b" "mayhem-devnet-joiner-b" "mayhem-devnet-joiner-b-msb" "$joiner_b_port" "$admin_bootstrap" >/dev/null
-wait_log_contains "$joiner_a_log" "Sidechannel: ready" 60
-wait_log_contains "$joiner_b_log" "Sidechannel: ready" 60
+wait_log_contains "$joiner_a_log" "Sidechannel: ready" "$startup_timeout_sec"
+wait_log_contains "$joiner_b_log" "Sidechannel: ready" "$startup_timeout_sec"
 
 echo "Waiting for all peers to list both other peers..."
-admin_stats="$(wait_bridge_connections admin "$admin_port" 2 90)"
-joiner_a_stats="$(wait_bridge_connections joiner-a "$joiner_a_port" 2 90)"
-joiner_b_stats="$(wait_bridge_connections joiner-b "$joiner_b_port" 2 90)"
+admin_stats="$(wait_bridge_connections admin "$admin_port" 2 "$connection_timeout_sec")"
+joiner_a_stats="$(wait_bridge_connections joiner-a "$joiner_a_port" 2 "$connection_timeout_sec")"
+joiner_b_stats="$(wait_bridge_connections joiner-b "$joiner_b_port" 2 "$connection_timeout_sec")"
 
 echo "Running simulated Mayhem no-op on admin (--sim 1, no MSB fee)..."
 sim_result="$(bridge_request "$admin_port" '{"type":"cli","command":"/tx --command \"noop\" --sim 1"}')"
