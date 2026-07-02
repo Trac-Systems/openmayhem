@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+pub mod failover;
 pub mod openai;
 pub mod provider_table;
+pub use failover::*;
 pub use provider_table::*;
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
