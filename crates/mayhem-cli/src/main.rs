@@ -7,6 +7,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,10 @@ use mayhem_enclave::{
     Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
     SEALED_STORE_MANIFEST,
 };
-use mayhem_gateway::heartbeat_signing_payload;
+use mayhem_gateway::{
+    heartbeat_signing_payload,
+    openai::{serve as serve_gateway, GatewayState},
+};
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
     VerdictStatus,
@@ -69,6 +73,10 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ProviderCommands>,
     },
+    /// Start the local OpenAI-compatible user gateway.
+    Use(UseArgs),
+    /// List models from the local OpenAI-compatible gateway.
+    Models(ModelsArgs),
     /// Buy Mayhem credits through fiat/crypto rails.
     Pay {
         #[command(subcommand)]
@@ -175,6 +183,44 @@ struct EarningsArgs {
     provider: Option<String>,
 
     /// Print machine-readable earnings.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct UseArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
+    #[arg(long)]
+    bind: Option<String>,
+
+    /// Loopback port for the gateway when --bind is not provided.
+    #[arg(long, default_value_t = 11_435)]
+    port: u16,
+
+    /// Print a machine-readable startup report before serving.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ModelsArgs {
+    /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// HTTP timeout in seconds for gateway calls.
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable model list.
     #[arg(long)]
     json: bool,
 }
@@ -924,6 +970,8 @@ async fn main() -> Result<()> {
         Commands::Provider { command } => match *command {
             ProviderCommands::Start(args) => provider_start(args).await,
         },
+        Commands::Use(args) => use_gateway(args).await,
+        Commands::Models(args) => models(args).await,
         Commands::Pay { command } => match command {
             PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
             PayCommands::Coinbase(args) => pay(PayRail::Coinbase, args).await,
@@ -1367,6 +1415,65 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     Ok(())
 }
 
+async fn use_gateway(args: UseArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
+    let gateway_url = gateway_public_url(bind);
+    let openai_base_url = gateway_v1_url(&gateway_url);
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "bind": bind.to_string(),
+        "gateway_url": gateway_url,
+        "openai_base_url": openai_base_url,
+        "source": "embedded-catalog",
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Mayhem gateway starting.");
+        println!("Bind: {bind}");
+        println!("Copy/paste OpenAI base URL: {openai_base_url}");
+        println!("Use Ctrl-C to stop.");
+    }
+    io::stdout().flush()?;
+
+    let state = GatewayState::from_embedded_catalog();
+    serve_gateway(bind, state)
+        .await
+        .with_context(|| format!("serving Mayhem gateway on {bind}"))?;
+    Ok(())
+}
+
+async fn models(args: ModelsArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let models = fetch_gateway_models(&client, &gateway_root).await?;
+    let summaries = gateway_model_summaries(&models)?;
+    let report = json!({
+        "ok": true,
+        "gateway_url": gateway_root,
+        "models": summaries,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_models_report(&report)?;
+    }
+    Ok(())
+}
+
 async fn mayhem_test(args: TestArgs) -> Result<()> {
     if args.timeout_seconds == 0 {
         bail!("--timeout-seconds must be positive");
@@ -1486,6 +1593,20 @@ struct TestModel {
     tools: bool,
     json: bool,
     context: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelSummary {
+    id: String,
+    providers_online: u64,
+    rooms: u64,
+    denom: String,
+    in_per_1k_mu: u64,
+    out_per_1k_mu: u64,
+    tools: bool,
+    json: bool,
+    context: u64,
+    attestation_tiers: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1943,6 +2064,50 @@ fn gateway_model_view(model: &Value) -> Result<TestModel> {
     })
 }
 
+fn gateway_model_summaries(models: &[Value]) -> Result<Vec<ModelSummary>> {
+    models.iter().map(gateway_model_summary).collect()
+}
+
+fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
+    let id = model
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .context("gateway model missing id")?;
+    let mayhem = model.get("mayhem").unwrap_or(&Value::Null);
+    let price = mayhem.get("price_ref_mu").unwrap_or(&Value::Null);
+    let caps = mayhem.get("caps").unwrap_or(&Value::Null);
+    let attestation_tiers = mayhem
+        .get("attestation_tiers")
+        .and_then(Value::as_object)
+        .map(|tiers| {
+            tiers
+                .iter()
+                .filter_map(|(tier, value)| value.as_u64().map(|count| (tier.clone(), count)))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    Ok(ModelSummary {
+        id: id.to_owned(),
+        providers_online: mayhem
+            .get("providers_online")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        rooms: mayhem.get("rooms").and_then(Value::as_u64).unwrap_or(0),
+        denom: price
+            .get("denom")
+            .and_then(Value::as_str)
+            .unwrap_or("mu_usd")
+            .to_owned(),
+        in_per_1k_mu: price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
+        out_per_1k_mu: price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
+        tools: caps.get("tools").and_then(Value::as_bool).unwrap_or(false),
+        json: caps.get("json").and_then(Value::as_bool).unwrap_or(false),
+        context: caps.get("ctx").and_then(Value::as_u64).unwrap_or(0),
+        attestation_tiers,
+    })
+}
+
 fn model_tool_capable(model: &Value) -> bool {
     model
         .get("mayhem")
@@ -2365,6 +2530,44 @@ fn gateway_v1_url(gateway_root: &str) -> String {
     format!("{root}/v1")
 }
 
+fn gateway_bind_addr(
+    config: Option<&MayhemConfig>,
+    bind: Option<&str>,
+    port: u16,
+) -> Result<SocketAddr> {
+    if let Some(bind) = bind {
+        let bind = bind.trim();
+        if !bind.is_empty() {
+            return bind
+                .parse()
+                .with_context(|| format!("parsing gateway bind address {bind}"));
+        }
+    }
+    let port = config
+        .and_then(|config| config.network.as_ref())
+        .and_then(|network| network.gateway_url.as_deref())
+        .and_then(gateway_port_from_url)
+        .unwrap_or(port);
+    Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+}
+
+fn gateway_port_from_url(value: &str) -> Option<u16> {
+    let root = normalize_gateway_root(value);
+    reqwest::Url::parse(&root).ok()?.port()
+}
+
+fn gateway_public_url(bind: SocketAddr) -> String {
+    match bind {
+        SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
+            format!("http://127.0.0.1:{}", addr.port())
+        }
+        SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
+            format!("http://[::1]:{}", addr.port())
+        }
+        bind => format!("http://{bind}"),
+    }
+}
+
 fn resolve_cli_gateway_url(config: Option<&MayhemConfig>, gateway_url: Option<&str>) -> String {
     if let Some(gateway_url) = gateway_url {
         let gateway_url = gateway_url.trim();
@@ -2438,6 +2641,62 @@ fn print_test_report(report: &Value) {
         "Expected epoch evidence key: {}",
         report["expected_epoch_evidence_key"].as_str().unwrap_or("")
     );
+}
+
+fn print_models_report(report: &Value) -> Result<()> {
+    println!("Gateway: {}", report["gateway_url"].as_str().unwrap_or(""));
+    println!(
+        "{:<52} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}",
+        "MODEL", "PROVIDERS", "ROOMS", "MU/1K IN/OUT", "CTX", "TOOLS", "JSON"
+    );
+    for model in report["models"]
+        .as_array()
+        .context("models report missing models[]")?
+    {
+        let id = model["id"].as_str().unwrap_or("");
+        let providers = model["providers_online"].as_u64().unwrap_or(0);
+        let rooms = model["rooms"].as_u64().unwrap_or(0);
+        let price = format!(
+            "{}/{}",
+            model["in_per_1k_mu"].as_u64().unwrap_or(0),
+            model["out_per_1k_mu"].as_u64().unwrap_or(0)
+        );
+        let context = model["context"].as_u64().unwrap_or(0);
+        let tools = bool_mark(model["tools"].as_bool().unwrap_or(false));
+        let json = bool_mark(model["json"].as_bool().unwrap_or(false));
+        println!(
+            "{:<52} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}",
+            truncate_for_table(id, 52),
+            providers,
+            rooms,
+            price,
+            context,
+            tools,
+            json
+        );
+    }
+    Ok(())
+}
+
+fn bool_mark(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn truncate_for_table(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return ".".repeat(width);
+    }
+    let mut out = value.chars().take(width - 1).collect::<String>();
+    out.push('.');
+    out
 }
 
 async fn payouts(args: PayoutsArgs) -> Result<()> {
@@ -5697,6 +5956,72 @@ mod tests {
             lines[1],
             "Copy/paste checkout URL: https://checkout.stripe.com/c/pay/cs_test"
         );
+    }
+
+    #[test]
+    fn use_gateway_bind_addr_defaults_to_loopback_port() {
+        let bind = gateway_bind_addr(None, None, 31_435).unwrap();
+
+        assert_eq!(bind.to_string(), "127.0.0.1:31435");
+        assert_eq!(gateway_public_url(bind), "http://127.0.0.1:31435");
+        assert_eq!(
+            gateway_v1_url(&gateway_public_url(bind)),
+            "http://127.0.0.1:31435/v1"
+        );
+    }
+
+    #[test]
+    fn use_gateway_bind_addr_honors_config_port_and_explicit_bind() {
+        let config = MayhemConfig {
+            identity: None,
+            network: Some(ConfigNetwork {
+                rpc_url: None,
+                sc_bridge_url: None,
+                sc_bridge_token: None,
+                gateway_url: Some("http://127.0.0.1:4242/v1".to_owned()),
+                paygate_url: None,
+            }),
+            provider: None,
+            role: None,
+        };
+
+        let from_config = gateway_bind_addr(Some(&config), None, 11_435).unwrap();
+        assert_eq!(from_config.to_string(), "127.0.0.1:4242");
+
+        let explicit = gateway_bind_addr(Some(&config), Some("0.0.0.0:5252"), 11_435).unwrap();
+        assert_eq!(explicit.to_string(), "0.0.0.0:5252");
+        assert_eq!(gateway_public_url(explicit), "http://127.0.0.1:5252");
+    }
+
+    #[test]
+    fn model_summaries_extract_gateway_mayhem_fields() {
+        let summaries = gateway_model_summaries(&[json!({
+            "id": "mayhem/test",
+            "mayhem": {
+                "providers_online": 3,
+                "rooms": 2,
+                "price_ref_mu": {
+                    "denom": "mu_usd",
+                    "in_per_1k": 20,
+                    "out_per_1k": 60
+                },
+                "attestation_tiers": { "T1": 2, "T2": 1 },
+                "caps": { "tools": true, "json": false, "ctx": 8192 }
+            }
+        })])
+        .unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "mayhem/test");
+        assert_eq!(summaries[0].providers_online, 3);
+        assert_eq!(summaries[0].rooms, 2);
+        assert_eq!(summaries[0].denom, "mu_usd");
+        assert_eq!(summaries[0].in_per_1k_mu, 20);
+        assert_eq!(summaries[0].out_per_1k_mu, 60);
+        assert!(summaries[0].tools);
+        assert!(!summaries[0].json);
+        assert_eq!(summaries[0].context, 8192);
+        assert_eq!(summaries[0].attestation_tiers["T2"], 1);
     }
 
     #[test]

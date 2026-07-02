@@ -18,6 +18,10 @@ Providers can only opt into admin-created enclave and room records from the cont
 ```bash
 ./install.sh
 mayhem setup --role user
+# terminal 1: leave the gateway running
+mayhem use
+# terminal 2
+mayhem models
 mayhem test --sync-models
 opencode run --model mayhem/<model-id> "Say hello from Mayhem."
 ```
