@@ -1351,15 +1351,17 @@ class MayhemContract extends Contract {
       };
     }
     if (this.value.epoch <= fee.updated_epoch) {
-      return new Error('Epoch apply must be monotonic.');
+      return new Error('Guardian monotonic epoch invariant failed.');
     }
     if (this.value.epoch !== fee.updated_epoch + 1) {
-      return new Error('Epoch apply must be contiguous.');
+      return new Error('Guardian monotonic epoch invariant failed: epoch apply must be contiguous.');
     }
 
     const balances = new Map();
     for (const [user, debitMu] of debitMap) {
       const balance = await this.balanceRecord(user);
+      const balanceError = this.guardianValidateBalanceRecord(balance, user);
+      if (balanceError) return balanceError;
       if (balance.mu < debitMu) return new Error('Insufficient credit balance.');
       balances.set(user, {
         ...balance,
@@ -1389,6 +1391,8 @@ class MayhemContract extends Contract {
     let earnCumTotal = 0;
     for (const [provider, deltaMu] of earningDeltas) {
       const current = await this.earningRecord(provider);
+      const currentError = this.guardianValidateEarningRecord(current, provider);
+      if (currentError) return currentError;
       const totalMu = this.safeAddMu(current.total_mu, deltaMu);
       if (totalMu instanceof Error) return totalMu;
       const heldMu = this.safeAddMu(current.held_mu, deltaMu);
@@ -1406,6 +1410,17 @@ class MayhemContract extends Contract {
 
     const nextFeeCum = this.safeAddMu(fee.cum_mu, feeDeltaMu);
     if (nextFeeCum instanceof Error) return nextFeeCum;
+    const guardian = this.guardianCheckEpochApply({
+      epoch: this.value.epoch,
+      fee,
+      debitTotal,
+      feeDeltaMu,
+      providerDeltaTotal: grossTotal - feeDeltaMu,
+      nextFeeCum,
+      balances,
+      earnings,
+    });
+    if (guardian instanceof Error) return guardian;
 
     if (totals) {
       const totalsError = await this.validateEpochApplyTotals({
@@ -1430,6 +1445,7 @@ class MayhemContract extends Contract {
     const feeRecord = {
       ...fee,
       cum_mu: nextFeeCum,
+      settled_cum_mu: guardian.next_settled_cum_mu,
       updated_epoch: this.value.epoch,
       updated_at: this.tx,
       last_apply_hash: applyHash,
@@ -1665,7 +1681,7 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     if (!this.isSafeKeyPart(this.value.memo_hash)) return new Error('Invalid deposit memo hash.');
 
-    const rate = await this.requireFreshRate(this.value.at);
+    const rate = await this.guardianRequireFreshRate(this.value.at);
     if (rate instanceof Error) return rate;
     const pendingKey = `dep/pending/${this.value.memo_hash}`;
     const pending = await this.get(pendingKey);
@@ -1729,7 +1745,7 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid payout recipient.');
 
-    const rate = await this.requireFreshRate(this.value.at);
+    const rate = await this.guardianRequireFreshRate(this.value.at);
     if (rate instanceof Error) return rate;
     const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
     if (tnkE18 instanceof Error) return tnkE18;
@@ -1740,7 +1756,9 @@ class MayhemContract extends Contract {
     }
 
     const earning = await this.earningRecord(this.value.who);
-    const releasedMu = earning.total_mu - earning.held_mu - earning.paid_cum_mu;
+    const payoutGuardian = this.guardianCheckPayoutConfirm(earning, this.value.mu);
+    if (payoutGuardian instanceof Error) return payoutGuardian;
+    const releasedMu = payoutGuardian.released_mu;
     if (releasedMu < this.value.mu) return new Error('Insufficient released earnings.');
     const paidCumMu = this.safeAddMu(earning.paid_cum_mu, this.value.mu);
     if (paidCumMu instanceof Error) return paidCumMu;
@@ -1940,6 +1958,124 @@ class MayhemContract extends Contract {
       }
     }
     return null;
+  }
+
+  guardianValidateBalanceRecord(record, user = null) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      return new Error('Guardian non-negative balance invariant failed.');
+    }
+    if (record.denom !== PRICE_DENOMINATION) {
+      return new Error('Guardian balance denomination invariant failed.');
+    }
+    if (user !== null && record.user !== user) {
+      return new Error('Guardian balance owner invariant failed.');
+    }
+    if (!Number.isSafeInteger(record.mu) || record.mu < 0) {
+      return new Error('Guardian non-negative balance invariant failed.');
+    }
+    if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
+      return new Error('Guardian balance epoch invariant failed.');
+    }
+    return null;
+  }
+
+  guardianValidateEarningRecord(record, provider = null) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      return new Error('Guardian non-negative earnings invariant failed.');
+    }
+    if (record.denom !== PRICE_DENOMINATION) {
+      return new Error('Guardian earnings denomination invariant failed.');
+    }
+    if (provider !== null && record.provider !== provider) {
+      return new Error('Guardian earnings owner invariant failed.');
+    }
+    for (const key of ['total_mu', 'held_mu', 'paid_cum_mu']) {
+      if (!Number.isSafeInteger(record[key]) || record[key] < 0) {
+        return new Error('Guardian non-negative earnings invariant failed.');
+      }
+    }
+    if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
+      return new Error('Guardian earnings epoch invariant failed.');
+    }
+    if (record.held_mu > record.total_mu || record.paid_cum_mu > record.total_mu - record.held_mu) {
+      return new Error('Guardian earnings conservation invariant failed.');
+    }
+    return null;
+  }
+
+  guardianValidateFeeRecord(record) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      return new Error('Guardian fee conservation invariant failed.');
+    }
+    if (record.denom !== PRICE_DENOMINATION) {
+      return new Error('Guardian fee denomination invariant failed.');
+    }
+    for (const key of ['cum_mu', 'swept_cum_mu']) {
+      if (!Number.isSafeInteger(record[key]) || record[key] < 0) {
+        return new Error('Guardian fee conservation invariant failed.');
+      }
+    }
+    if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
+      return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    if (record.swept_cum_mu > record.cum_mu) {
+      return new Error('Guardian fee conservation invariant failed.');
+    }
+    const settledCumMu = record.settled_cum_mu ?? record.cum_mu;
+    if (!Number.isSafeInteger(settledCumMu) || settledCumMu < 0 || settledCumMu < record.cum_mu) {
+      return new Error('Guardian conservation invariant failed.');
+    }
+    return null;
+  }
+
+  guardianCheckEpochApply({
+    epoch,
+    fee,
+    debitTotal,
+    feeDeltaMu,
+    providerDeltaTotal,
+    nextFeeCum,
+    balances,
+    earnings,
+  }) {
+    const feeError = this.guardianValidateFeeRecord(fee);
+    if (feeError) return feeError;
+    if (epoch <= fee.updated_epoch || epoch !== fee.updated_epoch + 1) {
+      return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    if (providerDeltaTotal + feeDeltaMu !== debitTotal) {
+      return new Error('Guardian conservation invariant failed.');
+    }
+
+    for (const [user, balance] of balances) {
+      const balanceError = this.guardianValidateBalanceRecord(balance, user);
+      if (balanceError) return balanceError;
+    }
+    for (const [provider, earning] of earnings) {
+      const earningError = this.guardianValidateEarningRecord(earning, provider);
+      if (earningError) return earningError;
+    }
+
+    const priorSettledCumMu = fee.settled_cum_mu ?? fee.cum_mu;
+    const nextSettledCumMu = this.safeAddMu(priorSettledCumMu, debitTotal);
+    if (nextSettledCumMu instanceof Error) return nextSettledCumMu;
+    if (nextFeeCum > nextSettledCumMu) {
+      return new Error('Guardian conservation invariant failed.');
+    }
+    return { ok: true, next_settled_cum_mu: nextSettledCumMu };
+  }
+
+  guardianCheckPayoutConfirm(earning, payoutMu) {
+    const earningError = this.guardianValidateEarningRecord(earning, earning.provider);
+    if (earningError) return earningError;
+    if (!Number.isSafeInteger(payoutMu) || payoutMu <= 0) {
+      return new Error('Guardian non-negative payout invariant failed.');
+    }
+    const releasedMu = earning.total_mu - earning.held_mu - earning.paid_cum_mu;
+    if (!Number.isSafeInteger(releasedMu) || releasedMu < 0) {
+      return new Error('Guardian earnings conservation invariant failed.');
+    }
+    return { ok: true, released_mu: releasedMu };
   }
 
   normalizeEpochRoots(value) {
@@ -2358,6 +2494,14 @@ class MayhemContract extends Contract {
     const params = await this.activeParamsAt(at, ['rate_staleness_seconds']);
     if (at - rate.ts > params.rate_staleness_seconds) {
       return new Error('Rate oracle is stale.');
+    }
+    return rate;
+  }
+
+  async guardianRequireFreshRate(at) {
+    const rate = await this.requireFreshRate(at);
+    if (rate instanceof Error) {
+      return new Error(`Guardian rate freshness invariant failed: ${rate.message}`);
     }
     return rate;
   }
