@@ -14,6 +14,8 @@ const DAY_SECONDS = 24 * 60 * 60;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const FULL_SLASH_BPS = 10_000;
 const DISPUTE_LOST_SLASH_BPS = 2_000;
+const DISPUTE_DEPOSIT_MU = 5_000;
+const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
 const SESSION_RECEIPT_SCHEMA_VERSION = 1;
@@ -52,6 +54,8 @@ const REPUTATION_EVENT_KINDS = new Set([
 ]);
 const PROBE_KINDS = new Set(['canary', 'uptime_tick']);
 const FRAUD_PROOF_REASONS = new Set(['over_credit']);
+const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
+const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit']);
 const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee', 'pay'];
 const EPOCH_TOTAL_KEYS = [
   'dep_count',
@@ -440,6 +444,38 @@ class MayhemContract extends Contract {
         receipt: { type: 'any' },
         claimed_mu_owed_cum: { type: 'number', integer: true, min: 0 },
         previous_mu_owed_cum: { type: 'number', integer: true, min: 0, optional: true },
+      },
+    });
+
+    this.addSchema('dispute', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        session_id: { type: 'string', min: 1, max: 128 },
+        reason: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128, optional: true },
+        counterparty: { type: 'string', min: 1, max: 128, optional: true },
+        enclave_id: { type: 'string', min: 1, max: 128, optional: true },
+        epoch: { type: 'number', integer: true, min: 0, optional: true },
+        at: { type: 'number', integer: true, min: 0 },
+        evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
+        evidence: { type: 'any', optional: true },
+      },
+    });
+
+    this.addSchema('disputeResolve', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        dispute_id: { type: 'number', integer: true, min: 1 },
+        outcome: { type: 'string', min: 1, max: 64 },
+        deposit_action: { type: 'string', min: 1, max: 64 },
+        rationale_hash: { type: 'string', min: 1, max: 128 },
+        at: { type: 'number', integer: true, min: 0 },
+        slash: { type: 'boolean', optional: true },
+        beneficiary: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
 
@@ -1686,6 +1722,195 @@ class MayhemContract extends Contract {
     };
   }
 
+  async dispute() {
+    if (!(await this.isAdmin())) {
+      const consentError = await this.requireConsent();
+      if (consentError) return consentError;
+    }
+    const validationError = this.validateDisputeOpen(this.value);
+    if (validationError) return validationError;
+
+    const balance = await this.balanceRecord(this.address);
+    const balanceError = this.guardianValidateBalanceRecord(balance, this.address);
+    if (balanceError) return balanceError;
+    if (balance.mu < DISPUTE_DEPOSIT_MU) return new Error('Insufficient balance for dispute deposit.');
+
+    const nextBalance = {
+      ...balance,
+      mu: balance.mu - DISPUTE_DEPOSIT_MU,
+      updated_epoch: Math.max(balance.updated_epoch, this.value.epoch ?? 0),
+      updated_at: this.tx,
+    };
+    const nextBalanceError = this.guardianValidateBalanceRecord(nextBalance, this.address);
+    if (nextBalanceError) return nextBalanceError;
+
+    const next = await this.get('disp/next');
+    const disputeId = next?.next ?? 1;
+    const record = {
+      type: 'dispute',
+      dispute_id: disputeId,
+      status: 'open',
+      opened_by: this.address,
+      session_id: this.value.session_id,
+      reason: this.value.reason,
+      provider: this.value.provider ?? null,
+      counterparty: this.value.counterparty ?? null,
+      enclave_id: this.value.enclave_id ?? null,
+      epoch: this.value.epoch ?? null,
+      at: this.value.at,
+      evidence_hash: this.value.evidence_hash ?? null,
+      evidence: cloneValue(this.value.evidence ?? null),
+      deposit_mu: DISPUTE_DEPOSIT_MU,
+      deposit_holder: this.address,
+      opened_at: this.tx,
+      updated_at: this.tx,
+    };
+    record.dispute_hash = await this.opaqueHash('mayhem-dispute-v1', record);
+
+    await this.put(`bal/${this.address}`, nextBalance);
+    await this.put(`disp/${disputeId}`, record);
+    await this.put('disp/next', { next: disputeId + 1, updated_at: this.tx });
+    console.log('mayhem dispute', record);
+    return {
+      ok: true,
+      op: 'dispute',
+      dispute_id: disputeId,
+      deposit_mu: DISPUTE_DEPOSIT_MU,
+      dispute_hash: record.dispute_hash,
+    };
+  }
+
+  async disputeResolve() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!DISPUTE_OUTCOMES.has(this.value.outcome)) return new Error('Unsupported dispute outcome.');
+    if (!DISPUTE_DEPOSIT_ACTIONS.has(this.value.deposit_action)) {
+      return new Error('Unsupported dispute deposit action.');
+    }
+
+    const key = `disp/${this.value.dispute_id}`;
+    const dispute = await this.get(key);
+    if (!dispute || dispute.type !== 'dispute') return new Error('Dispute not found.');
+    if (dispute.status !== 'open') return new Error('Dispute is not open.');
+    if (this.value.beneficiary !== undefined && !this.isSafeKeyPart(this.value.beneficiary)) {
+      return new Error('Invalid slash beneficiary.');
+    }
+    if (this.value.outcome === 'provider_fault' && !dispute.provider) {
+      return new Error('Provider fault disputes require a provider.');
+    }
+    if (this.value.outcome === 'provider_fault') {
+      const provider = await this.get(`prov/${dispute.provider}`);
+      if (!provider) return new Error('Provider not found.');
+    }
+    if (this.value.slash === true && !dispute.provider) {
+      return new Error('Dispute slash requires a provider.');
+    }
+    if (this.value.slash === true && this.value.outcome !== 'provider_fault') {
+      return new Error('Only provider_fault disputes may slash a provider.');
+    }
+
+    let depositRefundedMu = 0;
+    let depositForfeitedMu = 0;
+    if (this.value.deposit_action === 'refund') {
+      depositRefundedMu = dispute.deposit_mu;
+      const balance = await this.balanceRecord(dispute.opened_by);
+      const balanceError = this.guardianValidateBalanceRecord(balance, dispute.opened_by);
+      if (balanceError) return balanceError;
+      const nextMu = this.safeAddMu(balance.mu, depositRefundedMu);
+      if (nextMu instanceof Error) return nextMu;
+      await this.put(`bal/${dispute.opened_by}`, {
+        ...balance,
+        mu: nextMu,
+        updated_epoch: Math.max(balance.updated_epoch, dispute.epoch ?? 0),
+        updated_at: this.tx,
+      });
+    } else {
+      depositForfeitedMu = dispute.deposit_mu;
+      const fee = await this.feeCumRecord();
+      const feeError = this.guardianValidateFeeRecord(fee);
+      if (feeError) return feeError;
+      const cumMu = this.safeAddMu(fee.cum_mu, depositForfeitedMu);
+      if (cumMu instanceof Error) return cumMu;
+      const settledCumMu = this.safeAddMu(fee.settled_cum_mu ?? fee.cum_mu, depositForfeitedMu);
+      if (settledCumMu instanceof Error) return settledCumMu;
+      const updatedFee = {
+        ...fee,
+        cum_mu: cumMu,
+        settled_cum_mu: settledCumMu,
+        updated_epoch: Math.max(fee.updated_epoch, dispute.epoch ?? 0),
+        updated_at: this.tx,
+        last_dispute_forfeit_at: this.tx,
+      };
+      const updatedFeeError = this.guardianValidateFeeRecord(updatedFee);
+      if (updatedFeeError) return updatedFeeError;
+      await this.put('fee/cum', updatedFee);
+    }
+
+    let reputationEvent = null;
+    let slash = null;
+    if (this.value.outcome === 'provider_fault' && dispute.provider) {
+      reputationEvent = await this.appendReputationEvent({
+        provider: dispute.provider,
+        event_id: `dispute-${dispute.dispute_id}-lost`,
+        kind: 'dispute_lost',
+        epoch: dispute.epoch ?? 0,
+        at: this.value.at,
+        paid_mu: null,
+        max_spend_mu: null,
+        evidence_hash: this.value.rationale_hash,
+      });
+      if (reputationEvent instanceof Error) return reputationEvent;
+
+      if (this.value.slash === true) {
+        slash = await this.applyProviderSlash({
+          providerId: dispute.provider,
+          source: 'dispute',
+          reason: 'dispute_lost',
+          evidenceHash: this.value.rationale_hash,
+          epoch: dispute.epoch ?? 0,
+          at: this.value.at,
+          slashBps: DISPUTE_LOST_SLASH_BPS,
+          beneficiary: this.value.beneficiary ?? dispute.opened_by,
+          enclaveId: dispute.enclave_id,
+          eventId: reputationEvent.event_id,
+          banProvider: false,
+          tombstoneEnclave: false,
+        });
+        if (slash instanceof Error) return slash;
+      }
+    }
+
+    const resolved = {
+      ...dispute,
+      status: 'resolved',
+      outcome: this.value.outcome,
+      deposit_action: this.value.deposit_action,
+      rationale_hash: this.value.rationale_hash,
+      resolved_by: this.address,
+      resolved_at: this.tx,
+      resolved_at_seconds: this.value.at,
+      deposit_refunded_mu: depositRefundedMu,
+      deposit_forfeited_mu: depositForfeitedMu,
+      reputation_event: reputationEvent,
+      slash,
+      updated_at: this.tx,
+    };
+    resolved.resolution_hash = await this.opaqueHash('mayhem-dispute-resolution-v1', resolved);
+    await this.put(key, resolved);
+    console.log('mayhem disputeResolve', resolved);
+    return {
+      ok: true,
+      op: 'disputeResolve',
+      dispute_id: dispute.dispute_id,
+      outcome: resolved.outcome,
+      deposit_action: resolved.deposit_action,
+      deposit_refunded_mu: depositRefundedMu,
+      deposit_forfeited_mu: depositForfeitedMu,
+      slash,
+      resolution_hash: resolved.resolution_hash,
+    };
+  }
+
   async rateOracle() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
@@ -2110,6 +2335,23 @@ class MayhemContract extends Contract {
     if (value.probe_kind === 'canary') {
       if (!Number.isInteger(value.match_bps)) return new Error('Canary probe requires match_bps.');
       if (!value.canary_set) return new Error('Canary probe requires canary_set.');
+    }
+    return null;
+  }
+
+  validateDisputeOpen(value) {
+    if (!this.isSafeKeyPart(value.session_id)) return new Error('Invalid dispute session id.');
+    if (!this.isSafeKeyPart(value.reason)) return new Error('Invalid dispute reason.');
+    for (const key of ['provider', 'counterparty', 'enclave_id']) {
+      if (value[key] !== undefined && !this.isSafeKeyPart(value[key])) {
+        return new Error(`Invalid dispute ${key}.`);
+      }
+    }
+    if (value.evidence !== undefined) {
+      const bytes = b4a.from(stableJson(value.evidence)).byteLength;
+      if (bytes > DISPUTE_EVIDENCE_MAX_BYTES) {
+        return new Error('Dispute evidence bundle is too large.');
+      }
     }
     return null;
   }
