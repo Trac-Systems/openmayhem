@@ -1303,9 +1303,11 @@ dependencies = [
  "aes-gcm",
  "blake3",
  "clap",
+ "ed25519-dalek",
  "getrandom 0.3.4",
  "hex",
  "hkdf",
+ "mayhem-proto",
  "reqwest",
  "serde",
  "serde_json",
@@ -1329,6 +1331,14 @@ dependencies = [
 [[package]]
 name = "mayhem-gateway"
 version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "mayhem-enclave",
+ "mayhem-proto",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "mayhem-hwprobe"
@@ -1345,6 +1355,11 @@ version = "0.1.0"
 [[package]]
 name = "mayhem-proto"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "mayhemd"

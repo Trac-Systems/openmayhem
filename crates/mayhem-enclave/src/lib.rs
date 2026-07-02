@@ -4,10 +4,17 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
+use mayhem_proto::{
+    attestation_report_head, attestation_signing_bytes, catalog_enclave_id, AttestationBody,
+    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
@@ -15,6 +22,8 @@ use thiserror::Error;
 pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MERKLE_KIND: &str = "blake3_merkle_v1";
 pub const SEALED_STORE_MANIFEST: &str = "sealed-manifest.json";
+pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
+pub const TIER1_ATTESTATION_TIER: u8 = 1;
 
 type Result<T> = std::result::Result<T, EnclaveError>;
 
@@ -51,6 +60,10 @@ pub enum EnclaveError {
     },
     #[error("sealed artifact authentication failed at chunk {chunk_index}")]
     SealedArtifactAuthenticationFailed { chunk_index: u64 },
+    #[error("runtime keypair authentication failed")]
+    RuntimeKeypairAuthenticationFailed,
+    #[error("runtime keypair store already exists: {0}")]
+    RuntimeKeypairStoreAlreadyExists(PathBuf),
     #[error(
         "sealed chunk hash mismatch at chunk {chunk_index}: expected {expected}, got {actual}"
     )]
@@ -61,6 +74,53 @@ pub enum EnclaveError {
     },
     #[error("crypto error: {0}")]
     Crypto(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeKeyContext {
+    pub provider_id: String,
+    pub enclave_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeKeypair {
+    seed: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeKeypairStoreOptions {
+    pub path: PathBuf,
+    pub context: RuntimeKeyContext,
+    pub provider_secret: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeKeypairStore {
+    pub schema_version: u32,
+    pub alg: String,
+    pub cipher: String,
+    pub kdf: String,
+    pub context: RuntimeKeyContext,
+    pub public_key: String,
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Tier1AttestationOptions {
+    pub identity: CatalogEnclaveIdentity,
+    pub runtime_keypair: RuntimeKeypair,
+    pub provider_signing_seed: [u8; 32],
+    pub binary_path: PathBuf,
+    pub boot_epoch: u64,
+    pub report_ts: u64,
+    pub nonce_u: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Tier1AttestationReport {
+    pub report: AttestationReport,
+    pub report_head: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +239,46 @@ impl DownloadRequest {
             destination: destination.into(),
             chunk_size: DEFAULT_CHUNK_SIZE,
             expected_merkle_root: None,
+        }
+    }
+}
+
+impl RuntimeKeypair {
+    pub fn generate() -> Result<Self> {
+        Ok(Self {
+            seed: random_bytes::<32>()?,
+        })
+    }
+
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self { seed }
+    }
+
+    pub fn from_seed_hex(seed_hex: &str) -> Result<Self> {
+        Ok(Self {
+            seed: decode_fixed::<32>(seed_hex)?,
+        })
+    }
+
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.signing_key().verifying_key().to_bytes())
+    }
+
+    fn signing_key(&self) -> SigningKey {
+        SigningKey::from_bytes(&self.seed)
+    }
+}
+
+impl RuntimeKeypairStoreOptions {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        context: RuntimeKeyContext,
+        provider_secret: Vec<u8>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            context,
+            provider_secret,
         }
     }
 }
@@ -495,6 +595,223 @@ pub fn hex_secret(secret_hex: &str) -> Result<Vec<u8>> {
     Ok(hex::decode(secret_hex.trim())?)
 }
 
+pub fn provider_signing_seed_from_hex(seed_hex: &str) -> Result<[u8; 32]> {
+    decode_fixed::<32>(seed_hex)
+}
+
+pub fn measure_binary(path: &Path) -> Result<String> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub fn measure_current_binary() -> Result<String> {
+    let current = std::env::current_exe()?;
+    measure_binary(&current)
+}
+
+pub fn unix_timestamp_now() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| EnclaveError::InvalidInput(err.to_string()))?
+        .as_secs())
+}
+
+pub fn create_runtime_keypair_store(
+    options: &RuntimeKeypairStoreOptions,
+) -> Result<RuntimeKeypair> {
+    validate_runtime_key_context(&options.context)?;
+    validate_provider_secret(&options.provider_secret)?;
+    if options.path.exists() {
+        return Err(EnclaveError::RuntimeKeypairStoreAlreadyExists(
+            options.path.clone(),
+        ));
+    }
+    if let Some(parent) = options.path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let keypair = RuntimeKeypair::generate()?;
+    write_runtime_keypair_store(options, &keypair)?;
+    Ok(keypair)
+}
+
+pub fn load_or_create_runtime_keypair_store(
+    options: &RuntimeKeypairStoreOptions,
+) -> Result<RuntimeKeypair> {
+    if options.path.exists() {
+        read_runtime_keypair_store(options)
+    } else {
+        create_runtime_keypair_store(options)
+    }
+}
+
+pub fn read_runtime_keypair_store(options: &RuntimeKeypairStoreOptions) -> Result<RuntimeKeypair> {
+    validate_runtime_key_context(&options.context)?;
+    validate_provider_secret(&options.provider_secret)?;
+    let store: RuntimeKeypairStore =
+        serde_json::from_reader(BufReader::new(File::open(&options.path)?))?;
+
+    if store.schema_version != 1 {
+        return Err(EnclaveError::InvalidInput(format!(
+            "runtime keypair store schema_version must be 1, got {}",
+            store.schema_version
+        )));
+    }
+    if store.alg != ATTESTATION_ALG {
+        return Err(EnclaveError::InvalidInput(format!(
+            "runtime keypair alg must be {ATTESTATION_ALG}, got {}",
+            store.alg
+        )));
+    }
+    if store.cipher != "AES-256-GCM" || store.kdf != "HKDF-SHA256" {
+        return Err(EnclaveError::InvalidInput(
+            "runtime keypair store must use AES-256-GCM with HKDF-SHA256".to_owned(),
+        ));
+    }
+    validate_runtime_manifest_context(&options.context, &store.context)?;
+
+    let key = derive_runtime_keypair_store_key(&options.provider_secret, &options.context)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| EnclaveError::Crypto("invalid AES key".into()))?;
+    let nonce = decode_fixed::<12>(&store.nonce)?;
+    let ciphertext = hex::decode(&store.ciphertext)?;
+    let aad = runtime_keypair_aad(&store.context, &store.public_key)?;
+    let seed = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext.as_slice(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| EnclaveError::RuntimeKeypairAuthenticationFailed)?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| EnclaveError::InvalidInput("runtime keypair seed must be 32 bytes".into()))?;
+    let keypair = RuntimeKeypair::from_seed(seed);
+    let actual_public_key = keypair.public_key_hex();
+    if actual_public_key != store.public_key {
+        return Err(EnclaveError::InvalidInput(format!(
+            "runtime keypair public key mismatch: expected {}, got {}",
+            store.public_key, actual_public_key
+        )));
+    }
+    Ok(keypair)
+}
+
+pub fn write_runtime_keypair_store(
+    options: &RuntimeKeypairStoreOptions,
+    keypair: &RuntimeKeypair,
+) -> Result<RuntimeKeypairStore> {
+    validate_runtime_key_context(&options.context)?;
+    validate_provider_secret(&options.provider_secret)?;
+    if let Some(parent) = options.path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let public_key = keypair.public_key_hex();
+    let key = derive_runtime_keypair_store_key(&options.provider_secret, &options.context)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| EnclaveError::Crypto("invalid AES key".into()))?;
+    let nonce = random_nonce()?;
+    let aad = runtime_keypair_aad(&options.context, &public_key)?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &keypair.seed,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| EnclaveError::Crypto("runtime keypair encryption failed".into()))?;
+
+    let store = RuntimeKeypairStore {
+        schema_version: 1,
+        alg: ATTESTATION_ALG.to_owned(),
+        cipher: "AES-256-GCM".to_owned(),
+        kdf: "HKDF-SHA256".to_owned(),
+        context: options.context.clone(),
+        public_key,
+        nonce: hex::encode(nonce),
+        ciphertext: hex::encode(ciphertext),
+    };
+    write_json_pretty(&options.path, &store)?;
+    Ok(store)
+}
+
+pub fn build_tier1_attestation_report(
+    options: &Tier1AttestationOptions,
+) -> Result<Tier1AttestationReport> {
+    validate_identity(&options.identity)?;
+    validate_hex_field("nonce_u", &options.nonce_u, 32)?;
+
+    let binary_hash = measure_binary(&options.binary_path)?;
+    if !options.identity.binary_hash.is_empty() && options.identity.binary_hash != binary_hash {
+        return Err(EnclaveError::InvalidInput(format!(
+            "identity binary_hash {} does not match measured binary hash {}",
+            options.identity.binary_hash, binary_hash
+        )));
+    }
+    let identity = CatalogEnclaveIdentity {
+        binary_hash: binary_hash.clone(),
+        ..options.identity.clone()
+    };
+    let enclave_id = catalog_enclave_id(&identity);
+    let provider_signing_key = SigningKey::from_bytes(&options.provider_signing_seed);
+    let provider_pubkey = hex::encode(provider_signing_key.verifying_key().to_bytes());
+    let body = AttestationBody {
+        schema_version: ATTESTATION_SCHEMA_VERSION,
+        alg: ATTESTATION_ALG.to_owned(),
+        enclave_id,
+        enclave_pubkey: options.runtime_keypair.public_key_hex(),
+        provider_pubkey,
+        manifest_hash: identity.manifest_hash,
+        binary_hash,
+        att_tier: TIER1_ATTESTATION_TIER,
+        hw_quote: None,
+        boot_epoch: options.boot_epoch,
+        report_ts: options.report_ts,
+        nonce_u: options.nonce_u.clone(),
+    };
+
+    let enclave_signing_key = options.runtime_keypair.signing_key();
+    let sig_enclave =
+        sign_attestation_body(&enclave_signing_key, &body, AttestationSigner::Enclave)?;
+    let sig_provider =
+        sign_attestation_body(&provider_signing_key, &body, AttestationSigner::Provider)?;
+    let report = AttestationReport {
+        schema_version: body.schema_version,
+        alg: body.alg,
+        enclave_id: body.enclave_id,
+        enclave_pubkey: body.enclave_pubkey,
+        provider_pubkey: body.provider_pubkey,
+        manifest_hash: body.manifest_hash,
+        binary_hash: body.binary_hash,
+        att_tier: body.att_tier,
+        hw_quote: body.hw_quote,
+        boot_epoch: body.boot_epoch,
+        report_ts: body.report_ts,
+        nonce_u: body.nonce_u,
+        sig_enclave,
+        sig_provider,
+    };
+    let report_head =
+        attestation_report_head(&report).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
+    Ok(Tier1AttestationReport {
+        report,
+        report_head,
+    })
+}
+
 fn append_file_range(
     source: &Path,
     part_path: &Path,
@@ -620,6 +937,45 @@ fn validate_key_context(context: &KeyContext) -> Result<()> {
     Ok(())
 }
 
+fn validate_runtime_key_context(context: &RuntimeKeyContext) -> Result<()> {
+    for (field, value) in [
+        ("provider_id", &context.provider_id),
+        ("enclave_id", &context.enclave_id),
+    ] {
+        if value.trim().is_empty() {
+            return Err(EnclaveError::InvalidInput(format!(
+                "{field} cannot be empty"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_identity(identity: &CatalogEnclaveIdentity) -> Result<()> {
+    for (field, value) in [
+        ("admin_pubkey", &identity.admin_pubkey),
+        ("model_id", &identity.model_id),
+        ("artifact_root", &identity.artifact_root),
+        ("manifest_hash", &identity.manifest_hash),
+    ] {
+        if value.trim().is_empty() {
+            return Err(EnclaveError::InvalidInput(format!(
+                "{field} cannot be empty"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_hex_field(field: &str, value: &str, bytes: usize) -> Result<()> {
+    if value.len() != bytes * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(EnclaveError::InvalidInput(format!(
+            "{field} must be {bytes} bytes of hex"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_manifest_context(expected: &KeyContext, actual: &KeyContext) -> Result<()> {
     compare_context_field("provider_id", &expected.provider_id, &actual.provider_id)?;
     compare_context_field("enclave_id", &expected.enclave_id, &actual.enclave_id)?;
@@ -633,6 +989,15 @@ fn validate_manifest_context(expected: &KeyContext, actual: &KeyContext) -> Resu
         &expected.manifest_hash,
         &actual.manifest_hash,
     )?;
+    Ok(())
+}
+
+fn validate_runtime_manifest_context(
+    expected: &RuntimeKeyContext,
+    actual: &RuntimeKeyContext,
+) -> Result<()> {
+    compare_context_field("provider_id", &expected.provider_id, &actual.provider_id)?;
+    compare_context_field("enclave_id", &expected.enclave_id, &actual.enclave_id)?;
     Ok(())
 }
 
@@ -679,6 +1044,12 @@ fn random_nonce() -> Result<[u8; 12]> {
     Ok(nonce)
 }
 
+fn random_bytes<const N: usize>() -> Result<[u8; N]> {
+    let mut bytes = [0_u8; N];
+    getrandom::fill(&mut bytes).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
+    Ok(bytes)
+}
+
 fn derive_sealing_key(secret: &[u8], context: &KeyContext) -> Result<[u8; 32]> {
     let context_bytes = serde_json::to_vec(context)?;
     let mut salt_hasher = blake3::Hasher::new();
@@ -689,6 +1060,23 @@ fn derive_sealing_key(secret: &[u8], context: &KeyContext) -> Result<[u8; 32]> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt.as_bytes()), secret);
     let mut key = [0_u8; 32];
     hkdf.expand(b"mayhem-enclave-sealed-weights-v1", &mut key)
+        .map_err(|_| EnclaveError::Crypto("HKDF expand failed".to_owned()))?;
+    Ok(key)
+}
+
+fn derive_runtime_keypair_store_key(
+    secret: &[u8],
+    context: &RuntimeKeyContext,
+) -> Result<[u8; 32]> {
+    let context_bytes = serde_json::to_vec(context)?;
+    let mut salt_hasher = blake3::Hasher::new();
+    salt_hasher.update(b"mayhem-runtime-keypair-store-salt-v1");
+    salt_hasher.update(&context_bytes);
+    let salt = salt_hasher.finalize();
+
+    let hkdf = Hkdf::<Sha256>::new(Some(salt.as_bytes()), secret);
+    let mut key = [0_u8; 32];
+    hkdf.expand(b"mayhem-enclave-runtime-keypair-v1", &mut key)
         .map_err(|_| EnclaveError::Crypto("HKDF expand failed".to_owned()))?;
     Ok(key)
 }
@@ -714,6 +1102,31 @@ fn chunk_aad(context: &KeyContext, merkle_root: &str, chunk: &MerkleChunk) -> Re
         chunk_len: chunk.len,
         chunk_blake3: &chunk.blake3,
     })?)
+}
+
+fn runtime_keypair_aad(context: &RuntimeKeyContext, public_key: &str) -> Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct RuntimeKeypairAad<'a> {
+        schema: &'static str,
+        context: &'a RuntimeKeyContext,
+        public_key: &'a str,
+    }
+
+    Ok(serde_json::to_vec(&RuntimeKeypairAad {
+        schema: "mayhem-runtime-keypair-aad-v1",
+        context,
+        public_key,
+    })?)
+}
+
+fn sign_attestation_body(
+    signing_key: &SigningKey,
+    body: &AttestationBody,
+    signer: AttestationSigner,
+) -> Result<String> {
+    let bytes = attestation_signing_bytes(body, signer)
+        .map_err(|err| EnclaveError::Crypto(err.to_string()))?;
+    Ok(hex::encode(signing_key.sign(&bytes).to_bytes()))
 }
 
 fn merkle_leaf_hash(index: u64, len: u64, data: &[u8]) -> [u8; 32] {
@@ -773,6 +1186,13 @@ mod tests {
 
     fn test_secret() -> Vec<u8> {
         (0_u8..32).collect()
+    }
+
+    fn runtime_context() -> RuntimeKeyContext {
+        RuntimeKeyContext {
+            provider_id: "provider-test".to_owned(),
+            enclave_id: "enclave-test".to_owned(),
+        }
     }
 
     #[test]
@@ -904,6 +1324,71 @@ mod tests {
         assert_eq!(first.root, second.root);
         assert_eq!(first.total_bytes, 0);
         assert!(first.chunks.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_keypair_store_round_trips_and_rejects_wrong_secret() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(RUNTIME_KEYPAIR_STORE);
+        let options = RuntimeKeypairStoreOptions::new(&path, runtime_context(), test_secret());
+        let keypair = RuntimeKeypair::from_seed([9_u8; 32]);
+        let store = write_runtime_keypair_store(&options, &keypair)?;
+
+        let loaded = read_runtime_keypair_store(&options)?;
+        assert_eq!(loaded.public_key_hex(), keypair.public_key_hex());
+        assert_eq!(store.public_key, keypair.public_key_hex());
+
+        let wrong_secret_options =
+            RuntimeKeypairStoreOptions::new(&path, runtime_context(), vec![7_u8; 32]);
+        let err = read_runtime_keypair_store(&wrong_secret_options)
+            .expect_err("wrong secret must not decrypt runtime keypair");
+        assert!(matches!(
+            err,
+            EnclaveError::RuntimeKeypairAuthenticationFailed
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn tier1_report_self_measures_binary_and_rejects_mismatched_identity_hash() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binary = temp.path().join("mayhem-enclave-test-bin");
+        fs::write(&binary, b"test binary bytes")?;
+        let binary_hash = measure_binary(&binary)?;
+        let identity = CatalogEnclaveIdentity {
+            admin_pubkey: "admin".to_owned(),
+            model_id: "model".to_owned(),
+            artifact_root: "artifact".to_owned(),
+            manifest_hash: "manifest".to_owned(),
+            binary_hash: binary_hash.clone(),
+        };
+        let report = build_tier1_attestation_report(&Tier1AttestationOptions {
+            identity: identity.clone(),
+            runtime_keypair: RuntimeKeypair::from_seed([9_u8; 32]),
+            provider_signing_seed: [7_u8; 32],
+            binary_path: binary.clone(),
+            boot_epoch: 100,
+            report_ts: 200,
+            nonce_u: "aa".repeat(32),
+        })?;
+        assert_eq!(report.report.binary_hash, binary_hash);
+        assert_eq!(report.report.manifest_hash, identity.manifest_hash);
+        assert_eq!(report.report.att_tier, TIER1_ATTESTATION_TIER);
+
+        let mut wrong_identity = identity;
+        wrong_identity.binary_hash = "00".repeat(32);
+        let err = build_tier1_attestation_report(&Tier1AttestationOptions {
+            identity: wrong_identity,
+            runtime_keypair: RuntimeKeypair::from_seed([9_u8; 32]),
+            provider_signing_seed: [7_u8; 32],
+            binary_path: binary,
+            boot_epoch: 100,
+            report_ts: 200,
+            nonce_u: "aa".repeat(32),
+        })
+        .expect_err("wrong identity binary hash must fail before signing");
+        assert!(err.to_string().contains("does not match measured"));
         Ok(())
     }
 }
