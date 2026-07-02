@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log*
+.git
+.gitignore
+.github
+.idea
+.vscode
+coverage
+docs
+migration
+dockerfile
+proto
+stores
+tests
+whitelist
+docker-compose.yml

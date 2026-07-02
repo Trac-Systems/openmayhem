@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package apply.operations;
+
+//DO NOT CHANGE THE ORDER AFTER RELEASE - ONLY APPEND NEW ONES
+enum OperationType {
+    UNKNOWN                = 0;
+    ADD_ADMIN              = 1; // complete
+    DISABLE_INITIALIZATION = 2; // complete
+    BALANCE_INITIALIZATION = 3; // complete
+    APPEND_WHITELIST       = 4; // complete
+    ADD_WRITER             = 5; // partial
+    REMOVE_WRITER          = 6; // partial
+    ADMIN_RECOVERY         = 7; // partial
+    ADD_INDEXER            = 8; // complete
+    REMOVE_INDEXER         = 9; // complete
+    BAN_VALIDATOR          = 10; // complete
+    BOOTSTRAP_DEPLOYMENT   = 11; // partial
+    TX                     = 12; // partial
+    TRANSFER               = 13; // partial
+}
+
+// add admin operation, disable_initialization (complete by default)
+message CoreAdminOperation {
+    bytes tx     = 1; // Transaction hash (unique identifier for the transaction)
+    bytes txv    = 2; // Transaction expiration
+    bytes iw     = 3;  // incoming writer key (admin)
+    bytes in     = 4; // Nonce of the invoker (admin)
+    bytes is     = 5; // Signature of the invoker (admin)
+}
+
+// append_whitelist, add_indexer, remove_indexer, ban_writer (complete by default)
+message AdminControlOperation {
+    bytes tx     = 1; // Transaction hash (unique identifier for the transaction)
+    bytes txv    = 2; // Transaction expiration
+    bytes ia     = 3; // selected address to specific operation.
+    bytes in     = 4; // Nonce of the invoker (admin)
+    bytes is     = 5; // Signature of the invoker (admin)
+}
+
+// balance_initialization (complete by default)
+message BalanceInitializationOperation {
+    bytes tx   = 1; // Transaction hash (unique identifier for the transaction)
+    bytes txv  = 2; // Transaction expiration
+    bytes ia   = 3; // selected address to specific operation.
+    bytes am   = 4; // Initial balance to be set for the address
+    bytes in   = 5; // Nonce of the contract invoker (admin)
+    bytes is   = 6; // Signature of the contract invoker (admin)
+}
+// token_transfer (partial - need to be signed by another writer to be complete)
+message TransferOperation {
+    bytes tx      = 1; // Transaction hash (unique identifier for the transaction)
+    bytes txv     = 2; // Transaction expiration
+    bytes to      = 3; // Address of the recipient (any account)
+    bytes am      = 4; // Amount of tokens to transfer
+    bytes in      = 5; // Nonce of the invoker (any account)
+    bytes is      = 6; // Signature of the invoker (any account)
+    bytes va      = 7; // Validator's address (optional)
+    bytes vn      = 8; // Validator's nonce  (optional)
+    bytes vs      = 9; // Validator's signature (optional)
+}
+
+// add_writer, remove_writer, admin_recovery (partial - need to be signed by another writer to be complete)
+message RoleAccessOperation  {
+    bytes tx      = 1;   // Transaction hash (unique identifier for the transaction)
+    bytes txv     = 2;   // Transaction expiration
+    bytes iw      = 3;  // Writing key of the invoker (whitelisted node, admin to be recovered, Trac Network)
+    bytes in      = 4;  // Nonce of the invoker (whitelisted node, admin to be recovered, Trac Network)
+    bytes is      = 5;  // Signature of the invoker (whitelisted node, admin to be recovered)
+    bytes va      = 6; // Validator's address (optional)
+    bytes vn      = 7; // Validator's nonce  (optional)
+    bytes vs      = 8; // Validator's signature (optional)
+}
+
+// transaction - (partial - need to be signed by another writer to be complete)
+message TxOperation {
+    bytes tx   = 1;  // Transaction hash (unique identifier for the transaction)
+    bytes txv  = 2;  // Transaction expiration
+    bytes iw   = 3;  // Writing key of the requesting node (external subnetwork)
+    bytes ch   = 4;  // Content hash (hash of the transaction's data)
+    bytes bs   = 5;  // External bootstrap contract
+    bytes mbs  = 6;  // MSB bootstrap key
+    bytes in   = 7;  // Nonce of the requesting node
+    bytes is   = 8;  // Requester's signature
+    bytes va   = 9;  // Validator's address (optional)
+    bytes vn   = 10; // Validator's nonce  (optional)
+    bytes vs   = 11; // Validator's signature (optional)
+}
+
+// bootstrap deployment - (partial - need to be signed by another writer to be complete)
+message BootstrapDeploymentOperation {
+    bytes tx   = 1; // Transaction hash (unique identifier for the transaction)
+    bytes txv  = 2; // Transaction expiration
+    bytes bs   = 3; // Bootstrap contract address
+    bytes ic   = 4; // Channel on which the contract will operate
+    bytes in   = 5; // Nonce of the contract invoker
+    bytes is   = 6; // Signature of the contract invoker
+    bytes va   = 7; // Validator's address (optional)
+    bytes vn   = 8; // Validator's nonce (optional)
+    bytes vs   = 9; // Validator's signature (optional)
+}
+
+// Main structure for the operations where messages are
+message Operation {
+    OperationType type = 1;
+    bytes address      = 2; // address of the invoker
+
+    oneof value {
+        CoreAdminOperation                cao  = 3;
+        AdminControlOperation             aco  = 4;
+        BalanceInitializationOperation    bio  = 5;
+        TransferOperation                 tro  = 6;
+        RoleAccessOperation               rao  = 7;
+        BootstrapDeploymentOperation      bdo  = 8;
+        TxOperation                       txo  = 9;
+    }
+}

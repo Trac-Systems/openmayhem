@@ -1,0 +1,16 @@
+services:
+  msb-rpc:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: msb-rpc
+    restart: always
+    environment:
+      MSB_STORE: ${MSB_STORE:-rpc-node-store}
+      MSB_HOST: ${MSB_HOST:-127.0.0.1}
+      MSB_PORT: ${MSB_PORT:-5000}
+    volumes:
+      - ./stores:/msb/stores
+    ports:
+      - "${MSB_HOST:-127.0.0.1}:${MSB_PUBLISH_PORT:-5000}:${MSB_PORT:-5000}"
+    read_only: true
