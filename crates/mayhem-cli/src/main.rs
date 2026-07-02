@@ -26,7 +26,9 @@ use mayhem_enclave::{
 };
 use mayhem_gateway::{
     heartbeat_signing_payload,
-    openai::{serve as serve_gateway, GatewayState},
+    openai::{
+        serve as serve_gateway, GatewayModel, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
+    },
 };
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
@@ -222,6 +224,10 @@ struct UseArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
     /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
     #[arg(long)]
     bind: Option<String>,
@@ -233,6 +239,10 @@ struct UseArgs {
     /// Print a machine-readable startup report before serving.
     #[arg(long)]
     json: bool,
+
+    /// Development smoke only: use the embedded catalog instead of contract-backed canonical models.
+    #[arg(long)]
+    dev_embedded_catalog: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1452,13 +1462,29 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
+    let (state, source, model_count) = if args.dev_embedded_catalog {
+        let state = GatewayState::from_embedded_catalog();
+        (state, "dev-embedded-catalog".to_owned(), None)
+    } else {
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let contract = read_contract_catalog(&rpc).await?;
+        let models = gateway_models_from_contract(&contract)?;
+        let model_count = models.len();
+        (
+            GatewayState::from_models(models),
+            format!("contract:{rpc_url}"),
+            Some(model_count),
+        )
+    };
     let report = json!({
         "ok": true,
         "home": home,
         "bind": bind.to_string(),
         "gateway_url": gateway_url,
         "openai_base_url": openai_base_url,
-        "source": "embedded-catalog",
+        "source": source,
+        "models": model_count,
     });
 
     if args.json {
@@ -1467,11 +1493,18 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         println!("Mayhem gateway starting.");
         println!("Bind: {bind}");
         println!("Copy/paste OpenAI base URL: {openai_base_url}");
+        if args.dev_embedded_catalog {
+            println!("Model source: development embedded catalog (non-canonical).");
+        } else {
+            println!(
+                "Model source: canonical contract state ({} models).",
+                model_count.unwrap_or(0)
+            );
+        }
         println!("Use Ctrl-C to stop.");
     }
     io::stdout().flush()?;
 
-    let state = GatewayState::from_embedded_catalog();
     serve_gateway(bind, state)
         .await
         .with_context(|| format!("serving Mayhem gateway on {bind}"))?;
@@ -4005,6 +4038,21 @@ struct LedgerRoom {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerRoomServe {
+    room_id: String,
+    provider: String,
+    enclave_id: String,
+    model_id: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerProvider {
+    provider: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LedgerPriceSchedule {
     enclave_id: String,
     model_id: String,
@@ -4039,6 +4087,8 @@ struct PrefixStateEntry {
 struct ContractCatalog {
     enclaves: Vec<LedgerEnclave>,
     rooms: Vec<LedgerRoom>,
+    roomserve: Vec<LedgerRoomServe>,
+    providers: Vec<LedgerProvider>,
     prices: Vec<LedgerPriceSchedule>,
 }
 
@@ -4516,6 +4566,8 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
     Ok(ContractCatalog {
         enclaves: read_prefix_values(rpc, "enclave/").await?,
         rooms: read_prefix_values(rpc, "room/").await?,
+        roomserve: read_prefix_values(rpc, "roomserve/").await?,
+        providers: read_prefix_values(rpc, "prov/").await?,
         prices,
     })
 }
@@ -4543,6 +4595,188 @@ async fn read_prefix_entries(rpc: &PeerRpcClient, prefix: &str) -> Result<Vec<Pr
         .into_iter()
         .filter(|entry| entry.key.starts_with(prefix))
         .collect())
+}
+
+fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<GatewayModel>> {
+    let active_enclaves = contract
+        .enclaves
+        .iter()
+        .filter(|enclave| enclave.status == "active")
+        .map(|enclave| (enclave.enclave_id.clone(), enclave))
+        .collect::<BTreeMap<_, _>>();
+    let open_rooms = contract
+        .rooms
+        .iter()
+        .filter(|room| room.status == "open")
+        .collect::<Vec<_>>();
+    let active_providers = contract
+        .providers
+        .iter()
+        .filter(|provider| provider.status == "active")
+        .map(|provider| provider.provider.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut room_ids = BTreeSet::new();
+    let mut rooms_by_model: BTreeMap<String, u32> = BTreeMap::new();
+    for room in &open_rooms {
+        room_ids.insert(room.room_id.clone());
+        let count = rooms_by_model.entry(room.model_id.clone()).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    let mut prices_by_enclave = BTreeMap::new();
+    for schedule in &contract.prices {
+        let Some(price) = schedule.current.as_ref() else {
+            continue;
+        };
+        if schedule.denom != "mu_usd" || price.denom != "mu_usd" {
+            bail!(
+                "price schedule for enclave {} uses unsupported denomination",
+                schedule.enclave_id
+            );
+        }
+        prices_by_enclave.insert(schedule.enclave_id.clone(), price.clone());
+    }
+
+    let mut price_by_model: BTreeMap<String, LedgerPriceRecord> = BTreeMap::new();
+    let mut caps_by_model: BTreeMap<String, ModelCaps> = BTreeMap::new();
+    for enclave in active_enclaves.values() {
+        if rooms_by_model.get(&enclave.model_id).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let Some(price) = prices_by_enclave.get(&enclave.enclave_id) else {
+            continue;
+        };
+        price_by_model
+            .entry(enclave.model_id.clone())
+            .and_modify(|existing| {
+                if price_sort_key(price) < price_sort_key(existing) {
+                    *existing = price.clone();
+                }
+            })
+            .or_insert_with(|| price.clone());
+        caps_by_model
+            .entry(enclave.model_id.clone())
+            .and_modify(|caps| merge_model_caps(caps, &gateway_caps_from_contract(&enclave.caps)))
+            .or_insert_with(|| gateway_caps_from_contract(&enclave.caps));
+    }
+
+    let mut providers_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut tiers_by_model: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    for serving in contract
+        .roomserve
+        .iter()
+        .filter(|serving| serving.status == "active")
+    {
+        if !active_providers.contains(serving.provider.as_str()) {
+            continue;
+        }
+        if !room_ids.contains(&serving.room_id) {
+            continue;
+        }
+        let Some(enclave) = active_enclaves.get(&serving.enclave_id) else {
+            continue;
+        };
+        if enclave.model_id != serving.model_id || !price_by_model.contains_key(&enclave.model_id) {
+            continue;
+        }
+        providers_by_model
+            .entry(enclave.model_id.clone())
+            .or_default()
+            .insert(serving.provider.clone());
+        let tier = format!("T{}", enclave.att_tier);
+        tiers_by_model
+            .entry(enclave.model_id.clone())
+            .or_default()
+            .entry(tier)
+            .or_default()
+            .insert(serving.provider.clone());
+    }
+
+    let mut models = Vec::new();
+    for (model_id, price) in price_by_model {
+        let rooms = rooms_by_model.get(&model_id).copied().unwrap_or(0);
+        let providers_online = providers_by_model
+            .get(&model_id)
+            .map(|providers| usize_to_u32(providers.len()))
+            .unwrap_or(0);
+        if rooms == 0 || providers_online == 0 {
+            continue;
+        }
+        models.push(GatewayModel {
+            id: model_id.clone(),
+            created: 1_782_950_400,
+            owned_by: "mayhem".to_owned(),
+            mayhem: MayhemModelInfo {
+                providers_online,
+                rooms,
+                price_ref_mu: PriceRefMu {
+                    denom: "mu_usd".to_owned(),
+                    ver: price.ver,
+                    in_per_1k: price.in_per_1k_mu,
+                    out_per_1k: price.out_per_1k_mu,
+                },
+                attestation_tiers: tiers_by_model
+                    .remove(&model_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(tier, providers)| (tier, usize_to_u32(providers.len())))
+                    .collect(),
+                caps: caps_by_model
+                    .remove(&model_id)
+                    .unwrap_or_else(empty_gateway_caps),
+                source: "contract".to_owned(),
+            },
+        });
+    }
+    if models.is_empty() {
+        bail!(
+            "no canonical contract-backed models found; ask the admin to register an enclave, set a current mu_usd price, open a room, and confirm an active provider joined it, or use --dev-embedded-catalog for local smoke only"
+        );
+    }
+    Ok(models)
+}
+
+fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64) {
+    (
+        price.in_per_1k_mu.saturating_add(price.out_per_1k_mu),
+        price.in_per_1k_mu,
+        price.out_per_1k_mu,
+        price.ver,
+    )
+}
+
+fn empty_gateway_caps() -> ModelCaps {
+    ModelCaps {
+        tools: false,
+        json: false,
+        ctx: 0,
+        vision: false,
+    }
+}
+
+fn gateway_caps_from_contract(caps: &Value) -> ModelCaps {
+    ModelCaps {
+        tools: caps.get("tools").and_then(Value::as_bool).unwrap_or(false),
+        json: caps.get("json").and_then(Value::as_bool).unwrap_or(false),
+        ctx: caps
+            .get("ctx")
+            .or_else(|| caps.get("ctx_max"))
+            .and_then(Value::as_u64)
+            .and_then(|ctx| u32::try_from(ctx).ok())
+            .unwrap_or(0),
+        vision: caps.get("vision").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+fn merge_model_caps(target: &mut ModelCaps, next: &ModelCaps) {
+    target.tools |= next.tools;
+    target.json |= next.json;
+    target.vision |= next.vision;
+    target.ctx = target.ctx.max(next.ctx);
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn build_provider_candidates(
@@ -5855,6 +6089,44 @@ mod tests {
         assert!(build_provider_candidates(&mismatched, &catalog, &hardware, &args).is_err());
     }
 
+    #[test]
+    fn gateway_models_are_built_from_canonical_contract_state() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        let models = gateway_models_from_contract(&contract).unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "test/model@4bit");
+        assert_eq!(models[0].owned_by, "mayhem");
+        assert_eq!(models[0].mayhem.source, "contract");
+        assert_eq!(models[0].mayhem.providers_online, 1);
+        assert_eq!(models[0].mayhem.rooms, 1);
+        assert_eq!(models[0].mayhem.price_ref_mu.denom, "mu_usd");
+        assert_eq!(models[0].mayhem.price_ref_mu.ver, 1);
+        assert_eq!(models[0].mayhem.price_ref_mu.in_per_1k, 1);
+        assert_eq!(models[0].mayhem.price_ref_mu.out_per_1k, 2);
+        assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
+        assert!(models[0].mayhem.caps.tools);
+        assert_eq!(models[0].mayhem.caps.ctx, 8192);
+
+        contract.prices.clear();
+        let err = gateway_models_from_contract(&contract)
+            .expect_err("missing current contract price should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut contract = test_contract(&root);
+        contract.roomserve.clear();
+        let err = gateway_models_from_contract(&contract)
+            .expect_err("missing active room participation should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut contract = test_contract(&root);
+        contract.providers[0].status = "banned".to_owned();
+        let err =
+            gateway_models_from_contract(&contract).expect_err("banned provider should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+    }
+
     #[tokio::test]
     async fn provider_local_artifact_must_match_admin_root() {
         let temp = env::temp_dir().join(format!(
@@ -6570,7 +6842,32 @@ mod tests {
                     status: "open".to_owned(),
                 },
             ],
-            prices: Vec::new(),
+            roomserve: vec![LedgerRoomServe {
+                room_id: "room-a".to_owned(),
+                provider: "55".repeat(32),
+                enclave_id: "11".repeat(32),
+                model_id: "test/model@4bit".to_owned(),
+                status: "active".to_owned(),
+            }],
+            providers: vec![LedgerProvider {
+                provider: "55".repeat(32),
+                status: "active".to_owned(),
+            }],
+            prices: vec![LedgerPriceSchedule {
+                enclave_id: "11".repeat(32),
+                model_id: "test/model@4bit".to_owned(),
+                denom: "mu_usd".to_owned(),
+                current: Some(LedgerPriceRecord {
+                    ver: 1,
+                    denom: "mu_usd".to_owned(),
+                    in_per_1k_mu: 1,
+                    out_per_1k_mu: 2,
+                    per_req_mu: 0,
+                    min_session_mu: 0,
+                    effective_at: 0,
+                }),
+                pending: None,
+            }],
         }
     }
 

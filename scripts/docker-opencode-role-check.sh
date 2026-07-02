@@ -129,7 +129,10 @@ docker run --rm \
     grep -F "Copy/paste PATH for this shell session:" /tmp/mayhem-install.out >/dev/null
 
     gateway_log=/tmp/mayhem-gateway.log
-    "$install_dir/mayhem-gateway" --bind 127.0.0.1:11435 >"$gateway_log" 2>&1 &
+    "$install_dir/mayhem-gateway" \
+      --dev-embedded-catalog \
+      --bind 127.0.0.1:11435 \
+      >"$gateway_log" 2>&1 &
     gateway_pid=$!
     cleanup_gateway() {
       kill "$gateway_pid" >/dev/null 2>&1 || true

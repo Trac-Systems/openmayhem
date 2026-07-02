@@ -6,34 +6,55 @@ use mayhem_gateway::openai::{serve, GatewayState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bind = parse_bind_addr()?;
+    let args = parse_args()?;
+    if !args.dev_embedded_catalog {
+        eprintln!(
+            "mayhem-gateway is a development smoke binary and does not read the contract ledger."
+        );
+        eprintln!("Use `mayhem use` for canonical contract-backed models.");
+        eprintln!(
+            "For isolated API smoke only, pass: mayhem-gateway --dev-embedded-catalog --bind {}",
+            args.bind
+        );
+        std::process::exit(2);
+    }
     let state = GatewayState::from_embedded_catalog();
-    eprintln!("mayhem-gateway listening on http://{bind}");
-    serve(bind, state).await?;
+    eprintln!(
+        "mayhem-gateway listening on http://{} with development embedded catalog",
+        args.bind
+    );
+    serve(args.bind, state).await?;
     Ok(())
 }
 
-fn parse_bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
+struct GatewayArgs {
+    bind: SocketAddr,
+    dev_embedded_catalog: bool,
+}
+
+fn parse_args() -> Result<GatewayArgs, Box<dyn std::error::Error>> {
+    let mut bind = env::var("MAYHEM_GATEWAY_BIND").unwrap_or_else(|_| "127.0.0.1:11435".to_owned());
+    let mut dev_embedded_catalog = false;
     let mut args = env::args().skip(1);
-    match args.next() {
-        Some(arg) => match arg.as_str() {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--bind" => {
-                let value = args.next().ok_or("--bind requires an address")?;
-                if let Some(extra) = args.next() {
-                    return Err(format!("unexpected extra argument: {extra}").into());
-                }
-                Ok(value.parse()?)
+                bind = args.next().ok_or("--bind requires an address")?;
+            }
+            "--dev-embedded-catalog" => {
+                dev_embedded_catalog = true;
             }
             "--help" | "-h" => {
-                println!("Usage: mayhem-gateway [--bind 127.0.0.1:11435]");
+                println!("Usage: mayhem-gateway --dev-embedded-catalog [--bind 127.0.0.1:11435]");
+                println!();
+                println!("Development-only raw gateway. Use `mayhem use` for canonical contract-backed models.");
                 std::process::exit(0);
             }
-            _ => Err(format!("unknown argument: {arg}").into()),
-        },
-        None => {
-            let bind =
-                env::var("MAYHEM_GATEWAY_BIND").unwrap_or_else(|_| "127.0.0.1:11435".to_owned());
-            Ok(bind.parse()?)
+            _ => return Err(format!("unknown argument: {arg}").into()),
         }
     }
+    Ok(GatewayArgs {
+        bind: bind.parse()?,
+        dev_embedded_catalog,
+    })
 }

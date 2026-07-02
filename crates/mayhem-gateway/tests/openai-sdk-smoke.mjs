@@ -41,11 +41,15 @@ const waitForGateway = async (baseUrl, child) => {
 const startGateway = async () => {
   const port = await freePort();
   const bind = `127.0.0.1:${port}`;
-  const child = spawn('cargo', ['run', '-p', 'mayhem-gateway', '--', '--bind', bind], {
-    cwd: repoRoot,
-    env: { ...process.env, MAYHEM_GATEWAY_BIND: bind },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const child = spawn(
+    'cargo',
+    ['run', '-p', 'mayhem-gateway', '--', '--dev-embedded-catalog', '--bind', bind],
+    {
+      cwd: repoRoot,
+      env: { ...process.env, MAYHEM_GATEWAY_BIND: bind },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
   child.stdout.on('data', () => {});
   child.stderr.on('data', () => {});
   const baseUrl = `http://${bind}`;

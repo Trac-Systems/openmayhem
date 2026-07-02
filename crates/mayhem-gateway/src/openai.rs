@@ -238,6 +238,10 @@ impl GatewayState {
         }])
     }
 
+    pub fn from_models(models: Vec<GatewayModel>) -> Self {
+        Self::with_models(models)
+    }
+
     fn with_models(models: Vec<GatewayModel>) -> Self {
         Self {
             models: Arc::new(models),
