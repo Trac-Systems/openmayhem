@@ -1,0 +1,11 @@
+.DS_Store
+.idea/
+.env
+.env.*
+!.env.example
+node_modules/
+stores/
+**/stores/
+**/keypair.json
+docs/test-resources.local.md
+target/
