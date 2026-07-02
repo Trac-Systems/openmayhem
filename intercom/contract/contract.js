@@ -10,6 +10,7 @@ const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
 const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
 const DAY_SECONDS = 24 * 60 * 60;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
+const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
@@ -61,6 +62,18 @@ export const deriveRoomId = async (modelId, creator, nonce) => {
 
 const cloneValue = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+const stableValue = (value) => {
+  if (Array.isArray(value)) return value.map((item) => stableValue(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, stableValue(value[key])])
+    );
+  }
+  return value;
+};
+const stableJson = (value) => JSON.stringify(stableValue(value));
 
 class MayhemContract extends Contract {
   constructor(protocol, options = {}) {
@@ -340,6 +353,26 @@ class MayhemContract extends Contract {
         pass: { type: 'boolean', optional: true },
         session_receipt_hash: { type: 'string', min: 1, max: 128, optional: true },
         evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
+    this.addSchema('epochApply', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+        debits: {
+          type: 'array',
+          max: LEDGER_BATCH_SCHEMA_MAX,
+          items: { type: 'any' },
+        },
+        earnings: {
+          type: 'array',
+          max: LEDGER_BATCH_SCHEMA_MAX,
+          items: { type: 'any' },
+        },
       },
     });
   }
@@ -1129,6 +1162,139 @@ class MayhemContract extends Contract {
     };
   }
 
+  async epochApply() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const shapeError = this.validateEpochApplyShape(this.value);
+    if (shapeError) return shapeError;
+
+    const params = await this.activeParamsAt(this.value.at, ['fee_bps', 'max_apply_batch']);
+    if (this.value.debits.length + this.value.earnings.length > params.max_apply_batch) {
+      return new Error('Epoch apply batch exceeds max_apply_batch.');
+    }
+
+    const debitMap = this.aggregateLedgerEntries(this.value.debits, 'user', 'mu', 'debit');
+    if (debitMap instanceof Error) return debitMap;
+    const grossEarningMap = this.aggregateLedgerEntries(
+      this.value.earnings,
+      'provider',
+      'gross_mu',
+      'earning'
+    );
+    if (grossEarningMap instanceof Error) return grossEarningMap;
+
+    const debitTotal = this.sumMu(debitMap);
+    if (debitTotal instanceof Error) return debitTotal;
+    const grossTotal = this.sumMu(grossEarningMap);
+    if (grossTotal instanceof Error) return grossTotal;
+    if (debitTotal !== grossTotal) {
+      return new Error('Epoch debits must equal gross provider earnings.');
+    }
+
+    const fee = await this.feeCumRecord();
+    const normalized = {
+      epoch: this.value.epoch,
+      at: this.value.at,
+      fee_bps: params.fee_bps,
+      debits: this.mapEntriesForHash(debitMap, 'user', 'mu'),
+      earnings: this.mapEntriesForHash(grossEarningMap, 'provider', 'gross_mu'),
+    };
+    const applyHash = await this.epochApplyHash(normalized);
+    if (fee.updated_epoch === this.value.epoch && fee.last_apply_hash === applyHash) {
+      return {
+        ok: true,
+        op: 'epochApply',
+        epoch: this.value.epoch,
+        idempotent: true,
+        debited_mu: 0,
+        earned_mu: 0,
+        fee_mu: 0,
+      };
+    }
+    if (this.value.epoch <= fee.updated_epoch) {
+      return new Error('Epoch apply must be monotonic.');
+    }
+    if (this.value.epoch !== fee.updated_epoch + 1) {
+      return new Error('Epoch apply must be contiguous.');
+    }
+
+    const balances = new Map();
+    for (const [user, debitMu] of debitMap) {
+      const balance = await this.balanceRecord(user);
+      if (balance.mu < debitMu) return new Error('Insufficient credit balance.');
+      balances.set(user, {
+        ...balance,
+        mu: balance.mu - debitMu,
+        updated_epoch: this.value.epoch,
+        updated_at: this.tx,
+      });
+    }
+
+    const earningDeltas = new Map();
+    let feeDeltaMu = 0;
+    for (const [provider, grossMu] of grossEarningMap) {
+      const providerRecord = await this.get(`prov/${provider}`);
+      if (!providerRecord) return new Error('Provider not found.');
+
+      const feeMu = Math.floor((grossMu * params.fee_bps) / 10_000);
+      const providerMu = grossMu - feeMu;
+      feeDeltaMu = this.safeAddMu(feeDeltaMu, feeMu);
+      if (feeDeltaMu instanceof Error) return feeDeltaMu;
+      const current = earningDeltas.get(provider) ?? 0;
+      const next = this.safeAddMu(current, providerMu);
+      if (next instanceof Error) return next;
+      earningDeltas.set(provider, next);
+    }
+
+    const earnings = new Map();
+    for (const [provider, deltaMu] of earningDeltas) {
+      const current = await this.earningRecord(provider);
+      const totalMu = this.safeAddMu(current.total_mu, deltaMu);
+      if (totalMu instanceof Error) return totalMu;
+      const heldMu = this.safeAddMu(current.held_mu, deltaMu);
+      if (heldMu instanceof Error) return heldMu;
+      earnings.set(provider, {
+        ...current,
+        total_mu: totalMu,
+        held_mu: heldMu,
+        updated_epoch: this.value.epoch,
+        updated_at: this.tx,
+      });
+    }
+
+    const nextFeeCum = this.safeAddMu(fee.cum_mu, feeDeltaMu);
+    if (nextFeeCum instanceof Error) return nextFeeCum;
+
+    for (const [user, balance] of this.sortedMapEntries(balances)) {
+      await this.put(`bal/${user}`, balance);
+    }
+    for (const [provider, earning] of this.sortedMapEntries(earnings)) {
+      await this.put(`earn/${provider}`, earning);
+    }
+    const feeRecord = {
+      ...fee,
+      cum_mu: nextFeeCum,
+      updated_epoch: this.value.epoch,
+      updated_at: this.tx,
+      last_apply_hash: applyHash,
+      last_fee_bps: params.fee_bps,
+    };
+    await this.put('fee/cum', feeRecord);
+
+    const result = {
+      ok: true,
+      op: 'epochApply',
+      epoch: this.value.epoch,
+      idempotent: false,
+      debited_mu: debitTotal,
+      earned_mu: grossTotal - feeDeltaMu,
+      fee_mu: feeDeltaMu,
+    };
+    console.log('mayhem epochApply', result);
+    return result;
+  }
+
   async currentRules() {
     return await this.get(CURRENT_RULES_KEY);
   }
@@ -1287,6 +1453,113 @@ class MayhemContract extends Contract {
       if (!value.canary_set) return new Error('Canary probe requires canary_set.');
     }
     return null;
+  }
+
+  validateEpochApplyShape(value) {
+    const arrays = [
+      ['debits', value.debits],
+      ['earnings', value.earnings],
+    ];
+    for (const [name, entries] of arrays) {
+      if (!Array.isArray(entries)) return new Error(`Epoch apply ${name} must be an array.`);
+      if (entries.length > LEDGER_BATCH_SCHEMA_MAX) {
+        return new Error(`Epoch apply ${name} batch is too large.`);
+      }
+    }
+    return null;
+  }
+
+  aggregateLedgerEntries(entries, idKey, amountKey, label) {
+    const out = new Map();
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return new Error(`Invalid ${label} entry.`);
+      }
+      const id = entry[idKey];
+      const mu = entry[amountKey];
+      if (!this.isSafeKeyPart(id)) return new Error(`Invalid ${label} ${idKey}.`);
+      if (!Number.isSafeInteger(mu) || mu <= 0) {
+        return new Error(`Invalid ${label} amount.`);
+      }
+      const next = this.safeAddMu(out.get(id) ?? 0, mu);
+      if (next instanceof Error) return next;
+      out.set(id, next);
+    }
+    return out;
+  }
+
+  sumMu(entries) {
+    let sum = 0;
+    for (const [, mu] of entries) {
+      const next = this.safeAddMu(sum, mu);
+      if (next instanceof Error) return next;
+      sum = next;
+    }
+    return sum;
+  }
+
+  safeAddMu(a, b) {
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b)) {
+      return new Error('mu values must be safe integers.');
+    }
+    const sum = a + b;
+    if (!Number.isSafeInteger(sum) || sum > Number.MAX_SAFE_INTEGER) {
+      return new Error('mu value overflow.');
+    }
+    return sum;
+  }
+
+  sortedMapEntries(map) {
+    return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b));
+  }
+
+  mapEntriesForHash(map, idKey, amountKey) {
+    return this.sortedMapEntries(map).map(([id, mu]) => ({
+      [idKey]: id,
+      [amountKey]: mu,
+    }));
+  }
+
+  async balanceRecord(user) {
+    return (await this.get(`bal/${user}`)) ?? {
+      user,
+      denom: PRICE_DENOMINATION,
+      mu: 0,
+      updated_epoch: 0,
+      updated_at: null,
+    };
+  }
+
+  async earningRecord(provider) {
+    return (await this.get(`earn/${provider}`)) ?? {
+      provider,
+      denom: PRICE_DENOMINATION,
+      total_mu: 0,
+      held_mu: 0,
+      paid_cum_mu: 0,
+      updated_epoch: 0,
+      updated_at: null,
+    };
+  }
+
+  async feeCumRecord() {
+    return (await this.get('fee/cum')) ?? {
+      denom: PRICE_DENOMINATION,
+      cum_mu: 0,
+      swept_cum_mu: 0,
+      updated_epoch: 0,
+      updated_at: null,
+      last_apply_hash: null,
+      last_fee_bps: null,
+    };
+  }
+
+  async epochApplyHash(value) {
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-epoch-apply-v1',
+      value,
+    })));
+    return b4a.toString(digest, 'hex');
   }
 
   probePass(value, params) {

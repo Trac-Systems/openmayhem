@@ -166,6 +166,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'epoch_apply') {
+      return {
+        type: 'epochApply',
+        value: json,
+      };
+    }
     if (json?.op === 'read_key') {
       return {
         type: 'readKey',
@@ -199,6 +205,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "anchor_reputation", "provider": "<pubkey>", "epoch": 1, "folded_at": 3600, "events_head": "<head>", "r_bps": 8700, "raw_milli": 12345, "successful_sessions": 50 }\' --sim 1 | admin/oracle anchors a rep/<provider> snapshot.');
     console.log('- /tx --command \'{ "op": "auditor_register", "auditor": "<pubkey>" }\' --sim 1 | admin accredits an auditor, or a qualified peer self-registers.');
     console.log('- /tx --command \'{ "op": "probe_result", "probe_id": "<id>", "probe_kind": "canary", "provider": "<pk>", "match_bps": 9700, "pass": true, "canary_set": "canary-dev-v1", "epoch": 1, "at": 3600 }\' --sim 1 | auditor submits probe evidence.');
+    console.log('- /tx --command \'{ "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] }\' --sim 1 | admin/oracle applies bounded credit, earning, and fee deltas.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');
