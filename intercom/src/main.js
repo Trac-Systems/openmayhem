@@ -4,6 +4,7 @@ import path from 'path';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
+import { createServer as createRpcServer } from '../trac/trac-peer/rpc/create_server.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
@@ -150,8 +151,49 @@ const scBridgeDebug = parseBool(
   false
 );
 
+const rpcEnabled = parseBool(
+  (flags.rpc && String(flags.rpc)) || env.PEER_RPC || '',
+  false
+);
+const rpcHost =
+  (flags['rpc-host'] && String(flags['rpc-host'])) ||
+  env.PEER_RPC_HOST ||
+  '127.0.0.1';
+const rpcPort = Number.parseInt(
+  (flags['rpc-port'] && String(flags['rpc-port'])) || env.PEER_RPC_PORT || '5001',
+  10
+);
+const rpcAllowOrigin =
+  (flags['rpc-allow-origin'] && String(flags['rpc-allow-origin'])) ||
+  env.PEER_RPC_ALLOW_ORIGIN ||
+  '*';
+const rpcMaxBodyBytes = Number.parseInt(
+  (flags['rpc-max-body-bytes'] && String(flags['rpc-max-body-bytes'])) ||
+    env.PEER_RPC_MAX_BODY_BYTES ||
+    '1000000',
+  10
+);
+const apiTxExposed = parseBool(
+  (flags['api-tx-exposed'] && String(flags['api-tx-exposed'])) ||
+    env.PEER_API_TX_EXPOSED ||
+    '',
+  false
+);
+const apiTxLocalApply = parseBool(
+  (flags['api-tx-local-apply'] && String(flags['api-tx-local-apply'])) ||
+    env.PEER_API_TX_LOCAL_APPLY ||
+    '',
+  false
+);
+
 if (scBridgeEnabled && !scBridgeToken) {
   throw new Error('SC-Bridge requires --sc-bridge-token (auth is mandatory).');
+}
+if (rpcEnabled && (!Number.isSafeInteger(rpcPort) || rpcPort < 1 || rpcPort > 65535)) {
+  throw new Error('Invalid --rpc-port. Expected integer 1-65535.');
+}
+if (rpcEnabled && (!Number.isSafeInteger(rpcMaxBodyBytes) || rpcMaxBodyBytes < 1)) {
+  throw new Error('Invalid --rpc-max-body-bytes. Expected a positive integer.');
 }
 
 const peerDhtBootstrap = parseCsvList(
@@ -220,6 +262,8 @@ const peerConfig = createPeerConfig(PEER_ENV.MAINNET, {
   enableBackgroundTasks: true,
   enableUpdater: true,
   replicate: true,
+  apiTxExposed,
+  apiTxLocalApply,
   ...(peerDhtBootstrap ? { dhtBootstrap: peerDhtBootstrap } : {}),
 });
 
@@ -281,6 +325,9 @@ if (scBridgeEnabled) {
   const portDisplay = Number.isSafeInteger(scBridgePort) ? scBridgePort : 49222;
   console.log('SC-Bridge:', `ws://${scBridgeHost}:${portDisplay}`);
 }
+if (rpcEnabled) {
+  console.log('RPC:', `http://${rpcHost}:${rpcPort}/v1`);
+}
 console.log('================================================================');
 console.log('');
 
@@ -333,6 +380,18 @@ if (scBridge) {
     console.error('SC-Bridge failed to start:', err?.message ?? err);
   }
   peer.scBridge = scBridge;
+}
+
+let rpcServer = null;
+if (rpcEnabled) {
+  rpcServer = createRpcServer(peer, {
+    maxBodyBytes: rpcMaxBodyBytes,
+    allowOrigin: rpcAllowOrigin,
+  });
+  rpcServer.listen(rpcPort, rpcHost, () => {
+    console.log('RPC: ready', `http://${rpcHost}:${rpcPort}/v1`);
+  });
+  peer.rpcServer = rpcServer;
 }
 
 sidechannel

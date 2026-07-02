@@ -103,6 +103,9 @@ export class Config {
         }
         this.apiTxExposed = apiTxExposedRaw === true;
 
+        const apiTxLocalApplyRaw = this.#select("apiTxLocalApply", options, defaults);
+        this.apiTxLocalApply = apiTxLocalApplyRaw === true;
+
         const apiMsgExposedRaw = this.#select("apiMsgExposed", options, defaults);
         if (apiMsgExposedRaw === undefined) {
             throw new Error("Peer: apiMsgExposed must be set.");

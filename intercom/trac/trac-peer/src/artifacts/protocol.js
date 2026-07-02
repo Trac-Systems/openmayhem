@@ -232,6 +232,37 @@ class Protocol{
             pubKeyHex = this.peer.wallet.publicKey;
         }
 
+        if(this.config.apiTxLocalApply === true) {
+            const txo = {
+                tx: txHex,
+                txv: txvHex,
+                iw: this.peer.writerLocalKey,
+                in: nonceHex,
+                ch: content_hash,
+                is: signatureHex,
+                bs: subnetBootstrapHex,
+                mbs: msbBootstrapHex
+            };
+            await this.peer.base.append({
+                type: 'tx',
+                key: txHex,
+                value: {
+                    dispatch: obj,
+                    msbsl: 0,
+                    ipk: pubKeyHex,
+                    wp: validator_pub_key,
+                    local: true,
+                    sig: signatureHex,
+                    nonce: nonceHex,
+                    txv: txvHex,
+                    iw: this.peer.writerLocalKey,
+                    bs: subnetBootstrapHex,
+                    mbs: msbBootstrapHex
+                }
+            });
+            return { type: MSB_OPERATION_TYPE.TX, address: null, txo, local: true };
+        }
+
         const address = this.peer.msbClient.pubKeyHexToAddress(pubKeyHex);
         if(address === null) throw new Error('Failed to create MSB address from public key.');
 

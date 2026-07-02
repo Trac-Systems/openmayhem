@@ -91,13 +91,17 @@ free_port() {
 admin_port="$(free_port)"
 joiner_a_port="$(free_port)"
 joiner_b_port="$(free_port)"
+admin_rpc_port="$(free_port)"
+joiner_a_rpc_port="$(free_port)"
+joiner_b_rpc_port="$(free_port)"
 
 start_peer() {
   local label="$1"
   local store="$2"
   local msb_store="$3"
   local port="$4"
-  local bootstrap="${5:-}"
+  local rpc_port="$5"
+  local bootstrap="${6:-}"
   local log_file="$log_dir/$label.log"
 
   local args=(
@@ -112,6 +116,11 @@ start_peer() {
     --sc-bridge-port "$port"
     --sc-bridge-token "$token"
     --sc-bridge-cli 1
+    --rpc 1
+    --rpc-host 127.0.0.1
+    --rpc-port "$rpc_port"
+    --api-tx-exposed 1
+    --api-tx-local-apply 1
   )
   if [[ -n "$bootstrap" ]]; then
     args+=(--subnet-bootstrap "$bootstrap")
@@ -246,9 +255,10 @@ joiner_a_log="$log_dir/joiner-a.log"
 joiner_b_log="$log_dir/joiner-b.log"
 
 echo "Starting admin peer..."
-start_peer "admin" "mayhem-devnet-admin" "mayhem-devnet-admin-msb" "$admin_port" >/dev/null
+start_peer "admin" "mayhem-devnet-admin" "mayhem-devnet-admin-msb" "$admin_port" "$admin_rpc_port" >/dev/null
 admin_bootstrap="$(wait_log_value "$admin_log" "Peer subnet bootstrap:" "$startup_timeout_sec")"
 admin_pubkey="$(wait_log_value "$admin_log" "Peer pubkey (hex):" "$startup_timeout_sec")"
+wait_log_contains "$admin_log" "RPC: ready" "$startup_timeout_sec"
 wait_log_contains "$admin_log" "Sidechannel: ready" "$startup_timeout_sec"
 
 echo "Configuring admin and auto-add writers..."
@@ -256,8 +266,10 @@ bridge_request "$admin_port" "{\"type\":\"cli\",\"command\":\"/add_admin --addre
 bridge_request "$admin_port" '{"type":"cli","command":"/set_auto_add_writers --enabled 1"}' >/dev/null
 
 echo "Starting joiner peers..."
-start_peer "joiner-a" "mayhem-devnet-joiner-a" "mayhem-devnet-joiner-a-msb" "$joiner_a_port" "$admin_bootstrap" >/dev/null
-start_peer "joiner-b" "mayhem-devnet-joiner-b" "mayhem-devnet-joiner-b-msb" "$joiner_b_port" "$admin_bootstrap" >/dev/null
+start_peer "joiner-a" "mayhem-devnet-joiner-a" "mayhem-devnet-joiner-a-msb" "$joiner_a_port" "$joiner_a_rpc_port" "$admin_bootstrap" >/dev/null
+start_peer "joiner-b" "mayhem-devnet-joiner-b" "mayhem-devnet-joiner-b-msb" "$joiner_b_port" "$joiner_b_rpc_port" "$admin_bootstrap" >/dev/null
+wait_log_contains "$joiner_a_log" "RPC: ready" "$startup_timeout_sec"
+wait_log_contains "$joiner_b_log" "RPC: ready" "$startup_timeout_sec"
 wait_log_contains "$joiner_a_log" "Sidechannel: ready" "$startup_timeout_sec"
 wait_log_contains "$joiner_b_log" "Sidechannel: ready" "$startup_timeout_sec"
 
@@ -272,9 +284,9 @@ node -e 'const r = JSON.parse(process.argv[1]); if (r.type !== "cli_result" || r
 
 cat <<EOF
 Mayhem dev-net ready.
-  admin:    ws://127.0.0.1:$admin_port  $admin_stats
-  joiner-a: ws://127.0.0.1:$joiner_a_port  $joiner_a_stats
-  joiner-b: ws://127.0.0.1:$joiner_b_port  $joiner_b_stats
+  admin:    ws://127.0.0.1:$admin_port  rpc=http://127.0.0.1:$admin_rpc_port/v1  $admin_stats
+  joiner-a: ws://127.0.0.1:$joiner_a_port  rpc=http://127.0.0.1:$joiner_a_rpc_port/v1  $joiner_a_stats
+  joiner-b: ws://127.0.0.1:$joiner_b_port  rpc=http://127.0.0.1:$joiner_b_rpc_port/v1  $joiner_b_stats
   subnet bootstrap: $admin_bootstrap
   subnet channel:   $subnet_channel
   logs:             $log_dir
