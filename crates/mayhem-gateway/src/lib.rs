@@ -3,8 +3,10 @@
 pub mod failover;
 pub mod openai;
 pub mod provider_table;
+pub mod reputation;
 pub use failover::*;
 pub use provider_table::*;
+pub use reputation::*;
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 

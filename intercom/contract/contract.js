@@ -8,8 +8,13 @@ const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
 const PRICE_DENOMINATION = 'mu_usd';
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
 const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
+const PROBATION_SECONDS = 7 * 24 * 60 * 60;
 const PARAM_DEFINITIONS = Object.freeze({
-  probation_successful_sessions: { default: 3, min: 0, max: 1_000_000 },
+  probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
+  probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
+  probation_max_concurrent_sessions_per_user: { default: 2, min: 1, max: 1_000_000 },
+  probation_price_max_bps: { default: 10_000, min: 0, max: 1_000_000 },
+  probation_weight_bps: { default: 5_000, min: 0, max: 10_000 },
   holdback_epochs: { default: 168, min: 0, max: 1_000_000 },
   fee_bps: { default: 1_500, min: 0, max: 10_000 },
   payout_min_mu: { default: 1_000_000, min: 0, max: Number.MAX_SAFE_INTEGER },
@@ -21,6 +26,16 @@ const PARAM_DEFINITIONS = Object.freeze({
   challenge_epochs: { default: 6, min: 0, max: 1_000_000 },
   max_apply_batch: { default: 500, min: 1, max: 5_000 },
 });
+const REPUTATION_EVENT_KINDS = new Set([
+  'session_ok',
+  'session_partial',
+  'session_fail',
+  'probe_ok',
+  'probe_fail',
+  'uptime_tick',
+  'dispute_lost',
+  'provenance_violation',
+]);
 const ENCLAVE_UPDATE_FIELDS = [
   'backend',
   'artifact_root',
@@ -123,6 +138,7 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         payout_addr: { type: 'string', min: 1, max: 256 },
         payout_method: { type: 'string', min: 1, max: 32 },
+        registered_at_seconds: { type: 'number', integer: true, min: 0, optional: true },
       },
     });
 
@@ -256,6 +272,38 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
         at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
+    this.addSchema('recordReputationEvent', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128 },
+        event_id: { type: 'string', min: 1, max: 128 },
+        kind: { type: 'string', min: 1, max: 64 },
+        epoch: { type: 'number', integer: true, min: 0 },
+        at: { type: 'number', integer: true, min: 0 },
+        paid_mu: { type: 'number', integer: true, min: 0, optional: true },
+        max_spend_mu: { type: 'number', integer: true, min: 0, optional: true },
+        evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
+    this.addSchema('anchorReputation', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128 },
+        epoch: { type: 'number', integer: true, min: 0 },
+        folded_at: { type: 'number', integer: true, min: 0 },
+        events_head: { type: 'string', min: 1, max: 128 },
+        r_bps: { type: 'number', integer: true, min: 0, max: 10_000 },
+        raw_milli: { type: 'number', integer: true },
+        successful_sessions: { type: 'number', integer: true, min: 0 },
+        provenance_violation: { type: 'boolean', optional: true },
       },
     });
   }
@@ -422,6 +470,7 @@ class MayhemContract extends Contract {
       status: 'active',
       probation: {
         since: this.tx,
+        since_seconds: this.value.registered_at_seconds ?? 0,
         successful_sessions: 0,
       },
       registered_at: this.tx,
@@ -787,6 +836,133 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'readPrice', enclave_id: this.value.enclave_id, at: this.value.at, price };
   }
 
+  async recordReputationEvent() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const validationError = this.validateReputationEvent(this.value);
+    if (validationError) return validationError;
+
+    const provider = await this.get(`prov/${this.value.provider}`);
+    if (!provider) return new Error('Provider not found.');
+
+    const key = `ev/rep/${this.value.provider}/${this.value.event_id}`;
+    if ((await this.get(key)) !== null) return new Error('Reputation event already recorded.');
+
+    const headKey = `ev/rep/head/${this.value.provider}`;
+    const currentHead = await this.get(headKey);
+    const event = {
+      provider: this.value.provider,
+      event_id: this.value.event_id,
+      kind: this.value.kind,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      paid_mu: this.value.paid_mu ?? null,
+      max_spend_mu: this.value.max_spend_mu ?? null,
+      evidence_hash: this.value.evidence_hash ?? null,
+      recorded_at: this.tx,
+      recorded_by: this.address,
+    };
+    const head = await this.reputationEventHead(currentHead?.head ?? null, event);
+    const record = {
+      ...event,
+      head,
+    };
+    const headRecord = {
+      provider: this.value.provider,
+      head,
+      count: (currentHead?.count ?? 0) + 1,
+      updated_at: this.tx,
+    };
+
+    await this.put(key, record);
+    await this.put(headKey, headRecord);
+    console.log('mayhem recordReputationEvent', record);
+    return {
+      ok: true,
+      op: 'recordReputationEvent',
+      provider: this.value.provider,
+      event_id: this.value.event_id,
+      head,
+    };
+  }
+
+  async anchorReputation() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const providerKey = `prov/${this.value.provider}`;
+    const provider = await this.get(providerKey);
+    if (!provider) return new Error('Provider not found.');
+
+    const head = await this.get(`ev/rep/head/${this.value.provider}`);
+    if (!head || head.head !== this.value.events_head) {
+      return new Error('Reputation events head mismatch.');
+    }
+    if (this.value.successful_sessions < (provider.probation?.successful_sessions ?? 0)) {
+      return new Error('Successful sessions must not decrease.');
+    }
+
+    const params = await this.activeParamsAt(this.value.folded_at, [
+      'probation_successful_sessions',
+      'probation_seconds',
+      'probation_max_concurrent_sessions_per_user',
+      'probation_price_max_bps',
+      'probation_weight_bps',
+    ]);
+    const sinceSeconds = provider.probation?.since_seconds ?? 0;
+    const probationActive = (
+      this.value.successful_sessions < params.probation_successful_sessions ||
+      this.value.folded_at - sinceSeconds < params.probation_seconds
+    );
+    const probation = {
+      active: probationActive,
+      since: provider.probation?.since ?? provider.registered_at,
+      since_seconds: sinceSeconds,
+      successful_sessions: this.value.successful_sessions,
+      required_successful_sessions: params.probation_successful_sessions,
+      required_seconds: params.probation_seconds,
+      caps: {
+        max_concurrent_sessions_per_user: params.probation_max_concurrent_sessions_per_user,
+        price_max_bps: params.probation_price_max_bps,
+        weight_bps: params.probation_weight_bps,
+      },
+    };
+    const snapshot = {
+      provider: this.value.provider,
+      r: this.value.r_bps / 10_000,
+      r_bps: this.value.r_bps,
+      raw: this.value.raw_milli / 1_000,
+      raw_milli: this.value.raw_milli,
+      events_head: this.value.events_head,
+      epoch: this.value.epoch,
+      folded_at: this.value.folded_at,
+      updated_at: this.tx,
+      probation,
+      provenance_violation: this.value.provenance_violation === true,
+    };
+    const updatedProvider = {
+      ...provider,
+      probation: {
+        ...(provider.probation ?? {}),
+        successful_sessions: this.value.successful_sessions,
+        since_seconds: sinceSeconds,
+      },
+      updated_at: this.tx,
+    };
+
+    await this.put(`rep/${this.value.provider}`, snapshot);
+    await this.put(providerKey, updatedProvider);
+    console.log('mayhem anchorReputation', snapshot);
+    return {
+      ok: true,
+      op: 'anchorReputation',
+      provider: this.value.provider,
+      epoch: this.value.epoch,
+      events_head: this.value.events_head,
+    };
+  }
+
   async currentRules() {
     return await this.get(CURRENT_RULES_KEY);
   }
@@ -920,6 +1096,35 @@ class MayhemContract extends Contract {
       price * 10_000 >= ref * params.price_min_bps &&
       price * 10_000 <= ref * params.price_max_bps
     );
+  }
+
+  validateReputationEvent(value) {
+    if (!this.isSafeKeyPart(value.event_id)) return new Error('Invalid reputation event id.');
+    if (!REPUTATION_EVENT_KINDS.has(value.kind)) return new Error('Unsupported reputation event kind.');
+    if (
+      (value.kind === 'session_ok' || value.kind === 'session_partial') &&
+      !Number.isInteger(value.paid_mu)
+    ) {
+      return new Error('Reputation event requires paid_mu.');
+    }
+    if (value.kind === 'session_fail' && !Number.isInteger(value.max_spend_mu)) {
+      return new Error('Reputation event requires max_spend_mu.');
+    }
+    return null;
+  }
+
+  isSafeKeyPart(value) {
+    return typeof value === 'string' && /^[a-zA-Z0-9._:-]{1,128}$/.test(value);
+  }
+
+  async reputationEventHead(previousHead, event) {
+    const payload = JSON.stringify({
+      domain: 'mayhem-reputation-event-v1',
+      previous_head: previousHead,
+      event,
+    });
+    const digest = await blake3(b4a.from(payload));
+    return b4a.toString(digest, 'hex');
   }
 
   verifyConsentSignature(sender, ver, hash, sig) {

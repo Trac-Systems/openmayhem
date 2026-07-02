@@ -142,6 +142,18 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'record_rep_event') {
+      return {
+        type: 'recordReputationEvent',
+        value: json,
+      };
+    }
+    if (json?.op === 'anchor_reputation') {
+      return {
+        type: 'anchorReputation',
+        value: json,
+      };
+    }
     if (json?.op === 'read_key') {
       return {
         type: 'readKey',
@@ -171,6 +183,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | admin closes a canonical model room.');
     console.log('- /tx --command \'{ "op": "set_price", "enclave_id": "<id>", "in_per_1k_mu": 18, "out_per_1k_mu": 55, "per_req_mu": 0, "min_session_mu": 100, "effective_at": 21600 }\' --sim 1 | admin sets an enclave price in mu_usd.');
     console.log('- /tx --command \'{ "op": "read_price", "enclave_id": "<id>", "at": 21600 }\' --sim 1 | reads the active enclave price at a timestamp.');
+    console.log('- /tx --command \'{ "op": "record_rep_event", "provider": "<pubkey>", "event_id": "<id>", "kind": "session_ok", "paid_mu": 1000, "epoch": 1, "at": 3600 }\' --sim 1 | admin/oracle records reputation evidence.');
+    console.log('- /tx --command \'{ "op": "anchor_reputation", "provider": "<pubkey>", "epoch": 1, "folded_at": 3600, "events_head": "<head>", "r_bps": 8700, "raw_milli": 12345, "successful_sessions": 50 }\' --sim 1 | admin/oracle anchors a rep/<provider> snapshot.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');

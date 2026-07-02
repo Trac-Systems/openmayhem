@@ -154,6 +154,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     status: 'active',
     probation: {
       since: makeTxKey(3),
+      since_seconds: 0,
       successful_sessions: 0,
     },
     registered_at: makeTxKey(3),

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{HeartbeatCaps, ProviderHeartbeat};
+use crate::{HeartbeatCaps, ProviderHeartbeat, ProviderProbation};
 
 pub const DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS: u64 = 10_000;
 pub const DEFAULT_OBSERVATION_EWMA_ALPHA: f64 = 0.2;
@@ -30,6 +30,9 @@ pub struct ContractProviderSnapshot {
     pub price_ver: u64,
     pub in_per_1k_mu: u64,
     pub out_per_1k_mu: u64,
+    pub ref_in_per_1k_mu: u64,
+    pub ref_out_per_1k_mu: u64,
+    pub probation: Option<ProviderProbation>,
     pub caps: HeartbeatCaps,
     pub attestation_head: Option<String>,
 }
@@ -83,6 +86,7 @@ pub struct RequestRequirements {
     pub max_attestation_head_age_millis: u64,
     pub heartbeat_ttl_millis: u64,
     pub saturation_cutoff: f64,
+    pub provider_user_active_sessions: BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -94,6 +98,8 @@ pub enum IneligibilityReason {
     Saturated,
     Capabilities,
     Price,
+    ProbationConcurrentLimit,
+    ProbationPriceCap,
     AttestationMissing,
     AttestationStale,
 }
@@ -198,6 +204,7 @@ impl Default for RequestRequirements {
             max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
             heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
             saturation_cutoff: DEFAULT_SATURATION_CUTOFF,
+            provider_user_active_sessions: BTreeMap::new(),
         }
     }
 }
@@ -419,6 +426,29 @@ pub fn evaluate_eligibility(
     {
         return Err(IneligibilityReason::Price);
     }
+    if let Some(probation) = entry
+        .contract
+        .probation
+        .as_ref()
+        .filter(|probation| probation.active)
+    {
+        let active_sessions = request
+            .provider_user_active_sessions
+            .get(&entry.contract.provider)
+            .copied()
+            .unwrap_or_default();
+        if active_sessions >= probation.caps.max_concurrent_sessions_per_user {
+            return Err(IneligibilityReason::ProbationConcurrentLimit);
+        }
+        let reference_price_mu = estimate_reference_request_price_mu(&entry.contract, request);
+        if probation_price_over_cap(
+            estimated_price_mu,
+            reference_price_mu,
+            probation.caps.price_max_bps,
+        ) {
+            return Err(IneligibilityReason::ProbationPriceCap);
+        }
+    }
     let attestation = entry
         .attestation_head
         .as_ref()
@@ -473,7 +503,8 @@ pub fn eligible_candidates(
             let weight = reputation.powf(weights.reputation_alpha)
                 * available.powf(weights.saturation_beta)
                 * (1.0 / price_norm).powf(weights.price_gamma)
-                * latency_factor;
+                * latency_factor
+                * probation_weight_multiplier(&entry);
             SelectionCandidate {
                 entry,
                 estimated_price_mu,
@@ -525,6 +556,24 @@ pub fn estimate_request_price_mu(
     rounded.min(u128::from(u64::MAX)) as u64
 }
 
+pub fn estimate_reference_request_price_mu(
+    contract: &ContractProviderSnapshot,
+    request: &RequestRequirements,
+) -> u64 {
+    let raw = u128::from(request.input_tokens) * u128::from(contract.ref_in_per_1k_mu)
+        + u128::from(request.output_tokens) * u128::from(contract.ref_out_per_1k_mu);
+    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
+    rounded.min(u128::from(u64::MAX)) as u64
+}
+
+fn probation_price_over_cap(
+    estimated_price_mu: u64,
+    reference_price_mu: u64,
+    cap_bps: u32,
+) -> bool {
+    u128::from(estimated_price_mu) * 10_000 > u128::from(reference_price_mu) * u128::from(cap_bps)
+}
+
 fn update_ewma(current: Option<f64>, sample: f64, alpha: f64) -> f64 {
     match current {
         Some(current) => alpha * sample + (1.0 - alpha) * current,
@@ -542,6 +591,15 @@ fn effective_ttft_ms(entry: &ProviderTableEntry) -> f64 {
                 .as_ref()
                 .map(|heartbeat| heartbeat.perf.ttft_ms as f64)
         })
+        .unwrap_or(1.0)
+}
+
+fn probation_weight_multiplier(entry: &ProviderTableEntry) -> f64 {
+    entry
+        .contract
+        .probation
+        .as_ref()
+        .map(ProviderProbation::weight_multiplier)
         .unwrap_or(1.0)
 }
 
@@ -624,7 +682,9 @@ fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HeartbeatAttestation, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots};
+    use crate::{
+        HeartbeatAttestation, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProbationCaps,
+    };
 
     fn key() -> ProviderKey {
         ProviderKey::new("aa".repeat(32), "bb".repeat(32), "cc".repeat(16))
@@ -659,6 +719,9 @@ mod tests {
             price_ver: 5,
             in_per_1k_mu: 20,
             out_per_1k_mu: 60,
+            ref_in_per_1k_mu: 20,
+            ref_out_per_1k_mu: 60,
+            probation: None,
             caps: caps(),
             attestation_head: None,
         }
@@ -676,6 +739,9 @@ mod tests {
             price_ver: 5,
             in_per_1k_mu: 20,
             out_per_1k_mu: 60,
+            ref_in_per_1k_mu: 20,
+            ref_out_per_1k_mu: 60,
+            probation: None,
             caps: caps(),
             attestation_head: None,
         }
@@ -769,6 +835,21 @@ mod tests {
             max_price_mu: Some(100),
             now_millis: now,
             ..RequestRequirements::default()
+        }
+    }
+
+    fn active_probation() -> ProviderProbation {
+        ProviderProbation {
+            active: true,
+            since_seconds: 0,
+            successful_sessions: 7,
+            required_successful_sessions: 50,
+            required_seconds: 7 * 24 * 60 * 60,
+            caps: ProbationCaps {
+                max_concurrent_sessions_per_user: 2,
+                price_max_bps: 10_000,
+                weight_bps: 5_000,
+            },
         }
     }
 
@@ -979,6 +1060,53 @@ mod tests {
         let selected =
             select_weighted_p2c(&entries, &request, &weights, &mut rng).expect("provider selected");
         assert_eq!(selected.selected.entry.key, entries[1].key);
+    }
+
+    #[test]
+    fn probation_caps_are_enforced_in_balancer() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.contract.probation = Some(active_probation());
+
+        assert_eq!(evaluate_eligibility(&entry, &request), Ok(80));
+
+        let mut over_concurrent = request.clone();
+        over_concurrent
+            .provider_user_active_sessions
+            .insert(entry.contract.provider.clone(), 2);
+        assert_eq!(
+            evaluate_eligibility(&entry, &over_concurrent),
+            Err(IneligibilityReason::ProbationConcurrentLimit)
+        );
+
+        let mut overpriced = entry.clone();
+        overpriced.contract.in_per_1k_mu = 21;
+        assert_eq!(
+            evaluate_eligibility(&overpriced, &request),
+            Err(IneligibilityReason::ProbationPriceCap)
+        );
+
+        let weights = SelectionWeights::default();
+        let non_probation_weight = eligible_candidates(
+            &[ProviderTableEntry {
+                contract: ContractProviderSnapshot {
+                    probation: None,
+                    ..entry.contract.clone()
+                },
+                ..entry.clone()
+            }],
+            &request,
+            &weights,
+        )
+        .pop()
+        .expect("non-probation candidate")
+        .weight;
+        let probation_weight = eligible_candidates(&[entry], &request, &weights)
+            .pop()
+            .expect("probation candidate")
+            .weight;
+        assert!((probation_weight - non_probation_weight * 0.5).abs() < 1e-12);
     }
 
     #[test]
