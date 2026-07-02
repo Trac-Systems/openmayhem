@@ -6,6 +6,11 @@ use crate::{HeartbeatCaps, ProviderHeartbeat};
 
 pub const DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS: u64 = 10_000;
 pub const DEFAULT_OBSERVATION_EWMA_ALPHA: f64 = 0.2;
+pub const DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS: u64 = 24 * 60 * 60 * 1000;
+pub const DEFAULT_SATURATION_CUTOFF: f64 = 0.85;
+pub const DEFAULT_REPUTATION_ALPHA: f64 = 1.5;
+pub const DEFAULT_SATURATION_BETA: f64 = 1.0;
+pub const DEFAULT_PRICE_GAMMA: f64 = 0.7;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ProviderKey {
@@ -63,6 +68,68 @@ pub struct ProviderTableEntry {
     pub attestation_head: Option<AttestationHeadCacheEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RequestRequirements {
+    pub current_rules_ver: u64,
+    pub min_reputation: f64,
+    pub requires_tools: bool,
+    pub requires_json: bool,
+    pub requires_vision: bool,
+    pub min_ctx: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub max_price_mu: Option<u64>,
+    pub now_millis: u64,
+    pub max_attestation_head_age_millis: u64,
+    pub heartbeat_ttl_millis: u64,
+    pub saturation_cutoff: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum IneligibilityReason {
+    ConsentVersion,
+    Reputation,
+    HeartbeatMissing,
+    HeartbeatStale,
+    Saturated,
+    Capabilities,
+    Price,
+    AttestationMissing,
+    AttestationStale,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SelectionWeights {
+    pub reputation_alpha: f64,
+    pub saturation_beta: f64,
+    pub price_gamma: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SelectionCandidate {
+    pub entry: ProviderTableEntry,
+    pub estimated_price_mu: u64,
+    pub effective_ttft_ms: f64,
+    pub latency_factor: f64,
+    pub price_norm: f64,
+    pub weight: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSelection {
+    pub selected: SelectionCandidate,
+    pub sampled: Vec<ProviderKey>,
+}
+
+pub trait BalancerRng {
+    fn next_unit_f64(&mut self) -> f64;
+}
+
+#[derive(Clone, Debug)]
+pub struct LcgBalancerRng {
+    state: u64,
+}
+
 #[derive(Clone, Debug)]
 struct LiveHeartbeat {
     heartbeat: ProviderHeartbeat,
@@ -112,6 +179,53 @@ impl ProviderKey {
 impl Default for ProviderTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Default for RequestRequirements {
+    fn default() -> Self {
+        Self {
+            current_rules_ver: 1,
+            min_reputation: 0.0,
+            requires_tools: false,
+            requires_json: false,
+            requires_vision: false,
+            min_ctx: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            max_price_mu: None,
+            now_millis: 0,
+            max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
+            heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+            saturation_cutoff: DEFAULT_SATURATION_CUTOFF,
+        }
+    }
+}
+
+impl Default for SelectionWeights {
+    fn default() -> Self {
+        Self {
+            reputation_alpha: DEFAULT_REPUTATION_ALPHA,
+            saturation_beta: DEFAULT_SATURATION_BETA,
+            price_gamma: DEFAULT_PRICE_GAMMA,
+        }
+    }
+}
+
+impl LcgBalancerRng {
+    pub fn seeded(seed: u64) -> Self {
+        Self { state: seed }
+    }
+}
+
+impl BalancerRng for LcgBalancerRng {
+    fn next_unit_f64(&mut self) -> f64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let bits = self.state >> 11;
+        (bits as f64) * (1.0 / ((1_u64 << 53) as f64))
     }
 }
 
@@ -268,10 +382,242 @@ impl ProviderTable {
     }
 }
 
+pub fn evaluate_eligibility(
+    entry: &ProviderTableEntry,
+    request: &RequestRequirements,
+) -> Result<u64, IneligibilityReason> {
+    if entry.contract.consent_ver != request.current_rules_ver {
+        return Err(IneligibilityReason::ConsentVersion);
+    }
+    if entry.contract.reputation < request.min_reputation {
+        return Err(IneligibilityReason::Reputation);
+    }
+    let heartbeat = entry
+        .heartbeat
+        .as_ref()
+        .ok_or(IneligibilityReason::HeartbeatMissing)?;
+    let heartbeat_age = entry
+        .heartbeat_age_millis
+        .ok_or(IneligibilityReason::HeartbeatMissing)?;
+    if heartbeat_age >= request.heartbeat_ttl_millis {
+        return Err(IneligibilityReason::HeartbeatStale);
+    }
+    if heartbeat.sat >= request.saturation_cutoff {
+        return Err(IneligibilityReason::Saturated);
+    }
+    if request.requires_tools && !heartbeat.caps.tools
+        || request.requires_json && !heartbeat.caps.json
+        || request.requires_vision && !heartbeat.caps.vision
+        || heartbeat.caps.ctx < request.min_ctx
+    {
+        return Err(IneligibilityReason::Capabilities);
+    }
+    let estimated_price_mu = estimate_request_price_mu(&entry.contract, request);
+    if request
+        .max_price_mu
+        .is_some_and(|max_price_mu| estimated_price_mu > max_price_mu)
+    {
+        return Err(IneligibilityReason::Price);
+    }
+    let attestation = entry
+        .attestation_head
+        .as_ref()
+        .ok_or(IneligibilityReason::AttestationMissing)?;
+    let attestation_age = request
+        .now_millis
+        .saturating_sub(attestation.observed_at_millis);
+    if attestation_age > request.max_attestation_head_age_millis {
+        return Err(IneligibilityReason::AttestationStale);
+    }
+    Ok(estimated_price_mu)
+}
+
+pub fn eligible_candidates(
+    entries: &[ProviderTableEntry],
+    request: &RequestRequirements,
+    weights: &SelectionWeights,
+) -> Vec<SelectionCandidate> {
+    let mut base = entries
+        .iter()
+        .filter_map(|entry| {
+            let estimated_price_mu = evaluate_eligibility(entry, request).ok()?;
+            Some((
+                entry.clone(),
+                estimated_price_mu,
+                effective_ttft_ms(entry).max(1.0),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if base.is_empty() {
+        return Vec::new();
+    }
+
+    let median_ttft = median(base.iter().map(|(_, _, ttft)| *ttft).collect()).max(1.0);
+    let median_price = median(
+        base.iter()
+            .map(|(_, price, _)| (*price).max(1) as f64)
+            .collect(),
+    )
+    .max(1.0);
+
+    base.drain(..)
+        .map(|(entry, estimated_price_mu, effective_ttft_ms)| {
+            let heartbeat = entry
+                .heartbeat
+                .as_ref()
+                .expect("eligible candidates have live heartbeats");
+            let reputation = entry.contract.reputation.clamp(0.0, 1.0);
+            let available = (1.0 - heartbeat.sat).clamp(0.0, 1.0);
+            let price_norm = ((estimated_price_mu.max(1) as f64) / median_price).max(f64::EPSILON);
+            let latency_factor = (median_ttft / effective_ttft_ms).clamp(0.25, 4.0);
+            let weight = reputation.powf(weights.reputation_alpha)
+                * available.powf(weights.saturation_beta)
+                * (1.0 / price_norm).powf(weights.price_gamma)
+                * latency_factor;
+            SelectionCandidate {
+                entry,
+                estimated_price_mu,
+                effective_ttft_ms,
+                latency_factor,
+                price_norm,
+                weight,
+            }
+        })
+        .collect()
+}
+
+pub fn select_weighted_p2c(
+    entries: &[ProviderTableEntry],
+    request: &RequestRequirements,
+    weights: &SelectionWeights,
+    rng: &mut impl BalancerRng,
+) -> Option<ProviderSelection> {
+    let candidates = eligible_candidates(entries, request, weights);
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(ProviderSelection {
+            selected: candidates[0].clone(),
+            sampled: vec![candidates[0].entry.key.clone()],
+        });
+    }
+
+    let first = weighted_sample_index(&candidates, None, rng)?;
+    let second = weighted_sample_index(&candidates, Some(first), rng).unwrap_or(first);
+    let selected = better_p2c_index(&candidates, first, second);
+    Some(ProviderSelection {
+        selected: candidates[selected].clone(),
+        sampled: vec![
+            candidates[first].entry.key.clone(),
+            candidates[second].entry.key.clone(),
+        ],
+    })
+}
+
+pub fn estimate_request_price_mu(
+    contract: &ContractProviderSnapshot,
+    request: &RequestRequirements,
+) -> u64 {
+    let raw = u128::from(request.input_tokens) * u128::from(contract.in_per_1k_mu)
+        + u128::from(request.output_tokens) * u128::from(contract.out_per_1k_mu);
+    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
+    rounded.min(u128::from(u64::MAX)) as u64
+}
+
 fn update_ewma(current: Option<f64>, sample: f64, alpha: f64) -> f64 {
     match current {
         Some(current) => alpha * sample + (1.0 - alpha) * current,
         None => sample,
+    }
+}
+
+fn effective_ttft_ms(entry: &ProviderTableEntry) -> f64 {
+    entry
+        .observed
+        .ewma_ttft_ms
+        .or_else(|| {
+            entry
+                .heartbeat
+                .as_ref()
+                .map(|heartbeat| heartbeat.perf.ttft_ms as f64)
+        })
+        .unwrap_or(1.0)
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|left, right| left.total_cmp(right));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+fn weighted_sample_index(
+    candidates: &[SelectionCandidate],
+    excluded: Option<usize>,
+    rng: &mut impl BalancerRng,
+) -> Option<usize> {
+    let total = candidates
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| Some(*idx) != excluded)
+        .map(|(_, candidate)| candidate.weight.max(0.0))
+        .sum::<f64>();
+    if total <= f64::EPSILON {
+        return candidates
+            .iter()
+            .enumerate()
+            .find(|(idx, _)| Some(*idx) != excluded)
+            .map(|(idx, _)| idx);
+    }
+    let unit = rng.next_unit_f64();
+    let unit = if unit.is_finite() {
+        unit.clamp(0.0, 1.0 - f64::EPSILON)
+    } else {
+        0.0
+    };
+    let mut target = unit * total;
+    let mut fallback = None;
+    for (idx, candidate) in candidates.iter().enumerate() {
+        if Some(idx) == excluded {
+            continue;
+        }
+        fallback = Some(idx);
+        let weight = candidate.weight.max(0.0);
+        if target < weight {
+            return Some(idx);
+        }
+        target -= weight;
+    }
+    fallback
+}
+
+fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize) -> usize {
+    let left_sat = candidates[left]
+        .entry
+        .heartbeat
+        .as_ref()
+        .map(|heartbeat| heartbeat.sat)
+        .unwrap_or(1.0);
+    let right_sat = candidates[right]
+        .entry
+        .heartbeat
+        .as_ref()
+        .map(|heartbeat| heartbeat.sat)
+        .unwrap_or(1.0);
+    match left_sat.total_cmp(&right_sat) {
+        std::cmp::Ordering::Less => left,
+        std::cmp::Ordering::Greater => right,
+        std::cmp::Ordering::Equal => {
+            if candidates[left].effective_ttft_ms <= candidates[right].effective_ttft_ms {
+                left
+            } else {
+                right
+            }
+        }
     }
 }
 
@@ -284,12 +630,37 @@ mod tests {
         ProviderKey::new("aa".repeat(32), "bb".repeat(32), "cc".repeat(16))
     }
 
+    fn key_for(idx: u8) -> ProviderKey {
+        ProviderKey::new(
+            format!("{idx:02x}").repeat(32),
+            format!("{:02x}", idx.wrapping_add(80)).repeat(32),
+            format!("{:02x}", idx.wrapping_add(160)).repeat(16),
+        )
+    }
+
     fn caps() -> HeartbeatCaps {
         HeartbeatCaps {
             tools: true,
             json: true,
             ctx: 8192,
             vision: false,
+        }
+    }
+
+    fn contract_record_for(idx: u8) -> ContractProviderSnapshot {
+        let key = key_for(idx);
+        ContractProviderSnapshot {
+            provider: key.provider,
+            enclave_id: key.enclave_id,
+            model_id: "model/test@4bit".to_owned(),
+            room_id: key.room_id,
+            consent_ver: 3,
+            reputation: 0.8,
+            price_ver: 5,
+            in_per_1k_mu: 20,
+            out_per_1k_mu: 60,
+            caps: caps(),
+            attestation_head: None,
         }
     }
 
@@ -307,6 +678,44 @@ mod tests {
             out_per_1k_mu: 60,
             caps: caps(),
             attestation_head: None,
+        }
+    }
+
+    fn heartbeat_for(
+        idx: u8,
+        ts: u64,
+        sat: f64,
+        ttft_ms: u64,
+        epoch: u64,
+        head: &str,
+    ) -> ProviderHeartbeat {
+        let key = key_for(idx);
+        ProviderHeartbeat {
+            t: "hb".to_owned(),
+            v: crate::HEARTBEAT_SCHEMA_VERSION,
+            provider: key.provider,
+            enclave_id: key.enclave_id,
+            model_id: "model/test@4bit".to_owned(),
+            room_id: key.room_id,
+            sat,
+            slots: HeartbeatSlots { active: 1, max: 8 },
+            q: HeartbeatQueue {
+                depth: 0,
+                est_wait_ms: 0,
+            },
+            perf: HeartbeatPerf {
+                tok_s: Some(50.0),
+                ttft_ms,
+            },
+            price_ver: 5,
+            caps: caps(),
+            att: HeartbeatAttestation {
+                epoch,
+                head: head.repeat(32),
+            },
+            ts,
+            nonce: format!("{idx:02x}").repeat(32),
+            sig: "ee".repeat(64),
         }
     }
 
@@ -338,6 +747,50 @@ mod tests {
             ts,
             nonce: "dd".repeat(32),
             sig: "ee".repeat(64),
+        }
+    }
+
+    fn entry_for(idx: u8, now: u64, sat: f64, ttft_ms: u64) -> ProviderTableEntry {
+        let mut table = ProviderTable::new();
+        table.upsert_contract(contract_record_for(idx));
+        table.upsert_heartbeat(heartbeat_for(idx, now, sat, ttft_ms, 9, "44"), now);
+        table.entries(now + 1).pop().expect("provider entry")
+    }
+
+    fn eligible_request(now: u64) -> RequestRequirements {
+        RequestRequirements {
+            current_rules_ver: 3,
+            min_reputation: 0.5,
+            requires_tools: true,
+            requires_json: true,
+            min_ctx: 4096,
+            input_tokens: 1000,
+            output_tokens: 1000,
+            max_price_mu: Some(100),
+            now_millis: now,
+            ..RequestRequirements::default()
+        }
+    }
+
+    struct ScriptedRng {
+        values: Vec<f64>,
+        idx: usize,
+    }
+
+    impl ScriptedRng {
+        fn new(values: impl IntoIterator<Item = f64>) -> Self {
+            Self {
+                values: values.into_iter().collect(),
+                idx: 0,
+            }
+        }
+    }
+
+    impl BalancerRng for ScriptedRng {
+        fn next_unit_f64(&mut self) -> f64 {
+            let value = self.values[self.idx % self.values.len()];
+            self.idx += 1;
+            value
         }
     }
 
@@ -429,5 +882,142 @@ mod tests {
 
         assert_eq!(table.heartbeat_len(), 1);
         assert!(table.entries(1_000_500).is_empty());
+    }
+
+    #[test]
+    fn eligibility_filter_applies_normative_predicates() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let good = entry_for(1, now, 0.2, 100);
+
+        assert_eq!(evaluate_eligibility(&good, &request), Ok(80));
+
+        let mut bad = good.clone();
+        bad.contract.consent_ver = 2;
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::ConsentVersion)
+        );
+
+        let mut bad = good.clone();
+        bad.contract.reputation = 0.4;
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::Reputation)
+        );
+
+        let mut bad = good.clone();
+        bad.heartbeat = None;
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::HeartbeatMissing)
+        );
+
+        let mut bad = good.clone();
+        bad.heartbeat_age_millis = Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS);
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::HeartbeatStale)
+        );
+
+        let mut bad = good.clone();
+        bad.heartbeat.as_mut().expect("heartbeat").sat = DEFAULT_SATURATION_CUTOFF;
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::Saturated)
+        );
+
+        let mut bad = good.clone();
+        bad.heartbeat.as_mut().expect("heartbeat").caps.tools = false;
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::Capabilities)
+        );
+
+        let mut price_limited = request.clone();
+        price_limited.max_price_mu = Some(79);
+        assert_eq!(
+            evaluate_eligibility(&good, &price_limited),
+            Err(IneligibilityReason::Price)
+        );
+
+        let mut bad = good.clone();
+        bad.attestation_head = None;
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::AttestationMissing)
+        );
+
+        let mut bad = good;
+        bad.attestation_head
+            .as_mut()
+            .expect("attestation head")
+            .observed_at_millis = 0;
+        let mut stale_attestation = request;
+        stale_attestation.now_millis = DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS + 1;
+        assert_eq!(
+            evaluate_eligibility(&bad, &stale_attestation),
+            Err(IneligibilityReason::AttestationStale)
+        );
+    }
+
+    #[test]
+    fn weighted_p2c_prefers_lower_saturation_then_ttft() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let weights = SelectionWeights::default();
+        let entries = vec![entry_for(1, now, 0.7, 50), entry_for(2, now, 0.2, 500)];
+        let mut rng = ScriptedRng::new([0.0, 0.0]);
+
+        let selected =
+            select_weighted_p2c(&entries, &request, &weights, &mut rng).expect("provider selected");
+        assert_eq!(selected.sampled.len(), 2);
+        assert_eq!(selected.selected.entry.key, entries[1].key);
+
+        let entries = vec![entry_for(1, now, 0.2, 500), entry_for(2, now, 0.2, 100)];
+        let mut rng = ScriptedRng::new([0.0, 0.0]);
+        let selected =
+            select_weighted_p2c(&entries, &request, &weights, &mut rng).expect("provider selected");
+        assert_eq!(selected.selected.entry.key, entries[1].key);
+    }
+
+    #[test]
+    fn weighted_p2c_synthetic_fleet_has_low_load_variance() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let weights = SelectionWeights::default();
+        let entries = (0_u8..10)
+            .map(|idx| entry_for(idx, now, 0.2, 120))
+            .collect::<Vec<_>>();
+        let mut rng = LcgBalancerRng::seeded(0xfeed_cafe);
+        let mut counts = [0_u32; 10];
+
+        for _ in 0..20_000 {
+            let selected = select_weighted_p2c(&entries, &request, &weights, &mut rng)
+                .expect("provider selected");
+            let idx = entries
+                .iter()
+                .position(|entry| entry.key == selected.selected.entry.key)
+                .expect("selected provider in fleet");
+            counts[idx] += 1;
+        }
+
+        let mean = counts.iter().map(|count| f64::from(*count)).sum::<f64>() / counts.len() as f64;
+        let variance = counts
+            .iter()
+            .map(|count| {
+                let delta = f64::from(*count) - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / counts.len() as f64;
+        let coefficient_of_variation = variance.sqrt() / mean;
+        let max_share = f64::from(*counts.iter().max().expect("max count")) / 20_000.0;
+
+        assert!(
+            coefficient_of_variation < 0.06,
+            "counts={counts:?}, cv={coefficient_of_variation}"
+        );
+        assert!(max_share < 0.115, "counts={counts:?}");
     }
 }
