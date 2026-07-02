@@ -226,6 +226,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'fiat_chargeback') {
+      return {
+        type: 'fiatChargeback',
+        value: json,
+      };
+    }
     if (json?.op === 'payout_confirm') {
       return {
         type: 'payoutConfirm',

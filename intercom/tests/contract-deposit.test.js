@@ -298,3 +298,92 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   assert.equal(JSON.stringify(root).includes(ctx.user.publicKey), false);
   assert.equal(JSON.stringify(root).includes('a'.repeat(64)), false);
 });
+
+test('MayhemContract fiatChargeback claws back remaining credits and freezes buyer', async () => {
+  const ctx = await setupDepositContract();
+  await consentUser(ctx, 2);
+
+  const deposit = await execute(
+    ctx.contract,
+    ctx.storage,
+    'fiatDeposit',
+    {
+      op: 'fiat_deposit',
+      rail: 'stripe',
+      who: ctx.user.publicKey,
+      mu: 2_500_000,
+      ext_ref_hash: 'b'.repeat(64),
+      epoch: 1,
+      at: 1_800,
+    },
+    ctx.admin.publicKey,
+    3
+  );
+  assert.equal(deposit.ok, true, deposit.message);
+
+  const chargeback = await execute(
+    ctx.contract,
+    ctx.storage,
+    'fiatChargeback',
+    {
+      op: 'fiat_chargeback',
+      rail: 'stripe',
+      who: ctx.user.publicKey,
+      mu: 3_000_000,
+      ext_ref_hash: 'b'.repeat(64),
+      dispute_ref_hash: 'c'.repeat(64),
+      epoch: 2,
+      at: 3_600,
+    },
+    ctx.admin.publicKey,
+    4
+  );
+  assert.equal(chargeback.ok, true, chargeback.message);
+  assert.equal(chargeback.op, 'fiatChargeback');
+  assert.equal(chargeback.clawback_mu, 2_500_000);
+  assert.equal(chargeback.network_absorbed_mu, 500_000);
+  assert.equal(chargeback.frozen, true);
+  assert.equal(chargeback.deposit_root.length, 64);
+
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}`)).value, {
+    user: ctx.user.publicKey,
+    denom: 'mu_usd',
+    mu: 0,
+    updated_epoch: 2,
+    updated_at: makeTxKey(4),
+    last_deposit_rail: 'stripe',
+    last_chargeback_rail: 'stripe',
+  });
+  assert.deepEqual((await ctx.storage.get(`frozen/${ctx.user.publicKey}`)).value, {
+    user: ctx.user.publicKey,
+    status: 'frozen',
+    reason: 'fiat_chargeback',
+    rail: 'stripe',
+    first_frozen_at: makeTxKey(4),
+    first_frozen_at_seconds: 3_600,
+    updated_at: makeTxKey(4),
+    updated_at_seconds: 3_600,
+    updated_epoch: 2,
+    dispute_count: 1,
+    disputed_mu_cum: 3_000_000,
+    clawback_mu_cum: 2_500_000,
+    network_absorbed_mu_cum: 500_000,
+    last_ext_ref_hash: 'b'.repeat(64),
+    last_dispute_ref_hash: 'c'.repeat(64),
+  });
+
+  const reversalRoot = (await ctx.storage.get('ev/dep/2')).value;
+  assert.equal(reversalRoot.type, 'deposit_root');
+  assert.equal(reversalRoot.reversed, true);
+  assert.equal(reversalRoot.count, 1);
+  assert.equal(reversalRoot.reversal_count, 1);
+  assert.equal(reversalRoot.mu_total, 0);
+  assert.equal(reversalRoot.reversed_mu_total, 3_000_000);
+  assert.equal(reversalRoot.clawback_mu_total, 2_500_000);
+  assert.equal(reversalRoot.network_absorbed_mu_total, 500_000);
+  assert.equal(JSON.stringify(reversalRoot).includes(ctx.user.publicKey), false);
+  assert.equal(JSON.stringify(reversalRoot).includes('c'.repeat(64)), false);
+
+  const frozenDeposit = await depositIntent(ctx, 'memo-frozen', 5);
+  assert.match(frozenDeposit.message, /frozen/i);
+});

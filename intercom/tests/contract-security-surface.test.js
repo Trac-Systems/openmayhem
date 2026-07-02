@@ -234,6 +234,19 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
       },
     ],
     [
+      'fiatChargeback',
+      {
+        op: 'fiat_chargeback',
+        rail: 'stripe',
+        who: provider.publicKey,
+        mu: 1_000_000,
+        ext_ref_hash: 'c'.repeat(64),
+        dispute_ref_hash: 'd'.repeat(64),
+        epoch: 1,
+        at: 3_600,
+      },
+    ],
+    [
       'payoutConfirm',
       {
         op: 'payout_confirm',

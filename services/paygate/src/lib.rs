@@ -163,6 +163,12 @@ pub trait ContractPoster: Send + Sync {
         oracle: &'a OracleKeypair,
         feature: FiatDepositFeature,
     ) -> BoxFuture<'a, Result<ContractPostResult>>;
+
+    fn post_fiat_chargeback<'a>(
+        &'a self,
+        oracle: &'a OracleKeypair,
+        feature: FiatChargebackFeature,
+    ) -> BoxFuture<'a, Result<ContractPostResult>>;
 }
 
 #[derive(Clone)]
@@ -252,6 +258,18 @@ pub struct FiatDepositFeature {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct FiatChargebackFeature {
+    pub op: &'static str,
+    pub rail: &'static str,
+    pub who: String,
+    pub mu: u64,
+    pub ext_ref_hash: String,
+    pub dispute_ref_hash: String,
+    pub epoch: u64,
+    pub at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ContractPostResult {
     pub tx: String,
     pub command_hash: Option<String>,
@@ -280,6 +298,10 @@ struct StripePaymentIntentObject {
     amount: Option<u64>,
     #[serde(default)]
     amount_received: Option<u64>,
+    #[serde(default)]
+    latest_charge: Option<Value>,
+    #[serde(default)]
+    charges: Option<Value>,
     currency: String,
     #[serde(default)]
     metadata: HashMap<String, String>,
@@ -289,11 +311,17 @@ struct StripePaymentIntentObject {
 struct StripeWebhookResponse {
     ok: bool,
     event_id: String,
+    event_type: String,
     duplicate: bool,
     credited: bool,
+    clawed_back: bool,
     ignored: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     payment_intent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    charge: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispute: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mu: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,18 +330,32 @@ struct StripeWebhookResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StripeEventRecord {
+    #[serde(default = "default_stripe_event_record_kind")]
+    kind: String,
     event_id: String,
-    payment_intent: String,
+    #[serde(default)]
+    payment_intent: Option<String>,
+    #[serde(default)]
+    charge: Option<String>,
+    #[serde(default)]
+    dispute: Option<String>,
     who: String,
     mu: u64,
     ext_ref_hash: String,
-    credited_at: u64,
+    #[serde(default)]
+    dispute_ref_hash: Option<String>,
+    #[serde(default)]
+    credited_at: Option<u64>,
+    #[serde(default)]
+    disputed_at: Option<u64>,
 }
 
 #[derive(Debug)]
 struct StripeEventStore {
     seen: HashSet<String>,
     processing: HashSet<String>,
+    deposits_by_payment_intent: HashMap<String, StripeEventRecord>,
+    deposits_by_charge: HashMap<String, StripeEventRecord>,
     path: Option<PathBuf>,
 }
 
@@ -678,6 +720,84 @@ impl PeerRpcContractPoster {
             path.trim_start_matches('/')
         )
     }
+
+    async fn post_feature_value(
+        &self,
+        oracle: &OracleKeypair,
+        command_type: &str,
+        value: Value,
+    ) -> Result<ContractPostResult> {
+        let nonce_response: Value = self
+            .http
+            .get(self.endpoint("contract/nonce"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let nonce = nonce_response
+            .get("nonce")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PaygateError::Contract("nonce response missing nonce".to_owned()))?;
+        let prepared_command = json!({
+            "type": command_type,
+            "value": value,
+        });
+        let prepared: Value = self
+            .http
+            .post(self.endpoint("contract/tx/prepare"))
+            .json(&json!({
+                "prepared_command": prepared_command,
+                "address": oracle.public_key_hex(),
+                "nonce": nonce,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let tx = prepared
+            .get("tx")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PaygateError::Contract("prepare response missing tx".to_owned()))?
+            .to_owned();
+        let command_hash = prepared
+            .get("command_hash")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let signature = oracle.sign_tx_hex(&tx)?;
+        let submitted: Value = self
+            .http
+            .post(self.endpoint("contract/tx"))
+            .json(&json!({
+                "tx": tx,
+                "prepared_command": prepared_command,
+                "address": oracle.public_key_hex(),
+                "signature": signature,
+                "nonce": nonce,
+                "sim": self.simulate,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let result = submitted
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| submitted.clone());
+        let accepted = result.get("ok").and_then(Value::as_bool) == Some(true)
+            || (result.get("local").and_then(Value::as_bool) == Some(true)
+                && result.get("txo").is_some());
+        if !accepted {
+            return Err(PaygateError::Contract(result.to_string()));
+        }
+        Ok(ContractPostResult {
+            tx,
+            command_hash,
+            result,
+        })
+    }
 }
 
 impl ContractPoster for PeerRpcContractPoster {
@@ -687,76 +807,19 @@ impl ContractPoster for PeerRpcContractPoster {
         feature: FiatDepositFeature,
     ) -> BoxFuture<'a, Result<ContractPostResult>> {
         Box::pin(async move {
-            let nonce_response: Value = self
-                .http
-                .get(self.endpoint("contract/nonce"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let nonce = nonce_response
-                .get("nonce")
-                .and_then(Value::as_str)
-                .ok_or_else(|| PaygateError::Contract("nonce response missing nonce".to_owned()))?;
-            let prepared_command = json!({
-                "type": "fiatDeposit",
-                "value": feature,
-            });
-            let prepared: Value = self
-                .http
-                .post(self.endpoint("contract/tx/prepare"))
-                .json(&json!({
-                    "prepared_command": prepared_command,
-                    "address": oracle.public_key_hex(),
-                    "nonce": nonce,
-                }))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let tx = prepared
-                .get("tx")
-                .and_then(Value::as_str)
-                .ok_or_else(|| PaygateError::Contract("prepare response missing tx".to_owned()))?
-                .to_owned();
-            let command_hash = prepared
-                .get("command_hash")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let signature = oracle.sign_tx_hex(&tx)?;
-            let submitted: Value = self
-                .http
-                .post(self.endpoint("contract/tx"))
-                .json(&json!({
-                    "tx": tx,
-                    "prepared_command": prepared_command,
-                    "address": oracle.public_key_hex(),
-                    "signature": signature,
-                    "nonce": nonce,
-                    "sim": self.simulate,
-                }))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let result = submitted
-                .get("result")
-                .cloned()
-                .unwrap_or_else(|| submitted.clone());
-            let accepted = result.get("ok").and_then(Value::as_bool) == Some(true)
-                || (result.get("local").and_then(Value::as_bool) == Some(true)
-                    && result.get("txo").is_some());
-            if !accepted {
-                return Err(PaygateError::Contract(result.to_string()));
-            }
-            Ok(ContractPostResult {
-                tx,
-                command_hash,
-                result,
-            })
+            self.post_feature_value(oracle, "fiatDeposit", serde_json::to_value(feature)?)
+                .await
+        })
+    }
+
+    fn post_fiat_chargeback<'a>(
+        &'a self,
+        oracle: &'a OracleKeypair,
+        feature: FiatChargebackFeature,
+    ) -> BoxFuture<'a, Result<ContractPostResult>> {
+        Box::pin(async move {
+            self.post_feature_value(oracle, "fiatChargeback", serde_json::to_value(feature)?)
+                .await
         })
     }
 }
@@ -937,14 +1000,22 @@ async fn handle_stripe_webhook(
         stripe.webhook_tolerance_seconds,
     )?;
     let event: StripeEventEnvelope = serde_json::from_slice(payload)?;
-    if event.event_type != "payment_intent.succeeded" {
+    let handles_event = matches!(
+        event.event_type.as_str(),
+        "payment_intent.succeeded" | "charge.dispute.created"
+    );
+    if !handles_event {
         return Ok(StripeWebhookResponse {
             ok: true,
             event_id: event.id,
+            event_type: event.event_type,
             duplicate: false,
             credited: false,
+            clawed_back: false,
             ignored: true,
             payment_intent: None,
+            charge: None,
+            dispute: None,
             mu: None,
             contract: None,
         });
@@ -956,28 +1027,40 @@ async fn handle_stripe_webhook(
             return Ok(StripeWebhookResponse {
                 ok: true,
                 event_id: event.id,
+                event_type: event.event_type,
                 duplicate: true,
                 credited: false,
+                clawed_back: false,
                 ignored: false,
                 payment_intent: None,
+                charge: None,
+                dispute: None,
                 mu: None,
                 contract: None,
             });
         }
     }
 
-    let result = handle_stripe_payment_intent_succeeded(state, &event).await;
+    let result = match event.event_type.as_str() {
+        "payment_intent.succeeded" => handle_stripe_payment_intent_succeeded(state, &event).await,
+        "charge.dispute.created" => handle_stripe_dispute_created(state, &event).await,
+        _ => unreachable!("handled Stripe event types checked above"),
+    };
     match result {
         Ok((record, contract)) => {
             let mut store = state.stripe_events.lock().await;
             store.complete(record.clone())?;
             Ok(StripeWebhookResponse {
                 ok: true,
-                event_id: record.event_id,
+                event_id: record.event_id.clone(),
+                event_type: event.event_type,
                 duplicate: false,
-                credited: true,
+                credited: record.kind == "deposit",
+                clawed_back: record.kind == "chargeback",
                 ignored: false,
-                payment_intent: Some(record.payment_intent),
+                payment_intent: record.payment_intent,
+                charge: record.charge,
+                dispute: record.dispute,
                 mu: Some(record.mu),
                 contract: Some(contract),
             })
@@ -1038,6 +1121,7 @@ async fn handle_stripe_payment_intent_succeeded(
     }
     let at = event.created.unwrap_or(unix_epoch_seconds()?);
     let ext_ref_hash = stripe_ext_ref_hash(&event.id, &object.id);
+    let charge = payment_intent_charge_id(&object);
     let feature = FiatDepositFeature {
         op: "fiat_deposit",
         rail: "stripe",
@@ -1053,12 +1137,94 @@ async fn handle_stripe_payment_intent_succeeded(
         .await?;
     Ok((
         StripeEventRecord {
+            kind: "deposit".to_owned(),
             event_id: event.id.clone(),
-            payment_intent: object.id,
+            payment_intent: Some(object.id),
+            charge,
+            dispute: None,
             who,
             mu,
             ext_ref_hash,
-            credited_at: at,
+            dispute_ref_hash: None,
+            credited_at: Some(at),
+            disputed_at: None,
+        },
+        contract,
+    ))
+}
+
+async fn handle_stripe_dispute_created(
+    state: &PaygateState,
+    event: &StripeEventEnvelope,
+) -> Result<(StripeEventRecord, ContractPostResult)> {
+    let object = &event.data.object;
+    let dispute = json_string_field(object, "id")?;
+    let amount_cents = json_u64_field(object, "amount")?;
+    let currency = json_string_field(object, "currency")?;
+    if !currency.eq_ignore_ascii_case("usd") {
+        return Err(PaygateError::Stripe(
+            "Dispute currency must be usd".to_owned(),
+        ));
+    }
+    let charge = stripe_expandable_id(object.get("charge"));
+    let payment_intent = stripe_expandable_id(object.get("payment_intent"));
+    if charge.is_none() && payment_intent.is_none() {
+        return Err(PaygateError::Stripe(
+            "Dispute missing charge/payment_intent reference".to_owned(),
+        ));
+    }
+    let deposit = {
+        let store = state.stripe_events.lock().await;
+        store.lookup_deposit(payment_intent.as_deref(), charge.as_deref())
+    }
+    .ok_or_else(|| PaygateError::Stripe("Dispute original deposit not found".to_owned()))?;
+    let mu = amount_cents
+        .checked_mul(MU_PER_USD_CENT)
+        .ok_or_else(|| PaygateError::Stripe("Dispute amount overflow".to_owned()))?;
+    if mu == 0 {
+        return Err(PaygateError::Stripe(
+            "Dispute amount must be positive".to_owned(),
+        ));
+    }
+    let at = event
+        .created
+        .or_else(|| object.get("created").and_then(Value::as_u64))
+        .unwrap_or(unix_epoch_seconds()?);
+    let dispute_ref_hash = stripe_dispute_ref_hash(
+        &event.id,
+        &dispute,
+        charge
+            .as_deref()
+            .or(payment_intent.as_deref())
+            .unwrap_or(""),
+    );
+    let feature = FiatChargebackFeature {
+        op: "fiat_chargeback",
+        rail: "stripe",
+        who: deposit.who.clone(),
+        mu,
+        ext_ref_hash: deposit.ext_ref_hash.clone(),
+        dispute_ref_hash: dispute_ref_hash.clone(),
+        epoch: epoch_for_at(at, state.config.epoch_seconds),
+        at,
+    };
+    let contract = state
+        .contract
+        .post_fiat_chargeback(&state.oracle, feature)
+        .await?;
+    Ok((
+        StripeEventRecord {
+            kind: "chargeback".to_owned(),
+            event_id: event.id.clone(),
+            payment_intent: payment_intent.or(deposit.payment_intent),
+            charge: charge.or(deposit.charge),
+            dispute: Some(dispute),
+            who: deposit.who,
+            mu,
+            ext_ref_hash: deposit.ext_ref_hash,
+            dispute_ref_hash: Some(dispute_ref_hash),
+            credited_at: None,
+            disputed_at: Some(at),
         },
         contract,
     ))
@@ -1145,6 +1311,8 @@ impl StripeEventStore {
         Self {
             seen: HashSet::new(),
             processing: HashSet::new(),
+            deposits_by_payment_intent: HashMap::new(),
+            deposits_by_charge: HashMap::new(),
             path: None,
         }
     }
@@ -1153,6 +1321,8 @@ impl StripeEventStore {
         let mut store = Self {
             seen: HashSet::new(),
             processing: HashSet::new(),
+            deposits_by_payment_intent: HashMap::new(),
+            deposits_by_charge: HashMap::new(),
             path: Some(path.to_path_buf()),
         };
         if !path.exists() {
@@ -1161,7 +1331,8 @@ impl StripeEventStore {
         let text = fs::read_to_string(path)?;
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
             let record: StripeEventRecord = serde_json::from_str(line)?;
-            store.seen.insert(record.event_id);
+            store.seen.insert(record.event_id.clone());
+            store.index_record(record);
         }
         Ok(store)
     }
@@ -1188,12 +1359,36 @@ impl StripeEventStore {
                 writeln!(file, "{}", serde_json::to_string(&record)?)?;
                 file.flush()?;
             }
+            self.index_record(record);
         }
         Ok(())
     }
 
     fn fail(&mut self, event_id: &str) {
         self.processing.remove(event_id);
+    }
+
+    fn index_record(&mut self, record: StripeEventRecord) {
+        if record.kind != "deposit" {
+            return;
+        }
+        if let Some(payment_intent) = &record.payment_intent {
+            self.deposits_by_payment_intent
+                .insert(payment_intent.clone(), record.clone());
+        }
+        if let Some(charge) = &record.charge {
+            self.deposits_by_charge.insert(charge.clone(), record);
+        }
+    }
+
+    fn lookup_deposit(
+        &self,
+        payment_intent: Option<&str>,
+        charge: Option<&str>,
+    ) -> Option<StripeEventRecord> {
+        payment_intent
+            .and_then(|id| self.deposits_by_payment_intent.get(id).cloned())
+            .or_else(|| charge.and_then(|id| self.deposits_by_charge.get(id).cloned()))
     }
 }
 
@@ -1253,6 +1448,21 @@ fn parse_u64(field: &str, value: &str) -> Result<u64> {
         .trim()
         .parse()
         .map_err(|err| PaygateError::InvalidConfig(format!("{field} is invalid: {err}")))
+}
+
+fn json_string_field(value: &Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| PaygateError::Stripe(format!("Stripe object missing {field}")))
+}
+
+fn json_u64_field(value: &Value, field: &str) -> Result<u64> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| PaygateError::Stripe(format!("Stripe object missing {field}")))
 }
 
 fn decode_seed(seed_hex: &str) -> Result<[u8; 32]> {
@@ -1354,6 +1564,45 @@ fn stripe_ext_ref_hash(event_id: &str, payment_intent: &str) -> String {
     hasher.update(b"\0");
     hasher.update(payment_intent.as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+fn stripe_dispute_ref_hash(event_id: &str, dispute: &str, source: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mayhem-stripe-dispute-v1");
+    hasher.update(event_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(dispute.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(source.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn stripe_expandable_id(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(id) if !id.is_empty() => Some(id.to_owned()),
+        Value::Object(object) => object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn payment_intent_charge_id(object: &StripePaymentIntentObject) -> Option<String> {
+    stripe_expandable_id(object.latest_charge.as_ref()).or_else(|| {
+        object
+            .charges
+            .as_ref()
+            .and_then(|charges| charges.get("data"))
+            .and_then(Value::as_array)
+            .and_then(|data| data.first())
+            .and_then(|charge| stripe_expandable_id(Some(charge)))
+    })
+}
+
+fn default_stripe_event_record_kind() -> String {
+    "deposit".to_owned()
 }
 
 fn epoch_for_at(at: u64, epoch_seconds: u64) -> u64 {

@@ -527,6 +527,21 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('fiatChargeback', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        rail: { type: 'string', min: 1, max: 64 },
+        who: { type: 'string', min: 1, max: 128 },
+        mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        ext_ref_hash: { type: 'string', min: 1, max: 128 },
+        dispute_ref_hash: { type: 'string', min: 1, max: 128 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
     this.addSchema('payoutConfirm', {
       value: {
         $$strict: true,
@@ -2089,6 +2104,98 @@ class MayhemContract extends Contract {
     };
   }
 
+  async fiatChargeback() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!FIAT_DEPOSIT_RAILS.has(this.value.rail)) return new Error('Unsupported fiat chargeback rail.');
+    if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid chargeback account.');
+    if (!this.isSafeKeyPart(this.value.ext_ref_hash)) return new Error('Invalid external reference hash.');
+    if (!this.isSafeKeyPart(this.value.dispute_ref_hash)) return new Error('Invalid dispute reference hash.');
+
+    const balance = await this.balanceRecord(this.value.who);
+    const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who);
+    if (balanceError) return balanceError;
+    const clawbackMu = Math.min(balance.mu, this.value.mu);
+    const networkAbsorbedMu = this.value.mu - clawbackMu;
+    const nextMu = this.safeSubMu(balance.mu, clawbackMu);
+    if (nextMu instanceof Error) return nextMu;
+
+    const leaf = await this.depositLeafHash({
+      rail: this.value.rail,
+      user_hash: await this.opaqueHash('deposit-user', this.value.who),
+      mu: this.value.mu,
+      clawback_mu: clawbackMu,
+      network_absorbed_mu: networkAbsorbedMu,
+      ext_ref_hash: this.value.ext_ref_hash,
+      dispute_ref_hash: this.value.dispute_ref_hash,
+      reversed: true,
+    });
+    const depositRoot = await this.nextDepositReversalRoot({
+      epoch: this.value.epoch,
+      leaf,
+      disputedMu: this.value.mu,
+      clawbackMu,
+      absorbedMu: networkAbsorbedMu,
+      at: this.value.at,
+    });
+    if (depositRoot instanceof Error) return depositRoot;
+
+    const frozen = await this.get(`frozen/${this.value.who}`);
+    const disputedMuCum = this.safeAddMu(frozen?.disputed_mu_cum ?? 0, this.value.mu);
+    if (disputedMuCum instanceof Error) return disputedMuCum;
+    const clawbackMuCum = this.safeAddMu(frozen?.clawback_mu_cum ?? 0, clawbackMu);
+    if (clawbackMuCum instanceof Error) return clawbackMuCum;
+    const absorbedMuCum = this.safeAddMu(frozen?.network_absorbed_mu_cum ?? 0, networkAbsorbedMu);
+    if (absorbedMuCum instanceof Error) return absorbedMuCum;
+    const freezeRecord = {
+      user: this.value.who,
+      status: 'frozen',
+      reason: 'fiat_chargeback',
+      rail: this.value.rail,
+      first_frozen_at: frozen?.first_frozen_at ?? this.tx,
+      first_frozen_at_seconds: frozen?.first_frozen_at_seconds ?? this.value.at,
+      updated_at: this.tx,
+      updated_at_seconds: this.value.at,
+      updated_epoch: Math.max(frozen?.updated_epoch ?? 0, this.value.epoch),
+      dispute_count: (frozen?.dispute_count ?? 0) + 1,
+      disputed_mu_cum: disputedMuCum,
+      clawback_mu_cum: clawbackMuCum,
+      network_absorbed_mu_cum: absorbedMuCum,
+      last_ext_ref_hash: this.value.ext_ref_hash,
+      last_dispute_ref_hash: this.value.dispute_ref_hash,
+    };
+
+    await this.put(`bal/${this.value.who}`, {
+      ...balance,
+      mu: nextMu,
+      updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_chargeback_rail: this.value.rail,
+    });
+    await this.put(`frozen/${this.value.who}`, freezeRecord);
+    await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    console.log('mayhem fiatChargeback', {
+      rail: this.value.rail,
+      who: this.value.who,
+      mu: this.value.mu,
+      clawback_mu: clawbackMu,
+      network_absorbed_mu: networkAbsorbedMu,
+      epoch: this.value.epoch,
+    });
+    return {
+      ok: true,
+      op: 'fiatChargeback',
+      rail: this.value.rail,
+      who: this.value.who,
+      mu: this.value.mu,
+      clawback_mu: clawbackMu,
+      network_absorbed_mu: networkAbsorbedMu,
+      frozen: true,
+      epoch: this.value.epoch,
+      deposit_root: depositRoot.merkle_root,
+    };
+  }
+
   async payoutConfirm() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
@@ -2270,6 +2377,8 @@ class MayhemContract extends Contract {
     if (!consent || consent.ver !== rules.ver || consent.hash !== rules.hash) {
       return new Error(`Consent required for rules version ${rules.ver}.`);
     }
+    const frozen = await this.get(`frozen/${sender}`);
+    if (frozen?.status === 'frozen') return new Error('Account frozen.');
     return null;
   }
 
@@ -3239,6 +3348,14 @@ class MayhemContract extends Contract {
     return sum;
   }
 
+  safeSubMu(a, b) {
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || b < 0) {
+      return new Error('mu values must be safe integers.');
+    }
+    if (b > a) return new Error('mu value underflow.');
+    return a - b;
+  }
+
   sortedMapEntries(map) {
     return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b));
   }
@@ -3355,6 +3472,45 @@ class MayhemContract extends Contract {
       merkle_root: merkleRoot,
       count,
       mu_total: muTotal,
+      ts: at,
+      updated_at: this.tx,
+    };
+  }
+
+  async nextDepositReversalRoot({ epoch, leaf, disputedMu, clawbackMu, absorbedMu, at }) {
+    const current = await this.get(`ev/dep/${epoch}`);
+    if (current && current.type !== 'deposit_root') {
+      return new Error('Invalid deposit evidence root.');
+    }
+    const count = (current?.count ?? 0) + 1;
+    const reversedMuTotal = this.safeAddMu(current?.reversed_mu_total ?? 0, disputedMu);
+    if (reversedMuTotal instanceof Error) return reversedMuTotal;
+    const clawbackMuTotal = this.safeAddMu(current?.clawback_mu_total ?? 0, clawbackMu);
+    if (clawbackMuTotal instanceof Error) return clawbackMuTotal;
+    const networkAbsorbedMuTotal = this.safeAddMu(current?.network_absorbed_mu_total ?? 0, absorbedMu);
+    if (networkAbsorbedMuTotal instanceof Error) return networkAbsorbedMuTotal;
+    const merkleRoot = current
+      ? await this.opaqueHash('mayhem-deposit-root-v1', {
+        previous_root: current.merkle_root,
+        leaf,
+        count,
+      })
+      : leaf;
+    return {
+      ...(current ?? {
+        type: 'deposit_root',
+        epoch,
+        mu_total: 0,
+      }),
+      type: 'deposit_root',
+      epoch,
+      merkle_root: merkleRoot,
+      count,
+      reversed: true,
+      reversal_count: (current?.reversal_count ?? 0) + 1,
+      reversed_mu_total: reversedMuTotal,
+      clawback_mu_total: clawbackMuTotal,
+      network_absorbed_mu_total: networkAbsorbedMuTotal,
       ts: at,
       updated_at: this.tx,
     };

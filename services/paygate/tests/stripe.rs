@@ -12,7 +12,8 @@ use axum::{
 };
 use mayhem_paygate::{
     paygate_router, stripe_signature_header, BoxFuture, ContractPostResult, ContractPoster,
-    FiatDepositFeature, OracleKeypair, PaygateConfig, PaygateState, RailConfig, StripeSettings,
+    FiatChargebackFeature, FiatDepositFeature, OracleKeypair, PaygateConfig, PaygateState,
+    RailConfig, StripeSettings,
 };
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -33,6 +34,7 @@ struct StripeRequest {
 #[derive(Clone, Default)]
 struct RecordingContractPoster {
     deposits: Arc<Mutex<Vec<FiatDepositFeature>>>,
+    chargebacks: Arc<Mutex<Vec<FiatChargebackFeature>>>,
 }
 
 impl ContractPoster for RecordingContractPoster {
@@ -54,6 +56,30 @@ impl ContractPoster for RecordingContractPoster {
                     "mu": feature.mu,
                     "epoch": feature.epoch,
                     "deposit_root": "3".repeat(64),
+                }),
+            })
+        })
+    }
+
+    fn post_fiat_chargeback<'a>(
+        &'a self,
+        _oracle: &'a OracleKeypair,
+        feature: FiatChargebackFeature,
+    ) -> BoxFuture<'a, mayhem_paygate::Result<ContractPostResult>> {
+        Box::pin(async move {
+            self.chargebacks.lock().await.push(feature.clone());
+            Ok(ContractPostResult {
+                tx: "4".repeat(64),
+                command_hash: Some("5".repeat(64)),
+                result: json!({
+                    "ok": true,
+                    "op": "fiatChargeback",
+                    "rail": feature.rail,
+                    "who": feature.who,
+                    "mu": feature.mu,
+                    "clawback_mu": feature.mu,
+                    "network_absorbed_mu": 0,
+                    "deposit_root": "6".repeat(64),
                 }),
             })
         })
@@ -225,6 +251,7 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
             "object": {
                 "id": "pi_test_replay",
                 "object": "payment_intent",
+                "latest_charge": "ch_test_replay",
                 "amount_received": 250,
                 "currency": "usd",
                 "metadata": {
@@ -275,4 +302,126 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
         std::fs::read_to_string(temp.path().join("stripe-events.jsonl")).expect("event log");
     assert_eq!(event_log.lines().count(), 1);
     assert!(event_log.contains("evt_test_replay"));
+}
+
+#[tokio::test]
+async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let poster = Arc::new(RecordingContractPoster::default());
+    let state = PaygateState::try_new_with_contract_poster(
+        test_config(
+            "http://127.0.0.1:9".to_owned(),
+            temp.path().join("stripe-events.jsonl"),
+        ),
+        OracleKeypair::from_seed_hex(&"33".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+    let app = paygate_router(state);
+    let deposit_payload = json!({
+        "id": "evt_test_deposit_before_dispute",
+        "object": "event",
+        "type": "payment_intent.succeeded",
+        "created": 3_600,
+        "data": {
+            "object": {
+                "id": "pi_test_dispute",
+                "object": "payment_intent",
+                "latest_charge": "ch_test_dispute",
+                "amount_received": 250,
+                "currency": "usd",
+                "metadata": {
+                    "mayhem_who": "c".repeat(64),
+                    "mayhem_mu": "2500000",
+                    "mayhem_denom": "mu_usd"
+                }
+            }
+        }
+    })
+    .to_string();
+    let deposit_signature =
+        stripe_signature_header("whsec_test", deposit_payload.as_bytes(), now_seconds())
+            .expect("deposit sig");
+    let deposit_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/stripe/webhook")
+                .header("stripe-signature", &deposit_signature)
+                .body(Body::from(deposit_payload.clone()))
+                .expect("deposit request builds"),
+        )
+        .await
+        .expect("deposit response");
+    assert_eq!(deposit_response.status(), StatusCode::OK);
+
+    let dispute_payload = json!({
+        "id": "evt_test_dispute_replay",
+        "object": "event",
+        "type": "charge.dispute.created",
+        "created": 7_200,
+        "data": {
+            "object": {
+                "id": "dp_test_replay",
+                "object": "dispute",
+                "amount": 250,
+                "currency": "usd",
+                "charge": "ch_test_dispute",
+                "payment_intent": "pi_test_dispute",
+                "reason": "fraudulent",
+                "status": "needs_response"
+            }
+        }
+    })
+    .to_string();
+    let dispute_signature =
+        stripe_signature_header("whsec_test", dispute_payload.as_bytes(), now_seconds())
+            .expect("dispute sig");
+
+    for expected_duplicate in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/stripe/webhook")
+                    .header("stripe-signature", &dispute_signature)
+                    .body(Body::from(dispute_payload.clone()))
+                    .expect("dispute request builds"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: Value = serde_json::from_slice(&bytes).expect("response JSON");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["duplicate"], expected_duplicate);
+        if !expected_duplicate {
+            assert_eq!(body["clawed_back"], true);
+            assert_eq!(body["dispute"], "dp_test_replay");
+            assert_eq!(body["charge"], "ch_test_dispute");
+        }
+    }
+
+    let deposits = poster.deposits.lock().await;
+    let chargebacks = poster.chargebacks.lock().await;
+    assert_eq!(deposits.len(), 1);
+    assert_eq!(chargebacks.len(), 1);
+    assert_eq!(chargebacks[0].op, "fiat_chargeback");
+    assert_eq!(chargebacks[0].rail, "stripe");
+    assert_eq!(chargebacks[0].who, "c".repeat(64));
+    assert_eq!(chargebacks[0].mu, 2_500_000);
+    assert_eq!(chargebacks[0].ext_ref_hash, deposits[0].ext_ref_hash);
+    assert_eq!(chargebacks[0].dispute_ref_hash.len(), 64);
+    assert_eq!(chargebacks[0].epoch, 3);
+    assert_eq!(chargebacks[0].at, 7_200);
+
+    let event_log =
+        std::fs::read_to_string(temp.path().join("stripe-events.jsonl")).expect("event log");
+    assert_eq!(event_log.lines().count(), 2);
+    assert!(event_log.contains("evt_test_deposit_before_dispute"));
+    assert!(event_log.contains("evt_test_dispute_replay"));
 }
