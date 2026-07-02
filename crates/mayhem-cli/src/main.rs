@@ -2,6 +2,7 @@
 
 mod catalog;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -32,6 +33,8 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::sleep;
 
+const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
+
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
 #[command(about = "Mayhem network CLI")]
@@ -57,6 +60,15 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ProviderCommands>,
     },
+    /// Show provider payout evidence and treasury fee sweeps.
+    Payouts(PayoutsArgs),
+    /// Show provider earnings, holdback, paid, and released balances.
+    Earnings(EarningsArgs),
+    /// Receipt audit commands.
+    Receipts {
+        #[command(subcommand)]
+        command: ReceiptsCommands,
+    },
     /// Inspect, hash, and re-consent to router rules.
     Rules {
         #[command(subcommand)]
@@ -79,9 +91,116 @@ enum RulesCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum ReceiptsCommands {
+    /// Export an epoch audit bundle and verify it against ev/* roots.
+    Export(ReceiptsExportArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum CatalogCommands {
     /// Verify catalog structure, maintainer signature, canary refs, and optional dev downloads.
     Verify(CatalogVerifyArgs),
+}
+
+#[derive(Debug, Parser)]
+struct PayoutsArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Show one payout evidence epoch.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    /// Print machine-readable payout evidence.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct EarningsArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Restrict output to one provider public key.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Print machine-readable earnings.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ReceiptsExportArgs {
+    /// Epoch to export and verify.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Gateway base URL used to read /mayhem/receipts when --receipts-file is omitted.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Write the audit bundle to this file. Defaults to stdout.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Read receipt entries from a JSON file instead of the gateway.
+    #[arg(long, value_name = "PATH")]
+    receipts_file: Option<PathBuf>,
+
+    /// Read deposit entries from a JSON file.
+    #[arg(long, value_name = "PATH")]
+    deposits_file: Option<PathBuf>,
+
+    /// Read payout entries from a JSON file.
+    #[arg(long, value_name = "PATH")]
+    payouts_file: Option<PathBuf>,
+
+    /// Read prior provider cumulative earnings as a JSON object.
+    #[arg(long, value_name = "PATH")]
+    prior_earnings_file: Option<PathBuf>,
+
+    /// Read ev/* records from a JSON file instead of peer RPC.
+    #[arg(long, value_name = "PATH")]
+    evidence_file: Option<PathBuf>,
+
+    /// Fee split in basis points for the independent root recompute.
+    #[arg(long, default_value_t = 1_500)]
+    fee_bps: u64,
+
+    /// Prior fee/cum.mu before this epoch.
+    #[arg(long, default_value_t = 0)]
+    prior_fee_cum_mu: u64,
+
+    /// Path to intercom/scripts/recompute-epoch-roots.mjs.
+    #[arg(long, value_name = "PATH")]
+    verifier_script: Option<PathBuf>,
+
+    /// Only write the bundle; do not run independent root verification.
+    #[arg(long)]
+    no_verify: bool,
+
+    /// Print a machine-readable export report.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -456,6 +575,11 @@ async fn main() -> Result<()> {
         Commands::Provider { command } => match *command {
             ProviderCommands::Start(args) => provider_start(args).await,
         },
+        Commands::Payouts(args) => payouts(args).await,
+        Commands::Earnings(args) => earnings(args).await,
+        Commands::Receipts { command } => match command {
+            ReceiptsCommands::Export(args) => receipts_export(args).await,
+        },
         Commands::Rules { command } => match command {
             RulesCommands::Hash(args) => rules_hash(args),
             RulesCommands::Review(args) => rules_review(args).await,
@@ -768,6 +892,564 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
     Ok(())
 }
 
+async fn payouts(args: PayoutsArgs) -> Result<()> {
+    let rpc_url = resolve_cli_rpc_url(args.home.as_ref(), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let report = if let Some(epoch) = args.epoch {
+        json!({
+            "rpc_url": rpc_url,
+            "epoch": epoch,
+            "pay": read_state_value(&rpc, &format!("ev/pay/{epoch}")).await?,
+            "fee": read_state_value(&rpc, &format!("ev/fee/{epoch}")).await?,
+        })
+    } else {
+        let mut pay = read_prefix_entries(&rpc, "ev/pay/").await?;
+        pay.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut fee_sweeps = read_prefix_entries(&rpc, "ev/fee/")
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .value
+                    .get("sweep_msb_tx_hash")
+                    .and_then(Value::as_str)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        fee_sweeps.sort_by(|a, b| a.key.cmp(&b.key));
+        json!({
+            "rpc_url": rpc_url,
+            "pay": pay,
+            "fee_sweeps": fee_sweeps,
+        })
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_payouts_report(&report);
+    }
+    Ok(())
+}
+
+async fn earnings(args: EarningsArgs) -> Result<()> {
+    let rpc_url = resolve_cli_rpc_url(args.home.as_ref(), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let records = if let Some(provider) = &args.provider {
+        read_state_value(&rpc, &format!("earn/{provider}"))
+            .await?
+            .into_iter()
+            .map(|value| serde_json::from_value(value).context("parsing earning record"))
+            .collect::<Result<Vec<LedgerEarningRecord>>>()?
+    } else {
+        read_prefix_values(&rpc, "earn/").await?
+    };
+    let mut views = records
+        .into_iter()
+        .map(earning_view)
+        .collect::<Result<Vec<_>>>()?;
+    views.sort_by(|a, b| a.provider.cmp(&b.provider));
+    let report = json!({
+        "rpc_url": rpc_url,
+        "earnings": views,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_earnings_report(&report);
+    }
+    Ok(())
+}
+
+async fn receipts_export(args: ReceiptsExportArgs) -> Result<()> {
+    let deposits = read_optional_json_array(args.deposits_file.as_deref(), "deposits")?;
+    let receipts = read_receipts_for_export(&args).await?;
+    let payouts = read_optional_json_array(args.payouts_file.as_deref(), "payouts")?;
+    let prior_earnings = read_prior_earnings(args.prior_earnings_file.as_deref())?;
+    let bundle = EpochAuditBundle {
+        epoch: args.epoch,
+        fee_bps: args.fee_bps,
+        deposits,
+        receipts,
+        payouts,
+        prior_earnings,
+        prior_fee_cum_mu: args.prior_fee_cum_mu,
+    };
+
+    let output_path = args
+        .output
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
+    if let Some(path) = &output_path {
+        write_json_file(path, &bundle)?;
+    }
+
+    let mut cleanup_path = None;
+    let verifier_input_path = if let Some(path) = &output_path {
+        path.clone()
+    } else if args.no_verify {
+        PathBuf::new()
+    } else {
+        let path = temp_audit_bundle_path(args.epoch)?;
+        write_json_file(&path, &bundle)?;
+        cleanup_path = Some(path.clone());
+        path
+    };
+
+    let mut report = ReceiptsExportReport {
+        bundle,
+        bundle_path: output_path.clone(),
+        recomputed: None,
+        evidence: None,
+        checks: Vec::new(),
+        verified: false,
+    };
+
+    if !args.no_verify {
+        let verifier_script = args
+            .verifier_script
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("intercom/scripts/recompute-epoch-roots.mjs"))?;
+        let verifier_script = absolutize(verifier_script)?;
+        let recomputed = run_epoch_recompute_script(&verifier_script, &verifier_input_path).await?;
+        let evidence = read_evidence_for_export(&args).await?;
+        let checks = verify_epoch_evidence(args.epoch, &recomputed, &evidence);
+        let verified = checks.iter().all(|check| check.ok);
+        report.recomputed = Some(recomputed);
+        report.evidence = Some(evidence);
+        report.checks = checks;
+        report.verified = verified;
+        if !verified {
+            bail!(
+                "exported receipt bundle did not verify against ev/* records; rerun with --json for details"
+            );
+        }
+    }
+
+    if let Some(path) = cleanup_path {
+        let _ = fs::remove_file(path);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if output_path.is_none() {
+        println!("{}", serde_json::to_string_pretty(&report.bundle)?);
+    } else if report.verified {
+        println!(
+            "Receipt audit bundle verified for epoch {}: {} checks matched.",
+            args.epoch,
+            report.checks.len()
+        );
+    } else {
+        println!("Receipt audit bundle written for epoch {}.", args.epoch);
+    }
+    Ok(())
+}
+
+fn resolve_cli_rpc_url(home: Option<&PathBuf>, rpc_url: Option<&str>) -> Result<String> {
+    if let Some(rpc_url) = rpc_url {
+        if !rpc_url.trim().is_empty() {
+            return Ok(rpc_url.to_owned());
+        }
+    }
+    let home = home.cloned().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    Ok(config
+        .and_then(|config| config.network)
+        .and_then(|network| network.rpc_url)
+        .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned()))
+}
+
+fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
+    let locked = record
+        .held_mu
+        .checked_add(record.paid_cum_mu)
+        .context("earning held_mu + paid_cum_mu overflowed")?;
+    if record.total_mu < locked {
+        bail!(
+            "earning record for {} violates total >= held + paid",
+            record.provider
+        );
+    }
+    Ok(EarningsView {
+        provider: record.provider,
+        denom: record.denom,
+        total_mu: record.total_mu,
+        held_mu: record.held_mu,
+        paid_cum_mu: record.paid_cum_mu,
+        released_mu: record.total_mu - locked,
+        holdbacks: record.holdbacks,
+        updated_epoch: record.updated_epoch,
+        last_payout_msb_tx_hash: record.last_payout_msb_tx_hash,
+    })
+}
+
+fn print_payouts_report(report: &Value) {
+    if let Some(epoch) = report.get("epoch").and_then(Value::as_u64) {
+        println!("Payout evidence for epoch {epoch}");
+        print_optional_evidence("pay", report.get("pay"));
+        print_optional_evidence("fee", report.get("fee"));
+        return;
+    }
+    println!("Payout evidence");
+    for entry in report
+        .get("pay")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = entry.get("key").and_then(Value::as_str).unwrap_or("");
+        let value = entry.get("value").unwrap_or(&Value::Null);
+        println!(
+            "{key}: count={} mu_total={} root={}",
+            value.get("count").and_then(Value::as_u64).unwrap_or(0),
+            value.get("mu_total").and_then(Value::as_u64).unwrap_or(0),
+            value
+                .get("merkle_root")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        );
+    }
+    for entry in report
+        .get("fee_sweeps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = entry.get("key").and_then(Value::as_str).unwrap_or("");
+        let value = entry.get("value").unwrap_or(&Value::Null);
+        println!(
+            "{key}: fee sweep mu={} msb_tx={}",
+            value.get("sweep_mu").and_then(Value::as_u64).unwrap_or(0),
+            value
+                .get("sweep_msb_tx_hash")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        );
+    }
+}
+
+fn print_optional_evidence(label: &str, value: Option<&Value>) {
+    match value {
+        Some(Value::Null) | None => println!("{label}: missing"),
+        Some(value) => println!(
+            "{label}: {}",
+            serde_json::to_string(value).unwrap_or_default()
+        ),
+    }
+}
+
+fn print_earnings_report(report: &Value) {
+    println!("Provider earnings");
+    for entry in report
+        .get("earnings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "{}: total={} held={} paid={} released={} {}",
+            entry.get("provider").and_then(Value::as_str).unwrap_or(""),
+            entry.get("total_mu").and_then(Value::as_u64).unwrap_or(0),
+            entry.get("held_mu").and_then(Value::as_u64).unwrap_or(0),
+            entry
+                .get("paid_cum_mu")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            entry
+                .get("released_mu")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            entry
+                .get("denom")
+                .and_then(Value::as_str)
+                .unwrap_or("mu_usd")
+        );
+    }
+}
+
+async fn read_receipts_for_export(args: &ReceiptsExportArgs) -> Result<Vec<Value>> {
+    if let Some(path) = args.receipts_file.as_deref() {
+        return read_json_array(path, "receipts");
+    }
+    let base = args
+        .gateway_url
+        .as_deref()
+        .unwrap_or(DEFAULT_GATEWAY_URL)
+        .trim_end_matches('/');
+    let url = format!("{base}/mayhem/receipts");
+    let response: Value = reqwest::get(&url)
+        .await
+        .with_context(|| format!("fetching {url}"))?
+        .error_for_status()
+        .with_context(|| format!("gateway returned an error for {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("parsing {url} response"))?;
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("gateway /mayhem/receipts response did not include data[]")
+}
+
+fn read_optional_json_array(path: Option<&Path>, label: &str) -> Result<Vec<Value>> {
+    match path {
+        Some(path) => read_json_array(path, label),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn read_json_array(path: &Path, label: &str) -> Result<Vec<Value>> {
+    let value = read_json_file(path)?;
+    if let Some(array) = value.as_array() {
+        return Ok(array.clone());
+    }
+    if let Some(array) = value.get("data").and_then(Value::as_array) {
+        return Ok(array.clone());
+    }
+    bail!(
+        "{label} file {} must be a JSON array or object with data[]",
+        path.display()
+    );
+}
+
+fn read_prior_earnings(path: Option<&Path>) -> Result<BTreeMap<String, u64>> {
+    let Some(path) = path else {
+        return Ok(BTreeMap::new());
+    };
+    let value = read_json_file(path)?;
+    let object = value
+        .as_object()
+        .with_context(|| format!("{} must contain a JSON object", path.display()))?;
+    let mut out = BTreeMap::new();
+    for (provider, value) in object {
+        let mu = value
+            .as_u64()
+            .or_else(|| value.get("total_mu").and_then(Value::as_u64))
+            .with_context(|| {
+                format!("prior earning for {provider} must be a u64 or record.total_mu")
+            })?;
+        out.insert(provider.clone(), mu);
+    }
+    Ok(out)
+}
+
+async fn read_evidence_for_export(args: &ReceiptsExportArgs) -> Result<EpochEvidenceSnapshot> {
+    if let Some(path) = args.evidence_file.as_deref() {
+        return read_evidence_file(path, args.epoch);
+    }
+    let rpc_url = resolve_cli_rpc_url(args.home.as_ref(), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    Ok(EpochEvidenceSnapshot {
+        dep: read_state_value(&rpc, &format!("ev/dep/{}", args.epoch)).await?,
+        r#use: read_state_value(&rpc, &format!("ev/use/{}", args.epoch)).await?,
+        earn: read_state_value(&rpc, &format!("ev/earn/{}", args.epoch)).await?,
+        fee: read_state_value(&rpc, &format!("ev/fee/{}", args.epoch)).await?,
+        pay: read_state_value(&rpc, &format!("ev/pay/{}", args.epoch)).await?,
+    })
+}
+
+fn read_evidence_file(path: &Path, epoch: u64) -> Result<EpochEvidenceSnapshot> {
+    let value = read_json_file(path)?;
+    Ok(EpochEvidenceSnapshot {
+        dep: evidence_record(&value, epoch, "dep"),
+        r#use: evidence_record(&value, epoch, "use"),
+        earn: evidence_record(&value, epoch, "earn"),
+        fee: evidence_record(&value, epoch, "fee"),
+        pay: evidence_record(&value, epoch, "pay"),
+    })
+}
+
+fn evidence_record(value: &Value, epoch: u64, kind: &str) -> Option<Value> {
+    value
+        .get(kind)
+        .cloned()
+        .or_else(|| value.get(format!("ev/{kind}/{epoch}")).cloned())
+}
+
+fn read_json_file(path: &Path) -> Result<Value> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(value)?)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn temp_audit_bundle_path(epoch: u64) -> Result<PathBuf> {
+    Ok(env::temp_dir().join(format!(
+        "mayhem-receipts-export-{epoch}-{}-{}.json",
+        std::process::id(),
+        unix_epoch_millis()?
+    )))
+}
+
+async fn run_epoch_recompute_script(script: &Path, bundle: &Path) -> Result<Value> {
+    let output = Command::new("node")
+        .arg(script)
+        .arg(bundle)
+        .output()
+        .await
+        .with_context(|| format!("running {}", script.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{} failed: {}", script.display(), stderr.trim());
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parsing {} output", script.display()))
+}
+
+fn verify_epoch_evidence(
+    epoch: u64,
+    recomputed: &Value,
+    evidence: &EpochEvidenceSnapshot,
+) -> Vec<EvidenceCheck> {
+    let roots = &recomputed["roots"];
+    let totals = &recomputed["totals"];
+    let mut checks = Vec::new();
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/dep/{epoch}.merkle_root"),
+        &roots["dep"],
+        evidence.dep.as_ref(),
+        "merkle_root",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/dep/{epoch}.count"),
+        &totals["dep_count"],
+        evidence.dep.as_ref(),
+        "count",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/dep/{epoch}.mu_total"),
+        &totals["dep_mu"],
+        evidence.dep.as_ref(),
+        "mu_total",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/use/{epoch}.merkle_root"),
+        &roots["use"],
+        evidence.r#use.as_ref(),
+        "merkle_root",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/use/{epoch}.sessions"),
+        &totals["use_count"],
+        evidence.r#use.as_ref(),
+        "sessions",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/use/{epoch}.mu_total"),
+        &totals["use_mu"],
+        evidence.r#use.as_ref(),
+        "mu_total",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/use/{epoch}.providers"),
+        &totals["provider_count"],
+        evidence.r#use.as_ref(),
+        "providers",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/earn/{epoch}.merkle_root"),
+        &roots["earn"],
+        evidence.earn.as_ref(),
+        "merkle_root",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/earn/{epoch}.provider_count"),
+        &totals["provider_count"],
+        evidence.earn.as_ref(),
+        "provider_count",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/earn/{epoch}.mu_cum_total"),
+        &totals["earn_mu"],
+        evidence.earn.as_ref(),
+        "mu_cum_total",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/fee/{epoch}.merkle_root"),
+        &roots["fee"],
+        evidence.fee.as_ref(),
+        "merkle_root",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/fee/{epoch}.mu_fee_epoch"),
+        &totals["fee_mu"],
+        evidence.fee.as_ref(),
+        "mu_fee_epoch",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/fee/{epoch}.mu_fee_cum"),
+        &totals["fee_cum_mu"],
+        evidence.fee.as_ref(),
+        "mu_fee_cum",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/pay/{epoch}.merkle_root"),
+        &roots["pay"],
+        evidence.pay.as_ref(),
+        "merkle_root",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/pay/{epoch}.count"),
+        &totals["pay_count"],
+        evidence.pay.as_ref(),
+        "count",
+    );
+    push_evidence_check(
+        &mut checks,
+        &format!("ev/pay/{epoch}.mu_total"),
+        &totals["pay_mu"],
+        evidence.pay.as_ref(),
+        "mu_total",
+    );
+    checks
+}
+
+fn push_evidence_check(
+    checks: &mut Vec<EvidenceCheck>,
+    key: &str,
+    expected: &Value,
+    record: Option<&Value>,
+    field: &str,
+) {
+    let actual = record
+        .and_then(|value| value.get(field))
+        .cloned()
+        .unwrap_or(Value::Null);
+    checks.push(EvidenceCheck {
+        key: key.to_owned(),
+        ok: &actual == expected,
+        expected: expected.clone(),
+        actual,
+    });
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct LedgerEnclave {
     enclave_id: String,
@@ -813,12 +1495,12 @@ struct LedgerPriceRecord {
     effective_at: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct PrefixStateResponse {
     values: Vec<PrefixStateEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct PrefixStateEntry {
     key: String,
     value: Value,
@@ -829,6 +1511,94 @@ struct ContractCatalog {
     enclaves: Vec<LedgerEnclave>,
     rooms: Vec<LedgerRoom>,
     prices: Vec<LedgerPriceSchedule>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerHoldbackBucket {
+    epoch: u64,
+    mu: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerEarningRecord {
+    provider: String,
+    denom: String,
+    total_mu: u64,
+    held_mu: u64,
+    paid_cum_mu: u64,
+    #[serde(default)]
+    holdbacks: Vec<LedgerHoldbackBucket>,
+    #[serde(default)]
+    updated_epoch: u64,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    last_holdback_release_epoch: Option<u64>,
+    #[serde(default)]
+    last_payout_rate_ts: Option<u64>,
+    #[serde(default)]
+    last_payout_msb_tx_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EarningsView {
+    provider: String,
+    denom: String,
+    total_mu: u64,
+    held_mu: u64,
+    paid_cum_mu: u64,
+    released_mu: u64,
+    holdbacks: Vec<LedgerHoldbackBucket>,
+    updated_epoch: u64,
+    last_payout_msb_tx_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EpochAuditBundle {
+    epoch: u64,
+    fee_bps: u64,
+    #[serde(default)]
+    deposits: Vec<Value>,
+    #[serde(default)]
+    receipts: Vec<Value>,
+    #[serde(default)]
+    payouts: Vec<Value>,
+    #[serde(default)]
+    prior_earnings: BTreeMap<String, u64>,
+    #[serde(default)]
+    prior_fee_cum_mu: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct EpochEvidenceSnapshot {
+    #[serde(default)]
+    dep: Option<Value>,
+    #[serde(default)]
+    r#use: Option<Value>,
+    #[serde(default)]
+    earn: Option<Value>,
+    #[serde(default)]
+    fee: Option<Value>,
+    #[serde(default)]
+    pay: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EvidenceCheck {
+    key: String,
+    ok: bool,
+    expected: Value,
+    actual: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReceiptsExportReport {
+    bundle: EpochAuditBundle,
+    bundle_path: Option<PathBuf>,
+    recomputed: Option<Value>,
+    evidence: Option<EpochEvidenceSnapshot>,
+    checks: Vec<EvidenceCheck>,
+    verified: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2546,6 +3316,115 @@ mod tests {
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].room_id, "room-a");
         assert!(select_provider_rooms(&contract.rooms, enclave, "room-other").is_err());
+    }
+
+    #[test]
+    fn earning_view_computes_released_mu_after_holdback_and_paid() {
+        let view = earning_view(LedgerEarningRecord {
+            provider: "provider-a".to_owned(),
+            denom: "mu_usd".to_owned(),
+            total_mu: 10_000,
+            held_mu: 2_500,
+            paid_cum_mu: 3_000,
+            holdbacks: vec![LedgerHoldbackBucket {
+                epoch: 7,
+                mu: 2_500,
+            }],
+            updated_epoch: 7,
+            updated_at: None,
+            last_holdback_release_epoch: Some(7),
+            last_payout_rate_ts: None,
+            last_payout_msb_tx_hash: Some("aa".repeat(32)),
+        })
+        .unwrap();
+
+        assert_eq!(view.released_mu, 4_500);
+        assert_eq!(view.holdbacks[0].epoch, 7);
+
+        assert!(earning_view(LedgerEarningRecord {
+            total_mu: 1,
+            held_mu: 1,
+            paid_cum_mu: 1,
+            provider: "bad-provider".to_owned(),
+            denom: "mu_usd".to_owned(),
+            holdbacks: Vec::new(),
+            updated_epoch: 0,
+            updated_at: None,
+            last_holdback_release_epoch: None,
+            last_payout_rate_ts: None,
+            last_payout_msb_tx_hash: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn evidence_checks_cover_all_epoch_roots_and_totals() {
+        let recomputed = json!({
+            "roots": {
+                "dep": "a".repeat(64),
+                "use": "b".repeat(64),
+                "earn": "c".repeat(64),
+                "fee": "d".repeat(64),
+                "pay": "e".repeat(64),
+            },
+            "totals": {
+                "dep_count": 1,
+                "dep_mu": 2,
+                "use_count": 3,
+                "use_mu": 4,
+                "provider_count": 5,
+                "earn_mu": 6,
+                "fee_mu": 7,
+                "fee_cum_mu": 8,
+                "pay_count": 9,
+                "pay_mu": 10,
+            }
+        });
+        let evidence = EpochEvidenceSnapshot {
+            dep: Some(json!({
+                "merkle_root": "a".repeat(64),
+                "count": 1,
+                "mu_total": 2,
+            })),
+            r#use: Some(json!({
+                "merkle_root": "b".repeat(64),
+                "sessions": 3,
+                "mu_total": 4,
+                "providers": 5,
+            })),
+            earn: Some(json!({
+                "merkle_root": "c".repeat(64),
+                "provider_count": 5,
+                "mu_cum_total": 6,
+            })),
+            fee: Some(json!({
+                "merkle_root": "d".repeat(64),
+                "mu_fee_epoch": 7,
+                "mu_fee_cum": 8,
+            })),
+            pay: Some(json!({
+                "merkle_root": "e".repeat(64),
+                "count": 9,
+                "mu_total": 10,
+            })),
+        };
+
+        let checks = verify_epoch_evidence(4, &recomputed, &evidence);
+        assert_eq!(checks.len(), 16);
+        assert!(checks.iter().all(|check| check.ok));
+
+        let mismatched = EpochEvidenceSnapshot {
+            pay: Some(json!({
+                "merkle_root": "e".repeat(64),
+                "count": 9,
+                "mu_total": 11,
+            })),
+            ..evidence
+        };
+        let checks = verify_epoch_evidence(4, &recomputed, &mismatched);
+        assert!(checks.iter().any(|check| {
+            check.key == "ev/pay/4.mu_total" && !check.ok && check.actual == json!(11)
+        }));
     }
 
     #[test]

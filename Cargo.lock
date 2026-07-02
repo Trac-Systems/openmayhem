@@ -1370,6 +1370,7 @@ dependencies = [
  "mayhem-gateway",
  "mayhem-hwprobe",
  "mayhem-proto",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

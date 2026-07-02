@@ -19,6 +19,7 @@ mayhem-enclave = { path = "../mayhem-enclave" }
 mayhem-gateway = { path = "../mayhem-gateway" }
 mayhem-hwprobe = { path = "../mayhem-hwprobe" }
 mayhem-proto = { path = "../mayhem-proto" }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
