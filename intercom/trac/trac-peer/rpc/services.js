@@ -145,19 +145,47 @@ export async function contractTx(peer, { tx, prepared_command, address, signatur
   return { result: res };
 }
 
+const stateView = (peer, confirmed) => {
+  if (!peer.base?.view) throw new Error("Peer view not ready.");
+  if (!confirmed) return { view: peer.base.view, close: async () => {} };
+  const view = peer.base.view.checkout(peer.base.view.core.signedLength);
+  return { view, close: async () => view.close() };
+};
+
 export async function getState(peer, key, { confirmed = true } = {}) {
   const k = String(key ?? "");
   if (!k) throw new Error("Missing key.");
-  if (!peer.base?.view) throw new Error("Peer view not ready.");
-  if (confirmed) {
-    const viewSession = peer.base.view.checkout(peer.base.view.core.signedLength);
-    try {
-      const res = await viewSession.get(k);
-      return res?.value ?? null;
-    } finally {
-      await viewSession.close();
-    }
+  const session = stateView(peer, confirmed);
+  try {
+    const res = await session.view.get(k);
+    return res?.value ?? null;
+  } finally {
+    await session.close();
   }
-  const res = await peer.base.view.get(k);
-  return res?.value ?? null;
+}
+
+export async function getStatePrefix(peer, prefix, { confirmed = true, limit = 500 } = {}) {
+  const p = String(prefix ?? "");
+  if (!p) throw new Error("Missing prefix.");
+  if (p.length > 256) throw new Error("Prefix is too long.");
+  const n = Number(limit);
+  if (!Number.isInteger(n) || n < 1 || n > 1000) {
+    throw new Error("Invalid limit. Expected an integer from 1 to 1000.");
+  }
+
+  const session = stateView(peer, confirmed);
+  const entries = [];
+  try {
+    const stream = session.view.createReadStream({
+      gte: p,
+      lt: `${p}\xff`,
+      limit: n,
+    });
+    for await (const entry of stream) {
+      entries.push({ key: entry.key, value: entry.value });
+    }
+  } finally {
+    await session.close();
+  }
+  return entries;
 }

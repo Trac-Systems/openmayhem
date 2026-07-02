@@ -3,6 +3,7 @@ import { readJsonBody } from "./utils/body.js";
 import {
   getStatus,
   getState,
+  getStatePrefix,
   getContractSchema,
   contractGenerateNonce,
   contractPrepareTx,
@@ -20,8 +21,17 @@ export async function handleStatus({ respond, peer }) {
 export async function handleGetState({ req, respond, peer }) {
   const url = buildRequestUrl(req);
   const key = url.searchParams.get("key");
+  const prefix = url.searchParams.get("prefix");
   const confirmed = url.searchParams.get("confirmed");
   const confirmedBool = confirmed == null ? true : confirmed === "true";
+  if (prefix != null) {
+    const limit = url.searchParams.get("limit");
+    const values = await getStatePrefix(peer, prefix, {
+      confirmed: confirmedBool,
+      limit: limit == null ? 500 : Number(limit),
+    });
+    return respond(200, { prefix, confirmed: confirmedBool, values });
+  }
   const value = await getState(peer, key, { confirmed: confirmedBool });
   respond(200, { key, confirmed: confirmedBool, value });
 }

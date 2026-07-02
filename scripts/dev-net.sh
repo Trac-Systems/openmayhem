@@ -63,7 +63,7 @@ if [[ "$cleanup_stores" -eq 1 ]]; then
 fi
 mkdir -p "$log_dir"
 
-token="mayhem-devnet-token-$(date +%s)-$$"
+token="${MAYHEM_DEVNET_TOKEN:-mayhem-devnet-token-$(date +%s)-$$}"
 subnet_channel="mayhem-devnet-local"
 startup_timeout_sec="${MAYHEM_DEVNET_STARTUP_TIMEOUT:-120}"
 connection_timeout_sec="${MAYHEM_DEVNET_CONNECTION_TIMEOUT:-120}"
@@ -289,6 +289,7 @@ Mayhem dev-net ready.
   joiner-b: ws://127.0.0.1:$joiner_b_port  rpc=http://127.0.0.1:$joiner_b_rpc_port/v1  $joiner_b_stats
   subnet bootstrap: $admin_bootstrap
   subnet channel:   $subnet_channel
+  sc bridge token:  $token
   logs:             $log_dir
 EOF
 

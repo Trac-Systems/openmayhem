@@ -141,6 +141,24 @@ pub struct Tier1AttestationOptions {
     pub nonce_u: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct Tier1ExternalProviderAttestationOptions {
+    pub identity: CatalogEnclaveIdentity,
+    pub runtime_keypair: RuntimeKeypair,
+    pub provider_pubkey: String,
+    pub binary_path: PathBuf,
+    pub boot_epoch: u64,
+    pub report_ts: u64,
+    pub nonce_u: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Tier1AttestationDraft {
+    pub body: AttestationBody,
+    pub sig_enclave: String,
+    pub provider_signing_message_hex: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Tier1AttestationReport {
     pub report: AttestationReport,
@@ -1259,6 +1277,84 @@ pub fn build_tier1_attestation_report(
     })
 }
 
+pub fn prepare_tier1_attestation_report(
+    options: &Tier1ExternalProviderAttestationOptions,
+) -> Result<Tier1AttestationDraft> {
+    validate_identity(&options.identity)?;
+    validate_hex_field("provider_pubkey", &options.provider_pubkey, 32)?;
+    validate_hex_field("nonce_u", &options.nonce_u, 32)?;
+
+    let binary_hash = measure_binary(&options.binary_path)?;
+    if !options.identity.binary_hash.is_empty() && options.identity.binary_hash != binary_hash {
+        return Err(EnclaveError::InvalidInput(format!(
+            "identity binary_hash {} does not match measured binary hash {}",
+            options.identity.binary_hash, binary_hash
+        )));
+    }
+    let identity = CatalogEnclaveIdentity {
+        binary_hash: binary_hash.clone(),
+        ..options.identity.clone()
+    };
+    let body = AttestationBody {
+        schema_version: ATTESTATION_SCHEMA_VERSION,
+        alg: ATTESTATION_ALG.to_owned(),
+        enclave_id: catalog_enclave_id(&identity),
+        enclave_pubkey: options.runtime_keypair.public_key_hex(),
+        provider_pubkey: options.provider_pubkey.clone(),
+        manifest_hash: identity.manifest_hash,
+        binary_hash,
+        att_tier: TIER1_ATTESTATION_TIER,
+        hw_quote: None,
+        boot_epoch: options.boot_epoch,
+        report_ts: options.report_ts,
+        nonce_u: options.nonce_u.clone(),
+    };
+
+    let enclave_signing_key = options.runtime_keypair.signing_key();
+    let sig_enclave =
+        sign_attestation_body(&enclave_signing_key, &body, AttestationSigner::Enclave)?;
+    let provider_signing_message_hex = hex::encode(
+        attestation_signing_bytes(&body, AttestationSigner::Provider)
+            .map_err(|err| EnclaveError::Crypto(err.to_string()))?,
+    );
+
+    Ok(Tier1AttestationDraft {
+        body,
+        sig_enclave,
+        provider_signing_message_hex,
+    })
+}
+
+pub fn finalize_tier1_attestation_report(
+    draft: Tier1AttestationDraft,
+    sig_provider: impl Into<String>,
+) -> Result<Tier1AttestationReport> {
+    let sig_provider = sig_provider.into();
+    validate_hex_field("sig_provider", &sig_provider, 64)?;
+    let report = AttestationReport {
+        schema_version: draft.body.schema_version,
+        alg: draft.body.alg,
+        enclave_id: draft.body.enclave_id,
+        enclave_pubkey: draft.body.enclave_pubkey,
+        provider_pubkey: draft.body.provider_pubkey,
+        manifest_hash: draft.body.manifest_hash,
+        binary_hash: draft.body.binary_hash,
+        att_tier: draft.body.att_tier,
+        hw_quote: draft.body.hw_quote,
+        boot_epoch: draft.body.boot_epoch,
+        report_ts: draft.body.report_ts,
+        nonce_u: draft.body.nonce_u,
+        sig_enclave: draft.sig_enclave,
+        sig_provider,
+    };
+    let report_head =
+        attestation_report_head(&report).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
+    Ok(Tier1AttestationReport {
+        report,
+        report_head,
+    })
+}
+
 pub fn current_sandbox_platform() -> Result<SandboxPlatform> {
     if cfg!(target_os = "linux") {
         Ok(SandboxPlatform::LinuxSeccompBpf)
@@ -2211,6 +2307,49 @@ mod tests {
         })
         .expect_err("wrong identity binary hash must fail before signing");
         assert!(err.to_string().contains("does not match measured"));
+        Ok(())
+    }
+
+    #[test]
+    fn tier1_external_provider_signature_keeps_provider_pubkey() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binary = temp.path().join("mayhem-enclave-test-bin");
+        fs::write(&binary, b"test binary bytes")?;
+        let binary_hash = measure_binary(&binary)?;
+        let provider_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let provider_pubkey = hex::encode(provider_key.verifying_key().to_bytes());
+        let identity = CatalogEnclaveIdentity {
+            admin_pubkey: "admin".to_owned(),
+            model_id: "model".to_owned(),
+            artifact_root: "artifact".to_owned(),
+            manifest_hash: "manifest".to_owned(),
+            binary_hash,
+        };
+        let draft = prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
+            identity,
+            runtime_keypair: RuntimeKeypair::from_seed([9_u8; 32]),
+            provider_pubkey: provider_pubkey.clone(),
+            binary_path: binary,
+            boot_epoch: 100,
+            report_ts: 200,
+            nonce_u: "aa".repeat(32),
+        })?;
+        let provider_message = hex::decode(&draft.provider_signing_message_hex)?;
+        let sig_provider = provider_key.sign(&provider_message);
+        let report =
+            finalize_tier1_attestation_report(draft, hex::encode(sig_provider.to_bytes()))?;
+
+        assert_eq!(report.report.provider_pubkey, provider_pubkey);
+        assert_eq!(
+            report.report.enclave_id,
+            catalog_enclave_id(&CatalogEnclaveIdentity {
+                admin_pubkey: "admin".to_owned(),
+                model_id: "model".to_owned(),
+                artifact_root: "artifact".to_owned(),
+                manifest_hash: "manifest".to_owned(),
+                binary_hash: report.report.binary_hash.clone(),
+            })
+        );
         Ok(())
     }
 

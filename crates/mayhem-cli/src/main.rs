@@ -7,12 +7,24 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use mayhem_bridge::{PeerRpcClient, DEFAULT_RPC_URL};
-use mayhem_hwprobe::{human_report, probe, FixtureProfile, ProbeOptions};
+use mayhem_bridge::{PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL};
+use mayhem_enclave::{
+    boot_sealed_store, build_merkle_manifest, download_resumable,
+    finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
+    prepare_tier1_attestation_report, seal_artifact, BootOptions, DownloadReport, DownloadRequest,
+    DownloadSource, KeyContext, RuntimeKeyContext, RuntimeKeypairStoreOptions, SealOptions,
+    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
+};
+use mayhem_hwprobe::{
+    human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
+    VerdictStatus,
+};
+use mayhem_proto::CatalogEnclaveIdentity;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -38,11 +50,22 @@ enum Commands {
         #[command(subcommand)]
         command: CatalogCommands,
     },
+    /// Provider serving lifecycle commands.
+    Provider {
+        #[command(subcommand)]
+        command: Box<ProviderCommands>,
+    },
     /// Inspect, hash, and re-consent to router rules.
     Rules {
         #[command(subcommand)]
         command: RulesCommands,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommands {
+    /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
+    Start(ProviderStartArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,6 +245,109 @@ struct CatalogVerifyArgs {
     json: bool,
 }
 
+#[derive(Debug, Parser)]
+struct ProviderStartArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Admin-created model id or enclave id. If omitted, the first feasible admin enclave is used.
+    #[arg(long)]
+    enclave: Option<String>,
+
+    /// Canonical room ids to join, comma-separated, or auto for all open admin rooms for the model.
+    #[arg(long, default_value = "auto")]
+    rooms: String,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// SC-Bridge websocket URL for the local provider peer. Required for live heartbeats.
+    #[arg(long)]
+    sc_bridge_url: Option<String>,
+
+    /// SC-Bridge token for the local provider peer.
+    #[arg(long)]
+    sc_bridge_token: Option<String>,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Path to the detached catalog signature JSON.
+    #[arg(long, value_name = "PATH")]
+    signature_path: Option<PathBuf>,
+
+    /// Directory containing catalog maintainer public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Use a local artifact path instead of downloading the catalog source.
+    #[arg(long, value_name = "PATH")]
+    artifact: Option<PathBuf>,
+
+    /// Directory for downloaded/plain artifacts. Defaults to <home>/downloads.
+    #[arg(long, value_name = "PATH")]
+    downloads_dir: Option<PathBuf>,
+
+    /// Hugging Face token file used when downloading a Hugging Face artifact.
+    #[arg(long, value_name = "PATH")]
+    hf_token_file: Option<PathBuf>,
+
+    /// Override backend selection: auto, trt-llm, mlx, or llama.cpp.
+    #[arg(long, default_value = "auto")]
+    engine_backend: String,
+
+    /// Run hwprobe against a deterministic reference profile.
+    #[arg(long)]
+    fixture: Option<String>,
+
+    /// Path used for disk free-space and write-throughput probes.
+    #[arg(long, value_name = "PATH")]
+    disk_path: Option<PathBuf>,
+
+    /// Skip the disk write-throughput benchmark.
+    #[arg(long)]
+    skip_disk_bench: bool,
+
+    /// Chunk size for download verification and sealing.
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+    chunk_size: usize,
+
+    /// Binary path to measure for Tier-1 attestation. Defaults to the running mayhem binary.
+    #[arg(long, value_name = "PATH")]
+    enclave_binary: Option<PathBuf>,
+
+    /// Dry-run the provider registration/join txs through contract simulation.
+    #[arg(long)]
+    sim: bool,
+
+    /// Do not connect to SC-Bridge or emit room heartbeats.
+    #[arg(long)]
+    no_heartbeat: bool,
+
+    /// Number of heartbeat frames to send to each joined room.
+    #[arg(long, default_value_t = 1)]
+    heartbeat_count: u32,
+
+    /// Print a machine-readable provider start report.
+    #[arg(long)]
+    print_json: bool,
+
+    /// Development-only: load a local catalog fixture without verifying its detached signature.
+    #[arg(long, hide = true)]
+    dev_skip_catalog_verify: bool,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Role {
     Provider,
@@ -295,6 +421,7 @@ struct RulesDoc {
 struct MayhemConfig {
     identity: Option<ConfigIdentity>,
     network: Option<ConfigNetwork>,
+    provider: Option<ConfigProvider>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +433,15 @@ struct ConfigIdentity {
 #[derive(Debug, Deserialize)]
 struct ConfigNetwork {
     rpc_url: Option<String>,
+    sc_bridge_url: Option<String>,
+    sc_bridge_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigProvider {
+    payout_target: Option<String>,
+    payout_method: Option<String>,
+    engine_backend: Option<String>,
 }
 
 #[tokio::main]
@@ -316,6 +452,9 @@ async fn main() -> Result<()> {
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
             CatalogCommands::Verify(args) => catalog_verify(args),
+        },
+        Commands::Provider { command } => match *command {
+            ProviderCommands::Start(args) => provider_start(args).await,
         },
         Commands::Rules { command } => match command {
             RulesCommands::Hash(args) => rules_hash(args),
@@ -627,6 +766,1128 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         bail!("catalog verification failed");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerEnclave {
+    enclave_id: String,
+    model_id: String,
+    backend: String,
+    artifact_root: String,
+    manifest_hash: String,
+    att_tier: u8,
+    binary_hash: String,
+    #[serde(default)]
+    caps: Value,
+    status: String,
+    created_by: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerRoom {
+    room_id: String,
+    sidechannel: String,
+    model_id: String,
+    #[serde(default)]
+    label: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerPriceSchedule {
+    enclave_id: String,
+    model_id: String,
+    denom: String,
+    current: Option<LedgerPriceRecord>,
+    pending: Option<LedgerPriceRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerPriceRecord {
+    ver: u64,
+    denom: String,
+    in_per_1k_mu: u64,
+    out_per_1k_mu: u64,
+    per_req_mu: u64,
+    min_session_mu: u64,
+    effective_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrefixStateResponse {
+    values: Vec<PrefixStateEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrefixStateEntry {
+    key: String,
+    value: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ContractCatalog {
+    enclaves: Vec<LedgerEnclave>,
+    rooms: Vec<LedgerRoom>,
+    prices: Vec<LedgerPriceSchedule>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderCandidate {
+    enclave: LedgerEnclave,
+    model: catalog::CatalogModel,
+    artifact_name: String,
+    artifact: catalog::CatalogArtifact,
+    verdict: BackendVerdict,
+    price: Option<LedgerPriceSchedule>,
+}
+
+struct HeartbeatContext<'a> {
+    args: &'a ProviderStartArgs,
+    config: &'a Option<MayhemConfig>,
+    keypair_path: &'a Path,
+    password: &'a str,
+    wallet: &'a WalletInfo,
+    selected: &'a ProviderCandidate,
+    rooms: &'a [LedgerRoom],
+    attestation_head: &'a str,
+}
+
+async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    if args.engine_backend == "auto" {
+        if let Some(config_backend) = config
+            .as_ref()
+            .and_then(|config| config.provider.as_ref())
+            .and_then(|provider| provider.engine_backend.clone())
+            .filter(|backend| !backend.trim().is_empty())
+        {
+            args.engine_backend = config_backend;
+        }
+    }
+    let rpc_url = args
+        .rpc_url
+        .clone()
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.network.as_ref())
+                .and_then(|network| network.rpc_url.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned());
+    let store_name = config
+        .as_ref()
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.store_name.clone())
+        .unwrap_or_else(|| "main".to_owned());
+    let keypair_path = config
+        .as_ref()
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.keypair_path.as_ref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.join("stores")
+                .join(&store_name)
+                .join("db")
+                .join("keypair.json")
+        });
+    let password = args.wallet_password.clone().unwrap_or_default();
+    let wallet = inspect_wallet(&keypair_path, &password).await?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+
+    provider_log(
+        &args,
+        "Reading admin catalog and canonical rooms from contract state",
+    );
+    let contract = read_contract_catalog(&rpc).await?;
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let catalog_hash = verify_or_hash_catalog(&args, &catalog_path)?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+
+    provider_log(&args, "Running hwprobe and selecting a backend");
+    let hardware = provider_hwprobe(&args)?;
+    let candidates = build_provider_candidates(&contract, &catalog_doc, &hardware, &args)?;
+    let selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
+    let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
+    if rooms.is_empty() {
+        bail!(
+            "no open admin-created canonical rooms found for {}; ask the admin to open one",
+            selected.enclave.model_id
+        );
+    }
+
+    provider_log(
+        &args,
+        &format!(
+            "Selected {} via {} ({})",
+            selected.enclave.model_id, selected.enclave.backend, selected.artifact_name
+        ),
+    );
+    let provider_secret = derive_provider_secret(&keypair_path, &password, &wallet).await?;
+    let downloads_dir = args
+        .downloads_dir
+        .clone()
+        .unwrap_or_else(|| home.join("downloads"));
+    let downloads_dir = absolutize(downloads_dir)?;
+    let artifact_path = download_provider_artifact(&args, &downloads_dir, &selected).await?;
+
+    provider_log(
+        &args,
+        "Verifying, sealing, and boot-checking the enclave artifact",
+    );
+    let sealed_store = home
+        .join("enclaves")
+        .join(safe_path_component(&selected.enclave.model_id))
+        .join(&selected.enclave.enclave_id);
+    let key_context = KeyContext {
+        provider_id: wallet.public_key.clone(),
+        enclave_id: selected.enclave.enclave_id.clone(),
+        artifact_root: selected.enclave.artifact_root.clone(),
+        manifest_hash: selected.enclave.manifest_hash.clone(),
+    };
+    let seal_report = seal_provider_artifact(
+        &artifact_path,
+        &sealed_store,
+        &key_context,
+        &provider_secret,
+        args.chunk_size,
+    )?;
+    let boot_report = boot_sealed_store(&BootOptions {
+        store_dir: sealed_store.clone(),
+        key_context: key_context.clone(),
+        provider_secret: provider_secret.clone(),
+        output_path: None,
+        expected_merkle_root: Some(selected.enclave.artifact_root.clone()),
+    })?;
+
+    provider_log(&args, "Preparing Tier-1 attestation");
+    let runtime_context = RuntimeKeyContext {
+        provider_id: wallet.public_key.clone(),
+        enclave_id: selected.enclave.enclave_id.clone(),
+    };
+    let runtime_keypair = load_or_create_runtime_keypair_store(&RuntimeKeypairStoreOptions::new(
+        sealed_store.join("runtime-keypair.json"),
+        runtime_context,
+        provider_secret.clone(),
+    ))?;
+    let binary_path = args
+        .enclave_binary
+        .clone()
+        .map(absolutize)
+        .transpose()?
+        .unwrap_or(std::env::current_exe()?);
+    let binary_hash = measure_binary(&binary_path)?;
+    if binary_hash != selected.enclave.binary_hash {
+        bail!(
+            "measured enclave binary hash {} does not match admin enclave record {}; rebuild or ask the admin to update the enclave",
+            binary_hash,
+            selected.enclave.binary_hash
+        );
+    }
+    let now = unix_epoch_seconds()?;
+    let nonce_u = blake3::hash(
+        format!(
+            "mayhem-provider-start:{}:{}:{}",
+            wallet.public_key, selected.enclave.enclave_id, now
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    let draft = prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
+        identity: CatalogEnclaveIdentity {
+            admin_pubkey: selected.enclave.created_by.clone(),
+            model_id: selected.enclave.model_id.clone(),
+            artifact_root: selected.enclave.artifact_root.clone(),
+            manifest_hash: selected.enclave.manifest_hash.clone(),
+            binary_hash,
+        },
+        runtime_keypair,
+        provider_pubkey: wallet.public_key.clone(),
+        binary_path,
+        boot_epoch: now,
+        report_ts: now,
+        nonce_u,
+    })?;
+    let provider_attestation_sig = sign_hex(
+        &keypair_path,
+        &password,
+        &draft.provider_signing_message_hex,
+    )
+    .await?;
+    let attestation = finalize_tier1_attestation_report(draft, provider_attestation_sig)?;
+    if attestation.report.enclave_id != selected.enclave.enclave_id {
+        bail!(
+            "admin enclave id {} is not bound to the measured identity {}; providers cannot serve unbound enclaves",
+            selected.enclave.enclave_id,
+            attestation.report.enclave_id
+        );
+    }
+
+    provider_log(&args, "Submitting provider opt-in transactions");
+    let provider_tx =
+        ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, &config, args.sim)
+            .await?;
+    let serve_tx = ensure_joined_enclave(
+        &rpc,
+        &keypair_path,
+        &password,
+        &wallet,
+        &selected.enclave,
+        args.sim,
+    )
+    .await?;
+    let room_txs = ensure_joined_rooms(
+        &rpc,
+        &keypair_path,
+        &password,
+        &wallet,
+        &selected.enclave,
+        &rooms,
+        args.sim,
+    )
+    .await?;
+
+    let heartbeats = if args.no_heartbeat {
+        Vec::new()
+    } else {
+        emit_provider_heartbeats(HeartbeatContext {
+            args: &args,
+            config: &config,
+            keypair_path: &keypair_path,
+            password: &password,
+            wallet: &wallet,
+            selected: &selected,
+            rooms: &rooms,
+            attestation_head: &attestation.report_head,
+        })
+        .await?
+    };
+    let heartbeat_status = if heartbeats.is_empty() {
+        "joined_no_heartbeat"
+    } else {
+        "heartbeats_flowing"
+    };
+    let report = json!({
+        "status": heartbeat_status,
+        "home": home,
+        "provider": wallet.public_key.clone(),
+        "catalog": {
+            "path": catalog_path,
+            "hash": catalog_hash,
+        },
+        "hardware": {
+            "source": hardware.source,
+            "selected_backend": hardware.selected_backend,
+            "summary": hardware.summary,
+        },
+        "enclave": selected.enclave.clone(),
+        "artifact": {
+            "name": selected.artifact_name.clone(),
+            "engine": selected.artifact.engine.clone(),
+            "path": artifact_path,
+            "root": selected.enclave.artifact_root.clone(),
+        },
+        "sealed_store": {
+            "path": sealed_store,
+            "sealed": seal_report,
+            "boot": boot_report,
+        },
+        "attestation": {
+            "head": attestation.report_head,
+            "enclave_pubkey": attestation.report.enclave_pubkey,
+            "att_tier": attestation.report.att_tier,
+        },
+        "rooms": rooms.clone(),
+        "transactions": {
+            "provider": provider_tx,
+            "serve": serve_tx,
+            "rooms": room_txs,
+        },
+        "heartbeats": heartbeats,
+        "self_test": {
+            "ok": true,
+            "kind": "sealed-boot-attestation-heartbeat",
+        },
+    });
+
+    if args.print_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if heartbeat_status == "heartbeats_flowing" {
+        println!("Provider start complete: heartbeats flowing.");
+        println!("Enclave: {}", selected.enclave.enclave_id);
+        println!("Model: {}", selected.enclave.model_id);
+        println!(
+            "Rooms: {}",
+            rooms
+                .iter()
+                .map(|room| room.room_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        println!("Provider start complete: joined canonical rooms; heartbeat bridge was not used.");
+    }
+
+    Ok(())
+}
+
+fn provider_log(args: &ProviderStartArgs, message: &str) {
+    if !args.print_json {
+        println!("-> {message}");
+    }
+}
+
+fn verify_or_hash_catalog(args: &ProviderStartArgs, catalog_path: &Path) -> Result<String> {
+    if args.dev_skip_catalog_verify {
+        let bytes = fs::read(catalog_path)
+            .with_context(|| format!("reading {}", catalog_path.display()))?;
+        return Ok(blake3::hash(&bytes).to_hex().to_string());
+    }
+
+    let signature_path = args
+        .signature_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/signatures/models.json.sig"))?;
+    let keys_dir = args
+        .keys_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let report = catalog::verify(catalog::VerifyOptions {
+        catalog_path: catalog_path.to_path_buf(),
+        signature_path: absolutize(signature_path)?,
+        keys_dir: absolutize(keys_dir)?,
+        canaries_dir: absolutize(canaries_dir)?,
+        check_dev_downloads: false,
+        hf_token_file: None,
+    })?;
+    if !report.ok {
+        bail!("catalog verification failed: {}", report.errors.join("; "));
+    }
+    Ok(report.catalog_hash)
+}
+
+fn provider_hwprobe(args: &ProviderStartArgs) -> Result<HardwareReport> {
+    let fixture = args
+        .fixture
+        .as_deref()
+        .map(|value| {
+            FixtureProfile::parse(value).with_context(|| {
+                format!(
+                    "unknown fixture {value}; expected apple-silicon, linux-nvidia, or cpu-only"
+                )
+            })
+        })
+        .transpose()?;
+    let mut options = ProbeOptions::default();
+    if let Some(path) = &args.disk_path {
+        options.disk_path = absolutize(path.clone())?;
+    }
+    options.run_disk_bench = !args.skip_disk_bench;
+    options.fixture = fixture;
+    Ok(probe(options))
+}
+
+async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
+    let prices = read_prefix_entries(rpc, "price/")
+        .await?
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .key
+                .strip_prefix("price/")
+                .is_some_and(|tail| !tail.contains('/'))
+        })
+        .map(|entry| serde_json::from_value(entry.value).context("parsing price schedule"))
+        .collect::<Result<Vec<LedgerPriceSchedule>>>()?;
+    Ok(ContractCatalog {
+        enclaves: read_prefix_values(rpc, "enclave/").await?,
+        rooms: read_prefix_values(rpc, "room/").await?,
+        prices,
+    })
+}
+
+async fn read_prefix_values<T>(rpc: &PeerRpcClient, prefix: &str) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    read_prefix_entries(rpc, prefix)
+        .await?
+        .into_iter()
+        .map(|entry| serde_json::from_value(entry.value).context("parsing contract state record"))
+        .collect()
+}
+
+async fn read_prefix_entries(rpc: &PeerRpcClient, prefix: &str) -> Result<Vec<PrefixStateEntry>> {
+    let response = rpc
+        .state_prefix(prefix, Some(false), Some(1000))
+        .await
+        .with_context(|| format!("reading {prefix}* from peer RPC"))?;
+    let parsed: PrefixStateResponse = serde_json::from_value(response)
+        .with_context(|| format!("parsing {prefix}* state response"))?;
+    Ok(parsed
+        .values
+        .into_iter()
+        .filter(|entry| entry.key.starts_with(prefix))
+        .collect())
+}
+
+fn build_provider_candidates(
+    contract: &ContractCatalog,
+    catalog_doc: &catalog::CatalogDocument,
+    hardware: &HardwareReport,
+    args: &ProviderStartArgs,
+) -> Result<Vec<ProviderCandidate>> {
+    let requested_backend = requested_backend(args, hardware)?;
+    let mut candidates = Vec::new();
+    for enclave in contract
+        .enclaves
+        .iter()
+        .filter(|enclave| enclave.status == "active")
+    {
+        if let Some(requested) = &requested_backend {
+            if &enclave.backend != requested {
+                continue;
+            }
+        }
+        let Some(model) = catalog_doc
+            .models
+            .iter()
+            .find(|model| model.model_id == enclave.model_id)
+        else {
+            continue;
+        };
+        let Some(verdict) = hardware
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == enclave.backend)
+            .filter(|verdict| verdict.status != VerdictStatus::Insufficient)
+        else {
+            continue;
+        };
+        let Some((artifact_name, artifact)) =
+            select_catalog_artifact(model, &enclave.backend, hardware)
+        else {
+            continue;
+        };
+        if artifact.artifact_root != enclave.artifact_root {
+            continue;
+        }
+        let price = contract
+            .prices
+            .iter()
+            .find(|price| price.enclave_id == enclave.enclave_id)
+            .cloned();
+        candidates.push(ProviderCandidate {
+            enclave: enclave.clone(),
+            model: model.clone(),
+            artifact_name,
+            artifact,
+            verdict: verdict.clone(),
+            price,
+        });
+    }
+    if candidates.is_empty() {
+        bail!(
+            "no feasible active admin-created enclaves found in contract state; providers can only join enclaves the admin already registered"
+        );
+    }
+    Ok(candidates)
+}
+
+fn requested_backend(
+    args: &ProviderStartArgs,
+    hardware: &HardwareReport,
+) -> Result<Option<String>> {
+    let requested = args.engine_backend.trim();
+    if requested.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let valid = hardware
+        .backend_verdicts
+        .iter()
+        .any(|verdict| verdict.backend == requested);
+    if !valid {
+        bail!("unknown backend {requested}; expected auto, trt-llm, mlx, or llama.cpp");
+    }
+    Ok(Some(requested.to_owned()))
+}
+
+fn select_catalog_artifact(
+    model: &catalog::CatalogModel,
+    backend: &str,
+    hardware: &HardwareReport,
+) -> Option<(String, catalog::CatalogArtifact)> {
+    let mut artifacts = model
+        .artifacts
+        .iter()
+        .filter(|(_, artifact)| artifact.engine == backend)
+        .collect::<Vec<_>>();
+    if backend == "trt-llm" {
+        let supports_nvfp4 = hardware.gpus.iter().any(|gpu| gpu.supports_nvfp4);
+        let preferred = if supports_nvfp4 { "nvfp4" } else { "trt-fp8" };
+        if let Some((name, artifact)) = artifacts
+            .iter()
+            .find(|(name, _)| name.as_str() == preferred)
+        {
+            return Some(((*name).clone(), (*artifact).clone()));
+        }
+    }
+    artifacts
+        .pop()
+        .map(|(name, artifact)| (name.clone(), artifact.clone()))
+}
+
+fn select_provider_candidate(
+    candidates: &[ProviderCandidate],
+    requested: Option<&str>,
+) -> Result<ProviderCandidate> {
+    if let Some(requested) = requested {
+        let by_id = is_32_byte_hex(requested);
+        return candidates
+            .iter()
+            .find(|candidate| {
+                if by_id {
+                    candidate.enclave.enclave_id == requested
+                } else {
+                    candidate.enclave.model_id == requested
+                }
+            })
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "requested enclave {requested} is not an active feasible admin-created enclave"
+                )
+            });
+    }
+
+    candidates
+        .iter()
+        .max_by_key(|candidate| backend_rank(&candidate.enclave.backend))
+        .cloned()
+        .context("no provider candidate available")
+}
+
+fn backend_rank(backend: &str) -> u8 {
+    match backend {
+        "trt-llm" => 3,
+        "mlx" => 2,
+        "llama.cpp" => 1,
+        _ => 0,
+    }
+}
+
+fn select_provider_rooms(
+    rooms: &[LedgerRoom],
+    enclave: &LedgerEnclave,
+    requested: &str,
+) -> Result<Vec<LedgerRoom>> {
+    if requested.trim().eq_ignore_ascii_case("auto") {
+        let mut selected = rooms
+            .iter()
+            .filter(|room| room.status == "open" && room.model_id == enclave.model_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        selected.sort_by(|a, b| a.room_id.cmp(&b.room_id));
+        return Ok(selected);
+    }
+
+    let requested_ids = requested
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if requested_ids.is_empty() {
+        bail!("--rooms must be auto or a comma-separated list of room ids");
+    }
+    let mut selected = Vec::new();
+    for room_id in requested_ids {
+        let room = rooms
+            .iter()
+            .find(|room| room.room_id == room_id)
+            .with_context(|| format!("room {room_id} is not in contract state"))?;
+        if room.status != "open" {
+            bail!("room {room_id} is not open");
+        }
+        if room.model_id != enclave.model_id {
+            bail!(
+                "room {room_id} is for model {}, not {}",
+                room.model_id,
+                enclave.model_id
+            );
+        }
+        selected.push(room.clone());
+    }
+    Ok(selected)
+}
+
+async fn derive_provider_secret(
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+) -> Result<Vec<u8>> {
+    let sig = sign_message(
+        keypair_path,
+        password,
+        &format!("mayhem-provider-sealing-v1:{}", wallet.public_key),
+    )
+    .await?;
+    Ok(blake3::hash(sig.as_bytes()).as_bytes().to_vec())
+}
+
+async fn download_provider_artifact(
+    args: &ProviderStartArgs,
+    downloads_dir: &Path,
+    selected: &ProviderCandidate,
+) -> Result<PathBuf> {
+    let artifact_file = format!(
+        "{}-{}",
+        safe_path_component(&selected.enclave.enclave_id),
+        safe_path_component(&selected.artifact_name)
+    );
+    let destination = downloads_dir.join(artifact_file);
+    if destination.exists() {
+        let merkle = build_merkle_manifest(&destination, args.chunk_size)?;
+        if merkle.root == selected.enclave.artifact_root {
+            return Ok(destination);
+        }
+    }
+
+    let source = if let Some(path) = &args.artifact {
+        DownloadSource::File(absolutize(path.clone())?)
+    } else if selected.artifact.source.kind == "huggingface" {
+        DownloadSource::Http {
+            url: format!(
+                "https://huggingface.co/{}/resolve/{}/{}",
+                selected.artifact.source.repo,
+                selected.artifact.source.revision,
+                selected.artifact.path
+            ),
+            bearer_token: read_optional_token(args.hf_token_file.as_deref())?,
+        }
+    } else {
+        bail!(
+            "unsupported artifact source kind {}; pass --artifact with a local verified file",
+            selected.artifact.source.kind
+        );
+    };
+
+    let mut request = DownloadRequest::new(source, destination.clone());
+    request.chunk_size = args.chunk_size;
+    request.expected_merkle_root = Some(selected.enclave.artifact_root.clone());
+    download_resumable(&request).with_context(|| {
+        format!(
+            "downloading and verifying artifact root {}",
+            selected.enclave.artifact_root
+        )
+    })?;
+    Ok(destination)
+}
+
+fn read_optional_token(path: Option<&Path>) -> Result<Option<String>> {
+    if let Some(path) = path {
+        return fs::read_to_string(path)
+            .with_context(|| format!("reading token file {}", path.display()))
+            .map(|value| Some(value.trim().to_owned()));
+    }
+    Ok(env::var("HF_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty()))
+}
+
+fn seal_provider_artifact(
+    artifact_path: &Path,
+    sealed_store: &Path,
+    key_context: &KeyContext,
+    provider_secret: &[u8],
+    chunk_size: usize,
+) -> Result<DownloadReport> {
+    if sealed_store.join(SEALED_STORE_MANIFEST).exists() {
+        let merkle = build_merkle_manifest(artifact_path, chunk_size)?;
+        return Ok(DownloadReport {
+            destination: artifact_path.to_path_buf(),
+            resumed_from: 0,
+            bytes_written: 0,
+            total_bytes: merkle.total_bytes,
+            merkle,
+        });
+    }
+
+    let mut options = SealOptions::new(
+        artifact_path,
+        sealed_store,
+        key_context.clone(),
+        provider_secret.to_vec(),
+    );
+    options.chunk_size = chunk_size;
+    options.expected_merkle_root = Some(key_context.artifact_root.clone());
+    let report = seal_artifact(&options)?;
+    Ok(DownloadReport {
+        destination: report.store_dir,
+        resumed_from: 0,
+        bytes_written: report.total_bytes,
+        total_bytes: report.total_bytes,
+        merkle: build_merkle_manifest(artifact_path, chunk_size)?,
+    })
+}
+
+async fn ensure_provider_registered(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    config: &Option<MayhemConfig>,
+    sim: bool,
+) -> Result<Value> {
+    let key = format!("prov/{}", wallet.public_key);
+    if let Some(existing) = read_state_value(rpc, &key).await? {
+        let status = existing.get("status").and_then(Value::as_str).unwrap_or("");
+        if status == "active" {
+            return Ok(
+                json!({ "skipped": true, "reason": "already_registered", "state": existing }),
+            );
+        }
+        bail!("provider registration exists but is not active: {existing}");
+    }
+
+    let payout_addr = config
+        .as_ref()
+        .and_then(|config| config.provider.as_ref())
+        .and_then(|provider| provider.payout_target.clone())
+        .or_else(|| wallet.address.clone())
+        .unwrap_or_else(|| wallet.public_key.clone());
+    let payout_method = config
+        .as_ref()
+        .and_then(|config| config.provider.as_ref())
+        .and_then(|provider| provider.payout_method.clone())
+        .unwrap_or_else(|| "tnk".to_owned());
+    let submitted = submit_contract_command(
+        rpc,
+        keypair_path,
+        password,
+        wallet,
+        "registerProvider",
+        json!({
+            "op": "register_provider",
+            "payout_addr": payout_addr,
+            "payout_method": payout_method,
+        }),
+        sim,
+    )
+    .await?;
+    if sim {
+        return Ok(submitted);
+    }
+    let state = wait_for_state(rpc, &key, |value| {
+        value.get("status").and_then(Value::as_str) == Some("active")
+    })
+    .await?;
+    Ok(json!({ "skipped": false, "tx": submitted, "state": state }))
+}
+
+async fn ensure_joined_enclave(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    enclave: &LedgerEnclave,
+    sim: bool,
+) -> Result<Value> {
+    let key = format!("serve/{}/{}", wallet.public_key, enclave.enclave_id);
+    if let Some(existing) = read_state_value(rpc, &key).await? {
+        if existing.get("status").and_then(Value::as_str) == Some("active") {
+            return Ok(
+                json!({ "skipped": true, "reason": "already_joined_enclave", "state": existing }),
+            );
+        }
+    }
+    let submitted = submit_contract_command(
+        rpc,
+        keypair_path,
+        password,
+        wallet,
+        "joinEnclave",
+        json!({
+            "op": "join_enclave",
+            "enclave_id": enclave.enclave_id,
+        }),
+        sim,
+    )
+    .await?;
+    if sim {
+        return Ok(submitted);
+    }
+    let state = wait_for_state(rpc, &key, |value| {
+        value.get("status").and_then(Value::as_str) == Some("active")
+    })
+    .await?;
+    Ok(json!({ "skipped": false, "tx": submitted, "state": state }))
+}
+
+async fn ensure_joined_rooms(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    enclave: &LedgerEnclave,
+    rooms: &[LedgerRoom],
+    sim: bool,
+) -> Result<Vec<Value>> {
+    let mut reports = Vec::new();
+    for room in rooms {
+        let key = format!(
+            "roomserve/{}/{}/{}",
+            room.room_id, wallet.public_key, enclave.enclave_id
+        );
+        if let Some(existing) = read_state_value(rpc, &key).await? {
+            if existing.get("status").and_then(Value::as_str) == Some("active") {
+                reports.push(json!({
+                    "room_id": room.room_id,
+                    "skipped": true,
+                    "reason": "already_joined_room",
+                    "state": existing,
+                }));
+                continue;
+            }
+        }
+        let submitted = submit_contract_command(
+            rpc,
+            keypair_path,
+            password,
+            wallet,
+            "joinRoom",
+            json!({
+                "op": "join_room",
+                "room_id": room.room_id,
+                "enclave_id": enclave.enclave_id,
+            }),
+            sim,
+        )
+        .await?;
+        if sim {
+            reports.push(json!({ "room_id": room.room_id, "tx": submitted }));
+            continue;
+        }
+        let state = wait_for_state(rpc, &key, |value| {
+            value.get("status").and_then(Value::as_str) == Some("active")
+        })
+        .await?;
+        reports.push(
+            json!({ "room_id": room.room_id, "skipped": false, "tx": submitted, "state": state }),
+        );
+    }
+    Ok(reports)
+}
+
+async fn submit_contract_command(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    tx_type: &str,
+    value: Value,
+    sim: bool,
+) -> Result<Value> {
+    let prepared_command = json!({
+        "type": tx_type,
+        "value": value,
+    });
+    let nonce_response = rpc
+        .contract_nonce()
+        .await
+        .context("requesting contract nonce")?;
+    let nonce = nonce_response
+        .get("nonce")
+        .and_then(Value::as_str)
+        .context("RPC nonce response did not include nonce")?;
+    let prepared = rpc
+        .prepare_tx(json!({
+            "prepared_command": prepared_command.clone(),
+            "address": wallet.public_key,
+            "nonce": nonce,
+        }))
+        .await
+        .with_context(|| format!("preparing {tx_type} tx"))?;
+    let tx = prepared
+        .get("tx")
+        .and_then(Value::as_str)
+        .context("RPC prepare response did not include tx")?
+        .to_owned();
+    let command_hash = prepared
+        .get("command_hash")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let signature = sign_hex(keypair_path, password, &tx).await?;
+    let submitted = rpc
+        .submit_tx(json!({
+            "tx": tx,
+            "prepared_command": prepared_command.clone(),
+            "address": wallet.public_key,
+            "signature": signature,
+            "nonce": nonce,
+            "sim": sim,
+        }))
+        .await
+        .with_context(|| format!("submitting {tx_type} tx"))?;
+    let result = submitted
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| submitted.clone());
+    let accepted = result.get("ok").and_then(Value::as_bool) == Some(true)
+        || (result.get("local").and_then(Value::as_bool) == Some(true)
+            && result.get("txo").is_some());
+    if !accepted {
+        bail!("contract {tx_type} rejected provider command: {result}");
+    }
+    Ok(json!({
+        "tx": tx,
+        "command_hash": command_hash,
+        "result": result,
+    }))
+}
+
+async fn read_state_value(rpc: &PeerRpcClient, key: &str) -> Result<Option<Value>> {
+    let state = rpc
+        .state(Some(key), Some(false))
+        .await
+        .with_context(|| format!("reading {key} from peer RPC"))?;
+    Ok(state.get("value").cloned().filter(|value| !value.is_null()))
+}
+
+async fn wait_for_state<F>(rpc: &PeerRpcClient, key: &str, predicate: F) -> Result<Value>
+where
+    F: Fn(&Value) -> bool,
+{
+    let mut last = Value::Null;
+    for _ in 0..120 {
+        last = read_state_value(rpc, key).await?.unwrap_or(Value::Null);
+        if predicate(&last) {
+            return Ok(last);
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    bail!("timed out waiting for {key}; last value: {last}");
+}
+
+async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value>> {
+    let sc_bridge_url = ctx.args.sc_bridge_url.clone().or_else(|| {
+        ctx.config
+            .as_ref()
+            .and_then(|config| config.network.as_ref())
+            .and_then(|network| network.sc_bridge_url.clone())
+    });
+    let sc_bridge_token = ctx.args.sc_bridge_token.clone().or_else(|| {
+        ctx.config
+            .as_ref()
+            .and_then(|config| config.network.as_ref())
+            .and_then(|network| network.sc_bridge_token.clone())
+    });
+    let (Some(url), Some(token)) = (sc_bridge_url, sc_bridge_token) else {
+        provider_log(
+            ctx.args,
+            "SC-Bridge URL/token not configured; skipping live heartbeat send",
+        );
+        return Ok(Vec::new());
+    };
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(url, token)?)
+        .await
+        .context("connecting to SC-Bridge for provider heartbeats")?;
+    let mut sent = Vec::new();
+    for room in ctx.rooms {
+        bridge
+            .join(&room.sidechannel)
+            .await
+            .with_context(|| format!("joining sidechannel {}", room.sidechannel))?;
+        for seq in 0..ctx.args.heartbeat_count.max(1) {
+            let mut heartbeat = json!({
+                "t": "hb",
+                "v": 1,
+                "provider": ctx.wallet.public_key,
+                "enclave_id": ctx.selected.enclave.enclave_id,
+                "model_id": ctx.selected.enclave.model_id,
+                "room_id": room.room_id,
+                "sat": 0.0,
+                "slots": {
+                    "active": 0,
+                    "max": ctx.selected.verdict.max_sessions,
+                },
+                "q": {
+                    "depth": 0,
+                    "est_wait_ms": 0,
+                },
+                "perf": {
+                    "tok_s": ctx.selected.verdict.est_tok_s,
+                    "ttft_ms": 0,
+                },
+                "price_ver": ctx.selected
+                    .price
+                    .as_ref()
+                    .and_then(|price| price.current.as_ref())
+                    .map(|price| price.ver)
+                    .unwrap_or(0),
+                "caps": {
+                    "tools": ctx.selected.model.caps.tools,
+                    "json": ctx.selected.model.caps.json,
+                    "ctx": ctx.selected.model.caps.ctx_max,
+                    "vision": ctx.selected.model.caps.vision,
+                },
+                "attestation_head": ctx.attestation_head,
+                "ts": unix_epoch_seconds()?,
+                "nonce": blake3::hash(format!("{}:{}:{}", room.room_id, ctx.wallet.public_key, seq).as_bytes()).to_hex().to_string(),
+            });
+            let signing_payload = serde_json::to_string(&heartbeat)?;
+            let sig = sign_message(ctx.keypair_path, ctx.password, &signing_payload).await?;
+            heartbeat["sig"] = json!(sig);
+            bridge
+                .send(&room.sidechannel, &heartbeat)
+                .await
+                .with_context(|| format!("sending heartbeat to {}", room.sidechannel))?;
+            sent.push(json!({
+                "room_id": room.room_id,
+                "sidechannel": room.sidechannel,
+                "seq": seq,
+            }));
+        }
+    }
+    Ok(sent)
+}
+
+fn safe_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn is_32_byte_hex(value: &str) -> bool {
+    value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn unix_epoch_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before Unix epoch")?
+        .as_secs())
 }
 
 fn default_home() -> Result<PathBuf> {
@@ -1240,6 +2501,7 @@ fn print_human_report(report: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn toml_string_escapes_quotes_and_backslashes() {
@@ -1252,5 +2514,199 @@ mod tests {
         assert!(validate_rules_hash("not-hex").is_err());
         assert!(validate_rules_hash("aabb001122").is_err());
         assert!(validate_rules_hash("").is_err());
+    }
+
+    #[test]
+    fn provider_candidates_require_admin_enclave_and_matching_catalog_artifact() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let args = test_provider_start_args();
+        let contract = test_contract(&root);
+
+        let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].enclave.model_id, "test/model@4bit");
+        assert_eq!(candidates[0].artifact_name, "gguf-q4_k_m");
+
+        let mut retired = contract.clone();
+        retired.enclaves[0].status = "retired".to_owned();
+        assert!(build_provider_candidates(&retired, &catalog, &hardware, &args).is_err());
+
+        let mut mismatched = contract;
+        mismatched.enclaves[0].artifact_root = "bb".repeat(32);
+        assert!(build_provider_candidates(&mismatched, &catalog, &hardware, &args).is_err());
+    }
+
+    #[test]
+    fn provider_rooms_auto_selects_only_open_matching_admin_rooms() {
+        let root = "aa".repeat(32);
+        let contract = test_contract(&root);
+        let enclave = &contract.enclaves[0];
+        let rooms = select_provider_rooms(&contract.rooms, enclave, "auto").unwrap();
+
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].room_id, "room-a");
+        assert!(select_provider_rooms(&contract.rooms, enclave, "room-other").is_err());
+    }
+
+    #[test]
+    fn safe_path_component_removes_model_path_separators() {
+        assert_eq!(
+            safe_path_component("meta/llama-3.1:8b@4bit"),
+            "meta_llama-3.1_8b_4bit"
+        );
+    }
+
+    fn test_provider_start_args() -> ProviderStartArgs {
+        ProviderStartArgs {
+            home: None,
+            enclave: None,
+            rooms: "auto".to_owned(),
+            rpc_url: None,
+            sc_bridge_url: None,
+            sc_bridge_token: None,
+            wallet_password: None,
+            catalog_path: None,
+            signature_path: None,
+            keys_dir: None,
+            canaries_dir: None,
+            artifact: None,
+            downloads_dir: None,
+            hf_token_file: None,
+            engine_backend: "auto".to_owned(),
+            fixture: None,
+            disk_path: None,
+            skip_disk_bench: true,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            enclave_binary: None,
+            sim: false,
+            no_heartbeat: true,
+            heartbeat_count: 1,
+            print_json: true,
+            dev_skip_catalog_verify: true,
+        }
+    }
+
+    fn test_hardware(fixture: FixtureProfile) -> HardwareReport {
+        probe(ProbeOptions {
+            disk_path: PathBuf::from("."),
+            run_disk_bench: false,
+            disk_bench_mib: 1,
+            fixture: Some(fixture),
+        })
+    }
+
+    fn test_catalog(root: &str) -> catalog::CatalogDocument {
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(
+            "gguf-q4_k_m".to_owned(),
+            catalog::CatalogArtifact {
+                engine: "llama.cpp".to_owned(),
+                source: catalog::SourceRef {
+                    kind: "huggingface".to_owned(),
+                    repo: "test/model".to_owned(),
+                    revision: "1".repeat(40),
+                    publisher_key: None,
+                },
+                path: "model.gguf".to_owned(),
+                artifact_root: root.to_owned(),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 42,
+                source_sha256: None,
+                tokenizer_sha256: None,
+                chat_template_sha256: None,
+                min_compute_cap: None,
+                download_check: false,
+                notes: None,
+            },
+        );
+        catalog::CatalogDocument {
+            schema_version: 1,
+            catalog_id: "test".to_owned(),
+            generated_at: "2026-07-02T00:00:00Z".to_owned(),
+            models: vec![catalog::CatalogModel {
+                model_id: "test/model@4bit".to_owned(),
+                family: "test".to_owned(),
+                params_b: 1.0,
+                tier: "dev".to_owned(),
+                provenance: catalog::Provenance {
+                    source: catalog::SourceRef {
+                        kind: "huggingface".to_owned(),
+                        repo: "test/source".to_owned(),
+                        revision: "2".repeat(40),
+                        publisher_key: None,
+                    },
+                    conversion: Vec::new(),
+                    license: "test".to_owned(),
+                    license_sha256: "3".repeat(64),
+                },
+                artifacts,
+                caps: catalog::CatalogCaps {
+                    tools: true,
+                    json: true,
+                    ctx_max: 8192,
+                    vision: false,
+                },
+                requirements: catalog::CatalogRequirements {
+                    min_ram_gb: 1,
+                    min_vram_gb_full_offload: 0,
+                    cpu_flags: Vec::new(),
+                    backends: vec!["llama.cpp".to_owned()],
+                },
+                canary: catalog::CanaryRef {
+                    set_id: "test-canary".to_owned(),
+                    match_min: 0.9,
+                    fingerprints: BTreeMap::new(),
+                },
+                price_ref_mu: catalog::PriceRef {
+                    denom: "mu_usd".to_owned(),
+                    in_per_1k: 1,
+                    out_per_1k: 2,
+                },
+            }],
+        }
+    }
+
+    fn test_contract(root: &str) -> ContractCatalog {
+        let enclave = LedgerEnclave {
+            enclave_id: "11".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            backend: "llama.cpp".to_owned(),
+            artifact_root: root.to_owned(),
+            manifest_hash: "22".repeat(32),
+            att_tier: 1,
+            binary_hash: "33".repeat(32),
+            caps: json!({ "tools": true, "json": true, "ctx": 8192 }),
+            status: "active".to_owned(),
+            created_by: "44".repeat(32),
+        };
+        ContractCatalog {
+            enclaves: vec![enclave],
+            rooms: vec![
+                LedgerRoom {
+                    room_id: "room-a".to_owned(),
+                    sidechannel: "mx/room/room-a".to_owned(),
+                    model_id: "test/model@4bit".to_owned(),
+                    label: "test".to_owned(),
+                    status: "open".to_owned(),
+                },
+                LedgerRoom {
+                    room_id: "room-closed".to_owned(),
+                    sidechannel: "mx/room/room-closed".to_owned(),
+                    model_id: "test/model@4bit".to_owned(),
+                    label: "test".to_owned(),
+                    status: "closed".to_owned(),
+                },
+                LedgerRoom {
+                    room_id: "room-other".to_owned(),
+                    sidechannel: "mx/room/room-other".to_owned(),
+                    model_id: "other/model".to_owned(),
+                    label: "test".to_owned(),
+                    status: "open".to_owned(),
+                },
+            ],
+            prices: Vec::new(),
+        }
     }
 }

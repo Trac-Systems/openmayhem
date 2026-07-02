@@ -15,7 +15,9 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
 mayhem-bridge = { path = "../mayhem-bridge" }
+mayhem-enclave = { path = "../mayhem-enclave" }
 mayhem-hwprobe = { path = "../mayhem-hwprobe" }
+mayhem-proto = { path = "../mayhem-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }

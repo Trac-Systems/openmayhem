@@ -45,107 +45,107 @@ pub struct DownloadCheckReport {
     pub ok: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct CatalogDocument {
-    schema_version: u32,
-    catalog_id: String,
-    generated_at: String,
-    models: Vec<CatalogModel>,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CatalogDocument {
+    pub(crate) schema_version: u32,
+    pub(crate) catalog_id: String,
+    pub(crate) generated_at: String,
+    pub(crate) models: Vec<CatalogModel>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CatalogModel {
-    model_id: String,
-    family: String,
-    params_b: f64,
-    tier: String,
-    provenance: Provenance,
-    artifacts: BTreeMap<String, CatalogArtifact>,
-    caps: CatalogCaps,
-    requirements: CatalogRequirements,
-    canary: CanaryRef,
-    price_ref_mu: PriceRef,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CatalogModel {
+    pub(crate) model_id: String,
+    pub(crate) family: String,
+    pub(crate) params_b: f64,
+    pub(crate) tier: String,
+    pub(crate) provenance: Provenance,
+    pub(crate) artifacts: BTreeMap<String, CatalogArtifact>,
+    pub(crate) caps: CatalogCaps,
+    pub(crate) requirements: CatalogRequirements,
+    pub(crate) canary: CanaryRef,
+    pub(crate) price_ref_mu: PriceRef,
 }
 
-#[derive(Debug, Deserialize)]
-struct Provenance {
-    source: SourceRef,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Provenance {
+    pub(crate) source: SourceRef,
     #[serde(default)]
-    conversion: Vec<ConversionRef>,
-    license: String,
-    license_sha256: String,
+    pub(crate) conversion: Vec<ConversionRef>,
+    pub(crate) license: String,
+    pub(crate) license_sha256: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct SourceRef {
-    kind: String,
-    repo: String,
-    revision: String,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SourceRef {
+    pub(crate) kind: String,
+    pub(crate) repo: String,
+    pub(crate) revision: String,
     #[serde(default)]
-    publisher_key: Option<String>,
+    pub(crate) publisher_key: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ConversionRef {
-    tool: String,
-    method: String,
-    input_sha256: String,
-    output_sha256: String,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ConversionRef {
+    pub(crate) tool: String,
+    pub(crate) method: String,
+    pub(crate) input_sha256: String,
+    pub(crate) output_sha256: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CatalogArtifact {
-    engine: String,
-    source: SourceRef,
-    path: String,
-    artifact_root: String,
-    artifact_root_kind: String,
-    weights_bytes: u64,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CatalogArtifact {
+    pub(crate) engine: String,
+    pub(crate) source: SourceRef,
+    pub(crate) path: String,
+    pub(crate) artifact_root: String,
+    pub(crate) artifact_root_kind: String,
+    pub(crate) weights_bytes: u64,
     #[serde(default)]
-    source_sha256: Option<String>,
+    pub(crate) source_sha256: Option<String>,
     #[serde(default)]
-    tokenizer_sha256: Option<String>,
+    pub(crate) tokenizer_sha256: Option<String>,
     #[serde(default)]
-    chat_template_sha256: Option<String>,
+    pub(crate) chat_template_sha256: Option<String>,
     #[serde(default)]
-    min_compute_cap: Option<String>,
+    pub(crate) min_compute_cap: Option<String>,
     #[serde(default)]
-    download_check: bool,
+    pub(crate) download_check: bool,
     #[serde(default)]
-    notes: Option<String>,
+    pub(crate) notes: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CatalogCaps {
-    tools: bool,
-    json: bool,
-    ctx_max: u64,
-    vision: bool,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CatalogCaps {
+    pub(crate) tools: bool,
+    pub(crate) json: bool,
+    pub(crate) ctx_max: u64,
+    pub(crate) vision: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct CatalogRequirements {
-    min_ram_gb: u64,
-    min_vram_gb_full_offload: u64,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CatalogRequirements {
+    pub(crate) min_ram_gb: u64,
+    pub(crate) min_vram_gb_full_offload: u64,
     #[serde(default)]
-    cpu_flags: Vec<String>,
+    pub(crate) cpu_flags: Vec<String>,
     #[serde(default)]
-    backends: Vec<String>,
+    pub(crate) backends: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CanaryRef {
-    set_id: String,
-    match_min: f64,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CanaryRef {
+    pub(crate) set_id: String,
+    pub(crate) match_min: f64,
     #[serde(default)]
-    fingerprints: BTreeMap<String, String>,
+    pub(crate) fingerprints: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct PriceRef {
-    denom: String,
-    in_per_1k: u64,
-    out_per_1k: u64,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PriceRef {
+    pub(crate) denom: String,
+    pub(crate) in_per_1k: u64,
+    pub(crate) out_per_1k: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +247,11 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
         download_checks,
         errors,
     })
+}
+
+pub(crate) fn load_document(path: &Path) -> Result<CatalogDocument> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
 }
 
 fn failed_report(

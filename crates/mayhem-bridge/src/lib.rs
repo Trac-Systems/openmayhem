@@ -244,6 +244,25 @@ impl PeerRpcClient {
         self.request_json(self.http.get(url)).await
     }
 
+    pub async fn state_prefix(
+        &self,
+        prefix: &str,
+        confirmed: Option<bool>,
+        limit: Option<u64>,
+    ) -> Result<Value> {
+        let mut url = self.endpoint("state")?;
+        url.query_pairs_mut().append_pair("prefix", prefix);
+        if let Some(confirmed) = confirmed {
+            url.query_pairs_mut()
+                .append_pair("confirmed", if confirmed { "true" } else { "false" });
+        }
+        if let Some(limit) = limit {
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.to_string());
+        }
+        self.request_json(self.http.get(url)).await
+    }
+
     pub async fn contract_schema(&self) -> Result<Value> {
         self.get("contract/schema").await
     }
@@ -295,6 +314,20 @@ mod tests {
         assert_eq!(
             client.endpoint("contract/schema").unwrap().as_str(),
             "http://127.0.0.1:49223/v1/contract/schema"
+        );
+    }
+
+    #[test]
+    fn rpc_state_prefix_url_uses_state_endpoint() {
+        let client = PeerRpcClient::new(DEFAULT_RPC_URL).unwrap();
+        let mut url = client.endpoint("state").unwrap();
+        url.query_pairs_mut()
+            .append_pair("prefix", "enclave/")
+            .append_pair("confirmed", "false")
+            .append_pair("limit", "10");
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:49223/v1/state?prefix=enclave%2F&confirmed=false&limit=10"
         );
     }
 
