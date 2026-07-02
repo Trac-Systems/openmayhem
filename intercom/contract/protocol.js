@@ -178,6 +178,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'epoch_commit') {
+      return {
+        type: 'epochCommit',
+        value: json,
+      };
+    }
     if (json?.op === 'rate_oracle') {
       return {
         type: 'rateOracle',
@@ -236,6 +242,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "anchor_reputation", "provider": "<pubkey>", "epoch": 1, "folded_at": 3600, "events_head": "<head>", "r_bps": 8700, "raw_milli": 12345, "successful_sessions": 50 }\' --sim 1 | admin/oracle anchors a rep/<provider> snapshot.');
     console.log('- /tx --command \'{ "op": "auditor_register", "auditor": "<pubkey>" }\' --sim 1 | admin accredits an auditor, or a qualified peer self-registers.');
     console.log('- /tx --command \'{ "op": "probe_result", "probe_id": "<id>", "probe_kind": "canary", "provider": "<pk>", "match_bps": 9700, "pass": true, "canary_set": "canary-dev-v1", "epoch": 1, "at": 3600 }\' --sim 1 | auditor submits probe evidence.');
+    console.log('- /tx --command \'{ "op": "epoch_commit", "epoch": 1, "at": 3600, "roots": { "dep": "<root>", "use": "<root>", "earn": "<root>", "fee": "<root>", "pay": "<root>" }, "totals": { "dep_count": 0, "dep_mu": 0, "use_count": 1, "use_mu": 1000, "provider_count": 1, "earn_mu": 850, "fee_mu": 150, "fee_cum_mu": 150, "pay_count": 0, "pay_mu": 0 } }\' --sim 1 | permissionlessly anchors epoch roots.');
     console.log('- /tx --command \'{ "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] }\' --sim 1 | admin/oracle applies bounded credit, earning, and fee deltas.');
     console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "coinbase-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
     console.log('- /tx --command \'{ "op": "deposit_tnk", "memo_hash": "<hash>" }\' --sim 1 | user creates a memo-bound TNK deposit intent.');

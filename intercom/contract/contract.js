@@ -46,6 +46,19 @@ const REPUTATION_EVENT_KINDS = new Set([
   'provenance_violation',
 ]);
 const PROBE_KINDS = new Set(['canary', 'uptime_tick']);
+const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee', 'pay'];
+const EPOCH_TOTAL_KEYS = [
+  'dep_count',
+  'dep_mu',
+  'use_count',
+  'use_mu',
+  'provider_count',
+  'earn_mu',
+  'fee_mu',
+  'fee_cum_mu',
+  'pay_count',
+  'pay_mu',
+];
 const ENCLAVE_UPDATE_FIELDS = [
   'backend',
   'artifact_root',
@@ -386,6 +399,20 @@ class MayhemContract extends Contract {
           max: LEDGER_BATCH_SCHEMA_MAX,
           items: { type: 'any' },
         },
+        roots: { type: 'any', optional: true },
+        totals: { type: 'any', optional: true },
+      },
+    });
+
+    this.addSchema('epochCommit', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+        roots: { type: 'any' },
+        totals: { type: 'any' },
       },
     });
 
@@ -1248,6 +1275,13 @@ class MayhemContract extends Contract {
 
     const shapeError = this.validateEpochApplyShape(this.value);
     if (shapeError) return shapeError;
+    const roots = this.value.roots === undefined ? null : this.normalizeEpochRoots(this.value.roots);
+    if (roots instanceof Error) return roots;
+    const totals = this.value.totals === undefined ? null : this.normalizeEpochTotals(this.value.totals);
+    if (totals instanceof Error) return totals;
+    if ((roots && !totals) || (!roots && totals)) {
+      return new Error('Epoch apply roots and totals must be provided together.');
+    }
 
     const params = await this.activeParamsAt(this.value.at, ['fee_bps', 'max_apply_batch']);
     if (this.value.debits.length + this.value.earnings.length > params.max_apply_batch) {
@@ -1279,6 +1313,8 @@ class MayhemContract extends Contract {
       fee_bps: params.fee_bps,
       debits: this.mapEntriesForHash(debitMap, 'user', 'mu'),
       earnings: this.mapEntriesForHash(grossEarningMap, 'provider', 'gross_mu'),
+      roots,
+      totals,
     };
     const applyHash = await this.epochApplyHash(normalized);
     if (fee.updated_epoch === this.value.epoch && fee.last_apply_hash === applyHash) {
@@ -1328,6 +1364,7 @@ class MayhemContract extends Contract {
     }
 
     const earnings = new Map();
+    let earnCumTotal = 0;
     for (const [provider, deltaMu] of earningDeltas) {
       const current = await this.earningRecord(provider);
       const totalMu = this.safeAddMu(current.total_mu, deltaMu);
@@ -1341,10 +1378,26 @@ class MayhemContract extends Contract {
         updated_epoch: this.value.epoch,
         updated_at: this.tx,
       });
+      earnCumTotal = this.safeAddMu(earnCumTotal, totalMu);
+      if (earnCumTotal instanceof Error) return earnCumTotal;
     }
 
     const nextFeeCum = this.safeAddMu(fee.cum_mu, feeDeltaMu);
     if (nextFeeCum instanceof Error) return nextFeeCum;
+
+    if (totals) {
+      const totalsError = await this.validateEpochApplyTotals({
+        epoch: this.value.epoch,
+        roots,
+        totals,
+        debitTotal,
+        feeDeltaMu,
+        nextFeeCum,
+        providerCount: grossEarningMap.size,
+        earnCumTotal,
+      });
+      if (totalsError) return totalsError;
+    }
 
     for (const [user, balance] of this.sortedMapEntries(balances)) {
       await this.put(`bal/${user}`, balance);
@@ -1361,6 +1414,16 @@ class MayhemContract extends Contract {
       last_fee_bps: params.fee_bps,
     };
     await this.put('fee/cum', feeRecord);
+    if (totals) {
+      await this.writeEpochEvidenceRoots({
+        epoch: this.value.epoch,
+        at: this.value.at,
+        roots,
+        totals,
+        feeDeltaMu,
+        feeCumMu: nextFeeCum,
+      });
+    }
 
     const result = {
       ok: true,
@@ -1373,6 +1436,57 @@ class MayhemContract extends Contract {
     };
     console.log('mayhem epochApply', result);
     return result;
+  }
+
+  async epochCommit() {
+    const roots = this.normalizeEpochRoots(this.value.roots);
+    if (roots instanceof Error) return roots;
+    const totals = this.normalizeEpochTotals(this.value.totals);
+    if (totals instanceof Error) return totals;
+    const params = await this.activeParamsAt(this.value.at, ['challenge_epochs']);
+    const normalized = {
+      epoch: this.value.epoch,
+      roots,
+      totals,
+    };
+    const commitHash = await this.epochCommitHash(normalized);
+    const key = `epoch/commit/${this.value.epoch}`;
+    const existing = await this.get(key);
+    if (existing) {
+      if (existing.commit_hash === commitHash) {
+        return {
+          ok: true,
+          op: 'epochCommit',
+          epoch: this.value.epoch,
+          idempotent: true,
+          commit_hash: commitHash,
+        };
+      }
+      return new Error('Epoch commit already exists.');
+    }
+
+    const record = {
+      type: 'epoch_commit',
+      epoch: this.value.epoch,
+      roots,
+      totals,
+      status: 'provisional',
+      challenge_epochs: params.challenge_epochs,
+      provisional_until_epoch: this.value.epoch + params.challenge_epochs,
+      commit_hash: commitHash,
+      submitted_by: this.address,
+      submitted_at: this.tx,
+      at: this.value.at,
+    };
+    await this.put(key, record);
+    console.log('mayhem epochCommit', record);
+    return {
+      ok: true,
+      op: 'epochCommit',
+      epoch: this.value.epoch,
+      idempotent: false,
+      commit_hash: commitHash,
+    };
   }
 
   async rateOracle() {
@@ -1704,6 +1818,150 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  normalizeEpochRoots(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Epoch roots must be an object.');
+    }
+    const keys = Object.keys(value).sort();
+    if (
+      keys.length !== EPOCH_ROOT_KEYS.length ||
+      keys.some((key, idx) => key !== EPOCH_ROOT_KEYS.slice().sort()[idx])
+    ) {
+      return new Error('Epoch roots must include dep, use, earn, fee, and pay.');
+    }
+    const roots = {};
+    for (const key of EPOCH_ROOT_KEYS) {
+      const root = value[key];
+      if (typeof root !== 'string' || !/^[0-9a-fA-F]{64}$/.test(root)) {
+        return new Error(`Invalid epoch ${key} root.`);
+      }
+      roots[key] = root.toLowerCase();
+    }
+    return roots;
+  }
+
+  normalizeEpochTotals(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Epoch totals must be an object.');
+    }
+    const expected = EPOCH_TOTAL_KEYS.slice().sort();
+    const keys = Object.keys(value).sort();
+    if (keys.length !== expected.length || keys.some((key, idx) => key !== expected[idx])) {
+      return new Error('Epoch totals have an invalid shape.');
+    }
+    const totals = {};
+    for (const key of EPOCH_TOTAL_KEYS) {
+      const total = value[key];
+      if (!Number.isSafeInteger(total) || total < 0) {
+        return new Error(`Invalid epoch total ${key}.`);
+      }
+      totals[key] = total;
+    }
+    return totals;
+  }
+
+  async validateEpochApplyTotals({
+    epoch,
+    roots,
+    totals,
+    debitTotal,
+    feeDeltaMu,
+    nextFeeCum,
+    providerCount,
+    earnCumTotal,
+  }) {
+    const commit = await this.get(`epoch/commit/${epoch}`);
+    if (!commit) return new Error('Epoch commit required before applying evidence roots.');
+    if (commit.status === 'void') return new Error('Epoch commit is void.');
+    if (
+      stableJson(commit.roots) !== stableJson(roots) ||
+      stableJson(commit.totals) !== stableJson(totals)
+    ) {
+      return new Error('Epoch apply roots do not match committed roots.');
+    }
+    if (totals.use_mu !== debitTotal) return new Error('Epoch usage total does not match debits.');
+    if (totals.earn_mu !== earnCumTotal) {
+      return new Error('Epoch earn total does not match cumulative provider earnings.');
+    }
+    if (totals.fee_mu !== feeDeltaMu) return new Error('Epoch fee total does not match computed fee.');
+    if (totals.fee_cum_mu !== nextFeeCum) {
+      return new Error('Epoch cumulative fee total does not match fee state.');
+    }
+    if (totals.provider_count !== providerCount) {
+      return new Error('Epoch provider count does not match earnings.');
+    }
+
+    const depositRoot = await this.get(`ev/dep/${epoch}`);
+    if (depositRoot) {
+      if (depositRoot.type !== 'deposit_root') return new Error('Invalid deposit evidence root.');
+      if (
+        depositRoot.merkle_root !== roots.dep ||
+        depositRoot.count !== totals.dep_count ||
+        depositRoot.mu_total !== totals.dep_mu
+      ) {
+        return new Error('Committed deposit root does not match deposit evidence.');
+      }
+    }
+    for (const key of ['use', 'earn', 'fee', 'pay']) {
+      if ((await this.get(`ev/${key}/${epoch}`)) !== null) {
+        return new Error(`Epoch ${key} evidence root already exists.`);
+      }
+    }
+    return null;
+  }
+
+  async writeEpochEvidenceRoots({ epoch, at, roots, totals, feeDeltaMu, feeCumMu }) {
+    if ((await this.get(`ev/dep/${epoch}`)) === null) {
+      await this.put(`ev/dep/${epoch}`, {
+        type: 'deposit_root',
+        epoch,
+        merkle_root: roots.dep,
+        count: totals.dep_count,
+        mu_total: totals.dep_mu,
+        ts: at,
+        updated_at: this.tx,
+      });
+    }
+    await this.put(`ev/use/${epoch}`, {
+      type: 'usage_root',
+      epoch,
+      merkle_root: roots.use,
+      sessions: totals.use_count,
+      mu_total: totals.use_mu,
+      providers: totals.provider_count,
+      ts: at,
+      updated_at: this.tx,
+    });
+    await this.put(`ev/earn/${epoch}`, {
+      type: 'earn_root',
+      epoch,
+      merkle_root: roots.earn,
+      provider_count: totals.provider_count,
+      mu_cum_total: totals.earn_mu,
+      ts: at,
+      updated_at: this.tx,
+    });
+    await this.put(`ev/fee/${epoch}`, {
+      type: 'fee_root',
+      epoch,
+      merkle_root: roots.fee,
+      mu_fee_epoch: feeDeltaMu,
+      mu_fee_cum: feeCumMu,
+      sweep_msb_tx_hash: null,
+      ts: at,
+      updated_at: this.tx,
+    });
+    await this.put(`ev/pay/${epoch}`, {
+      type: 'payout_root',
+      epoch,
+      merkle_root: roots.pay,
+      count: totals.pay_count,
+      mu_total: totals.pay_mu,
+      ts: at,
+      updated_at: this.tx,
+    });
+  }
+
   aggregateLedgerEntries(entries, idKey, amountKey, label) {
     const out = new Map();
     for (const entry of entries) {
@@ -1856,6 +2114,14 @@ class MayhemContract extends Contract {
   async epochApplyHash(value) {
     const digest = await blake3(b4a.from(stableJson({
       domain: 'mayhem-epoch-apply-v1',
+      value,
+    })));
+    return b4a.toString(digest, 'hex');
+  }
+
+  async epochCommitHash(value) {
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-epoch-commit-v1',
       value,
     })));
     return b4a.toString(digest, 'hex');
