@@ -4,13 +4,14 @@
   "type": "module",
   "main": "src/main.js",
   "scripts": {
-    "test:contract": "node --test tests/contract-consent.test.js tests/contract-registry.test.js"
+    "test:contract": "node --test tests/contract-consent.test.js tests/contract-registry.test.js tests/contract-room.test.js"
   },
   "pear": {
     "name": "mayhem-intercom",
     "type": "terminal"
   },
   "dependencies": {
+    "@tracsystems/blake3": "^0.0.15",
     "b4a": "^1.6.7",
     "bare-ws": "2.0.3",
     "compact-encoding": "^2.18.0",

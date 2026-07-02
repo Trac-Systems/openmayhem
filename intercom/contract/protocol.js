@@ -76,6 +76,18 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'open_room') {
+      return {
+        type: 'openRoom',
+        value: json,
+      };
+    }
+    if (json?.op === 'close_room') {
+      return {
+        type: 'closeRoom',
+        value: json,
+      };
+    }
     if (json?.op === 'read_key') {
       return {
         type: 'readKey',
@@ -94,6 +106,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "consent", "ver": 1, "hash": "<hash>", "sig": "<sig>" }\' --sim 1 | records consent.');
     console.log('- /tx --command \'{ "op": "register_provider", "payout_addr": "<target>", "payout_method": "tnk" }\' --sim 1 | registers a provider.');
     console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | registers an enclave.');
+    console.log('- /tx --command \'{ "op": "open_room", "model_id": "<model>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | opens a model room.');
+    console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | closes a model room.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');

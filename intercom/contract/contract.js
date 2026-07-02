@@ -1,3 +1,5 @@
+import b4a from 'b4a';
+import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
 const CONTRACT_VERSION = 1;
@@ -14,6 +16,11 @@ const ENCLAVE_UPDATE_FIELDS = [
 ];
 
 export const consentMessage = (ver, hash) => `mayhem-consent${ver}${hash}`;
+export const roomSidechannelName = (roomId) => `mx/room/${roomId}`;
+export const deriveRoomId = async (modelId, creator, nonce) => {
+  const digest = await blake3(b4a.from(`${modelId}${creator}${nonce}`));
+  return b4a.toString(digest, 'hex').slice(0, 32);
+};
 
 const cloneValue = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
@@ -126,6 +133,27 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
+    this.addSchema('openRoom', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        model_id: { type: 'string', min: 1, max: 256 },
+        nonce: { type: 'string', min: 1, max: 128 },
+        label: { type: 'string', min: 1, max: 64 },
+        policy: { type: 'any' },
+      },
+    });
+
+    this.addSchema('closeRoom', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        room_id: { type: 'string', min: 1, max: 128 },
       },
     });
   }
@@ -307,6 +335,50 @@ class MayhemContract extends Contract {
     await this.put(key, updated);
     console.log('mayhem retireEnclave', updated);
     return { ok: true, op: 'retireEnclave', enclave_id: updated.enclave_id };
+  }
+
+  async openRoom() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+
+    const roomId = await deriveRoomId(this.value.model_id, this.address, this.value.nonce);
+    const key = `room/${roomId}`;
+    const existing = await this.get(key);
+    if (existing && existing.status !== 'closed') return new Error('Room already open.');
+
+    const record = {
+      room_id: roomId,
+      sidechannel: roomSidechannelName(roomId),
+      model_id: this.value.model_id,
+      label: this.value.label,
+      creator: this.address,
+      policy: cloneValue(this.value.policy),
+      created_at: this.tx,
+      updated_at: this.tx,
+      closed_at: null,
+      status: 'open',
+    };
+    await this.put(key, record);
+    console.log('mayhem openRoom', record);
+    return { ok: true, op: 'openRoom', room_id: roomId, sidechannel: record.sidechannel };
+  }
+
+  async closeRoom() {
+    const key = `room/${this.value.room_id}`;
+    const record = await this.get(key);
+    if (!record) return new Error('Room not found.');
+    if (record.creator !== this.address) return new Error('Room creator required.');
+    if (record.status === 'closed') return new Error('Room already closed.');
+
+    const updated = {
+      ...record,
+      status: 'closed',
+      updated_at: this.tx,
+      closed_at: this.tx,
+    };
+    await this.put(key, updated);
+    console.log('mayhem closeRoom', updated);
+    return { ok: true, op: 'closeRoom', room_id: updated.room_id, sidechannel: updated.sidechannel };
   }
 
   async currentRules() {

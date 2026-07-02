@@ -9,6 +9,10 @@ export class MemoryStorage {
     this.values = new Map(Object.entries(initial));
   }
 
+  static fromSnapshotBytes(bytes) {
+    return new MemoryStorage(Object.fromEntries(JSON.parse(bytes)));
+  }
+
   async get(key) {
     return this.values.has(key) ? { value: this.values.get(key) } : null;
   }
