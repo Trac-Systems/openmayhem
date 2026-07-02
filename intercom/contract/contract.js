@@ -5,6 +5,7 @@ import { Contract } from 'trac-peer';
 const CONTRACT_VERSION = 1;
 const CURRENT_RULES_KEY = 'rules/current';
 const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
+const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
 const ENCLAVE_UPDATE_FIELDS = [
   'backend',
   'artifact_root',
@@ -154,6 +155,20 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         room_id: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
+    this.addSchema('setPrice', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+        in_per_1k_mu: { type: 'number', integer: true, min: 0 },
+        out_per_1k_mu: { type: 'number', integer: true, min: 0 },
+        per_req_mu: { type: 'number', integer: true, min: 0 },
+        min_session_mu: { type: 'number', integer: true, min: 0 },
+        effective_at: { type: 'number', integer: true, min: 0 },
       },
     });
   }
@@ -381,6 +396,54 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'closeRoom', room_id: updated.room_id, sidechannel: updated.sidechannel };
   }
 
+  async setPrice() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+
+    const enclave = await this.get(`enclave/${this.value.enclave_id}`);
+    if (!enclave) return new Error('Enclave not found.');
+    if (enclave.provider !== this.address) return new Error('Provider mismatch.');
+    if (enclave.status === 'retired') return new Error('Enclave is retired.');
+
+    const modelRef = await this.get(`modelref/${enclave.model_id}`);
+    if (!modelRef) return new Error('Model reference not found.');
+
+    const inRef = this.modelRefPrice(modelRef, 'in_per_1k_mu', 'in_per_1k');
+    const outRef = this.modelRefPrice(modelRef, 'out_per_1k_mu', 'out_per_1k');
+    if (!this.priceWithinBounds(this.value.in_per_1k_mu, inRef)) {
+      return new Error('Input price outside model reference bounds.');
+    }
+    if (!this.priceWithinBounds(this.value.out_per_1k_mu, outRef)) {
+      return new Error('Output price outside model reference bounds.');
+    }
+
+    const key = `price/${this.value.enclave_id}`;
+    const current = await this.get(key);
+    if (
+      current &&
+      this.value.effective_at - current.effective_at < PRICE_RATE_LIMIT_SECONDS
+    ) {
+      return new Error('Price changes are limited to once per 6h.');
+    }
+
+    const record = {
+      enclave_id: this.value.enclave_id,
+      model_id: enclave.model_id,
+      provider: this.address,
+      ver: current ? current.ver + 1 : 1,
+      in_per_1k_mu: this.value.in_per_1k_mu,
+      out_per_1k_mu: this.value.out_per_1k_mu,
+      per_req_mu: this.value.per_req_mu,
+      min_session_mu: this.value.min_session_mu,
+      effective_at: this.value.effective_at,
+      effective_from: this.tx,
+      updated_at: this.tx,
+    };
+    await this.put(key, record);
+    console.log('mayhem setPrice', record);
+    return { ok: true, op: 'setPrice', enclave_id: record.enclave_id, ver: record.ver };
+  }
+
   async currentRules() {
     return await this.get(CURRENT_RULES_KEY);
   }
@@ -408,6 +471,17 @@ class MayhemContract extends Contract {
     const provider = await this.get(`prov/${sender}`);
     if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
     return null;
+  }
+
+  modelRefPrice(modelRef, directKey, nestedKey) {
+    if (Number.isInteger(modelRef?.[directKey])) return modelRef[directKey];
+    if (Number.isInteger(modelRef?.price_ref_mu?.[nestedKey])) return modelRef.price_ref_mu[nestedKey];
+    return null;
+  }
+
+  priceWithinBounds(price, ref) {
+    if (!Number.isInteger(ref) || ref <= 0) return false;
+    return price * 4 >= ref && price <= ref * 4;
   }
 
   verifyConsentSignature(sender, ver, hash, sig) {

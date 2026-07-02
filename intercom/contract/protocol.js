@@ -88,6 +88,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'set_price') {
+      return {
+        type: 'setPrice',
+        value: json,
+      };
+    }
     if (json?.op === 'read_key') {
       return {
         type: 'readKey',
@@ -108,6 +114,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | registers an enclave.');
     console.log('- /tx --command \'{ "op": "open_room", "model_id": "<model>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | opens a model room.');
     console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | closes a model room.');
+    console.log('- /tx --command \'{ "op": "set_price", "enclave_id": "<id>", "in_per_1k_mu": 18, "out_per_1k_mu": 55, "per_req_mu": 0, "min_session_mu": 100, "effective_at": 21600 }\' --sim 1 | sets an enclave price.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');
