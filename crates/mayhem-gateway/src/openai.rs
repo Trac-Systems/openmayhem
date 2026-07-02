@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,7 +16,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use ed25519_dalek::{Signer, SigningKey};
 use futures_util::stream;
+use mayhem_proto::{
+    receipt_signing_bytes, spend_voucher_signing_bytes, CheckpointPolicy, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, SESSION_RECEIPT_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -28,6 +33,9 @@ const EMBEDDED_CATALOG: &str = include_str!("../../../catalog/models.json");
 #[derive(Clone, Debug)]
 pub struct GatewayState {
     models: Arc<Vec<GatewayModel>>,
+    receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+    paused_sessions: Arc<Mutex<Vec<PausedSession>>>,
+    receipt_config: ReceiptConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +59,7 @@ pub struct MayhemModelInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PriceRefMu {
     pub denom: String,
+    pub ver: u64,
     pub in_per_1k: u64,
     pub out_per_1k: u64,
 }
@@ -61,6 +70,30 @@ pub struct ModelCaps {
     pub json: bool,
     pub ctx: u32,
     pub vision: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StoredReceipt {
+    pub voucher: SpendVoucher,
+    pub receipt: SessionReceipt,
+    pub receipt_ack: ReceiptAck,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PausedSession {
+    pub session_id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReceiptConfig {
+    cosign_enabled: bool,
+    balance_mu: u64,
+    rules_ver: u64,
+    checkpoint_every: CheckpointPolicy,
+    user_seed: [u8; 32],
+    provider_seed: [u8; 32],
+    enclave_seed: [u8; 32],
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,39 +206,89 @@ impl GatewayState {
         if models.is_empty() {
             Ok(Self::fixture())
         } else {
-            Ok(Self {
-                models: Arc::new(models),
-            })
+            Ok(Self::with_models(models))
         }
     }
 
     pub fn fixture() -> Self {
         let mut tiers = BTreeMap::new();
         tiers.insert("T1".to_owned(), 1);
-        Self {
-            models: Arc::new(vec![GatewayModel {
-                id: "mayhem/dev-chat-tools".to_owned(),
-                created: 1_782_950_400,
-                owned_by: "mayhem".to_owned(),
-                mayhem: MayhemModelInfo {
-                    providers_online: 1,
-                    rooms: 1,
-                    price_ref_mu: PriceRefMu {
-                        denom: "mu_usd".to_owned(),
-                        in_per_1k: 20,
-                        out_per_1k: 60,
-                    },
-                    attestation_tiers: tiers,
-                    caps: ModelCaps {
-                        tools: true,
-                        json: true,
-                        ctx: 8192,
-                        vision: false,
-                    },
-                    source: "local-fixture".to_owned(),
+        Self::with_models(vec![GatewayModel {
+            id: "mayhem/dev-chat-tools".to_owned(),
+            created: 1_782_950_400,
+            owned_by: "mayhem".to_owned(),
+            mayhem: MayhemModelInfo {
+                providers_online: 1,
+                rooms: 1,
+                price_ref_mu: PriceRefMu {
+                    denom: "mu_usd".to_owned(),
+                    ver: 1,
+                    in_per_1k: 20,
+                    out_per_1k: 60,
                 },
-            }]),
+                attestation_tiers: tiers,
+                caps: ModelCaps {
+                    tools: true,
+                    json: true,
+                    ctx: 8192,
+                    vision: false,
+                },
+                source: "local-fixture".to_owned(),
+            },
+        }])
+    }
+
+    fn with_models(models: Vec<GatewayModel>) -> Self {
+        Self {
+            models: Arc::new(models),
+            receipts: Arc::new(Mutex::new(Vec::new())),
+            paused_sessions: Arc::new(Mutex::new(Vec::new())),
+            receipt_config: ReceiptConfig::default(),
         }
+    }
+
+    pub fn with_receipt_cosign_enabled(mut self, enabled: bool) -> Self {
+        self.receipt_config.cosign_enabled = enabled;
+        self
+    }
+
+    pub fn receipts(&self) -> Vec<StoredReceipt> {
+        self.receipts
+            .lock()
+            .expect("receipt store poisoned")
+            .clone()
+    }
+
+    pub fn paused_sessions(&self) -> Vec<PausedSession> {
+        self.paused_sessions
+            .lock()
+            .expect("paused session store poisoned")
+            .clone()
+    }
+
+    fn receipt_count(&self) -> usize {
+        self.receipts.lock().expect("receipt store poisoned").len()
+    }
+
+    fn paused_session_count(&self) -> usize {
+        self.paused_sessions
+            .lock()
+            .expect("paused session store poisoned")
+            .len()
+    }
+
+    fn record_receipt(&self, receipt: StoredReceipt) {
+        self.receipts
+            .lock()
+            .expect("receipt store poisoned")
+            .push(receipt);
+    }
+
+    fn pause_session(&self, paused: PausedSession) {
+        self.paused_sessions
+            .lock()
+            .expect("paused session store poisoned")
+            .push(paused);
     }
 
     fn model(&self, id: &str) -> Option<GatewayModel> {
@@ -214,6 +297,23 @@ impl GatewayState {
 
     fn first_model(&self) -> Option<GatewayModel> {
         self.models.first().cloned()
+    }
+}
+
+impl Default for ReceiptConfig {
+    fn default() -> Self {
+        Self {
+            cosign_enabled: true,
+            balance_mu: 1_000_000,
+            rules_ver: 1,
+            checkpoint_every: CheckpointPolicy {
+                tokens: 8192,
+                ms: 30000,
+            },
+            user_seed: [41_u8; 32],
+            provider_seed: [42_u8; 32],
+            enclave_seed: [43_u8; 32],
+        }
     }
 }
 
@@ -279,16 +379,28 @@ async fn mayhem_status(State(state): State<SharedState>) -> Response {
         "backend": "local-openai-shape",
         "models": state.models.len(),
         "sessions_active": 0,
+        "sessions_paused": state.paused_session_count(),
+        "receipts": state.receipt_count(),
     }))
     .into_response()
 }
 
-async fn mayhem_receipts() -> Response {
-    Json(json!({ "object": "list", "data": [] })).into_response()
+async fn mayhem_receipts(State(state): State<SharedState>) -> Response {
+    Json(json!({
+        "object": "list",
+        "data": state.receipts(),
+        "paused": state.paused_sessions(),
+    }))
+    .into_response()
 }
 
-async fn mayhem_balance() -> Response {
-    Json(json!({ "denom": "mu_usd", "balance_mu": 0, "held_mu": 0 })).into_response()
+async fn mayhem_balance(State(state): State<SharedState>) -> Response {
+    Json(json!({
+        "denom": "mu_usd",
+        "balance_mu": state.receipt_config.balance_mu,
+        "held_mu": 0
+    }))
+    .into_response()
 }
 
 enum ChatResponse {
@@ -328,12 +440,14 @@ fn build_chat_completion(
     let id = make_id("chatcmpl");
     let created = now_secs();
     let output = deterministic_chat_output(&model, &request);
+    let receipt = state.meter_chat_session(&model, &request, &output)?;
     if request.stream {
         Ok(ChatResponse::Sse(chat_stream_chunks(
             &id,
             created,
             &model.id,
             &output,
+            &receipt,
             request
                 .stream_options
                 .as_ref()
@@ -341,7 +455,7 @@ fn build_chat_completion(
         )))
     } else {
         Ok(ChatResponse::Json(chat_response_value(
-            &id, created, &model, &output,
+            &id, created, &model, &output, &receipt,
         )))
     }
 }
@@ -360,6 +474,11 @@ fn build_completion(
         .take(max_tokens as usize * 8)
         .collect::<String>();
     let usage = usage_for(&prompt, &text);
+    let receipt_usage = ReceiptUsage {
+        in_tokens: usage.prompt_tokens,
+        out_tokens: usage.completion_tokens,
+    };
+    let receipt = state.meter_session(&model, &prompt, receipt_usage)?;
     let chunk = json!({
         "id": id,
         "object": "text_completion",
@@ -372,11 +491,114 @@ fn build_completion(
             "finish_reason": "stop"
         }],
         "usage": usage,
+        "mayhem": {
+            "receipt": receipt_summary(&receipt),
+        },
     });
     if request.stream {
         Ok(ChatResponse::Sse(vec![chunk]))
     } else {
         Ok(ChatResponse::Json(chunk))
+    }
+}
+
+impl GatewayState {
+    fn meter_chat_session(
+        &self,
+        model: &GatewayModel,
+        request: &ChatCompletionRequest,
+        output: &ChatOutput,
+    ) -> Result<StoredReceipt, ApiError> {
+        let prompt_text = request
+            .messages
+            .iter()
+            .map(message_to_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let usage = ReceiptUsage {
+            in_tokens: output.usage.prompt_tokens,
+            out_tokens: output.usage.completion_tokens,
+        };
+        self.meter_session(model, &prompt_text, usage)
+    }
+
+    fn meter_session(
+        &self,
+        model: &GatewayModel,
+        prompt_text: &str,
+        usage: ReceiptUsage,
+    ) -> Result<StoredReceipt, ApiError> {
+        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        let max_spend_mu = mu_owed_cum.max(1_000);
+        if max_spend_mu > self.receipt_config.balance_mu {
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+
+        let session_id = session_id_for(&model.id, prompt_text);
+        let enclave_id = enclave_id_for_model(&model.id);
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver: model.mayhem.price_ref_mu.ver,
+            max_spend_mu,
+            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+        };
+        let voucher_payload =
+            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
+        let voucher = SpendVoucher {
+            body: voucher_body,
+            user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
+        };
+
+        if !self.receipt_config.cosign_enabled {
+            self.pause_session(PausedSession {
+                session_id,
+                reason: "receipt co-signing refused; session paused".to_owned(),
+            });
+            return Err(ApiError::conflict(
+                "receipt co-signing refused; session paused",
+                None,
+            ));
+        }
+
+        let body = ReceiptBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            seq: 1,
+            final_receipt: true,
+            user: verifying_key_hex(&self.receipt_config.user_seed),
+            provider: verifying_key_hex(&self.receipt_config.provider_seed),
+            enclave_id,
+            model_id: model.id.clone(),
+            price_ver: model.mayhem.price_ref_mu.ver,
+            rules_ver: self.receipt_config.rules_ver,
+            usage,
+            mu_owed_cum,
+            prompt_hash: blake3_hex(prompt_text.as_bytes()),
+            ts: now_millis_u64(),
+        };
+        let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
+        let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
+        let receipt = SessionReceipt {
+            body,
+            enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+            user_sig: user_sig.clone(),
+        };
+        let receipt_ack = ReceiptAck {
+            session_id: receipt.body.session_id.clone(),
+            seq: receipt.body.seq,
+            user_sig,
+        };
+        let stored = StoredReceipt {
+            voucher,
+            receipt,
+            receipt_ack,
+        };
+        self.record_receipt(stored.clone());
+        Ok(stored)
     }
 }
 
@@ -431,7 +653,13 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
     output
 }
 
-fn chat_response_value(id: &str, created: u64, model: &GatewayModel, output: &ChatOutput) -> Value {
+fn chat_response_value(
+    id: &str,
+    created: u64,
+    model: &GatewayModel,
+    output: &ChatOutput,
+    receipt: &StoredReceipt,
+) -> Value {
     let message = if let Some(tool_call) = &output.tool_call {
         json!({
             "role": "assistant",
@@ -460,6 +688,7 @@ fn chat_response_value(id: &str, created: u64, model: &GatewayModel, output: &Ch
             "backend": "local-openai-shape",
             "direct_session": false,
             "model": model.mayhem,
+            "receipt": receipt_summary(receipt),
         },
     })
 }
@@ -469,6 +698,7 @@ fn chat_stream_chunks(
     created: u64,
     model: &str,
     output: &ChatOutput,
+    receipt: &StoredReceipt,
     include_usage: bool,
 ) -> Vec<Value> {
     let mut chunks = vec![chat_chunk(
@@ -516,6 +746,7 @@ fn chat_stream_chunks(
             "model": model,
             "choices": [],
             "usage": output.usage,
+            "mayhem": { "receipt": receipt_summary(receipt) },
         }));
     }
     chunks
@@ -552,6 +783,17 @@ fn tool_call_value(tool_call: &ToolCallOutput) -> Value {
             "name": tool_call.name,
             "arguments": tool_call.arguments,
         }
+    })
+}
+
+fn receipt_summary(receipt: &StoredReceipt) -> Value {
+    json!({
+        "session_id": receipt.receipt.body.session_id,
+        "seq": receipt.receipt.body.seq,
+        "final": receipt.receipt.body.final_receipt,
+        "mu_owed_cum": receipt.receipt.body.mu_owed_cum,
+        "prompt_hash": receipt.receipt.body.prompt_hash,
+        "receipt_ack": receipt.receipt_ack,
     })
 }
 
@@ -593,6 +835,11 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .and_then(Value::as_str)
                     .unwrap_or("mu_usd")
                     .to_owned(),
+                ver: price
+                    .get("ver")
+                    .or_else(|| price.get("price_ver"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1),
                 in_per_1k: price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
                 out_per_1k: price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
             },
@@ -626,6 +873,34 @@ fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiE
         message: format!("model '{model}' is not available"),
         param: Some("model"),
     })
+}
+
+fn calculate_mu_owed(price: &PriceRefMu, usage: &ReceiptUsage) -> u64 {
+    let raw = u128::from(usage.in_tokens) * u128::from(price.in_per_1k)
+        + u128::from(usage.out_tokens) * u128::from(price.out_per_1k);
+    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
+    rounded.min(u128::from(u64::MAX)) as u64
+}
+
+fn session_id_for(model_id: &str, prompt_text: &str) -> String {
+    blake3_hex(format!("{model_id}:{prompt_text}:{}", now_millis()).as_bytes())
+}
+
+fn enclave_id_for_model(model_id: &str) -> String {
+    blake3_hex(format!("mayhem-local-enclave:{model_id}").as_bytes())
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+fn sign_hex(seed: &[u8; 32], payload: &[u8]) -> String {
+    let key = SigningKey::from_bytes(seed);
+    hex::encode(key.sign(payload).to_bytes())
+}
+
+fn verifying_key_hex(seed: &[u8; 32]) -> String {
+    hex::encode(SigningKey::from_bytes(seed).verifying_key().to_bytes())
 }
 
 fn requested_tool_name(request: &ChatCompletionRequest) -> Option<String> {
@@ -766,12 +1041,43 @@ fn now_millis() -> u128 {
         .as_millis()
 }
 
+fn now_millis_u64() -> u64 {
+    match u64::try_from(now_millis()) {
+        Ok(millis) => millis,
+        Err(_) => u64::MAX,
+    }
+}
+
 impl ApiError {
     fn bad_request(message: impl Into<String>, param: Option<&'static str>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             param,
+        }
+    }
+
+    fn payment_required(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::PAYMENT_REQUIRED,
+            message: message.into(),
+            param,
+        }
+    }
+
+    fn conflict(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+            param,
+        }
+    }
+
+    fn internal(err: serde_json::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("receipt signing payload failed: {err}"),
+            param: None,
         }
     }
 }
