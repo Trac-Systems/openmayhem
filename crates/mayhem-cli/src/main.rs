@@ -2,7 +2,7 @@
 
 mod catalog;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -12,7 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use mayhem_bridge::{PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL};
+use mayhem_bridge::{
+    PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL, DEFAULT_SC_BRIDGE_URL,
+};
 use mayhem_enclave::{
     boot_sealed_store, build_merkle_manifest, download_resumable,
     finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
@@ -116,6 +118,10 @@ enum RulesCommands {
 enum ReceiptsCommands {
     /// Export an epoch audit bundle and verify it against ev/* roots.
     Export(ReceiptsExportArgs),
+    /// Publish gateway receipts onto the canonical epoch sidechannel.
+    Publish(ReceiptsPublishArgs),
+    /// Collect epoch sidechannel receipts into a receipts-file compatible JSON bundle.
+    Collect(ReceiptsCollectArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,6 +227,92 @@ struct ReceiptsExportArgs {
     no_verify: bool,
 
     /// Print a machine-readable export report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ReceiptsPublishArgs {
+    /// Epoch sidechannel to publish to. Defaults to mx/epoch/<epoch>.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Gateway base URL used to read /mayhem/receipts.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// SC-Bridge websocket URL. Defaults to config.toml, env, or local dev-net.
+    #[arg(long)]
+    sc_bridge_url: Option<String>,
+
+    /// SC-Bridge token.
+    #[arg(long)]
+    sc_bridge_token: Option<String>,
+
+    /// Override the sidechannel name.
+    #[arg(long)]
+    channel: Option<String>,
+
+    /// Keep polling the gateway and publish newly observed receipts.
+    #[arg(long)]
+    watch: bool,
+
+    /// Poll interval while --watch is active.
+    #[arg(long, default_value_t = 2_000)]
+    poll_interval_ms: u64,
+
+    /// Stop after publishing this many unique receipts.
+    #[arg(long)]
+    max_receipts: Option<usize>,
+
+    /// Maximum seconds to watch. Zero means no time limit.
+    #[arg(long, default_value_t = 0)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable publish report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ReceiptsCollectArgs {
+    /// Epoch sidechannel to collect from. Defaults to mx/epoch/<epoch>.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// SC-Bridge websocket URL. Defaults to config.toml, env, or local dev-net.
+    #[arg(long)]
+    sc_bridge_url: Option<String>,
+
+    /// SC-Bridge token.
+    #[arg(long)]
+    sc_bridge_token: Option<String>,
+
+    /// Override the sidechannel name.
+    #[arg(long)]
+    channel: Option<String>,
+
+    /// Write collected receipts to this JSON file. Defaults to stdout.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Stop after collecting this many unique receipts.
+    #[arg(long)]
+    max_receipts: Option<usize>,
+
+    /// Maximum seconds to collect before writing what was observed.
+    #[arg(long, default_value_t = 60)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable collection report.
     #[arg(long)]
     json: bool,
 }
@@ -738,6 +830,8 @@ async fn main() -> Result<()> {
         Commands::Earnings(args) => earnings(args).await,
         Commands::Receipts { command } => match command {
             ReceiptsCommands::Export(args) => receipts_export(args).await,
+            ReceiptsCommands::Publish(args) => receipts_publish(args).await,
+            ReceiptsCommands::Collect(args) => receipts_collect(args).await,
         },
         Commands::Rules { command } => match command {
             RulesCommands::Hash(args) => rules_hash(args),
@@ -2028,6 +2122,258 @@ async fn receipts_export(args: ReceiptsExportArgs) -> Result<()> {
     Ok(())
 }
 
+async fn receipts_publish(args: ReceiptsPublishArgs) -> Result<()> {
+    if args.poll_interval_ms == 0 {
+        bail!("--poll-interval-ms must be positive");
+    }
+    let channel = epoch_sidechannel(args.epoch, args.channel.as_deref());
+    let gateway_url = args
+        .gateway_url
+        .as_deref()
+        .unwrap_or(DEFAULT_GATEWAY_URL)
+        .trim_end_matches('/')
+        .to_owned();
+    let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
+        args.home.as_ref(),
+        args.sc_bridge_url.as_deref(),
+        args.sc_bridge_token.as_deref(),
+    )?;
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(&sc_bridge_url, sc_bridge_token)?)
+        .await
+        .context("connecting to SC-Bridge for epoch receipt publish")?;
+    bridge
+        .join(&channel)
+        .await
+        .with_context(|| format!("joining sidechannel {channel}"))?;
+
+    let deadline = (args.watch && args.timeout_seconds > 0)
+        .then(|| Instant::now() + Duration::from_secs(args.timeout_seconds));
+    let mut seen = BTreeSet::new();
+    let mut published = 0usize;
+
+    loop {
+        let receipts = fetch_gateway_receipts(&gateway_url).await?;
+        for receipt in receipts {
+            let receipt_id = receipt_id(&receipt);
+            if !seen.insert(receipt_id.clone()) {
+                continue;
+            }
+            let message = epoch_receipt_message(args.epoch, receipt_id, receipt)?;
+            bridge
+                .send(&channel, &message)
+                .await
+                .with_context(|| format!("publishing receipt to {channel}"))?;
+            published += 1;
+            if args.max_receipts.is_some_and(|max| published >= max) {
+                break;
+            }
+        }
+
+        if !args.watch || args.max_receipts.is_some_and(|max| published >= max) {
+            break;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        sleep(Duration::from_millis(args.poll_interval_ms)).await;
+    }
+
+    let report = json!({
+        "epoch": args.epoch,
+        "channel": channel,
+        "gateway_url": gateway_url,
+        "published": published,
+        "seen": seen.len(),
+        "watch": args.watch,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Published {} unique receipt(s) to {}.",
+            report["published"].as_u64().unwrap_or_default(),
+            report["channel"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+async fn receipts_collect(args: ReceiptsCollectArgs) -> Result<()> {
+    let channel = epoch_sidechannel(args.epoch, args.channel.as_deref());
+    let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
+        args.home.as_ref(),
+        args.sc_bridge_url.as_deref(),
+        args.sc_bridge_token.as_deref(),
+    )?;
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(&sc_bridge_url, sc_bridge_token)?)
+        .await
+        .context("connecting to SC-Bridge for epoch receipt collection")?;
+    bridge
+        .subscribe([channel.as_str()])
+        .await
+        .with_context(|| format!("subscribing to sidechannel {channel}"))?;
+    bridge
+        .join(&channel)
+        .await
+        .with_context(|| format!("joining sidechannel {channel}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(args.timeout_seconds);
+    let mut seen = BTreeSet::new();
+    let mut receipts = Vec::new();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match bridge.next_sidechannel_message(remaining).await {
+            Ok(event) => {
+                let Some((receipt_id, receipt)) =
+                    epoch_receipt_from_sidechannel_event(&event, args.epoch, &channel)
+                else {
+                    continue;
+                };
+                if seen.insert(receipt_id) {
+                    receipts.push(receipt);
+                }
+                if args.max_receipts.is_some_and(|max| receipts.len() >= max) {
+                    break;
+                }
+            }
+            Err(mayhem_bridge::BridgeError::Timeout) => break,
+            Err(err) => return Err(err).context("collecting epoch receipt sidechannel message"),
+        }
+    }
+
+    let output = json!({
+        "schema_version": 1,
+        "epoch": args.epoch,
+        "channel": channel,
+        "collected_at_ms": unix_epoch_millis()?,
+        "data": receipts,
+    });
+
+    let output_path = args
+        .output
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
+    if let Some(path) = &output_path {
+        write_json_file(path, &output)?;
+    }
+
+    let report = json!({
+        "epoch": args.epoch,
+        "channel": output["channel"],
+        "receipts": output["data"].as_array().map(Vec::len).unwrap_or(0),
+        "output": output_path,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if let Some(path) = output_path {
+        println!(
+            "Collected {} unique receipt(s) from {}.",
+            report["receipts"].as_u64().unwrap_or_default(),
+            report["channel"].as_str().unwrap_or("")
+        );
+        println!("Copy/paste receipts file: {}", path.display());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    }
+    Ok(())
+}
+
+fn epoch_sidechannel(epoch: u64, requested: Option<&str>) -> String {
+    requested
+        .filter(|channel| !channel.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("mx/epoch/{epoch}"))
+}
+
+fn receipt_id(receipt: &Value) -> String {
+    if let Some(body) = receipt_body(receipt) {
+        if let (Some(session_id), Some(seq)) = (
+            body.get("session_id").and_then(Value::as_str),
+            body.get("seq").and_then(Value::as_u64),
+        ) {
+            return format!("{session_id}:{seq}");
+        }
+    }
+    blake3::hash(&serde_json::to_vec(receipt).unwrap_or_else(|_| Vec::new()))
+        .to_hex()
+        .to_string()
+}
+
+fn epoch_receipt_message(epoch: u64, receipt_id: String, receipt: Value) -> Result<Value> {
+    Ok(json!({
+        "t": "epoch.receipt",
+        "v": 1,
+        "epoch": epoch,
+        "receipt_id": receipt_id,
+        "published_at_ms": unix_epoch_millis()?,
+        "receipt": receipt,
+    }))
+}
+
+fn epoch_receipt_from_sidechannel_event(
+    event: &Value,
+    epoch: u64,
+    channel: &str,
+) -> Option<(String, Value)> {
+    if event.get("channel").and_then(Value::as_str) != Some(channel) {
+        return None;
+    }
+    let message = event.get("message")?;
+    if message.get("t").and_then(Value::as_str) != Some("epoch.receipt") {
+        return None;
+    }
+    if message.get("epoch").and_then(Value::as_u64) != Some(epoch) {
+        return None;
+    }
+    let receipt = message.get("receipt")?.clone();
+    let receipt_id = message
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| receipt_id(&receipt));
+    Some((receipt_id, receipt))
+}
+
+fn resolve_cli_sc_bridge(
+    home: Option<&PathBuf>,
+    sc_bridge_url: Option<&str>,
+    sc_bridge_token: Option<&str>,
+) -> Result<(String, String)> {
+    let home = home.cloned().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let url = sc_bridge_url
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| env::var("MAYHEM_SC_BRIDGE_URL").ok())
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.network.as_ref())
+                .and_then(|network| network.sc_bridge_url.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_SC_BRIDGE_URL.to_owned());
+    let token = sc_bridge_token
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| env::var("MAYHEM_SC_BRIDGE_TOKEN").ok())
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.network.as_ref())
+                .and_then(|network| network.sc_bridge_token.clone())
+        })
+        .context(
+            "SC-Bridge token is required; pass --sc-bridge-token or set MAYHEM_SC_BRIDGE_TOKEN",
+        )?;
+    Ok((url, token))
+}
+
 fn resolve_cli_rpc_url(home: Option<&PathBuf>, rpc_url: Option<&str>) -> Result<String> {
     if let Some(rpc_url) = rpc_url {
         if !rpc_url.trim().is_empty() {
@@ -2491,7 +2837,11 @@ async fn read_receipts_for_export(args: &ReceiptsExportArgs) -> Result<Vec<Value
         .as_deref()
         .unwrap_or(DEFAULT_GATEWAY_URL)
         .trim_end_matches('/');
-    let url = format!("{base}/mayhem/receipts");
+    fetch_gateway_receipts(base).await
+}
+
+async fn fetch_gateway_receipts(gateway_url: &str) -> Result<Vec<Value>> {
+    let url = format!("{}/mayhem/receipts", gateway_url.trim_end_matches('/'));
     let response: Value = reqwest::get(&url)
         .await
         .with_context(|| format!("fetching {url}"))?
@@ -4646,6 +4996,61 @@ mod tests {
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].room_id, "room-a");
         assert!(select_provider_rooms(&contract.rooms, enclave, "room-other").is_err());
+    }
+
+    #[test]
+    fn epoch_receipt_messages_round_trip_gateway_receipts() {
+        let receipt = json!({
+            "voucher": { "session_id": "s1" },
+            "receipt": {
+                "schema_version": 1,
+                "session_id": "s1",
+                "seq": 2,
+                "final": true,
+                "user": "u",
+                "provider": "p",
+                "mu_owed_cum": 100
+            },
+            "receipt_ack": { "session_id": "s1", "seq": 2, "user_sig": "sig" }
+        });
+        let id = receipt_id(&receipt);
+        assert_eq!(id, "s1:2");
+
+        let message = epoch_receipt_message(7, id.clone(), receipt.clone()).unwrap();
+        assert_eq!(message["t"], "epoch.receipt");
+        assert_eq!(message["epoch"], 7);
+        assert_eq!(message["receipt_id"], id);
+
+        let event = json!({
+            "type": "sidechannel_message",
+            "channel": "mx/epoch/7",
+            "message": message,
+        });
+        let (extracted_id, extracted) =
+            epoch_receipt_from_sidechannel_event(&event, 7, "mx/epoch/7").unwrap();
+        assert_eq!(extracted_id, "s1:2");
+        assert_eq!(extracted, receipt);
+    }
+
+    #[test]
+    fn epoch_receipt_collector_filters_wrong_channel_epoch_and_type() {
+        let receipt = json!({ "receipt": { "session_id": "s1", "seq": 1 } });
+        let message = epoch_receipt_message(7, receipt_id(&receipt), receipt).unwrap();
+        let event = json!({
+            "type": "sidechannel_message",
+            "channel": "mx/epoch/7",
+            "message": message,
+        });
+        assert!(epoch_receipt_from_sidechannel_event(&event, 7, "mx/epoch/7").is_some());
+        assert!(epoch_receipt_from_sidechannel_event(&event, 8, "mx/epoch/7").is_none());
+        assert!(epoch_receipt_from_sidechannel_event(&event, 7, "mx/epoch/8").is_none());
+
+        let wrong_type = json!({
+            "type": "sidechannel_message",
+            "channel": "mx/epoch/7",
+            "message": { "t": "hb", "epoch": 7, "receipt": {} },
+        });
+        assert!(epoch_receipt_from_sidechannel_event(&wrong_type, 7, "mx/epoch/7").is_none());
     }
 
     #[test]
