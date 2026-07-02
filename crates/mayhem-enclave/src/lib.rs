@@ -15,9 +15,9 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use mayhem_proto::{
-    attestation_report_head, attestation_signing_bytes, catalog_enclave_id, AttestationBody,
-    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION,
+    attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
+    AttestationBody, AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuote,
+    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -28,6 +28,7 @@ pub const MERKLE_KIND: &str = "blake3_merkle_v1";
 pub const SEALED_STORE_MANIFEST: &str = "sealed-manifest.json";
 pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
 pub const TIER1_ATTESTATION_TIER: u8 = 1;
+pub const TIER2_ATTESTATION_TIER: u8 = 2;
 pub const SANDBOX_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TCP_PROBE_TIMEOUT_MS: u64 = 2_000;
 pub const SATURATION_SHED_THRESHOLD: f64 = 0.9;
@@ -139,6 +140,18 @@ pub struct Tier1AttestationOptions {
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Tier2AttestationOptions {
+    pub identity: CatalogEnclaveIdentity,
+    pub runtime_keypair: RuntimeKeypair,
+    pub provider_signing_seed: [u8; 32],
+    pub binary_path: PathBuf,
+    pub boot_epoch: u64,
+    pub report_ts: u64,
+    pub nonce_u: String,
+    pub hw_quote: HardwareQuote,
 }
 
 #[derive(Clone, Debug)]
@@ -1247,6 +1260,82 @@ pub fn build_tier1_attestation_report(
         report_ts: options.report_ts,
         nonce_u: options.nonce_u.clone(),
     };
+
+    let enclave_signing_key = options.runtime_keypair.signing_key();
+    let sig_enclave =
+        sign_attestation_body(&enclave_signing_key, &body, AttestationSigner::Enclave)?;
+    let sig_provider =
+        sign_attestation_body(&provider_signing_key, &body, AttestationSigner::Provider)?;
+    let report = AttestationReport {
+        schema_version: body.schema_version,
+        alg: body.alg,
+        enclave_id: body.enclave_id,
+        enclave_pubkey: body.enclave_pubkey,
+        provider_pubkey: body.provider_pubkey,
+        manifest_hash: body.manifest_hash,
+        binary_hash: body.binary_hash,
+        att_tier: body.att_tier,
+        hw_quote: body.hw_quote,
+        boot_epoch: body.boot_epoch,
+        report_ts: body.report_ts,
+        nonce_u: body.nonce_u,
+        sig_enclave,
+        sig_provider,
+    };
+    let report_head =
+        attestation_report_head(&report).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
+    Ok(Tier1AttestationReport {
+        report,
+        report_head,
+    })
+}
+
+pub fn build_tier2_attestation_report(
+    options: &Tier2AttestationOptions,
+) -> Result<Tier1AttestationReport> {
+    validate_identity(&options.identity)?;
+    validate_hex_field("nonce_u", &options.nonce_u, 32)?;
+    if options.hw_quote.evidence.is_empty() {
+        return Err(EnclaveError::InvalidInput(
+            "Tier-2 hardware quote evidence is required".to_owned(),
+        ));
+    }
+
+    let binary_hash = measure_binary(&options.binary_path)?;
+    if !options.identity.binary_hash.is_empty() && options.identity.binary_hash != binary_hash {
+        return Err(EnclaveError::InvalidInput(format!(
+            "identity binary_hash {} does not match measured binary hash {}",
+            options.identity.binary_hash, binary_hash
+        )));
+    }
+    let identity = CatalogEnclaveIdentity {
+        binary_hash: binary_hash.clone(),
+        ..options.identity.clone()
+    };
+    let provider_signing_key = SigningKey::from_bytes(&options.provider_signing_seed);
+    let provider_pubkey = hex::encode(provider_signing_key.verifying_key().to_bytes());
+    let mut body = AttestationBody {
+        schema_version: ATTESTATION_SCHEMA_VERSION,
+        alg: ATTESTATION_ALG.to_owned(),
+        enclave_id: catalog_enclave_id(&identity),
+        enclave_pubkey: options.runtime_keypair.public_key_hex(),
+        provider_pubkey,
+        manifest_hash: identity.manifest_hash,
+        binary_hash,
+        att_tier: TIER2_ATTESTATION_TIER,
+        hw_quote: None,
+        boot_epoch: options.boot_epoch,
+        report_ts: options.report_ts,
+        nonce_u: options.nonce_u.clone(),
+    };
+    let binding =
+        hardware_quote_binding(&body).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
+    if options.hw_quote.binding != binding {
+        return Err(EnclaveError::InvalidInput(
+            "Tier-2 hardware quote binding does not match attestation body".to_owned(),
+        ));
+    }
+    body.hw_quote = Some(options.hw_quote.clone());
 
     let enclave_signing_key = options.runtime_keypair.signing_key();
     let sig_enclave =

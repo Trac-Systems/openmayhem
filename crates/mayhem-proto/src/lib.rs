@@ -6,6 +6,7 @@ pub const CRATE_NAME: &str = "mayhem-proto";
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttestationSigner {
@@ -32,10 +33,28 @@ pub struct AttestationBody {
     pub manifest_hash: String,
     pub binary_hash: String,
     pub att_tier: u8,
-    pub hw_quote: Option<String>,
+    pub hw_quote: Option<HardwareQuote>,
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareQuoteKind {
+    AmdSevSnpVcek,
+    IntelTdxDcap,
+    NvidiaNrasJwt,
+    MockTier2,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HardwareQuote {
+    pub kind: HardwareQuoteKind,
+    pub evidence: String,
+    pub binding: String,
+    #[serde(default)]
+    pub endorsements: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -48,7 +67,7 @@ pub struct AttestationReport {
     pub manifest_hash: String,
     pub binary_hash: String,
     pub att_tier: u8,
-    pub hw_quote: Option<String>,
+    pub hw_quote: Option<HardwareQuote>,
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
@@ -189,6 +208,25 @@ pub fn attestation_report_head(report: &AttestationReport) -> Result<String, ser
         .to_string())
 }
 
+pub fn hardware_quote_binding(body: &AttestationBody) -> Result<String, serde_json::Error> {
+    let mut bound_body = body.clone();
+    bound_body.hw_quote = None;
+    Ok(
+        blake3::hash(&serde_json::to_vec(&AttestationHardwareQuoteBinding {
+            domain: HARDWARE_QUOTE_BINDING_DOMAIN,
+            body: &bound_body,
+        })?)
+        .to_hex()
+        .to_string(),
+    )
+}
+
+#[derive(Serialize)]
+struct AttestationHardwareQuoteBinding<'a> {
+    domain: &'static str,
+    body: &'a AttestationBody,
+}
+
 pub fn spend_voucher_signing_bytes(body: &SpendVoucherBody) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&SpendVoucherSigningEnvelope {
         domain: "mayhem-spend-voucher-v1",
@@ -225,6 +263,34 @@ mod tests {
         changed.manifest_hash = "other-manifest".to_owned();
 
         assert_ne!(catalog_enclave_id(&base), catalog_enclave_id(&changed));
+    }
+
+    #[test]
+    fn hardware_quote_binding_excludes_quote_but_includes_nonce_and_identity() {
+        let mut body = AttestationBody {
+            schema_version: ATTESTATION_SCHEMA_VERSION,
+            alg: ATTESTATION_ALG.to_owned(),
+            enclave_id: "enclave".to_owned(),
+            enclave_pubkey: "enclave-pub".to_owned(),
+            provider_pubkey: "provider-pub".to_owned(),
+            manifest_hash: "manifest".to_owned(),
+            binary_hash: "binary".to_owned(),
+            att_tier: 2,
+            hw_quote: None,
+            boot_epoch: 1,
+            report_ts: 2,
+            nonce_u: "aa".repeat(32),
+        };
+        let base = hardware_quote_binding(&body).unwrap();
+        body.hw_quote = Some(HardwareQuote {
+            kind: HardwareQuoteKind::MockTier2,
+            evidence: "mock".to_owned(),
+            binding: base.clone(),
+            endorsements: Vec::new(),
+        });
+        assert_eq!(hardware_quote_binding(&body).unwrap(), base);
+        body.nonce_u = "bb".repeat(32);
+        assert_ne!(hardware_quote_binding(&body).unwrap(), base);
     }
 
     #[test]

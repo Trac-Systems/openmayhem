@@ -78,6 +78,27 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
 }
 
 #[tokio::test]
+async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
+    let catalog = json!({
+        "models": [{
+            "model_id": "mayhem/tier2-model",
+            "caps": { "tools": true, "json": true, "ctx_max": 4096, "vision": false },
+            "price_ref_mu": { "denom": "mu_usd", "ver": 1, "in_per_1k": 10, "out_per_1k": 30 },
+            "attestation_tiers": { "T1": 1, "T2": 2 }
+        }]
+    });
+    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+    let app = openai_router(state);
+
+    let (status, body) = json_request(app, Method::GET, "/v1/models", Value::Null).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["id"], "mayhem/tier2-model");
+    assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T1"], 1);
+    assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T2"], 2);
+}
+
+#[tokio::test]
 async fn chat_completion_returns_tool_call_and_accepts_tool_result_followup() {
     let model = first_model_id().await;
     let tool_request = json!({

@@ -820,8 +820,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
     let id = model.get("model_id")?.as_str()?.to_owned();
     let caps = model.get("caps").unwrap_or(&Value::Null);
     let price = model.get("price_ref_mu").unwrap_or(&Value::Null);
-    let mut tiers = BTreeMap::new();
-    tiers.insert("T1".to_owned(), 0);
+    let tiers = attestation_tiers_from_catalog_value(model);
     Some(GatewayModel {
         id,
         created,
@@ -857,6 +856,21 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
             source: "catalog".to_owned(),
         },
     })
+}
+
+fn attestation_tiers_from_catalog_value(model: &Value) -> BTreeMap<String, u32> {
+    let mut tiers = BTreeMap::new();
+    if let Some(object) = model.get("attestation_tiers").and_then(Value::as_object) {
+        for (tier, count) in object {
+            if let Some(count) = count.as_u64().and_then(|count| u32::try_from(count).ok()) {
+                tiers.insert(tier.clone(), count);
+            }
+        }
+    }
+    if tiers.is_empty() {
+        tiers.insert("T1".to_owned(), 0);
+    }
+    tiers
 }
 
 fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiError> {

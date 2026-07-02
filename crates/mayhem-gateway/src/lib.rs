@@ -14,8 +14,9 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use mayhem_proto::{
-    attestation_report_head, attestation_signing_bytes, catalog_enclave_id, AttestationReport,
-    AttestationSigner, CatalogEnclaveIdentity, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
+    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind,
+    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,6 +73,16 @@ pub enum GatewayError {
     ReportHash(String),
     #[error("attestation signing payload failed: {0}")]
     SigningPayload(String),
+    #[error("Tier-2 attestation requires a hardware quote")]
+    HardwareQuoteRequired,
+    #[error("hardware quote evidence is empty")]
+    HardwareQuoteEvidenceMissing,
+    #[error("hardware quote binding mismatch: expected {expected}, got {actual}")]
+    HardwareQuoteBindingMismatch { expected: String, actual: String },
+    #[error("mock Tier-2 hardware quotes are disabled")]
+    MockHardwareQuoteDisabled,
+    #[error("hardware quote kind {kind} is not verified by this build")]
+    HardwareQuoteUnsupported { kind: String },
     #[error("heartbeat JSON error: {0}")]
     HeartbeatJson(String),
     #[error("heartbeat must have t=\"hb\" and v={expected_version}")]
@@ -115,6 +126,7 @@ pub struct AttestationVerificationRequest<'a> {
     pub now_ts: u64,
     pub max_report_age_secs: u64,
     pub max_report_clock_skew_secs: u64,
+    pub allow_mock_hardware_quote: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +251,7 @@ impl<'a> AttestationVerificationRequest<'a> {
             now_ts,
             max_report_age_secs: DEFAULT_MAX_REPORT_AGE_SECS,
             max_report_clock_skew_secs: DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS,
+            allow_mock_hardware_quote: false,
         }
     }
 }
@@ -428,6 +441,7 @@ pub fn verify_tier1_attestation(
         request.max_report_age_secs,
         request.max_report_clock_skew_secs,
     )?;
+    verify_hardware_quote(request)?;
     verify_report_signature(report, AttestationSigner::Enclave)?;
     verify_report_signature(report, AttestationSigner::Provider)?;
 
@@ -442,6 +456,47 @@ pub fn verify_tier1_attestation(
         report_ts: report.report_ts,
         att_tier: report.att_tier,
     })
+}
+
+pub fn verify_attestation(
+    request: &AttestationVerificationRequest<'_>,
+) -> Result<VerifiedAttestation> {
+    verify_tier1_attestation(request)
+}
+
+fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result<()> {
+    if request.contract.att_tier < 2 {
+        return Ok(());
+    }
+    let quote = request
+        .report
+        .hw_quote
+        .as_ref()
+        .ok_or(GatewayError::HardwareQuoteRequired)?;
+    if quote.evidence.is_empty() {
+        return Err(GatewayError::HardwareQuoteEvidenceMissing);
+    }
+    let expected = hardware_quote_binding(&request.report.body())
+        .map_err(|err| GatewayError::SigningPayload(err.to_string()))?;
+    if quote.binding != expected {
+        return Err(GatewayError::HardwareQuoteBindingMismatch {
+            expected,
+            actual: quote.binding.clone(),
+        });
+    }
+    match quote.kind {
+        HardwareQuoteKind::MockTier2 if request.allow_mock_hardware_quote => Ok(()),
+        HardwareQuoteKind::MockTier2 => Err(GatewayError::MockHardwareQuoteDisabled),
+        HardwareQuoteKind::AmdSevSnpVcek => Err(GatewayError::HardwareQuoteUnsupported {
+            kind: "amd_sev_snp_vcek".to_owned(),
+        }),
+        HardwareQuoteKind::IntelTdxDcap => Err(GatewayError::HardwareQuoteUnsupported {
+            kind: "intel_tdx_dcap".to_owned(),
+        }),
+        HardwareQuoteKind::NvidiaNrasJwt => Err(GatewayError::HardwareQuoteUnsupported {
+            kind: "nvidia_nras_jwt".to_owned(),
+        }),
+    }
 }
 
 fn compare_field(field: &'static str, expected: &str, actual: &str) -> Result<()> {
