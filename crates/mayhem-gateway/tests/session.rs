@@ -86,6 +86,9 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
     assert_eq!(opened["direct"], true);
     assert_eq!(opened["relayed"], false);
     assert_eq!(opened["channel"], format!("mx/s/{session_id}"));
+    let user_session_stats = user_bridge.session_stats().await?;
+    assert_eq!(user_session_stats["rateBytesPerSecond"], 1_000_000);
+    assert_eq!(user_session_stats["rateBurstBytes"], 1_000_000);
 
     let open_frame = json!({
         "t": "s.open",
