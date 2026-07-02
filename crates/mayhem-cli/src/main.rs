@@ -813,7 +813,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
-    /// Use a local artifact path instead of downloading the catalog source.
+    /// Use a local copy of the admin catalog artifact; it must match the enclave artifact_root.
     #[arg(long, value_name = "PATH")]
     artifact: Option<PathBuf>,
 
@@ -4780,7 +4780,7 @@ async fn download_provider_artifact(
         }
     } else {
         bail!(
-            "unsupported artifact source kind {}; pass --artifact with a local verified file",
+            "unsupported artifact source kind {}; pass --artifact with a local copy that matches the admin enclave artifact_root",
             selected.artifact.source.kind
         );
     };
@@ -5853,6 +5853,48 @@ mod tests {
         let mut mismatched = contract;
         mismatched.enclaves[0].artifact_root = "bb".repeat(32);
         assert!(build_provider_candidates(&mismatched, &catalog, &hardware, &args).is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_local_artifact_must_match_admin_root() {
+        let temp = env::temp_dir().join(format!(
+            "mayhem-cli-local-artifact-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("artifact.gguf");
+        fs::write(&source, b"admin-approved artifact bytes").unwrap();
+        let root = build_merkle_manifest(&source, 8).unwrap().root;
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let contract = test_contract(&root);
+        let mut args = test_provider_start_args();
+        args.artifact = Some(source.clone());
+        args.chunk_size = 8;
+        let selected =
+            build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap()[0].clone();
+
+        let accepted = download_provider_artifact(&args, &temp.join("downloads-ok"), &selected)
+            .await
+            .unwrap();
+        assert!(accepted.exists());
+        assert_eq!(
+            build_merkle_manifest(&accepted, 8).unwrap().root,
+            selected.enclave.artifact_root
+        );
+
+        let mut wrong = selected.clone();
+        wrong.enclave.artifact_root = "bb".repeat(32);
+        let err = download_provider_artifact(&args, &temp.join("downloads-bad"), &wrong)
+            .await
+            .expect_err("wrong local artifact root must be rejected");
+        assert!(
+            format!("{err:#}").contains("artifact merkle root mismatch"),
+            "{err:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
