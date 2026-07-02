@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod openai;
+pub mod provider_table;
+pub use provider_table::*;
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
