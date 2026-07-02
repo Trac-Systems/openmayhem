@@ -1290,6 +1290,7 @@ dependencies = [
  "ed25519-dalek",
  "mayhem-bridge",
  "mayhem-enclave",
+ "mayhem-gateway",
  "mayhem-hwprobe",
  "mayhem-proto",
  "serde",
@@ -1336,12 +1337,18 @@ dependencies = [
 name = "mayhem-gateway"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "blake3",
  "ed25519-dalek",
  "hex",
+ "mayhem-bridge",
  "mayhem-enclave",
  "mayhem-proto",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

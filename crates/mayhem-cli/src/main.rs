@@ -17,8 +17,10 @@ use mayhem_enclave::{
     finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
     prepare_tier1_attestation_report, seal_artifact, BootOptions, DownloadReport, DownloadRequest,
     DownloadSource, KeyContext, RuntimeKeyContext, RuntimeKeypairStoreOptions, SealOptions,
-    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
+    Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
+    SEALED_STORE_MANIFEST,
 };
+use mayhem_gateway::heartbeat_signing_payload;
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
     VerdictStatus,
@@ -849,6 +851,7 @@ struct HeartbeatContext<'a> {
     wallet: &'a WalletInfo,
     selected: &'a ProviderCandidate,
     rooms: &'a [LedgerRoom],
+    attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
 }
 
@@ -1065,6 +1068,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             wallet: &wallet,
             selected: &selected,
             rooms: &rooms,
+            attestation: &attestation,
             attestation_head: &attestation.report_head,
         })
         .await?
@@ -1813,6 +1817,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
             .await
             .with_context(|| format!("joining sidechannel {}", room.sidechannel))?;
         for seq in 0..ctx.args.heartbeat_count.max(1) {
+            let ts = unix_epoch_millis()?;
             let mut heartbeat = json!({
                 "t": "hb",
                 "v": 1,
@@ -1845,11 +1850,15 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                     "ctx": ctx.selected.model.caps.ctx_max,
                     "vision": ctx.selected.model.caps.vision,
                 },
-                "attestation_head": ctx.attestation_head,
-                "ts": unix_epoch_seconds()?,
-                "nonce": blake3::hash(format!("{}:{}:{}", room.room_id, ctx.wallet.public_key, seq).as_bytes()).to_hex().to_string(),
+                "att": {
+                    "epoch": ctx.attestation.report.boot_epoch,
+                    "head": ctx.attestation_head,
+                },
+                "ts": ts,
+                "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, ctx.wallet.public_key, ts, seq).as_bytes()).to_hex().to_string(),
             });
-            let signing_payload = serde_json::to_string(&heartbeat)?;
+            let signing_payload = String::from_utf8(heartbeat_signing_payload(&heartbeat)?)
+                .context("heartbeat signing payload was not UTF-8")?;
             let sig = sign_message(ctx.keypair_path, ctx.password, &signing_payload).await?;
             heartbeat["sig"] = json!(sig);
             bridge
@@ -1888,6 +1897,14 @@ fn unix_epoch_seconds() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system time is before Unix epoch")?
         .as_secs())
+}
+
+fn unix_epoch_millis() -> Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("Unix epoch milliseconds overflowed u64")
 }
 
 fn default_home() -> Result<PathBuf> {

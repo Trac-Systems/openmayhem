@@ -16,8 +16,14 @@ path = "src/lib.rs"
 ed25519-dalek = "2"
 hex = "0.4"
 mayhem-proto = { path = "../mayhem-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
+anyhow = "1"
+blake3 = "1"
+mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-enclave = { path = "../mayhem-enclave" }
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }

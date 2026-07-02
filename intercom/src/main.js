@@ -125,6 +125,12 @@ const sidechannelAutoJoin = parseBool(
     '',
   false
 );
+const sidechannelWelcomeRequired = parseBool(
+  (flags['sidechannel-welcome-required'] && String(flags['sidechannel-welcome-required'])) ||
+    env.SIDECHANNEL_WELCOME_REQUIRED ||
+    '',
+  false
+);
 
 const scBridgeEnabled = parseBool(
   (flags['sc-bridge'] && String(flags['sc-bridge'])) || env.SC_BRIDGE || '',
@@ -364,6 +370,7 @@ const sidechannel = new Sidechannel(peer, {
   entryChannel: sidechannelEntry,
   allowRemoteOpen: sidechannelAllowRemoteOpen,
   autoJoinOnOpen: sidechannelAutoJoin,
+  welcomeRequired: sidechannelWelcomeRequired,
   onMessage: scBridgeEnabled
     ? (channel, payload, connection) => scBridge.handleSidechannelMessage(channel, payload, connection)
     : sidechannelQuiet
