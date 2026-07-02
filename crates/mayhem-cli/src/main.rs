@@ -1089,6 +1089,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         args.cancel_url.as_deref(),
     )
     .await?;
+    emit_checkout_handoff(args.json, rail, amount_mu, &checkout.url)?;
     let opened = open_checkout_url(&checkout.url, args.no_open).await;
     let target_mu = before_mu
         .checked_add(amount_mu)
@@ -1140,12 +1141,6 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!(
-            "Mayhem {} checkout for {}",
-            rail.as_str(),
-            mu_to_usd_amount(amount_mu)
-        );
-        println!("Copy/paste checkout URL: {}", checkout.url);
         if opened {
             println!("Opened checkout in your browser.");
         } else if !args.no_open {
@@ -2108,6 +2103,40 @@ struct PayCreditStatus {
     current_mu: u64,
     target_mu: u64,
     waited_ms: u64,
+}
+
+fn checkout_handoff_lines(rail: PayRail, amount_mu: u64, url: &str) -> [String; 2] {
+    [
+        format!(
+            "Mayhem {} checkout for {}",
+            rail.as_str(),
+            mu_to_usd_amount(amount_mu)
+        ),
+        format!("Copy/paste checkout URL: {url}"),
+    ]
+}
+
+fn emit_checkout_handoff(
+    json_output: bool,
+    rail: PayRail,
+    amount_mu: u64,
+    url: &str,
+) -> Result<()> {
+    let lines = checkout_handoff_lines(rail, amount_mu, url);
+    if json_output {
+        let mut stderr = io::stderr().lock();
+        for line in lines {
+            writeln!(stderr, "{line}")?;
+        }
+        stderr.flush()?;
+    } else {
+        let mut stdout = io::stdout().lock();
+        for line in lines {
+            writeln!(stdout, "{line}")?;
+        }
+        stdout.flush()?;
+    }
+    Ok(())
 }
 
 async fn create_pay_checkout(
@@ -4773,6 +4802,21 @@ mod tests {
             &json!({ "charge": { "id": "charge_test" } })
         )
         .is_err());
+    }
+
+    #[test]
+    fn pay_checkout_handoff_includes_copy_paste_url() {
+        let lines = checkout_handoff_lines(
+            PayRail::Stripe,
+            10_000_000,
+            "https://checkout.stripe.com/c/pay/cs_test",
+        );
+
+        assert_eq!(lines[0], "Mayhem stripe checkout for 10.00");
+        assert_eq!(
+            lines[1],
+            "Copy/paste checkout URL: https://checkout.stripe.com/c/pay/cs_test"
+        );
     }
 
     #[test]
