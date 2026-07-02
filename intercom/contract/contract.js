@@ -5,6 +5,7 @@ import { Contract } from 'trac-peer';
 const CONTRACT_VERSION = 1;
 const CURRENT_RULES_KEY = 'rules/current';
 const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
+const PRICE_DENOMINATION = 'mu_usd';
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
 const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
 const PARAM_DEFINITIONS = Object.freeze({
@@ -27,7 +28,6 @@ const ENCLAVE_UPDATE_FIELDS = [
   'att_tier',
   'binary_hash',
   'caps',
-  'rooms',
 ];
 
 export const consentMessage = (ver, hash) => `mayhem-consent${ver}${hash}`;
@@ -126,6 +126,16 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('banProvider', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128 },
+        reason_hash: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
     this.addSchema('registerEnclave', {
       value: {
         $$strict: true,
@@ -139,11 +149,6 @@ class MayhemContract extends Contract {
         att_tier: { type: 'number', integer: true, min: 1, max: 2 },
         binary_hash: { type: 'string', min: 1, max: 128 },
         caps: { type: 'any' },
-        rooms: {
-          type: 'array',
-          max: 64,
-          items: { type: 'string', min: 1, max: 256 },
-        },
       },
     });
 
@@ -159,12 +164,44 @@ class MayhemContract extends Contract {
         att_tier: { type: 'number', integer: true, min: 1, max: 2, optional: true },
         binary_hash: { type: 'string', min: 1, max: 128, optional: true },
         caps: { type: 'any', optional: true },
-        rooms: {
-          type: 'array',
-          max: 64,
-          items: { type: 'string', min: 1, max: 256 },
-          optional: true,
-        },
+      },
+    });
+
+    this.addSchema('joinEnclave', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
+    this.addSchema('leaveEnclave', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
+    this.addSchema('joinRoom', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        room_id: { type: 'string', min: 1, max: 128 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
+    this.addSchema('leaveRoom', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        room_id: { type: 'string', min: 1, max: 128 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
       },
     });
 
@@ -209,6 +246,16 @@ class MayhemContract extends Contract {
         per_req_mu: { type: 'number', integer: true, min: 0 },
         min_session_mu: { type: 'number', integer: true, min: 0 },
         effective_at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
+    this.addSchema('readPrice', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+        at: { type: 'number', integer: true, min: 0 },
       },
     });
   }
@@ -385,18 +432,37 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'registerProvider', provider: this.address };
   }
 
+  async banProvider() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const key = `prov/${this.value.provider}`;
+    const record = await this.get(key);
+    if (!record) return new Error('Provider not found.');
+    if (record.status === 'banned') return new Error('Provider already banned.');
+
+    const updated = {
+      ...record,
+      status: 'banned',
+      banned_at: this.tx,
+      banned_by: this.address,
+      ban_reason_hash: this.value.reason_hash ?? null,
+      updated_at: this.tx,
+    };
+    await this.put(key, updated);
+    console.log('mayhem banProvider', updated);
+    return { ok: true, op: 'banProvider', provider: this.value.provider };
+  }
+
   async registerEnclave() {
-    const consentError = await this.requireConsent();
-    if (consentError) return consentError;
-    const providerError = await this.requireProvider();
-    if (providerError) return providerError;
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
 
     const key = `enclave/${this.value.enclave_id}`;
     if ((await this.get(key)) !== null) return new Error('Enclave already registered.');
 
     const record = {
       enclave_id: this.value.enclave_id,
-      provider: this.address,
       model_id: this.value.model_id,
       backend: this.value.backend,
       artifact_root: this.value.artifact_root,
@@ -404,8 +470,8 @@ class MayhemContract extends Contract {
       att_tier: this.value.att_tier,
       binary_hash: this.value.binary_hash,
       caps: cloneValue(this.value.caps),
-      rooms: this.value.rooms.slice(),
       status: 'active',
+      created_by: this.address,
       registered_at: this.tx,
       updated_at: this.tx,
       retired_at: null,
@@ -416,20 +482,19 @@ class MayhemContract extends Contract {
   }
 
   async updateEnclave() {
-    const consentError = await this.requireConsent();
-    if (consentError) return consentError;
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
 
     const key = `enclave/${this.value.enclave_id}`;
     const record = await this.get(key);
     if (!record) return new Error('Enclave not found.');
-    if (record.provider !== this.address) return new Error('Provider mismatch.');
     if (record.status === 'retired') return new Error('Enclave is retired.');
 
     let changed = false;
     const updated = cloneValue(record);
     for (const field of ENCLAVE_UPDATE_FIELDS) {
       if (!hasOwn(this.value, field)) continue;
-      updated[field] = field === 'rooms' ? this.value[field].slice() : cloneValue(this.value[field]);
+      updated[field] = cloneValue(this.value[field]);
       changed = true;
     }
     if (!changed) return new Error('No enclave fields to update.');
@@ -441,13 +506,12 @@ class MayhemContract extends Contract {
   }
 
   async retireEnclave() {
-    const consentError = await this.requireConsent();
-    if (consentError) return consentError;
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
 
     const key = `enclave/${this.value.enclave_id}`;
     const record = await this.get(key);
     if (!record) return new Error('Enclave not found.');
-    if (record.provider !== this.address) return new Error('Provider mismatch.');
     if (record.status === 'retired') return new Error('Enclave already retired.');
 
     const updated = {
@@ -461,9 +525,145 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'retireEnclave', enclave_id: updated.enclave_id };
   }
 
-  async openRoom() {
+  async joinEnclave() {
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
+    const providerError = await this.requireProvider();
+    if (providerError) return providerError;
+
+    const enclave = await this.get(`enclave/${this.value.enclave_id}`);
+    if (!enclave) return new Error('Enclave not found.');
+    if (enclave.status !== 'active') return new Error('Enclave is not active.');
+
+    const key = `serve/${this.address}/${this.value.enclave_id}`;
+    const existing = await this.get(key);
+    if (existing && existing.status === 'active') return new Error('Provider already serving enclave.');
+
+    const record = {
+      provider: this.address,
+      enclave_id: this.value.enclave_id,
+      model_id: enclave.model_id,
+      status: 'active',
+      joined_at: existing?.joined_at ?? this.tx,
+      updated_at: this.tx,
+      left_at: null,
+      rooms: Array.isArray(existing?.rooms) ? existing.rooms.slice() : [],
+    };
+    await this.put(key, record);
+    console.log('mayhem joinEnclave', record);
+    return { ok: true, op: 'joinEnclave', provider: this.address, enclave_id: this.value.enclave_id };
+  }
+
+  async leaveEnclave() {
+    const key = `serve/${this.address}/${this.value.enclave_id}`;
+    const record = await this.get(key);
+    if (!record || record.status !== 'active') return new Error('Provider is not serving enclave.');
+    if (Array.isArray(record.rooms) && record.rooms.length > 0) {
+      return new Error('Provider must leave rooms before leaving enclave.');
+    }
+
+    const updated = {
+      ...record,
+      status: 'inactive',
+      updated_at: this.tx,
+      left_at: this.tx,
+    };
+    await this.put(key, updated);
+    console.log('mayhem leaveEnclave', updated);
+    return { ok: true, op: 'leaveEnclave', provider: this.address, enclave_id: this.value.enclave_id };
+  }
+
+  async joinRoom() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+    const providerError = await this.requireProvider();
+    if (providerError) return providerError;
+
+    const room = await this.get(`room/${this.value.room_id}`);
+    if (!room) return new Error('Room not found.');
+    if (room.status !== 'open') return new Error('Room is not open.');
+
+    const serving = await this.get(`serve/${this.address}/${this.value.enclave_id}`);
+    if (!serving || serving.status !== 'active') return new Error('Provider is not serving enclave.');
+    const enclave = await this.get(`enclave/${this.value.enclave_id}`);
+    if (!enclave || enclave.status !== 'active') return new Error('Enclave is not active.');
+    if (serving.model_id !== enclave.model_id || enclave.model_id !== room.model_id) {
+      return new Error('Enclave model does not match room model.');
+    }
+
+    const key = `roomserve/${this.value.room_id}/${this.address}/${this.value.enclave_id}`;
+    const existing = await this.get(key);
+    if (existing && existing.status === 'active') return new Error('Provider already joined room with enclave.');
+
+    const rooms = Array.isArray(serving.rooms) ? serving.rooms.slice() : [];
+    if (!rooms.includes(this.value.room_id)) rooms.push(this.value.room_id);
+    rooms.sort();
+    const record = {
+      room_id: this.value.room_id,
+      sidechannel: room.sidechannel,
+      provider: this.address,
+      enclave_id: this.value.enclave_id,
+      model_id: enclave.model_id,
+      status: 'active',
+      joined_at: existing?.joined_at ?? this.tx,
+      updated_at: this.tx,
+      left_at: null,
+    };
+    await this.put(key, record);
+    await this.put(`serve/${this.address}/${this.value.enclave_id}`, {
+      ...serving,
+      rooms,
+      updated_at: this.tx,
+    });
+    console.log('mayhem joinRoom', record);
+    return {
+      ok: true,
+      op: 'joinRoom',
+      room_id: this.value.room_id,
+      provider: this.address,
+      enclave_id: this.value.enclave_id,
+      sidechannel: room.sidechannel,
+    };
+  }
+
+  async leaveRoom() {
+    const key = `roomserve/${this.value.room_id}/${this.address}/${this.value.enclave_id}`;
+    const record = await this.get(key);
+    if (!record || record.status !== 'active') return new Error('Provider has not joined room with enclave.');
+
+    const servingKey = `serve/${this.address}/${this.value.enclave_id}`;
+    const serving = await this.get(servingKey);
+    const rooms = Array.isArray(serving?.rooms)
+      ? serving.rooms.filter((roomId) => roomId !== this.value.room_id)
+      : [];
+    const updated = {
+      ...record,
+      status: 'inactive',
+      updated_at: this.tx,
+      left_at: this.tx,
+    };
+    await this.put(key, updated);
+    if (serving) {
+      await this.put(servingKey, {
+        ...serving,
+        rooms,
+        updated_at: this.tx,
+      });
+    }
+    console.log('mayhem leaveRoom', updated);
+    return {
+      ok: true,
+      op: 'leaveRoom',
+      room_id: this.value.room_id,
+      provider: this.address,
+      enclave_id: this.value.enclave_id,
+      sidechannel: updated.sidechannel,
+    };
+  }
+
+  async openRoom() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
 
     const roomId = await deriveRoomId(this.value.model_id, this.address, this.value.nonce);
     const key = `room/${roomId}`;
@@ -488,10 +688,12 @@ class MayhemContract extends Contract {
   }
 
   async closeRoom() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
     const key = `room/${this.value.room_id}`;
     const record = await this.get(key);
     if (!record) return new Error('Room not found.');
-    if (record.creator !== this.address) return new Error('Room creator required.');
     if (record.status === 'closed') return new Error('Room already closed.');
 
     const updated = {
@@ -506,12 +708,11 @@ class MayhemContract extends Contract {
   }
 
   async setPrice() {
-    const consentError = await this.requireConsent();
-    if (consentError) return consentError;
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
 
     const enclave = await this.get(`enclave/${this.value.enclave_id}`);
     if (!enclave) return new Error('Enclave not found.');
-    if (enclave.provider !== this.address) return new Error('Provider mismatch.');
     if (enclave.status === 'retired') return new Error('Enclave is retired.');
 
     const modelRef = await this.get(`modelref/${enclave.model_id}`);
@@ -528,10 +729,11 @@ class MayhemContract extends Contract {
     }
 
     const key = `price/${this.value.enclave_id}`;
-    const current = await this.get(key);
+    const schedule = await this.priceSchedule(key, enclave);
+    const latest = this.priceLatestEntry(schedule);
     if (
-      current &&
-      this.value.effective_at - current.effective_at < PRICE_RATE_LIMIT_SECONDS
+      latest &&
+      this.value.effective_at - latest.effective_at < PRICE_RATE_LIMIT_SECONDS
     ) {
       return new Error('Price changes are limited to once per 6h.');
     }
@@ -539,8 +741,8 @@ class MayhemContract extends Contract {
     const record = {
       enclave_id: this.value.enclave_id,
       model_id: enclave.model_id,
-      provider: this.address,
-      ver: current ? current.ver + 1 : 1,
+      denom: PRICE_DENOMINATION,
+      ver: latest ? latest.ver + 1 : 1,
       in_per_1k_mu: this.value.in_per_1k_mu,
       out_per_1k_mu: this.value.out_per_1k_mu,
       per_req_mu: this.value.per_req_mu,
@@ -548,19 +750,54 @@ class MayhemContract extends Contract {
       effective_at: this.value.effective_at,
       effective_from: this.tx,
       updated_at: this.tx,
+      set_by: this.address,
+      set_by_role: 'admin',
     };
-    await this.put(key, record);
-    console.log('mayhem setPrice', record);
+
+    const updated = {
+      enclave_id: this.value.enclave_id,
+      model_id: enclave.model_id,
+      denom: PRICE_DENOMINATION,
+      current: schedule.current,
+      pending: schedule.pending,
+    };
+    if (!updated.current) {
+      updated.current = record;
+    } else {
+      if (updated.pending && updated.pending.effective_at <= this.value.effective_at) {
+        updated.current = updated.pending;
+        updated.pending = null;
+      }
+      if (updated.pending) return new Error('Pending price change already scheduled.');
+      updated.pending = record;
+    }
+
+    await this.put(key, updated);
+    await this.put(`price/${this.value.enclave_id}/v/${record.ver}`, record);
+    console.log('mayhem setPrice', { schedule: updated, record });
     return { ok: true, op: 'setPrice', enclave_id: record.enclave_id, ver: record.ver };
+  }
+
+  async readPrice() {
+    const schedule = await this.get(`price/${this.value.enclave_id}`);
+    if (!schedule) return { ok: true, op: 'readPrice', enclave_id: this.value.enclave_id, at: this.value.at, price: null };
+
+    const price = this.priceActiveEntry(schedule, this.value.at);
+    console.log('mayhem readPrice', { enclave_id: this.value.enclave_id, at: this.value.at, price });
+    return { ok: true, op: 'readPrice', enclave_id: this.value.enclave_id, at: this.value.at, price };
   }
 
   async currentRules() {
     return await this.get(CURRENT_RULES_KEY);
   }
 
-  async requireAdmin(sender = this.address) {
+  async isAdmin(sender = this.address) {
     const admin = await this.get('admin');
-    if (admin === null || admin === sender) return null;
+    return admin === null || admin === sender;
+  }
+
+  async requireAdmin(sender = this.address) {
+    if (await this.isAdmin(sender)) return null;
     return new Error('Admin required.');
   }
 
@@ -645,6 +882,27 @@ class MayhemContract extends Contract {
       return new Error('price_min_bps must not exceed price_max_bps.');
     }
     return null;
+  }
+
+  async priceSchedule(key, enclave) {
+    const existing = await this.get(key);
+    if (existing) return existing;
+    return {
+      enclave_id: enclave.enclave_id,
+      model_id: enclave.model_id,
+      denom: PRICE_DENOMINATION,
+      current: null,
+      pending: null,
+    };
+  }
+
+  priceActiveEntry(schedule, at) {
+    if (schedule.pending && schedule.pending.effective_at <= at) return cloneValue(schedule.pending);
+    return schedule.current ? cloneValue(schedule.current) : null;
+  }
+
+  priceLatestEntry(schedule) {
+    return schedule.pending ?? schedule.current;
   }
 
   modelRefPrice(modelRef, directKey, nestedKey) {

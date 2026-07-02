@@ -70,9 +70,39 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'ban_provider') {
+      return {
+        type: 'banProvider',
+        value: json,
+      };
+    }
     if (json?.op === 'register_enclave') {
       return {
         type: 'registerEnclave',
+        value: json,
+      };
+    }
+    if (json?.op === 'join_enclave') {
+      return {
+        type: 'joinEnclave',
+        value: json,
+      };
+    }
+    if (json?.op === 'leave_enclave') {
+      return {
+        type: 'leaveEnclave',
+        value: json,
+      };
+    }
+    if (json?.op === 'join_room') {
+      return {
+        type: 'joinRoom',
+        value: json,
+      };
+    }
+    if (json?.op === 'leave_room') {
+      return {
+        type: 'leaveRoom',
         value: json,
       };
     }
@@ -106,6 +136,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'read_price') {
+      return {
+        type: 'readPrice',
+        value: json,
+      };
+    }
     if (json?.op === 'read_key') {
       return {
         type: 'readKey',
@@ -125,10 +161,16 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
     console.log('- /tx --command \'{ "op": "consent", "ver": 1, "hash": "<hash>", "sig": "<sig>" }\' --sim 1 | records consent.');
     console.log('- /tx --command \'{ "op": "register_provider", "payout_addr": "<target>", "payout_method": "tnk" }\' --sim 1 | registers a provider.');
-    console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | registers an enclave.');
-    console.log('- /tx --command \'{ "op": "open_room", "model_id": "<model>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | opens a model room.');
-    console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | closes a model room.');
-    console.log('- /tx --command \'{ "op": "set_price", "enclave_id": "<id>", "in_per_1k_mu": 18, "out_per_1k_mu": 55, "per_req_mu": 0, "min_session_mu": 100, "effective_at": 21600 }\' --sim 1 | sets an enclave price.');
+    console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
+    console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | admin registers an enclave catalog entry.');
+    console.log('- /tx --command \'{ "op": "join_enclave", "enclave_id": "<id>" }\' --sim 1 | provider opts into serving an existing enclave.');
+    console.log('- /tx --command \'{ "op": "leave_enclave", "enclave_id": "<id>" }\' --sim 1 | provider stops serving an enclave.');
+    console.log('- /tx --command \'{ "op": "join_room", "room_id": "<room_id>", "enclave_id": "<id>" }\' --sim 1 | provider joins a canonical admin room with a served enclave.');
+    console.log('- /tx --command \'{ "op": "leave_room", "room_id": "<room_id>", "enclave_id": "<id>" }\' --sim 1 | provider leaves a canonical room.');
+    console.log('- /tx --command \'{ "op": "open_room", "model_id": "<model>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | admin opens a canonical model room.');
+    console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | admin closes a canonical model room.');
+    console.log('- /tx --command \'{ "op": "set_price", "enclave_id": "<id>", "in_per_1k_mu": 18, "out_per_1k_mu": 55, "per_req_mu": 0, "min_session_mu": 100, "effective_at": 21600 }\' --sim 1 | admin sets an enclave price in mu_usd.');
+    console.log('- /tx --command \'{ "op": "read_price", "enclave_id": "<id>", "at": 21600 }\' --sim 1 | reads the active enclave price at a timestamp.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');

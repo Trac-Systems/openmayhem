@@ -35,7 +35,6 @@ const enclaveRegistration = {
     tools: false,
     ctx: 32768,
   },
-  rooms: [],
 };
 
 const makePrice = (overrides = {}) => ({
@@ -51,7 +50,8 @@ const makePrice = (overrides = {}) => ({
 
 async function setupRegisteredEnclave() {
   const provider = await makeIdentity();
-  const storage = new MemoryStorage({ admin: provider.publicKey });
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
   const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
   const contract = new MayhemContract(protocol, {});
 
@@ -67,6 +67,7 @@ async function setupRegisteredEnclave() {
     {
       type: 'setRules',
       value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
       txNo: 1,
     },
     {
@@ -77,36 +78,49 @@ async function setupRegisteredEnclave() {
         hash: rulesHash,
         sig: signConsent(provider.wallet, 1, rulesHash),
       },
+      sender: provider.publicKey,
       txNo: 2,
     },
     {
       type: 'registerProvider',
       value: providerRegistration,
+      sender: provider.publicKey,
       txNo: 3,
     },
     {
       type: 'registerEnclave',
       value: enclaveRegistration,
+      sender: admin.publicKey,
       txNo: 4,
     },
   ]) {
-    const result = await execute(contract, storage, op.type, op.value, provider.publicKey, op.txNo);
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
 
-  return { contract, storage, provider };
+  return { contract, storage, provider, admin };
 }
 
 test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit', async () => {
-  const { contract, storage, provider } = await setupRegisteredEnclave();
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+
+  const providerPrice = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice(),
+    provider.publicKey,
+    5
+  );
+  assert.match(providerPrice.message, /admin required/i);
 
   const tooLow = await execute(
     contract,
     storage,
     'setPrice',
     makePrice({ in_per_1k_mu: 4 }),
-    provider.publicKey,
-    5
+    admin.publicKey,
+    6
   );
   assert.match(tooLow.message, /input price outside/i);
 
@@ -115,8 +129,8 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     storage,
     'setPrice',
     makePrice({ out_per_1k_mu: 241 }),
-    provider.publicKey,
-    6
+    admin.publicKey,
+    7
   );
   assert.match(tooHigh.message, /output price outside/i);
 
@@ -125,8 +139,8 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     storage,
     'setPrice',
     makePrice(),
-    provider.publicKey,
-    7
+    admin.publicKey,
+    8
   );
   assert.deepEqual(first, {
     ok: true,
@@ -140,8 +154,8 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     storage,
     'setPrice',
     makePrice({ in_per_1k_mu: 19, effective_at: 21_660 }),
-    provider.publicKey,
-    8
+    admin.publicKey,
+    9
   );
   assert.match(tooSoon.message, /once per 6h/i);
 
@@ -150,8 +164,8 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     storage,
     'setPrice',
     makePrice({ in_per_1k_mu: 19, out_per_1k_mu: 56, effective_at: 43_200 }),
-    provider.publicKey,
-    9
+    admin.publicKey,
+    10
   );
   assert.deepEqual(second, {
     ok: true,
@@ -164,20 +178,115 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
   assert.deepEqual(price.value, {
     enclave_id: enclaveId,
     model_id: modelId,
-    provider: provider.publicKey,
-    ver: 2,
-    in_per_1k_mu: 19,
-    out_per_1k_mu: 56,
-    per_req_mu: 0,
-    min_session_mu: 100,
-    effective_at: 43_200,
-    effective_from: makeTxKey(9),
-    updated_at: makeTxKey(9),
+    denom: 'mu_usd',
+    current: {
+      enclave_id: enclaveId,
+      model_id: modelId,
+      denom: 'mu_usd',
+      ver: 1,
+      in_per_1k_mu: 18,
+      out_per_1k_mu: 55,
+      per_req_mu: 0,
+      min_session_mu: 100,
+      effective_at: 21_600,
+      effective_from: makeTxKey(8),
+      updated_at: makeTxKey(8),
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+    },
+    pending: {
+      enclave_id: enclaveId,
+      model_id: modelId,
+      denom: 'mu_usd',
+      ver: 2,
+      in_per_1k_mu: 19,
+      out_per_1k_mu: 56,
+      per_req_mu: 0,
+      min_session_mu: 100,
+      effective_at: 43_200,
+      effective_from: makeTxKey(10),
+      updated_at: makeTxKey(10),
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+    },
   });
+
+  const beforeSecond = await execute(
+    contract,
+    storage,
+    'readPrice',
+    { op: 'read_price', enclave_id: enclaveId, at: 43_199 },
+    provider.publicKey,
+    11
+  );
+  assert.equal(beforeSecond.price.ver, 1);
+
+  const afterSecond = await execute(
+    contract,
+    storage,
+    'readPrice',
+    { op: 'read_price', enclave_id: enclaveId, at: 43_200 },
+    provider.publicKey,
+    12
+  );
+  assert.equal(afterSecond.price.ver, 2);
+});
+
+test('MayhemContract contract admin can edit enclave pricing forward-facing', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+
+  const initial = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice(),
+    admin.publicKey,
+    5
+  );
+  assert.equal(initial.ok, true, initial.message);
+
+  const adminUpdate = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({ in_per_1k_mu: 19, out_per_1k_mu: 56, effective_at: 43_200 }),
+    admin.publicKey,
+    6
+  );
+  assert.deepEqual(adminUpdate, {
+    ok: true,
+    op: 'setPrice',
+    enclave_id: enclaveId,
+    ver: 2,
+  });
+
+  const beforeActivation = await execute(
+    contract,
+    storage,
+    'readPrice',
+    { op: 'read_price', enclave_id: enclaveId, at: 43_199 },
+    provider.publicKey,
+    7
+  );
+  assert.equal(beforeActivation.price.ver, 1);
+  assert.equal(beforeActivation.price.set_by, admin.publicKey);
+  assert.equal(beforeActivation.price.set_by_role, 'admin');
+
+  const afterActivation = await execute(
+    contract,
+    storage,
+    'readPrice',
+    { op: 'read_price', enclave_id: enclaveId, at: 43_200 },
+    provider.publicKey,
+    8
+  );
+  assert.equal(afterActivation.price.ver, 2);
+  assert.equal(afterActivation.price.set_by, admin.publicKey);
+  assert.equal(afterActivation.price.set_by_role, 'admin');
 });
 
 test('MayhemContract setPrice uses the active scheduled price-bound params', async () => {
-  const { contract, storage, provider } = await setupRegisteredEnclave();
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
 
   const scheduledBounds = await execute(
     contract,
@@ -191,7 +300,7 @@ test('MayhemContract setPrice uses the active scheduled price-bound params', asy
         price_max_bps: 20_000,
       },
     },
-    provider.publicKey,
+    admin.publicKey,
     5
   );
   assert.equal(scheduledBounds.ok, true, scheduledBounds.message);
@@ -205,7 +314,7 @@ test('MayhemContract setPrice uses the active scheduled price-bound params', asy
       out_per_1k_mu: 180,
       effective_at: DAY_SECONDS - 1,
     }),
-    provider.publicKey,
+    admin.publicKey,
     6
   );
   assert.deepEqual(beforeActivation, {
@@ -224,7 +333,7 @@ test('MayhemContract setPrice uses the active scheduled price-bound params', asy
       out_per_1k_mu: 180,
       effective_at: DAY_SECONDS + 21_600,
     }),
-    provider.publicKey,
+    admin.publicKey,
     7
   );
   assert.match(afterActivation.message, /input price outside/i);

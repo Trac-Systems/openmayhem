@@ -7,7 +7,7 @@ Mayhem is a peer-to-peer OpenRouter built on Trac Intercom. The repo currently c
 ```bash
 ./install.sh
 mayhem setup --role provider
-mayhem provider start --model qwen3.5-4b-gguf-dev
+mayhem provider start --enclave qwen3.5-4b-gguf-dev --rooms auto
 ```
 
 ## User Quickstart
