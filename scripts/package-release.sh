@@ -125,10 +125,11 @@ case "$TARGET" in
   *) BIN_EXT="" ;;
 esac
 
+TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 if [[ "$TARGET_SET" -eq 1 ]]; then
-  RELEASE_DIR="$ROOT_DIR/target/$TARGET/release"
+  RELEASE_DIR="$TARGET_ROOT/$TARGET/release"
 else
-  RELEASE_DIR="$ROOT_DIR/target/release"
+  RELEASE_DIR="$TARGET_ROOT/release"
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
