@@ -3,7 +3,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -40,6 +40,8 @@ pub enum EngineError {
     NotLoaded,
     #[error("prompt has {prompt_tokens} tokens, leaving no room in ctx_size={ctx_size}")]
     PromptTooLong { prompt_tokens: usize, ctx_size: u32 },
+    #[error("MLX backend error: {0}")]
+    Mlx(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -74,18 +76,21 @@ pub enum EngineError {
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactFormat {
     Gguf,
+    MlxSafetensors,
 }
 
 impl ArtifactFormat {
     fn magic(&self) -> &'static [u8] {
         match self {
             Self::Gguf => b"GGUF",
+            Self::MlxSafetensors => b"",
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
             Self::Gguf => "GGUF",
+            Self::MlxSafetensors => "MLX safetensors",
         }
     }
 }
@@ -103,6 +108,14 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::Gguf,
+            sha256: None,
+        }
+    }
+
+    pub fn mlx_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::MlxSafetensors,
             sha256: None,
         }
     }
@@ -137,6 +150,13 @@ impl LoadConfig {
     pub fn gguf(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::gguf(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn mlx_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::mlx_safetensors(path),
             ..Self::default()
         }
     }
@@ -409,28 +429,133 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
         return Err(EngineError::ModelPathMissing(artifact.path.clone()));
     }
 
-    let mut file = File::open(&artifact.path)?;
-    let mut actual = vec![0_u8; artifact.format.magic().len()];
-    file.read_exact(&mut actual)?;
-    if actual.as_slice() != artifact.format.magic() {
-        return Err(EngineError::UnsupportedArtifactHeader {
-            path: artifact.path.clone(),
-            expected: artifact.format.label(),
-            actual,
-        });
-    }
+    let hash_path = match artifact.format {
+        ArtifactFormat::Gguf => {
+            verify_magic_header(&artifact.path, &artifact.format)?;
+            artifact.path.clone()
+        }
+        ArtifactFormat::MlxSafetensors => {
+            let weights = mlx_weights_path(&artifact.path)?;
+            verify_safetensors_header(&weights)?;
+            weights
+        }
+    };
 
     if let Some(expected) = &artifact.sha256 {
-        let actual = file_sha256_hex(&artifact.path)?;
+        let actual = file_sha256_hex(&hash_path)?;
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(EngineError::ArtifactHashMismatch {
-                path: artifact.path.clone(),
+                path: hash_path,
                 expected: expected.clone(),
                 actual,
             });
         }
     }
 
+    Ok(())
+}
+
+fn validate_load_config(config: &LoadConfig) -> Result<()> {
+    if config.artifact.path.as_os_str().is_empty() {
+        return Err(EngineError::InvalidConfig(
+            "artifact path cannot be empty".to_owned(),
+        ));
+    }
+    if config.ctx_size == 0 {
+        return Err(EngineError::InvalidConfig(
+            "ctx_size must be greater than zero".to_owned(),
+        ));
+    }
+    if config.batch_size == 0 {
+        return Err(EngineError::InvalidConfig(
+            "batch_size must be greater than zero".to_owned(),
+        ));
+    }
+    if config.ubatch_size == 0 {
+        return Err(EngineError::InvalidConfig(
+            "ubatch_size must be greater than zero".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn verify_magic_header(path: &PathBuf, format: &ArtifactFormat) -> Result<()> {
+    let mut file = File::open(path)?;
+    let mut actual = vec![0_u8; format.magic().len()];
+    file.read_exact(&mut actual)?;
+    if actual.as_slice() != format.magic() {
+        return Err(EngineError::UnsupportedArtifactHeader {
+            path: path.clone(),
+            expected: format.label(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn mlx_weights_path(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    }
+
+    let default = path.join("model.safetensors");
+    if default.is_file() {
+        return Ok(default);
+    }
+
+    let mut candidates = std::fs::read_dir(path)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().ok_or_else(|| {
+        EngineError::InvalidConfig(format!(
+            "MLX artifact directory {} contains no .safetensors weights",
+            path.display()
+        ))
+    })
+}
+
+fn verify_safetensors_header(path: &PathBuf) -> Result<()> {
+    let mut file = File::open(path)?;
+    let mut header_len_bytes = [0_u8; 8];
+    file.read_exact(&mut header_len_bytes)
+        .map_err(|_| EngineError::UnsupportedArtifactHeader {
+            path: path.clone(),
+            expected: ArtifactFormat::MlxSafetensors.label(),
+            actual: Vec::new(),
+        })?;
+    let header_len = u64::from_le_bytes(header_len_bytes);
+    let file_len = file.metadata()?.len();
+    if header_len == 0 || header_len > file_len.saturating_sub(8) || header_len > 256 * 1024 * 1024
+    {
+        return Err(EngineError::UnsupportedArtifactHeader {
+            path: path.clone(),
+            expected: ArtifactFormat::MlxSafetensors.label(),
+            actual: header_len_bytes.to_vec(),
+        });
+    }
+
+    let mut header = vec![
+        0_u8;
+        usize::try_from(header_len).map_err(|err| {
+            EngineError::InvalidConfig(format!("safetensors header length overflow: {err}"))
+        })?
+    ];
+    file.read_exact(&mut header)?;
+    let header: Value = serde_json::from_slice(&header)?;
+    if !header.is_object() {
+        return Err(EngineError::UnsupportedArtifactHeader {
+            path: path.clone(),
+            expected: ArtifactFormat::MlxSafetensors.label(),
+            actual: header_len_bytes.to_vec(),
+        });
+    }
     Ok(())
 }
 
@@ -481,6 +606,9 @@ fn default_tool_parameters() -> Value {
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp_backend::LlamaCppBackend;
 
+#[cfg(feature = "mlx")]
+pub use mlx_backend::MlxBackend;
+
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_backend {
     use encoding_rs::UTF_8;
@@ -493,9 +621,10 @@ mod llama_cpp_backend {
     use llama_cpp_2::token::LlamaToken;
 
     use super::{
-        tool_call_json_schema, verify_artifact, EngineBackend, EngineError, FinishReason,
-        GenerateOutput, GenerateRequest, GrammarSpec, LoadConfig, LoadedModelInfo, Result,
-        TokenChunk, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
+        tool_call_json_schema, validate_load_config, verify_artifact, ArtifactFormat,
+        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, GrammarSpec,
+        LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        DEFAULT_SEED,
     };
     use std::num::NonZeroU32;
 
@@ -535,6 +664,12 @@ mod llama_cpp_backend {
 
         fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
             validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::Gguf {
+                return Err(EngineError::InvalidConfig(format!(
+                    "llama.cpp backend requires GGUF artifacts, got {:?}",
+                    config.artifact.format
+                )));
+            }
             verify_artifact(&config.artifact)?;
 
             let mut model_params = LlamaModelParams::default()
@@ -666,30 +801,6 @@ mod llama_cpp_backend {
         }
     }
 
-    fn validate_load_config(config: &LoadConfig) -> Result<()> {
-        if config.artifact.path.as_os_str().is_empty() {
-            return Err(EngineError::InvalidConfig(
-                "artifact path cannot be empty".to_owned(),
-            ));
-        }
-        if config.ctx_size == 0 {
-            return Err(EngineError::InvalidConfig(
-                "ctx_size must be greater than zero".to_owned(),
-            ));
-        }
-        if config.batch_size == 0 {
-            return Err(EngineError::InvalidConfig(
-                "batch_size must be greater than zero".to_owned(),
-            ));
-        }
-        if config.ubatch_size == 0 {
-            return Err(EngineError::InvalidConfig(
-                "ubatch_size must be greater than zero".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
     fn make_sampler(model: &LlamaModel, request: &GenerateRequest) -> Result<LlamaSampler> {
         let mut samplers = Vec::new();
         if let Some(grammar) = &request.grammar {
@@ -737,6 +848,270 @@ mod llama_cpp_backend {
     }
 }
 
+#[cfg(feature = "mlx")]
+mod mlx_backend {
+    use super::{
+        validate_load_config, verify_artifact, ArtifactFormat, EngineBackend, EngineError,
+        FinishReason, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result,
+        TokenChunk, TokenSink, Tokenization, UsageCounters,
+    };
+    use serde::de::DeserializeOwned;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use std::cell::{Cell, RefCell};
+    use std::env;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+    const WORKER: &str = include_str!("mlx_worker.py");
+    const PYTHON_ENV: &str = "MAYHEM_MLX_PYTHON";
+
+    pub struct MlxBackend {
+        python: PathBuf,
+        worker: RefCell<Option<MlxWorker>>,
+        loaded: Option<LoadedModelInfo>,
+        next_id: Cell<u64>,
+    }
+
+    impl MlxBackend {
+        pub fn new() -> Result<Self> {
+            let python = env::var_os(PYTHON_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("python3"));
+            Self::with_python(python)
+        }
+
+        pub fn with_python(python: impl Into<PathBuf>) -> Result<Self> {
+            Ok(Self {
+                python: python.into(),
+                worker: RefCell::new(None),
+                loaded: None,
+                next_id: Cell::new(1),
+            })
+        }
+
+        fn call<T>(&self, op: &str, payload: Value) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            self.call_streaming(op, payload, &mut |_| Ok(()))
+        }
+
+        fn call_streaming<T>(
+            &self,
+            op: &str,
+            payload: Value,
+            sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let id = self.next_id.get();
+            self.next_id.set(id.saturating_add(1));
+            let mut worker = self.worker.borrow_mut();
+            if worker.is_none() {
+                *worker = Some(MlxWorker::spawn(&self.python)?);
+            }
+            let worker = worker
+                .as_mut()
+                .ok_or_else(|| EngineError::Mlx("failed to start MLX backend worker".to_owned()))?;
+            worker.send(id, op, payload)?;
+
+            loop {
+                let message = worker.read_message()?;
+                if message.id != id {
+                    return Err(EngineError::Mlx(format!(
+                        "worker response id {} did not match request id {id}",
+                        message.id
+                    )));
+                }
+
+                if message.kind == "token" {
+                    let chunk = message.chunk.ok_or_else(|| {
+                        EngineError::Mlx("worker token message missing chunk".to_owned())
+                    })?;
+                    sink(chunk)?;
+                    continue;
+                }
+
+                if message.ok.unwrap_or(false) {
+                    let result = message.result.unwrap_or(Value::Null);
+                    return Ok(serde_json::from_value(result)?);
+                }
+
+                return Err(EngineError::Mlx(
+                    message
+                        .error
+                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
+                ));
+            }
+        }
+    }
+
+    impl EngineBackend for MlxBackend {
+        fn backend_id(&self) -> &'static str {
+            "mlx"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::MlxSafetensors {
+                return Err(EngineError::InvalidConfig(format!(
+                    "MLX backend requires MLX safetensors artifacts, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+
+            let model_path = mlx_model_path(&config.artifact.path)?;
+            let info: WorkerLoadInfo = self.call(
+                "load",
+                json!({
+                    "path": model_path,
+                    "ctx_size": config.ctx_size,
+                }),
+            )?;
+            let loaded = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact,
+                ctx_size: config.ctx_size,
+                n_ctx_train: info.n_ctx_train,
+                n_vocab: info.n_vocab,
+            };
+            self.loaded = Some(loaded.clone());
+            Ok(loaded)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            self.call("tokenize", json!({ "text": text }))
+        }
+
+        fn generate(
+            &mut self,
+            request: GenerateRequest,
+            sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            if request.max_new_tokens == 0 {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    usage: UsageCounters::default(),
+                    finish_reason: FinishReason::Length,
+                });
+            }
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+
+            self.call_streaming("generate", serde_json::to_value(request)?, &mut |chunk| {
+                sink.on_token(chunk)
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerLoadInfo {
+        n_ctx_train: u32,
+        n_vocab: i32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerMessage {
+        id: u64,
+        #[serde(default = "default_message_kind", rename = "type")]
+        kind: String,
+        #[serde(default)]
+        ok: Option<bool>,
+        #[serde(default)]
+        result: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        chunk: Option<TokenChunk>,
+    }
+
+    struct MlxWorker {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl MlxWorker {
+        fn spawn(python: &Path) -> Result<Self> {
+            let mut child = Command::new(python)
+                .arg("-u")
+                .arg("-c")
+                .arg(WORKER)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|err| {
+                    EngineError::Mlx(format!(
+                        "spawning MLX Python worker with {} failed: {err}",
+                        python.display()
+                    ))
+                })?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| EngineError::Mlx("opening worker stdin failed".to_owned()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| EngineError::Mlx("opening worker stdout failed".to_owned()))?;
+            Ok(Self {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+            })
+        }
+
+        fn send(&mut self, id: u64, op: &str, payload: Value) -> Result<()> {
+            let message = json!({
+                "id": id,
+                "op": op,
+                "payload": payload,
+            });
+            serde_json::to_writer(&mut self.stdin, &message)?;
+            self.stdin.write_all(b"\n")?;
+            self.stdin.flush()?;
+            Ok(())
+        }
+
+        fn read_message(&mut self) -> Result<WorkerMessage> {
+            let mut line = String::new();
+            let read = self.stdout.read_line(&mut line)?;
+            if read == 0 {
+                return Err(EngineError::Mlx(
+                    "MLX backend worker exited before replying".to_owned(),
+                ));
+            }
+            Ok(serde_json::from_str(line.trim_end())?)
+        }
+    }
+
+    impl Drop for MlxWorker {
+        fn drop(&mut self) {
+            let _ = self.send(0, "shutdown", Value::Null);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn mlx_model_path(path: &Path) -> Result<PathBuf> {
+        if path.is_dir() {
+            return Ok(path.to_path_buf());
+        }
+        path.parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| EngineError::InvalidConfig("MLX weights path has no parent".to_owned()))
+    }
+
+    fn default_message_kind() -> String {
+        "response".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +1150,28 @@ mod tests {
         let artifact = ModelArtifact::gguf(&path);
         verify_artifact(&artifact).expect("valid gguf header");
         std::fs::remove_file(path).expect("remove temp gguf");
+    }
+
+    #[test]
+    fn verifies_mlx_safetensors_header_from_file_and_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "mlx-safetensors"
+        ));
+        std::fs::create_dir_all(&dir).expect("temp mlx dir");
+        let path = dir.join("model.safetensors");
+        let header = br#"{"__metadata__":{}}"#;
+        let mut file = File::create(&path).expect("temp safetensors");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("write header length");
+        file.write_all(header).expect("write header");
+        file.write_all(b"weights").expect("write body");
+        drop(file);
+
+        verify_artifact(&ModelArtifact::mlx_safetensors(&path)).expect("valid safetensors file");
+        verify_artifact(&ModelArtifact::mlx_safetensors(&dir)).expect("valid safetensors dir");
+        std::fs::remove_dir_all(dir).expect("remove temp mlx dir");
     }
 
     #[cfg(feature = "llama-cpp")]

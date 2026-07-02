@@ -14,6 +14,7 @@ llama-cpp = ["dep:encoding_rs", "dep:llama-cpp-2", "llama-cpp-2/llguidance"]
 llama-cpp-cuda = ["llama-cpp", "llama-cpp-2/cuda"]
 llama-cpp-metal = ["llama-cpp", "llama-cpp-2/metal"]
 llama-cpp-vulkan = ["llama-cpp", "llama-cpp-2/vulkan"]
+mlx = []
 
 [dependencies]
 encoding_rs = { version = "0.8", optional = true }
