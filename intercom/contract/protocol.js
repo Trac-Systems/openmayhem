@@ -172,6 +172,24 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'rate_oracle') {
+      return {
+        type: 'rateOracle',
+        value: json,
+      };
+    }
+    if (json?.op === 'tnk_deposit') {
+      return {
+        type: 'tnkDeposit',
+        value: json,
+      };
+    }
+    if (json?.op === 'payout_confirm') {
+      return {
+        type: 'payoutConfirm',
+        value: json,
+      };
+    }
     if (json?.op === 'read_key') {
       return {
         type: 'readKey',
@@ -206,6 +224,9 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "auditor_register", "auditor": "<pubkey>" }\' --sim 1 | admin accredits an auditor, or a qualified peer self-registers.');
     console.log('- /tx --command \'{ "op": "probe_result", "probe_id": "<id>", "probe_kind": "canary", "provider": "<pk>", "match_bps": 9700, "pass": true, "canary_set": "canary-dev-v1", "epoch": 1, "at": 3600 }\' --sim 1 | auditor submits probe evidence.');
     console.log('- /tx --command \'{ "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] }\' --sim 1 | admin/oracle applies bounded credit, earning, and fee deltas.');
+    console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "coinbase-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
+    console.log('- /tx --command \'{ "op": "tnk_deposit", "who": "<pk>", "tnk_e18": "1000000000000000000", "msb_tx_hash": "<hash>", "at": 3600 }\' --sim 1 | admin/oracle credits a TNK deposit using a fresh rate.');
+    console.log('- /tx --command \'{ "op": "payout_confirm", "who": "<pk>", "mu": 1000, "tnk_e18": "20000000000000000", "msb_tx_hash": "<hash>", "at": 3600 }\' --sim 1 | admin/oracle confirms a TNK payout using a fresh rate.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');

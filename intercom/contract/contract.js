@@ -6,11 +6,13 @@ const CONTRACT_VERSION = 1;
 const CURRENT_RULES_KEY = 'rules/current';
 const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
 const PRICE_DENOMINATION = 'mu_usd';
+const RATE_SOURCES = new Set(['coinbase-spot', 'kraken']);
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
 const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
 const DAY_SECONDS = 24 * 60 * 60;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
+const TNK_E18 = 1_000_000_000_000_000_000n;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
@@ -373,6 +375,43 @@ class MayhemContract extends Contract {
           max: LEDGER_BATCH_SCHEMA_MAX,
           items: { type: 'any' },
         },
+      },
+    });
+
+    this.addSchema('rateOracle', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        tnk_usd_e6: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        source: { type: 'string', min: 1, max: 64 },
+        ts: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
+    this.addSchema('tnkDeposit', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        who: { type: 'string', min: 1, max: 128 },
+        tnk_e18: { type: 'string', min: 1, max: 80 },
+        msb_tx_hash: { type: 'string', min: 1, max: 128 },
+        at: { type: 'number', integer: true, min: 0 },
+        memo_hash: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
+    this.addSchema('payoutConfirm', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        who: { type: 'string', min: 1, max: 128 },
+        mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        tnk_e18: { type: 'string', min: 1, max: 80 },
+        msb_tx_hash: { type: 'string', min: 1, max: 128 },
+        at: { type: 'number', integer: true, min: 0 },
       },
     });
   }
@@ -1295,6 +1334,111 @@ class MayhemContract extends Contract {
     return result;
   }
 
+  async rateOracle() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!RATE_SOURCES.has(this.value.source)) return new Error('Unsupported rate source.');
+
+    const current = await this.get('rate/latest');
+    if (current && this.value.ts < current.ts) {
+      return new Error('Rate timestamp must not decrease.');
+    }
+
+    const record = {
+      denom: 'tnk_usd_e6',
+      tnk_usd_e6: this.value.tnk_usd_e6,
+      source: this.value.source,
+      ts: this.value.ts,
+      updated_at: this.tx,
+      posted_by: this.address,
+    };
+    await this.put('rate/latest', record);
+    console.log('mayhem rateOracle', record);
+    return { ok: true, op: 'rateOracle', ts: record.ts, source: record.source };
+  }
+
+  async tnkDeposit() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid deposit recipient.');
+
+    const rate = await this.requireFreshRate(this.value.at);
+    if (rate instanceof Error) return rate;
+    const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
+    if (tnkE18 instanceof Error) return tnkE18;
+    const mu = this.tnkE18ToMu(tnkE18, rate.tnk_usd_e6);
+    if (mu instanceof Error) return mu;
+    if (mu <= 0) return new Error('TNK deposit converts to zero mu.');
+
+    const balance = await this.balanceRecord(this.value.who);
+    const nextMu = this.safeAddMu(balance.mu, mu);
+    if (nextMu instanceof Error) return nextMu;
+    const record = {
+      ...balance,
+      mu: nextMu,
+      updated_at: this.tx,
+      last_deposit_rate_ts: rate.ts,
+    };
+    await this.put(`bal/${this.value.who}`, record);
+    console.log('mayhem tnkDeposit', {
+      who: this.value.who,
+      mu,
+      tnk_e18: this.value.tnk_e18,
+      rate_ts: rate.ts,
+    });
+    return {
+      ok: true,
+      op: 'tnkDeposit',
+      who: this.value.who,
+      mu,
+      rate_ts: rate.ts,
+    };
+  }
+
+  async payoutConfirm() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid payout recipient.');
+
+    const rate = await this.requireFreshRate(this.value.at);
+    if (rate instanceof Error) return rate;
+    const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
+    if (tnkE18 instanceof Error) return tnkE18;
+    const convertedMu = this.tnkE18ToMu(tnkE18, rate.tnk_usd_e6);
+    if (convertedMu instanceof Error) return convertedMu;
+    if (convertedMu < this.value.mu) {
+      return new Error('Payout TNK amount is below the mu amount at the oracle rate.');
+    }
+
+    const earning = await this.earningRecord(this.value.who);
+    const releasedMu = earning.total_mu - earning.held_mu - earning.paid_cum_mu;
+    if (releasedMu < this.value.mu) return new Error('Insufficient released earnings.');
+    const paidCumMu = this.safeAddMu(earning.paid_cum_mu, this.value.mu);
+    if (paidCumMu instanceof Error) return paidCumMu;
+
+    const updated = {
+      ...earning,
+      paid_cum_mu: paidCumMu,
+      updated_at: this.tx,
+      last_payout_rate_ts: rate.ts,
+      last_payout_msb_tx_hash: this.value.msb_tx_hash,
+    };
+    await this.put(`earn/${this.value.who}`, updated);
+    console.log('mayhem payoutConfirm', {
+      who: this.value.who,
+      mu: this.value.mu,
+      tnk_e18: this.value.tnk_e18,
+      rate_ts: rate.ts,
+    });
+    return {
+      ok: true,
+      op: 'payoutConfirm',
+      who: this.value.who,
+      mu: this.value.mu,
+      rate_ts: rate.ts,
+    };
+  }
+
   async currentRules() {
     return await this.get(CURRENT_RULES_KEY);
   }
@@ -1552,6 +1696,35 @@ class MayhemContract extends Contract {
       last_apply_hash: null,
       last_fee_bps: null,
     };
+  }
+
+  parseTnkE18(value) {
+    if (typeof value !== 'string' || !/^[0-9]+$/.test(value)) {
+      return new Error('tnk_e18 must be a decimal integer string.');
+    }
+    const parsed = BigInt(value);
+    if (parsed <= 0n) return new Error('tnk_e18 must be positive.');
+    return parsed;
+  }
+
+  tnkE18ToMu(tnkE18, tnkUsdE6) {
+    if (!Number.isSafeInteger(tnkUsdE6) || tnkUsdE6 <= 0) {
+      return new Error('Invalid TNK/USD rate.');
+    }
+    const mu = (tnkE18 * BigInt(tnkUsdE6)) / TNK_E18;
+    if (mu > BigInt(Number.MAX_SAFE_INTEGER)) return new Error('mu value overflow.');
+    return Number(mu);
+  }
+
+  async requireFreshRate(at) {
+    const rate = await this.get('rate/latest');
+    if (!rate) return new Error('Fresh rate oracle required.');
+    if (rate.ts > at) return new Error('Rate oracle timestamp is in the future.');
+    const params = await this.activeParamsAt(at, ['rate_staleness_seconds']);
+    if (at - rate.ts > params.rate_staleness_seconds) {
+      return new Error('Rate oracle is stale.');
+    }
+    return rate;
   }
 
   async epochApplyHash(value) {
