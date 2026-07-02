@@ -15,8 +15,6 @@ const enclaveId = 'b9'.repeat(32);
 
 const providerRegistration = {
   op: 'register_provider',
-  payout_addr: 'trac1providerpayouttarget',
-  payout_method: 'tnk',
 };
 
 async function setupAuditorContract() {

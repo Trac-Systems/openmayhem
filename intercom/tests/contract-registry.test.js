@@ -19,8 +19,6 @@ const updatedArtifactRoot = '6'.repeat(64);
 
 const providerRegistration = {
   op: 'register_provider',
-  payout_addr: 'trac1providerpayouttarget',
-  payout_method: 'tnk',
 };
 
 const enclaveRegistration = {
@@ -179,7 +177,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   });
 });
 
-test('MayhemContract ignores provider-authored payout and probation hints', async () => {
+test('MayhemContract rejects provider-authored payout and probation hints', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });
@@ -204,21 +202,36 @@ test('MayhemContract ignores provider-authored payout and probation hints', asyn
       sender: provider.publicKey,
       txNo: 2,
     },
-    {
-      type: 'registerProvider',
-      value: {
-        op: 'register_provider',
-        payout_addr: 'provider-picked-target',
-        payout_method: 'coinbase',
-        registered_at_seconds: 123_456,
-      },
-      sender: provider.publicKey,
-      txNo: 3,
-    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
+
+  const providerAuthoredTerms = await execute(
+    contract,
+    storage,
+    'registerProvider',
+    {
+      op: 'register_provider',
+      payout_addr: 'provider-picked-target',
+      payout_method: 'coinbase',
+      registered_at_seconds: 123_456,
+    },
+    provider.publicKey,
+    3
+  );
+  assert.match(providerAuthoredTerms.message, /payout_addr|payout_method|registered_at_seconds|forbidden/i);
+  assert.equal(await storage.get(`prov/${provider.publicKey}`), null);
+
+  const registered = await execute(
+    contract,
+    storage,
+    'registerProvider',
+    { op: 'register_provider' },
+    provider.publicKey,
+    4
+  );
+  assert.equal(registered.ok, true, registered.message);
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerEntry.value.payout, null);
@@ -235,7 +248,7 @@ test('MayhemContract ignores provider-authored payout and probation hints', asyn
       payout_method: 'tnk',
     },
     provider.publicKey,
-    4
+    5
   );
   assert.match(providerPayout.message, /admin required/i);
 
@@ -250,7 +263,7 @@ test('MayhemContract ignores provider-authored payout and probation hints', asyn
       payout_method: 'wire',
     },
     admin.publicKey,
-    5
+    6
   );
   assert.match(unsupported.message, /unsupported payout method/i);
 
@@ -265,7 +278,7 @@ test('MayhemContract ignores provider-authored payout and probation hints', asyn
       payout_method: 'tnk',
     },
     admin.publicKey,
-    6
+    7
   );
   assert.deepEqual(adminPayout, {
     ok: true,
@@ -278,9 +291,9 @@ test('MayhemContract ignores provider-authored payout and probation hints', asyn
     addr: 'admin-approved-target',
     method: 'tnk',
     set_by: admin.publicKey,
-    set_at: makeTxKey(6),
+    set_at: makeTxKey(7),
   });
-  assert.equal(updated.value.updated_at, makeTxKey(6));
+  assert.equal(updated.value.updated_at, makeTxKey(7));
 });
 
 test('MayhemContract admin can ban providers from future serving mutations', async () => {

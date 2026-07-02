@@ -16,9 +16,6 @@ const PROBATION_SECONDS = 7 * DAY_SECONDS;
 
 const providerRegistration = {
   op: 'register_provider',
-  payout_addr: 'trac1providerpayouttarget',
-  payout_method: 'tnk',
-  registered_at_seconds: 0,
 };
 
 async function setupReputationContract() {

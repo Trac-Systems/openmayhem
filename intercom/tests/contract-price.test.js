@@ -17,8 +17,6 @@ const DAY_SECONDS = 24 * 60 * 60;
 
 const providerRegistration = {
   op: 'register_provider',
-  payout_addr: 'trac1providerpayouttarget',
-  payout_method: 'tnk',
 };
 
 const enclaveRegistration = {

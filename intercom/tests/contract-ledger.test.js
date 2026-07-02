@@ -14,8 +14,6 @@ const rulesHash = '7'.repeat(64);
 
 const providerRegistration = {
   op: 'register_provider',
-  payout_addr: 'trac1providerpayouttarget',
-  payout_method: 'tnk',
 };
 
 const seededBalance = (user, mu) => ({

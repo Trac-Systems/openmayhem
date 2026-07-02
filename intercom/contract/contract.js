@@ -181,16 +181,7 @@ class MayhemContract extends Contract {
       },
     });
 
-    this.addSchema('registerProvider', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        payout_addr: { type: 'string', min: 1, max: 256, optional: true },
-        payout_method: { type: 'string', min: 1, max: 32, optional: true },
-        registered_at_seconds: { type: 'number', integer: true, min: 0, optional: true },
-      },
-    });
+    this.addFunction('registerProvider');
 
     this.addSchema('setProviderPayout', {
       value: {
@@ -715,6 +706,10 @@ class MayhemContract extends Contract {
   }
 
   async registerProvider() {
+    const shapeError = this.validateExactCommandValue(['op'], 'register_provider');
+    if (shapeError) return shapeError;
+    if (this.value.op !== 'register_provider') return new Error('Invalid provider registration op.');
+
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
 
@@ -2487,6 +2482,21 @@ class MayhemContract extends Contract {
   async requireProvider(sender = this.address) {
     const provider = await this.get(`prov/${sender}`);
     if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    return null;
+  }
+
+  validateExactCommandValue(allowedKeys, opName) {
+    if (!this.value || typeof this.value !== 'object' || Array.isArray(this.value)) {
+      return new Error(`${opName} value must be an object.`);
+    }
+    const allowed = new Set(allowedKeys);
+    const unknown = Object.keys(this.value).filter((key) => !allowed.has(key)).sort();
+    if (unknown.length > 0) {
+      return new Error(`${opName} does not accept provider-authored fields: ${unknown.join(', ')}.`);
+    }
+    for (const key of allowedKeys) {
+      if (!hasOwn(this.value, key)) return new Error(`${opName} is missing ${key}.`);
+    }
     return null;
   }
 

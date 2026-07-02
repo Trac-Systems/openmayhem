@@ -18,8 +18,6 @@ const otherModelId = 'qwen/qwen2.5-4b-instruct@4bit';
 
 const providerRegistration = {
   op: 'register_provider',
-  payout_addr: 'trac1providerpayouttarget',
-  payout_method: 'tnk',
 };
 
 const enclaveRegistration = {
