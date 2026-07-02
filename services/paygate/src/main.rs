@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     apply_overrides(&mut config, overrides)?;
 
     let oracle = OracleKeypair::load_or_create(&config.oracle_key_path)?;
-    let state = PaygateState::new(config.clone(), oracle);
+    let state = PaygateState::try_new(config.clone(), oracle)?;
     eprintln!(
         "mayhem-paygate listening on http://{} with oracle {}",
         config.bind,

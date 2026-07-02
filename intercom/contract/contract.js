@@ -6,6 +6,7 @@ const CONTRACT_VERSION = 1;
 const CURRENT_RULES_KEY = 'rules/current';
 const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
 const PAYOUT_CONFIRM_KINDS = new Set(['provider', 'fee_sweep']);
+const FIAT_DEPOSIT_RAILS = new Set(['stripe', 'coinbase']);
 const PRICE_DENOMINATION = 'mu_usd';
 const RATE_SOURCES = new Set(['coinbase-spot', 'kraken']);
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
@@ -507,6 +508,20 @@ class MayhemContract extends Contract {
         memo_hash: { type: 'string', min: 1, max: 128 },
         tnk_e18: { type: 'string', min: 1, max: 80 },
         msb_tx_hash: { type: 'string', min: 1, max: 128 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
+    this.addSchema('fiatDeposit', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        rail: { type: 'string', min: 1, max: 64 },
+        who: { type: 'string', min: 1, max: 128 },
+        mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        ext_ref_hash: { type: 'string', min: 1, max: 128 },
         epoch: { type: 'number', integer: true, min: 1 },
         at: { type: 'number', integer: true, min: 0 },
       },
@@ -2019,6 +2034,58 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
       rate_ts: rate.ts,
+    };
+  }
+
+  async fiatDeposit() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!FIAT_DEPOSIT_RAILS.has(this.value.rail)) return new Error('Unsupported fiat deposit rail.');
+    if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid deposit recipient.');
+    if (!this.isSafeKeyPart(this.value.ext_ref_hash)) return new Error('Invalid external reference hash.');
+
+    const balance = await this.balanceRecord(this.value.who);
+    const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who);
+    if (balanceError) return balanceError;
+    const nextMu = this.safeAddMu(balance.mu, this.value.mu);
+    if (nextMu instanceof Error) return nextMu;
+    const leaf = await this.depositLeafHash({
+      rail: this.value.rail,
+      user_hash: await this.opaqueHash('deposit-user', this.value.who),
+      mu: this.value.mu,
+      ext_ref_hash: this.value.ext_ref_hash,
+    });
+    const depositRoot = await this.nextDepositRoot({
+      epoch: this.value.epoch,
+      leaf,
+      mu: this.value.mu,
+      at: this.value.at,
+    });
+    if (depositRoot instanceof Error) return depositRoot;
+
+    const record = {
+      ...balance,
+      mu: nextMu,
+      updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_deposit_rail: this.value.rail,
+    };
+    await this.put(`bal/${this.value.who}`, record);
+    await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    console.log('mayhem fiatDeposit', {
+      rail: this.value.rail,
+      who: this.value.who,
+      mu: this.value.mu,
+      epoch: this.value.epoch,
+    });
+    return {
+      ok: true,
+      op: 'fiatDeposit',
+      rail: this.value.rail,
+      who: this.value.who,
+      mu: this.value.mu,
+      epoch: this.value.epoch,
+      deposit_root: depositRoot.merkle_root,
     };
   }
 

@@ -222,6 +222,18 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
       },
     ],
     [
+      'fiatDeposit',
+      {
+        op: 'fiat_deposit',
+        rail: 'stripe',
+        who: provider.publicKey,
+        mu: 1_000_000,
+        ext_ref_hash: 'c'.repeat(64),
+        epoch: 1,
+        at: 3_600,
+      },
+    ],
+    [
       'payoutConfirm',
       {
         op: 'payout_confirm',

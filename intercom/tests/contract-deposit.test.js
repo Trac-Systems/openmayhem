@@ -218,3 +218,83 @@ test('MayhemContract deposit root accumulation is deterministic and root-only', 
   assert.equal(rootJson.includes('1'.repeat(64)), false);
   assert.equal(rootJson.includes('2'.repeat(64)), false);
 });
+
+test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', async () => {
+  const ctx = await setupDepositContract();
+  await consentUser(ctx, 2);
+
+  const nonAdmin = await execute(
+    ctx.contract,
+    ctx.storage,
+    'fiatDeposit',
+    {
+      op: 'fiat_deposit',
+      rail: 'stripe',
+      who: ctx.user.publicKey,
+      mu: 2_500_000,
+      ext_ref_hash: 'a'.repeat(64),
+      epoch: 1,
+      at: 1_800,
+    },
+    ctx.outsider.publicKey,
+    3
+  );
+  assert.match(nonAdmin.message, /admin required/i);
+
+  const unsupported = await execute(
+    ctx.contract,
+    ctx.storage,
+    'fiatDeposit',
+    {
+      op: 'fiat_deposit',
+      rail: 'provider-rail',
+      who: ctx.user.publicKey,
+      mu: 2_500_000,
+      ext_ref_hash: 'a'.repeat(64),
+      epoch: 1,
+      at: 1_800,
+    },
+    ctx.admin.publicKey,
+    4
+  );
+  assert.match(unsupported.message, /unsupported/i);
+
+  const confirmed = await execute(
+    ctx.contract,
+    ctx.storage,
+    'fiatDeposit',
+    {
+      op: 'fiat_deposit',
+      rail: 'stripe',
+      who: ctx.user.publicKey,
+      mu: 2_500_000,
+      ext_ref_hash: 'a'.repeat(64),
+      epoch: 1,
+      at: 1_800,
+    },
+    ctx.admin.publicKey,
+    5
+  );
+  assert.equal(confirmed.ok, true, confirmed.message);
+  assert.equal(confirmed.op, 'fiatDeposit');
+  assert.equal(confirmed.rail, 'stripe');
+  assert.equal(confirmed.who, ctx.user.publicKey);
+  assert.equal(confirmed.mu, 2_500_000);
+  assert.equal(confirmed.deposit_root.length, 64);
+
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}`)).value, {
+    user: ctx.user.publicKey,
+    denom: 'mu_usd',
+    mu: 2_500_000,
+    updated_epoch: 1,
+    updated_at: makeTxKey(5),
+    last_deposit_rail: 'stripe',
+  });
+  const root = (await ctx.storage.get('ev/dep/1')).value;
+  assert.equal(root.type, 'deposit_root');
+  assert.equal(root.count, 1);
+  assert.equal(root.mu_total, 2_500_000);
+  assert.equal(root.merkle_root, confirmed.deposit_root);
+  assert.equal(JSON.stringify(root).includes(ctx.user.publicKey), false);
+  assert.equal(JSON.stringify(root).includes('a'.repeat(64)), false);
+});
