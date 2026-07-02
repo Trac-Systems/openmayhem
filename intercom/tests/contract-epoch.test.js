@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import MayhemContract from '../contract/contract.js';
+import b4a from 'b4a';
+import MayhemContract, { receiptMessage } from '../contract/contract.js';
 import { recomputeEpoch } from '../scripts/recompute-epoch-roots.mjs';
 import {
   MemoryStorage,
@@ -98,6 +99,33 @@ const receiptBundle = (user, provider, overrides = {}) => ({
   payouts: [],
   ...overrides,
 });
+
+const signedReceipt = (user, provider, enclave, overrides = {}) => {
+  const body = {
+    schema_version: 1,
+    session_id: 'session-epoch-1',
+    seq: 1,
+    final: true,
+    user: user.publicKey,
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    model_id: modelId,
+    price_ver: 1,
+    rules_ver: 1,
+    usage: { in: 100, out: 250 },
+    mu_owed_cum: 1_000,
+    prompt_hash: 'a'.repeat(64),
+    ts: 3_600,
+    ...overrides,
+  };
+  const message = b4a.from(receiptMessage(body));
+  return {
+    body,
+    enclave_pubkey: enclave.publicKey,
+    enclave_sig: b4a.toString(enclave.wallet.sign(message), 'hex'),
+    user_sig: b4a.toString(user.wallet.sign(message), 'hex'),
+  };
+};
 
 test('MayhemContract anchors epoch roots permissionlessly and applies matching evidence roots', async () => {
   const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
@@ -257,6 +285,221 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     ts: 3_600,
     updated_at: makeTxKey(7),
   });
+});
+
+test('MayhemContract fraudProof voids an inflated single-receipt commit and bans submitter', async () => {
+  const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
+  const enclave = await makeIdentity();
+  const prover = await makeIdentity();
+  const otherSubmitter = await makeIdentity();
+  const receipt = signedReceipt(user, provider, enclave, { mu_owed_cum: 1_000 });
+  const inflatedReceipt = {
+    ...receipt,
+    body: {
+      ...receipt.body,
+      mu_owed_cum: 2_000,
+    },
+  };
+  const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
+    receipts: [inflatedReceipt],
+  }));
+
+  const commit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 1,
+      at: 3_600,
+      roots: inflatedRoll.roots,
+      totals: inflatedRoll.totals,
+    },
+    submitter.publicKey,
+    4
+  );
+  assert.equal(commit.ok, true, commit.message);
+  assert.equal(inflatedRoll.totals.use_mu, 2_000);
+
+  const proof = await execute(
+    contract,
+    storage,
+    'fraudProof',
+    {
+      op: 'fraud_proof',
+      epoch: 1,
+      proof_epoch: 2,
+      at: 7_200,
+      reason: 'over_credit',
+      receipt,
+      claimed_mu_owed_cum: 2_000,
+    },
+    prover.publicKey,
+    5
+  );
+  assert.equal(proof.ok, true, proof.message);
+  assert.equal(proof.op, 'fraudProof');
+  assert.equal(proof.idempotent, false);
+  assert.equal(proof.voided_commit, commit.commit_hash);
+  assert.equal(proof.banned_submitter, submitter.publicKey);
+
+  const commitRecord = (await storage.get('epoch/commit/1')).value;
+  assert.equal(commitRecord.status, 'void');
+  assert.equal(commitRecord.voided_by, prover.publicKey);
+  assert.equal(commitRecord.fraud_reason, 'over_credit');
+  assert.equal(commitRecord.fraud_proof_hash, proof.proof_hash);
+
+  const fraudRecord = (await storage.get(`ev/fraud/1/${proof.proof_hash}`)).value;
+  assert.equal(fraudRecord.actual_mu, 1_000);
+  assert.equal(fraudRecord.claimed_mu, 2_000);
+  assert.equal(fraudRecord.voided_commit, commit.commit_hash);
+
+  assert.deepEqual((await storage.get(`committer/ban/${submitter.publicKey}`)).value, {
+    submitter: submitter.publicKey,
+    status: 'banned',
+    reason: 'fraud_proof',
+    epoch: 1,
+    proof_hash: proof.proof_hash,
+    banned_at: makeTxKey(5),
+    banned_by: prover.publicKey,
+  });
+
+  const duplicateProof = await execute(
+    contract,
+    storage,
+    'fraudProof',
+    {
+      op: 'fraud_proof',
+      epoch: 1,
+      proof_epoch: 2,
+      at: 7_200,
+      reason: 'over_credit',
+      receipt,
+      claimed_mu_owed_cum: 2_000,
+    },
+    otherSubmitter.publicKey,
+    6
+  );
+  assert.deepEqual(duplicateProof, {
+    ok: true,
+    op: 'fraudProof',
+    epoch: 1,
+    idempotent: true,
+    proof_hash: proof.proof_hash,
+    voided_commit: commit.commit_hash,
+    banned_submitter: submitter.publicKey,
+  });
+
+  const voidApply = await execute(
+    contract,
+    storage,
+    'epochApply',
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 3_600,
+      debits: inflatedRoll.debits,
+      earnings: inflatedRoll.earnings,
+      roots: inflatedRoll.roots,
+      totals: inflatedRoll.totals,
+    },
+    admin.publicKey,
+    7
+  );
+  assert.match(voidApply.message, /commit is void/i);
+  assert.equal((await storage.get('ev/use/1')), null);
+  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 1_000_000);
+
+  const emptyEpoch = await recomputeEpoch({
+    epoch: 2,
+    fee_bps: 1_500,
+    deposits: [],
+    receipts: [],
+    payouts: [],
+  });
+  const bannedCommit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 2,
+      at: 7_200,
+      roots: emptyEpoch.roots,
+      totals: emptyEpoch.totals,
+    },
+    submitter.publicKey,
+    8
+  );
+  assert.match(bannedCommit.message, /committer is banned/i);
+
+  const allowedCommit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 2,
+      at: 7_200,
+      roots: emptyEpoch.roots,
+      totals: emptyEpoch.totals,
+    },
+    otherSubmitter.publicKey,
+    9
+  );
+  assert.equal(allowedCommit.ok, true, allowedCommit.message);
+});
+
+test('MayhemContract fraudProof rejects proofs after the challenge window', async () => {
+  const { provider, user, submitter, storage, contract } = await setupEpochContract();
+  const enclave = await makeIdentity();
+  const prover = await makeIdentity();
+  const receipt = signedReceipt(user, provider, enclave, { mu_owed_cum: 1_000 });
+  const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
+    receipts: [{
+      ...receipt,
+      body: {
+        ...receipt.body,
+        mu_owed_cum: 2_000,
+      },
+    }],
+  }));
+
+  const commit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 1,
+      at: 3_600,
+      roots: inflatedRoll.roots,
+      totals: inflatedRoll.totals,
+    },
+    submitter.publicKey,
+    4
+  );
+  assert.equal(commit.ok, true, commit.message);
+
+  const expired = await execute(
+    contract,
+    storage,
+    'fraudProof',
+    {
+      op: 'fraud_proof',
+      epoch: 1,
+      proof_epoch: 8,
+      at: 28_800,
+      reason: 'over_credit',
+      receipt,
+      claimed_mu_owed_cum: 2_000,
+    },
+    prover.publicKey,
+    5
+  );
+  assert.match(expired.message, /challenge window has closed/i);
+  assert.equal((await storage.get('epoch/commit/1')).value.status, 'provisional');
+  assert.equal(await storage.get(`committer/ban/${submitter.publicKey}`), null);
 });
 
 test('MayhemContract refuses evidence-root apply without a matching epoch commit', async () => {

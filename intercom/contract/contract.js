@@ -12,6 +12,8 @@ const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
 const DAY_SECONDS = 24 * 60 * 60;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
+const FRAUD_PROOF_MAX_BYTES = 4_096;
+const SESSION_RECEIPT_SCHEMA_VERSION = 1;
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
@@ -46,6 +48,7 @@ const REPUTATION_EVENT_KINDS = new Set([
   'provenance_violation',
 ]);
 const PROBE_KINDS = new Set(['canary', 'uptime_tick']);
+const FRAUD_PROOF_REASONS = new Set(['over_credit']);
 const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee', 'pay'];
 const EPOCH_TOTAL_KEYS = [
   'dep_count',
@@ -69,6 +72,10 @@ const ENCLAVE_UPDATE_FIELDS = [
 ];
 
 export const consentMessage = (ver, hash) => `mayhem-consent${ver}${hash}`;
+export const receiptMessage = (body) => JSON.stringify({
+  domain: 'mayhem-session-receipt-v1',
+  body,
+});
 export const roomSidechannelName = (roomId) => `mx/room/${roomId}`;
 export const deriveRoomId = async (modelId, creator, nonce) => {
   const digest = await blake3(b4a.from(`${modelId}${creator}${nonce}`));
@@ -413,6 +420,21 @@ class MayhemContract extends Contract {
         at: { type: 'number', integer: true, min: 0 },
         roots: { type: 'any' },
         totals: { type: 'any' },
+      },
+    });
+
+    this.addSchema('fraudProof', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        proof_epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+        reason: { type: 'string', min: 1, max: 64 },
+        receipt: { type: 'any' },
+        claimed_mu_owed_cum: { type: 'number', integer: true, min: 0 },
+        previous_mu_owed_cum: { type: 'number', integer: true, min: 0, optional: true },
       },
     });
 
@@ -1439,6 +1461,9 @@ class MayhemContract extends Contract {
   }
 
   async epochCommit() {
+    const banned = await this.get(`committer/ban/${this.address}`);
+    if (banned) return new Error('Epoch committer is banned.');
+
     const roots = this.normalizeEpochRoots(this.value.roots);
     if (roots instanceof Error) return roots;
     const totals = this.normalizeEpochTotals(this.value.totals);
@@ -1486,6 +1511,105 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       idempotent: false,
       commit_hash: commitHash,
+    };
+  }
+
+  async fraudProof() {
+    if (!FRAUD_PROOF_REASONS.has(this.value.reason)) {
+      return new Error('Unsupported fraud proof reason.');
+    }
+    if (b4a.from(stableJson(this.value)).byteLength > FRAUD_PROOF_MAX_BYTES) {
+      return new Error('Fraud proof exceeds 4096 bytes.');
+    }
+
+    const commitKey = `epoch/commit/${this.value.epoch}`;
+    const commit = await this.get(commitKey);
+    if (!commit) return new Error('Epoch commit not found.');
+
+    const receipt = this.normalizeReceiptEnvelope(this.value.receipt);
+    if (receipt instanceof Error) return receipt;
+    if (!this.verifyReceiptEnvelope(receipt)) {
+      return new Error('Invalid receipt signature.');
+    }
+
+    const proofHash = await this.fraudProofHash({
+      epoch: this.value.epoch,
+      proof_epoch: this.value.proof_epoch,
+      reason: this.value.reason,
+      receipt,
+      claimed_mu_owed_cum: this.value.claimed_mu_owed_cum,
+      previous_mu_owed_cum: this.value.previous_mu_owed_cum ?? 0,
+    });
+    const proofKey = `ev/fraud/${this.value.epoch}/${proofHash}`;
+    const existingProof = await this.get(proofKey);
+    if (existingProof) {
+      return {
+        ok: true,
+        op: 'fraudProof',
+        epoch: this.value.epoch,
+        idempotent: true,
+        proof_hash: proofHash,
+        voided_commit: commit.commit_hash,
+        banned_submitter: commit.submitted_by,
+      };
+    }
+
+    const proof = await this.validateOverCreditFraudProof(commit, receipt);
+    if (proof instanceof Error) return proof;
+
+    if (commit.status === 'void') return new Error('Epoch commit is already void.');
+    if (this.value.proof_epoch > commit.provisional_until_epoch) {
+      return new Error('Epoch commit challenge window has closed.');
+    }
+
+    const record = {
+      type: 'fraud_proof',
+      epoch: this.value.epoch,
+      proof_epoch: this.value.proof_epoch,
+      reason: this.value.reason,
+      proof_hash: proofHash,
+      receipt_hash: proof.receipt_hash,
+      actual_mu: proof.actual_mu,
+      claimed_mu: proof.claimed_mu,
+      committed_use_root: commit.roots.use,
+      submitted_by: this.address,
+      submitted_at: this.tx,
+      at: this.value.at,
+      voided_commit: commit.commit_hash,
+      banned_submitter: commit.submitted_by,
+    };
+    const updatedCommit = {
+      ...commit,
+      status: 'void',
+      voided_at: this.tx,
+      voided_by: this.address,
+      fraud_reason: this.value.reason,
+      fraud_proof_hash: proofHash,
+    };
+    const banKey = `committer/ban/${commit.submitted_by}`;
+    const existingBan = await this.get(banKey);
+    const ban = existingBan ?? {
+      submitter: commit.submitted_by,
+      status: 'banned',
+      reason: 'fraud_proof',
+      epoch: this.value.epoch,
+      proof_hash: proofHash,
+      banned_at: this.tx,
+      banned_by: this.address,
+    };
+
+    await this.put(proofKey, record);
+    await this.put(commitKey, updatedCommit);
+    await this.put(banKey, ban);
+    console.log('mayhem fraudProof', record);
+    return {
+      ok: true,
+      op: 'fraudProof',
+      epoch: this.value.epoch,
+      idempotent: false,
+      proof_hash: proofHash,
+      voided_commit: commit.commit_hash,
+      banned_submitter: commit.submitted_by,
     };
   }
 
@@ -1860,6 +1984,168 @@ class MayhemContract extends Contract {
     return totals;
   }
 
+  normalizeReceiptEnvelope(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Fraud proof receipt must be an object.');
+    }
+    const receipt = value.receipt ?? value;
+    if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+      return new Error('Fraud proof receipt must be an object.');
+    }
+    const bodySource = receipt.body ?? receipt;
+    if (!bodySource || typeof bodySource !== 'object' || Array.isArray(bodySource)) {
+      return new Error('Fraud proof receipt body must be an object.');
+    }
+    const usageSource = bodySource.usage;
+    if (!usageSource || typeof usageSource !== 'object' || Array.isArray(usageSource)) {
+      return new Error('Fraud proof receipt usage must be an object.');
+    }
+
+    const finalReceipt = hasOwn(bodySource, 'final')
+      ? bodySource.final
+      : bodySource.final_receipt;
+    const body = {
+      schema_version: bodySource.schema_version,
+      session_id: bodySource.session_id,
+      seq: bodySource.seq,
+      final: finalReceipt,
+      user: bodySource.user,
+      provider: bodySource.provider,
+      enclave_id: bodySource.enclave_id,
+      model_id: bodySource.model_id,
+      price_ver: bodySource.price_ver,
+      rules_ver: bodySource.rules_ver,
+      usage: {
+        in: hasOwn(usageSource, 'in') ? usageSource.in : usageSource.in_tokens,
+        out: hasOwn(usageSource, 'out') ? usageSource.out : usageSource.out_tokens,
+      },
+      mu_owed_cum: bodySource.mu_owed_cum,
+      prompt_hash: bodySource.prompt_hash,
+      ts: bodySource.ts,
+    };
+
+    const bodyError = this.validateReceiptBody(body);
+    if (bodyError) return bodyError;
+
+    const envelope = {
+      body,
+      enclave_sig: receipt.enclave_sig ?? value.enclave_sig,
+      user_sig: receipt.user_sig ?? value.user_sig,
+      enclave_pubkey: receipt.enclave_pubkey ?? value.enclave_pubkey ?? bodySource.enclave_pubkey ?? null,
+    };
+    if (!this.isHexBytes(envelope.enclave_sig, 64)) return new Error('Invalid enclave receipt signature.');
+    if (!this.isHexBytes(envelope.user_sig, 64)) return new Error('Invalid user receipt signature.');
+    if (envelope.enclave_pubkey !== null && !this.isHexBytes(envelope.enclave_pubkey, 32)) {
+      return new Error('Invalid enclave receipt public key.');
+    }
+    return envelope;
+  }
+
+  validateReceiptBody(body) {
+    if (body.schema_version !== SESSION_RECEIPT_SCHEMA_VERSION) {
+      return new Error('Unsupported receipt schema version.');
+    }
+    for (const field of ['session_id', 'user', 'provider', 'enclave_id', 'model_id', 'prompt_hash']) {
+      if (typeof body[field] !== 'string' || body[field].length === 0 || body[field].length > 256) {
+        return new Error(`Invalid receipt ${field}.`);
+      }
+    }
+    if (!this.isHexBytes(body.user, 32)) return new Error('Invalid receipt user public key.');
+    if (!this.isHexBytes(body.provider, 32)) return new Error('Invalid receipt provider public key.');
+    if (!Number.isSafeInteger(body.seq) || body.seq < 0) return new Error('Invalid receipt sequence.');
+    if (typeof body.final !== 'boolean') return new Error('Invalid receipt final flag.');
+    if (!Number.isSafeInteger(body.price_ver) || body.price_ver < 1) {
+      return new Error('Invalid receipt price version.');
+    }
+    if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
+      return new Error('Invalid receipt rules version.');
+    }
+    if (!Number.isSafeInteger(body.usage.in) || body.usage.in < 0) {
+      return new Error('Invalid receipt input usage.');
+    }
+    if (!Number.isSafeInteger(body.usage.out) || body.usage.out < 0) {
+      return new Error('Invalid receipt output usage.');
+    }
+    if (!Number.isSafeInteger(body.mu_owed_cum) || body.mu_owed_cum < 0) {
+      return new Error('Invalid receipt cumulative amount.');
+    }
+    if (!Number.isSafeInteger(body.ts) || body.ts < 0) return new Error('Invalid receipt timestamp.');
+    return null;
+  }
+
+  verifyReceiptEnvelope(envelope) {
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function') return false;
+    const message = receiptMessage(envelope.body);
+    const enclaveKey = envelope.enclave_pubkey ?? (
+      this.isHexBytes(envelope.body.enclave_id, 32) ? envelope.body.enclave_id : null
+    );
+    if (!enclaveKey) return false;
+    return (
+      verify.call(this.protocol.peer.wallet, envelope.enclave_sig, message, enclaveKey) === true &&
+      verify.call(this.protocol.peer.wallet, envelope.user_sig, message, envelope.body.user) === true
+    );
+  }
+
+  receiptLeafEnvelope(envelope) {
+    return {
+      body: cloneValue(envelope.body),
+      enclave_sig: envelope.enclave_sig,
+      user_sig: envelope.user_sig,
+    };
+  }
+
+  async usageLeafHash(envelope) {
+    return await this.opaqueHash('mayhem-usage-leaf-v1', this.receiptLeafEnvelope(envelope));
+  }
+
+  async fraudProofHash(value) {
+    return await this.opaqueHash('mayhem-fraud-proof-v1', value);
+  }
+
+  async validateOverCreditFraudProof(commit, receipt) {
+    if (commit.status === 'void') return new Error('Epoch commit is already void.');
+    if (this.value.proof_epoch > commit.provisional_until_epoch) {
+      return new Error('Epoch commit challenge window has closed.');
+    }
+    if (commit.totals.use_count !== 1) {
+      return new Error('Over-credit proof requires a single committed receipt.');
+    }
+
+    const previousMu = this.value.previous_mu_owed_cum ?? 0;
+    const claimedCum = this.value.claimed_mu_owed_cum;
+    if (!Number.isSafeInteger(previousMu) || previousMu < 0) {
+      return new Error('Invalid previous receipt amount.');
+    }
+    if (previousMu > receipt.body.mu_owed_cum || previousMu > claimedCum) {
+      return new Error('Previous receipt amount exceeds cumulative amount.');
+    }
+    const actualMu = receipt.body.mu_owed_cum - previousMu;
+    const claimedMu = claimedCum - previousMu;
+    if (claimedMu <= actualMu) return new Error('Receipt does not contradict committed usage.');
+    if (commit.totals.use_mu !== claimedMu) {
+      return new Error('Fraud proof claimed amount does not match committed usage total.');
+    }
+
+    const claimedReceipt = {
+      ...receipt,
+      body: {
+        ...receipt.body,
+        mu_owed_cum: claimedCum,
+      },
+    };
+    const claimedUseRoot = await this.usageLeafHash(claimedReceipt);
+    if (commit.roots.use !== claimedUseRoot) {
+      return new Error('Fraud proof does not match committed usage root.');
+    }
+
+    return {
+      actual_mu: actualMu,
+      claimed_mu: claimedMu,
+      receipt_hash: await this.usageLeafHash(receipt),
+    };
+  }
+
   async validateEpochApplyTotals({
     epoch,
     roots,
@@ -2184,6 +2470,12 @@ class MayhemContract extends Contract {
 
   isSafeKeyPart(value) {
     return typeof value === 'string' && /^[a-zA-Z0-9._:-]{1,128}$/.test(value);
+  }
+
+  isHexBytes(value, bytes) {
+    return typeof value === 'string' &&
+      value.length === bytes * 2 &&
+      /^[0-9a-fA-F]+$/.test(value);
   }
 
   async reputationEventHead(previousHead, event) {

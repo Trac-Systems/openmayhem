@@ -184,6 +184,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'fraud_proof') {
+      return {
+        type: 'fraudProof',
+        value: json,
+      };
+    }
     if (json?.op === 'rate_oracle') {
       return {
         type: 'rateOracle',
@@ -243,6 +249,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "auditor_register", "auditor": "<pubkey>" }\' --sim 1 | admin accredits an auditor, or a qualified peer self-registers.');
     console.log('- /tx --command \'{ "op": "probe_result", "probe_id": "<id>", "probe_kind": "canary", "provider": "<pk>", "match_bps": 9700, "pass": true, "canary_set": "canary-dev-v1", "epoch": 1, "at": 3600 }\' --sim 1 | auditor submits probe evidence.');
     console.log('- /tx --command \'{ "op": "epoch_commit", "epoch": 1, "at": 3600, "roots": { "dep": "<root>", "use": "<root>", "earn": "<root>", "fee": "<root>", "pay": "<root>" }, "totals": { "dep_count": 0, "dep_mu": 0, "use_count": 1, "use_mu": 1000, "provider_count": 1, "earn_mu": 850, "fee_mu": 150, "fee_cum_mu": 150, "pay_count": 0, "pay_mu": 0 } }\' --sim 1 | permissionlessly anchors epoch roots.');
+    console.log('- /tx --command \'{ "op": "fraud_proof", "epoch": 1, "proof_epoch": 2, "at": 7200, "reason": "over_credit", "receipt": { ... }, "claimed_mu_owed_cum": 2000 }\' --sim 1 | submits a signed receipt proving an inflated epoch commit.');
     console.log('- /tx --command \'{ "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] }\' --sim 1 | admin/oracle applies bounded credit, earning, and fee deltas.');
     console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "coinbase-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
     console.log('- /tx --command \'{ "op": "deposit_tnk", "memo_hash": "<hash>" }\' --sim 1 | user creates a memo-bound TNK deposit intent.');
