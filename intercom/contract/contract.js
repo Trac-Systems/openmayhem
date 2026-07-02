@@ -12,6 +12,8 @@ const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
 const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
 const DAY_SECONDS = 24 * 60 * 60;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
+const FULL_SLASH_BPS = 10_000;
+const DISPUTE_LOST_SLASH_BPS = 2_000;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
 const SESSION_RECEIPT_SCHEMA_VERSION = 1;
@@ -342,6 +344,8 @@ class MayhemContract extends Contract {
         paid_mu: { type: 'number', integer: true, min: 0, optional: true },
         max_spend_mu: { type: 'number', integer: true, min: 0, optional: true },
         evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
+        beneficiary: { type: 'string', min: 1, max: 128, optional: true },
+        enclave_id: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
 
@@ -1059,6 +1063,24 @@ class MayhemContract extends Contract {
     });
     if (record instanceof Error) return record;
 
+    let slash = null;
+    if (this.value.kind === 'dispute_lost') {
+      slash = await this.applyProviderSlash({
+        providerId: this.value.provider,
+        source: 'dispute',
+        reason: 'dispute_lost',
+        evidenceHash: this.value.evidence_hash ?? null,
+        epoch: this.value.epoch,
+        at: this.value.at,
+        slashBps: DISPUTE_LOST_SLASH_BPS,
+        beneficiary: this.value.beneficiary ?? null,
+        enclaveId: this.value.enclave_id ?? null,
+        banProvider: false,
+        tombstoneEnclave: false,
+      });
+      if (slash instanceof Error) return slash;
+    }
+
     console.log('mayhem recordReputationEvent', record);
     return {
       ok: true,
@@ -1066,6 +1088,7 @@ class MayhemContract extends Contract {
       provider: this.value.provider,
       event_id: this.value.event_id,
       head: record.head,
+      slash,
     };
   }
 
@@ -1237,24 +1260,21 @@ class MayhemContract extends Contract {
       });
       if (violationEvent instanceof Error) return violationEvent;
 
-      slash = {
-        provider: this.value.provider,
-        auditor: this.address,
+      slash = await this.applyProviderSlash({
+        providerId: this.value.provider,
+        source: 'probe',
         reason: 'canary_mismatch',
-        evidence_hash: this.value.evidence_hash ?? null,
-        probe_id: this.value.probe_id,
+        evidenceHash: this.value.evidence_hash ?? null,
+        epoch: this.value.epoch,
         at: this.value.at,
-        tx: this.tx,
-      };
-      await this.put(`ev/slash/${this.value.provider}/${this.tx}`, slash);
-      await this.put(providerKey, {
-        ...provider,
-        status: 'banned',
-        banned_at: this.tx,
-        banned_by: this.address,
-        ban_reason_hash: this.value.evidence_hash ?? null,
-        updated_at: this.tx,
+        slashBps: FULL_SLASH_BPS,
+        beneficiary: this.address,
+        enclaveId: this.value.enclave_id ?? null,
+        probeId: this.value.probe_id,
+        banProvider: true,
+        tombstoneEnclave: true,
       });
+      if (slash instanceof Error) return slash;
     }
 
     const record = {
@@ -1631,6 +1651,25 @@ class MayhemContract extends Contract {
       banned_by: this.address,
     };
 
+    let slash = null;
+    if ((await this.get(`prov/${commit.submitted_by}`)) !== null) {
+      slash = await this.applyProviderSlash({
+        providerId: commit.submitted_by,
+        source: 'fraud_proof',
+        reason: 'receipt_forgery',
+        evidenceHash: proofHash,
+        epoch: this.value.epoch,
+        at: this.value.at,
+        slashBps: FULL_SLASH_BPS,
+        beneficiary: this.address,
+        enclaveId: receipt.body.enclave_id,
+        banProvider: true,
+        tombstoneEnclave: true,
+      });
+      if (slash instanceof Error) return slash;
+    }
+    record.slash = slash;
+
     await this.put(proofKey, record);
     await this.put(commitKey, updatedCommit);
     await this.put(banKey, ban);
@@ -1643,6 +1682,7 @@ class MayhemContract extends Contract {
       proof_hash: proofHash,
       voided_commit: commit.commit_hash,
       banned_submitter: commit.submitted_by,
+      slash,
     };
   }
 
@@ -2279,6 +2319,240 @@ class MayhemContract extends Contract {
       holdbacks: kept,
       last_holdback_release_epoch: currentEpoch,
     };
+  }
+
+  slashHoldbackBuckets(holdbacks, slashMu) {
+    if (!Number.isSafeInteger(slashMu) || slashMu < 0) {
+      return new Error('Guardian non-negative earnings invariant failed.');
+    }
+    if (slashMu === 0) return holdbacks;
+
+    let remaining = slashMu;
+    const kept = [];
+    for (let idx = holdbacks.length - 1; idx >= 0; idx -= 1) {
+      const bucket = holdbacks[idx];
+      if (remaining === 0) {
+        kept.push(bucket);
+        continue;
+      }
+      if (bucket.mu <= remaining) {
+        remaining -= bucket.mu;
+        continue;
+      }
+      kept.push({
+        epoch: bucket.epoch,
+        mu: bucket.mu - remaining,
+      });
+      remaining = 0;
+    }
+    if (remaining !== 0) return new Error('Guardian earnings conservation invariant failed.');
+    return kept.reverse();
+  }
+
+  slashAmount(heldMu, slashBps) {
+    if (!Number.isSafeInteger(heldMu) || heldMu < 0) {
+      return new Error('Guardian non-negative earnings invariant failed.');
+    }
+    if (!Number.isSafeInteger(slashBps) || slashBps < 0 || slashBps > 10_000) {
+      return new Error('Invalid slash bps.');
+    }
+    return Number((BigInt(heldMu) * BigInt(slashBps)) / 10_000n);
+  }
+
+  async tombstoneProviderEnclave(providerId, enclaveId, evidenceHash) {
+    if (!enclaveId) {
+      return {
+        enclave_id: null,
+        serve_tombstoned: false,
+        rooms_tombstoned: [],
+      };
+    }
+    if (!this.isSafeKeyPart(enclaveId)) return new Error('Invalid enclave id.');
+
+    const serveKey = `serve/${providerId}/${enclaveId}`;
+    const serving = await this.get(serveKey);
+    if (!serving) {
+      return {
+        enclave_id: enclaveId,
+        serve_tombstoned: false,
+        rooms_tombstoned: [],
+      };
+    }
+
+    const rooms = Array.isArray(serving.rooms) ? serving.rooms.slice().sort() : [];
+    const tombstonedRooms = [];
+    for (const roomId of rooms) {
+      const roomServeKey = `roomserve/${roomId}/${providerId}/${enclaveId}`;
+      const roomServing = await this.get(roomServeKey);
+      if (!roomServing) continue;
+      await this.put(roomServeKey, {
+        ...roomServing,
+        status: 'tombstoned',
+        updated_at: this.tx,
+        tombstoned_at: this.tx,
+        tombstone_reason_hash: evidenceHash,
+      });
+      tombstonedRooms.push(roomId);
+    }
+
+    await this.put(serveKey, {
+      ...serving,
+      status: 'tombstoned',
+      rooms: [],
+      updated_at: this.tx,
+      tombstoned_at: this.tx,
+      tombstone_reason_hash: evidenceHash,
+    });
+    return {
+      enclave_id: enclaveId,
+      serve_tombstoned: true,
+      rooms_tombstoned: tombstonedRooms,
+    };
+  }
+
+  async applyProviderSlash({
+    providerId,
+    source,
+    reason,
+    evidenceHash,
+    epoch,
+    at,
+    slashBps,
+    beneficiary = null,
+    enclaveId = null,
+    probeId = null,
+    eventId = null,
+    banProvider = false,
+    tombstoneEnclave = false,
+  }) {
+    if (!this.isSafeKeyPart(providerId)) return new Error('Invalid provider id.');
+    if (beneficiary !== null && !this.isSafeKeyPart(beneficiary)) {
+      return new Error('Invalid slash beneficiary.');
+    }
+
+    const providerKey = `prov/${providerId}`;
+    const provider = await this.get(providerKey);
+    if (!provider) return new Error('Provider not found.');
+
+    const earning = await this.earningRecord(providerId);
+    const earningError = this.guardianValidateEarningRecord(earning, providerId);
+    if (earningError) return earningError;
+    const holdbacks = this.normalizeHoldbackBuckets(earning);
+    if (holdbacks instanceof Error) return holdbacks;
+
+    const forfeitedMu = this.slashAmount(earning.held_mu, slashBps);
+    if (forfeitedMu instanceof Error) return forfeitedMu;
+    const reporterMu = beneficiary === null ? 0 : Math.floor(forfeitedMu / 2);
+    const treasuryMu = forfeitedMu - reporterMu;
+    const remainingHoldbacks = this.slashHoldbackBuckets(holdbacks, forfeitedMu);
+    if (remainingHoldbacks instanceof Error) return remainingHoldbacks;
+    const heldMu = earning.held_mu - forfeitedMu;
+    const totalMu = earning.total_mu - forfeitedMu;
+    const slashedCumMu = this.safeAddMu(earning.slashed_cum_mu ?? 0, forfeitedMu);
+    if (slashedCumMu instanceof Error) return slashedCumMu;
+    const updatedEarning = {
+      ...earning,
+      total_mu: totalMu,
+      held_mu: heldMu,
+      holdbacks: remainingHoldbacks,
+      slashed_cum_mu: slashedCumMu,
+      last_slash_at: this.tx,
+      updated_at: this.tx,
+    };
+    const updatedEarningError = this.guardianValidateEarningRecord(updatedEarning, providerId);
+    if (updatedEarningError) return updatedEarningError;
+
+    let beneficiaryBalance = null;
+    if (reporterMu > 0) {
+      const currentBalance = await this.balanceRecord(beneficiary);
+      const balanceError = this.guardianValidateBalanceRecord(currentBalance, beneficiary);
+      if (balanceError) return balanceError;
+      const nextMu = this.safeAddMu(currentBalance.mu, reporterMu);
+      if (nextMu instanceof Error) return nextMu;
+      beneficiaryBalance = {
+        ...currentBalance,
+        mu: nextMu,
+        updated_epoch: Math.max(currentBalance.updated_epoch, epoch),
+        updated_at: this.tx,
+      };
+    }
+
+    let fee = null;
+    let updatedFee = null;
+    if (treasuryMu > 0) {
+      fee = await this.feeCumRecord();
+      const feeError = this.guardianValidateFeeRecord(fee);
+      if (feeError) return feeError;
+      const cumMu = this.safeAddMu(fee.cum_mu, treasuryMu);
+      if (cumMu instanceof Error) return cumMu;
+      const settledCumMu = this.safeAddMu(fee.settled_cum_mu ?? fee.cum_mu, treasuryMu);
+      if (settledCumMu instanceof Error) return settledCumMu;
+      updatedFee = {
+        ...fee,
+        cum_mu: cumMu,
+        settled_cum_mu: settledCumMu,
+        updated_epoch: Math.max(fee.updated_epoch, epoch),
+        updated_at: this.tx,
+        last_slash_at: this.tx,
+      };
+      const updatedFeeError = this.guardianValidateFeeRecord(updatedFee);
+      if (updatedFeeError) return updatedFeeError;
+    }
+
+    const tombstone = tombstoneEnclave
+      ? await this.tombstoneProviderEnclave(providerId, enclaveId, evidenceHash)
+      : {
+          enclave_id: enclaveId,
+          serve_tombstoned: false,
+          rooms_tombstoned: [],
+        };
+    if (tombstone instanceof Error) return tombstone;
+
+    const slash = {
+      type: 'slash',
+      provider: providerId,
+      source,
+      reason,
+      evidence_hash: evidenceHash,
+      epoch,
+      at,
+      tx: this.tx,
+      slashed_by: this.address,
+      beneficiary,
+      enclave_id: enclaveId,
+      probe_id: probeId,
+      event_id: eventId,
+      slash_bps: slashBps,
+      held_before_mu: earning.held_mu,
+      held_after_mu: heldMu,
+      forfeited_mu: forfeitedMu,
+      beneficiary_mu: reporterMu,
+      treasury_mu: treasuryMu,
+      tombstone,
+      provider_banned: banProvider,
+    };
+    slash.slash_hash = await this.opaqueHash('mayhem-slash-v1', slash);
+
+    const updatedProvider = banProvider
+      ? {
+          ...provider,
+          status: 'banned',
+          banned_at: provider.banned_at ?? this.tx,
+          banned_by: provider.banned_by ?? this.address,
+          ban_reason_hash: provider.ban_reason_hash ?? evidenceHash,
+          updated_at: this.tx,
+        }
+      : {
+          ...provider,
+          updated_at: this.tx,
+        };
+
+    await this.put(`earn/${providerId}`, updatedEarning);
+    if (beneficiaryBalance) await this.put(`bal/${beneficiary}`, beneficiaryBalance);
+    if (updatedFee) await this.put('fee/cum', updatedFee);
+    await this.put(providerKey, updatedProvider);
+    await this.put(`ev/slash/${providerId}/${this.tx}`, slash);
+    return slash;
   }
 
   appendHoldbackBucket(holdbacks, epoch, mu) {

@@ -202,7 +202,8 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
 
   const slash = await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(9)}`);
   assert.equal(slash.value.reason, 'canary_mismatch');
-  assert.equal(slash.value.auditor, auditor.publicKey);
+  assert.equal(slash.value.beneficiary, auditor.publicKey);
+  assert.equal(slash.value.slashed_by, auditor.publicKey);
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerEntry.value.status, 'banned');

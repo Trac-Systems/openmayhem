@@ -452,6 +452,104 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
   assert.equal(allowedCommit.ok, true, allowedCommit.message);
 });
 
+test('MayhemContract fraudProof slashes a registered provider committer', async () => {
+  const { provider, user, storage, contract } = await setupEpochContract();
+  const enclave = await makeIdentity();
+  const prover = await makeIdentity();
+  const receipt = signedReceipt(user, provider, enclave, { mu_owed_cum: 1_000 });
+  const inflatedReceipt = {
+    ...receipt,
+    body: {
+      ...receipt.body,
+      mu_owed_cum: 2_000,
+    },
+  };
+  const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
+    receipts: [inflatedReceipt],
+  }));
+  await storage.put(`earn/${provider.publicKey}`, {
+    provider: provider.publicKey,
+    denom: 'mu_usd',
+    total_mu: 8_500,
+    held_mu: 8_500,
+    paid_cum_mu: 0,
+    holdbacks: [{ epoch: 1, mu: 8_500 }],
+    updated_epoch: 1,
+    updated_at: null,
+  });
+  await storage.put(`serve/${provider.publicKey}/${enclaveId}`, {
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    model_id: modelId,
+    status: 'active',
+    joined_at: makeTxKey(4),
+    updated_at: makeTxKey(4),
+    left_at: null,
+    rooms: [],
+  });
+
+  const commit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 1,
+      at: 3_600,
+      roots: inflatedRoll.roots,
+      totals: inflatedRoll.totals,
+    },
+    provider.publicKey,
+    4
+  );
+  assert.equal(commit.ok, true, commit.message);
+
+  const proof = await execute(
+    contract,
+    storage,
+    'fraudProof',
+    {
+      op: 'fraud_proof',
+      epoch: 1,
+      proof_epoch: 2,
+      at: 7_200,
+      reason: 'over_credit',
+      receipt,
+      claimed_mu_owed_cum: 2_000,
+    },
+    prover.publicKey,
+    5
+  );
+  assert.equal(proof.ok, true, proof.message);
+  assert.equal(proof.slash.reason, 'receipt_forgery');
+  assert.equal(proof.slash.forfeited_mu, 8_500);
+  assert.equal(proof.slash.beneficiary_mu, 4_250);
+  assert.equal(proof.slash.treasury_mu, 4_250);
+
+  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+    provider: provider.publicKey,
+    denom: 'mu_usd',
+    total_mu: 0,
+    held_mu: 0,
+    paid_cum_mu: 0,
+    holdbacks: [],
+    updated_epoch: 1,
+    updated_at: makeTxKey(5),
+    slashed_cum_mu: 8_500,
+    last_slash_at: makeTxKey(5),
+  });
+  assert.equal((await storage.get(`bal/${prover.publicKey}`)).value.mu, 4_250);
+  assert.equal((await storage.get('fee/cum')).value.cum_mu, 4_250);
+  assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'banned');
+  assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.status, 'tombstoned');
+
+  const fraudRecord = (await storage.get(`ev/fraud/1/${proof.proof_hash}`)).value;
+  assert.equal(fraudRecord.slash.reason, 'receipt_forgery');
+  const slash = (await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(5)}`)).value;
+  assert.equal(slash.source, 'fraud_proof');
+  assert.equal(slash.provider_banned, true);
+});
+
 test('MayhemContract fraudProof rejects proofs after the challenge window', async () => {
   const { provider, user, submitter, storage, contract } = await setupEpochContract();
   const enclave = await makeIdentity();
