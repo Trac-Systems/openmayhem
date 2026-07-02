@@ -6,6 +6,20 @@ const CONTRACT_VERSION = 1;
 const CURRENT_RULES_KEY = 'rules/current';
 const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
+const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
+const PARAM_DEFINITIONS = Object.freeze({
+  probation_successful_sessions: { default: 3, min: 0, max: 1_000_000 },
+  holdback_epochs: { default: 168, min: 0, max: 1_000_000 },
+  fee_bps: { default: 1_500, min: 0, max: 10_000 },
+  payout_min_mu: { default: 1_000_000, min: 0, max: Number.MAX_SAFE_INTEGER },
+  price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
+  price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },
+  epoch_seconds: { default: 3_600, min: 60, max: 86_400 },
+  rate_staleness_seconds: { default: 900, min: 60, max: 86_400 },
+  rules_grace_seconds: { default: 14 * 24 * 60 * 60, min: 0, max: 365 * 24 * 60 * 60 },
+  challenge_epochs: { default: 6, min: 0, max: 1_000_000 },
+  max_apply_batch: { default: 500, min: 1, max: 5_000 },
+});
 const ENCLAVE_UPDATE_FIELDS = [
   'backend',
   'artifact_root',
@@ -62,6 +76,32 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         ver: { type: 'number', integer: true, min: 1 },
         hash: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
+    this.addSchema('setParams', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        submitted_at: { type: 'number', integer: true, min: 0 },
+        effective_at: { type: 'number', integer: true, min: 0 },
+        values: { type: 'any' },
+      },
+    });
+
+    this.addSchema('readParams', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        at: { type: 'number', integer: true, min: 0 },
+        keys: {
+          type: 'array',
+          max: 64,
+          items: { type: 'string', min: 1, max: 64 },
+          optional: true,
+        },
       },
     });
 
@@ -225,6 +265,75 @@ class MayhemContract extends Contract {
     await this.put(CURRENT_RULES_KEY, rules);
     console.log('mayhem setRules', rules);
     return { ok: true, op: 'setRules', rules };
+  }
+
+  async setParams() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    if (this.value.effective_at - this.value.submitted_at < PARAM_ACTIVATION_DELAY_SECONDS) {
+      return new Error('Parameter changes require at least 24h activation delay.');
+    }
+
+    const valuesError = this.validateParamValues(this.value.values);
+    if (valuesError) return valuesError;
+
+    const existingAtEffective = await this.activeParamsAt(this.value.effective_at);
+    const mergedAtEffective = { ...existingAtEffective, ...this.value.values };
+    const boundsError = this.validateParamBounds(mergedAtEffective);
+    if (boundsError) return boundsError;
+
+    const meta = await this.get('params/current');
+    const ver = meta ? meta.ver + 1 : 1;
+    const keys = Object.keys(this.value.values).sort();
+    const update = {
+      ver,
+      values: cloneValue(this.value.values),
+      submitted_at: this.value.submitted_at,
+      effective_at: this.value.effective_at,
+      tx: this.tx,
+    };
+
+    for (const key of keys) {
+      const record = await this.paramRecord(key);
+      if (record.pending && record.pending.effective_at > this.value.submitted_at) {
+        return new Error(`Pending parameter change already scheduled for ${key}.`);
+      }
+
+      const current = this.paramActiveEntry(record, this.value.submitted_at);
+      const updated = {
+        key,
+        current,
+        pending: {
+          value: this.value.values[key],
+          ver,
+          submitted_at: this.value.submitted_at,
+          effective_at: this.value.effective_at,
+          set_at: this.tx,
+        },
+      };
+      await this.put(`params/${key}`, updated);
+    }
+
+    await this.put(`params/update/${ver}`, update);
+    await this.put('params/current', {
+      ver,
+      keys,
+      updated_at: this.tx,
+      effective_at: this.value.effective_at,
+    });
+    console.log('mayhem setParams', update);
+    return { ok: true, op: 'setParams', ver, effective_at: this.value.effective_at, keys };
+  }
+
+  async readParams() {
+    const keys = this.value.keys ?? Object.keys(PARAM_DEFINITIONS);
+    const keyError = this.validateParamKeys(keys);
+    if (keyError) return keyError;
+
+    const params = await this.activeParamsAt(this.value.at, keys);
+    console.log('mayhem readParams', { at: this.value.at, params });
+    return { ok: true, op: 'readParams', at: this.value.at, params };
   }
 
   async consent() {
@@ -410,10 +519,11 @@ class MayhemContract extends Contract {
 
     const inRef = this.modelRefPrice(modelRef, 'in_per_1k_mu', 'in_per_1k');
     const outRef = this.modelRefPrice(modelRef, 'out_per_1k_mu', 'out_per_1k');
-    if (!this.priceWithinBounds(this.value.in_per_1k_mu, inRef)) {
+    const params = await this.activeParamsAt(this.value.effective_at, ['price_min_bps', 'price_max_bps']);
+    if (!this.priceWithinBounds(this.value.in_per_1k_mu, inRef, params)) {
       return new Error('Input price outside model reference bounds.');
     }
-    if (!this.priceWithinBounds(this.value.out_per_1k_mu, outRef)) {
+    if (!this.priceWithinBounds(this.value.out_per_1k_mu, outRef, params)) {
       return new Error('Output price outside model reference bounds.');
     }
 
@@ -473,15 +583,85 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  async activeParamsAt(at, keys = Object.keys(PARAM_DEFINITIONS)) {
+    const params = {};
+    for (const key of keys) {
+      params[key] = this.paramActiveEntry(await this.paramRecord(key), at).value;
+    }
+    return params;
+  }
+
+  async paramRecord(key) {
+    const existing = await this.get(`params/${key}`);
+    if (existing) return existing;
+    return {
+      key,
+      current: {
+        value: PARAM_DEFINITIONS[key].default,
+        ver: 0,
+        submitted_at: 0,
+        effective_at: 0,
+        set_at: null,
+      },
+      pending: null,
+    };
+  }
+
+  paramActiveEntry(record, at) {
+    if (record.pending && record.pending.effective_at <= at) return cloneValue(record.pending);
+    return cloneValue(record.current);
+  }
+
+  validateParamValues(values) {
+    if (!values || typeof values !== 'object' || Array.isArray(values)) {
+      return new Error('Parameter values must be an object.');
+    }
+    const keys = Object.keys(values);
+    if (keys.length === 0) return new Error('At least one parameter is required.');
+    const keyError = this.validateParamKeys(keys);
+    if (keyError) return keyError;
+
+    for (const key of keys) {
+      const value = values[key];
+      const def = PARAM_DEFINITIONS[key];
+      if (!Number.isInteger(value)) return new Error(`Parameter ${key} must be an integer.`);
+      if (value < def.min || value > def.max) return new Error(`Parameter ${key} is out of range.`);
+    }
+    return null;
+  }
+
+  validateParamKeys(keys) {
+    if (!Array.isArray(keys) || keys.length === 0 || keys.length > 64) {
+      return new Error('Invalid parameter keys.');
+    }
+    for (const key of keys) {
+      if (!hasOwn(PARAM_DEFINITIONS, key)) return new Error(`Unknown parameter ${key}.`);
+    }
+    return null;
+  }
+
+  validateParamBounds(params) {
+    if (params.price_min_bps > params.price_max_bps) {
+      return new Error('price_min_bps must not exceed price_max_bps.');
+    }
+    return null;
+  }
+
   modelRefPrice(modelRef, directKey, nestedKey) {
     if (Number.isInteger(modelRef?.[directKey])) return modelRef[directKey];
     if (Number.isInteger(modelRef?.price_ref_mu?.[nestedKey])) return modelRef.price_ref_mu[nestedKey];
     return null;
   }
 
-  priceWithinBounds(price, ref) {
+  priceWithinBounds(price, ref, params = {
+    price_min_bps: PARAM_DEFINITIONS.price_min_bps.default,
+    price_max_bps: PARAM_DEFINITIONS.price_max_bps.default,
+  }) {
     if (!Number.isInteger(ref) || ref <= 0) return false;
-    return price * 4 >= ref && price <= ref * 4;
+    return (
+      price * 10_000 >= ref * params.price_min_bps &&
+      price * 10_000 <= ref * params.price_max_bps
+    );
   }
 
   verifyConsentSignature(sender, ver, hash, sig) {

@@ -13,6 +13,7 @@ import {
 const rulesHash = '8'.repeat(64);
 const enclaveId = '9'.repeat(64);
 const modelId = 'meta/llama-3.1-8b-instruct@4bit';
+const DAY_SECONDS = 24 * 60 * 60;
 
 const providerRegistration = {
   op: 'register_provider',
@@ -173,4 +174,58 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     effective_from: makeTxKey(9),
     updated_at: makeTxKey(9),
   });
+});
+
+test('MayhemContract setPrice uses the active scheduled price-bound params', async () => {
+  const { contract, storage, provider } = await setupRegisteredEnclave();
+
+  const scheduledBounds = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: {
+        price_max_bps: 20_000,
+      },
+    },
+    provider.publicKey,
+    5
+  );
+  assert.equal(scheduledBounds.ok, true, scheduledBounds.message);
+
+  const beforeActivation = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({
+      in_per_1k_mu: 60,
+      out_per_1k_mu: 180,
+      effective_at: DAY_SECONDS - 1,
+    }),
+    provider.publicKey,
+    6
+  );
+  assert.deepEqual(beforeActivation, {
+    ok: true,
+    op: 'setPrice',
+    enclave_id: enclaveId,
+    ver: 1,
+  });
+
+  const afterActivation = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({
+      in_per_1k_mu: 60,
+      out_per_1k_mu: 180,
+      effective_at: DAY_SECONDS + 21_600,
+    }),
+    provider.publicKey,
+    7
+  );
+  assert.match(afterActivation.message, /input price outside/i);
 });
