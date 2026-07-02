@@ -11,9 +11,9 @@ use axum::{
     Json, Router,
 };
 use mayhem_paygate::{
-    paygate_router, stripe_signature_header, BoxFuture, ContractPostResult, ContractPoster,
-    FiatChargebackFeature, FiatDepositFeature, OracleKeypair, PaygateConfig, PaygateState,
-    RailConfig, StripeSettings,
+    paygate_router, stripe_signature_header, BoxFuture, CoinbaseSettings, ContractPostResult,
+    ContractPoster, FiatChargebackFeature, FiatDepositFeature, OracleKeypair, PaygateConfig,
+    PaygateState, RailConfig, StripeSettings,
 };
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -131,6 +131,7 @@ async fn start_mock_stripe() -> (String, StripeCapture) {
 }
 
 fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> PaygateConfig {
+    let coinbase_event_store_path = event_store_path.with_file_name("coinbase-events.jsonl");
     PaygateConfig {
         contract_simulate: true,
         rails: RailConfig {
@@ -142,7 +143,10 @@ fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> Pay
                 event_store_path,
                 ..StripeSettings::default()
             },
-            ..RailConfig::default()
+            coinbase: CoinbaseSettings {
+                event_store_path: coinbase_event_store_path,
+                ..CoinbaseSettings::default()
+            },
         },
         ..PaygateConfig::default()
     }

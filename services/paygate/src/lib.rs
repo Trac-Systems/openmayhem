@@ -39,6 +39,7 @@ pub const CREDIT_DENOM: &str = "mu_usd";
 pub const DEFAULT_BIND: &str = "127.0.0.1:11436";
 pub const DEFAULT_CONTRACT_RPC_URL: &str = "http://127.0.0.1:49223/v1";
 pub const DEFAULT_STRIPE_API_BASE_URL: &str = "https://api.stripe.com";
+pub const DEFAULT_COINBASE_COMMERCE_API_BASE_URL: &str = "https://api.commerce.coinbase.com";
 pub const DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS: u64 = 300;
 pub const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 pub const MU_PER_USD_CENT: u64 = 10_000;
@@ -69,6 +70,10 @@ pub enum PaygateError {
     Stripe(String),
     #[error("Stripe signature error: {0}")]
     StripeSignature(String),
+    #[error("Coinbase Commerce error: {0}")]
+    Coinbase(String),
+    #[error("Coinbase Commerce signature error: {0}")]
+    CoinbaseSignature(String),
     #[error("contract post failed: {0}")]
     Contract(String),
     #[error("crypto error: {0}")]
@@ -88,7 +93,7 @@ pub struct PaygateConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RailConfig {
     pub stripe: StripeSettings,
-    pub coinbase: RailSettings,
+    pub coinbase: CoinbaseSettings,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -106,6 +111,15 @@ pub struct StripeSettings {
     pub webhook_tolerance_seconds: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoinbaseSettings {
+    pub enabled: bool,
+    pub api_key: Option<String>,
+    pub webhook_secret: Option<String>,
+    pub api_base_url: String,
+    pub event_store_path: PathBuf,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
@@ -117,7 +131,7 @@ struct ConfigFile {
     #[serde(default)]
     stripe: StripeConfigFile,
     #[serde(default)]
-    coinbase: RailConfigFile,
+    coinbase: CoinbaseConfigFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -148,8 +162,12 @@ struct StripeConfigFile {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct RailConfigFile {
+struct CoinbaseConfigFile {
     enabled: Option<bool>,
+    api_key: Option<String>,
+    webhook_secret: Option<String>,
+    api_base_url: Option<String>,
+    event_store_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +196,7 @@ pub struct PaygateState {
     oracle_public_key: String,
     http: reqwest::Client,
     stripe_events: Arc<Mutex<StripeEventStore>>,
+    coinbase_events: Arc<Mutex<CoinbaseEventStore>>,
     contract: Arc<dyn ContractPoster>,
 }
 
@@ -202,11 +221,18 @@ struct HealthContract {
 #[derive(Debug, Serialize)]
 struct HealthRails {
     stripe: HealthStripeRail,
-    coinbase: RailSettings,
+    coinbase: HealthCoinbaseRail,
 }
 
 #[derive(Debug, Serialize)]
 struct HealthStripeRail {
+    enabled: bool,
+    api_configured: bool,
+    webhook_configured: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthCoinbaseRail {
     enabled: bool,
     api_configured: bool,
     webhook_configured: bool,
@@ -244,6 +270,36 @@ pub struct StripePaymentIntentSummary {
     pub amount: u64,
     pub currency: String,
     pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CoinbaseCreateChargeRequest {
+    pub who: String,
+    pub mu: u64,
+    #[serde(default)]
+    pub redirect_url: Option<String>,
+    #[serde(default)]
+    pub cancel_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CoinbaseCreateChargeResponse {
+    pub ok: bool,
+    pub rail: &'static str,
+    pub denom: &'static str,
+    pub who: String,
+    pub mu: u64,
+    pub charge: CoinbaseChargeSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CoinbaseChargeSummary {
+    pub id: String,
+    pub code: Option<String>,
+    pub hosted_url: Option<String>,
+    pub amount: String,
+    pub currency: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -359,6 +415,44 @@ struct StripeEventStore {
     path: Option<PathBuf>,
 }
 
+#[derive(Debug, Serialize)]
+struct CoinbaseWebhookResponse {
+    ok: bool,
+    event_id: String,
+    event_type: String,
+    duplicate: bool,
+    credited: bool,
+    ignored: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    charge: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mu: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract: Option<ContractPostResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CoinbaseEventRecord {
+    event_id: String,
+    event_type: String,
+    charge: String,
+    #[serde(default)]
+    code: Option<String>,
+    who: String,
+    mu: u64,
+    ext_ref_hash: String,
+    credited_at: u64,
+}
+
+#[derive(Debug)]
+struct CoinbaseEventStore {
+    seen: HashSet<String>,
+    processing: HashSet<String>,
+    path: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 enum StripeEventBegin {
     Started,
@@ -402,6 +496,18 @@ impl Default for StripeSettings {
             api_base_url: DEFAULT_STRIPE_API_BASE_URL.to_owned(),
             event_store_path: default_stripe_event_store_path(),
             webhook_tolerance_seconds: DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
+        }
+    }
+}
+
+impl Default for CoinbaseSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            webhook_secret: None,
+            api_base_url: DEFAULT_COINBASE_COMMERCE_API_BASE_URL.to_owned(),
+            event_store_path: default_coinbase_event_store_path(),
         }
     }
 }
@@ -472,6 +578,33 @@ impl PaygateConfig {
                 ));
             }
         }
+        if self.rails.coinbase.enabled {
+            if self
+                .rails
+                .coinbase
+                .api_key
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(PaygateError::InvalidConfig(
+                    "coinbase.api_key is required when Coinbase Commerce is enabled".to_owned(),
+                ));
+            }
+            if self
+                .rails
+                .coinbase
+                .webhook_secret
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(PaygateError::InvalidConfig(
+                    "coinbase.webhook_secret is required when Coinbase Commerce is enabled"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -518,6 +651,18 @@ impl PaygateConfig {
         if let Some(enabled) = file.coinbase.enabled {
             self.rails.coinbase.enabled = enabled;
         }
+        if let Some(api_key) = file.coinbase.api_key {
+            self.rails.coinbase.api_key = Some(api_key);
+        }
+        if let Some(webhook_secret) = file.coinbase.webhook_secret {
+            self.rails.coinbase.webhook_secret = Some(webhook_secret);
+        }
+        if let Some(api_base_url) = file.coinbase.api_base_url {
+            self.rails.coinbase.api_base_url = api_base_url;
+        }
+        if let Some(path) = file.coinbase.event_store_path {
+            self.rails.coinbase.event_store_path = expand_home(path);
+        }
         Ok(())
     }
 
@@ -558,6 +703,18 @@ impl PaygateConfig {
         }
         if let Ok(enabled) = env::var("MAYHEM_PAYGATE_COINBASE_ENABLED") {
             self.rails.coinbase.enabled = parse_bool("MAYHEM_PAYGATE_COINBASE_ENABLED", &enabled)?;
+        }
+        if let Ok(api_key) = env::var("MAYHEM_COINBASE_COMMERCE_API_KEY") {
+            self.rails.coinbase.api_key = Some(api_key);
+        }
+        if let Ok(webhook_secret) = env::var("MAYHEM_COINBASE_COMMERCE_WEBHOOK_SECRET") {
+            self.rails.coinbase.webhook_secret = Some(webhook_secret);
+        }
+        if let Ok(api_base_url) = env::var("MAYHEM_COINBASE_COMMERCE_API_BASE_URL") {
+            self.rails.coinbase.api_base_url = api_base_url;
+        }
+        if let Ok(path) = env::var("MAYHEM_PAYGATE_COINBASE_EVENTS_PATH") {
+            self.rails.coinbase.event_store_path = expand_home(PathBuf::from(path));
         }
         Ok(())
     }
@@ -618,7 +775,14 @@ impl PaygateState {
             config.contract_simulate,
             http.clone(),
         ));
-        Self::with_parts(config, oracle, http, StripeEventStore::memory(), contract)
+        Self::with_parts(
+            config,
+            oracle,
+            http,
+            StripeEventStore::memory(),
+            CoinbaseEventStore::memory(),
+            contract,
+        )
     }
 
     pub fn try_new(config: PaygateConfig, oracle: OracleKeypair) -> Result<Self> {
@@ -629,11 +793,13 @@ impl PaygateState {
             http.clone(),
         ));
         let stripe_events = StripeEventStore::load(&config.rails.stripe.event_store_path)?;
+        let coinbase_events = CoinbaseEventStore::load(&config.rails.coinbase.event_store_path)?;
         Ok(Self::with_parts(
             config,
             oracle,
             http,
             stripe_events,
+            coinbase_events,
             contract,
         ))
     }
@@ -645,11 +811,13 @@ impl PaygateState {
     ) -> Result<Self> {
         let http = reqwest::Client::new();
         let stripe_events = StripeEventStore::load(&config.rails.stripe.event_store_path)?;
+        let coinbase_events = CoinbaseEventStore::load(&config.rails.coinbase.event_store_path)?;
         Ok(Self::with_parts(
             config,
             oracle,
             http,
             stripe_events,
+            coinbase_events,
             contract,
         ))
     }
@@ -659,6 +827,7 @@ impl PaygateState {
         oracle: OracleKeypair,
         http: reqwest::Client,
         stripe_events: StripeEventStore,
+        coinbase_events: CoinbaseEventStore,
         contract: Arc<dyn ContractPoster>,
     ) -> Self {
         let oracle_public_key = oracle.public_key_hex();
@@ -668,6 +837,7 @@ impl PaygateState {
             oracle_public_key,
             http,
             stripe_events: Arc::new(Mutex::new(stripe_events)),
+            coinbase_events: Arc::new(Mutex::new(coinbase_events)),
             contract,
         }
     }
@@ -693,7 +863,11 @@ impl PaygateState {
                     api_configured: self.config.rails.stripe.secret_key.is_some(),
                     webhook_configured: self.config.rails.stripe.webhook_secret.is_some(),
                 },
-                coinbase: self.config.rails.coinbase.clone(),
+                coinbase: HealthCoinbaseRail {
+                    enabled: self.config.rails.coinbase.enabled,
+                    api_configured: self.config.rails.coinbase.api_key.is_some(),
+                    webhook_configured: self.config.rails.coinbase.webhook_secret.is_some(),
+                },
             },
             controls: HealthControls {
                 admin_sets_terms: true,
@@ -838,6 +1012,10 @@ pub fn paygate_router(state: PaygateState) -> Router {
         )
         .route("/stripe/webhook", post(stripe_webhook))
         .route("/v1/stripe/webhook", post(stripe_webhook))
+        .route("/coinbase/charges", post(create_coinbase_charge))
+        .route("/v1/coinbase/charges", post(create_coinbase_charge))
+        .route("/coinbase/webhook", post(coinbase_webhook))
+        .route("/v1/coinbase/webhook", post(coinbase_webhook))
         .with_state(Arc::new(state))
 }
 
@@ -866,6 +1044,27 @@ async fn stripe_webhook(
     body: Bytes,
 ) -> Response {
     match handle_stripe_webhook(&state, &headers, &body).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+async fn create_coinbase_charge(
+    State(state): State<Arc<PaygateState>>,
+    Json(request): Json<CoinbaseCreateChargeRequest>,
+) -> Response {
+    match create_coinbase_charge_inner(&state, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+async fn coinbase_webhook(
+    State(state): State<Arc<PaygateState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match handle_coinbase_webhook(&state, &headers, &body).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
@@ -970,6 +1169,99 @@ fn stripe_payment_intent_summary(value: Value) -> Result<StripePaymentIntentSumm
         amount,
         currency: currency.to_owned(),
         status: status.to_owned(),
+    })
+}
+
+async fn create_coinbase_charge_inner(
+    state: &PaygateState,
+    request: CoinbaseCreateChargeRequest,
+) -> Result<CoinbaseCreateChargeResponse> {
+    let coinbase = &state.config.rails.coinbase;
+    if !coinbase.enabled {
+        return Err(PaygateError::InvalidRequest(
+            "Coinbase Commerce rail is not enabled".to_owned(),
+        ));
+    }
+    validate_safe_key_part("who", &request.who)?;
+    let amount = coinbase_mu_to_usd_amount(request.mu)?;
+    let api_key = coinbase
+        .api_key
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("coinbase.api_key missing".to_owned()))?;
+    let charge = coinbase_create_charge(&state.http, coinbase, api_key, &request, &amount).await?;
+    Ok(CoinbaseCreateChargeResponse {
+        ok: true,
+        rail: "coinbase",
+        denom: CREDIT_DENOM,
+        who: request.who,
+        mu: request.mu,
+        charge,
+    })
+}
+
+async fn coinbase_create_charge(
+    http: &reqwest::Client,
+    coinbase: &CoinbaseSettings,
+    api_key: &str,
+    request: &CoinbaseCreateChargeRequest,
+    amount: &str,
+) -> Result<CoinbaseChargeSummary> {
+    let mut body = json!({
+        "name": "Mayhem credits",
+        "description": "Mayhem credit top-up",
+        "pricing_type": "fixed_price",
+        "local_price": {
+            "amount": amount,
+            "currency": "USD"
+        },
+        "metadata": {
+            "mayhem_who": request.who,
+            "mayhem_mu": request.mu.to_string(),
+            "mayhem_denom": CREDIT_DENOM
+        }
+    });
+    if let Some(redirect_url) = request
+        .redirect_url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+    {
+        body["redirect_url"] = Value::String(redirect_url.to_owned());
+    }
+    if let Some(cancel_url) = request.cancel_url.as_deref().filter(|url| !url.is_empty()) {
+        body["cancel_url"] = Value::String(cancel_url.to_owned());
+    }
+    let response = http
+        .post(format!(
+            "{}/charges",
+            coinbase.api_base_url.trim_end_matches('/')
+        ))
+        .header("X-CC-Api-Key", api_key)
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(PaygateError::Coinbase(format!(
+            "Coinbase Commerce returned {status}: {body}"
+        )));
+    }
+    let value: Value = serde_json::from_str(&body)?;
+    coinbase_charge_summary(value)
+}
+
+fn coinbase_charge_summary(value: Value) -> Result<CoinbaseChargeSummary> {
+    let charge = value.get("data").unwrap_or(&value);
+    let id = coinbase_string_field(charge, "id")?;
+    let local = coinbase_local_price(charge)
+        .ok_or_else(|| PaygateError::Coinbase("charge response missing local price".to_owned()))?;
+    Ok(CoinbaseChargeSummary {
+        id,
+        code: coinbase_optional_string_field(charge, "code"),
+        hosted_url: coinbase_optional_string_field(charge, "hosted_url"),
+        amount: local.0,
+        currency: local.1,
+        expires_at: coinbase_optional_string_field(charge, "expires_at"),
     })
 }
 
@@ -1230,6 +1522,161 @@ async fn handle_stripe_dispute_created(
     ))
 }
 
+async fn handle_coinbase_webhook(
+    state: &PaygateState,
+    headers: &HeaderMap,
+    payload: &[u8],
+) -> Result<CoinbaseWebhookResponse> {
+    let coinbase = &state.config.rails.coinbase;
+    if !coinbase.enabled {
+        return Err(PaygateError::InvalidRequest(
+            "Coinbase Commerce rail is not enabled".to_owned(),
+        ));
+    }
+    let webhook_secret = coinbase
+        .webhook_secret
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("coinbase.webhook_secret missing".to_owned()))?;
+    let signature = headers
+        .get("x-cc-webhook-signature")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            PaygateError::CoinbaseSignature("X-CC-Webhook-Signature missing".to_owned())
+        })?;
+    verify_coinbase_signature(payload, signature, webhook_secret)?;
+
+    let envelope: Value = serde_json::from_slice(payload)?;
+    let event = envelope.get("event").unwrap_or(&envelope);
+    let event_id = coinbase_string_field(event, "id")?;
+    let event_type = coinbase_string_field(event, "type")?;
+    if event_type != "charge:confirmed" {
+        return Ok(CoinbaseWebhookResponse {
+            ok: true,
+            event_id,
+            event_type,
+            duplicate: false,
+            credited: false,
+            ignored: true,
+            charge: None,
+            code: None,
+            mu: None,
+            contract: None,
+        });
+    }
+
+    {
+        let mut store = state.coinbase_events.lock().await;
+        if matches!(store.begin(&event_id), StripeEventBegin::Duplicate) {
+            return Ok(CoinbaseWebhookResponse {
+                ok: true,
+                event_id,
+                event_type,
+                duplicate: true,
+                credited: false,
+                ignored: false,
+                charge: None,
+                code: None,
+                mu: None,
+                contract: None,
+            });
+        }
+    }
+
+    let result = handle_coinbase_charge_confirmed(state, &event_id, &event_type, event).await;
+    match result {
+        Ok((record, contract)) => {
+            let mut store = state.coinbase_events.lock().await;
+            store.complete(record.clone())?;
+            Ok(CoinbaseWebhookResponse {
+                ok: true,
+                event_id: record.event_id,
+                event_type: record.event_type,
+                duplicate: false,
+                credited: true,
+                ignored: false,
+                charge: Some(record.charge),
+                code: record.code,
+                mu: Some(record.mu),
+                contract: Some(contract),
+            })
+        }
+        Err(err) => {
+            let mut store = state.coinbase_events.lock().await;
+            store.fail(&event_id);
+            Err(err)
+        }
+    }
+}
+
+async fn handle_coinbase_charge_confirmed(
+    state: &PaygateState,
+    event_id: &str,
+    event_type: &str,
+    event: &Value,
+) -> Result<(CoinbaseEventRecord, ContractPostResult)> {
+    let data = event
+        .get("data")
+        .ok_or_else(|| PaygateError::Coinbase("event missing data".to_owned()))?;
+    let charge = coinbase_string_field(data, "id")?;
+    let code = coinbase_optional_string_field(data, "code");
+    let metadata = data
+        .get("metadata")
+        .ok_or_else(|| PaygateError::Coinbase("charge missing metadata".to_owned()))?;
+    let who = coinbase_metadata_string(metadata, "mayhem_who")?;
+    validate_safe_key_part("mayhem_who", &who)?;
+    let mu = coinbase_metadata_string(metadata, "mayhem_mu")?
+        .parse::<u64>()
+        .map_err(|_| PaygateError::Coinbase("mayhem_mu metadata is invalid".to_owned()))?;
+    let denom = coinbase_metadata_string(metadata, "mayhem_denom")?;
+    if denom != CREDIT_DENOM {
+        return Err(PaygateError::Coinbase(
+            "charge denomination must be mu_usd".to_owned(),
+        ));
+    }
+    let local = coinbase_local_price(data)
+        .or_else(|| coinbase_first_payment_local_price(data))
+        .ok_or_else(|| PaygateError::Coinbase("charge missing local amount".to_owned()))?;
+    if !local.1.eq_ignore_ascii_case("USD") {
+        return Err(PaygateError::Coinbase(
+            "charge local currency must be USD".to_owned(),
+        ));
+    }
+    let mu_from_amount = usd_decimal_to_mu("Coinbase charge local amount", &local.0)?;
+    if mu != mu_from_amount {
+        return Err(PaygateError::Coinbase(
+            "charge amount does not match mayhem_mu metadata".to_owned(),
+        ));
+    }
+    let at = coinbase_event_timestamp(event).unwrap_or(unix_epoch_seconds()?);
+    let ext_ref_hash = coinbase_ext_ref_hash(event_id, &charge, code.as_deref());
+    let feature = FiatDepositFeature {
+        op: "fiat_deposit",
+        rail: "coinbase",
+        who: who.clone(),
+        mu,
+        ext_ref_hash: ext_ref_hash.clone(),
+        epoch: epoch_for_at(at, state.config.epoch_seconds),
+        at,
+    };
+    let contract = state
+        .contract
+        .post_fiat_deposit(&state.oracle, feature)
+        .await?;
+    Ok((
+        CoinbaseEventRecord {
+            event_id: event_id.to_owned(),
+            event_type: event_type.to_owned(),
+            charge,
+            code,
+            who,
+            mu,
+            ext_ref_hash,
+            credited_at: at,
+        },
+        contract,
+    ))
+}
+
 pub fn verify_stripe_signature(
     payload: &[u8],
     header: &str,
@@ -1276,6 +1723,36 @@ pub fn stripe_signature_header(secret: &str, payload: &[u8], timestamp: u64) -> 
     mac.update(&signed_payload);
     let signature = hex::encode(mac.finalize().into_bytes());
     Ok(format!("t={timestamp},v1={signature}"))
+}
+
+pub fn verify_coinbase_signature(payload: &[u8], header: &str, secret: &str) -> Result<()> {
+    let signature = header.trim();
+    if signature.is_empty() {
+        return Err(PaygateError::CoinbaseSignature(
+            "empty X-CC-Webhook-Signature".to_owned(),
+        ));
+    }
+    let candidate = hex::decode(signature).map_err(|_| {
+        PaygateError::CoinbaseSignature("invalid X-CC-Webhook-Signature hex".to_owned())
+    })?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|err| PaygateError::Crypto(err.to_string()))?;
+    mac.update(payload);
+    let expected = mac.finalize().into_bytes();
+    if expected.as_slice().ct_eq(candidate.as_slice()).into() {
+        Ok(())
+    } else {
+        Err(PaygateError::CoinbaseSignature(
+            "no matching signature".to_owned(),
+        ))
+    }
+}
+
+pub fn coinbase_signature_header(secret: &str, payload: &[u8]) -> Result<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|err| PaygateError::Crypto(err.to_string()))?;
+    mac.update(payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 fn parse_stripe_signature_header(header: &str) -> Result<(u64, Vec<&str>)> {
@@ -1392,13 +1869,72 @@ impl StripeEventStore {
     }
 }
 
+impl CoinbaseEventStore {
+    fn memory() -> Self {
+        Self {
+            seen: HashSet::new(),
+            processing: HashSet::new(),
+            path: None,
+        }
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let mut store = Self {
+            seen: HashSet::new(),
+            processing: HashSet::new(),
+            path: Some(path.to_path_buf()),
+        };
+        if !path.exists() {
+            return Ok(store);
+        }
+        let text = fs::read_to_string(path)?;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let record: CoinbaseEventRecord = serde_json::from_str(line)?;
+            store.seen.insert(record.event_id);
+        }
+        Ok(store)
+    }
+
+    fn begin(&mut self, event_id: &str) -> StripeEventBegin {
+        if self.seen.contains(event_id) || self.processing.contains(event_id) {
+            StripeEventBegin::Duplicate
+        } else {
+            self.processing.insert(event_id.to_owned());
+            StripeEventBegin::Started
+        }
+    }
+
+    fn complete(&mut self, record: CoinbaseEventRecord) -> Result<()> {
+        self.processing.remove(&record.event_id);
+        if self.seen.insert(record.event_id.clone()) {
+            if let Some(path) = &self.path {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+                writeln!(file, "{}", serde_json::to_string(&record)?)?;
+                file.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, event_id: &str) {
+        self.processing.remove(event_id);
+    }
+}
+
 impl From<PaygateError> for ApiError {
     fn from(err: PaygateError) -> Self {
         let status = match err {
             PaygateError::InvalidConfig(_) => StatusCode::SERVICE_UNAVAILABLE,
             PaygateError::InvalidRequest(_)
             | PaygateError::StripeSignature(_)
-            | PaygateError::Stripe(_) => StatusCode::BAD_REQUEST,
+            | PaygateError::Stripe(_)
+            | PaygateError::CoinbaseSignature(_)
+            | PaygateError::Coinbase(_) => StatusCode::BAD_REQUEST,
             PaygateError::Contract(_)
             | PaygateError::Io(_)
             | PaygateError::Http(_)
@@ -1465,6 +2001,72 @@ fn json_u64_field(value: &Value, field: &str) -> Result<u64> {
         .ok_or_else(|| PaygateError::Stripe(format!("Stripe object missing {field}")))
 }
 
+fn coinbase_string_field(value: &Value, field: &str) -> Result<String> {
+    coinbase_optional_string_field(value, field)
+        .ok_or_else(|| PaygateError::Coinbase(format!("Coinbase object missing {field}")))
+}
+
+fn coinbase_optional_string_field(value: &Value, field: &str) -> Option<String> {
+    value.get(field).and_then(value_to_string)
+}
+
+fn coinbase_metadata_string(metadata: &Value, field: &str) -> Result<String> {
+    metadata
+        .get(field)
+        .and_then(value_to_string)
+        .ok_or_else(|| PaygateError::Coinbase(format!("charge metadata missing {field}")))
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => Some(value.to_owned()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn coinbase_local_price(charge: &Value) -> Option<(String, String)> {
+    charge
+        .pointer("/pricing/local")
+        .or_else(|| charge.get("local_price"))
+        .and_then(coinbase_amount_currency)
+}
+
+fn coinbase_first_payment_local_price(charge: &Value) -> Option<(String, String)> {
+    charge
+        .get("payments")
+        .and_then(Value::as_array)
+        .and_then(|payments| payments.first())
+        .and_then(|payment| payment.pointer("/value/local"))
+        .and_then(coinbase_amount_currency)
+}
+
+fn coinbase_amount_currency(value: &Value) -> Option<(String, String)> {
+    Some((
+        value.get("amount").and_then(value_to_string)?,
+        value.get("currency").and_then(value_to_string)?,
+    ))
+}
+
+fn coinbase_event_timestamp(event: &Value) -> Option<u64> {
+    event
+        .get("created")
+        .and_then(Value::as_u64)
+        .or_else(|| event.get("created_at").and_then(Value::as_u64))
+        .or_else(|| {
+            event
+                .get("data")
+                .and_then(|data| data.get("created"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            event
+                .get("data")
+                .and_then(|data| data.get("created_at"))
+                .and_then(Value::as_u64)
+        })
+}
+
 fn decode_seed(seed_hex: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(seed_hex)?;
     bytes
@@ -1497,6 +2099,10 @@ fn default_oracle_key_path() -> PathBuf {
 
 fn default_stripe_event_store_path() -> PathBuf {
     mayhem_home().join("paygate").join("stripe-events.jsonl")
+}
+
+fn default_coinbase_event_store_path() -> PathBuf {
+    mayhem_home().join("paygate").join("coinbase-events.jsonl")
 }
 
 fn mayhem_home() -> PathBuf {
@@ -1557,6 +2163,68 @@ fn mu_to_usd_cents(mu: u64) -> Result<u64> {
     Ok(cents)
 }
 
+fn coinbase_mu_to_usd_amount(mu: u64) -> Result<String> {
+    if mu == 0 {
+        return Err(PaygateError::InvalidRequest(
+            "mu must be positive".to_owned(),
+        ));
+    }
+    if mu % MU_PER_USD_CENT != 0 {
+        return Err(PaygateError::InvalidRequest(
+            "Coinbase Commerce charges must be whole USD cents".to_owned(),
+        ));
+    }
+    let cents = mu / MU_PER_USD_CENT;
+    Ok(format!("{}.{:02}", cents / 100, cents % 100))
+}
+
+fn usd_decimal_to_mu(field: &str, amount: &str) -> Result<u64> {
+    let amount = amount.trim();
+    if amount.is_empty() {
+        return Err(PaygateError::Coinbase(format!("{field} is empty")));
+    }
+    let mut parts = amount.split('.');
+    let dollars = parts.next().unwrap_or_default();
+    let cents = parts.next();
+    if parts.next().is_some()
+        || dollars.is_empty()
+        || !dollars.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(PaygateError::Coinbase(format!("{field} is invalid")));
+    }
+    let cents = match cents {
+        None => 0,
+        Some("") => {
+            return Err(PaygateError::Coinbase(format!("{field} is invalid")));
+        }
+        Some(value) if value.len() <= 2 && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            let padded = if value.len() == 1 {
+                format!("{value}0")
+            } else {
+                value.to_owned()
+            };
+            padded
+                .parse::<u64>()
+                .map_err(|_| PaygateError::Coinbase(format!("{field} is invalid")))?
+        }
+        Some(_) => {
+            return Err(PaygateError::Coinbase(format!(
+                "{field} must have at most two decimal places"
+            )));
+        }
+    };
+    let dollars = dollars
+        .parse::<u64>()
+        .map_err(|_| PaygateError::Coinbase(format!("{field} is invalid")))?;
+    let total_cents = dollars
+        .checked_mul(100)
+        .and_then(|value| value.checked_add(cents))
+        .ok_or_else(|| PaygateError::Coinbase(format!("{field} overflow")))?;
+    total_cents
+        .checked_mul(MU_PER_USD_CENT)
+        .ok_or_else(|| PaygateError::Coinbase(format!("{field} overflow")))
+}
+
 fn stripe_ext_ref_hash(event_id: &str, payment_intent: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"mayhem-stripe-deposit-v1");
@@ -1574,6 +2242,17 @@ fn stripe_dispute_ref_hash(event_id: &str, dispute: &str, source: &str) -> Strin
     hasher.update(dispute.as_bytes());
     hasher.update(b"\0");
     hasher.update(source.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn coinbase_ext_ref_hash(event_id: &str, charge: &str, code: Option<&str>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mayhem-coinbase-deposit-v1");
+    hasher.update(event_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(charge.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(code.unwrap_or("").as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -1641,6 +2320,13 @@ mod tests {
             webhook_secret = "whsec_local"
             api_base_url = "http://127.0.0.1:19999"
             event_store_path = "/tmp/mayhem-paygate-stripe-events.jsonl"
+
+            [coinbase]
+            enabled = true
+            api_key = "cc_test_local"
+            webhook_secret = "ccwhsec_local"
+            api_base_url = "http://127.0.0.1:19998"
+            event_store_path = "/tmp/mayhem-paygate-coinbase-events.jsonl"
             "#,
         )?;
 
@@ -1661,7 +2347,15 @@ mod tests {
             config.rails.stripe.webhook_secret.as_deref(),
             Some("whsec_local")
         );
-        assert!(!config.rails.coinbase.enabled);
+        assert!(config.rails.coinbase.enabled);
+        assert_eq!(
+            config.rails.coinbase.api_key.as_deref(),
+            Some("cc_test_local")
+        );
+        assert_eq!(
+            config.rails.coinbase.webhook_secret.as_deref(),
+            Some("ccwhsec_local")
+        );
         Ok(())
     }
 
@@ -1712,5 +2406,29 @@ mod tests {
         assert_eq!(mu_to_usd_cents(500_000).unwrap(), 50);
         assert!(mu_to_usd_cents(499_999).is_err());
         assert!(mu_to_usd_cents(10_001).is_err());
+    }
+
+    #[test]
+    fn coinbase_signature_verification_accepts_raw_body_hmac() -> Result<()> {
+        let payload = br#"{"event":{"id":"evt_test"}}"#;
+        let header = coinbase_signature_header("ccwhsec_test", payload)?;
+        verify_coinbase_signature(payload, &header, "ccwhsec_test")?;
+        let bad = verify_coinbase_signature(payload, &header, "wrong")
+            .expect_err("wrong secret rejected");
+        assert!(bad.to_string().contains("no matching"));
+        Ok(())
+    }
+
+    #[test]
+    fn coinbase_amounts_are_cent_aligned_mu_usd() -> Result<()> {
+        assert_eq!(coinbase_mu_to_usd_amount(2_500_000)?, "2.50");
+        assert_eq!(coinbase_mu_to_usd_amount(25_000_000)?, "25.00");
+        assert_eq!(coinbase_mu_to_usd_amount(2_510_000)?, "2.51");
+        assert_eq!(usd_decimal_to_mu("amount", "2.50")?, 2_500_000);
+        assert_eq!(usd_decimal_to_mu("amount", "25.00")?, 25_000_000);
+        assert_eq!(usd_decimal_to_mu("amount", "2.5")?, 2_500_000);
+        assert!(coinbase_mu_to_usd_amount(10_001).is_err());
+        assert!(usd_decimal_to_mu("amount", "1.001").is_err());
+        Ok(())
     }
 }
