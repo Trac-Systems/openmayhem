@@ -7,8 +7,10 @@ Mayhem is a peer-to-peer OpenRouter built on Trac Intercom. The repo currently c
 ```bash
 ./install.sh
 mayhem setup --role provider
-mayhem provider start --enclave qwen3.5-4b-gguf-dev --rooms auto
+mayhem provider start --enclave <admin-enclave-id> --rooms auto
 ```
+
+Providers can only opt into admin-created enclave and room records from the contract ledger. They cannot submit arbitrary models, create canonical rooms, or set pricing.
 
 ## User Quickstart
 

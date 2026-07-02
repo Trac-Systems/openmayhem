@@ -441,8 +441,6 @@ struct ConfigNetwork {
 
 #[derive(Debug, Deserialize)]
 struct ConfigProvider {
-    payout_target: Option<String>,
-    payout_method: Option<String>,
     engine_backend: Option<String>,
 }
 
@@ -1035,8 +1033,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
 
     provider_log(&args, "Submitting provider opt-in transactions");
     let provider_tx =
-        ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, &config, args.sim)
-            .await?;
+        ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, args.sim).await?;
     let serve_tx = ensure_joined_enclave(
         &rpc,
         &keypair_path,
@@ -1554,7 +1551,6 @@ async fn ensure_provider_registered(
     keypair_path: &Path,
     password: &str,
     wallet: &WalletInfo,
-    config: &Option<MayhemConfig>,
     sim: bool,
 ) -> Result<Value> {
     let key = format!("prov/{}", wallet.public_key);
@@ -1568,28 +1564,13 @@ async fn ensure_provider_registered(
         bail!("provider registration exists but is not active: {existing}");
     }
 
-    let payout_addr = config
-        .as_ref()
-        .and_then(|config| config.provider.as_ref())
-        .and_then(|provider| provider.payout_target.clone())
-        .or_else(|| wallet.address.clone())
-        .unwrap_or_else(|| wallet.public_key.clone());
-    let payout_method = config
-        .as_ref()
-        .and_then(|config| config.provider.as_ref())
-        .and_then(|provider| provider.payout_method.clone())
-        .unwrap_or_else(|| "tnk".to_owned());
     let submitted = submit_contract_command(
         rpc,
         keypair_path,
         password,
         wallet,
         "registerProvider",
-        json!({
-            "op": "register_provider",
-            "payout_addr": payout_addr,
-            "payout_method": payout_method,
-        }),
+        json!({ "op": "register_provider" }),
         sim,
     )
     .await?;

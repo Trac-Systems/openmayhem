@@ -147,10 +147,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   const providerEntry = await first.storage.get(`prov/${provider.publicKey}`);
   assert.deepEqual(providerEntry.value, {
     provider: provider.publicKey,
-    payout: {
-      addr: providerRegistration.payout_addr,
-      method: 'tnk',
-    },
+    payout: null,
     status: 'active',
     probation: {
       since: makeTxKey(3),
@@ -180,6 +177,110 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     left_at: null,
     rooms: [],
   });
+});
+
+test('MayhemContract ignores provider-authored payout and probation hints', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: {
+        op: 'register_provider',
+        payout_addr: 'provider-picked-target',
+        payout_method: 'coinbase',
+        registered_at_seconds: 123_456,
+      },
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+
+  const providerEntry = await storage.get(`prov/${provider.publicKey}`);
+  assert.equal(providerEntry.value.payout, null);
+  assert.equal(providerEntry.value.probation.since_seconds, 0);
+
+  const providerPayout = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'provider-picked-target',
+      payout_method: 'tnk',
+    },
+    provider.publicKey,
+    4
+  );
+  assert.match(providerPayout.message, /admin required/i);
+
+  const unsupported = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'admin-approved-target',
+      payout_method: 'wire',
+    },
+    admin.publicKey,
+    5
+  );
+  assert.match(unsupported.message, /unsupported payout method/i);
+
+  const adminPayout = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'admin-approved-target',
+      payout_method: 'tnk',
+    },
+    admin.publicKey,
+    6
+  );
+  assert.deepEqual(adminPayout, {
+    ok: true,
+    op: 'setProviderPayout',
+    provider: provider.publicKey,
+  });
+
+  const updated = await storage.get(`prov/${provider.publicKey}`);
+  assert.deepEqual(updated.value.payout, {
+    addr: 'admin-approved-target',
+    method: 'tnk',
+    set_by: admin.publicKey,
+    set_at: makeTxKey(6),
+  });
+  assert.equal(updated.value.updated_at, makeTxKey(6));
 });
 
 test('MayhemContract admin can ban providers from future serving mutations', async () => {

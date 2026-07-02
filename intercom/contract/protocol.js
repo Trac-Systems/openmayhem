@@ -70,6 +70,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'set_provider_payout') {
+      return {
+        type: 'setProviderPayout',
+        value: json,
+      };
+    }
     if (json?.op === 'ban_provider') {
       return {
         type: 'banProvider',
@@ -214,7 +220,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "set_params", "submitted_at": 0, "effective_at": 86400, "values": { "fee_bps": 1500 } }\' --sim 1 | schedules parameter changes.');
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
     console.log('- /tx --command \'{ "op": "consent", "ver": 1, "hash": "<hash>", "sig": "<sig>" }\' --sim 1 | records consent.');
-    console.log('- /tx --command \'{ "op": "register_provider", "payout_addr": "<target>", "payout_method": "tnk" }\' --sim 1 | registers a provider.');
+    console.log('- /tx --command \'{ "op": "register_provider" }\' --sim 1 | provider opts into serving admin-created enclaves.');
+    console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk" }\' --sim 1 | admin sets a provider payout target.');
     console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
     console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | admin registers an enclave catalog entry.');
     console.log('- /tx --command \'{ "op": "join_enclave", "enclave_id": "<id>" }\' --sim 1 | provider opts into serving an existing enclave.');

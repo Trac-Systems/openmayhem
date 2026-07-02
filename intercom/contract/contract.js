@@ -158,9 +158,20 @@ class MayhemContract extends Contract {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
+        payout_addr: { type: 'string', min: 1, max: 256, optional: true },
+        payout_method: { type: 'string', min: 1, max: 32, optional: true },
+        registered_at_seconds: { type: 'number', integer: true, min: 0, optional: true },
+      },
+    });
+
+    this.addSchema('setProviderPayout', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128 },
         payout_addr: { type: 'string', min: 1, max: 256 },
         payout_method: { type: 'string', min: 1, max: 32 },
-        registered_at_seconds: { type: 'number', integer: true, min: 0, optional: true },
       },
     });
 
@@ -571,23 +582,17 @@ class MayhemContract extends Contract {
   async registerProvider() {
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
-    if (!PAYOUT_METHODS.has(this.value.payout_method)) {
-      return new Error('Unsupported payout method.');
-    }
 
     const key = `prov/${this.address}`;
     if ((await this.get(key)) !== null) return new Error('Provider already registered.');
 
     const record = {
       provider: this.address,
-      payout: {
-        addr: this.value.payout_addr,
-        method: this.value.payout_method,
-      },
+      payout: null,
       status: 'active',
       probation: {
         since: this.tx,
-        since_seconds: this.value.registered_at_seconds ?? 0,
+        since_seconds: 0,
         successful_sessions: 0,
       },
       registered_at: this.tx,
@@ -596,6 +601,33 @@ class MayhemContract extends Contract {
     await this.put(key, record);
     console.log('mayhem registerProvider', record);
     return { ok: true, op: 'registerProvider', provider: this.address };
+  }
+
+  async setProviderPayout() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.provider)) return new Error('Invalid provider id.');
+    if (!PAYOUT_METHODS.has(this.value.payout_method)) {
+      return new Error('Unsupported payout method.');
+    }
+
+    const key = `prov/${this.value.provider}`;
+    const record = await this.get(key);
+    if (!record) return new Error('Provider not found.');
+
+    const updated = {
+      ...record,
+      payout: {
+        addr: this.value.payout_addr,
+        method: this.value.payout_method,
+        set_by: this.address,
+        set_at: this.tx,
+      },
+      updated_at: this.tx,
+    };
+    await this.put(key, updated);
+    console.log('mayhem setProviderPayout', updated);
+    return { ok: true, op: 'setProviderPayout', provider: this.value.provider };
   }
 
   async banProvider() {
