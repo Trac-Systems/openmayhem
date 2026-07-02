@@ -1,0 +1,9 @@
+.npmrc
+.idea
+/stores/
+/msb_stores/
+/stores_msb/
+/node_modules/
+/contract/stores/
+/contract/stores_msb/
+.vscode/
