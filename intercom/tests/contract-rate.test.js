@@ -153,9 +153,10 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     'tnkDeposit',
     {
       op: 'tnk_deposit',
-      who: user.publicKey,
+      memo_hash: 'stale-deposit',
       tnk_e18: oneTnkE18,
       msb_tx_hash: 'd'.repeat(64),
+      epoch: 1,
       at: 1_901,
     },
     admin.publicKey,
@@ -182,33 +183,62 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
   assert.match(stalePayout.message, /rate oracle is stale/i);
   assert.equal((await storage.get(`earn/${provider.publicKey}`)).value.paid_cum_mu, 0);
 
+  const userConsent = await execute(
+    contract,
+    storage,
+    'consent',
+    {
+      op: 'consent',
+      ver: 1,
+      hash: rulesHash,
+      sig: signConsent(user.wallet, 1, rulesHash),
+    },
+    user.publicKey,
+    7
+  );
+  assert.equal(userConsent.ok, true, userConsent.message);
+
+  const intent = await execute(
+    contract,
+    storage,
+    'depositTnk',
+    {
+      op: 'deposit_tnk',
+      memo_hash: 'fresh-deposit',
+    },
+    user.publicKey,
+    8
+  );
+  assert.equal(intent.ok, true, intent.message);
+
   const freshDeposit = await execute(
     contract,
     storage,
     'tnkDeposit',
     {
       op: 'tnk_deposit',
-      who: user.publicKey,
+      memo_hash: 'fresh-deposit',
       tnk_e18: oneTnkE18,
       msb_tx_hash: 'f'.repeat(64),
+      epoch: 1,
       at: 1_900,
     },
     admin.publicKey,
-    7
+    9
   );
-  assert.deepEqual(freshDeposit, {
-    ok: true,
-    op: 'tnkDeposit',
-    who: user.publicKey,
-    mu: 2_000_000,
-    rate_ts: 1_000,
-  });
+  assert.equal(freshDeposit.ok, true, freshDeposit.message);
+  assert.equal(freshDeposit.op, 'tnkDeposit');
+  assert.equal(freshDeposit.who, user.publicKey);
+  assert.equal(freshDeposit.mu, 2_000_000);
+  assert.equal(freshDeposit.epoch, 1);
+  assert.equal(freshDeposit.deposit_root.length, 64);
+  assert.equal(freshDeposit.rate_ts, 1_000);
   assert.deepEqual((await storage.get(`bal/${user.publicKey}`)).value, {
     user: user.publicKey,
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 0,
-    updated_at: makeTxKey(7),
+    updated_at: makeTxKey(9),
     last_deposit_rate_ts: 1_000,
   });
 
@@ -225,7 +255,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
       at: 1_900,
     },
     admin.publicKey,
-    8
+    10
   );
   assert.deepEqual(freshPayout, {
     ok: true,
@@ -241,7 +271,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     held_mu: 0,
     paid_cum_mu: 1_000,
     updated_epoch: 0,
-    updated_at: makeTxKey(8),
+    updated_at: makeTxKey(10),
     last_payout_rate_ts: 1_000,
     last_payout_msb_tx_hash: '1'.repeat(64),
   });
@@ -280,9 +310,10 @@ test('MayhemContract rate staleness follows scheduled params', async () => {
     'tnkDeposit',
     {
       op: 'tnk_deposit',
-      who: user.publicKey,
+      memo_hash: 'scheduled-stale',
       tnk_e18: oneTnkE18,
       msb_tx_hash: '2'.repeat(64),
+      epoch: 1,
       at: 86_461,
     },
     admin.publicKey,

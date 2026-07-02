@@ -178,6 +178,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'deposit_tnk') {
+      return {
+        type: 'depositTnk',
+        value: json,
+      };
+    }
     if (json?.op === 'tnk_deposit') {
       return {
         type: 'tnkDeposit',
@@ -225,7 +231,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "probe_result", "probe_id": "<id>", "probe_kind": "canary", "provider": "<pk>", "match_bps": 9700, "pass": true, "canary_set": "canary-dev-v1", "epoch": 1, "at": 3600 }\' --sim 1 | auditor submits probe evidence.');
     console.log('- /tx --command \'{ "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] }\' --sim 1 | admin/oracle applies bounded credit, earning, and fee deltas.');
     console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "coinbase-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
-    console.log('- /tx --command \'{ "op": "tnk_deposit", "who": "<pk>", "tnk_e18": "1000000000000000000", "msb_tx_hash": "<hash>", "at": 3600 }\' --sim 1 | admin/oracle credits a TNK deposit using a fresh rate.');
+    console.log('- /tx --command \'{ "op": "deposit_tnk", "memo_hash": "<hash>" }\' --sim 1 | user creates a memo-bound TNK deposit intent.');
+    console.log('- /tx --command \'{ "op": "tnk_deposit", "memo_hash": "<hash>", "tnk_e18": "1000000000000000000", "msb_tx_hash": "<hash>", "epoch": 1, "at": 3600 }\' --sim 1 | admin/oracle credits a memo-bound TNK deposit using a fresh rate.');
     console.log('- /tx --command \'{ "op": "payout_confirm", "who": "<pk>", "mu": 1000, "tnk_e18": "20000000000000000", "msb_tx_hash": "<hash>", "at": 3600 }\' --sim 1 | admin/oracle confirms a TNK payout using a fresh rate.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');

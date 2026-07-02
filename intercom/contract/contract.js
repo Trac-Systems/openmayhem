@@ -389,16 +389,25 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('depositTnk', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        memo_hash: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
     this.addSchema('tnkDeposit', {
       value: {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
-        who: { type: 'string', min: 1, max: 128 },
+        memo_hash: { type: 'string', min: 1, max: 128 },
         tnk_e18: { type: 'string', min: 1, max: 80 },
         msb_tx_hash: { type: 'string', min: 1, max: 128 },
+        epoch: { type: 'number', integer: true, min: 1 },
         at: { type: 'number', integer: true, min: 0 },
-        memo_hash: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
 
@@ -1357,40 +1366,90 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'rateOracle', ts: record.ts, source: record.source };
   }
 
+  async depositTnk() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+    if (!this.isSafeKeyPart(this.value.memo_hash)) return new Error('Invalid deposit memo hash.');
+
+    const key = `dep/pending/${this.value.memo_hash}`;
+    if ((await this.get(key)) !== null) return new Error('TNK deposit memo already pending.');
+
+    const record = {
+      memo_hash: this.value.memo_hash,
+      user: this.address,
+      status: 'pending',
+      requested_at: this.tx,
+    };
+    await this.put(key, record);
+    console.log('mayhem depositTnk', record);
+    return {
+      ok: true,
+      op: 'depositTnk',
+      memo_hash: this.value.memo_hash,
+      user: this.address,
+    };
+  }
+
   async tnkDeposit() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
-    if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid deposit recipient.');
+    if (!this.isSafeKeyPart(this.value.memo_hash)) return new Error('Invalid deposit memo hash.');
 
     const rate = await this.requireFreshRate(this.value.at);
     if (rate instanceof Error) return rate;
+    const pendingKey = `dep/pending/${this.value.memo_hash}`;
+    const pending = await this.get(pendingKey);
+    if (!pending || pending.status !== 'pending') return new Error('Pending TNK deposit intent not found.');
+
     const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
     if (tnkE18 instanceof Error) return tnkE18;
     const mu = this.tnkE18ToMu(tnkE18, rate.tnk_usd_e6);
     if (mu instanceof Error) return mu;
     if (mu <= 0) return new Error('TNK deposit converts to zero mu.');
 
-    const balance = await this.balanceRecord(this.value.who);
+    const balance = await this.balanceRecord(pending.user);
     const nextMu = this.safeAddMu(balance.mu, mu);
     if (nextMu instanceof Error) return nextMu;
+    const leaf = await this.depositLeafHash({
+      rail: 'tnk',
+      memo_hash: this.value.memo_hash,
+      user_hash: await this.opaqueHash('deposit-user', pending.user),
+      mu,
+      tnk_e18: this.value.tnk_e18,
+      msb_tx_hash: this.value.msb_tx_hash,
+      rate_ts: rate.ts,
+    });
+    const depositRoot = await this.nextDepositRoot({
+      epoch: this.value.epoch,
+      leaf,
+      mu,
+      at: this.value.at,
+    });
+    if (depositRoot instanceof Error) return depositRoot;
+
     const record = {
       ...balance,
       mu: nextMu,
       updated_at: this.tx,
       last_deposit_rate_ts: rate.ts,
     };
-    await this.put(`bal/${this.value.who}`, record);
+    await this.put(`bal/${pending.user}`, record);
+    await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    await this.del(pendingKey);
     console.log('mayhem tnkDeposit', {
-      who: this.value.who,
+      who: pending.user,
       mu,
       tnk_e18: this.value.tnk_e18,
       rate_ts: rate.ts,
+      epoch: this.value.epoch,
     });
     return {
       ok: true,
       op: 'tnkDeposit',
-      who: this.value.who,
+      who: pending.user,
       mu,
+      epoch: this.value.epoch,
+      deposit_root: depositRoot.merkle_root,
       rate_ts: rate.ts,
     };
   }
@@ -1725,6 +1784,41 @@ class MayhemContract extends Contract {
       return new Error('Rate oracle is stale.');
     }
     return rate;
+  }
+
+  async opaqueHash(domain, value) {
+    const digest = await blake3(b4a.from(stableJson({ domain, value })));
+    return b4a.toString(digest, 'hex');
+  }
+
+  async depositLeafHash(value) {
+    return await this.opaqueHash('mayhem-deposit-leaf-v1', value);
+  }
+
+  async nextDepositRoot({ epoch, leaf, mu, at }) {
+    const current = await this.get(`ev/dep/${epoch}`);
+    if (current && current.type !== 'deposit_root') {
+      return new Error('Invalid deposit evidence root.');
+    }
+    const count = (current?.count ?? 0) + 1;
+    const muTotal = this.safeAddMu(current?.mu_total ?? 0, mu);
+    if (muTotal instanceof Error) return muTotal;
+    const merkleRoot = current
+      ? await this.opaqueHash('mayhem-deposit-root-v1', {
+        previous_root: current.merkle_root,
+        leaf,
+        count,
+      })
+      : leaf;
+    return {
+      type: 'deposit_root',
+      epoch,
+      merkle_root: merkleRoot,
+      count,
+      mu_total: muTotal,
+      ts: at,
+      updated_at: this.tx,
+    };
   }
 
   async epochApplyHash(value) {
