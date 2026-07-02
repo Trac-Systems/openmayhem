@@ -20,6 +20,28 @@ mayhem setup --role user
 mayhem use --model qwen3.5-4b
 ```
 
+## Install
+
+From this source checkout:
+
+```bash
+./install.sh --from-source
+```
+
+On Windows PowerShell:
+
+```powershell
+.\install.ps1 -FromSource
+```
+
+For release artifacts, use the prebuilt archive plus SHA-256 sidecar:
+
+```bash
+./install.sh --artifact-url <archive-url> --sha256 <archive-sha256>
+```
+
+Both installers print a copy/paste PATH command even when they update your shell profile. Browser-opening commands, such as hosted payment checkout, also print the copy/paste URL before attempting to open a browser.
+
 ## Development
 
 ```bash
