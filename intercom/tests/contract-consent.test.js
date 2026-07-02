@@ -1,66 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import b4a from 'b4a';
-import PeerWallet from 'trac-wallet';
-import MayhemContract, { consentMessage } from '../contract/contract.js';
-
-const ZERO_HEX = '0'.repeat(64);
-
-class MemoryStorage {
-  constructor(initial = {}) {
-    this.values = new Map(Object.entries(initial));
-  }
-
-  async get(key) {
-    return this.values.has(key) ? { value: this.values.get(key) } : null;
-  }
-
-  async put(key, value) {
-    this.values.set(key, value);
-  }
-
-  async del(key) {
-    this.values.delete(key);
-  }
-}
-
-const makeTxKey = (n) => n.toString(16).padStart(64, '0');
-
-const makeOperation = (type, value, sender, txNo) => ({
-  type: 'tx',
-  key: makeTxKey(txNo),
-  value: {
-    dispatch: { type, value },
-    ipk: sender,
-    wp: ZERO_HEX,
-  },
-});
-
-const execute = (contract, storage, type, value, sender, txNo) =>
-  contract.execute(makeOperation(type, value, sender, txNo), storage);
-
-async function makeIdentity() {
-  const wallet = new PeerWallet();
-  await wallet.ready;
-  await wallet.generateKeyPair();
-  return {
-    wallet,
-    publicKey: b4a.toString(wallet.publicKey, 'hex'),
-  };
-}
-
-const makeVerifier = (wallet) => ({
-  verify(signature, message, publicKey) {
-    return wallet.verify(
-      b4a.from(signature, 'hex'),
-      b4a.from(String(message)),
-      b4a.from(publicKey, 'hex')
-    );
-  },
-});
-
-const signConsent = (wallet, ver, hash) =>
-  b4a.toString(wallet.sign(b4a.from(consentMessage(ver, hash))), 'hex');
+import MayhemContract from '../contract/contract.js';
+import {
+  MemoryStorage,
+  execute,
+  makeIdentity,
+  makeTxKey,
+  makeVerifier,
+  signConsent,
+} from './helpers/contract.js';
 
 test('MayhemContract consent gates ops and requires re-consent after rules bump', async () => {
   const identity = await makeIdentity();

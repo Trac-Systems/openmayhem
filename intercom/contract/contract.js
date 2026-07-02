@@ -2,8 +2,21 @@ import { Contract } from 'trac-peer';
 
 const CONTRACT_VERSION = 1;
 const CURRENT_RULES_KEY = 'rules/current';
+const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
+const ENCLAVE_UPDATE_FIELDS = [
+  'backend',
+  'artifact_root',
+  'manifest_hash',
+  'att_tier',
+  'binary_hash',
+  'caps',
+  'rooms',
+];
 
 export const consentMessage = (ver, hash) => `mayhem-consent${ver}${hash}`;
+
+const cloneValue = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 
 class MayhemContract extends Contract {
   constructor(protocol, options = {}) {
@@ -52,6 +65,67 @@ class MayhemContract extends Contract {
         ver: { type: 'number', integer: true, min: 1 },
         hash: { type: 'string', min: 1, max: 128 },
         sig: { type: 'string', min: 1, max: 256 },
+      },
+    });
+
+    this.addSchema('registerProvider', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        payout_addr: { type: 'string', min: 1, max: 256 },
+        payout_method: { type: 'string', min: 1, max: 32 },
+      },
+    });
+
+    this.addSchema('registerEnclave', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+        model_id: { type: 'string', min: 1, max: 256 },
+        backend: { type: 'string', min: 1, max: 64 },
+        artifact_root: { type: 'string', min: 1, max: 256 },
+        manifest_hash: { type: 'string', min: 1, max: 128 },
+        att_tier: { type: 'number', integer: true, min: 1, max: 2 },
+        binary_hash: { type: 'string', min: 1, max: 128 },
+        caps: { type: 'any' },
+        rooms: {
+          type: 'array',
+          max: 64,
+          items: { type: 'string', min: 1, max: 256 },
+        },
+      },
+    });
+
+    this.addSchema('updateEnclave', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+        backend: { type: 'string', min: 1, max: 64, optional: true },
+        artifact_root: { type: 'string', min: 1, max: 256, optional: true },
+        manifest_hash: { type: 'string', min: 1, max: 128, optional: true },
+        att_tier: { type: 'number', integer: true, min: 1, max: 2, optional: true },
+        binary_hash: { type: 'string', min: 1, max: 128, optional: true },
+        caps: { type: 'any', optional: true },
+        rooms: {
+          type: 'array',
+          max: 64,
+          items: { type: 'string', min: 1, max: 256 },
+          optional: true,
+        },
+      },
+    });
+
+    this.addSchema('retireEnclave', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
       },
     });
   }
@@ -130,6 +204,111 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'consent', address: this.address, ...record };
   }
 
+  async registerProvider() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+    if (!PAYOUT_METHODS.has(this.value.payout_method)) {
+      return new Error('Unsupported payout method.');
+    }
+
+    const key = `prov/${this.address}`;
+    if ((await this.get(key)) !== null) return new Error('Provider already registered.');
+
+    const record = {
+      provider: this.address,
+      payout: {
+        addr: this.value.payout_addr,
+        method: this.value.payout_method,
+      },
+      status: 'active',
+      probation: {
+        since: this.tx,
+        successful_sessions: 0,
+      },
+      registered_at: this.tx,
+      updated_at: this.tx,
+    };
+    await this.put(key, record);
+    console.log('mayhem registerProvider', record);
+    return { ok: true, op: 'registerProvider', provider: this.address };
+  }
+
+  async registerEnclave() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+    const providerError = await this.requireProvider();
+    if (providerError) return providerError;
+
+    const key = `enclave/${this.value.enclave_id}`;
+    if ((await this.get(key)) !== null) return new Error('Enclave already registered.');
+
+    const record = {
+      enclave_id: this.value.enclave_id,
+      provider: this.address,
+      model_id: this.value.model_id,
+      backend: this.value.backend,
+      artifact_root: this.value.artifact_root,
+      manifest_hash: this.value.manifest_hash,
+      att_tier: this.value.att_tier,
+      binary_hash: this.value.binary_hash,
+      caps: cloneValue(this.value.caps),
+      rooms: this.value.rooms.slice(),
+      status: 'active',
+      registered_at: this.tx,
+      updated_at: this.tx,
+      retired_at: null,
+    };
+    await this.put(key, record);
+    console.log('mayhem registerEnclave', record);
+    return { ok: true, op: 'registerEnclave', enclave_id: record.enclave_id };
+  }
+
+  async updateEnclave() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+
+    const key = `enclave/${this.value.enclave_id}`;
+    const record = await this.get(key);
+    if (!record) return new Error('Enclave not found.');
+    if (record.provider !== this.address) return new Error('Provider mismatch.');
+    if (record.status === 'retired') return new Error('Enclave is retired.');
+
+    let changed = false;
+    const updated = cloneValue(record);
+    for (const field of ENCLAVE_UPDATE_FIELDS) {
+      if (!hasOwn(this.value, field)) continue;
+      updated[field] = field === 'rooms' ? this.value[field].slice() : cloneValue(this.value[field]);
+      changed = true;
+    }
+    if (!changed) return new Error('No enclave fields to update.');
+
+    updated.updated_at = this.tx;
+    await this.put(key, updated);
+    console.log('mayhem updateEnclave', updated);
+    return { ok: true, op: 'updateEnclave', enclave_id: updated.enclave_id };
+  }
+
+  async retireEnclave() {
+    const consentError = await this.requireConsent();
+    if (consentError) return consentError;
+
+    const key = `enclave/${this.value.enclave_id}`;
+    const record = await this.get(key);
+    if (!record) return new Error('Enclave not found.');
+    if (record.provider !== this.address) return new Error('Provider mismatch.');
+    if (record.status === 'retired') return new Error('Enclave already retired.');
+
+    const updated = {
+      ...record,
+      status: 'retired',
+      retired_at: this.tx,
+      updated_at: this.tx,
+    };
+    await this.put(key, updated);
+    console.log('mayhem retireEnclave', updated);
+    return { ok: true, op: 'retireEnclave', enclave_id: updated.enclave_id };
+  }
+
   async currentRules() {
     return await this.get(CURRENT_RULES_KEY);
   }
@@ -150,6 +329,12 @@ class MayhemContract extends Contract {
     if (!consent || consent.ver !== rules.ver || consent.hash !== rules.hash) {
       return new Error(`Consent required for rules version ${rules.ver}.`);
     }
+    return null;
+  }
+
+  async requireProvider(sender = this.address) {
+    const provider = await this.get(`prov/${sender}`);
+    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
     return null;
   }
 

@@ -4,7 +4,7 @@
   "type": "module",
   "main": "src/main.js",
   "scripts": {
-    "test:contract": "node --test tests/contract-consent.test.js"
+    "test:contract": "node --test tests/contract-consent.test.js tests/contract-registry.test.js"
   },
   "pear": {
     "name": "mayhem-intercom",
