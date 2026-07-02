@@ -1,0 +1,348 @@
+/** @typedef {import('pear-interface')} */
+import fs from 'fs';
+import path from 'path';
+import b4a from 'b4a';
+import PeerWallet from 'trac-wallet';
+import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
+import { MainSettlementBus } from 'trac-msb/src/index.js';
+import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
+import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
+import { getPearRuntime, ensureTrailingSlash } from 'trac-peer/src/runnerArgs.js';
+import { Terminal } from 'trac-peer/src/terminal/index.js';
+import MayhemProtocol from '../contract/protocol.js';
+import MayhemContract from '../contract/contract.js';
+import Sidechannel from '../features/sidechannel/index.js';
+import ScBridge from '../features/sc-bridge/index.js';
+
+const { env, storeLabel, flags } = getPearRuntime();
+
+class MayhemWallet extends PeerWallet {
+  get publicKey() {
+    const publicKey = super.publicKey;
+    return publicKey ? b4a.toString(publicKey, 'hex') : null;
+  }
+
+  get secretKey() {
+    const secretKey = super.secretKey;
+    return secretKey ? b4a.toString(secretKey, 'hex') : null;
+  }
+
+  sign(message) {
+    const messageBuffer = b4a.isBuffer(message) ? message : b4a.from(String(message));
+    const signature = super.sign(messageBuffer);
+    return b4a.toString(signature, 'hex');
+  }
+
+  verify(signature, message, publicKey = this.publicKey) {
+    const signatureBuffer = b4a.isBuffer(signature) ? signature : b4a.from(String(signature), 'hex');
+    const messageBuffer = b4a.isBuffer(message) ? message : b4a.from(String(message));
+    const publicKeyBuffer = b4a.isBuffer(publicKey) ? publicKey : b4a.from(String(publicKey), 'hex');
+    return PeerWallet.verify(signatureBuffer, messageBuffer, publicKeyBuffer);
+  }
+}
+
+const parseBool = (value, fallback) => {
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+};
+
+const parseCsvList = (raw) => {
+  if (!raw) return null;
+  return String(raw)
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+};
+
+const peerStoreName =
+  (flags['peer-store-name'] && String(flags['peer-store-name'])) ||
+  env.PEER_STORE_NAME ||
+  storeLabel ||
+  'peer';
+
+const peerStoresDirectory = ensureTrailingSlash(
+  (flags['peer-stores-directory'] && String(flags['peer-stores-directory'])) ||
+    env.PEER_STORES_DIRECTORY ||
+    'stores/'
+);
+
+const msbStoreName =
+  (flags['msb-store-name'] && String(flags['msb-store-name'])) ||
+  env.MSB_STORE_NAME ||
+  `${peerStoreName}-msb`;
+
+const msbStoresDirectory = ensureTrailingSlash(
+  (flags['msb-stores-directory'] && String(flags['msb-stores-directory'])) ||
+    env.MSB_STORES_DIRECTORY ||
+    'stores/'
+);
+
+const subnetChannel =
+  (flags['subnet-channel'] && String(flags['subnet-channel'])) ||
+  env.SUBNET_CHANNEL ||
+  'mayhem-router-subnet';
+
+const subnetBootstrapHex =
+  (flags['subnet-bootstrap'] && String(flags['subnet-bootstrap'])) ||
+  env.SUBNET_BOOTSTRAP ||
+  null;
+
+const sidechannelEntry = '0000intercom';
+const sidechannelsRaw =
+  (flags.sidechannels && String(flags.sidechannels)) ||
+  (flags.sidechannel && String(flags.sidechannel)) ||
+  env.SIDECHANNELS ||
+  '';
+const sidechannelExtras = sidechannelsRaw
+  .split(',')
+  .map((value) => value.trim())
+  .filter((value) => value.length > 0 && value !== sidechannelEntry);
+
+const sidechannelQuiet = parseBool(
+  (flags['sidechannel-quiet'] && String(flags['sidechannel-quiet'])) || env.SIDECHANNEL_QUIET || '',
+  false
+);
+const sidechannelDebug = parseBool(
+  (flags['sidechannel-debug'] && String(flags['sidechannel-debug'])) || env.SIDECHANNEL_DEBUG || '',
+  false
+);
+const sidechannelMaxBytes = Number.parseInt(
+  (flags['sidechannel-max-bytes'] && String(flags['sidechannel-max-bytes'])) ||
+    env.SIDECHANNEL_MAX_BYTES ||
+    '',
+  10
+);
+const sidechannelAllowRemoteOpen = parseBool(
+  (flags['sidechannel-allow-remote-open'] && String(flags['sidechannel-allow-remote-open'])) ||
+    env.SIDECHANNEL_ALLOW_REMOTE_OPEN ||
+    '',
+  true
+);
+const sidechannelAutoJoin = parseBool(
+  (flags['sidechannel-auto-join'] && String(flags['sidechannel-auto-join'])) ||
+    env.SIDECHANNEL_AUTO_JOIN ||
+    '',
+  false
+);
+
+const scBridgeEnabled = parseBool(
+  (flags['sc-bridge'] && String(flags['sc-bridge'])) || env.SC_BRIDGE || '',
+  false
+);
+const scBridgeHost =
+  (flags['sc-bridge-host'] && String(flags['sc-bridge-host'])) ||
+  env.SC_BRIDGE_HOST ||
+  '127.0.0.1';
+const scBridgePort = Number.parseInt(
+  (flags['sc-bridge-port'] && String(flags['sc-bridge-port'])) || env.SC_BRIDGE_PORT || '',
+  10
+);
+const scBridgeToken =
+  (flags['sc-bridge-token'] && String(flags['sc-bridge-token'])) ||
+  env.SC_BRIDGE_TOKEN ||
+  '';
+const scBridgeCliEnabled = parseBool(
+  (flags['sc-bridge-cli'] && String(flags['sc-bridge-cli'])) || env.SC_BRIDGE_CLI || '',
+  false
+);
+const scBridgeDebug = parseBool(
+  (flags['sc-bridge-debug'] && String(flags['sc-bridge-debug'])) || env.SC_BRIDGE_DEBUG || '',
+  false
+);
+
+if (scBridgeEnabled && !scBridgeToken) {
+  throw new Error('SC-Bridge requires --sc-bridge-token (auth is mandatory).');
+}
+
+const peerDhtBootstrap = parseCsvList(
+  (flags['peer-dht-bootstrap'] && String(flags['peer-dht-bootstrap'])) ||
+    (flags['dht-bootstrap'] && String(flags['dht-bootstrap'])) ||
+    env.PEER_DHT_BOOTSTRAP ||
+    env.DHT_BOOTSTRAP ||
+    ''
+);
+const msbDhtBootstrap = parseCsvList(
+  (flags['msb-dht-bootstrap'] && String(flags['msb-dht-bootstrap'])) ||
+    env.MSB_DHT_BOOTSTRAP ||
+    ''
+);
+
+const readHexFile = (filePath, byteLength) => {
+  try {
+    if (fs.existsSync(filePath)) {
+      const hex = fs.readFileSync(filePath, 'utf8').trim().toLowerCase();
+      if (/^[0-9a-f]+$/.test(hex) && hex.length === byteLength * 2) return hex;
+    }
+  } catch (_e) {}
+  return null;
+};
+
+const ensureKeypairFile = async (keyPairPath) => {
+  if (fs.existsSync(keyPairPath)) return;
+  fs.mkdirSync(path.dirname(keyPairPath), { recursive: true });
+  await ensureTextCodecs();
+  const wallet = new PeerWallet();
+  await wallet.ready;
+  if (!wallet.secretKey) {
+    await wallet.generateKeyPair();
+  }
+  wallet.exportToFile(keyPairPath, b4a.alloc(0));
+};
+
+const subnetBootstrapFile = path.join(peerStoresDirectory, peerStoreName, 'subnet-bootstrap.hex');
+let subnetBootstrap = subnetBootstrapHex ? subnetBootstrapHex.trim().toLowerCase() : null;
+if (subnetBootstrap) {
+  if (!/^[0-9a-f]{64}$/.test(subnetBootstrap)) {
+    throw new Error('Invalid --subnet-bootstrap. Provide 32-byte hex (64 chars).');
+  }
+} else {
+  subnetBootstrap = readHexFile(subnetBootstrapFile, 32);
+}
+
+const msbConfig = createMsbConfig(MSB_ENV.MAINNET, {
+  storeName: msbStoreName,
+  storesDirectory: msbStoresDirectory,
+  enableInteractiveMode: false,
+  ...(msbDhtBootstrap ? { dhtBootstrap: msbDhtBootstrap } : {}),
+});
+
+const msbBootstrapHex = b4a.toString(msbConfig.bootstrap, 'hex');
+if (subnetBootstrap && subnetBootstrap === msbBootstrapHex) {
+  throw new Error('Subnet bootstrap cannot equal MSB bootstrap.');
+}
+
+const peerConfig = createPeerConfig(PEER_ENV.MAINNET, {
+  storesDirectory: peerStoresDirectory,
+  storeName: peerStoreName,
+  bootstrap: subnetBootstrap || null,
+  channel: subnetChannel,
+  enableInteractiveMode: true,
+  enableBackgroundTasks: true,
+  enableUpdater: true,
+  replicate: true,
+  ...(peerDhtBootstrap ? { dhtBootstrap: peerDhtBootstrap } : {}),
+});
+
+await ensureKeypairFile(msbConfig.keyPairPath);
+await ensureKeypairFile(peerConfig.keyPairPath);
+
+console.log('=============== STARTING MSB ===============');
+const msb = new MainSettlementBus(msbConfig);
+await msb.ready();
+
+console.log('=============== STARTING MAYHEM PEER ===============');
+const peer = new Peer({
+  config: peerConfig,
+  msb,
+  wallet: new MayhemWallet(),
+  protocol: MayhemProtocol,
+  contract: MayhemContract,
+});
+await peer.ready();
+
+const effectiveSubnetBootstrapHex = peer.base?.key
+  ? peer.base.key.toString('hex')
+  : b4a.isBuffer(peer.config.bootstrap)
+    ? peer.config.bootstrap.toString('hex')
+    : String(peer.config.bootstrap ?? '').toLowerCase();
+
+if (!subnetBootstrap) {
+  fs.mkdirSync(path.dirname(subnetBootstrapFile), { recursive: true });
+  fs.writeFileSync(subnetBootstrapFile, `${effectiveSubnetBootstrapHex}\n`);
+}
+
+const msbChannel = b4a.toString(msbConfig.channel, 'utf8');
+const msbStorePath = path.join(msbStoresDirectory, msbStoreName);
+const peerStorePath = path.join(peerStoresDirectory, peerStoreName);
+const peerWriterKey = peer.writerLocalKey ?? peer.base?.local?.key?.toString('hex') ?? null;
+
+console.log('');
+console.log('==================== MAYHEM INTERCOM ====================');
+console.log('MSB network bootstrap:', msbBootstrapHex);
+console.log('MSB channel:', msbChannel);
+console.log('MSB store:', msbStorePath);
+console.log('Peer store:', peerStorePath);
+if (Array.isArray(msbConfig?.dhtBootstrap) && msbConfig.dhtBootstrap.length > 0) {
+  console.log('MSB DHT bootstrap nodes:', msbConfig.dhtBootstrap.join(', '));
+}
+if (Array.isArray(peerConfig?.dhtBootstrap) && peerConfig.dhtBootstrap.length > 0) {
+  console.log('Peer DHT bootstrap nodes:', peerConfig.dhtBootstrap.join(', '));
+}
+console.log('Peer subnet bootstrap:', effectiveSubnetBootstrapHex);
+console.log('Peer subnet channel:', subnetChannel);
+console.log('Peer pubkey (hex):', peer.wallet.publicKey);
+console.log('Peer trac address (bech32m):', peer.wallet.address ?? null);
+console.log('Peer writer key (hex):', peerWriterKey);
+console.log('Sidechannel entry:', sidechannelEntry);
+if (sidechannelExtras.length > 0) {
+  console.log('Sidechannel extras:', sidechannelExtras.join(', '));
+}
+if (scBridgeEnabled) {
+  const portDisplay = Number.isSafeInteger(scBridgePort) ? scBridgePort : 49222;
+  console.log('SC-Bridge:', `ws://${scBridgeHost}:${portDisplay}`);
+}
+console.log('================================================================');
+console.log('');
+
+let scBridge = null;
+if (scBridgeEnabled) {
+  scBridge = new ScBridge(peer, {
+    host: scBridgeHost,
+    port: Number.isSafeInteger(scBridgePort) ? scBridgePort : 49222,
+    token: scBridgeToken,
+    debug: scBridgeDebug,
+    cliEnabled: scBridgeCliEnabled,
+    requireAuth: true,
+    info: {
+      app: 'mayhem',
+      msbBootstrap: msbBootstrapHex,
+      msbChannel,
+      msbStore: msbStorePath,
+      peerStore: peerStorePath,
+      subnetBootstrap: effectiveSubnetBootstrapHex,
+      subnetChannel,
+      peerPubkey: peer.wallet.publicKey,
+      peerTracAddress: peer.wallet.address ?? null,
+      peerWriterKey,
+      sidechannelEntry,
+      sidechannelExtras: sidechannelExtras.slice(),
+    },
+  });
+}
+
+const sidechannel = new Sidechannel(peer, {
+  channels: [sidechannelEntry, ...sidechannelExtras],
+  debug: sidechannelDebug,
+  maxMessageBytes: Number.isSafeInteger(sidechannelMaxBytes) ? sidechannelMaxBytes : undefined,
+  entryChannel: sidechannelEntry,
+  allowRemoteOpen: sidechannelAllowRemoteOpen,
+  autoJoinOnOpen: sidechannelAutoJoin,
+  onMessage: scBridgeEnabled
+    ? (channel, payload, connection) => scBridge.handleSidechannelMessage(channel, payload, connection)
+    : sidechannelQuiet
+      ? () => {}
+      : null,
+});
+peer.sidechannel = sidechannel;
+
+if (scBridge) {
+  scBridge.attachSidechannel(sidechannel);
+  try {
+    scBridge.start();
+  } catch (err) {
+    console.error('SC-Bridge failed to start:', err?.message ?? err);
+  }
+  peer.scBridge = scBridge;
+}
+
+sidechannel
+  .start()
+  .then(() => {
+    console.log('Sidechannel: ready');
+  })
+  .catch((err) => {
+    console.error('Sidechannel failed to start:', err?.message ?? err);
+  });
+
+const terminal = new Terminal(peer);
+await terminal.start();

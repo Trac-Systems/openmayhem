@@ -1,0 +1,26 @@
+{
+  "name": "mayhem-intercom",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/main.js",
+  "pear": {
+    "name": "mayhem-intercom",
+    "type": "terminal"
+  },
+  "dependencies": {
+    "b4a": "^1.6.7",
+    "bare-ws": "2.0.3",
+    "compact-encoding": "^2.18.0",
+    "crypto": "npm:bare-node-crypto",
+    "fs": "npm:bare-node-fs",
+    "path": "npm:bare-node-path",
+    "protomux": "^3.10.1",
+    "trac-msb": "file:trac/msb",
+    "trac-peer": "file:trac/trac-peer",
+    "trac-wallet": "1.0.1",
+    "util": "npm:bare-node-util"
+  },
+  "overrides": {
+    "trac-wallet": "1.0.1"
+  }
+}

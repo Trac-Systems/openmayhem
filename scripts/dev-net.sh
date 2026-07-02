@@ -36,7 +36,7 @@ for arg in "$@"; do
 done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-app_dir="$repo_root/intercom/trac/contract-test-latest"
+app_dir="$repo_root/intercom"
 stores_dir="$app_dir/stores"
 log_dir="$stores_dir/dev-net-logs"
 pear_runtime="${MAYHEM_PEAR_RUNTIME:-$HOME/Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime}"
@@ -47,7 +47,7 @@ if [[ ! -x "$pear_runtime" ]]; then
 fi
 
 if [[ ! -d "$app_dir" ]]; then
-  echo "missing contract-test-latest app at $app_dir" >&2
+  echo "missing Mayhem Intercom app at $app_dir" >&2
   exit 1
 fi
 
@@ -264,9 +264,9 @@ admin_stats="$(wait_bridge_connections admin "$admin_port" 2 90)"
 joiner_a_stats="$(wait_bridge_connections joiner-a "$joiner_a_port" 2 90)"
 joiner_b_stats="$(wait_bridge_connections joiner-b "$joiner_b_port" 2 90)"
 
-echo "Running simulated contract read on admin (--sim 1, no MSB fee)..."
-sim_result="$(bridge_request "$admin_port" '{"type":"cli","command":"/tx --command \"read_snapshot\" --sim 1"}')"
-node -e 'const r = JSON.parse(process.argv[1]); if (r.type !== "cli_result" || r.ok !== true) { console.error(process.argv[1]); process.exit(1); }' "$sim_result"
+echo "Running simulated Mayhem no-op on admin (--sim 1, no MSB fee)..."
+sim_result="$(bridge_request "$admin_port" '{"type":"cli","command":"/tx --command \"noop\" --sim 1"}')"
+node -e 'const r = JSON.parse(process.argv[1]); if (r.type !== "cli_result" || r.ok !== true || !r.result || r.result.ok !== true || r.result.op !== "noop") { console.error(process.argv[1]); process.exit(1); }' "$sim_result"
 
 cat <<EOF
 Mayhem dev-net ready.
