@@ -1,14 +1,17 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mayhem_enclave::{
-    boot_sealed_store, build_merkle_manifest, build_tier1_attestation_report, hex_secret,
+    boot_sealed_store, build_merkle_manifest, build_sandbox_profile,
+    build_tier1_attestation_report, expect_outbound_tcp_denied, hex_secret,
     load_or_create_runtime_keypair_store, measure_binary, measure_current_binary,
-    provider_signing_seed_from_hex, seal_artifact, unix_timestamp_now, BootOptions, KeyContext,
-    RuntimeKeyContext, RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationOptions,
-    DEFAULT_CHUNK_SIZE,
+    probe_outbound_tcp, provider_signing_seed_from_hex, run_sandboxed_command, seal_artifact,
+    unix_timestamp_now, BootOptions, KeyContext, RuntimeKeyContext, RuntimeKeypairStoreOptions,
+    SandboxConfig, SandboxPlatform, SealOptions, Tier1AttestationOptions, DEFAULT_CHUNK_SIZE,
+    DEFAULT_TCP_PROBE_TIMEOUT_MS,
 };
 use mayhem_proto::CatalogEnclaveIdentity;
 
@@ -32,6 +35,12 @@ enum Commands {
     InitKeypair(RuntimeKeypairArgs),
     /// Build and sign a Tier-1 attestation report for a challenge nonce.
     Attest(AttestArgs),
+    /// Print the platform sandbox policy for a sealed enclave process.
+    SandboxProfile(SandboxProfileArgs),
+    /// Run a command under the current platform sandbox.
+    SandboxRun(SandboxRunArgs),
+    /// Probe whether outbound TCP is denied from this process.
+    SandboxProbeTcp(SandboxProbeTcpArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -201,21 +210,89 @@ struct AttestArgs {
     json: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PlatformArg {
+    Current,
+    Linux,
+    Macos,
+    Windows,
+}
+
+#[derive(Debug, Parser)]
+struct SandboxProfileArgs {
+    /// Read-only sealed store directory.
+    #[arg(long, value_name = "PATH")]
+    sealed_store: PathBuf,
+
+    /// Local IPC socket/named-pipe path allowed through the sandbox.
+    #[arg(long, value_name = "PATH")]
+    ipc_socket: PathBuf,
+
+    /// Platform profile to render.
+    #[arg(long, value_enum, default_value_t = PlatformArg::Current)]
+    platform: PlatformArg,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct SandboxRunArgs {
+    /// Read-only sealed store directory.
+    #[arg(long, value_name = "PATH")]
+    sealed_store: PathBuf,
+
+    /// Local IPC socket/named-pipe path allowed through the sandbox.
+    #[arg(long, value_name = "PATH")]
+    ipc_socket: PathBuf,
+
+    /// Command and arguments to run under the sandbox.
+    #[arg(required = true, trailing_var_arg = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct SandboxProbeTcpArgs {
+    /// TCP address to connect to, e.g. 127.0.0.1:12345.
+    #[arg(long)]
+    addr: String,
+
+    /// Treat sandbox-denied TCP as success and any other outcome as failure.
+    #[arg(long)]
+    expect_denied: bool,
+
+    /// Probe timeout in milliseconds.
+    #[arg(long, default_value_t = DEFAULT_TCP_PROBE_TIMEOUT_MS)]
+    timeout_ms: u64,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<i32, Box<dyn std::error::Error>> {
     match Cli::parse().command {
-        Commands::SealLocal(args) => seal_local(args),
-        Commands::BootCheck(args) => boot_check(args),
-        Commands::MeasureBinary(args) => measure_binary_command(args),
-        Commands::InitKeypair(args) => init_keypair(args),
-        Commands::Attest(args) => attest(args),
+        Commands::SealLocal(args) => seal_local(args)?,
+        Commands::BootCheck(args) => boot_check(args)?,
+        Commands::MeasureBinary(args) => measure_binary_command(args)?,
+        Commands::InitKeypair(args) => init_keypair(args)?,
+        Commands::Attest(args) => attest(args)?,
+        Commands::SandboxProfile(args) => sandbox_profile(args)?,
+        Commands::SandboxRun(args) => return sandbox_run(args),
+        Commands::SandboxProbeTcp(args) => sandbox_probe_tcp(args)?,
     }
+    Ok(0)
 }
 
 fn seal_local(args: SealLocalArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -348,6 +425,58 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("binary_hash={}", report.report.binary_hash);
         println!("manifest_hash={}", report.report.manifest_hash);
         println!("report_head={}", report.report_head);
+    }
+    Ok(())
+}
+
+fn sandbox_profile(args: SandboxProfileArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let config = SandboxConfig::new(args.sealed_store, args.ipc_socket);
+    let platform = match args.platform {
+        PlatformArg::Current => mayhem_enclave::current_sandbox_platform()?,
+        PlatformArg::Linux => SandboxPlatform::LinuxSeccompBpf,
+        PlatformArg::Macos => SandboxPlatform::MacosSandboxExec,
+        PlatformArg::Windows => SandboxPlatform::WindowsAppContainer,
+    };
+    let profile = build_sandbox_profile(&config, platform)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&profile)?);
+    } else {
+        println!("{}", profile.policy);
+    }
+    Ok(())
+}
+
+fn sandbox_run(args: SandboxRunArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let config = SandboxConfig::new(args.sealed_store, args.ipc_socket);
+    let report = run_sandboxed_command(&config, &args.command)?;
+    Ok(report
+        .status_code
+        .unwrap_or(if report.success { 0 } else { 1 }))
+}
+
+fn sandbox_probe_tcp(args: SandboxProbeTcpArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = Duration::from_millis(args.timeout_ms);
+    let report = if args.expect_denied {
+        expect_outbound_tcp_denied(&args.addr, timeout)?
+    } else {
+        probe_outbound_tcp(&args.addr, timeout)
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.connected {
+        println!("outbound tcp connected: {}", report.addr);
+    } else if report.denied {
+        println!(
+            "outbound tcp denied: {} kind={:?} raw_os_error={:?}",
+            report.addr, report.error_kind, report.raw_os_error
+        );
+    } else {
+        println!(
+            "outbound tcp failed: {} kind={:?} raw_os_error={:?}",
+            report.addr, report.error_kind, report.raw_os_error
+        );
     }
     Ok(())
 }

@@ -3,7 +3,10 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -24,6 +27,8 @@ pub const MERKLE_KIND: &str = "blake3_merkle_v1";
 pub const SEALED_STORE_MANIFEST: &str = "sealed-manifest.json";
 pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
 pub const TIER1_ATTESTATION_TIER: u8 = 1;
+pub const SANDBOX_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_TCP_PROBE_TIMEOUT_MS: u64 = 2_000;
 
 type Result<T> = std::result::Result<T, EnclaveError>;
 
@@ -64,6 +69,14 @@ pub enum EnclaveError {
     RuntimeKeypairAuthenticationFailed,
     #[error("runtime keypair store already exists: {0}")]
     RuntimeKeypairStoreAlreadyExists(PathBuf),
+    #[error("sandbox command cannot be empty")]
+    SandboxCommandEmpty,
+    #[error("sandbox is not supported on this platform: {0}")]
+    SandboxUnsupported(String),
+    #[error("outbound TCP unexpectedly succeeded to {addr}")]
+    OutboundTcpUnexpectedlySucceeded { addr: String },
+    #[error("outbound TCP failed, but not with a sandbox denial: {addr}: {error}")]
+    OutboundTcpNotDenied { addr: String, error: String },
     #[error(
         "sealed chunk hash mismatch at chunk {chunk_index}: expected {expected}, got {actual}"
     )]
@@ -121,6 +134,46 @@ pub struct Tier1AttestationOptions {
 pub struct Tier1AttestationReport {
     pub report: AttestationReport,
     pub report_head: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPlatform {
+    LinuxSeccompBpf,
+    MacosSandboxExec,
+    WindowsAppContainer,
+}
+
+#[derive(Clone, Debug)]
+pub struct SandboxConfig {
+    pub sealed_store_dir: PathBuf,
+    pub ipc_socket_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxProfile {
+    pub schema_version: u32,
+    pub platform: SandboxPlatform,
+    pub sealed_store_dir: PathBuf,
+    pub ipc_socket_path: PathBuf,
+    pub policy: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxRunReport {
+    pub platform: SandboxPlatform,
+    pub command: Vec<String>,
+    pub status_code: Option<i32>,
+    pub success: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TcpProbeReport {
+    pub addr: String,
+    pub connected: bool,
+    pub denied: bool,
+    pub error_kind: Option<String>,
+    pub raw_os_error: Option<i32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,6 +332,15 @@ impl RuntimeKeypairStoreOptions {
             path: path.into(),
             context,
             provider_secret,
+        }
+    }
+}
+
+impl SandboxConfig {
+    pub fn new(sealed_store_dir: impl Into<PathBuf>, ipc_socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            sealed_store_dir: sealed_store_dir.into(),
+            ipc_socket_path: ipc_socket_path.into(),
         }
     }
 }
@@ -812,6 +874,120 @@ pub fn build_tier1_attestation_report(
     })
 }
 
+pub fn current_sandbox_platform() -> Result<SandboxPlatform> {
+    if cfg!(target_os = "linux") {
+        Ok(SandboxPlatform::LinuxSeccompBpf)
+    } else if cfg!(target_os = "macos") {
+        Ok(SandboxPlatform::MacosSandboxExec)
+    } else if cfg!(target_os = "windows") {
+        Ok(SandboxPlatform::WindowsAppContainer)
+    } else {
+        Err(EnclaveError::SandboxUnsupported(
+            std::env::consts::OS.to_owned(),
+        ))
+    }
+}
+
+pub fn build_sandbox_profile(
+    config: &SandboxConfig,
+    platform: SandboxPlatform,
+) -> Result<SandboxProfile> {
+    validate_sandbox_config(config)?;
+    let policy = match platform {
+        SandboxPlatform::LinuxSeccompBpf => linux_seccomp_policy_document(),
+        SandboxPlatform::MacosSandboxExec => macos_sandbox_exec_profile(config),
+        SandboxPlatform::WindowsAppContainer => windows_appcontainer_policy_document(config)?,
+    };
+    Ok(SandboxProfile {
+        schema_version: SANDBOX_SCHEMA_VERSION,
+        platform,
+        sealed_store_dir: config.sealed_store_dir.clone(),
+        ipc_socket_path: config.ipc_socket_path.clone(),
+        policy,
+    })
+}
+
+pub fn run_sandboxed_command(
+    config: &SandboxConfig,
+    command: &[String],
+) -> Result<SandboxRunReport> {
+    validate_sandbox_config(config)?;
+    if command.is_empty() {
+        return Err(EnclaveError::SandboxCommandEmpty);
+    }
+    let platform = current_sandbox_platform()?;
+    let status = run_platform_sandbox(config, command)?;
+    Ok(SandboxRunReport {
+        platform,
+        command: command.to_vec(),
+        status_code: status.code(),
+        success: status.success(),
+    })
+}
+
+pub fn apply_current_process_sandbox(config: &SandboxConfig) -> Result<()> {
+    validate_sandbox_config(config)?;
+    apply_platform_sandbox(config)
+}
+
+pub fn probe_outbound_tcp(addr: &str, timeout: Duration) -> TcpProbeReport {
+    let socket_addr = match addr
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+    {
+        Some(addr) => addr,
+        None => {
+            return TcpProbeReport {
+                addr: addr.to_owned(),
+                connected: false,
+                denied: false,
+                error_kind: Some("invalid-address".to_owned()),
+                raw_os_error: None,
+            };
+        }
+    };
+
+    match TcpStream::connect_timeout(&socket_addr, timeout) {
+        Ok(_) => TcpProbeReport {
+            addr: addr.to_owned(),
+            connected: true,
+            denied: false,
+            error_kind: None,
+            raw_os_error: None,
+        },
+        Err(err) => {
+            let denied = is_tcp_denied_error(&err);
+            TcpProbeReport {
+                addr: addr.to_owned(),
+                connected: false,
+                denied,
+                error_kind: Some(format!("{:?}", err.kind())),
+                raw_os_error: err.raw_os_error(),
+            }
+        }
+    }
+}
+
+pub fn expect_outbound_tcp_denied(addr: &str, timeout: Duration) -> Result<TcpProbeReport> {
+    let report = probe_outbound_tcp(addr, timeout);
+    if report.denied {
+        Ok(report)
+    } else if report.connected {
+        Err(EnclaveError::OutboundTcpUnexpectedlySucceeded {
+            addr: addr.to_owned(),
+        })
+    } else {
+        Err(EnclaveError::OutboundTcpNotDenied {
+            addr: addr.to_owned(),
+            error: format!(
+                "kind={:?} raw_os_error={:?}",
+                report.error_kind, report.raw_os_error
+            ),
+        })
+    }
+}
+
 fn append_file_range(
     source: &Path,
     part_path: &Path,
@@ -967,6 +1143,20 @@ fn validate_identity(identity: &CatalogEnclaveIdentity) -> Result<()> {
     Ok(())
 }
 
+fn validate_sandbox_config(config: &SandboxConfig) -> Result<()> {
+    if config.sealed_store_dir.as_os_str().is_empty() {
+        return Err(EnclaveError::InvalidInput(
+            "sealed_store_dir cannot be empty".to_owned(),
+        ));
+    }
+    if config.ipc_socket_path.as_os_str().is_empty() {
+        return Err(EnclaveError::InvalidInput(
+            "ipc_socket_path cannot be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hex_field(field: &str, value: &str, bytes: usize) -> Result<()> {
     if value.len() != bytes * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(EnclaveError::InvalidInput(format!(
@@ -974,6 +1164,147 @@ fn validate_hex_field(field: &str, value: &str, bytes: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn macos_sandbox_exec_profile(config: &SandboxConfig) -> String {
+    let sealed_store = sandbox_quote_path(&config.sealed_store_dir);
+    let ipc_socket = sandbox_quote_path(&config.ipc_socket_path);
+    let ipc_parent = config
+        .ipc_socket_path
+        .parent()
+        .map(sandbox_quote_path)
+        .unwrap_or_else(|| "\"/tmp\"".to_owned());
+
+    format!(
+        r#"(version 1)
+(allow default)
+(deny network*)
+(allow file-read* (subpath {sealed_store}))
+(deny file-write* (subpath {sealed_store}))
+(allow file-read* file-write* (literal {ipc_socket}))
+(allow file-read* file-write* (subpath {ipc_parent}))
+"#
+    )
+}
+
+fn linux_seccomp_policy_document() -> String {
+    serde_json::json!({
+        "schema_version": SANDBOX_SCHEMA_VERSION,
+        "kind": "seccomp-bpf",
+        "default_action": "allow",
+        "match_action": "errno(EPERM)",
+        "blocked_syscalls": [
+            { "syscall": "socket", "arg": "domain", "values": ["AF_INET", "AF_INET6", "AF_PACKET", "AF_NETLINK"] }
+        ],
+        "fs": {
+            "sealed_store": "read-only by mount/permissions before applying seccomp",
+            "ipc_socket": "AF_UNIX only"
+        }
+    })
+    .to_string()
+}
+
+fn windows_appcontainer_policy_document(config: &SandboxConfig) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "schema_version": SANDBOX_SCHEMA_VERSION,
+        "kind": "appcontainer",
+        "capabilities": [],
+        "network": "no internetClient/privateNetworkClientServer capability",
+        "sealed_store": {
+            "path": config.sealed_store_dir,
+            "access": "read-only"
+        },
+        "ipc_socket": {
+            "path": config.ipc_socket_path,
+            "access": "only named-pipe/AF_UNIX IPC endpoint granted to the container"
+        }
+    }))?)
+}
+
+fn sandbox_quote_path(path: &Path) -> String {
+    format!(
+        "\"{}\"",
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
+}
+
+fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<ExitStatus> {
+    #[cfg(target_os = "macos")]
+    {
+        let profile = build_sandbox_profile(config, SandboxPlatform::MacosSandboxExec)?;
+        Command::new("sandbox-exec")
+            .arg("-p")
+            .arg(profile.policy)
+            .args(command)
+            .status()
+            .map_err(EnclaveError::Io)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        apply_current_process_sandbox(config)?;
+        Command::new(&command[0])
+            .args(&command[1..])
+            .status()
+            .map_err(EnclaveError::Io)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (config, command);
+        Err(EnclaveError::SandboxUnsupported(
+            "AppContainer process launch is not implemented in this build".to_owned(),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (config, command);
+        Err(EnclaveError::SandboxUnsupported(
+            std::env::consts::OS.to_owned(),
+        ))
+    }
+}
+
+fn apply_platform_sandbox(config: &SandboxConfig) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = config;
+        linux::apply_network_deny_seccomp()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = config;
+        Err(EnclaveError::SandboxUnsupported(
+            "macOS sandbox-exec must spawn a sandboxed child process".to_owned(),
+        ))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = config;
+        Err(EnclaveError::SandboxUnsupported(
+            "Windows AppContainer process launch is not implemented in this build".to_owned(),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = config;
+        Err(EnclaveError::SandboxUnsupported(
+            std::env::consts::OS.to_owned(),
+        ))
+    }
+}
+
+fn is_tcp_denied_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    matches!(err.raw_os_error(), Some(1 | 13))
 }
 
 fn validate_manifest_context(expected: &KeyContext, actual: &KeyContext) -> Result<()> {
@@ -1170,6 +1501,54 @@ fn merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{EnclaveError, Result};
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule,
+    };
+    use std::collections::BTreeMap;
+    use std::convert::TryInto;
+
+    pub fn apply_network_deny_seccomp() -> Result<()> {
+        let forbidden_domains = [
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_PACKET,
+            libc::AF_NETLINK,
+        ];
+        let mut socket_rules = Vec::with_capacity(forbidden_domains.len());
+        for domain in forbidden_domains {
+            socket_rules.push(
+                SeccompRule::new(vec![SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    domain as u64,
+                )
+                .map_err(seccomp_error)?])
+                .map_err(seccomp_error)?,
+            );
+        }
+
+        let rules = BTreeMap::from([(libc::SYS_socket, socket_rules)]);
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            std::env::consts::ARCH.try_into().map_err(seccomp_error)?,
+        )
+        .map_err(seccomp_error)?;
+        let bpf: BpfProgram = filter.try_into().map_err(seccomp_error)?;
+        seccompiler::apply_filter(&bpf).map_err(seccomp_error)
+    }
+
+    fn seccomp_error<E: std::fmt::Display>(err: E) -> EnclaveError {
+        EnclaveError::SandboxUnsupported(format!("seccomp-bpf setup failed: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,6 +1572,10 @@ mod tests {
             provider_id: "provider-test".to_owned(),
             enclave_id: "enclave-test".to_owned(),
         }
+    }
+
+    fn sandbox_config() -> SandboxConfig {
+        SandboxConfig::new("/sealed/store", "/tmp/mayhem-ipc.sock")
     }
 
     #[test]
@@ -1389,6 +1772,41 @@ mod tests {
         })
         .expect_err("wrong identity binary hash must fail before signing");
         assert!(err.to_string().contains("does not match measured"));
+        Ok(())
+    }
+
+    #[test]
+    fn macos_sandbox_profile_denies_network_and_sealed_store_writes() -> Result<()> {
+        let profile = build_sandbox_profile(&sandbox_config(), SandboxPlatform::MacosSandboxExec)?;
+
+        assert_eq!(profile.schema_version, SANDBOX_SCHEMA_VERSION);
+        assert!(profile.policy.contains("(deny network*)"));
+        assert!(profile.policy.contains("(deny file-write*"));
+        assert!(profile.policy.contains("/sealed/store"));
+        assert!(profile.policy.contains("/tmp/mayhem-ipc.sock"));
+        Ok(())
+    }
+
+    #[test]
+    fn linux_sandbox_profile_documents_seccomp_network_deny() -> Result<()> {
+        let profile = build_sandbox_profile(&sandbox_config(), SandboxPlatform::LinuxSeccompBpf)?;
+
+        assert!(profile.policy.contains("seccomp-bpf"));
+        assert!(profile.policy.contains("AF_INET"));
+        assert!(profile.policy.contains("AF_INET6"));
+        assert!(profile.policy.contains("AF_UNIX only"));
+        Ok(())
+    }
+
+    #[test]
+    fn windows_sandbox_profile_uses_appcontainer_without_network_capabilities() -> Result<()> {
+        let profile =
+            build_sandbox_profile(&sandbox_config(), SandboxPlatform::WindowsAppContainer)?;
+
+        assert!(profile.policy.contains("appcontainer"));
+        assert!(profile.policy.contains("\"capabilities\": []"));
+        assert!(profile.policy.contains("no internetClient"));
+        assert!(profile.policy.contains("read-only"));
         Ok(())
     }
 }
