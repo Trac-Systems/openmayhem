@@ -1,0 +1,8 @@
+{
+  "key_id": "mayhem-dev-catalog-v1",
+  "alg": "ed25519",
+  "public_key": "d012f4ef4ebcb79f9a93fbafcb5d3fc8a072c9644f89b9533ca0e2fe1e38b314",
+  "status": "active",
+  "created_at": "2026-07-02T00:00:00Z",
+  "custody": "dev catalog key; private key is not committed and should be rotated to an operator-held production key before mainnet"
+}

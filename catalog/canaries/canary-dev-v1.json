@@ -1,0 +1,39 @@
+{
+  "set_id": "canary-dev-v1",
+  "description": "Small local dev canaries for Qwen3.5-4B MLX/GGUF bring-up. Fingerprints are placeholders until backend calibration in P2b.4.",
+  "prompts": [
+    {
+      "id": "dev-arithmetic-json",
+      "messages": [
+        { "role": "system", "content": "Return compact JSON only." },
+        { "role": "user", "content": "What is 17 + 25? Use key answer." }
+      ],
+      "temperature": 0,
+      "max_tokens": 32
+    },
+    {
+      "id": "dev-tool-shape",
+      "messages": [
+        { "role": "system", "content": "You may call tools when useful." },
+        { "role": "user", "content": "Look up the weather for Berlin using the provided weather tool." }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": { "type": "string" }
+              },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 128
+    }
+  ]
+}

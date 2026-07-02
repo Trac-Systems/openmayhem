@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "catalog_id": "mayhem-mainnet-v1",
+  "generated_at": "2026-07-02T00:00:00Z",
+  "models": [
+    {
+      "model_id": "qwen/qwen3.5-4b-mlx-4bit-dev",
+      "family": "qwen3.5",
+      "params_b": 4,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "Qwen/Qwen3.5-4B",
+          "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "mlx-lm convert --quantize",
+            "method": "mlx-4bit",
+            "input_sha256": "3fc0f95dfd79787bdc2a73e2c5880fcda4e53a70f10aba390362407178bd34e9",
+            "output_sha256": "5fb9acd0246866381cf8c5c354c6db1019f6498eec4ccb4f5edcc71ffeacb2db"
+          }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "2af71558e438db0b73a20beab92dc278a94e1bbe974c00c1a33e3ab62d53a608"
+      },
+      "artifacts": {
+        "mlx-4bit": {
+          "engine": "mlx",
+          "source": {
+            "kind": "huggingface",
+            "repo": "mlx-community/Qwen3.5-4B-MLX-4bit",
+            "revision": "32f3e8ecf65426fc3306969496342d504bfa13f3",
+            "publisher_key": "mlx-community"
+          },
+          "path": "model.safetensors",
+          "artifact_root": "ecbb929194a044b4cf4dc51274e60da39cac5b82f7d4ca1c8c4a5455ff16411e",
+          "artifact_root_kind": "blake3_descriptor_hf_xet_sha256",
+          "weights_bytes": 2500000000,
+          "source_sha256": "5fb9acd0246866381cf8c5c354c6db1019f6498eec4ccb4f5edcc71ffeacb2db",
+          "tokenizer_sha256": "18de2b26d5a2d54445551638c0e7abf264016ef2c971c52a52a9174c559deecd",
+          "chat_template_sha256": "67b18035ebb6843c29c742ff89cd4e7269205f51c0d683c8888f1d8764caea54",
+          "download_check": true
+        }
+      },
+      "caps": { "tools": true, "json": true, "ctx_max": 8192, "vision": false },
+      "requirements": {
+        "min_ram_gb": 8,
+        "min_vram_gb_full_offload": 0,
+        "cpu_flags": ["neon"],
+        "backends": ["mlx"]
+      },
+      "canary": {
+        "set_id": "canary-dev-v1",
+        "match_min": 0.9,
+        "fingerprints": {
+          "mlx-4bit": "7f3e07ae395c027fc93aec6e81421cff17bcc4385d184f88178c2865fd95be1b"
+        }
+      },
+      "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 }
+    },
+    {
+      "model_id": "qwen/qwen3.5-4b-gguf-q4_k_m-dev",
+      "family": "qwen3.5",
+      "params_b": 4,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "Qwen/Qwen3.5-4B",
+          "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "llama.cpp convert+quantize",
+            "method": "q4_k_m",
+            "input_sha256": "3fc0f95dfd79787bdc2a73e2c5880fcda4e53a70f10aba390362407178bd34e9",
+            "output_sha256": "25082a7dd3776cc3c741c6347d3bd04523f05796607b3fbc32fa3a25dfa1418c"
+          }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "2af71558e438db0b73a20beab92dc278a94e1bbe974c00c1a33e3ab62d53a608"
+      },
+      "artifacts": {
+        "gguf-q4_k_m": {
+          "engine": "llama.cpp",
+          "source": {
+            "kind": "huggingface",
+            "repo": "lmstudio-community/Qwen3.5-4B-GGUF",
+            "revision": "f9f88ac3e234be915e23811a6d28ea287bdb927e",
+            "publisher_key": "lmstudio-community"
+          },
+          "path": "Qwen3.5-4B-Q4_K_M.gguf",
+          "artifact_root": "190bfadab238a4506e8ced226c340f13c3b2e3d47e128425e58fd3132029539b",
+          "artifact_root_kind": "blake3_descriptor_hf_xet_sha256",
+          "weights_bytes": 2700000000,
+          "source_sha256": "25082a7dd3776cc3c741c6347d3bd04523f05796607b3fbc32fa3a25dfa1418c",
+          "tokenizer_sha256": "d96089a477f3b15e4a41d442fe4289f560f459b295831639c8f739600f0dd746",
+          "chat_template_sha256": "eb9b4146d0c3ac3a3d669c182cb96ac4587aa48d7ba0a06cb97a631250df0f0d",
+          "download_check": true
+        }
+      },
+      "caps": { "tools": true, "json": true, "ctx_max": 8192, "vision": false },
+      "requirements": {
+        "min_ram_gb": 8,
+        "min_vram_gb_full_offload": 6,
+        "cpu_flags": ["avx2|neon"],
+        "backends": ["llama.cpp"]
+      },
+      "canary": {
+        "set_id": "canary-dev-v1",
+        "match_min": 0.9,
+        "fingerprints": {
+          "gguf-q4_k_m": "c6e8983e4120bcc7f68c7f3185ff44c7e02fc71dcc06b8e8ece7f65bd04a329c"
+        }
+      },
+      "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 18, "out_per_1k": 55 }
+    },
+    {
+      "model_id": "meta/llama-3.1-8b-instruct@4bit",
+      "family": "llama-3.1",
+      "params_b": 8,
+      "tier": "launch",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "meta-llama/Llama-3.1-8B-Instruct",
+          "revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          { "tool": "llama.cpp convert+quantize", "method": "q4_k_m", "input_sha256": "68cd046b18d7394df35f4ac4005c65335f99cdf77e9f78cebfc4468824cae0c6", "output_sha256": "6fc1c37a0d8df0cc4b68da74fe070ddc52eeeac7639ab8fd11169c1838230b2a" },
+          { "tool": "mlx-lm convert --quantize", "method": "mlx-4bit", "input_sha256": "68cd046b18d7394df35f4ac4005c65335f99cdf77e9f78cebfc4468824cae0c6", "output_sha256": "b6bf6a50d16ac138ce5c248208c7426319f3f20b3d6aa5a62300f4663aa41698" },
+          { "tool": "TensorRT Model Optimizer", "method": "nvfp4/fp8", "input_sha256": "68cd046b18d7394df35f4ac4005c65335f99cdf77e9f78cebfc4468824cae0c6", "output_sha256": "2b2e52b0138997d9b1658c7047c811b48c3927f5e2cfc2dedacb818d7dab530e" }
+        ],
+        "license": "llama3.1",
+        "license_sha256": "ba7f7cdca7fa0c05bd7fdcd13bb3a338af5158ee3e14f79f4c0ddf74c0f9b85a"
+      },
+      "artifacts": {
+        "gguf-q4_k_m": { "engine": "llama.cpp", "source": { "kind": "huggingface", "repo": "mayhem-catalog/llama-3.1-8b-instruct-GGUF", "revision": "0e9e39f249a16976918f6564b8830bc894c89659", "publisher_key": "huggingface-repo" }, "path": "llama-3.1-8b-instruct-Q4_K_M.gguf", "artifact_root": "7144a17813133c78ba2831b7926ff04cfef830a3ca86834baed2e8abc70bac02", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 4920000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "mlx-4bit": { "engine": "mlx", "source": { "kind": "huggingface", "repo": "mayhem-catalog/llama-3.1-8b-instruct-MLX-4bit", "revision": "0e9e39f249a16976918f6564b8830bc894c89659", "publisher_key": "huggingface-repo" }, "path": "model.safetensors", "artifact_root": "fe4d48970074f6248e87418d49ef1b3a6343b2a34f79896db1a16780dcd0535c", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 4580000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "trt-fp8": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/llama-3.1-8b-instruct-TRT-FP8", "revision": "0e9e39f249a16976918f6564b8830bc894c89659", "publisher_key": "huggingface-repo" }, "path": "checkpoint.fp8.safetensors", "artifact_root": "7e3c86482dc51aa4c0d0c425aaa18499a5479841d1db01769885ed8b33405a22", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 8900000000, "min_compute_cap": "8.9", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "nvfp4": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/llama-3.1-8b-instruct-NVFP4", "revision": "0e9e39f249a16976918f6564b8830bc894c89659", "publisher_key": "huggingface-repo" }, "path": "checkpoint.nvfp4.safetensors", "artifact_root": "02fde7da165c5f95bf77a5e3d48c2ba13d2dcb35da1e4c74a1b7acc6e97e5951", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 4710000000, "min_compute_cap": "10.0", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" }
+      },
+      "caps": { "tools": true, "json": true, "ctx_max": 131072, "vision": false },
+      "requirements": { "min_ram_gb": 16, "min_vram_gb_full_offload": 8, "cpu_flags": ["avx2|neon"], "backends": ["llama.cpp", "mlx", "trt-llm"] },
+      "canary": { "set_id": "canary-launch-v1", "match_min": 0.9, "fingerprints": { "gguf-q4_k_m": "bf4046fa02886e8b5c4d1527867790d51aa67b143d48497011dbfd10e06a4759", "mlx-4bit": "69539ac705ce86bfdf087dc8e82146f5289331acea878dd425c6d6c2cd2d8e08", "trt-fp8": "5994b36bbe2c1c1f48719316bfc8a6f130a621db3c269279bd7f5713ec3aecd4", "nvfp4": "9de49ebd4ac1581c93fe5dc39ee546c429bc38d475307792f223b098c6bda70e" } },
+      "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 18, "out_per_1k": 55 }
+    },
+    {
+      "model_id": "qwen/qwen2.5-72b-instruct@4bit",
+      "family": "qwen2.5",
+      "params_b": 72,
+      "tier": "launch",
+      "provenance": {
+        "source": { "kind": "huggingface", "repo": "Qwen/Qwen2.5-72B-Instruct", "revision": "495f39366efef23836d0cfae4fbe635880d2be31", "publisher_key": "huggingface-repo" },
+        "conversion": [
+          { "tool": "llama.cpp convert+quantize", "method": "q4_k_m", "input_sha256": "0b69a398fc2e9fa4c29cdb652bd1cdc9d55a404ab31d90f8f884f16f75d4ad82", "output_sha256": "5675ff135e090b0b0f6cae5b05ce3144c2527885186d54a5df337f5c009675aa" },
+          { "tool": "TensorRT Model Optimizer", "method": "nvfp4/fp8", "input_sha256": "0b69a398fc2e9fa4c29cdb652bd1cdc9d55a404ab31d90f8f884f16f75d4ad82", "output_sha256": "88dd308a40bf97ae9dd6948737e4265583799d84361005a157d7fed8b11010b2" }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "2af71558e438db0b73a20beab92dc278a94e1bbe974c00c1a33e3ab62d53a608"
+      },
+      "artifacts": {
+        "gguf-q4_k_m": { "engine": "llama.cpp", "source": { "kind": "huggingface", "repo": "mayhem-catalog/qwen2.5-72b-instruct-GGUF", "revision": "495f39366efef23836d0cfae4fbe635880d2be31", "publisher_key": "huggingface-repo" }, "path": "qwen2.5-72b-instruct-Q4_K_M.gguf", "artifact_root": "fcd58ccf9a9371062ddaeb7e14fb84608c551b5ce0ec0f6776fe204f6afff03c", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 43000000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "trt-fp8": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/qwen2.5-72b-instruct-TRT-FP8", "revision": "495f39366efef23836d0cfae4fbe635880d2be31", "publisher_key": "huggingface-repo" }, "path": "checkpoint.fp8.safetensors", "artifact_root": "70623eb4057d49b6fe3f3a4d052f9fb27f6e4befd245adb81ff7d6e21ebbfd66", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 76000000000, "min_compute_cap": "8.9", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "nvfp4": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/qwen2.5-72b-instruct-NVFP4", "revision": "495f39366efef23836d0cfae4fbe635880d2be31", "publisher_key": "huggingface-repo" }, "path": "checkpoint.nvfp4.safetensors", "artifact_root": "356c2bbd3caebdde0633cf6f3348dd1edc5b0bf69c88dbd97f74792419dca295", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 39000000000, "min_compute_cap": "10.0", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" }
+      },
+      "caps": { "tools": true, "json": true, "ctx_max": 131072, "vision": false },
+      "requirements": { "min_ram_gb": 96, "min_vram_gb_full_offload": 48, "cpu_flags": ["avx2|neon"], "backends": ["llama.cpp", "trt-llm"] },
+      "canary": { "set_id": "canary-launch-v1", "match_min": 0.9, "fingerprints": { "gguf-q4_k_m": "3524e00aa3a0df9250d4d7c4d0361c46217d65b3b3a91b79ae31c86b21c8511f", "trt-fp8": "9d11a04b0c48c20cfd553adc99f2b56f1685e24830ab9724bd2741d8f1176452", "nvfp4": "13d7854cc396421727f8fb79061f8ceaa47f236bb4a7393c536ed32fe31d091a" } },
+      "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 140, "out_per_1k": 420 }
+    },
+    {
+      "model_id": "mistral/devstral-small@4bit",
+      "family": "devstral",
+      "params_b": 24,
+      "tier": "launch",
+      "provenance": {
+        "source": { "kind": "huggingface", "repo": "mistralai/Devstral-Small-2505", "revision": "c2a9d81a2989af566682b4cecc828c84556076c5", "publisher_key": "huggingface-repo" },
+        "conversion": [
+          { "tool": "llama.cpp convert+quantize", "method": "q4_k_m", "input_sha256": "cfa9d7edcfa5c9cbb5453a6fb9664eb577e798d4c518072e09e9487d19d83fc9", "output_sha256": "423234d1689080310a52a18ff5f85b2206c4a0d90d395d4f7746fc6b04787a8d" },
+          { "tool": "mlx-lm convert --quantize", "method": "mlx-4bit", "input_sha256": "cfa9d7edcfa5c9cbb5453a6fb9664eb577e798d4c518072e09e9487d19d83fc9", "output_sha256": "6f45699e6e7364189c66c22b31c617f7fb63587dec9db952fe9e90729c7f4b1a" },
+          { "tool": "TensorRT Model Optimizer", "method": "nvfp4/fp8", "input_sha256": "cfa9d7edcfa5c9cbb5453a6fb9664eb577e798d4c518072e09e9487d19d83fc9", "output_sha256": "62da894a919c1458c4c01d53697bd313a562e4992d625a2860307f04723751b9" }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "2af71558e438db0b73a20beab92dc278a94e1bbe974c00c1a33e3ab62d53a608"
+      },
+      "artifacts": {
+        "gguf-q4_k_m": { "engine": "llama.cpp", "source": { "kind": "huggingface", "repo": "mayhem-catalog/devstral-small-GGUF", "revision": "c2a9d81a2989af566682b4cecc828c84556076c5", "publisher_key": "huggingface-repo" }, "path": "devstral-small-Q4_K_M.gguf", "artifact_root": "a1bac456dcd97428458af34100866e93f5ecfe7eab8e27345b84d69e611ce43b", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 14500000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "mlx-4bit": { "engine": "mlx", "source": { "kind": "huggingface", "repo": "mayhem-catalog/devstral-small-MLX-4bit", "revision": "c2a9d81a2989af566682b4cecc828c84556076c5", "publisher_key": "huggingface-repo" }, "path": "model.safetensors", "artifact_root": "8f63431063266665876d0d2f0158e5288fce2de4ad7a63417417171687652ec0", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 13200000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "trt-fp8": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/devstral-small-TRT-FP8", "revision": "c2a9d81a2989af566682b4cecc828c84556076c5", "publisher_key": "huggingface-repo" }, "path": "checkpoint.fp8.safetensors", "artifact_root": "2194fba3f92ed68e21ca3042ad896558da7dbb5d9dd7128fe80fefbe1b7cea63", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 26000000000, "min_compute_cap": "8.9", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "nvfp4": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/devstral-small-NVFP4", "revision": "c2a9d81a2989af566682b4cecc828c84556076c5", "publisher_key": "huggingface-repo" }, "path": "checkpoint.nvfp4.safetensors", "artifact_root": "3e36c61d7fa686c3a3edc92de6a594456568bd2994017bf6d154e74a3c6b1e58", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 13600000000, "min_compute_cap": "10.0", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" }
+      },
+      "caps": { "tools": true, "json": true, "ctx_max": 131072, "vision": false },
+      "requirements": { "min_ram_gb": 32, "min_vram_gb_full_offload": 16, "cpu_flags": ["avx2|neon"], "backends": ["llama.cpp", "mlx", "trt-llm"] },
+      "canary": { "set_id": "canary-launch-v1", "match_min": 0.9, "fingerprints": { "gguf-q4_k_m": "f4bae7cebf155904ace2d23b8e7b68f45054b12be3b00c23d929a547969635f6", "mlx-4bit": "f675a86993e972eea0f07e3a823b611e259f4e923418410a6442880691bfa5fd", "trt-fp8": "054fcbb2a34da100efeabcafc524027949f831042c8eca02fb87552e07b8d6fb", "nvfp4": "35ed3ba5999a937bf3b77ac6ea5ce506ff2b2bc49d034f1bbcba0aeefc76776a" } },
+      "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 25, "out_per_1k": 70 }
+    },
+    {
+      "model_id": "google/gemma-3-12b-it@4bit",
+      "family": "gemma-3",
+      "params_b": 12,
+      "tier": "launch",
+      "provenance": {
+        "source": { "kind": "huggingface", "repo": "google/gemma-3-12b-it", "revision": "96b6f1eccf38110c56df3a15bffe176da04bfd80", "publisher_key": "huggingface-repo" },
+        "conversion": [
+          { "tool": "llama.cpp convert+quantize", "method": "q4_k_m", "input_sha256": "59133887191619a3adb5e71f7eae71f585f3556cb812880d7cc5a5177096f589", "output_sha256": "80fb707bd726c78dcd48ea5fb384ffa318d6cef82ebe6053e9f7f255625d2ee6" },
+          { "tool": "mlx-lm convert --quantize", "method": "mlx-4bit", "input_sha256": "59133887191619a3adb5e71f7eae71f585f3556cb812880d7cc5a5177096f589", "output_sha256": "d157844543be6071071e7332000de59cef94ba31fb75001957e21c25169e5e5b" },
+          { "tool": "TensorRT Model Optimizer", "method": "nvfp4/fp8", "input_sha256": "59133887191619a3adb5e71f7eae71f585f3556cb812880d7cc5a5177096f589", "output_sha256": "4b00ae4bcba4f363dda6e3b8f3eaf4ebd8381abd4f8fc2e8cc94a589faa8a098" }
+        ],
+        "license": "gemma",
+        "license_sha256": "1ac4624af6131aba036e742519dd49375e04af3bc90ac0bf3a6d636309995b41"
+      },
+      "artifacts": {
+        "gguf-q4_k_m": { "engine": "llama.cpp", "source": { "kind": "huggingface", "repo": "mayhem-catalog/gemma-3-12b-it-GGUF", "revision": "96b6f1eccf38110c56df3a15bffe176da04bfd80", "publisher_key": "huggingface-repo" }, "path": "gemma-3-12b-it-Q4_K_M.gguf", "artifact_root": "6b191f689709f6620efdcfa049962564df0c59c0c2da2a10081525957c331448", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 7600000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "mlx-4bit": { "engine": "mlx", "source": { "kind": "huggingface", "repo": "mayhem-catalog/gemma-3-12b-it-MLX-4bit", "revision": "96b6f1eccf38110c56df3a15bffe176da04bfd80", "publisher_key": "huggingface-repo" }, "path": "model.safetensors", "artifact_root": "b3a231656c110dd35c1d9290983e97e395436e1f6e1d9417ddf7369f799c114e", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 6900000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "trt-fp8": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/gemma-3-12b-it-TRT-FP8", "revision": "96b6f1eccf38110c56df3a15bffe176da04bfd80", "publisher_key": "huggingface-repo" }, "path": "checkpoint.fp8.safetensors", "artifact_root": "37ac06c6393d50560e8d31025408567e42990835579c36723d49733f14fc06bf", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 13000000000, "min_compute_cap": "8.9", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "nvfp4": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/gemma-3-12b-it-NVFP4", "revision": "96b6f1eccf38110c56df3a15bffe176da04bfd80", "publisher_key": "huggingface-repo" }, "path": "checkpoint.nvfp4.safetensors", "artifact_root": "433c521e23c0c3d0a110514aac82414e814305fe3608b5defbe234369ee66665", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 7100000000, "min_compute_cap": "10.0", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" }
+      },
+      "caps": { "tools": true, "json": true, "ctx_max": 32768, "vision": false },
+      "requirements": { "min_ram_gb": 24, "min_vram_gb_full_offload": 12, "cpu_flags": ["avx2|neon"], "backends": ["llama.cpp", "mlx", "trt-llm"] },
+      "canary": { "set_id": "canary-launch-v1", "match_min": 0.9, "fingerprints": { "gguf-q4_k_m": "fbdd291b18fe0b354390643ed1bcc38bd780fa0a330717f1e0df48a0acd6e6c0", "mlx-4bit": "90c777e6ffe4bdf8df7ce5933801ebdf555cdacc28a8f586f596ee8a9c0a38f7", "trt-fp8": "94ba21db31cf9c0642572c49a25433736356a84ba7df08699884425001c88a06", "nvfp4": "3c9f9fd5d4d32b805602138534973a5ef661be0d8b1bb04aca06babd662238cd" } },
+      "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 22, "out_per_1k": 66 }
+    },
+    {
+      "model_id": "deepseek/deepseek-r1-distill-qwen-14b@4bit",
+      "family": "deepseek-r1-distill-qwen",
+      "params_b": 14,
+      "tier": "launch",
+      "provenance": {
+        "source": { "kind": "huggingface", "repo": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "revision": "1df8507178afcc1bef68cd8c393f61a886323761", "publisher_key": "huggingface-repo" },
+        "conversion": [
+          { "tool": "llama.cpp convert+quantize", "method": "q4_k_m", "input_sha256": "c32d35f27aa9ced1be0c3f1b98ebf48e308437024ba2ce59bb393a12c0372c49", "output_sha256": "79ac8a8c7cbab723178859f7f7119f8665058475f141addffe287a0b3225e8e4" },
+          { "tool": "TensorRT Model Optimizer", "method": "nvfp4/fp8", "input_sha256": "c32d35f27aa9ced1be0c3f1b98ebf48e308437024ba2ce59bb393a12c0372c49", "output_sha256": "c6ea618d18e2c972f6285eb577d96ae10c8538660cdbf31b2a2953ac3896c61a" }
+        ],
+        "license": "mit",
+        "license_sha256": "e5dcffe836b6ec8a58e492419b550e65fb8cbdc308503979e5dacb33ac7ea3b7"
+      },
+      "artifacts": {
+        "gguf-q4_k_m": { "engine": "llama.cpp", "source": { "kind": "huggingface", "repo": "mayhem-catalog/deepseek-r1-distill-qwen-14b-GGUF", "revision": "1df8507178afcc1bef68cd8c393f61a886323761", "publisher_key": "huggingface-repo" }, "path": "deepseek-r1-distill-qwen-14b-Q4_K_M.gguf", "artifact_root": "5bc5a1da99481e1faf1a10ae0fcf53c33217389de6e3c4bcb17beeb944d64cdd", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 8800000000, "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "trt-fp8": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/deepseek-r1-distill-qwen-14b-TRT-FP8", "revision": "1df8507178afcc1bef68cd8c393f61a886323761", "publisher_key": "huggingface-repo" }, "path": "checkpoint.fp8.safetensors", "artifact_root": "4013a9c8787e6816253b2c3e33136077bdc4a6b565083641c8b608d25e023d00", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 15000000000, "min_compute_cap": "8.9", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" },
+        "nvfp4": { "engine": "trt-llm", "source": { "kind": "huggingface", "repo": "mayhem-catalog/deepseek-r1-distill-qwen-14b-NVFP4", "revision": "1df8507178afcc1bef68cd8c393f61a886323761", "publisher_key": "huggingface-repo" }, "path": "checkpoint.nvfp4.safetensors", "artifact_root": "7a37081d78036029171a58393f62a9e1826c897b56916730f018f1e3d03b10f5", "artifact_root_kind": "blake3_descriptor_until_p2_4", "weights_bytes": 8200000000, "min_compute_cap": "10.0", "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing" }
+      },
+      "caps": { "tools": true, "json": true, "ctx_max": 65536, "vision": false },
+      "requirements": { "min_ram_gb": 24, "min_vram_gb_full_offload": 12, "cpu_flags": ["avx2|neon"], "backends": ["llama.cpp", "trt-llm"] },
+      "canary": { "set_id": "canary-launch-v1", "match_min": 0.9, "fingerprints": { "gguf-q4_k_m": "d4a7c5ec47da1593e42e3eff3c2f08dd2c022c45dcb24a403a9e4e29e8f4bfe2", "trt-fp8": "94167b663c6c12c3ef9b2eac6f2f2858c42f27bec3b8b55229c72f72f02392a9", "nvfp4": "6a35116d21e8ae991617fc1e03bceaf6a86b378511b7ff0d0b19c953405dcf54" } },
+      "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 24, "out_per_1k": 72 }
+    }
+  ]
+}

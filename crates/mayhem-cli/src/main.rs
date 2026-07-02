@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod catalog;
+
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -31,6 +33,11 @@ enum Commands {
     Setup(SetupArgs),
     /// Probe local hardware and print enclave backend feasibility.
     Doctor(DoctorArgs),
+    /// Inspect and verify the admin-signed model catalog.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommands,
+    },
     /// Inspect, hash, and re-consent to router rules.
     Rules {
         #[command(subcommand)]
@@ -44,6 +51,12 @@ enum RulesCommands {
     Hash(RulesHashArgs),
     /// Review current rules and sign fresh consent when needed.
     Review(RulesReviewArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogCommands {
+    /// Verify catalog structure, maintainer signature, canary refs, and optional dev downloads.
+    Verify(CatalogVerifyArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -178,6 +191,37 @@ struct DoctorArgs {
     disk_bench_mib: u64,
 }
 
+#[derive(Debug, Parser)]
+struct CatalogVerifyArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Path to the detached catalog signature JSON.
+    #[arg(long, value_name = "PATH")]
+    signature_path: Option<PathBuf>,
+
+    /// Directory containing catalog maintainer public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Probe ranged downloads for dev artifacts marked download_check=true.
+    #[arg(long)]
+    check_dev_downloads: bool,
+
+    /// Hugging Face token file used only for --check-dev-downloads.
+    #[arg(long, value_name = "PATH")]
+    hf_token_file: Option<PathBuf>,
+
+    /// Print a machine-readable verification report.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Role {
     Provider,
@@ -270,6 +314,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Setup(args) => setup(args).await,
         Commands::Doctor(args) => doctor(args),
+        Commands::Catalog { command } => match command {
+            CatalogCommands::Verify(args) => catalog_verify(args),
+        },
         Commands::Rules { command } => match command {
             RulesCommands::Hash(args) => rules_hash(args),
             RulesCommands::Review(args) => rules_review(args).await,
@@ -527,6 +574,61 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     Ok(())
 }
 
+fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let signature_path = args
+        .signature_path
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/signatures/models.json.sig"))?;
+    let signature_path = absolutize(signature_path)?;
+    let keys_dir = args
+        .keys_dir
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    let canaries_dir = args
+        .canaries_dir
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+    let hf_token_file = args.hf_token_file.map(absolutize).transpose()?;
+
+    let report = catalog::verify(catalog::VerifyOptions {
+        catalog_path,
+        signature_path,
+        keys_dir,
+        canaries_dir,
+        check_dev_downloads: args.check_dev_downloads,
+        hf_token_file,
+    })?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.ok {
+        println!(
+            "Catalog OK: {} models ({} dev, {} launch), {} artifacts, hash {}",
+            report.model_count,
+            report.dev_model_count,
+            report.launch_model_count,
+            report.artifact_count,
+            report.catalog_hash
+        );
+        if !report.download_checks.is_empty() {
+            println!("Dev downloads checked: {}", report.download_checks.len());
+        }
+    } else {
+        for error in &report.errors {
+            eprintln!("Catalog error: {error}");
+        }
+        bail!("catalog verification failed");
+    }
+    Ok(())
+}
+
 fn default_home() -> Result<PathBuf> {
     if let Ok(home) = env::var("MAYHEM_HOME") {
         let home = home.trim();
@@ -539,8 +641,17 @@ fn default_home() -> Result<PathBuf> {
     Ok(PathBuf::from(user_home).join(".mayhem"))
 }
 
+fn repo_path(relative: &str) -> Result<PathBuf> {
+    let path = absolutize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative),
+    )?;
+    Ok(fs::canonicalize(&path).unwrap_or(path))
+}
+
 fn default_rules_path() -> Result<PathBuf> {
-    let repo_rules = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../RULES.md");
+    let repo_rules = repo_path("RULES.md")?;
     if repo_rules.exists() {
         return absolutize(repo_rules);
     }
