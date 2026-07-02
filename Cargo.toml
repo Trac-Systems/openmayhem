@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mayhem-bridge",
+    "crates/mayhem-cli",
+    "crates/mayhem-enclave",
+    "crates/mayhem-engine",
+    "crates/mayhem-gateway",
+    "crates/mayhem-hwprobe",
+    "crates/mayhem-pay",
+    "crates/mayhem-proto",
+    "crates/mayhemd",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+

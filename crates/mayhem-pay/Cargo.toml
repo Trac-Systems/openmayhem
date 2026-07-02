@@ -1,0 +1,11 @@
+[package]
+name = "mayhem-pay"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mayhem-pay"
+path = "src/main.rs"
+

@@ -1,0 +1,11 @@
+[package]
+name = "mayhem-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mayhem-gateway"
+path = "src/main.rs"
+
