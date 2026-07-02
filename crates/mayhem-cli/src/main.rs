@@ -29,12 +29,18 @@ use mayhem_hwprobe::{
 use mayhem_proto::CatalogEnclaveIdentity;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::process::Command;
 use tokio::time::sleep;
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
+const OPENCODE_PROVIDER_ID: &str = "mayhem";
+const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
+const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
+const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
+const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
+const DEFAULT_EPOCH_LENGTH_MILLIS: u64 = 3_600_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
@@ -80,6 +86,8 @@ enum Commands {
         #[command(subcommand)]
         command: RulesCommands,
     },
+    /// Run a gateway, peer, opencode, and receipt smoke test.
+    Test(TestArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -272,6 +280,57 @@ struct PayRailArgs {
     poll_interval_ms: u64,
 
     /// Print a machine-readable payment report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct TestArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Model id to test. Defaults to the first tool-capable /v1/models entry.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Refresh the Mayhem provider models in opencode.json from /v1/models.
+    #[arg(long)]
+    sync_models: bool,
+
+    /// Path to opencode.json. Defaults to MAYHEM_OPENCODE_CONFIG or ~/.config/opencode/opencode.json.
+    #[arg(long, value_name = "PATH")]
+    opencode_config: Option<PathBuf>,
+
+    /// Path to the opencode binary. Defaults to <home>/bin/opencode or PATH.
+    #[arg(long, value_name = "PATH")]
+    opencode_bin: Option<PathBuf>,
+
+    /// Skip the peer RPC health check; useful for isolated gateway/opencode smoke tests.
+    #[arg(long)]
+    skip_peer_health: bool,
+
+    /// Do not merge or run opencode.
+    #[arg(long)]
+    skip_opencode: bool,
+
+    /// Merge opencode.json but do not execute opencode run.
+    #[arg(long)]
+    no_opencode_run: bool,
+
+    /// Maximum seconds for individual HTTP/opencode checks.
+    #[arg(long, default_value_t = 60)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable test report.
     #[arg(long)]
     json: bool,
 }
@@ -631,6 +690,7 @@ struct MayhemConfig {
     identity: Option<ConfigIdentity>,
     network: Option<ConfigNetwork>,
     provider: Option<ConfigProvider>,
+    role: Option<ConfigRole>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -644,12 +704,18 @@ struct ConfigNetwork {
     rpc_url: Option<String>,
     sc_bridge_url: Option<String>,
     sc_bridge_token: Option<String>,
+    gateway_url: Option<String>,
     paygate_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ConfigProvider {
     engine_backend: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigRole {
+    mode: Option<String>,
 }
 
 #[tokio::main]
@@ -677,6 +743,7 @@ async fn main() -> Result<()> {
             RulesCommands::Hash(args) => rules_hash(args),
             RulesCommands::Review(args) => rules_review(args).await,
         },
+        Commands::Test(args) => mayhem_test(args).await,
     }
 }
 
@@ -704,6 +771,12 @@ async fn setup(args: SetupArgs) -> Result<()> {
         role,
         &args.peer_store_name,
         &rpc_url,
+    )?;
+    let opencode_config = merge_mayhem_opencode_config(
+        &default_opencode_config_path()?,
+        DEFAULT_GATEWAY_URL,
+        None,
+        false,
     )?;
 
     let consent = if args.no_consent {
@@ -752,7 +825,9 @@ async fn setup(args: SetupArgs) -> Result<()> {
         "wallet": wallet,
         "network": {
             "rpc_url": rpc_url,
+            "gateway_url": DEFAULT_GATEWAY_URL,
         },
+        "opencode": opencode_config,
         "consent": consent,
     });
 
@@ -1096,6 +1171,709 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn mayhem_test(args: TestArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let gateway_url = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let gateway_root = normalize_gateway_root(&gateway_url);
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+
+    let gateway_status =
+        fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/status")).await?;
+    let models = fetch_gateway_models(&client, &gateway_root).await?;
+    let selected_model = select_test_model(&models, args.model.as_deref())?;
+    let direct_tool = run_gateway_tool_smoke(&client, &gateway_root, &selected_model.id).await?;
+
+    let peer_health = if args.skip_peer_health {
+        json!({ "skipped": true })
+    } else {
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        json!({
+            "skipped": false,
+            "rpc_url": rpc_url,
+            "health": rpc.health().await.context("checking peer RPC health")?,
+        })
+    };
+
+    let opencode_config_path = args
+        .opencode_config
+        .clone()
+        .map(absolutize)
+        .transpose()?
+        .unwrap_or(default_opencode_config_path()?);
+    let existing_opencode_models =
+        read_existing_mayhem_opencode_model_count(&opencode_config_path).unwrap_or(0);
+    let should_write_models = args.sync_models
+        || existing_opencode_models == 0
+        || !opencode_model_exists(&opencode_config_path, &selected_model.id).unwrap_or(false);
+
+    let opencode_merge = if args.skip_opencode {
+        json!({ "skipped": true })
+    } else {
+        serde_json::to_value(merge_mayhem_opencode_config(
+            &opencode_config_path,
+            &gateway_root,
+            if should_write_models {
+                Some(&models)
+            } else {
+                None
+            },
+            should_write_models,
+        )?)?
+    };
+
+    let opencode_run = if args.skip_opencode || args.no_opencode_run {
+        json!({ "skipped": true })
+    } else {
+        let opencode_bin = resolve_opencode_bin(&home, args.opencode_bin.as_deref());
+        serde_json::to_value(
+            run_opencode_smoke(
+                &opencode_bin,
+                &opencode_config_path,
+                &selected_model.id,
+                timeout,
+            )
+            .await?,
+        )?
+    };
+
+    let receipts = fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/receipts")).await?;
+    let receipt = latest_gateway_receipt(&receipts);
+    let expected_evidence_key = receipt
+        .as_ref()
+        .and_then(expected_usage_evidence_key)
+        .unwrap_or_else(|| "ev/use/<epoch>".to_owned());
+
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "role": config
+            .as_ref()
+            .and_then(|config| config.role.as_ref())
+            .and_then(|role| role.mode.as_deref())
+            .unwrap_or("unknown"),
+        "gateway": {
+            "url": gateway_root,
+            "status": gateway_status,
+            "models": models.len(),
+            "selected_model": selected_model,
+            "direct_tool_call": direct_tool,
+        },
+        "peer": peer_health,
+        "opencode": {
+            "config": opencode_merge,
+            "run": opencode_run,
+        },
+        "receipt": receipt,
+        "expected_epoch_evidence_key": expected_evidence_key,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_test_report(&report);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TestModel {
+    id: String,
+    tools: bool,
+    json: bool,
+    context: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct OpencodeMergeReport {
+    path: PathBuf,
+    provider_id: String,
+    base_url: String,
+    models_written: usize,
+    created: bool,
+    enabled_provider_added: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OpencodeRunReport {
+    binary: String,
+    model: String,
+    session_id: Option<String>,
+    tool_use_seen: bool,
+    marker_seen: bool,
+    work_dir: PathBuf,
+    stdout_lines: usize,
+}
+
+async fn fetch_gateway_json(client: &reqwest::Client, url: &str) -> Result<Value> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("requesting {url}"))?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        bail!("gateway returned {status} for {url}: {body}");
+    }
+    serde_json::from_str(&body).with_context(|| format!("parsing JSON from {url}"))
+}
+
+async fn fetch_gateway_models(client: &reqwest::Client, gateway_root: &str) -> Result<Vec<Value>> {
+    let value = fetch_gateway_json(client, &format!("{gateway_root}/v1/models")).await?;
+    let models = value
+        .get("data")
+        .and_then(Value::as_array)
+        .filter(|models| !models.is_empty())
+        .context("gateway /v1/models returned no models")?
+        .clone();
+    Ok(models)
+}
+
+fn select_test_model(models: &[Value], requested: Option<&str>) -> Result<TestModel> {
+    let selected = if let Some(requested) = requested {
+        models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some(requested))
+            .with_context(|| format!("requested model {requested} was not in /v1/models"))?
+    } else {
+        models
+            .iter()
+            .find(|model| model_tool_capable(model))
+            .unwrap_or(&models[0])
+    };
+    gateway_model_view(selected)
+}
+
+fn gateway_model_view(model: &Value) -> Result<TestModel> {
+    let id = model
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .context("gateway model missing id")?;
+    Ok(TestModel {
+        id: id.to_owned(),
+        tools: model_tool_capable(model),
+        json: model
+            .get("mayhem")
+            .and_then(|mayhem| mayhem.get("caps"))
+            .and_then(|caps| caps.get("json"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        context: model
+            .get("mayhem")
+            .and_then(|mayhem| mayhem.get("caps"))
+            .and_then(|caps| caps.get("ctx"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn model_tool_capable(model: &Value) -> bool {
+    model
+        .get("mayhem")
+        .and_then(|mayhem| mayhem.get("caps"))
+        .and_then(|caps| caps.get("tools"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+async fn run_gateway_tool_smoke(
+    client: &reqwest::Client,
+    gateway_root: &str,
+    model_id: &str,
+) -> Result<Value> {
+    let request = json!({
+        "model": model_id,
+        "messages": [{ "role": "user", "content": "Call the mayhem_ping tool." }],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "mayhem_ping",
+                "description": "Return a small Mayhem smoke-test marker.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }
+        }],
+        "tool_choice": { "type": "function", "function": { "name": "mayhem_ping" } }
+    });
+    let response = post_gateway_json(
+        client,
+        &format!("{gateway_root}/v1/chat/completions"),
+        &request,
+    )
+    .await?;
+    let tool_call = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+        .and_then(|calls| calls.first())
+        .cloned()
+        .context("gateway chat completion did not return a tool call")?;
+    let tool_name = tool_call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .context("gateway tool call missing function name")?;
+    if tool_name != "mayhem_ping" {
+        bail!("gateway returned unexpected tool call {tool_name}");
+    }
+    let tool_call_id = tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .context("gateway tool call missing id")?;
+    let followup = json!({
+        "model": model_id,
+        "messages": [
+            { "role": "user", "content": "Call the mayhem_ping tool." },
+            { "role": "assistant", "content": null, "tool_calls": [tool_call] },
+            { "role": "tool", "tool_call_id": tool_call_id, "content": "{\"ok\":true}" }
+        ]
+    });
+    let final_response = post_gateway_json(
+        client,
+        &format!("{gateway_root}/v1/chat/completions"),
+        &followup,
+    )
+    .await?;
+    Ok(json!({
+        "tool_call": response,
+        "followup": final_response,
+    }))
+}
+
+async fn post_gateway_json(client: &reqwest::Client, url: &str, body: &Value) -> Result<Value> {
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("posting {url}"))?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if !status.is_success() {
+        bail!("gateway returned {status} for {url}: {response_body}");
+    }
+    serde_json::from_str(&response_body).with_context(|| format!("parsing JSON from {url}"))
+}
+
+fn default_opencode_config_path() -> Result<PathBuf> {
+    if let Ok(path) = env::var("MAYHEM_OPENCODE_CONFIG") {
+        if !path.trim().is_empty() {
+            return absolutize(PathBuf::from(path));
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if let Ok(appdata) = env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return Ok(PathBuf::from(appdata)
+                    .join("opencode")
+                    .join("opencode.json"));
+            }
+        }
+    }
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        if !config_home.trim().is_empty() {
+            return Ok(PathBuf::from(config_home)
+                .join("opencode")
+                .join("opencode.json"));
+        }
+    }
+    Ok(user_home_dir()?
+        .join(".config")
+        .join("opencode")
+        .join("opencode.json"))
+}
+
+fn merge_mayhem_opencode_config(
+    path: &Path,
+    gateway_root: &str,
+    models: Option<&[Value]>,
+    write_models: bool,
+) -> Result<OpencodeMergeReport> {
+    let created = !path.exists();
+    let mut root = if created {
+        json!({ "$schema": OPENCODE_SCHEMA_URL })
+    } else {
+        let text =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+    };
+    if !root.is_object() {
+        bail!("{} must contain a JSON object", path.display());
+    }
+    let object = root.as_object_mut().expect("checked object");
+    object
+        .entry("$schema")
+        .or_insert_with(|| Value::String(OPENCODE_SCHEMA_URL.to_owned()));
+    if !object
+        .get("provider")
+        .is_some_and(|provider| provider.is_object())
+    {
+        object.insert("provider".to_owned(), Value::Object(Map::new()));
+    }
+    let provider = object
+        .get_mut("provider")
+        .and_then(Value::as_object_mut)
+        .expect("provider object");
+    let existing_models = provider
+        .get(OPENCODE_PROVIDER_ID)
+        .and_then(|entry| entry.get("models"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let model_map = if write_models {
+        opencode_models_from_gateway(models.unwrap_or(&[]))?
+    } else {
+        existing_models
+    };
+    let models_written = model_map.len();
+    provider.insert(
+        OPENCODE_PROVIDER_ID.to_owned(),
+        json!({
+            "npm": OPENCODE_PROVIDER_NPM,
+            "name": OPENCODE_PROVIDER_NAME,
+            "options": {
+                "baseURL": gateway_v1_url(gateway_root),
+                "apiKey": "mayhem-local",
+                "timeout": false,
+                "headerTimeout": false,
+                "chunkTimeout": 300000
+            },
+            "models": Value::Object(model_map),
+        }),
+    );
+
+    let enabled_provider_added = ensure_enabled_provider(object, OPENCODE_PROVIDER_ID);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&root)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(OpencodeMergeReport {
+        path: path.to_path_buf(),
+        provider_id: OPENCODE_PROVIDER_ID.to_owned(),
+        base_url: gateway_v1_url(gateway_root),
+        models_written,
+        created,
+        enabled_provider_added,
+    })
+}
+
+fn read_existing_mayhem_opencode_model_count(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let root: Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(root
+        .get("provider")
+        .and_then(|provider| provider.get(OPENCODE_PROVIDER_ID))
+        .and_then(|provider| provider.get("models"))
+        .and_then(Value::as_object)
+        .map(Map::len)
+        .unwrap_or(0))
+}
+
+fn opencode_model_exists(path: &Path, model_id: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let root: Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(root
+        .get("provider")
+        .and_then(|provider| provider.get(OPENCODE_PROVIDER_ID))
+        .and_then(|provider| provider.get("models"))
+        .and_then(Value::as_object)
+        .is_some_and(|models| models.contains_key(model_id)))
+}
+
+fn opencode_models_from_gateway(models: &[Value]) -> Result<Map<String, Value>> {
+    let mut out = Map::new();
+    for model in models {
+        let view = gateway_model_view(model)?;
+        out.insert(
+            view.id.clone(),
+            json!({
+                "name": view.id,
+                "limit": {
+                    "context": view.context.max(1),
+                    "output": 4096
+                },
+                "tool_call": view.tools,
+                "reasoning": false,
+                "options": {
+                    "temperature": 0,
+                    "top_p": 1
+                }
+            }),
+        );
+    }
+    Ok(out)
+}
+
+fn ensure_enabled_provider(root: &mut Map<String, Value>, provider_id: &str) -> bool {
+    match root.get_mut("enabled_providers") {
+        Some(Value::Array(providers)) => {
+            if providers
+                .iter()
+                .any(|value| value.as_str() == Some(provider_id))
+            {
+                false
+            } else {
+                providers.push(Value::String(provider_id.to_owned()));
+                true
+            }
+        }
+        Some(_) => false,
+        None => false,
+    }
+}
+
+fn resolve_opencode_bin(home: &Path, requested: Option<&Path>) -> String {
+    if let Some(requested) = requested {
+        return requested.display().to_string();
+    }
+    let home_bin = if cfg!(target_os = "windows") {
+        home.join("bin").join("opencode.exe")
+    } else {
+        home.join("bin").join("opencode")
+    };
+    if home_bin.exists() {
+        home_bin.display().to_string()
+    } else {
+        "opencode".to_owned()
+    }
+}
+
+async fn run_opencode_smoke(
+    opencode_bin: &str,
+    opencode_config_path: &Path,
+    model_id: &str,
+    timeout: Duration,
+) -> Result<OpencodeRunReport> {
+    let work_dir = temp_work_dir("mayhem-opencode-test")?;
+    let model = format!("{OPENCODE_PROVIDER_ID}/{model_id}");
+    let mut command = Command::new(opencode_bin);
+    command
+        .arg("run")
+        .arg("--pure")
+        .arg("--model")
+        .arg(&model)
+        .arg("--format")
+        .arg("json")
+        .arg("--dir")
+        .arg(&work_dir)
+        .arg("Use the bash tool once to print mayhem-opencode-tool-ok, then answer with mayhem-opencode-tool-ok.");
+    command.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
+    let config_home = xdg_config_home_for_opencode_config(opencode_config_path).with_context(
+        || {
+            format!(
+                "opencode only reads config paths shaped like <config-home>/opencode/opencode.json; got {}",
+                opencode_config_path.display()
+            )
+        },
+    )?;
+    command.env("XDG_CONFIG_HOME", config_home);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("opencode run timed out after {}s", timeout.as_secs()))?
+        .with_context(|| format!("running {opencode_bin}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!("opencode run failed: {}", stderr.trim());
+    }
+    let parsed = parse_opencode_run_output(&stdout)?;
+    if !parsed.tool_use_seen {
+        bail!("opencode run did not exercise a tool call");
+    }
+    if !parsed.marker_seen {
+        bail!("opencode run did not echo {OPENCODE_TEST_MARKER}");
+    }
+    Ok(OpencodeRunReport {
+        binary: opencode_bin.to_owned(),
+        model,
+        session_id: parsed.session_id,
+        tool_use_seen: parsed.tool_use_seen,
+        marker_seen: parsed.marker_seen,
+        work_dir,
+        stdout_lines: parsed.stdout_lines,
+    })
+}
+
+#[derive(Debug)]
+struct ParsedOpencodeOutput {
+    session_id: Option<String>,
+    tool_use_seen: bool,
+    marker_seen: bool,
+    stdout_lines: usize,
+}
+
+fn parse_opencode_run_output(stdout: &str) -> Result<ParsedOpencodeOutput> {
+    let mut parsed = ParsedOpencodeOutput {
+        session_id: None,
+        tool_use_seen: false,
+        marker_seen: stdout.contains(OPENCODE_TEST_MARKER),
+        stdout_lines: 0,
+    };
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        parsed.stdout_lines += 1;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if parsed.session_id.is_none() {
+            parsed.session_id = value
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+        if value.get("type").and_then(Value::as_str) == Some("tool_use") {
+            parsed.tool_use_seen = true;
+        }
+        if value.to_string().contains(OPENCODE_TEST_MARKER) {
+            parsed.marker_seen = true;
+        }
+    }
+    Ok(parsed)
+}
+
+fn xdg_config_home_for_opencode_config(path: &Path) -> Option<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("opencode.json") {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) != Some("opencode") {
+        return None;
+    }
+    parent.parent().map(Path::to_path_buf)
+}
+
+fn latest_gateway_receipt(receipts: &Value) -> Option<Value> {
+    receipts
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.last())
+        .cloned()
+}
+
+fn expected_usage_evidence_key(receipt: &Value) -> Option<String> {
+    let body = receipt_body(receipt)?;
+    let ts = body.get("ts")?.as_u64()?;
+    Some(format!("ev/use/{}", ts / DEFAULT_EPOCH_LENGTH_MILLIS))
+}
+
+fn receipt_body(receipt: &Value) -> Option<&Value> {
+    let receipt = receipt.get("receipt").unwrap_or(receipt);
+    Some(receipt.get("body").unwrap_or(receipt))
+}
+
+fn normalize_gateway_root(gateway_url: &str) -> String {
+    let trimmed = gateway_url.trim().trim_end_matches('/');
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+fn gateway_v1_url(gateway_root: &str) -> String {
+    let root = normalize_gateway_root(gateway_root);
+    format!("{root}/v1")
+}
+
+fn resolve_cli_gateway_url(config: Option<&MayhemConfig>, gateway_url: Option<&str>) -> String {
+    if let Some(gateway_url) = gateway_url {
+        let gateway_url = gateway_url.trim();
+        if !gateway_url.is_empty() {
+            return normalize_gateway_root(gateway_url);
+        }
+    }
+    if let Ok(gateway_url) = env::var("MAYHEM_GATEWAY_URL") {
+        let gateway_url = gateway_url.trim();
+        if !gateway_url.is_empty() {
+            return normalize_gateway_root(gateway_url);
+        }
+    }
+    config
+        .and_then(|config| config.network.as_ref())
+        .and_then(|network| network.gateway_url.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .map(normalize_gateway_root)
+        .unwrap_or_else(|| DEFAULT_GATEWAY_URL.to_owned())
+}
+
+fn temp_work_dir(prefix: &str) -> Result<PathBuf> {
+    let path = env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        now_millis_for_path()
+    ));
+    fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+    Ok(path)
+}
+
+fn now_millis_for_path() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn print_test_report(report: &Value) {
+    let gateway = &report["gateway"];
+    println!("Mayhem test OK.");
+    println!("Gateway: {}", gateway["url"].as_str().unwrap_or(""));
+    println!(
+        "Models: {} (selected {})",
+        gateway["models"].as_u64().unwrap_or(0),
+        gateway["selected_model"]["id"].as_str().unwrap_or("")
+    );
+    if report["peer"]["skipped"].as_bool().unwrap_or(false) {
+        println!("Peer RPC: skipped");
+    } else {
+        println!("Peer RPC: ok");
+    }
+    if report["opencode"]["run"]["skipped"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        println!("opencode: skipped");
+    } else {
+        println!(
+            "opencode: ok ({})",
+            report["opencode"]["run"]["model"].as_str().unwrap_or("")
+        );
+    }
+    if let Some(session_id) = receipt_body(&report["receipt"])
+        .and_then(|body| body.get("session_id"))
+        .and_then(Value::as_str)
+    {
+        println!("Receipt session: {session_id}");
+    }
+    println!(
+        "Expected epoch evidence key: {}",
+        report["expected_epoch_evidence_key"].as_str().unwrap_or("")
+    );
 }
 
 async fn payouts(args: PayoutsArgs) -> Result<()> {
@@ -3173,6 +3951,22 @@ fn default_home() -> Result<PathBuf> {
     Ok(PathBuf::from(user_home).join(".mayhem"))
 }
 
+fn user_home_dir() -> Result<PathBuf> {
+    if let Ok(home) = env::var("HOME") {
+        let home = home.trim();
+        if !home.is_empty() {
+            return Ok(PathBuf::from(home));
+        }
+    }
+    if let Ok(home) = env::var("USERPROFILE") {
+        let home = home.trim();
+        if !home.is_empty() {
+            return Ok(PathBuf::from(home));
+        }
+    }
+    bail!("HOME/USERPROFILE is not set; pass an explicit path")
+}
+
 fn repo_path(relative: &str) -> Result<PathBuf> {
     let path = absolutize(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3526,6 +4320,7 @@ fn write_config(
             "mode = {}\n\n",
             "[network]\n",
             "rpc_url = {}\n",
+            "gateway_url = {}\n",
             "paygate_url = {}\n"
         ),
         toml_string(&wallet.public_key),
@@ -3536,6 +4331,7 @@ fn write_config(
         toml_string(&store_path.display().to_string()),
         toml_string(role.as_str()),
         toml_string(rpc_url),
+        toml_string(DEFAULT_GATEWAY_URL),
         toml_string(DEFAULT_PAYGATE_URL),
     );
     fs::write(&config_path, contents)
@@ -3984,6 +4780,113 @@ mod tests {
         assert_eq!(
             safe_path_component("meta/llama-3.1:8b@4bit"),
             "meta_llama-3.1_8b_4bit"
+        );
+    }
+
+    #[test]
+    fn opencode_merge_preserves_existing_config_and_adds_mayhem_provider() {
+        let path = env::temp_dir().join(format!(
+            "mayhem-opencode-merge-{}-{}.json",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "$schema": OPENCODE_SCHEMA_URL,
+                "provider": {
+                    "other": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "Other",
+                        "models": {}
+                    }
+                },
+                "model": "other/model",
+                "enabled_providers": ["other"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let models = vec![json!({
+            "id": "mayhem/test-model",
+            "mayhem": {
+                "caps": { "tools": true, "json": true, "ctx": 16384 }
+            }
+        })];
+
+        let report =
+            merge_mayhem_opencode_config(&path, "http://127.0.0.1:11435", Some(&models), true)
+                .unwrap();
+        let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        assert!(!report.created);
+        assert_eq!(report.models_written, 1);
+        assert_eq!(merged["model"], "other/model");
+        assert!(merged["provider"]["other"].is_object());
+        assert_eq!(
+            merged["provider"]["mayhem"]["options"]["baseURL"],
+            "http://127.0.0.1:11435/v1"
+        );
+        assert_eq!(
+            merged["provider"]["mayhem"]["models"]["mayhem/test-model"]["tool_call"],
+            true
+        );
+        assert_eq!(
+            merged["enabled_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|value| value.as_str() == Some("mayhem"))
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn opencode_model_config_maps_gateway_caps() {
+        let models = opencode_models_from_gateway(&[json!({
+            "id": "mayhem/no-tools",
+            "mayhem": {
+                "caps": { "tools": false, "json": true, "ctx": 4096 }
+            }
+        })])
+        .unwrap();
+        let model = models.get("mayhem/no-tools").unwrap();
+        assert_eq!(model["tool_call"], false);
+        assert_eq!(model["limit"]["context"], 4096);
+        assert_eq!(model["limit"]["output"], 4096);
+    }
+
+    #[test]
+    fn opencode_config_home_requires_standard_config_shape() {
+        let root = PathBuf::from("/tmp/mayhem-config-home");
+        assert_eq!(
+            xdg_config_home_for_opencode_config(&root.join("opencode").join("opencode.json")),
+            Some(root)
+        );
+        assert!(
+            xdg_config_home_for_opencode_config(Path::new("/tmp/mayhem-opencode.json")).is_none()
+        );
+    }
+
+    #[test]
+    fn receipt_body_accepts_wrapped_and_flattened_receipts() {
+        let wrapped = json!({ "receipt": { "body": { "session_id": "s1", "ts": 42 } } });
+        let flattened = json!({ "receipt": { "session_id": "s2", "ts": 42 } });
+
+        assert_eq!(
+            receipt_body(&wrapped)
+                .and_then(|body| body.get("session_id"))
+                .and_then(Value::as_str),
+            Some("s1")
+        );
+        assert_eq!(
+            receipt_body(&flattened)
+                .and_then(|body| body.get("session_id"))
+                .and_then(Value::as_str),
+            Some("s2")
         );
     }
 

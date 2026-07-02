@@ -8,6 +8,7 @@ Mayhem is a peer-to-peer OpenRouter built on Trac Intercom. The repo currently c
 ./install.sh
 mayhem setup --role provider
 mayhem provider start --enclave <admin-enclave-id> --rooms auto
+mayhem test --sync-models
 ```
 
 Providers can only opt into admin-created enclave and room records from the contract ledger. They cannot submit arbitrary models, create canonical rooms, or set pricing.
@@ -18,6 +19,7 @@ Providers can only opt into admin-created enclave and room records from the cont
 ./install.sh
 mayhem setup --role user
 mayhem use --model qwen3.5-4b
+mayhem test --sync-models
 ```
 
 ## Install
@@ -40,7 +42,7 @@ For release artifacts, use the prebuilt archive plus SHA-256 sidecar:
 ./install.sh --artifact-url <archive-url> --sha256 <archive-sha256>
 ```
 
-Both installers print a copy/paste PATH command even when they update your shell profile. Browser-opening commands, such as hosted payment checkout, also print the copy/paste URL before attempting to open a browser.
+Both installers print a copy/paste PATH command even when they update your shell profile. They also install a pinned, checksum-verified opencode binary unless `--skip-opencode` is passed or `opencode` is already on PATH. Browser-opening commands, such as hosted payment checkout, also print the copy/paste URL before attempting to open a browser.
 
 ## Development
 

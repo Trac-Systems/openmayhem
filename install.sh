@@ -15,6 +15,9 @@ SKIP_PEAR="${MAYHEM_SKIP_PEAR:-0}"
 NO_PATH_UPDATE="${MAYHEM_NO_PATH_UPDATE:-0}"
 ALLOW_UNVERIFIED="${MAYHEM_ALLOW_UNVERIFIED:-0}"
 NPM_PREFIX="${MAYHEM_NPM_PREFIX:-$HOME/.mayhem/node}"
+OPENCODE_VERSION="${MAYHEM_OPENCODE_VERSION:-1.17.13}"
+SKIP_OPENCODE="${MAYHEM_SKIP_OPENCODE:-0}"
+FORCE_OPENCODE="${MAYHEM_FORCE_OPENCODE:-0}"
 
 BINS=(
   mayhem
@@ -46,6 +49,9 @@ Options:
   --install-dir <dir>       Binary install directory (default: ~/.mayhem/bin)
   --skip-node               Do not require Node/npm before Pear checks
   --skip-pear               Do not install or warm up Pear
+  --skip-opencode           Do not install the pinned opencode binary
+  --opencode-version <ver>  Checksum-pinned opencode version (default: 1.17.13)
+  --force-opencode          Install pinned opencode even when one is on PATH
   --no-path-update          Do not edit the shell profile
   --allow-unverified        Allow archive installs without a checksum
   -h, --help                Show this help
@@ -184,6 +190,114 @@ archive_name() {
     *windows*) printf 'mayhem-%s-%s.zip\n' "$VERSION" "$target" ;;
     *) printf 'mayhem-%s-%s.tar.gz\n' "$VERSION" "$target" ;;
   esac
+}
+
+detect_opencode_asset() {
+  local os arch asset hash
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$arch" in
+    x86_64 | amd64) arch="x64" ;;
+    arm64 | aarch64) arch="arm64" ;;
+    *) die "unsupported host architecture for opencode: $arch" ;;
+  esac
+
+  case "$os" in
+    Darwin)
+      if [[ "$arch" == "x64" ]]; then
+        if [[ "$(sysctl -n hw.optional.avx2_0 2>/dev/null || echo 0)" != "1" ]]; then
+          asset="opencode-darwin-x64-baseline.zip"
+          hash="172ce4efd3adfed678616ccc70592fac24f424f1dc96c23cf1d2ab037d255e69"
+        else
+          asset="opencode-darwin-x64.zip"
+          hash="0bf3d9d134097ca698b83f64c55db960d6d2d0c409069bf4cfd863e5de503b4a"
+        fi
+      else
+        asset="opencode-darwin-arm64.zip"
+        hash="dd016d3e26b347d675ab26c45d1e287545912d5c4c49fa0770b622d4a1367e23"
+      fi
+      ;;
+    Linux)
+      local musl suffix
+      musl=0
+      if [[ -f /etc/alpine-release ]]; then
+        musl=1
+      elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+        musl=1
+      fi
+      suffix=""
+      if [[ "$arch" == "x64" ]]; then
+        if [[ ! -r /proc/cpuinfo ]] || ! grep -qwi avx2 /proc/cpuinfo; then
+          suffix="-baseline"
+        fi
+      fi
+      if [[ "$musl" -eq 1 ]]; then
+        suffix="$suffix-musl"
+      fi
+      asset="opencode-linux-$arch$suffix.tar.gz"
+      case "$asset" in
+        opencode-linux-arm64.tar.gz) hash="bbaccdd374aaab66cd97c7f8ad1c080aa393610fa5f80ee8dfc007f9500afaf9" ;;
+        opencode-linux-arm64-musl.tar.gz) hash="c2323c8c9643ac627a5291d33fba740c029c8487283d5f4f933ef11ac11ee15a" ;;
+        opencode-linux-x64.tar.gz) hash="157afa289d1a8d9372de0ce19ac726119b937a1f6b201808d46f06e4e59bb348" ;;
+        opencode-linux-x64-baseline.tar.gz) hash="301c245dd81ba80edfb7d6eee7557f58fe0f5174541fb89140b765e554ebc5fd" ;;
+        opencode-linux-x64-musl.tar.gz) hash="078ec3e678cc77be11b127660fd3e1f70c676a388ac9cb68cafee8e605b8c2f3" ;;
+        opencode-linux-x64-baseline-musl.tar.gz) hash="55da501cfdd88e82294e069b53e68bbea2e130a45ad1d409685478206233f03d" ;;
+        *) die "unsupported opencode Linux asset: $asset" ;;
+      esac
+      ;;
+    *)
+      die "unsupported host OS for opencode install: $os"
+      ;;
+  esac
+
+  printf '%s %s\n' "$asset" "$hash"
+}
+
+install_opencode() {
+  local asset hash archive extract_dir src url actual ext version
+
+  if [[ "$SKIP_OPENCODE" == "1" ]]; then
+    log "skipping opencode install"
+    return 0
+  fi
+
+  if [[ "$FORCE_OPENCODE" != "1" ]] && command -v opencode >/dev/null 2>&1; then
+    log "found opencode at $(command -v opencode); skipping pinned install"
+    return 0
+  fi
+
+  version="${OPENCODE_VERSION#v}"
+  [[ "$version" == "1.17.13" ]] || die "opencode installer checksums are pinned for v1.17.13; got v$version"
+
+  read -r asset hash < <(detect_opencode_asset)
+  ext="${asset##*.}"
+  url="https://github.com/anomalyco/opencode/releases/download/v$version/$asset"
+  archive="$(make_temp_dir)/$asset"
+  extract_dir="$(make_temp_dir)"
+
+  log "downloading opencode v$version ($asset)"
+  download_file "$url" "$archive"
+  actual="$(sha256_file "$archive" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$actual" != "$hash" ]]; then
+    die "opencode checksum mismatch for $asset: expected $hash, got $actual"
+  fi
+
+  if [[ "$asset" == *.tar.gz ]]; then
+    tar -xzf "$archive" -C "$extract_dir"
+  elif [[ "$ext" == "zip" ]]; then
+    command -v unzip >/dev/null 2>&1 || die "unzip is required for opencode .zip artifacts"
+    unzip -q "$archive" -d "$extract_dir"
+  else
+    die "unsupported opencode artifact format: $asset"
+  fi
+
+  src="$(find "$extract_dir" -type f -name opencode | sort | head -n 1 || true)"
+  [[ -n "$src" ]] || die "opencode archive did not contain an opencode binary"
+  mkdir -p "$INSTALL_DIR"
+  cp "$src" "$INSTALL_DIR/opencode"
+  chmod 0755 "$INSTALL_DIR/opencode"
+  log "installed opencode v$version into $INSTALL_DIR"
 }
 
 download_artifact_if_needed() {
@@ -440,6 +554,19 @@ while [[ $# -gt 0 ]]; do
       SKIP_PEAR=1
       shift
       ;;
+    --skip-opencode)
+      SKIP_OPENCODE=1
+      shift
+      ;;
+    --opencode-version)
+      [[ $# -ge 2 ]] || die "--opencode-version requires a value"
+      OPENCODE_VERSION="$2"
+      shift 2
+      ;;
+    --force-opencode)
+      FORCE_OPENCODE=1
+      shift
+      ;;
     --no-path-update)
       NO_PATH_UPDATE=1
       shift
@@ -473,6 +600,7 @@ else
   install_from_artifact
 fi
 
+install_opencode
 update_shell_profile
 smoke_test
 

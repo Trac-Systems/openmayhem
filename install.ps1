@@ -11,6 +11,9 @@ param(
     [string]$InstallDir = $(if ($env:MAYHEM_INSTALL_DIR) { $env:MAYHEM_INSTALL_DIR } else { Join-Path (Join-Path $HOME ".mayhem") "bin" }),
     [switch]$SkipNode,
     [switch]$SkipPear,
+    [switch]$SkipOpencode,
+    [string]$OpencodeVersion = $(if ($env:MAYHEM_OPENCODE_VERSION) { $env:MAYHEM_OPENCODE_VERSION } else { "1.17.13" }),
+    [switch]$ForceOpencode,
     [switch]$NoPathUpdate,
     [switch]$AllowUnverified,
     [string]$NpmPrefix = $(if ($env:MAYHEM_NPM_PREFIX) { $env:MAYHEM_NPM_PREFIX } else { Join-Path (Join-Path $HOME ".mayhem") "node" })
@@ -21,6 +24,8 @@ $ErrorActionPreference = "Stop"
 if ($env:MAYHEM_FROM_SOURCE -eq "1") { $FromSource = $true }
 if ($env:MAYHEM_SKIP_NODE -eq "1") { $SkipNode = $true }
 if ($env:MAYHEM_SKIP_PEAR -eq "1") { $SkipPear = $true }
+if ($env:MAYHEM_SKIP_OPENCODE -eq "1") { $SkipOpencode = $true }
+if ($env:MAYHEM_FORCE_OPENCODE -eq "1") { $ForceOpencode = $true }
 if ($env:MAYHEM_NO_PATH_UPDATE -eq "1") { $NoPathUpdate = $true }
 if ($env:MAYHEM_ALLOW_UNVERIFIED -eq "1") { $AllowUnverified = $true }
 
@@ -96,6 +101,51 @@ function Get-TargetTriple {
 function Get-ArchiveName {
     param([string]$Target)
     return "mayhem-$Version-$Target.zip"
+}
+
+function Test-WindowsAvx2 {
+    try {
+        if (-not ("MayhemProcessorFeatures" -as [type])) {
+            Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public static class MayhemProcessorFeatures {
+    [DllImport("kernel32.dll", SetLastError = false)]
+    public static extern bool IsProcessorFeaturePresent(uint processorFeature);
+}
+"@ | Out-Null
+        }
+        return [MayhemProcessorFeatures]::IsProcessorFeaturePresent(40)
+    } catch {
+        Write-Warn "could not detect AVX2 support; using the standard opencode x64 asset"
+        return $true
+    }
+}
+
+function Get-OpencodeAsset {
+    $target = Get-TargetTriple
+    switch ($target) {
+        "aarch64-pc-windows-msvc" {
+            return @{
+                Name = "opencode-windows-arm64.zip"
+                Sha256 = "bafec2dd6b89055910284ba910d59605295866563ccdb3d035c0c4b887dd11e6"
+            }
+        }
+        "x86_64-pc-windows-msvc" {
+            if (-not (Test-WindowsAvx2)) {
+                return @{
+                    Name = "opencode-windows-x64-baseline.zip"
+                    Sha256 = "5edd43946d2bb41bb9fd975e7faefc3cb9e37a3a8fdbbfd4f1762647f92bb6b8"
+                }
+            }
+            return @{
+                Name = "opencode-windows-x64.zip"
+                Sha256 = "18aa3df701a6eafcca201b5bcc63e086c96c8daa6ae2495cf718e12cb0ce3361"
+            }
+        }
+        default {
+            Fail "unsupported Windows target for opencode: $target"
+        }
+    }
 }
 
 function Invoke-Download {
@@ -338,6 +388,46 @@ function Ensure-Pear {
     }
 }
 
+function Install-Opencode {
+    if ($SkipOpencode) {
+        Write-Log "skipping opencode install"
+        return
+    }
+
+    if (-not $ForceOpencode -and (Test-Command "opencode")) {
+        Write-Log ("found opencode at " + (Get-Command opencode).Source + "; skipping pinned install")
+        return
+    }
+
+    $version = $OpencodeVersion.TrimStart("v")
+    if ($version -ne "1.17.13") {
+        Fail "opencode installer checksums are pinned for v1.17.13; got v$version"
+    }
+
+    $asset = Get-OpencodeAsset
+    $url = "https://github.com/anomalyco/opencode/releases/download/v$version/$($asset.Name)"
+    $tmp = New-TempDir
+    $archive = Join-Path $tmp $asset.Name
+    $extractDir = New-TempDir
+
+    Write-Log "downloading opencode v$version ($($asset.Name))"
+    Invoke-Download -Uri $url -OutFile $archive
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+    if ($actual -ne $asset.Sha256) {
+        Fail "opencode checksum mismatch for $($asset.Name): expected $($asset.Sha256), got $actual"
+    }
+
+    Expand-Archive -Path $archive -DestinationPath $extractDir -Force
+    $matches = @(Get-ChildItem -Path $extractDir -Recurse -File -Filter "opencode.exe")
+    if ($matches.Count -eq 0) {
+        Fail "opencode archive did not contain opencode.exe"
+    }
+
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    Copy-Item -Path $matches[0].FullName -Destination (Join-Path $InstallDir "opencode.exe") -Force
+    Write-Log "installed opencode v$version into $InstallDir"
+}
+
 function Update-UserPath {
     if ($script:PathEntries.Count -eq 0) {
         return
@@ -398,6 +488,7 @@ function Main {
         Install-FromArtifact
     }
 
+    Install-Opencode
     Update-UserPath
     Smoke-Test
     Write-Log "installed Mayhem binaries into $InstallDir"

@@ -619,8 +619,8 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
     } else if let Some(name) = requested_tool_name(request) {
         let tool_call = ToolCallOutput {
             id: make_id("call"),
+            arguments: deterministic_tool_arguments(&name),
             name,
-            arguments: "{}".to_owned(),
         };
         ChatOutput {
             content: None,
@@ -930,6 +930,17 @@ fn requested_tool_name(request: &ChatCompletionRequest) -> Option<String> {
             .as_str()
             .map(str::to_owned)
     })
+}
+
+fn deterministic_tool_arguments(name: &str) -> String {
+    match name {
+        "bash" => json!({ "command": "printf mayhem-opencode-tool-ok" }).to_string(),
+        "write" => {
+            json!({ "filePath": "mayhem-opencode-tool-ok.txt", "content": "mayhem-opencode-tool-ok" })
+                .to_string()
+        }
+        _ => "{}".to_owned(),
+    }
 }
 
 fn matches_tool_choice_none(value: &Option<Value>) -> bool {
