@@ -8,13 +8,19 @@ const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
 const PRICE_DENOMINATION = 'mu_usd';
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
 const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
-const PROBATION_SECONDS = 7 * 24 * 60 * 60;
+const DAY_SECONDS = 24 * 60 * 60;
+const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
   probation_max_concurrent_sessions_per_user: { default: 2, min: 1, max: 1_000_000 },
   probation_price_max_bps: { default: 10_000, min: 0, max: 1_000_000 },
   probation_weight_bps: { default: 5_000, min: 0, max: 10_000 },
+  auditor_min_reputation_bps: { default: 8_000, min: 0, max: 10_000 },
+  auditor_min_age_seconds: { default: 30 * DAY_SECONDS, min: 0, max: 10 * 365 * DAY_SECONDS },
+  canary_match_min_bps: { default: 9_000, min: 0, max: 10_000 },
+  probe_reward_mu: { default: 5_000, min: 0, max: Number.MAX_SAFE_INTEGER },
+  uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
   holdback_epochs: { default: 168, min: 0, max: 1_000_000 },
   fee_bps: { default: 1_500, min: 0, max: 10_000 },
   payout_min_mu: { default: 1_000_000, min: 0, max: Number.MAX_SAFE_INTEGER },
@@ -36,6 +42,7 @@ const REPUTATION_EVENT_KINDS = new Set([
   'dispute_lost',
   'provenance_violation',
 ]);
+const PROBE_KINDS = new Set(['canary', 'uptime_tick']);
 const ENCLAVE_UPDATE_FIELDS = [
   'backend',
   'artifact_root',
@@ -304,6 +311,35 @@ class MayhemContract extends Contract {
         raw_milli: { type: 'number', integer: true },
         successful_sessions: { type: 'number', integer: true, min: 0 },
         provenance_violation: { type: 'boolean', optional: true },
+      },
+    });
+
+    this.addSchema('auditorRegister', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        auditor: { type: 'string', min: 1, max: 128, optional: true },
+        registered_at_seconds: { type: 'number', integer: true, min: 0, optional: true },
+      },
+    });
+
+    this.addSchema('probeResult', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        probe_id: { type: 'string', min: 1, max: 128 },
+        probe_kind: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128 },
+        enclave_id: { type: 'string', min: 1, max: 128, optional: true },
+        epoch: { type: 'number', integer: true, min: 0 },
+        at: { type: 'number', integer: true, min: 0 },
+        canary_set: { type: 'string', min: 1, max: 128, optional: true },
+        match_bps: { type: 'number', integer: true, min: 0, max: 10_000, optional: true },
+        pass: { type: 'boolean', optional: true },
+        session_receipt_hash: { type: 'string', min: 1, max: 128, optional: true },
+        evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
   }
@@ -846,12 +882,7 @@ class MayhemContract extends Contract {
     const provider = await this.get(`prov/${this.value.provider}`);
     if (!provider) return new Error('Provider not found.');
 
-    const key = `ev/rep/${this.value.provider}/${this.value.event_id}`;
-    if ((await this.get(key)) !== null) return new Error('Reputation event already recorded.');
-
-    const headKey = `ev/rep/head/${this.value.provider}`;
-    const currentHead = await this.get(headKey);
-    const event = {
+    const record = await this.appendReputationEvent({
       provider: this.value.provider,
       event_id: this.value.event_id,
       kind: this.value.kind,
@@ -860,30 +891,16 @@ class MayhemContract extends Contract {
       paid_mu: this.value.paid_mu ?? null,
       max_spend_mu: this.value.max_spend_mu ?? null,
       evidence_hash: this.value.evidence_hash ?? null,
-      recorded_at: this.tx,
-      recorded_by: this.address,
-    };
-    const head = await this.reputationEventHead(currentHead?.head ?? null, event);
-    const record = {
-      ...event,
-      head,
-    };
-    const headRecord = {
-      provider: this.value.provider,
-      head,
-      count: (currentHead?.count ?? 0) + 1,
-      updated_at: this.tx,
-    };
+    });
+    if (record instanceof Error) return record;
 
-    await this.put(key, record);
-    await this.put(headKey, headRecord);
     console.log('mayhem recordReputationEvent', record);
     return {
       ok: true,
       op: 'recordReputationEvent',
       provider: this.value.provider,
       event_id: this.value.event_id,
-      head,
+      head: record.head,
     };
   }
 
@@ -960,6 +977,155 @@ class MayhemContract extends Contract {
       provider: this.value.provider,
       epoch: this.value.epoch,
       events_head: this.value.events_head,
+    };
+  }
+
+  async auditorRegister() {
+    const target = this.value.auditor ?? this.address;
+    if (!this.isSafeKeyPart(target)) return new Error('Invalid auditor id.');
+
+    const consentError = await this.requireConsent(target);
+    if (consentError) return consentError;
+
+    const adminRegistersOther = target !== this.address;
+    if (adminRegistersOther) {
+      const adminError = await this.requireAdmin();
+      if (adminError) return adminError;
+    } else {
+      const eligibilityError = await this.requireAuditorEligibility(
+        target,
+        this.value.registered_at_seconds ?? 0
+      );
+      if (eligibilityError) return eligibilityError;
+    }
+
+    const key = `auditor/${target}`;
+    const existing = await this.get(key);
+    if (existing?.status === 'active') return new Error('Auditor already registered.');
+
+    const record = {
+      auditor: target,
+      status: 'active',
+      registered_at: this.tx,
+      registered_at_seconds: this.value.registered_at_seconds ?? 0,
+      accredited_by: adminRegistersOther ? this.address : null,
+      successful_probes: existing?.successful_probes ?? 0,
+      submitted_probes: existing?.submitted_probes ?? 0,
+      false_reports: existing?.false_reports ?? 0,
+      updated_at: this.tx,
+    };
+    await this.put(key, record);
+    console.log('mayhem auditorRegister', record);
+    return { ok: true, op: 'auditorRegister', auditor: target };
+  }
+
+  async probeResult() {
+    const auditor = await this.get(`auditor/${this.address}`);
+    if (!auditor || auditor.status !== 'active') return new Error('Auditor registration required.');
+
+    const validationError = this.validateProbeResult(this.value);
+    if (validationError) return validationError;
+
+    const providerKey = `prov/${this.value.provider}`;
+    const provider = await this.get(providerKey);
+    if (!provider) return new Error('Provider not found.');
+
+    const params = await this.activeParamsAt(this.value.at, [
+      'canary_match_min_bps',
+      'probe_reward_mu',
+      'uptime_tick_seconds',
+    ]);
+    const pass = this.probePass(this.value, params);
+    if (this.value.pass !== undefined && this.value.pass !== pass) {
+      return new Error('Probe pass flag does not match contract threshold.');
+    }
+
+    const reputationEvent = await this.appendReputationEvent({
+      provider: this.value.provider,
+      event_id: `probe-${this.value.probe_id}`,
+      kind: this.value.probe_kind === 'uptime_tick'
+        ? 'uptime_tick'
+        : pass
+          ? 'probe_ok'
+          : 'probe_fail',
+      epoch: this.value.epoch,
+      at: this.value.at,
+      paid_mu: null,
+      max_spend_mu: null,
+      evidence_hash: this.value.evidence_hash ?? null,
+    });
+    if (reputationEvent instanceof Error) return reputationEvent;
+
+    let provenanceViolation = false;
+    let slash = null;
+    if (this.value.probe_kind === 'canary' && !pass) {
+      provenanceViolation = true;
+      const violationEvent = await this.appendReputationEvent({
+        provider: this.value.provider,
+        event_id: `probe-${this.value.probe_id}-violation`,
+        kind: 'provenance_violation',
+        epoch: this.value.epoch,
+        at: this.value.at,
+        paid_mu: null,
+        max_spend_mu: null,
+        evidence_hash: this.value.evidence_hash ?? null,
+      });
+      if (violationEvent instanceof Error) return violationEvent;
+
+      slash = {
+        provider: this.value.provider,
+        auditor: this.address,
+        reason: 'canary_mismatch',
+        evidence_hash: this.value.evidence_hash ?? null,
+        probe_id: this.value.probe_id,
+        at: this.value.at,
+        tx: this.tx,
+      };
+      await this.put(`ev/slash/${this.value.provider}/${this.tx}`, slash);
+      await this.put(providerKey, {
+        ...provider,
+        status: 'banned',
+        banned_at: this.tx,
+        banned_by: this.address,
+        ban_reason_hash: this.value.evidence_hash ?? null,
+        updated_at: this.tx,
+      });
+    }
+
+    const record = {
+      probe_id: this.value.probe_id,
+      probe_kind: this.value.probe_kind,
+      auditor: this.address,
+      provider: this.value.provider,
+      enclave_id: this.value.enclave_id ?? null,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      canary_set: this.value.canary_set ?? null,
+      match_bps: this.value.match_bps ?? null,
+      pass,
+      session_receipt_hash: this.value.session_receipt_hash ?? null,
+      evidence_hash: this.value.evidence_hash ?? null,
+      reputation_head: (await this.get(`ev/rep/head/${this.value.provider}`))?.head ?? null,
+      provenance_violation: provenanceViolation,
+      probe_reward_mu: params.probe_reward_mu,
+      slash,
+      recorded_at: this.tx,
+    };
+    await this.put(`ev/probe/${this.value.probe_id}`, record);
+    await this.put(`auditor/${this.address}`, {
+      ...auditor,
+      submitted_probes: (auditor.submitted_probes ?? 0) + 1,
+      successful_probes: (auditor.successful_probes ?? 0) + (pass ? 1 : 0),
+      updated_at: this.tx,
+    });
+    console.log('mayhem probeResult', record);
+    return {
+      ok: true,
+      op: 'probeResult',
+      probe_id: this.value.probe_id,
+      provider: this.value.provider,
+      pass,
+      provenance_violation: provenanceViolation,
     };
   }
 
@@ -1111,6 +1277,71 @@ class MayhemContract extends Contract {
       return new Error('Reputation event requires max_spend_mu.');
     }
     return null;
+  }
+
+  validateProbeResult(value) {
+    if (!this.isSafeKeyPart(value.probe_id)) return new Error('Invalid probe id.');
+    if (!PROBE_KINDS.has(value.probe_kind)) return new Error('Unsupported probe kind.');
+    if (value.probe_kind === 'canary') {
+      if (!Number.isInteger(value.match_bps)) return new Error('Canary probe requires match_bps.');
+      if (!value.canary_set) return new Error('Canary probe requires canary_set.');
+    }
+    return null;
+  }
+
+  probePass(value, params) {
+    if (value.probe_kind === 'uptime_tick') return true;
+    return value.match_bps >= params.canary_match_min_bps;
+  }
+
+  async requireAuditorEligibility(auditor, atSeconds) {
+    const rep = await this.get(`rep/${auditor}`);
+    if (!rep) return new Error('Auditor reputation snapshot required.');
+    const params = await this.activeParamsAt(atSeconds, [
+      'auditor_min_reputation_bps',
+      'auditor_min_age_seconds',
+    ]);
+    if (rep.provenance_violation === true) return new Error('Auditor has a provenance violation.');
+    if ((rep.r_bps ?? 0) < params.auditor_min_reputation_bps) {
+      return new Error('Auditor reputation too low.');
+    }
+    const sinceSeconds = rep.probation?.since_seconds ?? 0;
+    if (atSeconds - sinceSeconds < params.auditor_min_age_seconds) {
+      return new Error('Auditor account age too low.');
+    }
+    return null;
+  }
+
+  async appendReputationEvent(event) {
+    if (!this.isSafeKeyPart(event.event_id)) return new Error('Invalid reputation event id.');
+    const key = `ev/rep/${event.provider}/${event.event_id}`;
+    if ((await this.get(key)) !== null) return new Error('Reputation event already recorded.');
+
+    const headKey = `ev/rep/head/${event.provider}`;
+    const currentHead = await this.get(headKey);
+    const body = {
+      ...event,
+      paid_mu: event.paid_mu ?? null,
+      max_spend_mu: event.max_spend_mu ?? null,
+      evidence_hash: event.evidence_hash ?? null,
+      recorded_at: this.tx,
+      recorded_by: this.address,
+    };
+    const head = await this.reputationEventHead(currentHead?.head ?? null, body);
+    const record = {
+      ...body,
+      head,
+    };
+    const headRecord = {
+      provider: event.provider,
+      head,
+      count: (currentHead?.count ?? 0) + 1,
+      updated_at: this.tx,
+    };
+
+    await this.put(key, record);
+    await this.put(headKey, headRecord);
+    return record;
   }
 
   isSafeKeyPart(value) {
