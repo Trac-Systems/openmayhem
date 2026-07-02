@@ -720,6 +720,7 @@ class MayhemContract extends Contract {
       provider: this.address,
       payout: null,
       status: 'active',
+      enclaves: [],
       probation: {
         since: this.tx,
         since_seconds: 0,
@@ -769,9 +770,18 @@ class MayhemContract extends Contract {
     if (!record) return new Error('Provider not found.');
     if (record.status === 'banned') return new Error('Provider already banned.');
 
+    const tombstones = await this.tombstoneProviderEnclaves(
+      this.value.provider,
+      this.providerActiveEnclaves(record),
+      this.value.reason_hash ?? null
+    );
+    if (tombstones instanceof Error) return tombstones;
+
     const updated = {
       ...record,
       status: 'banned',
+      enclaves: [],
+      tombstoned_enclaves: tombstones.map((tombstone) => tombstone.enclave_id),
       banned_at: this.tx,
       banned_by: this.address,
       ban_reason_hash: this.value.reason_hash ?? null,
@@ -779,7 +789,12 @@ class MayhemContract extends Contract {
     };
     await this.put(key, updated);
     console.log('mayhem banProvider', updated);
-    return { ok: true, op: 'banProvider', provider: this.value.provider };
+    return {
+      ok: true,
+      op: 'banProvider',
+      provider: this.value.provider,
+      tombstoned_enclaves: updated.tombstoned_enclaves,
+    };
   }
 
   async setModelRef() {
@@ -893,6 +908,8 @@ class MayhemContract extends Contract {
     const key = `serve/${this.address}/${this.value.enclave_id}`;
     const existing = await this.get(key);
     if (existing && existing.status === 'active') return new Error('Provider already serving enclave.');
+    const provider = await this.get(`prov/${this.address}`);
+    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
 
     const record = {
       provider: this.address,
@@ -905,6 +922,11 @@ class MayhemContract extends Contract {
       rooms: Array.isArray(existing?.rooms) ? existing.rooms.slice() : [],
     };
     await this.put(key, record);
+    await this.put(`prov/${this.address}`, {
+      ...provider,
+      enclaves: this.providerEnclavesWith(provider, this.value.enclave_id),
+      updated_at: this.tx,
+    });
     console.log('mayhem joinEnclave', record);
     return { ok: true, op: 'joinEnclave', provider: this.address, enclave_id: this.value.enclave_id };
   }
@@ -924,6 +946,14 @@ class MayhemContract extends Contract {
       left_at: this.tx,
     };
     await this.put(key, updated);
+    const provider = await this.get(`prov/${this.address}`);
+    if (provider) {
+      await this.put(`prov/${this.address}`, {
+        ...provider,
+        enclaves: this.providerEnclavesWithout(provider, this.value.enclave_id),
+        updated_at: this.tx,
+      });
+    }
     console.log('mayhem leaveEnclave', updated);
     return { ok: true, op: 'leaveEnclave', provider: this.address, enclave_id: this.value.enclave_id };
   }
@@ -2907,6 +2937,31 @@ class MayhemContract extends Contract {
     return Number((BigInt(heldMu) * BigInt(slashBps)) / 10_000n);
   }
 
+  providerActiveEnclaves(provider) {
+    if (!provider || !Array.isArray(provider.enclaves)) return [];
+    return [...new Set(provider.enclaves.filter((enclaveId) => this.isSafeKeyPart(enclaveId)))].sort();
+  }
+
+  providerEnclavesWith(provider, enclaveId) {
+    const enclaves = this.providerActiveEnclaves(provider);
+    if (!enclaves.includes(enclaveId)) enclaves.push(enclaveId);
+    return enclaves.sort();
+  }
+
+  providerEnclavesWithout(provider, enclaveId) {
+    return this.providerActiveEnclaves(provider).filter((activeEnclaveId) => activeEnclaveId !== enclaveId);
+  }
+
+  async tombstoneProviderEnclaves(providerId, enclaveIds, evidenceHash) {
+    const tombstones = [];
+    for (const enclaveId of [...new Set(enclaveIds)].sort()) {
+      const tombstone = await this.tombstoneProviderEnclave(providerId, enclaveId, evidenceHash);
+      if (tombstone instanceof Error) return tombstone;
+      tombstones.push(tombstone);
+    }
+    return tombstones;
+  }
+
   async tombstoneProviderEnclave(providerId, enclaveId, evidenceHash) {
     if (!enclaveId) {
       return {
@@ -3055,6 +3110,14 @@ class MayhemContract extends Contract {
           rooms_tombstoned: [],
         };
     if (tombstone instanceof Error) return tombstone;
+    const banTombstones = banProvider
+      ? await this.tombstoneProviderEnclaves(
+          providerId,
+          this.providerActiveEnclaves(provider).filter((activeEnclaveId) => activeEnclaveId !== enclaveId),
+          evidenceHash
+        )
+      : [];
+    if (banTombstones instanceof Error) return banTombstones;
 
     const slash = {
       type: 'slash',
@@ -3077,6 +3140,7 @@ class MayhemContract extends Contract {
       beneficiary_mu: reporterMu,
       treasury_mu: treasuryMu,
       tombstone,
+      ban_tombstones: banTombstones,
       provider_banned: banProvider,
     };
     slash.slash_hash = await this.opaqueHash('mayhem-slash-v1', slash);
@@ -3085,6 +3149,10 @@ class MayhemContract extends Contract {
       ? {
           ...provider,
           status: 'banned',
+          enclaves: [],
+          tombstoned_enclaves: [tombstone, ...banTombstones]
+            .filter((entry) => entry.enclave_id)
+            .map((entry) => entry.enclave_id),
           banned_at: provider.banned_at ?? this.tx,
           banned_by: provider.banned_by ?? this.address,
           ban_reason_hash: provider.ban_reason_hash ?? evidenceHash,
@@ -3092,6 +3160,9 @@ class MayhemContract extends Contract {
         }
       : {
           ...provider,
+          enclaves: tombstone.serve_tombstoned
+            ? this.providerEnclavesWithout(provider, tombstone.enclave_id)
+            : this.providerActiveEnclaves(provider),
           updated_at: this.tx,
         };
 

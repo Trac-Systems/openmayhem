@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import MayhemContract from '../contract/contract.js';
+import MayhemContract, { deriveRoomId } from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
@@ -147,13 +147,14 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     provider: provider.publicKey,
     payout: null,
     status: 'active',
+    enclaves: [enclaveId],
     probation: {
       since: makeTxKey(3),
       since_seconds: 0,
       successful_sessions: 0,
     },
     registered_at: makeTxKey(3),
-    updated_at: makeTxKey(3),
+    updated_at: makeTxKey(5),
   });
 
   const enclaveEntry = await first.storage.get(`enclave/${enclaveId}`);
@@ -302,6 +303,7 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
   const storage = new MemoryStorage({ admin: admin.publicKey });
   const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
   const contract = new MayhemContract(protocol, {});
+  const roomId = await deriveRoomId(enclaveRegistration.model_id, admin.publicKey, 'ban-room');
 
   for (const op of [
     {
@@ -339,6 +341,28 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
       sender: provider.publicKey,
       txNo: 5,
     },
+    {
+      type: 'openRoom',
+      value: {
+        op: 'open_room',
+        model_id: enclaveRegistration.model_id,
+        nonce: 'ban-room',
+        label: 'ban-room',
+        policy: {},
+      },
+      sender: admin.publicKey,
+      txNo: 6,
+    },
+    {
+      type: 'joinRoom',
+      value: {
+        op: 'join_room',
+        room_id: roomId,
+        enclave_id: enclaveId,
+      },
+      sender: provider.publicKey,
+      txNo: 7,
+    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
@@ -354,19 +378,31 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
       reason_hash: '7'.repeat(64),
     },
     admin.publicKey,
-    6
+    8
   );
   assert.deepEqual(banned, {
     ok: true,
     op: 'banProvider',
     provider: provider.publicKey,
+    tombstoned_enclaves: [enclaveId],
   });
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerEntry.value.status, 'banned');
   assert.equal(providerEntry.value.banned_by, admin.publicKey);
-  assert.equal(providerEntry.value.banned_at, makeTxKey(6));
+  assert.equal(providerEntry.value.banned_at, makeTxKey(8));
   assert.equal(providerEntry.value.ban_reason_hash, '7'.repeat(64));
+  assert.deepEqual(providerEntry.value.enclaves, []);
+  assert.deepEqual(providerEntry.value.tombstoned_enclaves, [enclaveId]);
+
+  const servingEntry = await storage.get(`serve/${provider.publicKey}/${enclaveId}`);
+  assert.equal(servingEntry.value.status, 'tombstoned');
+  assert.deepEqual(servingEntry.value.rooms, []);
+  assert.equal(servingEntry.value.tombstone_reason_hash, '7'.repeat(64));
+
+  const roomServingEntry = await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`);
+  assert.equal(roomServingEntry.value.status, 'tombstoned');
+  assert.equal(roomServingEntry.value.tombstone_reason_hash, '7'.repeat(64));
 
   const joinAfterBan = await execute(
     contract,
@@ -374,7 +410,7 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
     'joinEnclave',
     providerJoin,
     provider.publicKey,
-    7
+    9
   );
   assert.match(joinAfterBan.message, /provider registration required/i);
 });
