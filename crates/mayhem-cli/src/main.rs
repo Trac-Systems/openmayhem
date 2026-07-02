@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,19 @@ struct Cli {
 enum Commands {
     /// Choose a role, create or import a wallet, and sign current router rules.
     Setup(SetupArgs),
+    /// Inspect, hash, and re-consent to router rules.
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RulesCommands {
+    /// Print the BLAKE3 hash of RULES.md.
+    Hash(RulesHashArgs),
+    /// Review current rules and sign fresh consent when needed.
+    Review(RulesReviewArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -75,11 +89,65 @@ struct SetupArgs {
     #[arg(long)]
     rules_hash: Option<String>,
 
+    /// Path to RULES.md. Defaults to the repo root RULES.md.
+    #[arg(long, value_name = "PATH")]
+    rules_path: Option<PathBuf>,
+
+    /// Accept the displayed rules without an interactive prompt.
+    #[arg(long)]
+    yes: bool,
+
     /// Overwrite an existing keypair when using --wallet create/import.
     #[arg(long)]
     force: bool,
 
     /// Print a machine-readable setup report.
+    #[arg(long)]
+    print_json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct RulesHashArgs {
+    /// Path to RULES.md. Defaults to the repo root RULES.md.
+    #[arg(long, value_name = "PATH")]
+    rules_path: Option<PathBuf>,
+
+    /// Print a machine-readable hash report.
+    #[arg(long)]
+    print_json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct RulesReviewArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml is absent.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Path to RULES.md. Defaults to the repo root RULES.md.
+    #[arg(long, value_name = "PATH")]
+    rules_path: Option<PathBuf>,
+
+    /// Accept the displayed rules without an interactive prompt.
+    #[arg(long)]
+    yes: bool,
+
+    /// Dry-run consent through the contract simulator; does not persist state.
+    #[arg(long)]
+    sim: bool,
+
+    /// Print a machine-readable review report.
     #[arg(long)]
     print_json: bool,
 }
@@ -145,11 +213,40 @@ struct ConsentReport {
     state: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct RulesDoc {
+    path: PathBuf,
+    text: String,
+    hash: String,
+    bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct MayhemConfig {
+    identity: Option<ConfigIdentity>,
+    network: Option<ConfigNetwork>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigIdentity {
+    keypair_path: Option<String>,
+    store_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigNetwork {
+    rpc_url: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Setup(args) => setup(args).await,
+        Commands::Rules { command } => match command {
+            RulesCommands::Hash(args) => rules_hash(args),
+            RulesCommands::Review(args) => rules_review(args).await,
+        },
     }
 }
 
@@ -191,8 +288,31 @@ async fn setup(args: SetupArgs) -> Result<()> {
         }
     } else {
         let rpc = PeerRpcClient::new(&rpc_url)?;
-        let rules = resolve_rules(&args, &rpc).await?;
-        submit_consent(&rpc, &keypair_path, &password, &wallet, rules, args.sim).await?
+        let rules_doc = read_rules_doc(args.rules_path.as_deref())?;
+        let rules = resolve_rules(
+            args.rules_ver,
+            args.rules_hash.as_deref(),
+            &rpc,
+            Some(&rules_doc),
+        )
+        .await?;
+        if !args.print_json {
+            print_rules_review(&home, &rules_doc, &rules, None, None)?;
+        }
+        confirm_rules_acceptance(args.yes)?;
+        let consent = submit_consent(
+            &rpc,
+            &keypair_path,
+            &password,
+            &wallet,
+            rules.clone(),
+            args.sim,
+        )
+        .await?;
+        if !args.sim {
+            persist_rules_acceptance(&home, &rules_doc, &rules)?;
+        }
+        consent
     };
 
     let report = json!({
@@ -215,6 +335,141 @@ async fn setup(args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
+fn rules_hash(args: RulesHashArgs) -> Result<()> {
+    let rules_doc = read_rules_doc(args.rules_path.as_deref())?;
+    if args.print_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "rules_path": rules_doc.path,
+                "hash": rules_doc.hash,
+                "bytes": rules_doc.bytes,
+            }))?
+        );
+    } else {
+        println!("{}", rules_doc.hash);
+    }
+    Ok(())
+}
+
+async fn rules_review(args: RulesReviewArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = args
+        .rpc_url
+        .clone()
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.network.as_ref())
+                .and_then(|network| network.rpc_url.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned());
+    let store_name = config
+        .as_ref()
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.store_name.clone())
+        .unwrap_or_else(|| args.peer_store_name.clone());
+    let keypair_path = config
+        .as_ref()
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.keypair_path.as_ref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.join("stores")
+                .join(&store_name)
+                .join("db")
+                .join("keypair.json")
+        });
+    let password = args.wallet_password.clone().unwrap_or_default();
+    let wallet = inspect_wallet(&keypair_path, &password).await?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let rules_doc = read_rules_doc(args.rules_path.as_deref())?;
+    let rules = resolve_rules(None, None, &rpc, Some(&rules_doc)).await?;
+    let prior_consent = read_consent_state(&rpc, &wallet.public_key).await?;
+    let already_consented = consent_matches(prior_consent.as_ref(), &rules);
+    let previous_rules = read_current_accepted_rules(&home)?;
+
+    if !args.print_json {
+        print_rules_review(
+            &home,
+            &rules_doc,
+            &rules,
+            previous_rules.as_deref(),
+            prior_consent.as_ref(),
+        )?;
+    }
+
+    let consent = if already_consented && !args.sim {
+        if previous_rules.as_deref() != Some(rules_doc.text.as_str()) {
+            confirm_rules_acceptance(args.yes)?;
+            persist_rules_acceptance(&home, &rules_doc, &rules)?;
+        }
+        ConsentReport {
+            skipped: true,
+            simulated: false,
+            rules: Some(rules.clone()),
+            tx: None,
+            command_hash: None,
+            result: None,
+            state: prior_consent.clone(),
+        }
+    } else {
+        confirm_rules_acceptance(args.yes)?;
+        let consent = submit_consent(
+            &rpc,
+            &keypair_path,
+            &password,
+            &wallet,
+            rules.clone(),
+            args.sim,
+        )
+        .await?;
+        if !args.sim {
+            persist_rules_acceptance(&home, &rules_doc, &rules)?;
+        }
+        consent
+    };
+    let consent_skipped = consent.skipped;
+    let consent_simulated = consent.simulated;
+    let rules_ver = rules.ver;
+
+    let report = json!({
+        "home": home,
+        "wallet": {
+            "public_key": wallet.public_key,
+            "address": wallet.address,
+            "keypair_path": wallet.keypair_path,
+        },
+        "network": {
+            "rpc_url": rpc_url,
+        },
+        "rules": {
+            "ver": rules.ver,
+            "hash": rules.hash,
+            "local_hash": rules_doc.hash,
+            "path": rules_doc.path,
+            "bytes": rules_doc.bytes,
+        },
+        "prior_consent": prior_consent,
+        "already_consented": already_consented,
+        "consent": consent,
+    });
+
+    if args.print_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if consent_skipped {
+        println!("Consent: already current for rules v{rules_ver}");
+    } else if consent_simulated {
+        println!("Consent: simulated for rules v{rules_ver}");
+    } else {
+        println!("Consent: submitted and observed for rules v{rules_ver}");
+    }
+
+    Ok(())
+}
+
 fn default_home() -> Result<PathBuf> {
     if let Ok(home) = env::var("MAYHEM_HOME") {
         let home = home.trim();
@@ -227,11 +482,168 @@ fn default_home() -> Result<PathBuf> {
     Ok(PathBuf::from(user_home).join(".mayhem"))
 }
 
+fn default_rules_path() -> Result<PathBuf> {
+    let repo_rules = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../RULES.md");
+    if repo_rules.exists() {
+        return absolutize(repo_rules);
+    }
+    absolutize(PathBuf::from("RULES.md"))
+}
+
 fn absolutize(path: PathBuf) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path);
     }
     Ok(env::current_dir()?.join(path))
+}
+
+fn read_mayhem_config(home: &Path) -> Result<Option<MayhemConfig>> {
+    let config_path = home.join("config.toml");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let config =
+        toml::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?;
+    Ok(Some(config))
+}
+
+fn read_rules_doc(path: Option<&Path>) -> Result<RulesDoc> {
+    let path = match path {
+        Some(path) => absolutize(path.to_path_buf())?,
+        None => default_rules_path()?,
+    };
+    let path = fs::canonicalize(&path).unwrap_or(path);
+    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text = String::from_utf8(bytes.clone())
+        .with_context(|| format!("{} must be valid UTF-8", path.display()))?;
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    Ok(RulesDoc {
+        path,
+        text,
+        hash,
+        bytes: bytes.len(),
+    })
+}
+
+fn rules_state_dir(home: &Path) -> PathBuf {
+    home.join("rules")
+}
+
+fn read_current_accepted_rules(home: &Path) -> Result<Option<String>> {
+    let path = rules_state_dir(home).join("current.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(text))
+}
+
+fn persist_rules_acceptance(home: &Path, rules_doc: &RulesDoc, rules: &RulesRef) -> Result<()> {
+    let dir = rules_state_dir(home);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let versioned_path = dir.join(format!("accepted-{}-{}.md", rules.ver, rules.hash));
+    fs::write(&versioned_path, &rules_doc.text)
+        .with_context(|| format!("writing {}", versioned_path.display()))?;
+    fs::write(dir.join("current.md"), &rules_doc.text)
+        .with_context(|| format!("writing {}", dir.join("current.md").display()))?;
+    fs::write(
+        dir.join("current.json"),
+        serde_json::to_vec_pretty(&json!({
+            "ver": rules.ver,
+            "hash": rules.hash,
+            "path": rules_doc.path,
+            "bytes": rules_doc.bytes,
+            "accepted_text": versioned_path,
+        }))?,
+    )
+    .with_context(|| format!("writing {}", dir.join("current.json").display()))?;
+    Ok(())
+}
+
+fn print_rules_review(
+    home: &Path,
+    rules_doc: &RulesDoc,
+    rules: &RulesRef,
+    previous_rules: Option<&str>,
+    prior_consent: Option<&Value>,
+) -> Result<()> {
+    println!("Mayhem rules review");
+    println!("Home: {}", home.display());
+    println!("Rules file: {}", rules_doc.path.display());
+    println!("Rules version: {}", rules.ver);
+    println!("BLAKE3(RULES.md): {}", rules_doc.hash);
+    if let Some(consent) = prior_consent {
+        let ver = consent.get("ver").and_then(Value::as_u64).unwrap_or(0);
+        let hash = consent.get("hash").and_then(Value::as_str).unwrap_or("");
+        println!("Existing consent: v{ver} {hash}");
+    } else {
+        println!("Existing consent: none");
+    }
+
+    match previous_rules {
+        Some(previous) if previous == rules_doc.text => {
+            println!();
+            println!("Local accepted rules text is unchanged.");
+        }
+        Some(previous) => {
+            println!();
+            println!("Diff from locally accepted rules:");
+            println!("{}", render_line_diff(previous, &rules_doc.text));
+        }
+        None => {
+            println!();
+            println!("No locally accepted rules text was found. Current rules text follows.");
+            println!();
+            println!("{}", rules_doc.text);
+        }
+    }
+    Ok(())
+}
+
+fn render_line_diff(old: &str, new: &str) -> String {
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let max_len = old_lines.len().max(new_lines.len());
+    let mut out = String::new();
+    for i in 0..max_len {
+        match (old_lines.get(i), new_lines.get(i)) {
+            (Some(old), Some(new)) if old == new => {
+                let _ = writeln!(out, "  {old}");
+            }
+            (Some(old), Some(new)) => {
+                let _ = writeln!(out, "- {old}");
+                let _ = writeln!(out, "+ {new}");
+            }
+            (Some(old), None) => {
+                let _ = writeln!(out, "- {old}");
+            }
+            (None, Some(new)) => {
+                let _ = writeln!(out, "+ {new}");
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+fn confirm_rules_acceptance(yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("Pass --yes to accept and sign the current RULES.md in non-interactive mode.");
+    }
+
+    eprint!("Type 'agree' to sign consent for these rules: ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "agree" {
+        bail!("Rules consent was not signed.");
+    }
+    Ok(())
 }
 
 fn select_role(role: Option<Role>) -> Result<Role> {
@@ -434,14 +846,19 @@ fn toml_string(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-async fn resolve_rules(args: &SetupArgs, rpc: &PeerRpcClient) -> Result<RulesRef> {
-    match (args.rules_ver, args.rules_hash.as_deref()) {
+async fn resolve_rules(
+    rules_ver: Option<u64>,
+    rules_hash: Option<&str>,
+    rpc: &PeerRpcClient,
+    rules_doc: Option<&RulesDoc>,
+) -> Result<RulesRef> {
+    let rules = match (rules_ver, rules_hash) {
         (Some(ver), Some(hash)) => {
             validate_rules_hash(hash)?;
-            Ok(RulesRef {
+            RulesRef {
                 ver,
                 hash: hash.to_owned(),
-            })
+            }
         }
         (None, None) => {
             let state = rpc
@@ -462,17 +879,46 @@ async fn resolve_rules(args: &SetupArgs, rpc: &PeerRpcClient) -> Result<RulesRef
                 .context("rules/current.hash is missing or invalid")?
                 .to_owned();
             validate_rules_hash(&hash)?;
-            Ok(RulesRef { ver, hash })
+            RulesRef { ver, hash }
         }
         _ => bail!("--rules-ver and --rules-hash must be provided together."),
+    };
+
+    if let Some(rules_doc) = rules_doc {
+        if rules.hash != rules_doc.hash {
+            bail!(
+                "contract rules hash {} does not match BLAKE3({}) {}",
+                rules.hash,
+                rules_doc.path.display(),
+                rules_doc.hash
+            );
+        }
     }
+
+    Ok(rules)
 }
 
 fn validate_rules_hash(hash: &str) -> Result<()> {
-    if hash.is_empty() || hash.len() > 128 || !hash.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        bail!("rules hash must be 1-128 hex characters.");
+    if hash.len() != 64 || !hash.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        bail!("rules hash must be a 32-byte hex BLAKE3 digest (64 characters).");
     }
     Ok(())
+}
+
+async fn read_consent_state(rpc: &PeerRpcClient, public_key: &str) -> Result<Option<Value>> {
+    let key = format!("consent/{public_key}");
+    let state = rpc
+        .state(Some(&key), Some(false))
+        .await
+        .with_context(|| format!("reading {key} from peer RPC"))?;
+    Ok(state.get("value").cloned().filter(|value| !value.is_null()))
+}
+
+fn consent_matches(consent: Option<&Value>, rules: &RulesRef) -> bool {
+    consent.is_some_and(|state| {
+        state.get("ver").and_then(Value::as_u64) == Some(rules.ver)
+            && state.get("hash").and_then(Value::as_str) == Some(rules.hash.as_str())
+    })
 }
 
 async fn submit_consent(
@@ -634,8 +1080,9 @@ mod tests {
 
     #[test]
     fn rules_hash_allows_hex_only() {
-        assert!(validate_rules_hash("aabb001122").is_ok());
+        assert!(validate_rules_hash(&"a".repeat(64)).is_ok());
         assert!(validate_rules_hash("not-hex").is_err());
+        assert!(validate_rules_hash("aabb001122").is_err());
         assert!(validate_rules_hash("").is_err());
     }
 }
