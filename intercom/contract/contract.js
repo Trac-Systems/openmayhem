@@ -5,6 +5,7 @@ import { Contract } from 'trac-peer';
 const CONTRACT_VERSION = 1;
 const CURRENT_RULES_KEY = 'rules/current';
 const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
+const PAYOUT_CONFIRM_KINDS = new Set(['provider', 'fee_sweep']);
 const PRICE_DENOMINATION = 'mu_usd';
 const RATE_SOURCES = new Set(['coinbase-spot', 'kraken']);
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
@@ -476,6 +477,8 @@ class MayhemContract extends Contract {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
+        kind: { type: 'string', min: 1, max: 64, optional: true },
+        epoch: { type: 'number', integer: true, min: 1 },
         who: { type: 'string', min: 1, max: 128 },
         mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
         tnk_e18: { type: 'string', min: 1, max: 80 },
@@ -1305,7 +1308,12 @@ class MayhemContract extends Contract {
       return new Error('Epoch apply roots and totals must be provided together.');
     }
 
-    const params = await this.activeParamsAt(this.value.at, ['fee_bps', 'max_apply_batch']);
+    const params = await this.activeParamsAt(this.value.at, [
+      'fee_bps',
+      'max_apply_batch',
+      'holdback_epochs',
+      'challenge_epochs',
+    ]);
     if (this.value.debits.length + this.value.earnings.length > params.max_apply_batch) {
       return new Error('Epoch apply batch exceeds max_apply_batch.');
     }
@@ -1393,14 +1401,23 @@ class MayhemContract extends Contract {
       const current = await this.earningRecord(provider);
       const currentError = this.guardianValidateEarningRecord(current, provider);
       if (currentError) return currentError;
-      const totalMu = this.safeAddMu(current.total_mu, deltaMu);
+      const refreshed = this.refreshEarningHoldback(
+        current,
+        this.value.epoch,
+        this.lockedEarningEpochs(params)
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const totalMu = this.safeAddMu(refreshed.total_mu, deltaMu);
       if (totalMu instanceof Error) return totalMu;
-      const heldMu = this.safeAddMu(current.held_mu, deltaMu);
+      const heldMu = this.safeAddMu(refreshed.held_mu, deltaMu);
       if (heldMu instanceof Error) return heldMu;
+      const holdbacks = this.appendHoldbackBucket(refreshed.holdbacks, this.value.epoch, deltaMu);
+      if (holdbacks instanceof Error) return holdbacks;
       earnings.set(provider, {
-        ...current,
+        ...refreshed,
         total_mu: totalMu,
         held_mu: heldMu,
+        holdbacks,
         updated_epoch: this.value.epoch,
         updated_at: this.tx,
       });
@@ -1744,6 +1761,8 @@ class MayhemContract extends Contract {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid payout recipient.');
+    const kind = this.value.kind ?? 'provider';
+    if (!PAYOUT_CONFIRM_KINDS.has(kind)) return new Error('Unsupported payout confirmation kind.');
 
     const rate = await this.guardianRequireFreshRate(this.value.at);
     if (rate instanceof Error) return rate;
@@ -1754,34 +1773,143 @@ class MayhemContract extends Contract {
     if (convertedMu < this.value.mu) {
       return new Error('Payout TNK amount is below the mu amount at the oracle rate.');
     }
+    if (kind === 'fee_sweep') {
+      return await this.confirmFeeSweepPayout(rate);
+    }
+
+    const provider = await this.get(`prov/${this.value.who}`);
+    if (!provider) return new Error('Provider not found.');
+    if (provider.status !== 'active') return new Error('Provider is not active.');
+    if (!provider.payout || provider.payout.method !== 'tnk') {
+      return new Error('Provider TNK payout target is not set.');
+    }
 
     const earning = await this.earningRecord(this.value.who);
-    const payoutGuardian = this.guardianCheckPayoutConfirm(earning, this.value.mu);
+    const earningError = this.guardianValidateEarningRecord(earning, this.value.who);
+    if (earningError) return earningError;
+    const params = await this.activeParamsAt(this.value.at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'payout_min_mu',
+    ]);
+    const refreshed = this.refreshEarningHoldback(
+      earning,
+      this.value.epoch,
+      this.lockedEarningEpochs(params)
+    );
+    if (refreshed instanceof Error) return refreshed;
+    const payoutGuardian = this.guardianCheckPayoutConfirm(refreshed, this.value.mu);
     if (payoutGuardian instanceof Error) return payoutGuardian;
     const releasedMu = payoutGuardian.released_mu;
+    if (releasedMu < params.payout_min_mu) {
+      return new Error('Released earnings are below payout_min_mu.');
+    }
     if (releasedMu < this.value.mu) return new Error('Insufficient released earnings.');
-    const paidCumMu = this.safeAddMu(earning.paid_cum_mu, this.value.mu);
+    const paidCumMu = this.safeAddMu(refreshed.paid_cum_mu, this.value.mu);
     if (paidCumMu instanceof Error) return paidCumMu;
+    const leaf = await this.payoutLeafHash({
+      kind: 'provider',
+      who_hash: await this.opaqueHash('payout-provider', this.value.who),
+      target_hash: await this.opaqueHash('payout-target', provider.payout.addr),
+      mu: this.value.mu,
+      tnk_e18: this.value.tnk_e18,
+      msb_tx_hash: this.value.msb_tx_hash,
+      rate_ts: rate.ts,
+    });
+    const payoutRoot = await this.nextPayoutRoot({
+      epoch: this.value.epoch,
+      leaf,
+      mu: this.value.mu,
+      at: this.value.at,
+    });
+    if (payoutRoot instanceof Error) return payoutRoot;
 
     const updated = {
-      ...earning,
+      ...refreshed,
       paid_cum_mu: paidCumMu,
       updated_at: this.tx,
       last_payout_rate_ts: rate.ts,
       last_payout_msb_tx_hash: this.value.msb_tx_hash,
     };
     await this.put(`earn/${this.value.who}`, updated);
+    await this.put(`ev/pay/${this.value.epoch}`, payoutRoot);
     console.log('mayhem payoutConfirm', {
+      kind: 'provider',
       who: this.value.who,
       mu: this.value.mu,
       tnk_e18: this.value.tnk_e18,
       rate_ts: rate.ts,
+      epoch: this.value.epoch,
     });
     return {
       ok: true,
       op: 'payoutConfirm',
+      kind: 'provider',
       who: this.value.who,
       mu: this.value.mu,
+      epoch: this.value.epoch,
+      payout_root: payoutRoot.merkle_root,
+      rate_ts: rate.ts,
+    };
+  }
+
+  async confirmFeeSweepPayout(rate) {
+    const fee = await this.feeCumRecord();
+    const feeError = this.guardianValidateFeeRecord(fee);
+    if (feeError) return feeError;
+    const availableMu = fee.cum_mu - fee.swept_cum_mu;
+    if (!Number.isSafeInteger(availableMu) || availableMu < this.value.mu) {
+      return new Error('Insufficient router fees to sweep.');
+    }
+    const sweptCumMu = this.safeAddMu(fee.swept_cum_mu, this.value.mu);
+    if (sweptCumMu instanceof Error) return sweptCumMu;
+
+    const feeEvidenceKey = `ev/fee/${this.value.epoch}`;
+    const feeEvidence = await this.get(feeEvidenceKey);
+    if (!feeEvidence || feeEvidence.type !== 'fee_root') {
+      return new Error('Fee evidence root required before sweep.');
+    }
+    if (
+      feeEvidence.sweep_msb_tx_hash &&
+      feeEvidence.sweep_msb_tx_hash !== this.value.msb_tx_hash
+    ) {
+      return new Error('Fee sweep already confirmed for epoch.');
+    }
+
+    const updatedFee = {
+      ...fee,
+      swept_cum_mu: sweptCumMu,
+      updated_at: this.tx,
+      last_sweep_rate_ts: rate.ts,
+      last_sweep_msb_tx_hash: this.value.msb_tx_hash,
+    };
+    const updatedEvidence = {
+      ...feeEvidence,
+      sweep_msb_tx_hash: this.value.msb_tx_hash,
+      sweep_mu: this.value.mu,
+      sweep_tnk_e18: this.value.tnk_e18,
+      sweep_rate_ts: rate.ts,
+      swept_cum_mu: sweptCumMu,
+      updated_at: this.tx,
+    };
+
+    await this.put('fee/cum', updatedFee);
+    await this.put(feeEvidenceKey, updatedEvidence);
+    console.log('mayhem payoutConfirm', {
+      kind: 'fee_sweep',
+      who: this.value.who,
+      mu: this.value.mu,
+      tnk_e18: this.value.tnk_e18,
+      rate_ts: rate.ts,
+      epoch: this.value.epoch,
+    });
+    return {
+      ok: true,
+      op: 'payoutConfirm',
+      kind: 'fee_sweep',
+      who: this.value.who,
+      mu: this.value.mu,
+      epoch: this.value.epoch,
       rate_ts: rate.ts,
     };
   }
@@ -2000,6 +2128,15 @@ class MayhemContract extends Contract {
     if (record.held_mu > record.total_mu || record.paid_cum_mu > record.total_mu - record.held_mu) {
       return new Error('Guardian earnings conservation invariant failed.');
     }
+    if (record.holdbacks !== undefined) {
+      const holdbacks = this.normalizeHoldbackBuckets(record);
+      if (holdbacks instanceof Error) return holdbacks;
+      const heldMu = this.holdbackBucketTotal(holdbacks);
+      if (heldMu instanceof Error) return heldMu;
+      if (heldMu !== record.held_mu) {
+        return new Error('Guardian earnings conservation invariant failed.');
+      }
+    }
     return null;
   }
 
@@ -2076,6 +2213,88 @@ class MayhemContract extends Contract {
       return new Error('Guardian earnings conservation invariant failed.');
     }
     return { ok: true, released_mu: releasedMu };
+  }
+
+  lockedEarningEpochs(params) {
+    return Math.max(params.holdback_epochs ?? 0, params.challenge_epochs ?? 0);
+  }
+
+  normalizeHoldbackBuckets(record) {
+    if (!Array.isArray(record.holdbacks)) {
+      if (!Number.isSafeInteger(record.held_mu) || record.held_mu < 0) {
+        return new Error('Guardian non-negative earnings invariant failed.');
+      }
+      if (record.held_mu === 0) return [];
+      return [{
+        epoch: Number.isSafeInteger(record.updated_epoch) ? record.updated_epoch : 0,
+        mu: record.held_mu,
+      }];
+    }
+
+    const byEpoch = new Map();
+    for (const bucket of record.holdbacks) {
+      if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) {
+        return new Error('Guardian earnings conservation invariant failed.');
+      }
+      if (!Number.isSafeInteger(bucket.epoch) || bucket.epoch < 0) {
+        return new Error('Guardian monotonic epoch invariant failed.');
+      }
+      if (!Number.isSafeInteger(bucket.mu) || bucket.mu <= 0) {
+        return new Error('Guardian non-negative earnings invariant failed.');
+      }
+      const next = this.safeAddMu(byEpoch.get(bucket.epoch) ?? 0, bucket.mu);
+      if (next instanceof Error) return next;
+      byEpoch.set(bucket.epoch, next);
+    }
+    return Array.from(byEpoch.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([epoch, mu]) => ({ epoch, mu }));
+  }
+
+  holdbackBucketTotal(holdbacks) {
+    let total = 0;
+    for (const bucket of holdbacks) {
+      const next = this.safeAddMu(total, bucket.mu);
+      if (next instanceof Error) return next;
+      total = next;
+    }
+    return total;
+  }
+
+  refreshEarningHoldback(record, currentEpoch, lockedEpochs) {
+    if (!Number.isSafeInteger(currentEpoch) || currentEpoch < 0) {
+      return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    if (!Number.isSafeInteger(lockedEpochs) || lockedEpochs < 0) {
+      return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    const holdbacks = this.normalizeHoldbackBuckets(record);
+    if (holdbacks instanceof Error) return holdbacks;
+    const kept = holdbacks.filter((bucket) => bucket.epoch + lockedEpochs > currentEpoch);
+    const heldMu = this.holdbackBucketTotal(kept);
+    if (heldMu instanceof Error) return heldMu;
+    return {
+      ...record,
+      held_mu: heldMu,
+      holdbacks: kept,
+      last_holdback_release_epoch: currentEpoch,
+    };
+  }
+
+  appendHoldbackBucket(holdbacks, epoch, mu) {
+    if (!Number.isSafeInteger(epoch) || epoch < 0) {
+      return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    if (!Number.isSafeInteger(mu) || mu <= 0) {
+      return new Error('Guardian non-negative earnings invariant failed.');
+    }
+    const byEpoch = new Map(holdbacks.map((bucket) => [bucket.epoch, bucket.mu]));
+    const next = this.safeAddMu(byEpoch.get(epoch) ?? 0, mu);
+    if (next instanceof Error) return next;
+    byEpoch.set(epoch, next);
+    return Array.from(byEpoch.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([bucketEpoch, bucketMu]) => ({ epoch: bucketEpoch, mu: bucketMu }));
   }
 
   normalizeEpochRoots(value) {
@@ -2324,7 +2543,18 @@ class MayhemContract extends Contract {
         return new Error('Committed deposit root does not match deposit evidence.');
       }
     }
-    for (const key of ['use', 'earn', 'fee', 'pay']) {
+    const payoutRoot = await this.get(`ev/pay/${epoch}`);
+    if (payoutRoot) {
+      if (
+        payoutRoot.type !== 'payout_root' ||
+        payoutRoot.merkle_root !== roots.pay ||
+        payoutRoot.count !== totals.pay_count ||
+        payoutRoot.mu_total !== totals.pay_mu
+      ) {
+        return new Error('Committed payout root does not match payout evidence.');
+      }
+    }
+    for (const key of ['use', 'earn', 'fee']) {
       if ((await this.get(`ev/${key}/${epoch}`)) !== null) {
         return new Error(`Epoch ${key} evidence root already exists.`);
       }
@@ -2373,15 +2603,17 @@ class MayhemContract extends Contract {
       ts: at,
       updated_at: this.tx,
     });
-    await this.put(`ev/pay/${epoch}`, {
-      type: 'payout_root',
-      epoch,
-      merkle_root: roots.pay,
-      count: totals.pay_count,
-      mu_total: totals.pay_mu,
-      ts: at,
-      updated_at: this.tx,
-    });
+    if ((await this.get(`ev/pay/${epoch}`)) === null) {
+      await this.put(`ev/pay/${epoch}`, {
+        type: 'payout_root',
+        epoch,
+        merkle_root: roots.pay,
+        count: totals.pay_count,
+        mu_total: totals.pay_mu,
+        ts: at,
+        updated_at: this.tx,
+      });
+    }
   }
 
   aggregateLedgerEntries(entries, idKey, amountKey, label) {
@@ -2515,6 +2747,10 @@ class MayhemContract extends Contract {
     return await this.opaqueHash('mayhem-deposit-leaf-v1', value);
   }
 
+  async payoutLeafHash(value) {
+    return await this.opaqueHash('mayhem-payout-leaf-v1', value);
+  }
+
   async nextDepositRoot({ epoch, leaf, mu, at }) {
     const current = await this.get(`ev/dep/${epoch}`);
     if (current && current.type !== 'deposit_root') {
@@ -2532,6 +2768,32 @@ class MayhemContract extends Contract {
       : leaf;
     return {
       type: 'deposit_root',
+      epoch,
+      merkle_root: merkleRoot,
+      count,
+      mu_total: muTotal,
+      ts: at,
+      updated_at: this.tx,
+    };
+  }
+
+  async nextPayoutRoot({ epoch, leaf, mu, at }) {
+    const current = await this.get(`ev/pay/${epoch}`);
+    if (current && current.type !== 'payout_root') {
+      return new Error('Invalid payout evidence root.');
+    }
+    const count = (current?.count ?? 0) + 1;
+    const muTotal = this.safeAddMu(current?.mu_total ?? 0, mu);
+    if (muTotal instanceof Error) return muTotal;
+    const merkleRoot = current
+      ? await this.opaqueHash('mayhem-payout-root-v1', {
+        previous_root: current.merkle_root,
+        leaf,
+        count,
+      })
+      : leaf;
+    return {
+      type: 'payout_root',
       epoch,
       merkle_root: merkleRoot,
       count,

@@ -63,6 +63,17 @@ async function setupGuardianContract() {
       txNo: 3,
     },
     {
+      type: 'setProviderPayout',
+      value: {
+        op: 'set_provider_payout',
+        provider: provider.publicKey,
+        payout_addr: 'trac1guardianprovider',
+        payout_method: 'tnk',
+      },
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+    {
       type: 'rateOracle',
       value: {
         op: 'rate_oracle',
@@ -71,7 +82,7 @@ async function setupGuardianContract() {
         ts: 1_000,
       },
       sender: admin.publicKey,
-      txNo: 4,
+      txNo: 5,
     },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
@@ -93,6 +104,7 @@ const epochApply = (epoch, user, provider, grossMu = 1_000) => ({
 const payoutConfirm = (provider, overrides = {}) => ({
   op: 'payout_confirm',
   who: provider,
+  epoch: 200,
   mu: 1_000,
   tnk_e18: '500000000000000',
   msb_tx_hash: 'a'.repeat(64),

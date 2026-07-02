@@ -140,7 +140,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
   await storage.put(`earn/${provider.publicKey}`, {
     provider: provider.publicKey,
     denom: 'mu_usd',
-    total_mu: 5_000,
+    total_mu: 2_000_000,
     held_mu: 0,
     paid_cum_mu: 0,
     updated_epoch: 0,
@@ -172,8 +172,9 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     {
       op: 'payout_confirm',
       who: provider.publicKey,
-      mu: 1_000,
-      tnk_e18: '500000000000000',
+      epoch: 200,
+      mu: 1_000_000,
+      tnk_e18: '500000000000000000',
       msb_tx_hash: 'e'.repeat(64),
       at: 1_901,
     },
@@ -242,6 +243,21 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     last_deposit_rate_ts: 1_000,
   });
 
+  const target = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'trac1providerpayouttarget',
+      payout_method: 'tnk',
+    },
+    admin.publicKey,
+    10
+  );
+  assert.equal(target.ok, true, target.message);
+
   const freshPayout = await execute(
     contract,
     storage,
@@ -249,29 +265,33 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     {
       op: 'payout_confirm',
       who: provider.publicKey,
-      mu: 1_000,
-      tnk_e18: '500000000000000',
+      epoch: 200,
+      mu: 1_000_000,
+      tnk_e18: '500000000000000000',
       msb_tx_hash: '1'.repeat(64),
       at: 1_900,
     },
     admin.publicKey,
-    10
+    11
   );
-  assert.deepEqual(freshPayout, {
-    ok: true,
-    op: 'payoutConfirm',
-    who: provider.publicKey,
-    mu: 1_000,
-    rate_ts: 1_000,
-  });
+  assert.equal(freshPayout.ok, true, freshPayout.message);
+  assert.equal(freshPayout.op, 'payoutConfirm');
+  assert.equal(freshPayout.kind, 'provider');
+  assert.equal(freshPayout.who, provider.publicKey);
+  assert.equal(freshPayout.mu, 1_000_000);
+  assert.equal(freshPayout.epoch, 200);
+  assert.equal(freshPayout.payout_root.length, 64);
+  assert.equal(freshPayout.rate_ts, 1_000);
   assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     denom: 'mu_usd',
-    total_mu: 5_000,
+    total_mu: 2_000_000,
     held_mu: 0,
-    paid_cum_mu: 1_000,
+    paid_cum_mu: 1_000_000,
+    holdbacks: [],
     updated_epoch: 0,
-    updated_at: makeTxKey(10),
+    updated_at: makeTxKey(11),
+    last_holdback_release_epoch: 200,
     last_payout_rate_ts: 1_000,
     last_payout_msb_tx_hash: '1'.repeat(64),
   });

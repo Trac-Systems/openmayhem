@@ -1,0 +1,243 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import MayhemContract from '../contract/contract.js';
+import {
+  MemoryStorage,
+  execute,
+  makeIdentity,
+  makeTxKey,
+  makeVerifier,
+  signConsent,
+} from './helpers/contract.js';
+
+const rulesHash = '9'.repeat(64);
+const oneUsdAtTwoUsdPerTnk = '500000000000000000';
+
+async function setupPayoutContract() {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const user = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: { op: 'register_provider' },
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'setProviderPayout',
+      value: {
+        op: 'set_provider_payout',
+        provider: provider.publicKey,
+        payout_addr: 'trac1providerpayouttarget',
+        payout_method: 'tnk',
+      },
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+    {
+      type: 'rateOracle',
+      value: {
+        op: 'rate_oracle',
+        tnk_usd_e6: 2_000_000,
+        source: 'coinbase-spot',
+        ts: 1_000,
+      },
+      sender: admin.publicKey,
+      txNo: 5,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+
+  await storage.put(`bal/${user.publicKey}`, {
+    user: user.publicKey,
+    denom: 'mu_usd',
+    mu: 5_000_000,
+    updated_epoch: 0,
+    updated_at: null,
+  });
+  return { admin, provider, user, storage, contract };
+}
+
+const epochApply = (epoch, user, provider, grossMu) => ({
+  op: 'epoch_apply',
+  epoch,
+  at: epoch * 3_600,
+  debits: [{ user, mu: grossMu }],
+  earnings: [{ provider, gross_mu: grossMu }],
+});
+
+const payoutConfirm = (provider, overrides = {}) => ({
+  op: 'payout_confirm',
+  epoch: 169,
+  who: provider,
+  mu: 1_000_000,
+  tnk_e18: oneUsdAtTwoUsdPerTnk,
+  msb_tx_hash: 'a'.repeat(64),
+  at: 1_900,
+  ...overrides,
+});
+
+test('MayhemContract payoutConfirm releases earnings only after challenge plus holdback lock', async () => {
+  const { admin, provider, user, storage, contract } = await setupPayoutContract();
+
+  const settled = await execute(
+    contract,
+    storage,
+    'epochApply',
+    epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
+    admin.publicKey,
+    6
+  );
+  assert.equal(settled.ok, true, settled.message);
+  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+    provider: provider.publicKey,
+    denom: 'mu_usd',
+    total_mu: 1_700_000,
+    held_mu: 1_700_000,
+    paid_cum_mu: 0,
+    holdbacks: [{ epoch: 1, mu: 1_700_000 }],
+    updated_epoch: 1,
+    updated_at: makeTxKey(6),
+    last_holdback_release_epoch: 1,
+  });
+
+  const beforeEarly = storage.snapshotBytes();
+  const early = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey, { epoch: 100 }),
+    admin.publicKey,
+    7
+  );
+  assert.match(early.message, /below payout_min/i);
+  assert.equal(storage.snapshotBytes(), beforeEarly);
+
+  const paid = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey),
+    admin.publicKey,
+    8
+  );
+  assert.equal(paid.ok, true, paid.message);
+  assert.equal(paid.kind, 'provider');
+  assert.equal(paid.epoch, 169);
+  assert.equal(paid.payout_root.length, 64);
+
+  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+    provider: provider.publicKey,
+    denom: 'mu_usd',
+    total_mu: 1_700_000,
+    held_mu: 0,
+    paid_cum_mu: 1_000_000,
+    holdbacks: [],
+    updated_epoch: 1,
+    updated_at: makeTxKey(8),
+    last_holdback_release_epoch: 169,
+    last_payout_rate_ts: 1_000,
+    last_payout_msb_tx_hash: 'a'.repeat(64),
+  });
+  const payRoot = (await storage.get('ev/pay/169')).value;
+  assert.equal(payRoot.type, 'payout_root');
+  assert.equal(payRoot.epoch, 169);
+  assert.equal(payRoot.count, 1);
+  assert.equal(payRoot.mu_total, 1_000_000);
+  assert.equal(payRoot.merkle_root, paid.payout_root);
+});
+
+test('MayhemContract payoutConfirm sweeps router fees into fee evidence', async () => {
+  const { admin, storage, contract } = await setupPayoutContract();
+  await storage.put('fee/cum', {
+    denom: 'mu_usd',
+    cum_mu: 2_000_000,
+    swept_cum_mu: 0,
+    settled_cum_mu: 2_000_000,
+    updated_epoch: 1,
+    updated_at: null,
+    last_apply_hash: null,
+    last_fee_bps: 1_500,
+  });
+  await storage.put('ev/fee/169', {
+    type: 'fee_root',
+    epoch: 169,
+    merkle_root: 'f'.repeat(64),
+    mu_fee_epoch: 0,
+    mu_fee_cum: 2_000_000,
+    sweep_msb_tx_hash: null,
+    ts: 1_900,
+    updated_at: null,
+  });
+
+  const swept = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm('treasury', {
+      kind: 'fee_sweep',
+      msb_tx_hash: 'b'.repeat(64),
+    }),
+    admin.publicKey,
+    6
+  );
+  assert.deepEqual(swept, {
+    ok: true,
+    op: 'payoutConfirm',
+    kind: 'fee_sweep',
+    who: 'treasury',
+    mu: 1_000_000,
+    epoch: 169,
+    rate_ts: 1_000,
+  });
+  assert.deepEqual((await storage.get('fee/cum')).value, {
+    denom: 'mu_usd',
+    cum_mu: 2_000_000,
+    swept_cum_mu: 1_000_000,
+    settled_cum_mu: 2_000_000,
+    updated_epoch: 1,
+    updated_at: makeTxKey(6),
+    last_apply_hash: null,
+    last_fee_bps: 1_500,
+    last_sweep_rate_ts: 1_000,
+    last_sweep_msb_tx_hash: 'b'.repeat(64),
+  });
+  assert.deepEqual((await storage.get('ev/fee/169')).value, {
+    type: 'fee_root',
+    epoch: 169,
+    merkle_root: 'f'.repeat(64),
+    mu_fee_epoch: 0,
+    mu_fee_cum: 2_000_000,
+    sweep_msb_tx_hash: 'b'.repeat(64),
+    ts: 1_900,
+    updated_at: makeTxKey(6),
+    sweep_mu: 1_000_000,
+    sweep_tnk_e18: oneUsdAtTwoUsdPerTnk,
+    sweep_rate_ts: 1_000,
+    swept_cum_mu: 1_000_000,
+  });
+});

@@ -154,8 +154,10 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     total_mu: 1_275,
     held_mu: 1_275,
     paid_cum_mu: 0,
+    holdbacks: [{ epoch: 1, mu: 1_275 }],
     updated_epoch: 1,
     updated_at: makeTxKey(6),
+    last_holdback_release_epoch: 1,
   });
   const feeAfterFirst = (await storage.get('fee/cum')).value;
   assert.equal(feeAfterFirst.denom, 'mu_usd');

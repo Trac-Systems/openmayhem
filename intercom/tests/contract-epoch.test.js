@@ -235,8 +235,10 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     total_mu: 1_700,
     held_mu: 1_700,
     paid_cum_mu: 0,
+    holdbacks: [{ epoch: 1, mu: 1_700 }],
     updated_epoch: 1,
     updated_at: makeTxKey(7),
+    last_holdback_release_epoch: 1,
   });
   assert.deepEqual((await storage.get('ev/dep/1')).value, {
     type: 'deposit_root',
