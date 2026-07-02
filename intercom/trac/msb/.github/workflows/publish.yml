@@ -1,0 +1,33 @@
+name: Publish trac-msb to npm on release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install dependencies
+        run: npm ci
+
+      # unit tests are temporarily disabled because they lost stability on GH runners.
+      #- name: Run unit tests
+      #  run: npm run test:unit:all
+
+      - name: Publish to npm
+        run: npm publish --access public

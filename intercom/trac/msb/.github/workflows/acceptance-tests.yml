@@ -1,0 +1,42 @@
+name: MSB-Acceptance-Tests
+
+on:
+  workflow_dispatch:
+  # TODO: re-enable when runners handle acceptance reliably outside local
+  # workflow_run:
+  #   workflows: ["MSB-Unit-Tests"]
+  #   types:
+  #     - completed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-tests:
+    name: Acceptance Tests
+    runs-on: ${{ matrix.os }}
+    # if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    strategy:
+      matrix:
+        node-version: [lts/*]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install bare
+        run: npm i -g bare
+
+      - name: Run Integration Tests
+        run: npm run test:acceptance
