@@ -78,6 +78,11 @@ enum Commands {
     Payouts(PayoutsArgs),
     /// Show provider earnings, holdback, paid, and released balances.
     Earnings(EarningsArgs),
+    /// Auditor probe commands.
+    Auditor {
+        #[command(subcommand)]
+        command: AuditorCommands,
+    },
     /// Receipt audit commands.
     Receipts {
         #[command(subcommand)]
@@ -125,6 +130,12 @@ enum ReceiptsCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum AuditorCommands {
+    /// Run a canary probe through the normal gateway chat path and emit/submit probe_result evidence.
+    Canary(AuditorCanaryArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum CatalogCommands {
     /// Verify catalog structure, maintainer signature, canary refs, and optional dev downloads.
     Verify(CatalogVerifyArgs),
@@ -164,6 +175,97 @@ struct EarningsArgs {
     provider: Option<String>,
 
     /// Print machine-readable earnings.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AuditorCanaryArgs {
+    /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Peer JSON-RPC base URL, including /v1. Required only with --submit.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted auditor keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Model id to probe. Defaults to the first gateway model.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Canary set id under catalog/canaries.
+    #[arg(long, default_value = "canary-dev-v1")]
+    canary_set: String,
+
+    /// Canary prompt id. Defaults to the first prompt in the set.
+    #[arg(long)]
+    prompt_id: Option<String>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Expected canary response text.
+    #[arg(long)]
+    expected_text: Option<String>,
+
+    /// File containing expected canary response text.
+    #[arg(long, value_name = "PATH")]
+    expected_file: Option<PathBuf>,
+
+    /// Provider public key. Defaults to the provider in the latest gateway receipt.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Admin-created enclave id. Defaults to the enclave in the latest gateway receipt.
+    #[arg(long)]
+    enclave_id: Option<String>,
+
+    /// Epoch used in the probe_result command.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Probe timestamp in Unix seconds. Defaults to current time.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// Minimum text-position match in basis points.
+    #[arg(long, default_value_t = 9_000)]
+    min_match_bps: u32,
+
+    /// Override the generated probe id.
+    #[arg(long)]
+    probe_id: Option<String>,
+
+    /// Write the full probe evidence bundle to this path.
+    #[arg(long, value_name = "PATH")]
+    evidence_output: Option<PathBuf>,
+
+    /// Submit probe_result to the contract using the auditor wallet.
+    #[arg(long)]
+    submit: bool,
+
+    /// Simulate the contract transaction when --submit is set.
+    #[arg(long)]
+    sim: bool,
+
+    /// HTTP timeout in seconds for gateway calls.
+    #[arg(long, default_value_t = 60)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable probe report.
     #[arg(long)]
     json: bool,
 }
@@ -828,6 +930,9 @@ async fn main() -> Result<()> {
         },
         Commands::Payouts(args) => payouts(args).await,
         Commands::Earnings(args) => earnings(args).await,
+        Commands::Auditor { command } => match command {
+            AuditorCommands::Canary(args) => auditor_canary(args).await,
+        },
         Commands::Receipts { command } => match command {
             ReceiptsCommands::Export(args) => receipts_export(args).await,
             ReceiptsCommands::Publish(args) => receipts_publish(args).await,
@@ -1402,6 +1507,376 @@ struct OpencodeRunReport {
     marker_seen: bool,
     work_dir: PathBuf,
     stdout_lines: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CanarySetDocument {
+    set_id: String,
+    #[serde(default)]
+    prompts: Vec<CanaryPrompt>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CanaryPrompt {
+    id: String,
+    #[serde(default)]
+    messages: Vec<Value>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TextMatchEvaluation {
+    expected_text_hash: String,
+    observed_text_hash: String,
+    matched_positions: u32,
+    total_positions: u32,
+    match_bps: u32,
+    pass: bool,
+}
+
+async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    if args.min_match_bps > 10_000 {
+        bail!("--min-match-bps must be <= 10000");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+
+    let models = fetch_gateway_models(&client, &gateway_root).await?;
+    let model = select_test_model(&models, args.model.as_deref())?;
+    let canary = load_canary_prompt(
+        args.canaries_dir.as_deref(),
+        &args.canary_set,
+        args.prompt_id.as_deref(),
+    )?;
+    let expected_text = read_expected_canary_text(&args)?;
+    let request = canary_probe_request(&model.id, &canary);
+    let response = post_gateway_json(
+        &client,
+        &format!("{gateway_root}/v1/chat/completions"),
+        &request,
+    )
+    .await?;
+    let observed_text = gateway_chat_observed_text(&response)?;
+    let evaluation = evaluate_text_match(&expected_text, &observed_text, args.min_match_bps);
+    let receipts = fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/receipts")).await?;
+    let latest_receipt = latest_gateway_receipt(&receipts);
+    let session_receipt_hash = latest_receipt.as_ref().map(stable_value_hash);
+    let receipt_body = latest_receipt.as_ref().and_then(receipt_body);
+    let provider = args
+        .provider
+        .clone()
+        .or_else(|| {
+            receipt_body
+                .and_then(|body| body.get("provider"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .context("--provider is required when the gateway receipt does not expose provider")?;
+    let enclave_id = args
+        .enclave_id
+        .clone()
+        .or_else(|| {
+            receipt_body
+                .and_then(|body| body.get("enclave_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .context("--enclave-id is required when the gateway receipt does not expose enclave_id")?;
+    let at = args.at.unwrap_or(unix_epoch_seconds()?);
+    let evidence = json!({
+        "schema_version": 1,
+        "kind": "mayhem-canary-probe-evidence",
+        "gateway_url": gateway_root,
+        "model": model.id,
+        "canary_set": args.canary_set,
+        "prompt_id": canary.id,
+        "request": request,
+        "response": response,
+        "observed_text": observed_text,
+        "expected_text_hash": evaluation.expected_text_hash,
+        "evaluation": evaluation,
+        "latest_receipt": latest_receipt,
+    });
+    let evidence_hash = stable_value_hash(&evidence);
+    let probe_id = args.probe_id.unwrap_or_else(|| {
+        stable_value_hash(&json!({
+            "provider": provider,
+            "enclave_id": enclave_id,
+            "canary_set": args.canary_set,
+            "prompt_id": canary.id,
+            "epoch": args.epoch,
+            "evidence_hash": evidence_hash,
+        }))
+    });
+    let probe_command = canary_probe_command(CanaryProbeCommandInput {
+        probe_id: probe_id.clone(),
+        provider: provider.clone(),
+        enclave_id: enclave_id.clone(),
+        epoch: args.epoch,
+        at,
+        canary_set: args.canary_set.clone(),
+        match_bps: evaluation.match_bps,
+        pass: evaluation.pass,
+        session_receipt_hash,
+        evidence_hash: evidence_hash.clone(),
+    });
+
+    let evidence_output = args
+        .evidence_output
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
+    if let Some(path) = &evidence_output {
+        let evidence_file = json!({
+            "evidence": evidence,
+            "probe_command": probe_command,
+        });
+        write_json_file(path, &evidence_file)?;
+    }
+
+    let tx = if args.submit {
+        let wallet = resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            args.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await?;
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let keypair_path = PathBuf::from(wallet.keypair_path.clone());
+        Some(
+            submit_contract_command(
+                &rpc,
+                &keypair_path,
+                args.wallet_password.as_deref().unwrap_or(""),
+                &wallet,
+                "probeResult",
+                probe_command.clone(),
+                args.sim,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let report = json!({
+        "ok": evaluation.pass,
+        "gateway_url": gateway_root,
+        "model": model,
+        "canary": {
+            "set_id": args.canary_set,
+            "prompt_id": canary.id,
+        },
+        "evaluation": evaluation,
+        "provider": probe_command["provider"],
+        "enclave_id": probe_command["enclave_id"],
+        "probe_command": probe_command,
+        "evidence_hash": evidence_hash,
+        "evidence_output": evidence_output,
+        "submitted": tx,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Canary probe {}: match {} bps.",
+            if report["ok"].as_bool().unwrap_or(false) {
+                "passed"
+            } else {
+                "failed"
+            },
+            report["evaluation"]["match_bps"]
+                .as_u64()
+                .unwrap_or_default()
+        );
+        println!(
+            "Probe id: {}",
+            report["probe_command"]["probe_id"].as_str().unwrap_or("")
+        );
+        println!("Evidence hash: {evidence_hash}");
+        if let Some(path) = evidence_output {
+            println!("Copy/paste evidence path: {}", path.display());
+        }
+        if !args.submit {
+            println!("Copy/paste probe_result command:");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report["probe_command"])?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_canary_prompt(
+    canaries_dir: Option<&Path>,
+    set_id: &str,
+    prompt_id: Option<&str>,
+) -> Result<CanaryPrompt> {
+    let canaries_dir = canaries_dir
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let path = absolutize(canaries_dir)?.join(format!("{set_id}.json"));
+    let doc: CanarySetDocument = serde_json::from_value(read_json_file(&path)?)
+        .with_context(|| format!("parsing canary set {}", path.display()))?;
+    if doc.set_id != set_id {
+        bail!("canary file {} declares set {}", path.display(), doc.set_id);
+    }
+    let prompt = if let Some(prompt_id) = prompt_id {
+        doc.prompts
+            .into_iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .with_context(|| format!("canary prompt {prompt_id} not found in {set_id}"))?
+    } else {
+        doc.prompts
+            .into_iter()
+            .next()
+            .with_context(|| format!("canary set {set_id} has no prompts"))?
+    };
+    if prompt.messages.is_empty() {
+        bail!("canary prompt {} has no messages", prompt.id);
+    }
+    Ok(prompt)
+}
+
+fn read_expected_canary_text(args: &AuditorCanaryArgs) -> Result<String> {
+    match (&args.expected_text, &args.expected_file) {
+        (Some(text), None) if !text.is_empty() => Ok(text.clone()),
+        (None, Some(path)) => fs::read_to_string(path)
+            .with_context(|| format!("reading expected canary text {}", path.display())),
+        (Some(_), Some(_)) => bail!("use either --expected-text or --expected-file, not both"),
+        _ => bail!("--expected-text or --expected-file is required for canary scoring"),
+    }
+}
+
+fn canary_probe_request(model_id: &str, prompt: &CanaryPrompt) -> Value {
+    let mut request = json!({
+        "model": model_id,
+        "messages": &prompt.messages,
+        "temperature": prompt.temperature.unwrap_or(0.0),
+        "max_tokens": prompt.max_tokens.unwrap_or(128),
+        "stream": false,
+    });
+    if let Some(tools) = &prompt.tools {
+        request["tools"] = json!(tools);
+    }
+    request
+}
+
+struct CanaryProbeCommandInput {
+    probe_id: String,
+    provider: String,
+    enclave_id: String,
+    epoch: u64,
+    at: u64,
+    canary_set: String,
+    match_bps: u32,
+    pass: bool,
+    session_receipt_hash: Option<String>,
+    evidence_hash: String,
+}
+
+fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
+    let mut command = json!({
+        "op": "probe_result",
+        "probe_id": input.probe_id,
+        "probe_kind": "canary",
+        "provider": input.provider,
+        "enclave_id": input.enclave_id,
+        "epoch": input.epoch,
+        "at": input.at,
+        "canary_set": input.canary_set,
+        "match_bps": input.match_bps,
+        "pass": input.pass,
+        "evidence_hash": input.evidence_hash,
+    });
+    if let Some(session_receipt_hash) = input.session_receipt_hash {
+        command["session_receipt_hash"] = json!(session_receipt_hash);
+    }
+    command
+}
+
+fn gateway_chat_observed_text(response: &Value) -> Result<String> {
+    let message = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .context("gateway canary response did not include choices[0].message")?;
+    if let Some(content) = message.get("content").and_then(Value::as_str) {
+        return Ok(content.to_owned());
+    }
+    if let Some(tool_calls) = message.get("tool_calls") {
+        return Ok(tool_calls.to_string());
+    }
+    bail!("gateway canary response message had neither content nor tool_calls")
+}
+
+fn normalize_canary_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn evaluate_text_match(expected: &str, observed: &str, min_match_bps: u32) -> TextMatchEvaluation {
+    let expected = normalize_canary_text(expected);
+    let observed = normalize_canary_text(observed);
+    let expected_chars = expected.chars().collect::<Vec<_>>();
+    let observed_chars = observed.chars().collect::<Vec<_>>();
+    let total_positions = expected_chars.len() as u32;
+    let matched_positions = expected_chars
+        .iter()
+        .zip(observed_chars.iter())
+        .filter(|(expected, observed)| expected == observed)
+        .count() as u32;
+    let match_bps = if total_positions == 0 {
+        0
+    } else {
+        ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
+    };
+    TextMatchEvaluation {
+        expected_text_hash: blake3::hash(expected.as_bytes()).to_hex().to_string(),
+        observed_text_hash: blake3::hash(observed.as_bytes()).to_hex().to_string(),
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: match_bps >= min_match_bps,
+    }
+}
+
+fn stable_value_hash(value: &Value) -> String {
+    let stable = stable_json_value(value);
+    blake3::hash(stable.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn stable_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(stable_json_value).collect()),
+        Value::Object(map) => {
+            let mut stable = serde_json::Map::new();
+            for (key, value) in map.iter() {
+                stable.insert(key.clone(), stable_json_value(value));
+            }
+            Value::Object(stable)
+        }
+        value => value.clone(),
+    }
 }
 
 async fn fetch_gateway_json(client: &reqwest::Client, url: &str) -> Result<Value> {
@@ -5225,6 +5700,69 @@ mod tests {
     }
 
     #[test]
+    fn canary_probe_request_uses_normal_chat_completion_shape() {
+        let prompt = CanaryPrompt {
+            id: "shape".to_owned(),
+            messages: vec![json!({ "role": "user", "content": "return ok" })],
+            tools: Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": { "type": "object" }
+                }
+            })]),
+            temperature: Some(0.2),
+            max_tokens: Some(16),
+        };
+
+        let request = canary_probe_request("admin/model", &prompt);
+
+        assert_eq!(request["model"], "admin/model");
+        assert_eq!(
+            request["messages"],
+            json!([{ "role": "user", "content": "return ok" }])
+        );
+        assert_eq!(request["tools"], json!(prompt.tools.as_ref().unwrap()));
+        assert_eq!(request["temperature"], 0.2);
+        assert_eq!(request["max_tokens"], 16);
+        assert_eq!(request["stream"], false);
+        assert!(request.get("canary").is_none());
+    }
+
+    #[test]
+    fn canary_text_match_normalizes_whitespace_and_scores_mismatch() {
+        let exact = evaluate_text_match("alpha\n beta", "alpha beta", 10_000);
+        assert!(exact.pass);
+        assert_eq!(exact.match_bps, 10_000);
+        assert_eq!(exact.total_positions, 10);
+
+        let mismatch = evaluate_text_match("abcdef", "abcxyz", 9_000);
+        assert!(!mismatch.pass);
+        assert_eq!(mismatch.matched_positions, 3);
+        assert_eq!(mismatch.match_bps, 5_000);
+    }
+
+    #[test]
+    fn stable_value_hash_is_object_key_order_independent() {
+        let a = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
+        let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
+
+        assert_eq!(stable_value_hash(&a), stable_value_hash(&b));
+    }
+
+    #[test]
+    fn canary_probe_command_omits_absent_optional_receipt_hash() {
+        let without_receipt = canary_probe_command(test_canary_probe_command_input(None));
+        assert!(without_receipt.get("session_receipt_hash").is_none());
+        assert_eq!(without_receipt["op"], "probe_result");
+        assert_eq!(without_receipt["enclave_id"], "enclave");
+
+        let with_receipt =
+            canary_probe_command(test_canary_probe_command_input(Some("rr".repeat(32))));
+        assert_eq!(with_receipt["session_receipt_hash"], "rr".repeat(32));
+    }
+
+    #[test]
     fn safe_path_component_removes_model_path_separators() {
         assert_eq!(
             safe_path_component("meta/llama-3.1:8b@4bit"),
@@ -5488,6 +6026,23 @@ mod tests {
                 },
             ],
             prices: Vec::new(),
+        }
+    }
+
+    fn test_canary_probe_command_input(
+        session_receipt_hash: Option<String>,
+    ) -> CanaryProbeCommandInput {
+        CanaryProbeCommandInput {
+            probe_id: "probe".to_owned(),
+            provider: "provider".to_owned(),
+            enclave_id: "enclave".to_owned(),
+            epoch: 7,
+            at: 42,
+            canary_set: "canary-dev-v1".to_owned(),
+            match_bps: 9_700,
+            pass: true,
+            session_receipt_hash,
+            evidence_hash: "ee".repeat(32),
         }
     }
 }
