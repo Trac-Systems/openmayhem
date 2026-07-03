@@ -262,6 +262,14 @@ pub fn session_accept_signing_bytes(
     })
 }
 
+pub fn session_frame_head(frame: &serde_json::Value) -> Result<String, serde_json::Error> {
+    Ok(
+        blake3::hash(&serde_json::to_vec(&stable_json_value(frame))?)
+            .to_hex()
+            .to_string(),
+    )
+}
+
 fn stable_json_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => {
@@ -385,6 +393,8 @@ mod tests {
             "t": "s.accept",
             "v": 1,
             "session_id": "aa".repeat(32),
+            "open_head": "bb".repeat(32),
+            "att_nonce": "88".repeat(32),
             "att_report": {
                 "provider_pubkey": "55".repeat(32),
                 "enclave_id": "11".repeat(32),
@@ -403,6 +413,8 @@ mod tests {
             "nonce": "77".repeat(32),
             "ts": 123,
             "engine": { "ctx": 8192, "mode": "provider-session-server-v1" },
+            "att_nonce": "88".repeat(32),
+            "open_head": "bb".repeat(32),
             "att_report": {
                 "sig_provider": "66".repeat(64),
                 "enclave_id": "11".repeat(32),
@@ -416,5 +428,32 @@ mod tests {
 
         frame["session_id"] = json!("bb".repeat(32));
         assert_ne!(session_accept_signing_bytes(&frame).unwrap(), payload);
+    }
+
+    #[test]
+    fn session_frame_head_is_stable_and_exact_frame_bound() {
+        let frame = json!({
+            "t": "s.open",
+            "session_id": "aa".repeat(32),
+            "voucher": { "price_ver": 1, "max_spend_mu": 1000 },
+            "sig": "11".repeat(64),
+        });
+        let reordered = json!({
+            "sig": "11".repeat(64),
+            "voucher": { "max_spend_mu": 1000, "price_ver": 1 },
+            "session_id": "aa".repeat(32),
+            "t": "s.open",
+        });
+        assert_eq!(
+            session_frame_head(&frame).unwrap(),
+            session_frame_head(&reordered).unwrap()
+        );
+
+        let mut changed = frame;
+        changed["sig"] = json!("22".repeat(64));
+        assert_ne!(
+            session_frame_head(&changed).unwrap(),
+            session_frame_head(&reordered).unwrap()
+        );
     }
 }

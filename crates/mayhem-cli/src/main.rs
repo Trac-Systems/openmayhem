@@ -40,7 +40,7 @@ use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
     VerdictStatus,
 };
-use mayhem_proto::{session_accept_signing_bytes, CatalogEnclaveIdentity};
+use mayhem_proto::{session_accept_signing_bytes, session_frame_head, CatalogEnclaveIdentity};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -7671,10 +7671,15 @@ async fn handle_provider_session_frame(
                         },
                     );
                     let ts = unix_epoch_millis()?;
+                    let open_head =
+                        session_frame_head(&frame).context("hashing s.open frame for s.accept")?;
+                    let att_nonce = frame.get("att_nonce").cloned().unwrap_or(Value::Null);
                     let mut accept_frame = json!({
                         "t": "s.accept",
                         "v": 1,
                         "session_id": session_id,
+                        "open_head": open_head,
+                        "att_nonce": att_nonce,
                         "att_report": attestation.report,
                         "engine": {
                             "ctx": terms.ctx,
@@ -8075,6 +8080,13 @@ fn provider_session_open_decision(
         .unwrap_or("");
     if !is_hex_len(session_id, 64) {
         return reject("SCHEMA", "session_id must be 32 bytes of hex".to_owned());
+    }
+    let att_nonce = frame.get("att_nonce").and_then(Value::as_str).unwrap_or("");
+    if !is_hex_len(att_nonce, 64) {
+        return reject(
+            "ATTESTATION",
+            "att_nonce must be 32 bytes of hex".to_owned(),
+        );
     }
     if frame.get("enclave_id").and_then(Value::as_str) != Some(terms.enclave_id.as_str()) {
         return reject(
@@ -9964,6 +9976,16 @@ mod tests {
             }
         ));
 
+        let mut bad_att_nonce = frame.clone();
+        bad_att_nonce["att_nonce"] = json!("not-hex");
+        assert!(matches!(
+            provider_session_open_decision(&bad_att_nonce, &terms),
+            ProviderSessionDecision::Reject {
+                code: "ATTESTATION",
+                ..
+            }
+        ));
+
         let mut bad_voucher = frame;
         bad_voucher["voucher"]["price_ver"] = json!(terms.price_ver + 1);
         assert!(matches!(
@@ -10044,6 +10066,8 @@ mod tests {
             "t": "s.accept",
             "v": 1,
             "session_id": "aa".repeat(32),
+            "open_head": "bb".repeat(32),
+            "att_nonce": "88".repeat(32),
             "att_report": {
                 "enclave_id": "11".repeat(32),
                 "provider_pubkey": "55".repeat(32),

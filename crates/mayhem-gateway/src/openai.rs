@@ -22,9 +22,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    receipt_signing_bytes, session_accept_signing_bytes, spend_voucher_signing_bytes,
-    CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
-    SpendVoucherBody, SESSION_RECEIPT_SCHEMA_VERSION,
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -605,6 +605,7 @@ impl ScBridgeGatewaySessionBackend {
         }
 
         let now = now_millis_u64();
+        let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
         let open_frame = json!({
             "t": "s.open",
             "v": 1,
@@ -614,11 +615,13 @@ impl ScBridgeGatewaySessionBackend {
             "price_ver": invocation.price_ver,
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher,
-            "att_nonce": blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes()),
+            "att_nonce": att_nonce,
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig,
         });
+        let open_head = session_frame_head(&open_frame)
+            .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
         bridge
             .session_send(provider, &invocation.session_id, open_frame)
             .await?;
@@ -640,7 +643,7 @@ impl ScBridgeGatewaySessionBackend {
                 invocation.session_id
             )));
         }
-        validate_direct_session_accept(&accept, invocation)?;
+        validate_direct_session_accept(&accept, invocation, &open_head, &att_nonce)?;
 
         let request_id = blake3_hex(
             format!(
@@ -698,6 +701,8 @@ impl ScBridgeGatewaySessionBackend {
 fn validate_direct_session_accept(
     frame: &Value,
     invocation: &GatewaySessionInvocation,
+    expected_open_head: &str,
+    expected_att_nonce: &str,
 ) -> Result<(), GatewaySessionError> {
     let fail = |message: String| GatewaySessionError::new(message);
     if frame.get("t").and_then(Value::as_str) != Some("s.accept") {
@@ -708,6 +713,16 @@ fn validate_direct_session_accept(
             "provider accept session_id did not match {}",
             invocation.session_id
         )));
+    }
+    if frame.get("open_head").and_then(Value::as_str) != Some(expected_open_head) {
+        return Err(fail(
+            "provider accept open_head did not match sent s.open".to_owned(),
+        ));
+    }
+    if frame.get("att_nonce").and_then(Value::as_str) != Some(expected_att_nonce) {
+        return Err(fail(
+            "provider accept att_nonce did not match sent s.open".to_owned(),
+        ));
     }
     let report = frame
         .get("att_report")
@@ -1834,11 +1849,25 @@ mod tests {
     fn direct_session_accept_pins_session_enclave_provider_and_signature() {
         let invocation = test_invocation();
         let frame = test_accept_frame(&invocation);
-        validate_direct_session_accept(&frame, &invocation).expect("matching accept is valid");
+        validate_direct_session_accept(
+            &frame,
+            &invocation,
+            test_open_head().as_str(),
+            test_att_nonce().as_str(),
+        )
+        .expect("matching accept is valid");
 
         let mut wrong_session = frame.clone();
         wrong_session["session_id"] = json!("bb".repeat(32));
         assert_accept_err(&wrong_session, &invocation, "session_id");
+
+        let mut wrong_open_head = frame.clone();
+        wrong_open_head["open_head"] = json!("99".repeat(32));
+        assert_accept_err(&wrong_open_head, &invocation, "open_head");
+
+        let mut wrong_att_nonce = frame.clone();
+        wrong_att_nonce["att_nonce"] = json!("98".repeat(32));
+        assert_accept_err(&wrong_att_nonce, &invocation, "att_nonce");
 
         let mut wrong_enclave = frame.clone();
         wrong_enclave["att_report"]["enclave_id"] = json!("cc".repeat(32));
@@ -1854,8 +1883,13 @@ mod tests {
     }
 
     fn assert_accept_err(frame: &Value, invocation: &GatewaySessionInvocation, needle: &str) {
-        let err = validate_direct_session_accept(frame, invocation)
-            .expect_err("mutated accept must be rejected");
+        let err = validate_direct_session_accept(
+            frame,
+            invocation,
+            test_open_head().as_str(),
+            test_att_nonce().as_str(),
+        )
+        .expect_err("mutated accept must be rejected");
         assert!(
             err.message.contains(needle),
             "expected error to contain {needle}, got {}",
@@ -1896,6 +1930,8 @@ mod tests {
             "t": "s.accept",
             "v": 1,
             "session_id": invocation.session_id,
+            "open_head": test_open_head(),
+            "att_nonce": test_att_nonce(),
             "att_report": {
                 "enclave_id": invocation.enclave_id,
                 "provider_pubkey": provider,
@@ -1915,5 +1951,13 @@ mod tests {
 
     fn test_provider_seed() -> [u8; 32] {
         [7; 32]
+    }
+
+    fn test_open_head() -> String {
+        "77".repeat(32)
+    }
+
+    fn test_att_nonce() -> String {
+        "88".repeat(32)
     }
 }
