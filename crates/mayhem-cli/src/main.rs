@@ -40,7 +40,10 @@ use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
     VerdictStatus,
 };
-use mayhem_proto::{session_accept_signing_bytes, session_frame_head, CatalogEnclaveIdentity};
+use mayhem_proto::{
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage, SESSION_RECEIPT_SCHEMA_VERSION,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -5582,7 +5585,8 @@ struct ProviderSessionRuntime<'a> {
 
 #[derive(Clone, Debug)]
 struct ActiveProviderSession {
-    user: String,
+    remote: String,
+    user_pubkey: String,
     session_id: String,
 }
 
@@ -5593,8 +5597,17 @@ struct ProviderSessionTerms {
     model_id: String,
     room_ids: Vec<String>,
     price_ver: u64,
+    in_per_1k_mu: u64,
+    out_per_1k_mu: u64,
     rules_ver: u64,
     ctx: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ProviderSignedSessionReceipt {
+    #[serde(flatten)]
+    body: ReceiptBody,
+    enclave_sig: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7677,7 +7690,12 @@ async fn handle_provider_session_frame(
                     sessions.insert(
                         session_id.clone(),
                         ActiveProviderSession {
-                            user: remote.clone(),
+                            remote: remote.clone(),
+                            user_pubkey: frame
+                                .get("user")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
                             session_id: session_id.clone(),
                         },
                     );
@@ -7761,13 +7779,15 @@ async fn handle_provider_session_frame(
             let output = responder.respond(terms, &body)?;
             send_provider_session_output(
                 bridge,
-                &active.user,
-                &active.session_id,
+                &active,
                 request_id,
+                terms,
+                &body,
                 &output,
+                runtime.runtime_keypair,
             )
             .await?;
-            send_provider_session_close(bridge, &active.user, &active.session_id, "done").await?;
+            send_provider_session_close(bridge, &active.remote, &active.session_id, "done").await?;
             sessions.remove(&session_id);
         }
         Some("s.close") => {
@@ -7780,16 +7800,18 @@ async fn handle_provider_session_frame(
 
 async fn send_provider_session_output(
     bridge: &mut ScBridgeClient,
-    remote: &str,
-    session_id: &str,
+    active: &ActiveProviderSession,
     request_id: &str,
+    terms: &ProviderSessionTerms,
+    body: &Value,
     output: &ProviderSessionOutput,
+    runtime_keypair: &RuntimeKeypair,
 ) -> Result<()> {
     if let Some(tool) = &output.tool {
         bridge
             .session_send(
-                remote,
-                session_id,
+                &active.remote,
+                &active.session_id,
                 json!({
                     "t": "s.delta",
                     "rid": request_id,
@@ -7802,44 +7824,60 @@ async fn send_provider_session_output(
             )
             .await
             .context("sending tool-call s.delta")?;
-        return Ok(());
-    }
-
-    let mut index = 0_u64;
-    for part in provider_stream_parts(&output.content) {
+    } else {
+        let mut index = 0_u64;
+        for part in provider_stream_parts(&output.content) {
+            bridge
+                .session_send(
+                    &active.remote,
+                    &active.session_id,
+                    json!({
+                        "t": "s.delta",
+                        "rid": request_id,
+                        "i": index,
+                        "d": part,
+                        "tool": null,
+                        "fin": null,
+                    }),
+                )
+                .await
+                .context("sending content s.delta")?;
+            index = index.saturating_add(1);
+        }
         bridge
             .session_send(
-                remote,
-                session_id,
+                &active.remote,
+                &active.session_id,
                 json!({
                     "t": "s.delta",
                     "rid": request_id,
                     "i": index,
-                    "d": part,
+                    "d": "",
                     "tool": null,
-                    "fin": null,
+                    "fin": output.finish_reason,
+                    "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
                 }),
             )
             .await
-            .context("sending content s.delta")?;
-        index = index.saturating_add(1);
+            .context("sending final s.delta")?;
     }
+
+    let receipt = provider_session_receipt(terms, active, body, output, runtime_keypair)
+        .context("building provider session receipt")?;
     bridge
         .session_send(
-            remote,
-            session_id,
+            &active.remote,
+            &active.session_id,
             json!({
-                "t": "s.delta",
-                "rid": request_id,
-                "i": index,
-                "d": "",
-                "tool": null,
-                "fin": output.finish_reason,
-                "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
+                "t": "s.receipt",
+                "v": 1,
+                "session_id": &active.session_id,
+                "seq": receipt.body.seq,
+                "receipt": receipt,
             }),
         )
         .await
-        .context("sending final s.delta")?;
+        .context("sending s.receipt")?;
     Ok(())
 }
 
@@ -7864,6 +7902,66 @@ async fn send_provider_session_close(
         .with_context(|| format!("sending s.close for {session_id}"))?;
     let _ = bridge.session_close(remote, session_id).await;
     Ok(())
+}
+
+fn provider_session_receipt(
+    terms: &ProviderSessionTerms,
+    active: &ActiveProviderSession,
+    body: &Value,
+    output: &ProviderSessionOutput,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<ProviderSignedSessionReceipt> {
+    let usage = ReceiptUsage {
+        in_tokens: output.prompt_tokens,
+        out_tokens: output.completion_tokens,
+    };
+    let receipt_body = ReceiptBody {
+        schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+        session_id: active.session_id.clone(),
+        seq: 1,
+        final_receipt: true,
+        user: active.user_pubkey.clone(),
+        provider: terms.provider.clone(),
+        enclave_id: terms.enclave_id.clone(),
+        model_id: terms.model_id.clone(),
+        price_ver: terms.price_ver,
+        rules_ver: terms.rules_ver,
+        usage: usage.clone(),
+        mu_owed_cum: provider_session_mu_owed(terms, &usage),
+        prompt_hash: provider_session_prompt_hash(body),
+        ts: unix_epoch_millis()?,
+    };
+    let payload = receipt_signing_bytes(&receipt_body).context("building receipt signing bytes")?;
+    Ok(ProviderSignedSessionReceipt {
+        body: receipt_body,
+        enclave_sig: runtime_keypair.sign_hex(&payload),
+    })
+}
+
+fn provider_session_mu_owed(terms: &ProviderSessionTerms, usage: &ReceiptUsage) -> u64 {
+    let raw = u128::from(usage.in_tokens) * u128::from(terms.in_per_1k_mu)
+        + u128::from(usage.out_tokens) * u128::from(terms.out_per_1k_mu);
+    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
+    rounded.min(u128::from(u64::MAX)) as u64
+}
+
+fn provider_session_prompt_hash(body: &Value) -> String {
+    blake3::hash(provider_session_prompt_text(body).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn provider_session_prompt_text(body: &Value) -> String {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .map(provider_message_to_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 async fn provider_session_attestation(
@@ -8002,6 +8100,8 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         model_id: ctx.selected.enclave.model_id.clone(),
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
+        in_per_1k_mu: price.in_per_1k_mu,
+        out_per_1k_mu: price.out_per_1k_mu,
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.model.caps.ctx_max,
     })
@@ -8144,6 +8244,10 @@ fn provider_session_open_decision(
         .unwrap_or("");
     if !is_hex_len(session_id, 64) {
         return reject("SCHEMA", "session_id must be 32 bytes of hex".to_owned());
+    }
+    let user = frame.get("user").and_then(Value::as_str).unwrap_or("");
+    if !is_hex_len(user, 64) {
+        return reject("USER", "session user must be 32 bytes of hex".to_owned());
     }
     let att_nonce = frame.get("att_nonce").and_then(Value::as_str).unwrap_or("");
     if !is_hex_len(att_nonce, 64) {
@@ -9202,6 +9306,7 @@ fn setup_admin_payout_notice(role: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use std::collections::BTreeMap;
 
     struct FakeEngineBackend {
@@ -10063,6 +10168,13 @@ mod tests {
             }
         ));
 
+        let mut bad_user = frame.clone();
+        bad_user["user"] = json!("not-hex");
+        assert!(matches!(
+            provider_session_open_decision(&bad_user, &terms),
+            ProviderSessionDecision::Reject { code: "USER", .. }
+        ));
+
         let mut bad_voucher = frame;
         bad_voucher["voucher"]["price_ver"] = json!(terms.price_ver + 1);
         assert!(matches!(
@@ -10208,6 +10320,58 @@ mod tests {
             draft.provider_signing_message_hex,
             other_draft.provider_signing_message_hex
         );
+    }
+
+    #[test]
+    fn provider_session_receipt_binds_admin_terms_usage_and_runtime_key() {
+        let terms = test_provider_session_terms();
+        let active = ActiveProviderSession {
+            remote: "peer-a".to_owned(),
+            user_pubkey: "66".repeat(32),
+            session_id: "aa".repeat(32),
+        };
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "be precise" },
+                { "role": "user", "content": "hello mayhem" }
+            ],
+            "stream": true
+        });
+        let output = ProviderSessionOutput {
+            content: "receipt ok".to_owned(),
+            tool: None,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 3,
+            completion_tokens: 4,
+        };
+        let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
+        let receipt =
+            provider_session_receipt(&terms, &active, &body, &output, &runtime_keypair).unwrap();
+
+        assert_eq!(receipt.body.session_id, active.session_id);
+        assert_eq!(receipt.body.user, active.user_pubkey);
+        assert_eq!(receipt.body.provider, terms.provider);
+        assert_eq!(receipt.body.enclave_id, terms.enclave_id);
+        assert_eq!(receipt.body.model_id, terms.model_id);
+        assert_eq!(receipt.body.price_ver, terms.price_ver);
+        assert_eq!(receipt.body.rules_ver, terms.rules_ver);
+        assert_eq!(receipt.body.usage.in_tokens, 3);
+        assert_eq!(receipt.body.usage.out_tokens, 4);
+        assert_eq!(receipt.body.mu_owed_cum, 1);
+        assert_eq!(
+            receipt.body.prompt_hash,
+            provider_session_prompt_hash(&body)
+        );
+
+        let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
+            .try_into()
+            .unwrap();
+        let sig_bytes: [u8; 64] = test_hex_decode(&receipt.enclave_sig).try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
+        let signature = Signature::from_bytes(&sig_bytes);
+        verifying_key
+            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .unwrap();
     }
 
     #[test]
@@ -11089,6 +11253,8 @@ mod tests {
             model_id: "test/model@4bit".to_owned(),
             room_ids: vec!["room-a".to_owned()],
             price_ver: 1,
+            in_per_1k_mu: 1,
+            out_per_1k_mu: 2,
             rules_ver: 3,
             ctx: 8192,
         }
@@ -11117,6 +11283,19 @@ mod tests {
             "nonce": "99".repeat(32),
             "sig": "77".repeat(64)
         })
+    }
+
+    fn test_hex_decode(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks(2)
+            .map(|chunk| {
+                let high = (chunk[0] as char).to_digit(16).unwrap();
+                let low = (chunk[1] as char).to_digit(16).unwrap();
+                ((high << 4) | low) as u8
+            })
+            .collect()
     }
 
     fn test_hardware(fixture: FixtureProfile) -> HardwareReport {

@@ -460,6 +460,10 @@ impl RuntimeKeypair {
         hex::encode(self.signing_key().verifying_key().to_bytes())
     }
 
+    pub fn sign_hex(&self, payload: &[u8]) -> String {
+        hex::encode(self.signing_key().sign(payload).to_bytes())
+    }
+
     fn signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.seed)
     }

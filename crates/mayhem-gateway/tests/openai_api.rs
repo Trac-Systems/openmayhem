@@ -46,6 +46,7 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                 },
                 backend: self.name().to_owned(),
                 direct_session: true,
+                provider_receipt: None,
             })
         })
     }
