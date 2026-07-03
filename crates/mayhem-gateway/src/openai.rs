@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +38,7 @@ pub struct GatewayState {
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     paused_sessions: Arc<Mutex<Vec<PausedSession>>>,
     receipt_config: ReceiptConfig,
+    session_backend: Arc<dyn GatewaySessionBackend>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,26 +169,53 @@ struct ApiError {
     param: Option<&'static str>,
 }
 
-#[derive(Clone, Debug)]
-struct ChatOutput {
-    content: Option<String>,
-    tool_call: Option<ToolCallOutput>,
-    finish_reason: &'static str,
-    usage: Usage,
+pub type GatewaySessionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GatewaySessionResult, GatewaySessionError>> + Send + 'a>>;
+
+pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
+    fn name(&self) -> &str;
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+    ) -> GatewaySessionFuture<'a>;
 }
 
 #[derive(Clone, Debug)]
-struct ToolCallOutput {
-    id: String,
-    name: String,
-    arguments: String,
+pub struct GatewaySessionResult {
+    pub output: ChatOutput,
+    pub backend: String,
+    pub direct_session: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewaySessionError {
+    pub message: String,
+}
+
+#[derive(Debug)]
+struct LocalOpenAiShapeBackend;
+
+#[derive(Clone, Debug)]
+pub struct ChatOutput {
+    pub content: Option<String>,
+    pub tool_call: Option<ToolCallOutput>,
+    pub finish_reason: String,
+    pub usage: Usage,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolCallOutput {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct Usage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 impl GatewayState {
@@ -248,11 +278,17 @@ impl GatewayState {
             receipts: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(Vec::new())),
             receipt_config: ReceiptConfig::default(),
+            session_backend: Arc::new(LocalOpenAiShapeBackend),
         }
     }
 
     pub fn with_receipt_cosign_enabled(mut self, enabled: bool) -> Self {
         self.receipt_config.cosign_enabled = enabled;
+        self
+    }
+
+    pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
+        self.session_backend = backend;
         self
     }
 
@@ -358,7 +394,7 @@ async fn create_chat_completion(
     State(state): State<SharedState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
-    match build_chat_completion(&state, request) {
+    match build_chat_completion(&state, request).await {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Err(err) => err.into_response(),
@@ -380,7 +416,7 @@ async fn mayhem_status(State(state): State<SharedState>) -> Response {
     Json(json!({
         "ok": true,
         "version": 1,
-        "backend": "local-openai-shape",
+        "backend": state.session_backend.name(),
         "models": state.models.len(),
         "sessions_active": 0,
         "sessions_paused": state.paused_session_count(),
@@ -412,7 +448,49 @@ enum ChatResponse {
     Sse(Vec<Value>),
 }
 
-fn build_chat_completion(
+#[derive(Clone, Copy)]
+struct ResponseMayhemMeta<'a> {
+    backend: &'a str,
+    direct_session: bool,
+}
+
+impl GatewaySessionError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl GatewaySessionResult {
+    pub fn local_openai_shape(output: ChatOutput) -> Self {
+        Self {
+            output,
+            backend: "local-openai-shape".to_owned(),
+            direct_session: false,
+        }
+    }
+}
+
+impl GatewaySessionBackend for LocalOpenAiShapeBackend {
+    fn name(&self) -> &str {
+        "local-openai-shape"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            Ok(GatewaySessionResult::local_openai_shape(
+                deterministic_chat_output(model, request),
+            ))
+        })
+    }
+}
+
+async fn build_chat_completion(
     state: &GatewayState,
     request: ChatCompletionRequest,
 ) -> Result<ChatResponse, ApiError> {
@@ -443,7 +521,19 @@ fn build_chat_completion(
 
     let id = make_id("chatcmpl");
     let created = now_secs();
-    let output = deterministic_chat_output(&model, &request);
+    let GatewaySessionResult {
+        output,
+        backend,
+        direct_session,
+    } = state
+        .session_backend
+        .run_chat(&model, &request)
+        .await
+        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+    let mayhem_meta = ResponseMayhemMeta {
+        backend: &backend,
+        direct_session,
+    };
     let receipt = state.meter_chat_session(&model, &request, &output)?;
     if request.stream {
         Ok(ChatResponse::Sse(chat_stream_chunks(
@@ -452,6 +542,7 @@ fn build_chat_completion(
             &model.id,
             &output,
             &receipt,
+            mayhem_meta,
             request
                 .stream_options
                 .as_ref()
@@ -459,7 +550,12 @@ fn build_chat_completion(
         )))
     } else {
         Ok(ChatResponse::Json(chat_response_value(
-            &id, created, &model, &output, &receipt,
+            &id,
+            created,
+            &model,
+            &output,
+            &receipt,
+            mayhem_meta,
         )))
     }
 }
@@ -617,7 +713,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
         ChatOutput {
             content: Some(format!("Tool result received: {tool_result}")),
             tool_call: None,
-            finish_reason: "stop",
+            finish_reason: "stop".to_owned(),
             usage: usage_for(&prompt_text, &tool_result),
         }
     } else if let Some(name) = requested_tool_name(request) {
@@ -629,7 +725,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
         ChatOutput {
             content: None,
             tool_call: Some(tool_call),
-            finish_reason: "tool_calls",
+            finish_reason: "tool_calls".to_owned(),
             usage: usage_for(&prompt_text, "{}"),
         }
     } else {
@@ -651,7 +747,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
             usage: usage_for(&prompt_text, &content),
             content: Some(content),
             tool_call: None,
-            finish_reason: "stop",
+            finish_reason: "stop".to_owned(),
         }
     };
     output
@@ -663,6 +759,7 @@ fn chat_response_value(
     model: &GatewayModel,
     output: &ChatOutput,
     receipt: &StoredReceipt,
+    mayhem_meta: ResponseMayhemMeta<'_>,
 ) -> Value {
     let message = if let Some(tool_call) = &output.tool_call {
         json!({
@@ -689,8 +786,8 @@ fn chat_response_value(
         }],
         "usage": output.usage,
         "mayhem": {
-            "backend": "local-openai-shape",
-            "direct_session": false,
+            "backend": mayhem_meta.backend,
+            "direct_session": mayhem_meta.direct_session,
             "model": model.mayhem,
             "receipt": receipt_summary(receipt),
         },
@@ -703,6 +800,7 @@ fn chat_stream_chunks(
     model: &str,
     output: &ChatOutput,
     receipt: &StoredReceipt,
+    mayhem_meta: ResponseMayhemMeta<'_>,
     include_usage: bool,
 ) -> Vec<Value> {
     let mut chunks = vec![chat_chunk(
@@ -739,7 +837,7 @@ fn chat_stream_chunks(
         created,
         model,
         json!({}),
-        Some(output.finish_reason),
+        Some(output.finish_reason.as_str()),
         None,
     ));
     if include_usage {
@@ -750,7 +848,11 @@ fn chat_stream_chunks(
             "model": model,
             "choices": [],
             "usage": output.usage,
-            "mayhem": { "receipt": receipt_summary(receipt) },
+            "mayhem": {
+                "backend": mayhem_meta.backend,
+                "direct_session": mayhem_meta.direct_session,
+                "receipt": receipt_summary(receipt),
+            },
         }));
     }
     chunks
@@ -1097,6 +1199,14 @@ impl ApiError {
     fn conflict(message: impl Into<String>, param: Option<&'static str>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message: message.into(),
+            param,
+        }
+    }
+
+    fn bad_gateway(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
             message: message.into(),
             param,
         }

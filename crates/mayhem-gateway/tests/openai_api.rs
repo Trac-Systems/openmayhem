@@ -3,9 +3,47 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode},
     Router,
 };
-use mayhem_gateway::openai::{openai_router, GatewayState};
+use mayhem_gateway::openai::{
+    openai_router, ChatCompletionRequest, ChatOutput, GatewayModel, GatewaySessionBackend,
+    GatewaySessionFuture, GatewaySessionResult, GatewayState, Usage,
+};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tower::ServiceExt;
+
+#[derive(Debug)]
+struct TestDirectSessionBackend;
+
+impl GatewaySessionBackend for TestDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = 4;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(format!("direct session response from {}", model.id)),
+                    tool_call: None,
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+            })
+        })
+    }
+}
 
 fn test_app() -> Router {
     openai_router(GatewayState::from_embedded_catalog())
@@ -154,6 +192,35 @@ async fn chat_completion_returns_tool_call_and_accepts_tool_result_followup() {
 }
 
 #[tokio::test]
+async fn chat_completion_can_use_direct_session_backend() {
+    let state = GatewayState::from_embedded_catalog()
+        .with_session_backend(Arc::new(TestDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let model = first_model_id().await;
+    let request = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "Use a direct session." }]
+    });
+
+    let (status, body) =
+        json_request(app.clone(), Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mayhem"]["backend"], "test-direct-session");
+    assert_eq!(body["mayhem"]["direct_session"], true);
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("assistant content")
+        .contains("direct session response"));
+    assert_eq!(state.receipts().len(), 1);
+    assert_eq!(state.receipts()[0].receipt.body.usage.out_tokens, 4);
+
+    let (status, body) = json_request(app, Method::GET, "/mayhem/status", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["backend"], "test-direct-session");
+}
+
+#[tokio::test]
 async fn chat_completion_streams_openai_sse_chunks_with_usage() {
     let model = first_model_id().await;
     let request = json!({
@@ -179,7 +246,10 @@ async fn chat_completion_streams_openai_sse_chunks_with_usage() {
     assert!(body.contains("data: {"));
     assert!(body.contains("\"object\":\"chat.completion.chunk\""));
     assert!(body.contains("\"choices\":[]"));
-    assert!(body.contains("\"mayhem\":{\"receipt\""));
+    assert!(body.contains("\"mayhem\":{"));
+    assert!(body.contains("\"backend\":\"local-openai-shape\""));
+    assert!(body.contains("\"direct_session\":false"));
+    assert!(body.contains("\"receipt\":{"));
     assert!(body.contains("data: [DONE]"));
 }
 
@@ -208,7 +278,8 @@ async fn streaming_chat_persists_dual_signed_receipt() {
         .unwrap_or_default()
         .starts_with("text/event-stream"));
     let body = String::from_utf8(bytes).expect("SSE body is utf8");
-    assert!(body.contains("\"mayhem\":{\"receipt\""));
+    assert!(body.contains("\"mayhem\":{"));
+    assert!(body.contains("\"receipt\":{"));
 
     let receipts = state.receipts();
     assert_eq!(receipts.len(), 1);
