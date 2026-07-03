@@ -920,6 +920,9 @@ class MayhemContract extends Contract {
   }
 
   async joinEnclave() {
+    const shapeError = this.validateExactCommandValue(['op', 'enclave_id'], 'join_enclave');
+    if (shapeError) return shapeError;
+
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
     const providerError = await this.requireProvider();
@@ -963,6 +966,9 @@ class MayhemContract extends Contract {
   }
 
   async leaveEnclave() {
+    const shapeError = this.validateExactCommandValue(['op', 'enclave_id'], 'leave_enclave');
+    if (shapeError) return shapeError;
+
     const key = `serve/${this.address}/${this.value.enclave_id}`;
     const record = await this.get(key);
     if (!record || record.status !== 'active') return new Error('Provider is not serving enclave.');
@@ -998,6 +1004,12 @@ class MayhemContract extends Contract {
   }
 
   async joinRoom() {
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'room_id', 'enclave_id'],
+      'join_room'
+    );
+    if (shapeError) return shapeError;
+
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
     const providerError = await this.requireProvider();
@@ -1056,6 +1068,12 @@ class MayhemContract extends Contract {
   }
 
   async leaveRoom() {
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'room_id', 'enclave_id'],
+      'leave_room'
+    );
+    if (shapeError) return shapeError;
+
     const key = `roomserve/${this.value.room_id}/${this.address}/${this.value.enclave_id}`;
     const record = await this.get(key);
     if (!record || record.status !== 'active') return new Error('Provider has not joined room with enclave.');
@@ -2608,6 +2626,9 @@ class MayhemContract extends Contract {
     }
     for (const key of allowedKeys) {
       if (!hasOwn(this.value, key)) return new Error(`${opName} is missing ${key}.`);
+    }
+    if (hasOwn(this.value, 'op') && this.value.op !== opName) {
+      return new Error(`Invalid ${opName} op.`);
     }
     return null;
   }
