@@ -798,6 +798,7 @@ class MayhemContract extends Contract {
   async banProvider() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.provider)) return new Error('Invalid provider id.');
 
     const key = `prov/${this.value.provider}`;
     const record = await this.get(key);
@@ -862,6 +863,8 @@ class MayhemContract extends Contract {
   async registerEnclave() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
+    if (!this.isSafeModelId(this.value.model_id)) return new Error('Invalid model id.');
 
     const capsError = this.validateEnclaveCaps(this.value.caps);
     if (capsError) return capsError;
@@ -894,6 +897,7 @@ class MayhemContract extends Contract {
   async updateEnclave() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
     const key = `enclave/${this.value.enclave_id}`;
     const record = await this.get(key);
@@ -922,6 +926,7 @@ class MayhemContract extends Contract {
   async retireEnclave() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
     const key = `enclave/${this.value.enclave_id}`;
     const record = await this.get(key);
@@ -959,6 +964,7 @@ class MayhemContract extends Contract {
   async joinEnclave() {
     const shapeError = this.validateExactCommandValue(['op', 'enclave_id'], 'join_enclave');
     if (shapeError) return shapeError;
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
@@ -1007,6 +1013,7 @@ class MayhemContract extends Contract {
   async leaveEnclave() {
     const shapeError = this.validateExactCommandValue(['op', 'enclave_id'], 'leave_enclave');
     if (shapeError) return shapeError;
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
     const key = `serve/${this.address}/${this.value.enclave_id}`;
     const record = await this.get(key);
@@ -1048,6 +1055,8 @@ class MayhemContract extends Contract {
       'join_room'
     );
     if (shapeError) return shapeError;
+    if (!this.isSafeKeyPart(this.value.room_id)) return new Error('Invalid room id.');
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
@@ -1121,6 +1130,8 @@ class MayhemContract extends Contract {
       'leave_room'
     );
     if (shapeError) return shapeError;
+    if (!this.isSafeKeyPart(this.value.room_id)) return new Error('Invalid room id.');
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
     const key = `roomserve/${this.value.room_id}/${this.address}/${this.value.enclave_id}`;
     const record = await this.get(key);
@@ -1180,6 +1191,12 @@ class MayhemContract extends Contract {
   async openRoom() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    if (this.value.enclave_id && !this.isSafeKeyPart(this.value.enclave_id)) {
+      return new Error('Invalid enclave id.');
+    }
+    if (this.value.model_id && !this.isSafeModelId(this.value.model_id)) {
+      return new Error('Invalid model id.');
+    }
 
     const policyError = this.validateRoomPolicy(this.value.policy);
     if (policyError) return policyError;
@@ -1231,6 +1248,7 @@ class MayhemContract extends Contract {
   async closeRoom() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.room_id)) return new Error('Invalid room id.');
 
     const key = `room/${this.value.room_id}`;
     const record = await this.get(key);
@@ -1269,6 +1287,7 @@ class MayhemContract extends Contract {
   async setPrice() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
     const enclave = await this.get(`enclave/${this.value.enclave_id}`);
     if (!enclave) return new Error('Enclave not found.');
@@ -1338,6 +1357,7 @@ class MayhemContract extends Contract {
   }
 
   async readPrice() {
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
     const schedule = await this.get(`price/${this.value.enclave_id}`);
     if (!schedule) return { ok: true, op: 'readPrice', enclave_id: this.value.enclave_id, at: this.value.at, price: null };
 

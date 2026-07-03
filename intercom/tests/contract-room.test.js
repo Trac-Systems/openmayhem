@@ -385,6 +385,112 @@ test('MayhemContract validates admin room policy as canonical routing controls',
   assert.deepEqual(room.value.policy, validPolicy);
 });
 
+test('MayhemContract rejects unsafe canonical room identifiers', async () => {
+  const provider = await makeIdentity();
+  const { contract, storage, admin } = await setupRoomAdmin(provider);
+
+  const badEnclaveRoom = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: 'bad/enclave',
+      nonce: 'bad-enclave-room',
+      label: 'bad-enclave-room',
+      policy: {},
+    },
+    admin.publicKey,
+    1
+  );
+  assert.match(badEnclaveRoom.message, /invalid enclave id/i);
+
+  const badModelRoom = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      model_id: '/provider/model',
+      nonce: 'bad-model-room',
+      label: 'bad-model-room',
+      policy: {},
+    },
+    admin.publicKey,
+    2
+  );
+  assert.match(badModelRoom.message, /invalid model id/i);
+
+  const badClose = await execute(
+    contract,
+    storage,
+    'closeRoom',
+    {
+      op: 'close_room',
+      room_id: 'bad/room',
+    },
+    admin.publicKey,
+    3
+  );
+  assert.match(badClose.message, /invalid room id/i);
+
+  const badJoinRoom = await execute(
+    contract,
+    storage,
+    'joinRoom',
+    {
+      op: 'join_room',
+      room_id: 'bad/room',
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    4
+  );
+  assert.match(badJoinRoom.message, /invalid room id/i);
+
+  const badJoinEnclave = await execute(
+    contract,
+    storage,
+    'joinRoom',
+    {
+      op: 'join_room',
+      room_id: 'room-safe',
+      enclave_id: 'bad/enclave',
+    },
+    provider.publicKey,
+    5
+  );
+  assert.match(badJoinEnclave.message, /invalid enclave id/i);
+
+  const badLeaveRoom = await execute(
+    contract,
+    storage,
+    'leaveRoom',
+    {
+      op: 'leave_room',
+      room_id: 'bad/room',
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    6
+  );
+  assert.match(badLeaveRoom.message, /invalid room id/i);
+
+  const badLeaveEnclave = await execute(
+    contract,
+    storage,
+    'leaveRoom',
+    {
+      op: 'leave_room',
+      room_id: 'room-safe',
+      enclave_id: 'bad/enclave',
+    },
+    provider.publicKey,
+    7
+  );
+  assert.match(badLeaveEnclave.message, /invalid enclave id/i);
+});
+
 test('MayhemContract room serving rejects explicit non-admin authority markers', async () => {
   const provider = await makeIdentity();
   const { contract, storage, admin } = await setupRoomAdmin(provider);
@@ -695,7 +801,7 @@ test('MayhemContract rejects non-canonical and wrong-enclave room offers', async
     provider.publicKey,
     8
   );
-  assert.match(nonCanonicalJoin.message, /room not found/i);
+  assert.match(nonCanonicalJoin.message, /invalid room id/i);
 
   const wrongModelHint = await execute(
     contract,

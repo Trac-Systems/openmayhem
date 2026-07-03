@@ -308,6 +308,35 @@ test('MayhemContract setModelRef is admin-only and forward-facing', async () => 
   });
 });
 
+test('MayhemContract rejects unsafe enclave identifiers in price reads and writes', async () => {
+  const provider = await makeIdentity();
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  const badWrite = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({ enclave_id: 'bad/enclave' }),
+    admin.publicKey,
+    1
+  );
+  assert.match(badWrite.message, /invalid enclave id/i);
+  assert.equal(await storage.get('price/bad/enclave'), null);
+
+  const badRead = await execute(
+    contract,
+    storage,
+    'readPrice',
+    { op: 'read_price', enclave_id: 'bad/enclave', at: 0 },
+    provider.publicKey,
+    2
+  );
+  assert.match(badRead.message, /invalid enclave id/i);
+});
+
 test('MayhemContract contract admin can edit enclave pricing forward-facing', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
 

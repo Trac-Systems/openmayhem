@@ -905,6 +905,110 @@ test('MayhemContract rejects provider-authored serving terms on joins', async ()
   assert.equal(leftEnclave.ok, true, leftEnclave.message);
 });
 
+test('MayhemContract rejects unsafe canonical registry identifiers', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  const badEnclaveRegister = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'bad/enclave',
+    },
+    admin.publicKey,
+    1
+  );
+  assert.match(badEnclaveRegister.message, /invalid enclave id/i);
+  assert.equal(await storage.get('enclave/bad/enclave'), null);
+
+  const badModelRegister = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'a'.repeat(64),
+      model_id: '/provider/model',
+    },
+    admin.publicKey,
+    2
+  );
+  assert.match(badModelRegister.message, /invalid model id/i);
+  assert.equal(await storage.get(`enclave/${'a'.repeat(64)}`), null);
+
+  const badUpdate = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'bad/enclave',
+      artifact_root: updatedArtifactRoot,
+    },
+    admin.publicKey,
+    3
+  );
+  assert.match(badUpdate.message, /invalid enclave id/i);
+
+  const badRetire = await execute(
+    contract,
+    storage,
+    'retireEnclave',
+    {
+      op: 'retire_enclave',
+      enclave_id: 'bad/enclave',
+    },
+    admin.publicKey,
+    4
+  );
+  assert.match(badRetire.message, /invalid enclave id/i);
+
+  const badJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    {
+      op: 'join_enclave',
+      enclave_id: 'bad/enclave',
+    },
+    provider.publicKey,
+    5
+  );
+  assert.match(badJoin.message, /invalid enclave id/i);
+
+  const badLeave = await execute(
+    contract,
+    storage,
+    'leaveEnclave',
+    {
+      op: 'leave_enclave',
+      enclave_id: 'bad/enclave',
+    },
+    provider.publicKey,
+    6
+  );
+  assert.match(badLeave.message, /invalid enclave id/i);
+
+  const badBan = await execute(
+    contract,
+    storage,
+    'banProvider',
+    {
+      op: 'ban_provider',
+      provider: 'bad/provider',
+    },
+    admin.publicKey,
+    7
+  );
+  assert.match(badBan.message, /invalid provider id/i);
+  assert.equal(await storage.get('prov/bad/provider'), null);
+});
+
 test('MayhemContract admin can ban providers from future serving mutations', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
