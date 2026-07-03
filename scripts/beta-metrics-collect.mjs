@@ -25,7 +25,8 @@ Accepted evidence shapes are intentionally plain:
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
 - guardian: small summary JSON; the source file hash is recorded as evidence
-- canary/browser: small summary JSON; browser handoffs may also be a text log`);
+- canary: small summary JSON; the source file hash is recorded as evidence
+- browser: small summary JSON; browser handoffs may also be a text log`);
 }
 
 function parseArgs(argv) {
@@ -421,11 +422,7 @@ function buildMetrics(args) {
     participants,
     audited_epoch: auditedEpoch,
     guardian,
-    canary: {
-      set_id: canary.set_id,
-      probes: canary.probes,
-      failures: canary.failures,
-    },
+    canary,
     browser_handoffs: browserHandoffs,
     tracker: {
       metrics_recorded: args.trackerRecorded,

@@ -242,6 +242,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireLiteral(add, metrics.canary.set_id, 'canary-launch-v1', 'canary.set_id');
     requireIntegerAtLeast(add, metrics.canary.probes, 1, 'canary.probes');
     requireLiteral(add, metrics.canary.failures, 0, 'canary.failures');
+    validateEvidenceArray(add, metrics.canary.evidence, 'canary.evidence');
   }
 
   if (requireObject(add, metrics.browser_handoffs, 'browser_handoffs')) {

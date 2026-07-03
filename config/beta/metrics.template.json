@@ -76,7 +76,10 @@
   "canary": {
     "set_id": "canary-launch-v1",
     "probes": "<accepted-canary-probe-count>",
-    "failures": 0
+    "failures": 0,
+    "evidence": [
+      "<canary-report-file-hash-or-url>"
+    ]
   },
   "browser_handoffs": {
     "copy_paste_urls_printed": true,
