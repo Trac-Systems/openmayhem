@@ -113,6 +113,16 @@ function requireIntegerAtLeast(add, value, min, name) {
   }
 }
 
+function requireIntegerRange(add, value, min, max, name) {
+  if (isPlaceholder(value)) {
+    add('placeholder', `${name} still contains a template placeholder`);
+    return;
+  }
+  if (!Number.isInteger(value) || value < min || value > max) {
+    add('error', `${name} must be an integer between ${min} and ${max}`);
+  }
+}
+
 function requireBoolean(add, value, expected, name) {
   if (value !== expected) add('error', `${name} must be ${expected}`);
 }
@@ -394,6 +404,9 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       for (const key of ['dep', 'use', 'earn', 'fee', 'pay']) {
         requireString(add, auditedEpoch.roots[key], `audited_epoch.roots.${key}`, hex64);
       }
+    }
+    if (requireObject(add, auditedEpoch.params, 'audited_epoch.params')) {
+      requireIntegerRange(add, auditedEpoch.params.fee_bps, 0, 10_000, 'audited_epoch.params.fee_bps');
     }
     requireBoolean(add, auditedEpoch.receipt_batches_verified, true, 'audited_epoch.receipt_batches_verified');
     requireBoolean(add, auditedEpoch.payout_evidence_verified, true, 'audited_epoch.payout_evidence_verified');

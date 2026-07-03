@@ -86,6 +86,9 @@
       "fee": "<fee-root-64-hex>",
       "pay": "<pay-root-64-hex>"
     },
+    "params": {
+      "fee_bps": "<admin-fee-bps>"
+    },
     "receipt_batches_verified": true,
     "payout_evidence_verified": true,
     "auditors": [

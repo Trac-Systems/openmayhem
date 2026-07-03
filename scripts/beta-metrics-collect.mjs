@@ -347,6 +347,15 @@ function collectEpoch(args) {
   const roots = firstDefined(value, ['audited_epoch.roots', 'recomputed.roots', 'roots']);
   if (!roots || typeof roots !== 'object') throw new Error('epoch evidence is missing roots');
   const epoch = firstDefined(value, ['audited_epoch.epoch', 'recomputed.epoch', 'bundle.epoch', 'epoch']);
+  const feeBps = firstDefined(value, [
+    'audited_epoch.params.fee_bps',
+    'recomputed.params.fee_bps',
+    'bundle.params.fee_bps',
+    'params.fee_bps',
+  ]);
+  if (!Number.isInteger(feeBps) || feeBps < 0 || feeBps > 10_000) {
+    throw new Error('epoch evidence params.fee_bps must be the admin-set fee_bps integer between 0 and 10000');
+  }
   const checks = Array.isArray(value.checks) ? value.checks : [];
   const checksOk = checks.length > 0 && checks.every((check) => check && check.ok === true);
   const verified = value.verified === true || checksOk || value.receipt_batches_verified === true;
@@ -370,6 +379,9 @@ function collectEpoch(args) {
       earn: roots.earn,
       fee: roots.fee,
       pay: roots.pay,
+    },
+    params: {
+      fee_bps: feeBps,
     },
     receipt_batches_verified: verified,
     payout_evidence_verified: value.payout_evidence_verified === true || verified,
@@ -516,6 +528,14 @@ function buildMetrics(args) {
 
   for (const key of ['dep', 'use', 'earn', 'fee', 'pay']) {
     auditedEpoch.roots[key] = requireHex64(auditedEpoch.roots[key], `audited_epoch.roots.${key}`);
+  }
+  if (
+    !auditedEpoch.params ||
+    !Number.isInteger(auditedEpoch.params.fee_bps) ||
+    auditedEpoch.params.fee_bps < 0 ||
+    auditedEpoch.params.fee_bps > 10_000
+  ) {
+    throw new Error('audited_epoch.params.fee_bps must be the admin-set fee_bps integer between 0 and 10000');
   }
   auditedEpoch.commit_tx = requireHex64(auditedEpoch.commit_tx, 'audited_epoch.commit_tx');
   auditedEpoch.apply_tx = requireHex64(auditedEpoch.apply_tx, 'audited_epoch.apply_tx');
