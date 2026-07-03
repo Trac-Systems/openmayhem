@@ -22,9 +22,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, SESSION_RECEIPT_SCHEMA_VERSION,
+    attestation_signing_bytes, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, AttestationReport, AttestationSigner,
+    CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -724,11 +725,25 @@ fn validate_direct_session_accept(
             "provider accept att_nonce did not match sent s.open".to_owned(),
         ));
     }
-    let report = frame
+    let report_value = frame
         .get("att_report")
-        .and_then(Value::as_object)
+        .cloned()
         .ok_or_else(|| fail("provider accept missing att_report".to_owned()))?;
-    if report.get("enclave_id").and_then(Value::as_str) != Some(invocation.enclave_id.as_str()) {
+    let report: AttestationReport = serde_json::from_value(report_value)
+        .map_err(|err| fail(format!("provider accept att_report invalid: {err}")))?;
+    if report.schema_version != ATTESTATION_SCHEMA_VERSION {
+        return Err(fail(format!(
+            "provider accept att_report schema_version {} is not supported",
+            report.schema_version
+        )));
+    }
+    if report.alg != ATTESTATION_ALG {
+        return Err(fail(format!(
+            "provider accept att_report alg {} is not supported",
+            report.alg
+        )));
+    }
+    if report.enclave_id != invocation.enclave_id {
         return Err(fail(format!(
             "provider accept att_report enclave_id did not match {}",
             invocation.enclave_id
@@ -738,19 +753,59 @@ fn validate_direct_session_accept(
         .get("sig")
         .and_then(Value::as_str)
         .ok_or_else(|| fail("provider accept missing sig".to_owned()))?;
-    report
-        .get("sig_provider")
-        .and_then(Value::as_str)
-        .ok_or_else(|| fail("provider accept att_report missing sig_provider".to_owned()))?;
     if let Some(provider) = invocation.provider_pubkey.as_deref() {
-        if report.get("provider_pubkey").and_then(Value::as_str) != Some(provider) {
+        if report.provider_pubkey != provider {
             return Err(fail(format!(
                 "provider accept att_report provider_pubkey did not match {provider}"
             )));
         }
+        verify_direct_session_report_signature(&report, AttestationSigner::Enclave)?;
+        verify_direct_session_report_signature(&report, AttestationSigner::Provider)?;
         verify_direct_session_accept_signature(frame, provider, top_sig)?;
     }
     Ok(())
+}
+
+fn verify_direct_session_report_signature(
+    report: &AttestationReport,
+    signer: AttestationSigner,
+) -> Result<(), GatewaySessionError> {
+    let (signer_name, public_key_hex, signature_hex) = match signer {
+        AttestationSigner::Enclave => (
+            "enclave",
+            report.enclave_pubkey.as_str(),
+            report.sig_enclave.as_str(),
+        ),
+        AttestationSigner::Provider => (
+            "provider",
+            report.provider_pubkey.as_str(),
+            report.sig_provider.as_str(),
+        ),
+    };
+    let public_key = decode_hex_array::<32>(
+        public_key_hex,
+        match signer {
+            AttestationSigner::Enclave => "att_report enclave pubkey",
+            AttestationSigner::Provider => "att_report provider pubkey",
+        },
+    )?;
+    let signature = decode_hex_array::<64>(
+        signature_hex,
+        match signer {
+            AttestationSigner::Enclave => "att_report sig_enclave",
+            AttestationSigner::Provider => "att_report sig_provider",
+        },
+    )?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key).map_err(|err| {
+        GatewaySessionError::new(format!("invalid att_report {signer_name} pubkey: {err}"))
+    })?;
+    let signature = Signature::from_bytes(&signature);
+    let payload = attestation_signing_bytes(&report.body(), signer).map_err(|err| {
+        GatewaySessionError::new(format!("att_report signing payload failed: {err}"))
+    })?;
+    verifying_key.verify(&payload, &signature).map_err(|err| {
+        GatewaySessionError::new(format!("att_report {signer_name} signature failed: {err}"))
+    })
 }
 
 fn verify_direct_session_accept_signature(
@@ -1877,6 +1932,11 @@ mod tests {
         wrong_provider["att_report"]["provider_pubkey"] = json!("dd".repeat(32));
         assert_accept_err(&wrong_provider, &invocation, "provider_pubkey");
 
+        let mut wrong_report_sig = frame.clone();
+        wrong_report_sig["att_report"]["sig_provider"] = json!("12".repeat(64));
+        sign_accept_frame(&mut wrong_report_sig);
+        assert_accept_err(&wrong_report_sig, &invocation, "provider signature");
+
         let mut wrong_sig = frame;
         wrong_sig["sig"] = json!("ee".repeat(64));
         assert_accept_err(&wrong_sig, &invocation, "signature");
@@ -1925,32 +1985,64 @@ mod tests {
     }
 
     fn test_accept_frame(invocation: &GatewaySessionInvocation) -> Value {
-        let provider = invocation.provider_pubkey.as_ref().unwrap();
         let mut frame = json!({
             "t": "s.accept",
             "v": 1,
             "session_id": invocation.session_id,
             "open_head": test_open_head(),
             "att_nonce": test_att_nonce(),
-            "att_report": {
-                "enclave_id": invocation.enclave_id,
-                "provider_pubkey": provider,
-                "sig_provider": "55".repeat(64),
-            },
+            "att_report": test_attestation_report(invocation),
             "engine": { "ctx": 8192 },
             "ts": 123,
             "nonce": "66".repeat(32),
         });
+        sign_accept_frame(&mut frame);
+        frame
+    }
+
+    fn test_attestation_report(invocation: &GatewaySessionInvocation) -> Value {
+        let mut report = AttestationReport {
+            schema_version: ATTESTATION_SCHEMA_VERSION,
+            alg: ATTESTATION_ALG.to_owned(),
+            enclave_id: invocation.enclave_id.clone(),
+            enclave_pubkey: verifying_key_hex(&test_enclave_seed()),
+            provider_pubkey: invocation.provider_pubkey.clone().unwrap(),
+            manifest_hash: "aa".repeat(32),
+            binary_hash: "bb".repeat(32),
+            att_tier: 1,
+            hw_quote: None,
+            boot_epoch: 1,
+            report_ts: 2,
+            nonce_u: test_att_nonce(),
+            sig_enclave: String::new(),
+            sig_provider: String::new(),
+        };
+        let body = report.body();
+        report.sig_enclave = sign_hex(
+            &test_enclave_seed(),
+            &attestation_signing_bytes(&body, AttestationSigner::Enclave).unwrap(),
+        );
+        report.sig_provider = sign_hex(
+            &test_provider_seed(),
+            &attestation_signing_bytes(&body, AttestationSigner::Provider).unwrap(),
+        );
+        serde_json::to_value(report).unwrap()
+    }
+
+    fn sign_accept_frame(frame: &mut Value) {
         let sig = sign_hex(
             &test_provider_seed(),
-            &session_accept_signing_bytes(&frame).unwrap(),
+            &session_accept_signing_bytes(frame).unwrap(),
         );
         frame["sig"] = json!(sig);
-        frame
     }
 
     fn test_provider_seed() -> [u8; 32] {
         [7; 32]
+    }
+
+    fn test_enclave_seed() -> [u8; 32] {
+        [8; 32]
     }
 
     fn test_open_head() -> String {
