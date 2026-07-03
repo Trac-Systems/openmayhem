@@ -1107,8 +1107,13 @@ struct AdminOpenRoomArgs {
     tx: AdminTxArgs,
 
     #[arg(long)]
-    model: String,
+    enclave_id: String,
 
+    /// Optional catalog model id. If provided, it must match the admin enclave.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Room nonce used with the enclave id to derive a stable room id.
     #[arg(long)]
     nonce: String,
 
@@ -2367,13 +2372,17 @@ fn admin_open_room_payload(args: &AdminOpenRoomArgs) -> Result<Value> {
         Some(json!({})),
         "room policy",
     )?;
-    Ok(json!({
+    let mut payload = json!({
         "op": "open_room",
-        "model_id": &args.model,
+        "enclave_id": &args.enclave_id,
         "nonce": &args.nonce,
         "label": &args.label,
         "policy": policy,
-    }))
+    });
+    if let Some(model) = &args.model {
+        payload["model_id"] = json!(model);
+    }
+    Ok(payload)
 }
 
 fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Value {
@@ -5353,6 +5362,8 @@ struct LedgerEnclave {
 struct LedgerRoom {
     room_id: String,
     sidechannel: String,
+    #[serde(default)]
+    enclave_id: Option<String>,
     model_id: String,
     #[serde(default)]
     label: String,
@@ -6121,12 +6132,14 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
     if room.status != "open" {
         bail!("room {} is not open", room.room_id);
     }
-    if room.model_id != enclave.model_id {
+    if !room_matches_enclave(room, enclave) {
         bail!(
-            "room {} is for model {}, not {}",
+            "room {} is for model {} / enclave {}, not model {} / enclave {}",
             room.room_id,
             room.model_id,
-            enclave.model_id
+            room.enclave_id.as_deref().unwrap_or("<legacy-model-room>"),
+            enclave.model_id,
+            enclave.enclave_id
         );
     }
     let price = require_current_mu_usd_price(&contract.prices, &enclave.enclave_id)?;
@@ -6614,10 +6627,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         .filter(|provider| provider.status == "active")
         .map(|provider| provider.provider.as_str())
         .collect::<BTreeSet<_>>();
-    let mut room_ids = BTreeSet::new();
+    let mut rooms_by_id = BTreeMap::new();
     let mut rooms_by_model: BTreeMap<String, u32> = BTreeMap::new();
     for room in &open_rooms {
-        room_ids.insert(room.room_id.clone());
+        rooms_by_id.insert(room.room_id.clone(), *room);
         let count = rooms_by_model.entry(room.model_id.clone()).or_default();
         *count = count.saturating_add(1);
     }
@@ -6659,12 +6672,15 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if !active_providers.contains(serving.provider.as_str()) {
             continue;
         }
-        if !room_ids.contains(&serving.room_id) {
+        let Some(room) = rooms_by_id.get(&serving.room_id) else {
             continue;
-        }
+        };
         let Some(enclave) = active_enclaves.get(&serving.enclave_id) else {
             continue;
         };
+        if !room_matches_enclave(room, enclave) {
+            continue;
+        }
         let Some(serving_price) = prices_by_enclave.get(&serving.enclave_id) else {
             continue;
         };
@@ -6693,12 +6709,15 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if !active_providers.contains(serving.provider.as_str()) {
             continue;
         }
-        if !room_ids.contains(&serving.room_id) {
+        let Some(room) = rooms_by_id.get(&serving.room_id) else {
             continue;
-        }
+        };
         let Some(enclave) = active_enclaves.get(&serving.enclave_id) else {
             continue;
         };
+        if !room_matches_enclave(room, enclave) {
+            continue;
+        }
         let Some(selected_price) = served_price_by_model.get(&enclave.model_id) else {
             continue;
         };
@@ -6803,6 +6822,13 @@ fn same_gateway_price_terms(left: &LedgerPriceRecord, right: &LedgerPriceRecord)
         && left.denom == right.denom
         && left.in_per_1k_mu == right.in_per_1k_mu
         && left.out_per_1k_mu == right.out_per_1k_mu
+}
+
+fn room_matches_enclave(room: &LedgerRoom, enclave: &LedgerEnclave) -> bool {
+    room.model_id == enclave.model_id
+        && room.enclave_id.as_ref().map_or(true, |room_enclave_id| {
+            room_enclave_id == &enclave.enclave_id
+        })
 }
 
 fn empty_gateway_caps() -> ModelCaps {
@@ -6996,7 +7022,7 @@ fn select_provider_rooms(
     if requested.trim().eq_ignore_ascii_case("auto") {
         let mut selected = rooms
             .iter()
-            .filter(|room| room.status == "open" && room.model_id == enclave.model_id)
+            .filter(|room| room.status == "open" && room_matches_enclave(room, enclave))
             .cloned()
             .collect::<Vec<_>>();
         selected.sort_by(|a, b| a.room_id.cmp(&b.room_id));
@@ -7020,11 +7046,13 @@ fn select_provider_rooms(
         if room.status != "open" {
             bail!("room {room_id} is not open");
         }
-        if room.model_id != enclave.model_id {
+        if !room_matches_enclave(room, enclave) {
             bail!(
-                "room {room_id} is for model {}, not {}",
+                "room {room_id} is for model {} / enclave {}, not model {} / enclave {}",
                 room.model_id,
-                enclave.model_id
+                room.enclave_id.as_deref().unwrap_or("<legacy-model-room>"),
+                enclave.model_id,
+                enclave.enclave_id
             );
         }
         selected.push(room.clone());
@@ -9083,7 +9111,8 @@ mod tests {
     fn admin_open_room_payload_defaults_empty_policy_and_requires_object_policy() {
         let args = AdminOpenRoomArgs {
             tx: test_admin_tx_args(),
-            model: "catalog/model".to_owned(),
+            enclave_id: "enclave-a".to_owned(),
+            model: Some("catalog/model".to_owned()),
             nonce: "stable-room-nonce".to_owned(),
             label: "eu-central".to_owned(),
             policy_json: None,
@@ -9094,6 +9123,7 @@ mod tests {
             admin_open_room_payload(&args).unwrap(),
             json!({
                 "op": "open_room",
+                "enclave_id": "enclave-a",
                 "model_id": "catalog/model",
                 "nonce": "stable-room-nonce",
                 "label": "eu-central",
@@ -9660,6 +9690,20 @@ mod tests {
         let err =
             gateway_models_from_contract(&contract).expect_err("banned provider should hide model");
         assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut wrong_same_model_enclave = test_contract(&root);
+        let other_enclave_id = "66".repeat(32);
+        let mut other_enclave = wrong_same_model_enclave.enclaves[0].clone();
+        other_enclave.enclave_id = other_enclave_id.clone();
+        other_enclave.artifact_root = "77".repeat(32);
+        wrong_same_model_enclave.enclaves.push(other_enclave);
+        let mut other_price = wrong_same_model_enclave.prices[0].clone();
+        other_price.enclave_id = other_enclave_id.clone();
+        wrong_same_model_enclave.prices.push(other_price);
+        wrong_same_model_enclave.roomserve[0].enclave_id = other_enclave_id;
+        let err = gateway_models_from_contract(&wrong_same_model_enclave)
+            .expect_err("same-model wrong-enclave roomserve should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
     }
 
     #[test]
@@ -9924,11 +9968,24 @@ mod tests {
         let root = "aa".repeat(32);
         let contract = test_contract(&root);
         let enclave = &contract.enclaves[0];
-        let rooms = select_provider_rooms(&contract.rooms, enclave, "auto").unwrap();
+        let mut canonical_rooms = contract.rooms.clone();
+        canonical_rooms.push(LedgerRoom {
+            room_id: "room-same-model-other-enclave".to_owned(),
+            sidechannel: "mx/room/room-same-model-other-enclave".to_owned(),
+            enclave_id: Some("66".repeat(32)),
+            model_id: enclave.model_id.clone(),
+            label: "other-enclave".to_owned(),
+            status: "open".to_owned(),
+        });
+        let rooms = select_provider_rooms(&canonical_rooms, enclave, "auto").unwrap();
 
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].room_id, "room-a");
-        assert!(select_provider_rooms(&contract.rooms, enclave, "room-other").is_err());
+        assert!(select_provider_rooms(&canonical_rooms, enclave, "room-other").is_err());
+        assert!(
+            select_provider_rooms(&canonical_rooms, enclave, "room-same-model-other-enclave")
+                .is_err()
+        );
     }
 
     #[test]
@@ -10733,6 +10790,7 @@ mod tests {
                 LedgerRoom {
                     room_id: "room-a".to_owned(),
                     sidechannel: "mx/room/room-a".to_owned(),
+                    enclave_id: Some("11".repeat(32)),
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
                     status: "open".to_owned(),
@@ -10740,6 +10798,7 @@ mod tests {
                 LedgerRoom {
                     room_id: "room-closed".to_owned(),
                     sidechannel: "mx/room/room-closed".to_owned(),
+                    enclave_id: Some("11".repeat(32)),
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
                     status: "closed".to_owned(),
@@ -10747,6 +10806,7 @@ mod tests {
                 LedgerRoom {
                     room_id: "room-other".to_owned(),
                     sidechannel: "mx/room/room-other".to_owned(),
+                    enclave_id: None,
                     model_id: "other/model".to_owned(),
                     label: "test".to_owned(),
                     status: "open".to_owned(),

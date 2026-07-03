@@ -108,6 +108,7 @@ async function setupProviderServing(ctx) {
     'openRoom',
     {
       op: 'open_room',
+      enclave_id: enclaveId,
       model_id: modelId,
       nonce: 'slash-room',
       label: 'Slash Room',

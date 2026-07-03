@@ -42,7 +42,7 @@ async function setupSecuritySurface() {
     },
   });
 
-  const roomId = await deriveRoomId(modelId, admin.publicKey, roomNonce);
+  const roomId = await deriveRoomId(enclaveId, admin.publicKey, roomNonce);
   const bootstrap = [
     {
       type: 'setRules',
@@ -77,6 +77,7 @@ async function setupSecuritySurface() {
       type: 'openRoom',
       value: {
         op: 'open_room',
+        enclave_id: enclaveId,
         model_id: modelId,
         nonce: roomNonce,
         label: 'security-review',
@@ -167,6 +168,7 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
       'openRoom',
       {
         op: 'open_room',
+        enclave_id: enclaveId,
         model_id: modelId,
         nonce: 'provider-room',
         label: 'provider-room',

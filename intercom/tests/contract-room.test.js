@@ -50,7 +50,7 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
   const { contract, storage: peerAStorage, admin } = await setupRoomAdmin(provider);
   const outsider = await makeIdentity();
   const nonce = 'room-nonce-001';
-  const expectedRoomId = await deriveRoomId(modelId, admin.publicKey, nonce);
+  const expectedRoomId = await deriveRoomId(enclaveId, admin.publicKey, nonce);
   const expectedSidechannel = roomSidechannelName(expectedRoomId);
   const policy = {
     min_reputation: 0,
@@ -105,6 +105,7 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     'openRoom',
     {
       op: 'open_room',
+      enclave_id: enclaveId,
       model_id: modelId,
       nonce,
       label: 'eu-central',
@@ -121,6 +122,7 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     'openRoom',
     {
       op: 'open_room',
+      enclave_id: enclaveId,
       model_id: modelId,
       nonce,
       label: 'eu-central',
@@ -189,6 +191,7 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
   assert.deepEqual(discovered.value, {
     room_id: expectedRoomId,
     sidechannel: expectedSidechannel,
+    enclave_id: enclaveId,
     model_id: modelId,
     label: 'eu-central',
     creator: admin.publicKey,
@@ -283,10 +286,11 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
   assert.equal(servingAfterLeaveRoom.value.updated_at, makeTxKey(12));
 });
 
-test('MayhemContract rejects non-canonical and wrong-model room offers', async () => {
+test('MayhemContract keeps legacy admin model rooms joinable by matching enclave model', async () => {
   const provider = await makeIdentity();
   const { contract, storage, admin } = await setupRoomAdmin(provider);
-  const roomId = await deriveRoomId(modelId, admin.publicKey, 'canonical-room');
+  const nonce = 'legacy-model-room';
+  const legacyRoomId = await deriveRoomId(modelId, admin.publicKey, nonce);
 
   for (const op of [
     {
@@ -314,11 +318,7 @@ test('MayhemContract rejects non-canonical and wrong-model room offers', async (
     },
     {
       type: 'registerEnclave',
-      value: {
-        ...enclaveRegistration,
-        enclave_id: otherEnclaveId,
-        model_id: otherModelId,
-      },
+      value: enclaveRegistration,
       sender: admin.publicKey,
       txNo: 4,
     },
@@ -327,10 +327,120 @@ test('MayhemContract rejects non-canonical and wrong-model room offers', async (
     assert.equal(result.ok, true, result.message);
   }
   await seedCurrentAdminPrice(storage, {
-    enclaveId: otherEnclaveId,
-    modelId: otherModelId,
+    enclaveId,
+    modelId,
     admin: admin.publicKey,
     txNo: 5,
+  });
+
+  const opened = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      model_id: modelId,
+      nonce,
+      label: 'legacy',
+      policy: {},
+    },
+    admin.publicKey,
+    6
+  );
+  assert.deepEqual(opened, {
+    ok: true,
+    op: 'openRoom',
+    room_id: legacyRoomId,
+    sidechannel: roomSidechannelName(legacyRoomId),
+  });
+
+  const providerServesEnclave = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    {
+      op: 'join_enclave',
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    7
+  );
+  assert.equal(providerServesEnclave.ok, true, providerServesEnclave.message);
+
+  const joined = await execute(
+    contract,
+    storage,
+    'joinRoom',
+    {
+      op: 'join_room',
+      room_id: legacyRoomId,
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    8
+  );
+  assert.equal(joined.ok, true, joined.message);
+
+  const room = await storage.get(`room/${legacyRoomId}`);
+  assert.equal(room.value.model_id, modelId);
+  assert.equal(Object.hasOwn(room.value, 'enclave_id'), false);
+});
+
+test('MayhemContract rejects non-canonical and wrong-enclave room offers', async () => {
+  const provider = await makeIdentity();
+  const { contract, storage, admin } = await setupRoomAdmin(provider);
+  const roomId = await deriveRoomId(enclaveId, admin.publicKey, 'canonical-room');
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerEnclave',
+      value: enclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+    {
+      type: 'registerEnclave',
+      value: {
+        ...enclaveRegistration,
+        enclave_id: otherEnclaveId,
+        model_id: modelId,
+        artifact_root: '1'.repeat(64),
+      },
+      sender: admin.publicKey,
+      txNo: 5,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId: otherEnclaveId,
+    modelId,
+    admin: admin.publicKey,
+    txNo: 6,
   });
 
   const providerServesOther = await execute(
@@ -342,7 +452,7 @@ test('MayhemContract rejects non-canonical and wrong-model room offers', async (
       enclave_id: otherEnclaveId,
     },
     provider.publicKey,
-    5
+    7
   );
   assert.equal(providerServesOther.ok, true, providerServesOther.message);
 
@@ -356,9 +466,26 @@ test('MayhemContract rejects non-canonical and wrong-model room offers', async (
       enclave_id: otherEnclaveId,
     },
     provider.publicKey,
-    6
+    8
   );
   assert.match(nonCanonicalJoin.message, /room not found/i);
+
+  const wrongModelHint = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: enclaveId,
+      model_id: otherModelId,
+      nonce: 'canonical-room',
+      label: 'eu-central',
+      policy: {},
+    },
+    admin.publicKey,
+    9
+  );
+  assert.match(wrongModelHint.message, /room model does not match enclave model/i);
 
   const opened = await execute(
     contract,
@@ -366,17 +493,18 @@ test('MayhemContract rejects non-canonical and wrong-model room offers', async (
     'openRoom',
     {
       op: 'open_room',
+      enclave_id: enclaveId,
       model_id: modelId,
       nonce: 'canonical-room',
       label: 'eu-central',
       policy: {},
     },
     admin.publicKey,
-    7
+    10
   );
   assert.equal(opened.ok, true, opened.message);
 
-  const wrongModelJoin = await execute(
+  const wrongEnclaveJoin = await execute(
     contract,
     storage,
     'joinRoom',
@@ -386,7 +514,7 @@ test('MayhemContract rejects non-canonical and wrong-model room offers', async (
       enclave_id: otherEnclaveId,
     },
     provider.publicKey,
-    8
+    11
   );
-  assert.match(wrongModelJoin.message, /model does not match/i);
+  assert.match(wrongEnclaveJoin.message, /room enclave does not match/i);
 });

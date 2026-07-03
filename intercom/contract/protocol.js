@@ -271,8 +271,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "leave_enclave", "enclave_id": "<id>" }\' --sim 1 | provider stops serving an enclave.');
     console.log('- /tx --command \'{ "op": "join_room", "room_id": "<room_id>", "enclave_id": "<id>" }\' --sim 1 | provider joins a canonical admin room with a served enclave.');
     console.log('- /tx --command \'{ "op": "leave_room", "room_id": "<room_id>", "enclave_id": "<id>" }\' --sim 1 | provider leaves a canonical room.');
-    console.log('- /tx --command \'{ "op": "open_room", "model_id": "<model>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | admin opens a canonical model room.');
-    console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | admin closes a canonical model room.');
+    console.log('- /tx --command \'{ "op": "open_room", "enclave_id": "<id>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | admin opens a canonical room for one admin enclave.');
+    console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | admin closes a canonical room.');
     console.log('- /tx --command \'{ "op": "set_price", "enclave_id": "<id>", "in_per_1k_mu": 18, "out_per_1k_mu": 55, "per_req_mu": 0, "min_session_mu": 100, "effective_at": 21600 }\' --sim 1 | admin sets an enclave price in mu_usd.');
     console.log('- /tx --command \'{ "op": "read_price", "enclave_id": "<id>", "at": 21600 }\' --sim 1 | reads the active enclave price at a timestamp.');
     console.log('- /tx --command \'{ "op": "record_rep_event", "provider": "<pubkey>", "event_id": "<id>", "kind": "session_ok", "paid_mu": 1000, "epoch": 1, "at": 3600 }\' --sim 1 | admin/oracle records reputation evidence.');

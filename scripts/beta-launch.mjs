@@ -239,6 +239,9 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
           requireString(add, room.nonce, `${roomPrefix}.nonce`);
           requireLiteral(add, room.admin_created, true, `${roomPrefix}.admin_created`);
           if (typeof room.label === 'string') {
+            if (roomLabels.has(room.label)) {
+              add('error', `${roomPrefix}.label duplicates another canonical room label`);
+            }
             roomLabels.set(room.label, { enclave, room });
           }
         }
@@ -275,8 +278,15 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
           if (requireArray(add, join.rooms, `${joinPrefix}.rooms`, 1)) {
             for (const [roomIndex, roomRef] of join.rooms.entries()) {
               requireString(add, roomRef, `${joinPrefix}.rooms[${roomIndex}]`);
-              if (!isPlaceholder(roomRef) && !roomLabels.has(roomRef)) {
+              const canonicalRoom = roomLabels.get(roomRef);
+              if (!isPlaceholder(roomRef) && !canonicalRoom) {
                 add('error', `${joinPrefix}.rooms[${roomIndex}] is not an admin-created canonical room label`);
+              } else if (
+                canonicalRoom &&
+                !isPlaceholder(join.enclave_id) &&
+                canonicalRoom.enclave.enclave_id !== join.enclave_id
+              ) {
+                add('error', `${joinPrefix}.rooms[${roomIndex}] belongs to enclave ${canonicalRoom.enclave.enclave_id}, not ${join.enclave_id}`);
               }
             }
           }
@@ -378,6 +388,7 @@ function buildCommands(manifest) {
     for (const room of enclave.rooms || []) {
       adminTxs.push(txCommand({
         op: 'open_room',
+        enclave_id: enclave.enclave_id,
         model_id: enclave.model_id,
         nonce: room.nonce,
         label: room.label,

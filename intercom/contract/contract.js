@@ -298,7 +298,8 @@ class MayhemContract extends Contract {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
-        model_id: { type: 'string', min: 1, max: 256 },
+        enclave_id: { type: 'string', min: 1, max: 128, optional: true },
+        model_id: { type: 'string', min: 1, max: 256, optional: true },
         nonce: { type: 'string', min: 1, max: 128 },
         label: { type: 'string', min: 1, max: 64 },
         policy: { type: 'any' },
@@ -976,6 +977,9 @@ class MayhemContract extends Contract {
     if (!enclave || enclave.status !== 'active') return new Error('Enclave is not active.');
     const priceError = await this.requireCurrentAdminPrice(this.value.enclave_id);
     if (priceError) return priceError;
+    if (room.enclave_id && room.enclave_id !== this.value.enclave_id) {
+      return new Error('Room enclave does not match served enclave.');
+    }
     if (serving.model_id !== enclave.model_id || enclave.model_id !== room.model_id) {
       return new Error('Enclave model does not match room model.');
     }
@@ -1054,7 +1058,23 @@ class MayhemContract extends Contract {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
 
-    const roomId = await deriveRoomId(this.value.model_id, this.address, this.value.nonce);
+    let roomIdSource = this.value.enclave_id;
+    let recordModelId = this.value.model_id;
+    if (this.value.enclave_id) {
+      const enclave = await this.get(`enclave/${this.value.enclave_id}`);
+      if (!enclave) return new Error('Enclave not found.');
+      if (enclave.status !== 'active') return new Error('Enclave is not active.');
+      if (this.value.model_id && this.value.model_id !== enclave.model_id) {
+        return new Error('Room model does not match enclave model.');
+      }
+      recordModelId = enclave.model_id;
+    } else if (this.value.model_id) {
+      roomIdSource = this.value.model_id;
+    } else {
+      return new Error('Room enclave_id or model_id required.');
+    }
+
+    const roomId = await deriveRoomId(roomIdSource, this.address, this.value.nonce);
     const key = `room/${roomId}`;
     const existing = await this.get(key);
     if (existing && existing.status !== 'closed') return new Error('Room already open.');
@@ -1062,7 +1082,8 @@ class MayhemContract extends Contract {
     const record = {
       room_id: roomId,
       sidechannel: roomSidechannelName(roomId),
-      model_id: this.value.model_id,
+      ...(this.value.enclave_id ? { enclave_id: this.value.enclave_id } : {}),
+      model_id: recordModelId,
       label: this.value.label,
       creator: this.address,
       policy: cloneValue(this.value.policy),

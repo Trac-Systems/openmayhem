@@ -279,13 +279,14 @@ test('MayhemContract requires a current admin price before provider serving rows
   );
   assert.equal(pricedJoin.ok, true, pricedJoin.message);
 
-  const roomId = await deriveRoomId(enclaveRegistration.model_id, admin.publicKey, 'priced-room');
+  const roomId = await deriveRoomId(enclaveId, admin.publicKey, 'priced-room');
   const opened = await execute(
     contract,
     storage,
     'openRoom',
     {
       op: 'open_room',
+      enclave_id: enclaveId,
       model_id: enclaveRegistration.model_id,
       nonce: 'priced-room',
       label: 'priced-room',
@@ -438,7 +439,7 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
   const storage = new MemoryStorage({ admin: admin.publicKey });
   const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
   const contract = new MayhemContract(protocol, {});
-  const roomId = await deriveRoomId(enclaveRegistration.model_id, admin.publicKey, 'ban-room');
+  const roomId = await deriveRoomId(enclaveId, admin.publicKey, 'ban-room');
 
   for (const op of [
     {
@@ -497,6 +498,7 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
     'openRoom',
     {
       op: 'open_room',
+      enclave_id: enclaveId,
       model_id: enclaveRegistration.model_id,
       nonce: 'ban-room',
       label: 'ban-room',
