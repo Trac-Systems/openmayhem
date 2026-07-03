@@ -25,6 +25,7 @@ Run PowerShell installer checks in Docker:
     unchecked shadow binary elsewhere in the archive
   - reject an archive containing multiple SHA256SUMS files
   - reject a SHA256SUMS file containing duplicate relative paths
+  - reject unsafe dot or empty path segments in SHA256SUMS entries
 
 This is local P8.1 PowerShell installer evidence. It does not replace the
 formal Windows clean-VM install gate.
@@ -144,7 +145,9 @@ function New-InstallerArtifact {
         [string]$Root,
         [switch]$IncludeShadow,
         [switch]$IncludeSecondSums,
-        [switch]$IncludeDuplicatePath
+        [switch]$IncludeDuplicatePath,
+        [switch]$IncludeDotPath,
+        [switch]$IncludeEmptySegmentPath
     )
 
     $bins = @(
@@ -170,6 +173,14 @@ function New-InstallerArtifact {
     }
     if ($IncludeDuplicatePath) {
         $sums += $sums[0]
+    }
+    if ($IncludeDotPath) {
+        $mayhem = Join-Path $binDir "mayhem.exe"
+        $sums[0] = "$(New-ArchiveHash -Path $mayhem)  bin/./mayhem.exe"
+    }
+    if ($IncludeEmptySegmentPath) {
+        $mayhem = Join-Path $binDir "mayhem.exe"
+        $sums[0] = "$(New-ArchiveHash -Path $mayhem)  bin//mayhem.exe"
     }
     Set-Content -Path (Join-Path $package "SHA256SUMS") -Value $sums -Encoding ascii
 
@@ -313,6 +324,62 @@ try {
         throw "duplicate SHA256SUMS path rejection message was missing"
     }
     Write-Step "duplicate SHA256SUMS path rejected"
+
+    $dotRoot = Join-Path $tmp "dot-path"
+    New-Item -ItemType Directory -Path $dotRoot -Force | Out-Null
+    $dot = New-InstallerArtifact -Root $dotRoot -IncludeDotPath
+    Write-Step "created dot-path SHA256SUMS artifact"
+    $dotResult = Invoke-CheckedProcess -FileName "pwsh" -Arguments @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        "/work/install.ps1",
+        "-Artifact",
+        $dot.Archive,
+        "-Sha256",
+        $dot.Sha256,
+        "-InstallDir",
+        (Join-Path $tmp "dot-install/bin"),
+        "-SkipPear",
+        "-SkipOpencode",
+        "-NoPathUpdate"
+    )
+    Write-Host $dotResult.Text
+    if ($dotResult.ExitCode -eq 0) {
+        throw "install.ps1 unexpectedly accepted dot-segment SHA256SUMS path"
+    }
+    if (-not $dotResult.Text.Contains("unsafe SHA256SUMS path: bin/./mayhem.exe")) {
+        throw "dot-segment SHA256SUMS path rejection message was missing"
+    }
+    Write-Step "dot-segment SHA256SUMS path rejected"
+
+    $emptySegmentRoot = Join-Path $tmp "empty-segment-path"
+    New-Item -ItemType Directory -Path $emptySegmentRoot -Force | Out-Null
+    $emptySegment = New-InstallerArtifact -Root $emptySegmentRoot -IncludeEmptySegmentPath
+    Write-Step "created empty-segment SHA256SUMS artifact"
+    $emptySegmentResult = Invoke-CheckedProcess -FileName "pwsh" -Arguments @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        "/work/install.ps1",
+        "-Artifact",
+        $emptySegment.Archive,
+        "-Sha256",
+        $emptySegment.Sha256,
+        "-InstallDir",
+        (Join-Path $tmp "empty-segment-install/bin"),
+        "-SkipPear",
+        "-SkipOpencode",
+        "-NoPathUpdate"
+    )
+    Write-Host $emptySegmentResult.Text
+    if ($emptySegmentResult.ExitCode -eq 0) {
+        throw "install.ps1 unexpectedly accepted empty-segment SHA256SUMS path"
+    }
+    if (-not $emptySegmentResult.Text.Contains("unsafe SHA256SUMS path: bin//mayhem.exe")) {
+        throw "empty-segment SHA256SUMS path rejection message was missing"
+    }
+    Write-Step "empty-segment SHA256SUMS path rejected"
 } finally {
     Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

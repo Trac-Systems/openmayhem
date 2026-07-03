@@ -327,19 +327,22 @@ function Verify-ExtractedChecksums {
 
         $expected = $match.Groups[1].Value.ToLowerInvariant()
         $relativePath = $match.Groups[2].Value.Trim()
-        $normalizedRelativePath = $relativePath -replace "\\", "/"
         if ([string]::IsNullOrWhiteSpace($relativePath)) {
             Fail "invalid SHA256SUMS entry with empty path"
+        }
+        if ($relativePath -match "^[A-Za-z]:[\\/]") {
+            Fail "unsafe SHA256SUMS path: $relativePath"
         }
         if ([System.IO.Path]::IsPathRooted($relativePath)) {
             Fail "unsafe SHA256SUMS path: $relativePath"
         }
         $parts = $relativePath -split "[\\/]"
-        if ($parts -contains "..") {
+        if ($parts -contains ".." -or $parts -contains "." -or $parts -contains "") {
             Fail "unsafe SHA256SUMS path: $relativePath"
         }
+        $normalizedRelativePath = $parts -join "/"
 
-        $target = Join-Path $sums.DirectoryName $relativePath
+        $target = Join-Path $sums.DirectoryName ($parts -join [System.IO.Path]::DirectorySeparatorChar)
         if (-not (Test-Path -Path $target -PathType Leaf)) {
             Fail "SHA256SUMS references missing file: $relativePath"
         }

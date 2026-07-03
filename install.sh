@@ -359,7 +359,8 @@ extract_archive() {
 
 verify_extracted_checksums() {
   local extract_dir="$1"
-  local sums_file sums_count sums_dir line expected rel target actual verified
+  local sums_file sums_count sums_dir line expected rel target actual verified part
+  local -a path_parts
 
   sums_file="$(find "$extract_dir" -type f -name SHA256SUMS | sort | head -n 1 || true)"
   [[ -n "$sums_file" ]] || die "artifact is missing SHA256SUMS"
@@ -377,9 +378,14 @@ verify_extracted_checksums() {
 
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "invalid SHA256SUMS entry: $line"
     [[ -n "$rel" ]] || die "invalid SHA256SUMS entry with empty path"
+    [[ "$rel" != *"\\"* ]] || die "unsafe SHA256SUMS path: $rel"
     case "$rel" in
       /* | .. | ../* | */.. | */../*) die "unsafe SHA256SUMS path: $rel" ;;
     esac
+    IFS='/' read -r -a path_parts <<< "$rel"
+    for part in "${path_parts[@]}"; do
+      [[ -n "$part" && "$part" != "." ]] || die "unsafe SHA256SUMS path: $rel"
+    done
 
     target="$sums_dir/$rel"
     [[ -f "$target" ]] || die "SHA256SUMS references missing file: $rel"
