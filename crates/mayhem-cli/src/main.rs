@@ -1601,7 +1601,7 @@ struct SignOutput {
     signature: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct RulesRef {
     ver: u64,
     hash: String,
@@ -5439,8 +5439,10 @@ struct ContractCatalog {
     enclaves: Vec<LedgerEnclave>,
     rooms: Vec<LedgerRoom>,
     roomserve: Vec<LedgerRoomServe>,
+    serves: Vec<LedgerServe>,
     providers: Vec<LedgerProvider>,
     prices: Vec<LedgerPriceSchedule>,
+    rules: Option<RulesRef>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5566,6 +5568,12 @@ struct ProviderSessionContext<'a> {
     rules: &'a RulesRef,
 }
 
+#[derive(Clone)]
+struct ProviderSessionRuntime<'a> {
+    rpc: &'a PeerRpcClient,
+    rooms: &'a [LedgerRoom],
+}
+
 #[derive(Clone, Debug)]
 struct ActiveProviderSession {
     user: String,
@@ -5577,6 +5585,7 @@ struct ProviderSessionTerms {
     provider: String,
     enclave_id: String,
     model_id: String,
+    room_ids: Vec<String>,
     price_ver: u64,
     rules_ver: u64,
     ctx: u64,
@@ -5946,6 +5955,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 attestation: &attestation,
                 attestation_head: &attestation.report_head,
                 rules: &rules,
+            },
+            ProviderSessionRuntime {
+                rpc: &rpc,
+                rooms: &rooms,
             },
             responder,
         )
@@ -6587,8 +6600,14 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         enclaves: read_prefix_values(rpc, "enclave/").await?,
         rooms: read_prefix_values(rpc, "room/").await?,
         roomserve: read_prefix_values(rpc, "roomserve/").await?,
+        serves: read_prefix_values(rpc, "serve/").await?,
         providers: read_prefix_values(rpc, "prov/").await?,
         prices,
+        rules: read_state_value(rpc, "rules/current")
+            .await?
+            .map(serde_json::from_value)
+            .transpose()
+            .context("parsing rules/current")?,
     })
 }
 
@@ -7498,6 +7517,7 @@ async fn send_provider_heartbeat_round(
 
 async fn serve_provider_sessions(
     ctx: ProviderSessionContext<'_>,
+    runtime: ProviderSessionRuntime<'_>,
     mut responder: Box<dyn ProviderSessionResponder>,
 ) -> Result<()> {
     let terms = provider_session_terms(&ctx)?;
@@ -7587,6 +7607,7 @@ async fn serve_provider_sessions(
                     &mut bridge,
                     &mut sessions,
                     &terms,
+                    &runtime,
                     ctx.attestation,
                     responder.as_mut(),
                     event,
@@ -7608,6 +7629,7 @@ async fn handle_provider_session_frame(
     bridge: &mut ScBridgeClient,
     sessions: &mut HashMap<String, ActiveProviderSession>,
     terms: &ProviderSessionTerms,
+    runtime: &ProviderSessionRuntime<'_>,
     attestation: &Tier1AttestationReport,
     responder: &mut dyn ProviderSessionResponder,
     event: Value,
@@ -7626,59 +7648,69 @@ async fn handle_provider_session_frame(
         .context("provider session frame missing remote peer")?
         .to_owned();
     match frame.get("t").and_then(Value::as_str) {
-        Some("s.open") => match provider_session_open_decision(&frame, terms) {
-            ProviderSessionDecision::Accept => {
-                sessions.insert(
-                    session_id.clone(),
-                    ActiveProviderSession {
-                        user: remote.clone(),
-                        session_id: session_id.clone(),
-                    },
-                );
-                bridge
-                    .session_send(
-                        &remote,
-                        &session_id,
-                        json!({
-                            "t": "s.accept",
-                            "v": 1,
-                            "session_id": session_id,
-                            "att_report": attestation.report,
-                            "engine": {
-                                "ctx": terms.ctx,
-                                "mode": "provider-session-server-v1",
-                            },
-                            "ts": unix_epoch_millis()?,
-                            "nonce": stable_value_hash(&json!({
-                                "session_id": frame.get("session_id"),
-                                "provider": terms.provider,
-                                "kind": "accept",
-                            })),
-                            "sig": attestation.report.sig_provider,
-                        }),
-                    )
-                    .await
-                    .context("sending s.accept")?;
+        Some("s.open") => {
+            let static_decision = provider_session_open_decision(&frame, terms);
+            let decision = match static_decision {
+                ProviderSessionDecision::Accept => {
+                    provider_session_current_state_decision(runtime.rpc, terms, runtime.rooms)
+                        .await?
+                }
+                reject => reject,
+            };
+            match decision {
+                ProviderSessionDecision::Accept => {
+                    sessions.insert(
+                        session_id.clone(),
+                        ActiveProviderSession {
+                            user: remote.clone(),
+                            session_id: session_id.clone(),
+                        },
+                    );
+                    bridge
+                        .session_send(
+                            &remote,
+                            &session_id,
+                            json!({
+                                "t": "s.accept",
+                                "v": 1,
+                                "session_id": session_id,
+                                "att_report": attestation.report,
+                                "engine": {
+                                    "ctx": terms.ctx,
+                                    "mode": "provider-session-server-v1",
+                                },
+                                "ts": unix_epoch_millis()?,
+                                "nonce": stable_value_hash(&json!({
+                                    "session_id": frame.get("session_id"),
+                                    "provider": terms.provider,
+                                    "kind": "accept",
+                                })),
+                                "sig": attestation.report.sig_provider,
+                            }),
+                        )
+                        .await
+                        .context("sending s.accept")?;
+                }
+                ProviderSessionDecision::Reject { code, reason } => {
+                    bridge
+                        .session_send(
+                            &remote,
+                            &session_id,
+                            json!({
+                                "t": "s.reject",
+                                "v": 1,
+                                "session_id": session_id,
+                                "code": code,
+                                "reason": reason,
+                                "retry_after_ms": 0,
+                                "alt_rooms": [],
+                            }),
+                        )
+                        .await
+                        .context("sending s.reject")?;
+                }
             }
-            ProviderSessionDecision::Reject { code, reason } => {
-                bridge
-                    .session_send(
-                        &remote,
-                        &session_id,
-                        json!({
-                            "t": "s.reject",
-                            "v": 1,
-                            "session_id": session_id,
-                            "code": code,
-                            "reason": reason,
-                            "retry_after_ms": 0,
-                            "alt_rooms": [],
-                        }),
-                    )
-                    .await
-                    .context("sending s.reject")?;
-            }
-        },
+        }
         Some("s.req") => {
             let Some(active) = sessions.get(&session_id).cloned() else {
                 send_provider_session_close(bridge, &remote, &session_id, "err:unknown_session")
@@ -7887,10 +7919,134 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         provider: ctx.wallet.public_key.clone(),
         enclave_id: ctx.selected.enclave.enclave_id.clone(),
         model_id: ctx.selected.enclave.model_id.clone(),
+        room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.model.caps.ctx_max,
     })
+}
+
+async fn provider_session_current_state_decision(
+    rpc: &PeerRpcClient,
+    terms: &ProviderSessionTerms,
+    startup_rooms: &[LedgerRoom],
+) -> Result<ProviderSessionDecision> {
+    let contract = read_contract_catalog(rpc).await?;
+    Ok(provider_session_contract_decision(
+        &contract,
+        terms,
+        startup_rooms,
+    ))
+}
+
+fn provider_session_contract_decision(
+    contract: &ContractCatalog,
+    terms: &ProviderSessionTerms,
+    startup_rooms: &[LedgerRoom],
+) -> ProviderSessionDecision {
+    let reject = |code, reason: String| ProviderSessionDecision::Reject { code, reason };
+    if contract.rules.as_ref().map(|rules| rules.ver) != Some(terms.rules_ver) {
+        return reject(
+            "CONSENT",
+            "current contract rules version no longer matches provider startup terms".to_owned(),
+        );
+    }
+    if contract
+        .providers
+        .iter()
+        .find(|provider| provider.provider == terms.provider)
+        .map(|provider| provider.status.as_str())
+        != Some("active")
+    {
+        return reject(
+            "BANNED",
+            "provider is no longer active in contract state".to_owned(),
+        );
+    }
+    let Some(enclave) = contract
+        .enclaves
+        .iter()
+        .find(|enclave| enclave.enclave_id == terms.enclave_id)
+    else {
+        return reject(
+            "ENCLAVE",
+            "admin enclave is no longer present in contract state".to_owned(),
+        );
+    };
+    if enclave.status != "active" || enclave.model_id != terms.model_id {
+        return reject(
+            "ENCLAVE",
+            "admin enclave is no longer active for this model".to_owned(),
+        );
+    }
+    if !contract.serves.iter().any(|serve| {
+        serve.provider == terms.provider
+            && serve.enclave_id == terms.enclave_id
+            && serve.status == "active"
+    }) {
+        return reject(
+            "SERVE",
+            "provider is no longer actively serving this admin enclave".to_owned(),
+        );
+    }
+    let Some(schedule) = contract
+        .prices
+        .iter()
+        .find(|price| price.enclave_id == terms.enclave_id)
+    else {
+        return reject(
+            "PRICE_VER",
+            "admin price schedule is no longer present for this enclave".to_owned(),
+        );
+    };
+    let Some(current_price) = current_mu_usd_price(schedule) else {
+        return reject(
+            "PRICE_VER",
+            "admin price schedule is no longer current mu_usd".to_owned(),
+        );
+    };
+    if current_price.ver != terms.price_ver {
+        return reject(
+            "PRICE_VER",
+            "current admin price version changed after provider startup".to_owned(),
+        );
+    }
+
+    let startup_room_ids = terms.room_ids.iter().collect::<BTreeSet<_>>();
+    let startup_rooms_by_id = startup_rooms
+        .iter()
+        .map(|room| (room.room_id.as_str(), room))
+        .collect::<BTreeMap<_, _>>();
+    let live_rooms_by_id = contract
+        .rooms
+        .iter()
+        .map(|room| (room.room_id.as_str(), room))
+        .collect::<BTreeMap<_, _>>();
+    let has_active_roomserve = contract.roomserve.iter().any(|serving| {
+        if serving.provider != terms.provider
+            || serving.enclave_id != terms.enclave_id
+            || serving.status != "active"
+            || !startup_room_ids.contains(&serving.room_id)
+        {
+            return false;
+        }
+        let Some(startup_room) = startup_rooms_by_id.get(serving.room_id.as_str()) else {
+            return false;
+        };
+        let Some(live_room) = live_rooms_by_id.get(serving.room_id.as_str()) else {
+            return false;
+        };
+        live_room.status == "open"
+            && room_matches_enclave(live_room, enclave)
+            && room_matches_enclave(startup_room, enclave)
+    });
+    if !has_active_roomserve {
+        return reject(
+            "ROOM",
+            "provider is no longer active in any startup canonical room".to_owned(),
+        );
+    }
+    ProviderSessionDecision::Accept
 }
 
 fn provider_session_open_decision(
@@ -9798,6 +9954,69 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_open_rechecks_current_admin_contract_state() {
+        let terms = test_provider_session_terms();
+        let contract = test_contract(&"aa".repeat(32));
+        let startup_rooms = contract.rooms[..1].to_vec();
+
+        assert_eq!(
+            provider_session_contract_decision(&contract, &terms, &startup_rooms),
+            ProviderSessionDecision::Accept
+        );
+
+        let mut banned = contract.clone();
+        banned.providers[0].status = "banned".to_owned();
+        assert!(matches!(
+            provider_session_contract_decision(&banned, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject { code: "BANNED", .. }
+        ));
+
+        let mut retired = contract.clone();
+        retired.enclaves[0].status = "retired".to_owned();
+        assert!(matches!(
+            provider_session_contract_decision(&retired, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject {
+                code: "ENCLAVE",
+                ..
+            }
+        ));
+
+        let mut stale_rules = contract.clone();
+        stale_rules.rules.as_mut().unwrap().ver = terms.rules_ver + 1;
+        assert!(matches!(
+            provider_session_contract_decision(&stale_rules, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject {
+                code: "CONSENT",
+                ..
+            }
+        ));
+
+        let mut stale_price = contract.clone();
+        stale_price.prices[0].current.as_mut().unwrap().ver = terms.price_ver + 1;
+        assert!(matches!(
+            provider_session_contract_decision(&stale_price, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject {
+                code: "PRICE_VER",
+                ..
+            }
+        ));
+
+        let mut tombstoned_roomserve = contract.clone();
+        tombstoned_roomserve.roomserve[0].status = "inactive".to_owned();
+        assert!(matches!(
+            provider_session_contract_decision(&tombstoned_roomserve, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject { code: "ROOM", .. }
+        ));
+
+        let mut tombstoned_serve = contract.clone();
+        tombstoned_serve.serves[0].status = "inactive".to_owned();
+        assert!(matches!(
+            provider_session_contract_decision(&tombstoned_serve, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject { code: "SERVE", .. }
+        ));
+    }
+
+    #[test]
     fn provider_session_response_preserves_tool_call_shape() {
         let terms = test_provider_session_terms();
         let body = json!({
@@ -10674,7 +10893,8 @@ mod tests {
             provider: "55".repeat(32),
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
-            price_ver: 7,
+            room_ids: vec!["room-a".to_owned()],
+            price_ver: 1,
             rules_ver: 3,
             ctx: 8192,
         }
@@ -10866,6 +11086,13 @@ mod tests {
                 model_id: "test/model@4bit".to_owned(),
                 status: "active".to_owned(),
             }],
+            serves: vec![LedgerServe {
+                provider: "55".repeat(32),
+                enclave_id: "11".repeat(32),
+                model_id: "test/model@4bit".to_owned(),
+                status: "active".to_owned(),
+                rooms: vec!["room-a".to_owned()],
+            }],
             providers: vec![LedgerProvider {
                 provider: "55".repeat(32),
                 status: "active".to_owned(),
@@ -10885,6 +11112,10 @@ mod tests {
                 }),
                 pending: None,
             }],
+            rules: Some(RulesRef {
+                ver: 3,
+                hash: "99".repeat(32),
+            }),
         }
     }
 
