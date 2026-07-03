@@ -235,6 +235,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireLiteral(add, metrics.guardian.trips, 0, 'guardian.trips');
     requireBoolean(add, metrics.guardian.conservation_ok, true, 'guardian.conservation_ok');
     requireBoolean(add, metrics.guardian.monotonic_epochs, true, 'guardian.monotonic_epochs');
+    validateEvidenceArray(add, metrics.guardian.evidence, 'guardian.evidence');
   }
 
   if (requireObject(add, metrics.canary, 'canary')) {

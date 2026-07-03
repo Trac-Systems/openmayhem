@@ -69,7 +69,9 @@
     "trips": 0,
     "conservation_ok": true,
     "monotonic_epochs": true,
-    "notes": []
+    "evidence": [
+      "<guardian-report-file-hash-or-url>"
+    ]
   },
   "canary": {
     "set_id": "canary-launch-v1",

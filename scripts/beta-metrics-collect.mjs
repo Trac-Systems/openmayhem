@@ -24,7 +24,8 @@ Accepted evidence shapes are intentionally plain:
 - providers/users: array, { data: [] }, { providers: [] }, { users: [] }, or a count record
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
-- guardian/canary/browser: small summary JSON; browser handoffs may also be a text log`);
+- guardian: small summary JSON; the source file hash is recorded as evidence
+- canary/browser: small summary JSON; browser handoffs may also be a text log`);
 }
 
 function parseArgs(argv) {
@@ -311,7 +312,7 @@ function collectGuardian(args) {
     trips: Number.isInteger(trips) ? trips : (tripArray ? tripArray.length : 0),
     conservation_ok: firstDefined(value, ['guardian.conservation_ok', 'conservation_ok']) === true,
     monotonic_epochs: firstDefined(value, ['guardian.monotonic_epochs', 'monotonic_epochs']) === true,
-    notes: [source.evidence, ...asEvidenceArray(value, ['guardian.evidence', 'evidence'])],
+    evidence: [source.evidence, ...asEvidenceArray(value, ['guardian.evidence', 'evidence', 'guardian.notes', 'notes'])],
   };
 }
 
