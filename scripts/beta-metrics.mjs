@@ -178,6 +178,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'canonical_service.provider_join_records_verified',
     );
+    requireBoolean(
+      add,
+      metrics.canonical_service.admin_price_records_verified,
+      true,
+      'canonical_service.admin_price_records_verified',
+    );
     validateEvidenceArray(add, metrics.canonical_service.evidence, 'canonical_service.evidence');
   }
 

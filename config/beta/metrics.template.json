@@ -24,6 +24,7 @@
     "admin_created_enclaves_verified": true,
     "admin_created_rooms_verified": true,
     "provider_join_records_verified": true,
+    "admin_price_records_verified": true,
     "evidence": [
       "<contract-snapshot-or-canonical-service-audit-hash-or-url>"
     ]

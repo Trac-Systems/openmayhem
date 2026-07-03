@@ -364,6 +364,7 @@ function collectCanonicalService(args) {
     admin_created_enclaves_verified: firstDefined(record, ['admin_created_enclaves_verified']) === true,
     admin_created_rooms_verified: firstDefined(record, ['admin_created_rooms_verified']) === true,
     provider_join_records_verified: firstDefined(record, ['provider_join_records_verified']) === true,
+    admin_price_records_verified: firstDefined(record, ['admin_price_records_verified']) === true,
     evidence: [
       source.evidence,
       ...asEvidenceArray(value, ['canonical_service.evidence', 'evidence']),
