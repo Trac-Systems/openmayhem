@@ -28,7 +28,13 @@ test('MayhemContract consent gates ops and requires re-consent after rules bump'
   );
   assert.equal(setV1.ok, true);
   assert.deepEqual(await storage.get('rules/current'), {
-    value: { ver: 1, hash: hashV1, activated_at: makeTxKey(1) },
+    value: {
+      ver: 1,
+      hash: hashV1,
+      set_by: identity.publicKey,
+      set_by_role: 'admin',
+      activated_at: makeTxKey(1),
+    },
   });
 
   const beforeConsent = await execute(

@@ -628,6 +628,8 @@ class MayhemContract extends Contract {
     const rules = {
       ver: this.value.ver,
       hash: this.value.hash,
+      set_by: this.address,
+      set_by_role: 'admin',
       activated_at: this.tx,
     };
     await this.put(`rules/${rules.ver}`, rules);
@@ -660,6 +662,8 @@ class MayhemContract extends Contract {
       values: cloneValue(this.value.values),
       submitted_at: this.value.submitted_at,
       effective_at: this.value.effective_at,
+      set_by: this.address,
+      set_by_role: 'admin',
       tx: this.tx,
     };
 
@@ -678,6 +682,8 @@ class MayhemContract extends Contract {
           ver,
           submitted_at: this.value.submitted_at,
           effective_at: this.value.effective_at,
+          set_by: this.address,
+          set_by_role: 'admin',
           set_at: this.tx,
         },
       };
@@ -688,6 +694,8 @@ class MayhemContract extends Contract {
     await this.put('params/current', {
       ver,
       keys,
+      set_by: this.address,
+      set_by_role: 'admin',
       updated_at: this.tx,
       effective_at: this.value.effective_at,
     });

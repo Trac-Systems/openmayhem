@@ -133,7 +133,20 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       },
       submitted_at: 0,
       effective_at: DAY_SECONDS,
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
       tx: makeTxKey(5),
+    },
+  });
+
+  assert.deepEqual(await storage.get('params/current'), {
+    value: {
+      ver: 1,
+      keys: ['fee_bps', 'price_max_bps'],
+      set_by: admin.publicKey,
+      set_by_role: 'admin',
+      updated_at: makeTxKey(5),
+      effective_at: DAY_SECONDS,
     },
   });
 
@@ -152,6 +165,8 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
         ver: 1,
         submitted_at: 0,
         effective_at: DAY_SECONDS,
+        set_by: admin.publicKey,
+        set_by_role: 'admin',
         set_at: makeTxKey(5),
       },
     },
