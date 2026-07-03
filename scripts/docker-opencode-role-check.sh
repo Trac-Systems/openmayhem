@@ -205,6 +205,7 @@ EOF
       grep -F "\"expected_epoch_evidence_key\": \"ev/use/" "/tmp/mayhem-$role-test.json" >/dev/null
       test -s "$config_home/opencode/opencode.json"
       grep -F "\"mayhem\"" "$config_home/opencode/opencode.json" >/dev/null
+      grep -F "\"model\": \"mayhem/" "$config_home/opencode/opencode.json" >/dev/null
     }
 
     run_role provider

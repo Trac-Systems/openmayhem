@@ -3205,6 +3205,7 @@ struct OpencodeMergeReport {
     models_written: usize,
     created: bool,
     enabled_provider_added: bool,
+    default_model_added: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3929,6 +3930,10 @@ fn merge_mayhem_opencode_config(
         existing_models
     };
     let models_written = model_map.len();
+    let default_model = model_map
+        .keys()
+        .next()
+        .map(|model_id| opencode_model_ref(model_id));
     provider.insert(
         OPENCODE_PROVIDER_ID.to_owned(),
         json!({
@@ -3945,6 +3950,16 @@ fn merge_mayhem_opencode_config(
         }),
     );
 
+    let default_model_added = if !object.contains_key("model") {
+        if let Some(default_model) = default_model {
+            object.insert("model".to_owned(), Value::String(default_model));
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     let enabled_provider_added = ensure_enabled_provider(object, OPENCODE_PROVIDER_ID);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -3958,6 +3973,7 @@ fn merge_mayhem_opencode_config(
         models_written,
         created,
         enabled_provider_added,
+        default_model_added,
     })
 }
 
@@ -4057,7 +4073,7 @@ async fn run_opencode_smoke(
     timeout: Duration,
 ) -> Result<OpencodeRunReport> {
     let work_dir = temp_work_dir("mayhem-opencode-test")?;
-    let model = format!("{OPENCODE_PROVIDER_ID}/{model_id}");
+    let model = opencode_model_ref(model_id);
     let mut command = Command::new(opencode_bin);
     command
         .arg("run")
@@ -4104,6 +4120,10 @@ async fn run_opencode_smoke(
         work_dir,
         stdout_lines: parsed.stdout_lines,
     })
+}
+
+fn opencode_model_ref(model_id: &str) -> String {
+    format!("{OPENCODE_PROVIDER_ID}/{model_id}")
 }
 
 #[derive(Debug)]
@@ -11577,6 +11597,7 @@ mod tests {
 
         assert!(!report.created);
         assert_eq!(report.models_written, 1);
+        assert!(!report.default_model_added);
         assert_eq!(merged["model"], "other/model");
         assert!(merged["provider"]["other"].is_object());
         assert_eq!(
@@ -11595,6 +11616,36 @@ mod tests {
                 .filter(|value| value.as_str() == Some("mayhem"))
                 .count(),
             1
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn opencode_merge_sets_default_model_only_when_absent() {
+        let path = env::temp_dir().join(format!(
+            "mayhem-opencode-new-{}-{}.json",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        let models = vec![json!({
+            "id": "mayhem/default-model",
+            "mayhem": {
+                "caps": { "tools": true, "json": true, "ctx": 8192 }
+            }
+        })];
+
+        let report =
+            merge_mayhem_opencode_config(&path, "http://127.0.0.1:11435", Some(&models), true)
+                .unwrap();
+        let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        assert!(report.created);
+        assert!(report.default_model_added);
+        assert_eq!(merged["model"], "mayhem/mayhem/default-model");
+        assert_eq!(
+            merged["provider"]["mayhem"]["models"]["mayhem/default-model"]["limit"]["context"],
+            8192
         );
 
         let _ = fs::remove_file(path);
