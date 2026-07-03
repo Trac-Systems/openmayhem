@@ -2687,6 +2687,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
             "url": checkout.url,
             "reference": checkout.reference,
         },
+        "copy_paste": checkout_copy_paste_value(&checkout.url),
         "opened": opened,
         "credit": {
             "credited": status.credited,
@@ -4658,6 +4659,12 @@ fn checkout_handoff_lines(rail: PayRail, amount_mu: u64, url: &str) -> [String; 
         ),
         format!("Copy/paste checkout URL: {url}"),
     ]
+}
+
+fn checkout_copy_paste_value(url: &str) -> Value {
+    json!({
+        "checkout_url": url,
+    })
 }
 
 fn emit_checkout_handoff(
@@ -10288,6 +10295,12 @@ mod tests {
         assert_eq!(
             lines[1],
             "Copy/paste checkout URL: https://checkout.stripe.com/c/pay/cs_test"
+        );
+        assert_eq!(
+            checkout_copy_paste_value("https://checkout.stripe.com/c/pay/cs_test"),
+            json!({
+                "checkout_url": "https://checkout.stripe.com/c/pay/cs_test",
+            })
         );
     }
 
