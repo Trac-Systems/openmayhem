@@ -289,6 +289,96 @@ test('MayhemContract payoutConfirm preserves legacy admin payout targets without
   assert.equal(paid.rail, 'tnk');
 });
 
+test('MayhemContract payoutConfirm fails closed without current admin key', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const user = await makeIdentity();
+  const storage = new MemoryStorage();
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: { op: 'register_provider' },
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'setProviderPayout',
+      value: {
+        op: 'set_provider_payout',
+        provider: provider.publicKey,
+        payout_addr: 'trac1providerpayouttarget',
+        payout_method: 'tnk',
+      },
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+    {
+      type: 'rateOracle',
+      value: {
+        op: 'rate_oracle',
+        tnk_usd_e6: 2_000_000,
+        source: 'coinbase-spot',
+        ts: 1_000,
+      },
+      sender: admin.publicKey,
+      txNo: 5,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+
+  await storage.put(`bal/${user.publicKey}`, {
+    user: user.publicKey,
+    denom: 'mu_usd',
+    mu: 5_000_000,
+    updated_epoch: 0,
+    updated_at: null,
+  });
+  const settled = await execute(
+    contract,
+    storage,
+    'epochApply',
+    epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
+    admin.publicKey,
+    6
+  );
+  assert.equal(settled.ok, true, settled.message);
+
+  const before = storage.snapshotBytes();
+  const rejected = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey),
+    admin.publicKey,
+    7
+  );
+  assert.match(rejected.message, /current admin key/i);
+  assert.equal(storage.snapshotBytes(), before);
+  assert.equal(await storage.get('ev/pay/169'), null);
+});
+
 test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async () => {
   for (const [rail, target, externalRef] of [
     ['stripe', 'acct_test_provider', 'tr_test_provider_payout'],

@@ -2707,11 +2707,11 @@ class MayhemContract extends Contract {
       return new Error('Provider payout target must be admin-set.');
     }
     const admin = await this.get('admin');
-    if (admin !== null && payout.set_by !== admin) {
-      return new Error('Provider payout target was not set by the current admin.');
+    if (admin === null) {
+      return new Error('Provider payout target requires a current admin key.');
     }
-    if (admin === null && payout.set_by !== this.address) {
-      return new Error('Provider payout target was not set by the confirming admin.');
+    if (payout.set_by !== admin) {
+      return new Error('Provider payout target was not set by the current admin.');
     }
     if (payout.set_by_role !== undefined && payout.set_by_role !== 'admin') {
       return new Error('Provider payout target must be admin-set.');
