@@ -30,6 +30,8 @@ BINS=(
 
 PATH_ENTRIES=()
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mayhem-install-root.XXXXXX")"
+VERIFIED_PACKAGE_ROOT=""
+VERIFIED_PACKAGE_FILES=""
 
 usage() {
   cat <<'USAGE'
@@ -357,13 +359,17 @@ extract_archive() {
 
 verify_extracted_checksums() {
   local extract_dir="$1"
-  local sums_file sums_dir line expected rel target actual verified
+  local sums_file sums_count sums_dir line expected rel target actual verified
 
   sums_file="$(find "$extract_dir" -type f -name SHA256SUMS | sort | head -n 1 || true)"
   [[ -n "$sums_file" ]] || die "artifact is missing SHA256SUMS"
+  sums_count="$(find "$extract_dir" -type f -name SHA256SUMS | wc -l | tr -d '[:space:]')"
+  [[ "$sums_count" == "1" ]] || die "artifact contains multiple SHA256SUMS files"
 
   sums_dir="$(dirname "$sums_file")"
   verified=0
+  VERIFIED_PACKAGE_ROOT="$sums_dir"
+  VERIFIED_PACKAGE_FILES=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -n "${line//[[:space:]]/}" ]] || continue
     expected="$(printf '%s\n' "$line" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
@@ -379,6 +385,7 @@ verify_extracted_checksums() {
     [[ -f "$target" ]] || die "SHA256SUMS references missing file: $rel"
     actual="$(sha256_file "$target" | tr '[:upper:]' '[:lower:]')"
     [[ "$actual" == "$expected" ]] || die "checksum mismatch for packaged file $rel: expected $expected, got $actual"
+    VERIFIED_PACKAGE_FILES+="$rel"$'\n'
     verified=$((verified + 1))
   done < "$sums_file"
 
@@ -386,14 +393,24 @@ verify_extracted_checksums() {
   log "verified $verified packaged file checksum(s)"
 }
 
+verified_package_file() {
+  local rel="$1"
+  grep -Fx -- "$rel" <<< "$VERIFIED_PACKAGE_FILES" >/dev/null
+}
+
 copy_artifact_bins() {
-  local extract_dir="$1"
-  local bin src
+  local package_root="$1"
+  local bin rel src
 
   mkdir -p "$INSTALL_DIR"
   for bin in "${BINS[@]}"; do
-    src="$(find "$extract_dir" -type f \( -path "*/bin/$bin" -o -name "$bin" \) | sort | head -n 1 || true)"
-    [[ -n "$src" ]] || die "artifact is missing binary: $bin"
+    rel="bin/$bin"
+    if ! verified_package_file "$rel"; then
+      rel="$bin"
+      verified_package_file "$rel" || die "SHA256SUMS does not verify binary: $bin"
+    fi
+    src="$package_root/$rel"
+    [[ -f "$src" ]] || die "artifact is missing verified binary: $rel"
     cp "$src" "$INSTALL_DIR/$bin"
     chmod 0755 "$INSTALL_DIR/$bin"
   done
@@ -410,7 +427,7 @@ install_from_artifact() {
   extract_dir="$(make_temp_dir)"
   extract_archive "$archive" "$extract_dir"
   verify_extracted_checksums "$extract_dir"
-  copy_artifact_bins "$extract_dir"
+  copy_artifact_bins "$VERIFIED_PACKAGE_ROOT"
 }
 
 install_from_source() {

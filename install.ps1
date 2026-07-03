@@ -275,37 +275,46 @@ function Expand-MayhemArchive {
 }
 
 function Copy-ArtifactBins {
-    param([string]$ExtractDir)
+    param(
+        [string]$PackageRoot,
+        [string[]]$VerifiedFiles
+    )
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
     foreach ($bin in $Bins) {
         $name = "$bin.exe"
-        $matches = @(Get-ChildItem -Path $ExtractDir -Recurse -File -Filter $name)
-        if ($matches.Count -eq 0) {
-            Fail "artifact is missing binary: $name"
+        $relativePath = "bin/$name"
+        if ($VerifiedFiles -notcontains $relativePath) {
+            $relativePath = $name
+            if ($VerifiedFiles -notcontains $relativePath) {
+                Fail "SHA256SUMS does not verify binary: $name"
+            }
         }
 
-        $preferred = $matches | Where-Object { $_.DirectoryName -match "[\\/]bin$" } | Select-Object -First 1
-        if (-not $preferred) {
-            $preferred = $matches | Select-Object -First 1
+        $source = Join-Path $PackageRoot $relativePath
+        if (-not (Test-Path -Path $source -PathType Leaf)) {
+            Fail "artifact is missing verified binary: $relativePath"
         }
 
-        Copy-Item -Path $preferred.FullName -Destination (Join-Path $InstallDir $name) -Force
+        Copy-Item -Path $source -Destination (Join-Path $InstallDir $name) -Force
     }
 }
 
 function Verify-ExtractedChecksums {
     param([string]$ExtractDir)
 
-    $sums = Get-ChildItem -Path $ExtractDir -Recurse -File -Filter "SHA256SUMS" |
-        Sort-Object FullName |
-        Select-Object -First 1
+    $allSums = @(Get-ChildItem -Path $ExtractDir -Recurse -File -Filter "SHA256SUMS" | Sort-Object FullName)
+    $sums = $allSums | Select-Object -First 1
     if (-not $sums) {
         Fail "artifact is missing SHA256SUMS"
     }
+    if ($allSums.Count -ne 1) {
+        Fail "artifact contains multiple SHA256SUMS files"
+    }
 
     $verified = 0
+    $verifiedFiles = @()
     foreach ($line in Get-Content -Path $sums.FullName) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
@@ -318,6 +327,7 @@ function Verify-ExtractedChecksums {
 
         $expected = $match.Groups[1].Value.ToLowerInvariant()
         $relativePath = $match.Groups[2].Value.Trim()
+        $normalizedRelativePath = $relativePath -replace "\\", "/"
         if ([string]::IsNullOrWhiteSpace($relativePath)) {
             Fail "invalid SHA256SUMS entry with empty path"
         }
@@ -337,6 +347,7 @@ function Verify-ExtractedChecksums {
         if ($actual -ne $expected) {
             Fail "checksum mismatch for packaged file $relativePath`: expected $expected, got $actual"
         }
+        $verifiedFiles += $normalizedRelativePath
         $verified += 1
     }
 
@@ -344,6 +355,10 @@ function Verify-ExtractedChecksums {
         Fail "SHA256SUMS contains no files"
     }
     Write-Log "verified $verified packaged file checksum(s)"
+    return [pscustomobject]@{
+        Root = $sums.DirectoryName
+        Files = $verifiedFiles
+    }
 }
 
 function Install-FromArtifact {
@@ -356,8 +371,8 @@ function Install-FromArtifact {
     Verify-Archive -ArchivePath $archive
     $extractDir = New-TempDir
     Expand-MayhemArchive -ArchivePath $archive -Destination $extractDir
-    Verify-ExtractedChecksums -ExtractDir $extractDir
-    Copy-ArtifactBins -ExtractDir $extractDir
+    $verifiedPackage = Verify-ExtractedChecksums -ExtractDir $extractDir
+    Copy-ArtifactBins -PackageRoot $verifiedPackage.Root -VerifiedFiles $verifiedPackage.Files
 }
 
 function Install-FromSource {
