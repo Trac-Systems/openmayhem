@@ -151,12 +151,16 @@ function validateEvidenceArray(add, value, name) {
   }
 }
 
+function hasEvidenceTag(value, tag) {
+  return typeof value === 'string' && value.split('#').includes(tag);
+}
+
 function validatePaymentRailEvidence(add, value) {
   validateEvidenceArray(add, value, 'payment_rails.evidence');
   if (!Array.isArray(value)) return;
   if (value.some((item) => isPlaceholder(item))) return;
   for (const rail of ['tnk', 'stripe', 'coinbase']) {
-    if (!value.some((item) => item.includes(`#rail:${rail}`) && item.includes('#credits_mu_usd'))) {
+    if (!value.some((item) => hasEvidenceTag(item, `rail:${rail}`) && hasEvidenceTag(item, 'credits_mu_usd'))) {
       add('error', `payment_rails.evidence must include mu_usd credit evidence for ${rail}`);
     }
   }
@@ -172,7 +176,7 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
   if (!Array.isArray(railsVerified)) return;
   for (const rail of ['stripe', 'coinbase']) {
     if (!railsVerified.includes(rail)) continue;
-    if (!value.some((sample) => /#copy_paste\.checkout_url:https?:\/\//i.test(sample) && sample.includes(`#rail:${rail}`))) {
+    if (!value.some((sample) => /#copy_paste\.checkout_url:https?:\/\//i.test(sample) && hasEvidenceTag(sample, `rail:${rail}`))) {
       add('error', `browser_handoffs.samples must include copy_paste.checkout_url evidence for ${rail}`);
     }
   }
