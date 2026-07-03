@@ -157,6 +157,8 @@ enum AuditorCommands {
 enum CatalogCommands {
     /// Verify catalog structure, maintainer signature, canary refs, and optional dev downloads.
     Verify(CatalogVerifyArgs),
+    /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
+    CalibrateCanary(CatalogCalibrateCanaryArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -792,6 +794,57 @@ struct CatalogVerifyArgs {
 }
 
 #[derive(Debug, Parser)]
+struct CatalogCalibrateCanaryArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Catalog model id to calibrate.
+    #[arg(long)]
+    model: String,
+
+    /// Artifact key in the model's artifacts map, e.g. gguf-q4_k_m or mlx-4bit.
+    #[arg(long)]
+    artifact: String,
+
+    /// Local artifact file or snapshot path. It must match the admin catalog artifact.
+    #[arg(long, value_name = "PATH")]
+    artifact_path: PathBuf,
+
+    /// Restrict calibration to one prompt id. Defaults to all prompts in the canary set.
+    #[arg(long)]
+    prompt_id: Option<String>,
+
+    /// Engine context size for the calibration run.
+    #[arg(long, default_value_t = 1024)]
+    ctx_size: u32,
+
+    /// Optional llama.cpp thread count.
+    #[arg(long)]
+    threads: Option<i32>,
+
+    /// Optional GPU layer count for llama.cpp calibration.
+    #[arg(long)]
+    gpu_layers: Option<u32>,
+
+    /// Seed for deterministic calibration requests.
+    #[arg(long, default_value_t = 0)]
+    seed: u32,
+
+    /// Include raw generated text in the report.
+    #[arg(long)]
+    include_output: bool,
+
+    /// Print a machine-readable calibration report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderStartArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -1031,6 +1084,7 @@ async fn main() -> Result<()> {
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
             CatalogCommands::Verify(args) => catalog_verify(args),
+            CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
         },
         Commands::Provider { command } => match *command {
             ProviderCommands::Start(args) => provider_start(args).await,
@@ -1371,6 +1425,200 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         bail!("catalog verification failed");
     }
     Ok(())
+}
+
+fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+    let artifact_path = absolutize(args.artifact_path.clone())?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let model = catalog_doc
+        .models
+        .iter()
+        .find(|model| model.model_id == args.model)
+        .with_context(|| {
+            format!(
+                "model {} not found in {}",
+                args.model,
+                catalog_path.display()
+            )
+        })?;
+    let artifact = model.artifacts.get(&args.artifact).with_context(|| {
+        format!(
+            "artifact {} not found for model {}; available: {}",
+            args.artifact,
+            model.model_id,
+            model
+                .artifacts
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let prompts = load_canary_prompts(
+        Some(&canaries_dir),
+        &model.canary.set_id,
+        args.prompt_id.as_deref(),
+    )?;
+    let mut backend = catalog_calibration_backend(artifact, &artifact_path, &args)?;
+    let mut reports = Vec::with_capacity(prompts.len());
+    for prompt in &prompts {
+        reports.push(calibrate_canary_prompt(
+            backend.as_mut(),
+            model,
+            prompt,
+            args.seed,
+            args.include_output,
+        )?);
+    }
+    let catalog_fingerprint = aggregate_canary_fingerprint(&reports);
+    let existing = model.canary.fingerprints.get(&args.artifact).cloned();
+    let matches_existing = existing
+        .as_ref()
+        .map(|existing| existing == &catalog_fingerprint);
+    let report = CatalogCanaryCalibrationReport {
+        model_id: model.model_id.clone(),
+        artifact: args.artifact,
+        engine: artifact.engine.clone(),
+        artifact_path,
+        canary_set: model.canary.set_id.clone(),
+        prompt_count: reports.len(),
+        catalog_fingerprint,
+        existing_catalog_fingerprint: existing,
+        matches_existing_catalog: matches_existing,
+        prompts: reports,
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Canary calibration complete.");
+        println!("Model: {}", report.model_id);
+        println!("Artifact: {} ({})", report.artifact, report.engine);
+        println!("Canary set: {}", report.canary_set);
+        println!("Prompts: {}", report.prompt_count);
+        println!("Catalog fingerprint: {}", report.catalog_fingerprint);
+        if let Some(existing) = &report.existing_catalog_fingerprint {
+            println!("Existing catalog fingerprint: {existing}");
+            println!(
+                "Matches existing catalog: {}",
+                report.matches_existing_catalog.unwrap_or(false)
+            );
+        }
+        println!("Per-prompt fingerprints:");
+        for prompt in &report.prompts {
+            println!(
+                "- {}: {} ({} tokens)",
+                prompt.prompt_id, prompt.fingerprint, prompt.token_count
+            );
+        }
+    }
+    Ok(())
+}
+
+fn catalog_calibration_backend(
+    artifact: &catalog::CatalogArtifact,
+    artifact_path: &Path,
+    args: &CatalogCalibrateCanaryArgs,
+) -> Result<Box<dyn EngineBackend>> {
+    let mut config = match artifact.engine.as_str() {
+        "llama.cpp" => LoadConfig::gguf(artifact_path),
+        "mlx" => LoadConfig::mlx_safetensors(artifact_path),
+        "trt-llm" => bail!(
+            "TensorRT-LLM canary calibration is gated on the P2b.2/P2b.3 backend and reference hardware"
+        ),
+        other => bail!("unsupported canary calibration engine {other}"),
+    };
+    config.ctx_size = args.ctx_size.max(1);
+    config.threads = args.threads;
+    config.gpu_layers = args.gpu_layers;
+    if let Some(sha256) = &artifact.source_sha256 {
+        config.artifact = config.artifact.with_sha256(sha256.clone());
+    }
+
+    match artifact.engine.as_str() {
+        "llama.cpp" => {
+            let mut backend =
+                mayhem_engine::LlamaCppBackend::new().context("initializing llama.cpp backend")?;
+            backend
+                .load(config)
+                .context("loading llama.cpp canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "mlx" => {
+            let mut backend =
+                mayhem_engine::MlxBackend::new().context("initializing MLX backend")?;
+            backend
+                .load(config)
+                .context("loading MLX canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        _ => unreachable!("unsupported engines returned above"),
+    }
+}
+
+fn calibrate_canary_prompt(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
+    seed: u32,
+    include_output: bool,
+) -> Result<CanaryCalibrationPromptReport> {
+    let body = canary_probe_request(&model.model_id, prompt);
+    let mut request = provider_engine_request_from_body(&body)?;
+    request.temperature = Some(prompt.temperature.unwrap_or(0.0) as f32);
+    request.seed = Some(seed);
+    let max_tokens = request.max_new_tokens;
+    let mut token_ids = Vec::new();
+    let output = backend
+        .generate(request, &mut |chunk: mayhem_engine::TokenChunk| {
+            token_ids.push(chunk.token_id);
+            Ok(())
+        })
+        .with_context(|| format!("generating canary prompt {}", prompt.id))?;
+    if token_ids.is_empty() {
+        bail!("canary prompt {} produced no tokens", prompt.id);
+    }
+    let fingerprint = canary_token_fingerprint(token_ids.iter().copied());
+    Ok(CanaryCalibrationPromptReport {
+        prompt_id: prompt.id.clone(),
+        max_tokens,
+        prompt_tokens: output.usage.prompt_tokens,
+        completion_tokens: output.usage.completion_tokens,
+        token_count: token_ids.len(),
+        fingerprint,
+        output_text: include_output.then_some(output.text),
+    })
+}
+
+fn canary_token_fingerprint(tokens: impl IntoIterator<Item = i32>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for token in tokens {
+        hasher.update(&token.to_be_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for prompt in prompts {
+        let prompt_id = prompt.prompt_id.as_bytes();
+        hasher.update(&(prompt_id.len() as u32).to_be_bytes());
+        hasher.update(prompt_id);
+        hasher.update(prompt.fingerprint.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
@@ -1812,6 +2060,31 @@ struct TextMatchEvaluation {
     pass: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CanaryCalibrationPromptReport {
+    prompt_id: String,
+    max_tokens: u32,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    token_count: usize,
+    fingerprint: String,
+    output_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryCalibrationReport {
+    model_id: String,
+    artifact: String,
+    engine: String,
+    artifact_path: PathBuf,
+    canary_set: String,
+    prompt_count: usize,
+    catalog_fingerprint: String,
+    existing_catalog_fingerprint: Option<String>,
+    matches_existing_catalog: Option<bool>,
+    prompts: Vec<CanaryCalibrationPromptReport>,
+}
+
 async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
     if args.timeout_seconds == 0 {
         bail!("--timeout-seconds must be positive");
@@ -2001,6 +2274,18 @@ fn load_canary_prompt(
     set_id: &str,
     prompt_id: Option<&str>,
 ) -> Result<CanaryPrompt> {
+    let prompts = load_canary_prompts(canaries_dir, set_id, prompt_id)?;
+    prompts
+        .into_iter()
+        .next()
+        .with_context(|| format!("canary set {set_id} has no prompts"))
+}
+
+fn load_canary_prompts(
+    canaries_dir: Option<&Path>,
+    set_id: &str,
+    prompt_id: Option<&str>,
+) -> Result<Vec<CanaryPrompt>> {
     let canaries_dir = canaries_dir
         .map(PathBuf::from)
         .map(Ok)
@@ -2011,21 +2296,24 @@ fn load_canary_prompt(
     if doc.set_id != set_id {
         bail!("canary file {} declares set {}", path.display(), doc.set_id);
     }
-    let prompt = if let Some(prompt_id) = prompt_id {
-        doc.prompts
+    let prompts = if let Some(prompt_id) = prompt_id {
+        vec![doc
+            .prompts
             .into_iter()
             .find(|prompt| prompt.id == prompt_id)
-            .with_context(|| format!("canary prompt {prompt_id} not found in {set_id}"))?
+            .with_context(|| format!("canary prompt {prompt_id} not found in {set_id}"))?]
     } else {
         doc.prompts
-            .into_iter()
-            .next()
-            .with_context(|| format!("canary set {set_id} has no prompts"))?
     };
-    if prompt.messages.is_empty() {
-        bail!("canary prompt {} has no messages", prompt.id);
+    if prompts.is_empty() {
+        bail!("canary set {set_id} has no prompts");
     }
-    Ok(prompt)
+    for prompt in &prompts {
+        if prompt.messages.is_empty() {
+            bail!("canary prompt {} has no messages", prompt.id);
+        }
+    }
+    Ok(prompts)
 }
 
 fn read_expected_canary_text(args: &AuditorCanaryArgs) -> Result<String> {
@@ -7855,6 +8143,42 @@ mod tests {
     }
 
     #[test]
+    fn canary_token_fingerprint_matches_catalog_format_vectors() {
+        assert_eq!(
+            canary_token_fingerprint([]),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_eq!(
+            canary_token_fingerprint([1, 2, 3]),
+            "04a03410338d287acb82ba338ec1aea060eac0650f256eddc814f743c731cf33"
+        );
+        assert_eq!(
+            canary_token_fingerprint([-1]),
+            "650e93bacca01942a5a787f2f3ec4ce560998eb7c250733601a880d7f0c11178"
+        );
+    }
+
+    #[test]
+    fn aggregate_canary_fingerprint_is_prompt_order_and_id_bound() {
+        let first = test_calibration_prompt("p1", "aa".repeat(32));
+        let second = test_calibration_prompt("p2", "bb".repeat(32));
+        let same_digest_different_id = test_calibration_prompt("p3", "aa".repeat(32));
+
+        assert_eq!(
+            aggregate_canary_fingerprint(&[first.clone(), second.clone()]),
+            aggregate_canary_fingerprint(&[first.clone(), second.clone()])
+        );
+        assert_ne!(
+            aggregate_canary_fingerprint(&[first.clone(), second.clone()]),
+            aggregate_canary_fingerprint(&[second, first.clone()])
+        );
+        assert_ne!(
+            aggregate_canary_fingerprint(&[first]),
+            aggregate_canary_fingerprint(&[same_digest_different_id])
+        );
+    }
+
+    #[test]
     fn stable_value_hash_is_object_key_order_independent() {
         let a = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
@@ -8065,6 +8389,21 @@ mod tests {
             disk_bench_mib: 1,
             fixture: Some(fixture),
         })
+    }
+
+    fn test_calibration_prompt(
+        prompt_id: &str,
+        fingerprint: String,
+    ) -> CanaryCalibrationPromptReport {
+        CanaryCalibrationPromptReport {
+            prompt_id: prompt_id.to_owned(),
+            max_tokens: 8,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            token_count: 1,
+            fingerprint,
+            output_text: None,
+        }
     }
 
     fn test_catalog(root: &str) -> catalog::CatalogDocument {
