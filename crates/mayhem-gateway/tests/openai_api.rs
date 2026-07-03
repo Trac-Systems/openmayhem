@@ -5,12 +5,15 @@ use axum::{
 };
 use mayhem_gateway::openai::{
     openai_router, ChatCompletionRequest, ChatOutput, GatewayModel, GatewayRouteCandidate,
-    GatewaySessionBackend, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
-    GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, Usage,
+    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
+    GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, Usage,
 };
 use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 use tower::ServiceExt;
 
 #[derive(Debug)]
@@ -35,6 +38,61 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                     content: Some(format!(
                         "direct session response from {} via {}",
                         model.id, invocation.session_id
+                    )),
+                    tool_call: None,
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RetryThenDirectSessionBackend {
+    retry_provider: String,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl GatewaySessionBackend for RetryThenDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-retry-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let provider = invocation
+                .provider_pubkey
+                .clone()
+                .unwrap_or_else(|| "<none>".to_owned());
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(provider.clone());
+            if provider == self.retry_provider {
+                return Err(GatewaySessionError::retryable(
+                    "simulated direct open timeout before spend",
+                ));
+            }
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = 3;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(format!(
+                        "direct retry response from {} via {}",
+                        model.id, provider
                     )),
                     tool_call: None,
                     finish_reason: "stop".to_owned(),
@@ -237,11 +295,48 @@ async fn chat_completion_can_use_direct_session_backend() {
     assert_eq!(body["backend"], "test-direct-session");
 }
 
+#[tokio::test]
+async fn chat_completion_retries_retryable_direct_session_route_before_metering() {
+    let first_provider = "55".repeat(32);
+    let second_provider = "66".repeat(32);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+        first_provider.clone(),
+        second_provider.clone(),
+    ])])
+    .with_session_backend(Arc::new(RetryThenDirectSessionBackend {
+        retry_provider: first_provider.clone(),
+        calls: calls.clone(),
+    }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Retry a direct session." }]
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mayhem"]["backend"], "test-retry-direct-session");
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("assistant content")
+        .contains(&second_provider));
+    assert_eq!(
+        calls.lock().expect("calls lock").clone(),
+        vec![first_provider, second_provider.clone()]
+    );
+    assert_eq!(state.receipts().len(), 1);
+    assert_eq!(state.receipts()[0].receipt.body.provider, second_provider);
+}
+
 fn routed_test_model() -> GatewayModel {
+    routed_test_model_with_providers(&["55".repeat(32)])
+}
+
+fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
     let mut tiers = BTreeMap::new();
     tiers.insert("T1".to_owned(), 1);
-    let identity = routed_test_identity();
-    let enclave_id = catalog_enclave_id(&identity);
     GatewayModel {
         id: "mayhem/routed-test".to_owned(),
         created: 1_782_950_400,
@@ -263,18 +358,27 @@ fn routed_test_model() -> GatewayModel {
                 vision: false,
             },
             source: "contract".to_owned(),
-            route_candidates: vec![GatewayRouteCandidate {
-                provider: "55".repeat(32),
-                enclave_id,
-                room_id: "room-a".to_owned(),
-                price_ver: 7,
-                att_tier: 1,
-                admin_pubkey: identity.admin_pubkey,
-                artifact_root: identity.artifact_root,
-                manifest_hash: identity.manifest_hash,
-                binary_hash: identity.binary_hash,
-            }],
+            route_candidates: providers
+                .iter()
+                .enumerate()
+                .map(|(idx, provider)| routed_test_candidate(provider, idx))
+                .collect(),
         },
+    }
+}
+
+fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
+    let identity = routed_test_identity();
+    GatewayRouteCandidate {
+        provider: provider.to_owned(),
+        enclave_id: catalog_enclave_id(&identity),
+        room_id: format!("room-{idx}"),
+        price_ver: 7,
+        att_tier: 1,
+        admin_pubkey: identity.admin_pubkey,
+        artifact_root: identity.artifact_root,
+        manifest_hash: identity.manifest_hash,
+        binary_hash: identity.binary_hash,
     }
 }
 

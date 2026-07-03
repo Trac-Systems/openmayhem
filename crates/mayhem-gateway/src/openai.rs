@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord};
+use crate::{
+    failover::DEFAULT_MAX_OPEN_ATTEMPTS, verify_tier1_attestation, AttestationVerificationRequest,
+    EnclaveContractRecord,
+};
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -239,6 +242,7 @@ pub struct GatewaySessionAttestation {
 #[derive(Clone, Debug)]
 pub struct GatewaySessionError {
     pub message: String,
+    pub retryable: bool,
 }
 
 #[derive(Debug)]
@@ -545,7 +549,20 @@ impl GatewaySessionError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            retryable: false,
         }
+    }
+
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn into_retryable(mut self) -> Self {
+        self.retryable = true;
+        self
     }
 }
 
@@ -640,7 +657,7 @@ impl ScBridgeGatewaySessionBackend {
             .session_open(provider, &invocation.session_id)
             .await
             .map_err(|err| {
-                GatewaySessionError::new(format!(
+                GatewaySessionError::retryable(format!(
                     "opening direct session {} to provider {} failed: {err}",
                     invocation.session_id, provider
                 ))
@@ -648,7 +665,7 @@ impl ScBridgeGatewaySessionBackend {
         if opened.get("direct").and_then(Value::as_bool) != Some(true)
             || opened.get("relayed").and_then(Value::as_bool) == Some(true)
         {
-            return Err(GatewaySessionError::new(format!(
+            return Err(GatewaySessionError::retryable(format!(
                 "session {} was not opened as a direct non-relayed channel",
                 invocation.session_id
             )));
@@ -674,7 +691,13 @@ impl ScBridgeGatewaySessionBackend {
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
         bridge
             .session_send(provider, &invocation.session_id, open_frame)
-            .await?;
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.open for session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
 
         let accept = next_session_frame(
             &mut bridge,
@@ -682,13 +705,14 @@ impl ScBridgeGatewaySessionBackend {
             self.config.open_timeout,
             &["s.accept", "s.reject"],
         )
-        .await?;
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
             let code = accept
                 .get("code")
                 .and_then(Value::as_str)
                 .unwrap_or("UNKNOWN");
-            return Err(GatewaySessionError::new(format!(
+            return Err(GatewaySessionError::retryable(format!(
                 "provider rejected session {} with {code}",
                 invocation.session_id
             )));
@@ -732,7 +756,8 @@ impl ScBridgeGatewaySessionBackend {
             request,
             &accept_info.enclave_pubkey,
         )
-        .await?;
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
         let receipt_ack = direct_session_receipt_ack(
             request,
             &collected.output,
@@ -753,7 +778,13 @@ impl ScBridgeGatewaySessionBackend {
                     "user_sig": receipt_ack.user_sig,
                 }),
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.receipt_ack for session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
         let _ = bridge
             .session_send(
                 provider,
@@ -1298,17 +1329,15 @@ async fn build_chat_completion(
 
     let id = make_id("chatcmpl");
     let created = now_secs();
-    let invocation = state.prepare_chat_invocation(&model, &request)?;
-    let GatewaySessionResult {
-        output,
-        backend,
-        direct_session,
-        provider_receipt,
-    } = state
-        .session_backend
-        .run_chat(&model, &request, &invocation)
-        .await
-        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+    let (
+        GatewaySessionResult {
+            output,
+            backend,
+            direct_session,
+            provider_receipt,
+        },
+        invocation,
+    ) = run_chat_with_route_retry(state, &model, &request).await?;
     let mayhem_meta = ResponseMayhemMeta {
         backend: &backend,
         direct_session,
@@ -1343,6 +1372,50 @@ async fn build_chat_completion(
             mayhem_meta,
         )))
     }
+}
+
+async fn run_chat_with_route_retry(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+) -> Result<(GatewaySessionResult, GatewaySessionInvocation), ApiError> {
+    let attempt_count = if model.mayhem.route_candidates.is_empty() {
+        1
+    } else {
+        model
+            .mayhem
+            .route_candidates
+            .len()
+            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
+    };
+    let mut last_retryable_error = None;
+
+    for attempt_index in 0..attempt_count {
+        let invocation = state.prepare_chat_invocation_for_route(
+            model,
+            request,
+            model.mayhem.route_candidates.get(attempt_index),
+        )?;
+        match state
+            .session_backend
+            .run_chat(model, request, &invocation)
+            .await
+        {
+            Ok(result) => return Ok((result, invocation)),
+            Err(err) if err.retryable => {
+                last_retryable_error = Some(err.message);
+            }
+            Err(err) => return Err(ApiError::bad_gateway(err.message, Some("model"))),
+        }
+    }
+
+    Err(ApiError::bad_gateway(
+        format!(
+            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+        ),
+        Some("model"),
+    ))
 }
 
 fn build_completion(
@@ -1388,13 +1461,13 @@ fn build_completion(
 }
 
 impl GatewayState {
-    fn prepare_chat_invocation(
+    fn prepare_chat_invocation_for_route(
         &self,
         model: &GatewayModel,
         request: &ChatCompletionRequest,
+        route: Option<&GatewayRouteCandidate>,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
-        let route = model.mayhem.route_candidates.first();
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
