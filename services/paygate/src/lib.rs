@@ -286,6 +286,7 @@ pub struct StripeCreateCheckoutSessionResponse {
     pub who: String,
     pub mu: u64,
     pub checkout_session: StripeCheckoutSessionSummary,
+    pub copy_paste: CheckoutCopyPaste,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -327,13 +328,19 @@ pub struct CoinbaseCreateChargeResponse {
     pub who: String,
     pub mu: u64,
     pub charge: CoinbaseChargeSummary,
+    pub copy_paste: CheckoutCopyPaste,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CheckoutCopyPaste {
+    pub checkout_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CoinbaseChargeSummary {
     pub id: String,
     pub code: Option<String>,
-    pub hosted_url: Option<String>,
+    pub hosted_url: String,
     pub amount: String,
     pub currency: String,
     pub expires_at: Option<String>,
@@ -1204,6 +1211,7 @@ async fn create_checkout_session(
     let session =
         stripe_create_checkout_session(&state.http, stripe, secret_key, &request, amount_cents)
             .await?;
+    let copy_paste = checkout_copy_paste(&session.url);
     Ok(StripeCreateCheckoutSessionResponse {
         ok: true,
         rail: "stripe",
@@ -1211,6 +1219,7 @@ async fn create_checkout_session(
         who: request.who,
         mu: request.mu,
         checkout_session: session,
+        copy_paste,
     })
 }
 
@@ -1365,6 +1374,7 @@ fn stripe_checkout_session_summary(value: Value) -> Result<StripeCheckoutSession
         .get("url")
         .and_then(Value::as_str)
         .ok_or_else(|| PaygateError::Stripe("Checkout Session response missing url".to_owned()))?;
+    validate_hosted_checkout_url("checkout_session.url", url, "checkout.stripe.com")?;
     Ok(StripeCheckoutSessionSummary {
         id: id.to_owned(),
         url: url.to_owned(),
@@ -1406,6 +1416,7 @@ async fn create_coinbase_charge_inner(
         .as_deref()
         .ok_or_else(|| PaygateError::InvalidConfig("coinbase.api_key missing".to_owned()))?;
     let charge = coinbase_create_charge(&state.http, coinbase, api_key, &request, &amount).await?;
+    let copy_paste = checkout_copy_paste(&charge.hosted_url);
     Ok(CoinbaseCreateChargeResponse {
         ok: true,
         rail: "coinbase",
@@ -1413,6 +1424,7 @@ async fn create_coinbase_charge_inner(
         who: request.who,
         mu: request.mu,
         charge,
+        copy_paste,
     })
 }
 
@@ -1470,12 +1482,14 @@ async fn coinbase_create_charge(
 fn coinbase_charge_summary(value: Value) -> Result<CoinbaseChargeSummary> {
     let charge = value.get("data").unwrap_or(&value);
     let id = coinbase_string_field(charge, "id")?;
+    let hosted_url = coinbase_string_field(charge, "hosted_url")?;
+    validate_hosted_checkout_url("charge.hosted_url", &hosted_url, "commerce.coinbase.com")?;
     let local = coinbase_local_price(charge)
         .ok_or_else(|| PaygateError::Coinbase("charge response missing local price".to_owned()))?;
     Ok(CoinbaseChargeSummary {
         id,
         code: coinbase_optional_string_field(charge, "code"),
-        hosted_url: coinbase_optional_string_field(charge, "hosted_url"),
+        hosted_url,
         amount: local.0,
         currency: local.1,
         expires_at: coinbase_optional_string_field(charge, "expires_at"),
@@ -2371,6 +2385,23 @@ fn validate_checkout_url(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_hosted_checkout_url(field: &str, value: &str, expected_host: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|_| PaygateError::InvalidRequest(format!("{field} is invalid")))?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some(expected_host) {
+        return Err(PaygateError::InvalidRequest(format!(
+            "{field} must be an HTTPS URL on {expected_host}"
+        )));
+    }
+    Ok(())
+}
+
+fn checkout_copy_paste(url: &str) -> CheckoutCopyPaste {
+    CheckoutCopyPaste {
+        checkout_url: url.to_owned(),
+    }
+}
+
 fn is_safe_key_part(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -2666,5 +2697,53 @@ mod tests {
         assert!(coinbase_mu_to_usd_amount(10_001).is_err());
         assert!(usd_decimal_to_mu("amount", "1.001").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn hosted_checkout_urls_are_exact_supported_https_hosts() {
+        let stripe = stripe_checkout_session_summary(json!({
+            "id": "cs_test",
+            "url": "https://checkout.stripe.com/c/pay/cs_test"
+        }))
+        .expect("hosted Stripe checkout URL accepted");
+        assert_eq!(stripe.url, "https://checkout.stripe.com/c/pay/cs_test");
+
+        assert!(stripe_checkout_session_summary(json!({
+            "id": "cs_test",
+            "url": "https://checkout.stripe.com.evil.example/c/pay/cs_test"
+        }))
+        .is_err());
+
+        let coinbase = coinbase_charge_summary(json!({
+            "data": {
+                "id": "charge_test",
+                "hosted_url": "https://commerce.coinbase.com/charges/CBTEST",
+                "pricing": {
+                    "local": {
+                        "amount": "2.50",
+                        "currency": "USD"
+                    }
+                }
+            }
+        }))
+        .expect("hosted Coinbase checkout URL accepted");
+        assert_eq!(
+            coinbase.hosted_url,
+            "https://commerce.coinbase.com/charges/CBTEST"
+        );
+
+        assert!(coinbase_charge_summary(json!({
+            "data": {
+                "id": "charge_test",
+                "hosted_url": "http://commerce.coinbase.com/charges/CBTEST",
+                "pricing": {
+                    "local": {
+                        "amount": "2.50",
+                        "currency": "USD"
+                    }
+                }
+            }
+        }))
+        .is_err());
     }
 }

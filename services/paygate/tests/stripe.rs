@@ -298,6 +298,10 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
         body["checkout_session"]["url"],
         "https://checkout.stripe.com/c/pay/cs_test_123"
     );
+    assert_eq!(
+        body["copy_paste"]["checkout_url"],
+        "https://checkout.stripe.com/c/pay/cs_test_123"
+    );
     assert_eq!(body["checkout_session"]["amount_total"], 250);
 
     let requests = capture.requests.lock().await;

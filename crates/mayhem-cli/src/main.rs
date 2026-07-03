@@ -4992,7 +4992,11 @@ fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayChe
                 .ok_or_else(|| anyhow::anyhow!("paygate response missing checkout_session"))?;
             Ok(PayCheckout {
                 id: required_json_string(session, "id")?,
-                url: required_hosted_checkout_url(session, "url")?,
+                url: {
+                    let url = required_hosted_checkout_url(session, "url", "checkout.stripe.com")?;
+                    validate_response_copy_paste_url(value, &url)?;
+                    url
+                },
                 reference: session
                     .get("payment_intent")
                     .and_then(Value::as_str)
@@ -5005,7 +5009,15 @@ fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayChe
                 .ok_or_else(|| anyhow::anyhow!("paygate response missing charge"))?;
             Ok(PayCheckout {
                 id: required_json_string(charge, "id")?,
-                url: required_hosted_checkout_url(charge, "hosted_url")?,
+                url: {
+                    let url = required_hosted_checkout_url(
+                        charge,
+                        "hosted_url",
+                        "commerce.coinbase.com",
+                    )?;
+                    validate_response_copy_paste_url(value, &url)?;
+                    url
+                },
                 reference: charge
                     .get("code")
                     .and_then(Value::as_str)
@@ -5024,14 +5036,27 @@ fn required_json_string(value: &Value, field: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("paygate response missing {field}"))
 }
 
-fn required_hosted_checkout_url(value: &Value, field: &str) -> Result<String> {
+fn required_hosted_checkout_url(value: &Value, field: &str, expected_host: &str) -> Result<String> {
     let url = required_json_string(value, field)?;
     let parsed = reqwest::Url::parse(&url)
         .with_context(|| format!("paygate response {field} is not a valid URL"))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(url),
-        scheme => bail!("paygate response {field} uses unsupported URL scheme {scheme:?}"),
+    if parsed.scheme() != "https" || parsed.host_str() != Some(expected_host) {
+        bail!("paygate response {field} must be an HTTPS URL on {expected_host}");
     }
+    Ok(url)
+}
+
+fn validate_response_copy_paste_url(value: &Value, url: &str) -> Result<()> {
+    if let Some(copy_paste_url) = value
+        .get("copy_paste")
+        .and_then(|copy_paste| copy_paste.get("checkout_url"))
+        .and_then(Value::as_str)
+    {
+        if copy_paste_url != url {
+            bail!("paygate response copy_paste.checkout_url does not match hosted checkout URL");
+        }
+    }
+    Ok(())
 }
 
 fn default_checkout_success_url(paygate_url: &str, rail: PayRail) -> String {
@@ -11291,6 +11316,9 @@ mod tests {
         let stripe = checkout_from_paygate_response(
             PayRail::Stripe,
             &json!({
+                "copy_paste": {
+                    "checkout_url": "https://checkout.stripe.com/c/pay/cs_test"
+                },
                 "checkout_session": {
                     "id": "cs_test",
                     "url": "https://checkout.stripe.com/c/pay/cs_test",
@@ -11305,6 +11333,9 @@ mod tests {
         let coinbase = checkout_from_paygate_response(
             PayRail::Coinbase,
             &json!({
+                "copy_paste": {
+                    "checkout_url": "https://commerce.coinbase.com/charges/CBTEST"
+                },
                 "charge": {
                     "id": "charge_test",
                     "code": "CBTEST",
@@ -11337,6 +11368,29 @@ mod tests {
                 "charge": {
                     "id": "charge_test",
                     "hosted_url": "file:///tmp/mayhem-checkout.html"
+                }
+            }),
+        )
+        .is_err());
+        assert!(checkout_from_paygate_response(
+            PayRail::Stripe,
+            &json!({
+                "checkout_session": {
+                    "id": "cs_test",
+                    "url": "https://checkout.stripe.com.evil.example/c/pay/cs_test"
+                }
+            }),
+        )
+        .is_err());
+        assert!(checkout_from_paygate_response(
+            PayRail::Coinbase,
+            &json!({
+                "copy_paste": {
+                    "checkout_url": "https://commerce.coinbase.com/charges/OTHER"
+                },
+                "charge": {
+                    "id": "charge_test",
+                    "hosted_url": "https://commerce.coinbase.com/charges/CBTEST"
                 }
             }),
         )

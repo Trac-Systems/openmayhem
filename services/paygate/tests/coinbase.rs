@@ -189,6 +189,14 @@ async fn coinbase_charge_route_posts_canonical_mu_metadata_to_commerce() {
     assert_eq!(body["rail"], "coinbase");
     assert_eq!(body["charge"]["id"], "coinbase-charge-id");
     assert_eq!(body["charge"]["code"], "CB123");
+    assert_eq!(
+        body["charge"]["hosted_url"],
+        "https://commerce.coinbase.com/charges/CB123"
+    );
+    assert_eq!(
+        body["copy_paste"]["checkout_url"],
+        "https://commerce.coinbase.com/charges/CB123"
+    );
     assert_eq!(body["charge"]["amount"], "2.50");
     assert_eq!(body["charge"]["currency"], "USD");
 
