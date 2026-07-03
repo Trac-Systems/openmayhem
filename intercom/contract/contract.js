@@ -91,6 +91,12 @@ const ENCLAVE_CAP_FIELDS = new Set([
   'ctx',
   'ctx_max',
 ]);
+const ROOM_POLICY_FIELDS = new Set([
+  'region_hint',
+  'canary_set',
+  'min_reputation',
+  'max_price_mult',
+]);
 
 export const consentMessage = (ver, hash) => `mayhem-consent${ver}${hash}`;
 export const receiptMessage = (body) => JSON.stringify({
@@ -1157,6 +1163,9 @@ class MayhemContract extends Contract {
   async openRoom() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+
+    const policyError = this.validateRoomPolicy(this.value.policy);
+    if (policyError) return policyError;
 
     let roomIdSource = this.value.enclave_id;
     let recordModelId = this.value.model_id;
@@ -2803,6 +2812,50 @@ class MayhemContract extends Contract {
     }
     if (hasCtx && hasCtxMax && caps.ctx !== caps.ctx_max) {
       return new Error('Enclave caps ctx and ctx_max must match when both are set.');
+    }
+    return null;
+  }
+
+  validateRoomPolicy(policy) {
+    if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+      return new Error('Room policy must be an object.');
+    }
+    const unknown = Object.keys(policy).filter((key) => !ROOM_POLICY_FIELDS.has(key)).sort();
+    if (unknown.length > 0) {
+      return new Error(`Unsupported room policy field: ${unknown.join(', ')}.`);
+    }
+    for (const key of ['region_hint', 'canary_set']) {
+      if (
+        hasOwn(policy, key) &&
+        (
+          typeof policy[key] !== 'string' ||
+          policy[key].length === 0 ||
+          policy[key].length > 128
+        )
+      ) {
+        return new Error(`Room policy ${key} must be a non-empty string.`);
+      }
+    }
+    if (
+      hasOwn(policy, 'min_reputation') &&
+      (
+        typeof policy.min_reputation !== 'number' ||
+        !Number.isFinite(policy.min_reputation) ||
+        policy.min_reputation < 0 ||
+        policy.min_reputation > 1
+      )
+    ) {
+      return new Error('Room policy min_reputation must be between 0 and 1.');
+    }
+    if (
+      hasOwn(policy, 'max_price_mult') &&
+      (
+        typeof policy.max_price_mult !== 'number' ||
+        !Number.isFinite(policy.max_price_mult) ||
+        policy.max_price_mult <= 0
+      )
+    ) {
+      return new Error('Room policy max_price_mult must be positive.');
     }
     return null;
   }

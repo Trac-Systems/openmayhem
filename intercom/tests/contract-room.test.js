@@ -301,6 +301,89 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
   assert.equal(servingAfterLeaveRoom.value.updated_at, makeTxKey(11));
 });
 
+test('MayhemContract validates admin room policy as canonical routing controls', async () => {
+  const { contract, storage, admin } = await setupRoomAdmin();
+  const registered = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    enclaveRegistration,
+    admin.publicKey,
+    1
+  );
+  assert.equal(registered.ok, true, registered.message);
+
+  const unsupported = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: enclaveId,
+      nonce: 'policy-side-terms',
+      label: 'bad-policy',
+      policy: {
+        region_hint: 'eu',
+        provider_fee_bps: 250,
+      },
+    },
+    admin.publicKey,
+    2
+  );
+  assert.match(unsupported.message, /unsupported room policy field: provider_fee_bps/i);
+  const rejectedRoomId = await deriveRoomId(enclaveId, admin.publicKey, 'policy-side-terms');
+  assert.equal(await storage.get(`room/${rejectedRoomId}`), null);
+
+  for (const [index, [policy, message]] of [
+    [{ min_reputation: 2 }, /min_reputation must be between 0 and 1/i],
+    [{ max_price_mult: 0 }, /max_price_mult must be positive/i],
+    [{ region_hint: '' }, /region_hint must be a non-empty string/i],
+    [{ canary_set: ['canary-dev-v1'] }, /canary_set must be a non-empty string/i],
+  ].entries()) {
+    const result = await execute(
+      contract,
+      storage,
+      'openRoom',
+      {
+        op: 'open_room',
+        enclave_id: enclaveId,
+        nonce: `policy-invalid-${Object.keys(policy)[0]}`,
+        label: 'invalid-policy',
+        policy,
+      },
+      admin.publicKey,
+      3 + index
+    );
+    assert.match(result.message, message);
+  }
+
+  const validPolicy = {
+    region_hint: 'eu',
+    canary_set: 'canary-dev-v1',
+    min_reputation: 0.5,
+    max_price_mult: 1.25,
+  };
+  const opened = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: enclaveId,
+      nonce: 'policy-good',
+      label: 'good-policy',
+      policy: validPolicy,
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(opened.ok, true, opened.message);
+
+  const roomId = await deriveRoomId(enclaveId, admin.publicKey, 'policy-good');
+  const room = await storage.get(`room/${roomId}`);
+  assert.deepEqual(room.value.policy, validPolicy);
+});
+
 test('MayhemContract keeps legacy admin model rooms joinable by matching enclave model', async () => {
   const provider = await makeIdentity();
   const { contract, storage, admin } = await setupRoomAdmin(provider);
