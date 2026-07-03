@@ -74,6 +74,13 @@ function catalogArtifactForEnclave(model, backend, artifactRoot) {
   return null;
 }
 
+async function deriveCatalogEnclaveId(adminPubkey, enclave) {
+  const digest = await blake3(Buffer.from(
+    `${adminPubkey}${enclave.model_id}${enclave.artifact_root}${enclave.manifest_hash}${enclave.binary_hash}`
+  ));
+  return Buffer.from(digest).toString('hex');
+}
+
 function isPlaceholder(value) {
   return typeof value === 'string' && (
     value.includes('<') ||
@@ -256,7 +263,7 @@ function validateCanaryEvidence(add, evidence, canaryPath) {
   }
 }
 
-function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
+async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   const { errors, warnings, add } = issueFactory({ allowPlaceholders });
   const catalogPath = path.join(repoRoot, 'catalog/models.json');
   const catalog = readJson(catalogPath);
@@ -427,7 +434,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
         'price_mu',
         'rooms',
       ]);
-      requireString(add, enclave.enclave_id, `${prefix}.enclave_id`);
+      requireString(add, enclave.enclave_id, `${prefix}.enclave_id`, hex64);
       if (typeof enclave.enclave_id === 'string') enclaveIds.add(enclave.enclave_id);
       requireString(add, enclave.model_id, `${prefix}.model_id`);
       if (enclave.model_id && !isPlaceholder(enclave.model_id) && !catalogModels.has(enclave.model_id)) {
@@ -449,6 +456,32 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
       }
       requireString(add, enclave.manifest_hash, `${prefix}.manifest_hash`, hex64);
       requireString(add, enclave.binary_hash, `${prefix}.binary_hash`, hex64);
+      if (
+        typeof manifest.admin?.peer_pubkey === 'string'
+        && typeof enclave.enclave_id === 'string'
+        && typeof enclave.model_id === 'string'
+        && typeof enclave.artifact_root === 'string'
+        && typeof enclave.manifest_hash === 'string'
+        && typeof enclave.binary_hash === 'string'
+        && ![
+          manifest.admin.peer_pubkey,
+          enclave.enclave_id,
+          enclave.model_id,
+          enclave.artifact_root,
+          enclave.manifest_hash,
+          enclave.binary_hash,
+        ].some(isPlaceholder)
+        && pubkey64.test(manifest.admin.peer_pubkey)
+        && hex64.test(enclave.enclave_id)
+        && hex64.test(enclave.artifact_root)
+        && hex64.test(enclave.manifest_hash)
+        && hex64.test(enclave.binary_hash)
+      ) {
+        const expectedEnclaveId = await deriveCatalogEnclaveId(manifest.admin.peer_pubkey, enclave);
+        if (enclave.enclave_id !== expectedEnclaveId) {
+          add('error', `${prefix}.enclave_id must equal derived catalog enclave id ${expectedEnclaveId}`);
+        }
+      }
       if (enclave.att_tier !== 1 && enclave.att_tier !== 2) {
         add('error', `${prefix}.att_tier must be 1 or 2`);
       }
@@ -801,7 +834,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const manifestPath = path.resolve(repoRoot, args.manifest);
   const manifest = readJson(manifestPath);
-  const report = validateLaunchManifest(manifest, {
+  const report = await validateLaunchManifest(manifest, {
     manifestPath,
     allowPlaceholders: args.allowPlaceholders,
   });

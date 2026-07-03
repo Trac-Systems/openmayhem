@@ -97,7 +97,7 @@
   },
   "canonical_enclaves": [
     {
-      "enclave_id": "llama-3-1-8b-instruct-gguf-q4km-v1",
+      "enclave_id": "<derived-catalog-enclave-id-64-hex>",
       "model_id": "meta/llama-3.1-8b-instruct@4bit",
       "backend": "llama.cpp",
       "artifact_root": "7144a17813133c78ba2831b7926ff04cfef830a3ca86834baed2e8abc70bac02",
@@ -145,7 +145,7 @@
       },
       "joins": [
         {
-          "enclave_id": "llama-3-1-8b-instruct-gguf-q4km-v1",
+          "enclave_id": "<derived-catalog-enclave-id-64-hex>",
           "rooms": [
             "launch-us-east"
           ]

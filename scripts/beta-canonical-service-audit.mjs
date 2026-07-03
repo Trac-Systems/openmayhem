@@ -428,6 +428,13 @@ function catalogArtifactForEnclave(catalogProof, enclave) {
   return null;
 }
 
+async function deriveCatalogEnclaveId(admin, enclave) {
+  const digest = await blake3(Buffer.from(
+    `${admin}${enclave.model_id}${enclave.artifact_root}${enclave.manifest_hash}${enclave.binary_hash}`
+  ));
+  return Buffer.from(digest).toString('hex');
+}
+
 function verifyAdminStampedRecord(record, key, admin, fail) {
   if (!isRecord(record)) {
     fail(`${key} admin-stamped record is missing`);
@@ -540,7 +547,7 @@ function verifyPriceSchedule(schedule, enclaveId, enclave, admin, fail) {
   return ok;
 }
 
-function auditCanonicalService({ records, sourceEvidence, adminOverride, catalogProof }) {
+async function auditCanonicalService({ records, sourceEvidence, adminOverride, catalogProof }) {
   const errors = [];
   const warnings = [];
   const fail = (message) => errors.push(message);
@@ -599,6 +606,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride, catalog
 
   for (const [enclaveId, enclave] of activeEnclaves.entries()) {
     if (enclave.enclave_id !== enclaveId) fail(`enclave/${enclaveId} value.enclave_id mismatch`);
+    if (!hex64.test(enclaveId)) fail(`enclave/${enclaveId} state key id must be 64 hex chars`);
     if (enclave.created_by !== admin) fail(`enclave/${enclaveId} was not created by admin ${admin}`);
     if (enclave.created_by_role !== 'admin') fail(`enclave/${enclaveId}.created_by_role must be admin`);
     verifyOptionalAdminMutation(
@@ -633,6 +641,21 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride, catalog
         && !catalogArtifactForEnclave(catalogProof, enclave)
       ) {
         fail(`enclave/${enclaveId}.backend/artifact_root is not present in the signed admin catalog for ${enclave.model_id}`);
+      }
+      if (
+        pubkey64.test(admin || '')
+        && typeof enclave.backend === 'string'
+        && typeof enclave.artifact_root === 'string'
+        && hex64.test(enclave.artifact_root)
+        && typeof enclave.manifest_hash === 'string'
+        && hex64.test(enclave.manifest_hash)
+        && typeof enclave.binary_hash === 'string'
+        && hex64.test(enclave.binary_hash)
+      ) {
+        const expectedEnclaveId = await deriveCatalogEnclaveId(admin, enclave);
+        if (enclaveId !== expectedEnclaveId) {
+          fail(`enclave/${enclaveId}.enclave_id must equal derived catalog enclave id ${expectedEnclaveId}`);
+        }
       }
     }
   }
@@ -835,7 +858,7 @@ async function main() {
     const args = parseArgs(process.argv.slice(2));
     const source = readJsonEvidence(args.snapshot);
     const records = buildRecordMap(source.value);
-    const report = auditCanonicalService({
+    const report = await auditCanonicalService({
       records,
       sourceEvidence: source.evidence,
       adminOverride: args.adminPubkey,
