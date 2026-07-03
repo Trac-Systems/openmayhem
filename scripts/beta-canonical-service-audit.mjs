@@ -13,6 +13,7 @@ const defaultCatalogSignature = 'catalog/signatures/models.json.sig';
 const defaultCatalogKeyDir = 'catalog/keys';
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const hex64 = /^[0-9a-fA-F]{64}$/;
+const roomIdHex = /^[0-9a-fA-F]{32}$/;
 const payoutMethods = new Set(['tnk', 'stripe', 'coinbase']);
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
@@ -661,6 +662,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
   }
 
   for (const [roomId, room] of openRooms.entries()) {
+    if (!roomIdHex.test(roomId)) fail(`room/${roomId} state key id must be 32 hex chars`);
     if (room.room_id !== roomId) fail(`room/${roomId} value.room_id mismatch`);
     if (room.creator !== admin) fail(`room/${roomId} was not created by admin ${admin}`);
     if (room.creator_role !== 'admin') fail(`room/${roomId}.creator_role must be admin`);
@@ -671,7 +673,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
     } else if (room.model_id !== enclave.model_id) {
       fail(`room/${roomId} model_id does not match enclave ${room.enclave_id}`);
     }
-    if (room.sidechannel && room.sidechannel !== `mx/room/${roomId}`) {
+    if (room.sidechannel !== `mx/room/${roomId}`) {
       fail(`room/${roomId} sidechannel does not match mx/room/${roomId}`);
     }
     const serveIndex = roomServeIndexEntries(room);
@@ -763,10 +765,6 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
         fail(`room/${roomId}.serves references missing or inactive ${key}`);
       }
     }
-  }
-
-  for (const entry of entriesByPrefix(records, 'roomserve/').filter((item) => item.value?.status === 'active')) {
-    if (!entry.value.sidechannel) warn(`${entry.key} has no sidechannel field`);
   }
 
   const ok = errors.length === 0;
