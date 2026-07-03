@@ -161,6 +161,15 @@ function validateEvidenceArray(add, value, name) {
   }
 }
 
+function validateReportFileEvidence(add, value, name) {
+  validateEvidenceArray(add, value, name);
+  if (!Array.isArray(value)) return;
+  if (value.some((item) => isPlaceholder(item))) return;
+  if (!value.some((item) => isFileEvidence(item))) {
+    add('error', `${name} must include file-hash-bound report evidence`);
+  }
+}
+
 function hasEvidenceTag(value, tag) {
   return typeof value === 'string' && value.split('#').includes(tag);
 }
@@ -498,14 +507,14 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireLiteral(add, metrics.guardian.trips, 0, 'guardian.trips');
     requireBoolean(add, metrics.guardian.conservation_ok, true, 'guardian.conservation_ok');
     requireBoolean(add, metrics.guardian.monotonic_epochs, true, 'guardian.monotonic_epochs');
-    validateEvidenceArray(add, metrics.guardian.evidence, 'guardian.evidence');
+    validateReportFileEvidence(add, metrics.guardian.evidence, 'guardian.evidence');
   }
 
   if (requireObject(add, metrics.canary, 'canary')) {
     requireLiteral(add, metrics.canary.set_id, 'canary-launch-v1', 'canary.set_id');
     requireIntegerAtLeast(add, metrics.canary.probes, 1, 'canary.probes');
     requireLiteral(add, metrics.canary.failures, 0, 'canary.failures');
-    validateEvidenceArray(add, metrics.canary.evidence, 'canary.evidence');
+    validateReportFileEvidence(add, metrics.canary.evidence, 'canary.evidence');
   }
 
   if (requireObject(add, metrics.browser_handoffs, 'browser_handoffs')) {
