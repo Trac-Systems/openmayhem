@@ -94,7 +94,7 @@
   "browser_handoffs": {
     "copy_paste_urls_printed": true,
     "samples": [
-      "<checkout-log-hash-or-url>"
+      "<checkout-log-hash-with-copy-paste-checkout-url>"
     ]
   },
   "tracker": {

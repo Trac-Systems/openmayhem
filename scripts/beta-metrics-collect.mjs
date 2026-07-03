@@ -160,6 +160,21 @@ function checkoutUrlFromPayReport(value) {
   return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : null;
 }
 
+function checkoutUrlsFromText(text) {
+  const urls = [];
+  const pattern = /Copy\/paste checkout URL:\s*(https?:\/\/\S+)/gi;
+  let match = pattern.exec(text);
+  while (match) {
+    urls.push(match[1].replace(/[),.;]+$/g, ''));
+    match = pattern.exec(text);
+  }
+  return urls;
+}
+
+function checkoutUrlEvidence(urls, sourceEvidence) {
+  return urls.map((url) => `${sourceEvidence}#copy_paste.checkout_url:${url}`);
+}
+
 function checkoutUrlEvidenceFromJson(value, sourceEvidence) {
   const records = Array.isArray(value)
     ? value
@@ -168,7 +183,7 @@ function checkoutUrlEvidenceFromJson(value, sourceEvidence) {
   for (const record of records) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
     const url = checkoutUrlFromPayReport(record);
-    if (url) samples.push(`${sourceEvidence}#copy_paste.checkout_url:${url}`);
+    if (url) samples.push(...checkoutUrlEvidence([url], sourceEvidence));
   }
   return samples;
 }
@@ -354,9 +369,10 @@ function collectBrowserHandoffs(args) {
       ],
     };
   }
+  const checkoutSamples = checkoutUrlEvidence(checkoutUrlsFromText(source.text), source.evidence);
   return {
-    copy_paste_urls_printed: /Copy\/paste checkout URL:/i.test(source.text),
-    samples: [source.evidence],
+    copy_paste_urls_printed: checkoutSamples.length > 0,
+    samples: [source.evidence, ...checkoutSamples],
   };
 }
 

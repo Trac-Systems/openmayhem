@@ -122,6 +122,15 @@ function validateEvidenceArray(add, value, name) {
   }
 }
 
+function validateCheckoutHandoffSamples(add, value) {
+  validateEvidenceArray(add, value, 'browser_handoffs.samples');
+  if (!Array.isArray(value)) return;
+  if (value.some((sample) => isPlaceholder(sample))) return;
+  if (!value.some((sample) => /#copy_paste\.checkout_url:https?:\/\//i.test(sample))) {
+    add('error', 'browser_handoffs.samples must include copy_paste.checkout_url evidence');
+  }
+}
+
 function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
   const { errors, warnings, add } = issueFactory({ allowPlaceholders });
 
@@ -256,7 +265,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
 
   if (requireObject(add, metrics.browser_handoffs, 'browser_handoffs')) {
     requireBoolean(add, metrics.browser_handoffs.copy_paste_urls_printed, true, 'browser_handoffs.copy_paste_urls_printed');
-    validateEvidenceArray(add, metrics.browser_handoffs.samples, 'browser_handoffs.samples');
+    validateCheckoutHandoffSamples(add, metrics.browser_handoffs.samples);
   }
 
   if (metrics.tracker?.metrics_recorded !== true) {
