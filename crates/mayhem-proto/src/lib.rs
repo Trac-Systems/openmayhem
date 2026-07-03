@@ -7,6 +7,7 @@ pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
+pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttestationSigner {
@@ -158,6 +159,12 @@ struct ReceiptSigningEnvelope<'a> {
     body: &'a ReceiptBody,
 }
 
+#[derive(Serialize)]
+struct SessionAcceptSigningEnvelope<'a> {
+    domain: &'static str,
+    body: &'a serde_json::Value,
+}
+
 impl AttestationReport {
     pub fn body(&self) -> AttestationBody {
         AttestationBody {
@@ -241,9 +248,42 @@ pub fn receipt_signing_bytes(body: &ReceiptBody) -> Result<Vec<u8>, serde_json::
     })
 }
 
+pub fn session_accept_signing_bytes(
+    frame: &serde_json::Value,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut unsigned = frame.clone();
+    if let Some(object) = unsigned.as_object_mut() {
+        object.remove("sig");
+    }
+    let stable_body = stable_json_value(&unsigned);
+    serde_json::to_vec(&SessionAcceptSigningEnvelope {
+        domain: SESSION_ACCEPT_SIGNING_DOMAIN,
+        body: &stable_body,
+    })
+}
+
+fn stable_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(stable_json_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut stable = serde_json::Map::new();
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                stable.insert(key.clone(), stable_json_value(value));
+            }
+            serde_json::Value::Object(stable)
+        }
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn exposes_crate_name() {
@@ -337,5 +377,44 @@ mod tests {
             receipt_signing_bytes(&receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
         );
+    }
+
+    #[test]
+    fn session_accept_signing_payload_is_stable_bound_and_sig_excluded() {
+        let mut frame = json!({
+            "t": "s.accept",
+            "v": 1,
+            "session_id": "aa".repeat(32),
+            "att_report": {
+                "provider_pubkey": "55".repeat(32),
+                "enclave_id": "11".repeat(32),
+                "sig_provider": "66".repeat(64)
+            },
+            "engine": { "mode": "provider-session-server-v1", "ctx": 8192 },
+            "ts": 123,
+            "nonce": "77".repeat(32)
+        });
+        let payload = session_accept_signing_bytes(&frame).unwrap();
+
+        frame["sig"] = json!("88".repeat(64));
+        assert_eq!(session_accept_signing_bytes(&frame).unwrap(), payload);
+
+        let reordered = json!({
+            "nonce": "77".repeat(32),
+            "ts": 123,
+            "engine": { "ctx": 8192, "mode": "provider-session-server-v1" },
+            "att_report": {
+                "sig_provider": "66".repeat(64),
+                "enclave_id": "11".repeat(32),
+                "provider_pubkey": "55".repeat(32)
+            },
+            "session_id": "aa".repeat(32),
+            "v": 1,
+            "t": "s.accept"
+        });
+        assert_eq!(session_accept_signing_bytes(&reordered).unwrap(), payload);
+
+        frame["session_id"] = json!("bb".repeat(32));
+        assert_ne!(session_accept_signing_bytes(&frame).unwrap(), payload);
     }
 }

@@ -22,8 +22,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    receipt_signing_bytes, spend_voucher_signing_bytes, CheckpointPolicy, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, SESSION_RECEIPT_SCHEMA_VERSION,
+    receipt_signing_bytes, session_accept_signing_bytes, spend_voucher_signing_bytes,
+    CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    SpendVoucherBody, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -749,38 +750,12 @@ fn verify_direct_session_accept_signature(
     let signature = Signature::from_bytes(&signature);
     verifying_key
         .verify(
-            direct_session_accept_signing_payload(frame).as_bytes(),
+            &session_accept_signing_bytes(frame).map_err(|err| {
+                GatewaySessionError::new(format!("provider accept signing payload failed: {err}"))
+            })?,
             &signature,
         )
         .map_err(|err| GatewaySessionError::new(format!("provider accept signature failed: {err}")))
-}
-
-fn direct_session_accept_signing_payload(frame: &Value) -> String {
-    let mut unsigned = frame.clone();
-    if let Some(object) = unsigned.as_object_mut() {
-        object.remove("sig");
-    }
-    stable_json_value(&json!({
-        "domain": "mayhem/session-accept/v1",
-        "body": unsigned,
-    }))
-    .to_string()
-}
-
-fn stable_json_value(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(stable_json_value).collect()),
-        Value::Object(map) => {
-            let mut stable = serde_json::Map::new();
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            for (key, value) in entries {
-                stable.insert(key.clone(), stable_json_value(value));
-            }
-            Value::Object(stable)
-        }
-        other => other.clone(),
-    }
 }
 
 fn decode_hex_array<const N: usize>(
@@ -1932,7 +1907,7 @@ mod tests {
         });
         let sig = sign_hex(
             &test_provider_seed(),
-            direct_session_accept_signing_payload(&frame).as_bytes(),
+            &session_accept_signing_bytes(&frame).unwrap(),
         );
         frame["sig"] = json!(sig);
         frame

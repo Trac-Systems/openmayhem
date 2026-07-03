@@ -40,7 +40,7 @@ use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
     VerdictStatus,
 };
-use mayhem_proto::CatalogEnclaveIdentity;
+use mayhem_proto::{session_accept_signing_bytes, CatalogEnclaveIdentity};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -7688,10 +7688,12 @@ async fn handle_provider_session_frame(
                             "ts": ts,
                         })),
                     });
-                    let accept_sig = sign_message(
+                    let accept_payload = session_accept_signing_bytes(&accept_frame)
+                        .context("building s.accept signing payload")?;
+                    let accept_sig = sign_hex(
                         runtime.keypair_path,
                         runtime.password,
-                        &provider_session_accept_signing_payload(&accept_frame),
+                        &hex_encode(&accept_payload),
                     )
                     .await
                     .context("signing s.accept")?;
@@ -8057,18 +8059,6 @@ fn provider_session_contract_decision(
         );
     }
     ProviderSessionDecision::Accept
-}
-
-fn provider_session_accept_signing_payload(frame: &Value) -> String {
-    let mut unsigned = frame.clone();
-    if let Some(object) = unsigned.as_object_mut() {
-        object.remove("sig");
-    }
-    stable_json_value(&json!({
-        "domain": "mayhem/session-accept/v1",
-        "body": unsigned,
-    }))
-    .to_string()
 }
 
 fn provider_session_open_decision(
@@ -8452,6 +8442,16 @@ fn rough_text_tokens(text: &str) -> u64 {
 
 fn is_hex_len(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn safe_path_component(value: &str) -> String {
@@ -10053,13 +10053,13 @@ mod tests {
             "ts": 123,
             "nonce": "77".repeat(32),
         });
-        let payload = provider_session_accept_signing_payload(&frame);
+        let payload = session_accept_signing_bytes(&frame).unwrap();
 
         frame["sig"] = json!("88".repeat(64));
-        assert_eq!(provider_session_accept_signing_payload(&frame), payload);
+        assert_eq!(session_accept_signing_bytes(&frame).unwrap(), payload);
 
         frame["session_id"] = json!("bb".repeat(32));
-        assert_ne!(provider_session_accept_signing_payload(&frame), payload);
+        assert_ne!(session_accept_signing_bytes(&frame).unwrap(), payload);
     }
 
     #[test]
