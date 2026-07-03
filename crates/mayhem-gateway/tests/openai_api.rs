@@ -110,6 +110,53 @@ impl GatewaySessionBackend for RetryThenDirectSessionBackend {
     }
 }
 
+#[derive(Debug)]
+struct HedgeInspectBackend {
+    invocations: Arc<Mutex<Vec<(String, bool, usize)>>>,
+}
+
+impl GatewaySessionBackend for HedgeInspectBackend {
+    fn name(&self) -> &str {
+        "test-hedge-inspect"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let provider = invocation
+                .provider_pubkey
+                .clone()
+                .unwrap_or_else(|| "<none>".to_owned());
+            self.invocations.lock().expect("invocations lock").push((
+                provider.clone(),
+                invocation.hedge.requested,
+                invocation.hedge.planned_probe_count,
+            ));
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = 2;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(format!("hedge inspected for {} via {}", model.id, provider)),
+                    tool_call: None,
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+            })
+        })
+    }
+}
+
 fn test_app() -> Router {
     openai_router(GatewayState::from_embedded_catalog())
 }
@@ -121,7 +168,18 @@ fn test_state_and_app() -> (GatewayState, Router) {
 }
 
 async fn json_request(app: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
-    let (status, headers, bytes) = raw_request(app, method, uri, Some(body)).await;
+    json_request_with_headers(app, method, uri, body, &[]).await
+}
+
+async fn json_request_with_headers(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    request_headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let (status, headers, bytes) =
+        raw_request_with_headers(app, method, uri, Some(body), request_headers).await;
     assert!(headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
@@ -137,7 +195,20 @@ async fn raw_request(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
+    raw_request_with_headers(app, method, uri, body, &[]).await
+}
+
+async fn raw_request_with_headers(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    request_headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in request_headers {
+        builder = builder.header(*name, *value);
+    }
     let body = if let Some(body) = body {
         builder = builder.header("content-type", "application/json");
         Body::from(body.to_string())
@@ -328,6 +399,80 @@ async fn chat_completion_retries_retryable_direct_session_route_before_metering(
     );
     assert_eq!(state.receipts().len(), 1);
     assert_eq!(state.receipts()[0].receipt.body.provider, second_provider);
+}
+
+#[tokio::test]
+async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
+    let first_provider = "55".repeat(32);
+    let second_provider = "66".repeat(32);
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+        first_provider.clone(),
+        second_provider,
+    ])])
+    .with_session_backend(Arc::new(HedgeInspectBackend {
+        invocations: invocations.clone(),
+    }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Hedge this direct session." }]
+    });
+
+    let (status, body) = json_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/chat/completions",
+        request,
+        &[("X-Mayhem-Hedge", "1")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mayhem"]["backend"], "test-hedge-inspect");
+    assert_eq!(body["mayhem"]["hedge"]["requested"], true);
+    assert_eq!(body["mayhem"]["hedge"]["planned_probe_count"], 2);
+    assert_eq!(
+        invocations.lock().expect("invocations lock").clone(),
+        vec![(first_provider.clone(), true, 2)]
+    );
+    assert_eq!(state.receipts().len(), 1);
+    assert_eq!(state.receipts()[0].receipt.body.provider, first_provider);
+}
+
+#[tokio::test]
+async fn invalid_x_mayhem_hedge_header_is_rejected_before_session_start() {
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+        "55".repeat(32),
+        "66".repeat(32),
+    ])])
+    .with_session_backend(Arc::new(HedgeInspectBackend {
+        invocations: invocations.clone(),
+    }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "This header should fail." }]
+    });
+
+    let (status, body) = json_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/chat/completions",
+        request,
+        &[("X-Mayhem-Hedge", "true")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "X-Mayhem-Hedge");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("must be 1"));
+    assert!(invocations.lock().expect("invocations lock").is_empty());
+    assert!(state.receipts().is_empty());
 }
 
 fn routed_test_model() -> GatewayModel {

@@ -9,12 +9,15 @@ use std::{
 };
 
 use crate::{
-    failover::DEFAULT_MAX_OPEN_ATTEMPTS, verify_tier1_attestation, AttestationVerificationRequest,
-    EnclaveContractRecord,
+    failover::{
+        x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState, SessionPriceMu,
+        DEFAULT_MAX_OPEN_ATTEMPTS,
+    },
+    verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, ProviderKey,
 };
 use axum::{
     extract::State,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -38,6 +41,7 @@ use tokio::net::TcpListener;
 type SharedState = Arc<GatewayState>;
 
 const EMBEDDED_CATALOG: &str = include_str!("../../../catalog/models.json");
+const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 
 #[derive(Clone, Debug)]
 pub struct GatewayState {
@@ -229,8 +233,15 @@ pub struct GatewaySessionInvocation {
     pub rules_ver: u64,
     pub spend_voucher: SpendVoucher,
     pub attestation: Option<GatewaySessionAttestation>,
+    pub hedge: GatewayHedgeInvocation,
     receipt_cosign_enabled: bool,
     receipt_user_seed: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GatewayHedgeInvocation {
+    pub requested: bool,
+    pub planned_probe_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -458,9 +469,14 @@ async fn list_models(State(state): State<SharedState>) -> Response {
 
 async fn create_chat_completion(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
-    match build_chat_completion(&state, request).await {
+    let options = match GatewayRequestOptions::from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    match build_chat_completion(&state, request, options).await {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
         Err(err) => err.into_response(),
@@ -518,6 +534,12 @@ enum ChatResponse {
 struct ResponseMayhemMeta<'a> {
     backend: &'a str,
     direct_session: bool,
+    hedge: GatewayHedgeInvocation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GatewayRequestOptions {
+    hedge_requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -564,6 +586,36 @@ impl GatewaySessionError {
         self.retryable = true;
         self
     }
+}
+
+impl GatewayRequestOptions {
+    fn from_headers(headers: &HeaderMap) -> Result<Self, ApiError> {
+        Ok(Self {
+            hedge_requested: parse_x_mayhem_hedge(headers)?,
+        })
+    }
+}
+
+fn parse_x_mayhem_hedge(headers: &HeaderMap) -> Result<bool, ApiError> {
+    let Some(value) = headers.get(X_MAYHEM_HEDGE_HEADER) else {
+        return Ok(false);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Hedge must be an ASCII header value of 0 or 1",
+            Some("X-Mayhem-Hedge"),
+        )
+    })?;
+    if x_mayhem_hedge_requested(Some(value)) {
+        return Ok(true);
+    }
+    if value.trim() == "0" {
+        return Ok(false);
+    }
+    Err(ApiError::bad_request(
+        "X-Mayhem-Hedge must be 1 to request hedging or 0 to disable it",
+        Some("X-Mayhem-Hedge"),
+    ))
 }
 
 impl From<BridgeError> for GatewaySessionError {
@@ -1301,6 +1353,7 @@ fn usage_from_session_delta(frame: &Value) -> Option<Usage> {
 async fn build_chat_completion(
     state: &GatewayState,
     request: ChatCompletionRequest,
+    options: GatewayRequestOptions,
 ) -> Result<ChatResponse, ApiError> {
     let model = require_model(state, &request.model)?;
     if request.messages.is_empty() {
@@ -1337,10 +1390,11 @@ async fn build_chat_completion(
             provider_receipt,
         },
         invocation,
-    ) = run_chat_with_route_retry(state, &model, &request).await?;
+    ) = run_chat_with_route_retry(state, &model, &request, options).await?;
     let mayhem_meta = ResponseMayhemMeta {
         backend: &backend,
         direct_session,
+        hedge: invocation.hedge,
     };
     let receipt = state.meter_chat_session(
         &model,
@@ -1378,6 +1432,7 @@ async fn run_chat_with_route_retry(
     state: &GatewayState,
     model: &GatewayModel,
     request: &ChatCompletionRequest,
+    options: GatewayRequestOptions,
 ) -> Result<(GatewaySessionResult, GatewaySessionInvocation), ApiError> {
     let attempt_count = if model.mayhem.route_candidates.is_empty() {
         1
@@ -1395,6 +1450,7 @@ async fn run_chat_with_route_retry(
             model,
             request,
             model.mayhem.route_candidates.get(attempt_index),
+            options,
         )?;
         match state
             .session_backend
@@ -1466,6 +1522,7 @@ impl GatewayState {
         model: &GatewayModel,
         request: &ChatCompletionRequest,
         route: Option<&GatewayRouteCandidate>,
+        options: GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
         let session_id = session_id_for(&model.id, &prompt_text);
@@ -1515,6 +1572,7 @@ impl GatewayState {
                 user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
             },
             attestation,
+            hedge: hedge_invocation_for_model(model, options),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -1707,6 +1765,41 @@ impl GatewayState {
     }
 }
 
+fn hedge_invocation_for_model(
+    model: &GatewayModel,
+    options: GatewayRequestOptions,
+) -> GatewayHedgeInvocation {
+    let candidates = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .map(|candidate| {
+            ProviderKey::new(
+                candidate.provider.clone(),
+                candidate.enclave_id.clone(),
+                candidate.room_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let failover_state = SessionFailoverState::new(
+        FailoverPolicy::default(),
+        SessionPriceMu {
+            in_per_1k_mu: model.mayhem.price_ref_mu.in_per_1k,
+            out_per_1k_mu: model.mayhem.price_ref_mu.out_per_1k,
+        },
+        0,
+        0,
+    );
+    let planned_probe_count = failover_state
+        .hedge_plan(&candidates, options.hedge_requested.then_some("1"), 0)
+        .map(|plan| plan.probes.len())
+        .unwrap_or(0);
+    GatewayHedgeInvocation {
+        requested: options.hedge_requested,
+        planned_probe_count,
+    }
+}
+
 fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> ChatOutput {
     let prompt_text = request
         .messages
@@ -1793,6 +1886,10 @@ fn chat_response_value(
         "mayhem": {
             "backend": mayhem_meta.backend,
             "direct_session": mayhem_meta.direct_session,
+            "hedge": {
+                "requested": mayhem_meta.hedge.requested,
+                "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
+            },
             "model": model.mayhem,
             "receipt": receipt_summary(receipt),
         },
@@ -1856,6 +1953,10 @@ fn chat_stream_chunks(
             "mayhem": {
                 "backend": mayhem_meta.backend,
                 "direct_session": mayhem_meta.direct_session,
+                "hedge": {
+                    "requested": mayhem_meta.hedge.requested,
+                    "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
+                },
                 "receipt": receipt_summary(receipt),
             },
         }));
@@ -2433,6 +2534,7 @@ mod tests {
                 contract,
                 trusted_binary_hashes: BTreeSet::from([identity.binary_hash]),
             }),
+            hedge: GatewayHedgeInvocation::default(),
             receipt_cosign_enabled: true,
             receipt_user_seed: test_user_seed(),
         }
