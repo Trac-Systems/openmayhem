@@ -383,7 +383,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'controls.admin_rules_params_verified',
     );
-    validateEvidenceArray(add, metrics.controls.evidence, 'controls.evidence');
+    validateFileBoundEvidence(add, metrics.controls.evidence, 'controls.evidence', 'admin-control-plane');
   }
 
   if (requireObject(add, metrics.canonical_service, 'canonical_service')) {
@@ -463,7 +463,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
         true,
         'participants.external_providers.identity_records_verified',
       );
-      validateEvidenceArray(add, metrics.participants.external_providers.evidence, 'participants.external_providers.evidence');
+      validateFileBoundEvidence(
+        add,
+        metrics.participants.external_providers.evidence,
+        'participants.external_providers.evidence',
+        'provider identity records',
+      );
     }
     if (requireObject(add, metrics.participants.users, 'participants.users')) {
       counts.users = metrics.participants.users.count;
@@ -474,7 +479,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
         true,
         'participants.users.identity_records_verified',
       );
-      validateEvidenceArray(add, metrics.participants.users.evidence, 'participants.users.evidence');
+      validateFileBoundEvidence(
+        add,
+        metrics.participants.users.evidence,
+        'participants.users.evidence',
+        'user activity records',
+      );
     }
   }
 

@@ -54,7 +54,7 @@
     "provider_payout_targets_admin_verified": true,
     "admin_rules_params_verified": true,
     "evidence": [
-      "<audit:admin-control-plane:v1#sha256:64-hex>"
+      "<file:admin-control-plane.json#sha256:64-hex>"
     ]
   },
   "canonical_service": {
