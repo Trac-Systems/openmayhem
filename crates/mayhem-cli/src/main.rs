@@ -839,6 +839,10 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long)]
     include_output: bool,
 
+    /// Exit nonzero when the calibrated fingerprint is absent or differs from the catalog.
+    #[arg(long)]
+    require_match: bool,
+
     /// Print a machine-readable calibration report.
     #[arg(long)]
     json: bool,
@@ -1524,7 +1528,31 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             );
         }
     }
+    if args.require_match {
+        ensure_calibration_matches_catalog(&report)?;
+    }
     Ok(())
+}
+
+fn ensure_calibration_matches_catalog(report: &CatalogCanaryCalibrationReport) -> Result<()> {
+    match report.matches_existing_catalog {
+        Some(true) => Ok(()),
+        Some(false) => bail!(
+            "calibrated fingerprint {} for model {} artifact {} does not match catalog fingerprint {}",
+            report.catalog_fingerprint,
+            report.model_id,
+            report.artifact,
+            report
+                .existing_catalog_fingerprint
+                .as_deref()
+                .unwrap_or("<missing>")
+        ),
+        None => bail!(
+            "catalog has no fingerprint for model {} artifact {}",
+            report.model_id,
+            report.artifact
+        ),
+    }
 }
 
 fn catalog_calibration_backend(
@@ -8179,6 +8207,31 @@ mod tests {
     }
 
     #[test]
+    fn calibration_match_guard_accepts_matching_catalog_fingerprint() {
+        let report = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+
+        ensure_calibration_matches_catalog(&report).unwrap();
+    }
+
+    #[test]
+    fn calibration_match_guard_rejects_catalog_mismatch() {
+        let report = test_calibration_report("aa".repeat(32), Some("bb".repeat(32)));
+        let err = ensure_calibration_matches_catalog(&report).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("does not match catalog fingerprint"));
+    }
+
+    #[test]
+    fn calibration_match_guard_rejects_missing_catalog_fingerprint() {
+        let report = test_calibration_report("aa".repeat(32), None);
+        let err = ensure_calibration_matches_catalog(&report).unwrap_err();
+
+        assert!(err.to_string().contains("catalog has no fingerprint"));
+    }
+
+    #[test]
     fn stable_value_hash_is_object_key_order_independent() {
         let a = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
@@ -8403,6 +8456,24 @@ mod tests {
             token_count: 1,
             fingerprint,
             output_text: None,
+        }
+    }
+
+    fn test_calibration_report(
+        fingerprint: String,
+        existing: Option<String>,
+    ) -> CatalogCanaryCalibrationReport {
+        CatalogCanaryCalibrationReport {
+            model_id: "test/model".to_owned(),
+            artifact: "gguf-q4_k_m".to_owned(),
+            engine: "llama.cpp".to_owned(),
+            artifact_path: PathBuf::from("model.gguf"),
+            canary_set: "test-canary".to_owned(),
+            prompt_count: 1,
+            matches_existing_catalog: existing.as_ref().map(|existing| existing == &fingerprint),
+            existing_catalog_fingerprint: existing,
+            catalog_fingerprint: fingerprint,
+            prompts: vec![test_calibration_prompt("p1", "aa".repeat(32))],
         }
     }
 
