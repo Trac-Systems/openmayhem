@@ -81,6 +81,11 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ProviderCommands>,
     },
+    /// Admin-only canonical contract control-plane commands.
+    Admin {
+        #[command(subcommand)]
+        command: Box<AdminCommands>,
+    },
     /// Start the local OpenAI-compatible user gateway.
     Use(UseArgs),
     /// List models from the local OpenAI-compatible gateway.
@@ -119,6 +124,30 @@ enum Commands {
 enum ProviderCommands {
     /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
     Start(ProviderStartArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommands {
+    /// Set the active rules version and hash.
+    SetRules(AdminSetRulesArgs),
+    /// Schedule admin-owned contract parameters.
+    SetParams(AdminSetParamsArgs),
+    /// Set the admin model reference price used to bound enclave prices.
+    SetModelRef(AdminSetModelRefArgs),
+    /// Register an admin-created and attested canonical enclave.
+    RegisterEnclave(AdminRegisterEnclaveArgs),
+    /// Retire an admin-created enclave.
+    RetireEnclave(AdminRetireEnclaveArgs),
+    /// Open a canonical admin room for a model.
+    OpenRoom(AdminOpenRoomArgs),
+    /// Close a canonical admin room.
+    CloseRoom(AdminCloseRoomArgs),
+    /// Set a forward-facing admin price schedule for an enclave.
+    SetPrice(AdminSetPriceArgs),
+    /// Set an admin-approved provider payout target.
+    SetProviderPayout(AdminSetProviderPayoutArgs),
+    /// Ban a provider and tombstone its active serving rows.
+    BanProvider(AdminBanProviderArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -848,6 +877,249 @@ struct CatalogCalibrateCanaryArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AdminPayoutMethod {
+    Tnk,
+    Stripe,
+    Coinbase,
+}
+
+impl AdminPayoutMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tnk => "tnk",
+            Self::Stripe => "stripe",
+            Self::Coinbase => "coinbase",
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+struct AdminTxArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted admin keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
+    #[arg(long)]
+    submit: bool,
+
+    /// Submit with peer RPC sim mode when --submit is used.
+    #[arg(long)]
+    sim: bool,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetRulesArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Monotonically increasing rules version.
+    #[arg(long)]
+    ver: u64,
+
+    /// Hash of the rules document.
+    #[arg(long)]
+    hash: String,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetParamsArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Contract timestamp/slot when the change is submitted.
+    #[arg(long)]
+    submitted_at: u64,
+
+    /// Contract timestamp/slot when the change becomes active. Must be at least 24h later.
+    #[arg(long)]
+    effective_at: u64,
+
+    /// JSON object containing parameter keys and values.
+    #[arg(long)]
+    values_json: Option<String>,
+
+    /// Path to a JSON file containing parameter keys and values.
+    #[arg(long, value_name = "PATH")]
+    values_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetModelRefArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Catalog model id.
+    #[arg(long)]
+    model: String,
+
+    /// Reference input price in integer micro-USD per 1k tokens.
+    #[arg(long)]
+    in_per_1k_mu: u64,
+
+    /// Reference output price in integer micro-USD per 1k tokens.
+    #[arg(long)]
+    out_per_1k_mu: u64,
+
+    /// Optional source hash for the catalog/price reference evidence.
+    #[arg(long)]
+    source_hash: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminRegisterEnclaveArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    enclave_id: String,
+
+    #[arg(long)]
+    model: String,
+
+    #[arg(long)]
+    backend: String,
+
+    #[arg(long)]
+    artifact_root: String,
+
+    #[arg(long)]
+    manifest_hash: String,
+
+    #[arg(long)]
+    binary_hash: String,
+
+    #[arg(long, default_value_t = 1)]
+    att_tier: u8,
+
+    /// JSON object for enclave caps, e.g. '{"tools":true,"json":true,"ctx":8192}'.
+    #[arg(long)]
+    caps_json: Option<String>,
+
+    /// Path to a JSON file containing enclave caps.
+    #[arg(long, value_name = "PATH")]
+    caps_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminRetireEnclaveArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    enclave_id: String,
+}
+
+#[derive(Debug, Parser)]
+struct AdminOpenRoomArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    model: String,
+
+    #[arg(long)]
+    nonce: String,
+
+    #[arg(long)]
+    label: String,
+
+    /// JSON object for room policy. Defaults to {}.
+    #[arg(long)]
+    policy_json: Option<String>,
+
+    /// Path to a JSON file containing room policy.
+    #[arg(long, value_name = "PATH")]
+    policy_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminCloseRoomArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    room_id: String,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetPriceArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    enclave_id: String,
+
+    /// Input price in integer micro-USD per 1k tokens.
+    #[arg(long)]
+    in_per_1k_mu: u64,
+
+    /// Output price in integer micro-USD per 1k tokens.
+    #[arg(long)]
+    out_per_1k_mu: u64,
+
+    /// Fixed per-request price in integer micro-USD.
+    #[arg(long, default_value_t = 0)]
+    per_req_mu: u64,
+
+    /// Minimum session price in integer micro-USD.
+    #[arg(long, default_value_t = 0)]
+    min_session_mu: u64,
+
+    /// Contract timestamp/slot at which the new price becomes active.
+    #[arg(long)]
+    effective_at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetProviderPayoutArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    provider: String,
+
+    #[arg(long, value_enum)]
+    payout_method: AdminPayoutMethod,
+
+    #[arg(long)]
+    payout_addr: String,
+}
+
+#[derive(Debug, Parser)]
+struct AdminBanProviderArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    provider: String,
+
+    /// Precomputed reason hash.
+    #[arg(long)]
+    reason_hash: Option<String>,
+
+    /// Plaintext reason to hash locally with BLAKE3.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Parser)]
 struct ProviderStartArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
@@ -1093,6 +1365,7 @@ async fn main() -> Result<()> {
         Commands::Provider { command } => match *command {
             ProviderCommands::Start(args) => provider_start(args).await,
         },
+        Commands::Admin { command } => admin(*command).await,
         Commands::Use(args) => use_gateway(args).await,
         Commands::Models(args) => models(args).await,
         Commands::Pay { command } => match command {
@@ -1647,6 +1920,278 @@ fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> St
         hasher.update(prompt.fingerprint.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+async fn admin(command: AdminCommands) -> Result<()> {
+    let tx_args = admin_tx_args(&command);
+    let (tx_type, value) = admin_command_payload(&command)?;
+    run_admin_command(tx_args, tx_type, value).await
+}
+
+fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
+    match command {
+        AdminCommands::SetRules(args) => &args.tx,
+        AdminCommands::SetParams(args) => &args.tx,
+        AdminCommands::SetModelRef(args) => &args.tx,
+        AdminCommands::RegisterEnclave(args) => &args.tx,
+        AdminCommands::RetireEnclave(args) => &args.tx,
+        AdminCommands::OpenRoom(args) => &args.tx,
+        AdminCommands::CloseRoom(args) => &args.tx,
+        AdminCommands::SetPrice(args) => &args.tx,
+        AdminCommands::SetProviderPayout(args) => &args.tx,
+        AdminCommands::BanProvider(args) => &args.tx,
+    }
+}
+
+fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value)> {
+    match command {
+        AdminCommands::SetRules(args) => Ok(("setRules", admin_set_rules_payload(args))),
+        AdminCommands::SetParams(args) => Ok(("setParams", admin_set_params_payload(args)?)),
+        AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args))),
+        AdminCommands::RegisterEnclave(args) => {
+            Ok(("registerEnclave", admin_register_enclave_payload(args)?))
+        }
+        AdminCommands::RetireEnclave(args) => Ok((
+            "retireEnclave",
+            json!({
+                "op": "retire_enclave",
+                "enclave_id": &args.enclave_id,
+            }),
+        )),
+        AdminCommands::OpenRoom(args) => Ok(("openRoom", admin_open_room_payload(args)?)),
+        AdminCommands::CloseRoom(args) => Ok((
+            "closeRoom",
+            json!({
+                "op": "close_room",
+                "room_id": &args.room_id,
+            }),
+        )),
+        AdminCommands::SetPrice(args) => Ok(("setPrice", admin_set_price_payload(args))),
+        AdminCommands::SetProviderPayout(args) => Ok((
+            "setProviderPayout",
+            json!({
+                "op": "set_provider_payout",
+                "provider": &args.provider,
+                "payout_method": args.payout_method.as_str(),
+                "payout_addr": &args.payout_addr,
+            }),
+        )),
+        AdminCommands::BanProvider(args) => Ok(("banProvider", admin_ban_provider_payload(args)?)),
+    }
+}
+
+fn admin_set_rules_payload(args: &AdminSetRulesArgs) -> Value {
+    json!({
+        "op": "set_rules",
+        "ver": args.ver,
+        "hash": &args.hash,
+    })
+}
+
+fn admin_set_params_payload(args: &AdminSetParamsArgs) -> Result<Value> {
+    let values = json_arg_or_file_object(
+        args.values_json.as_deref(),
+        args.values_file.as_ref(),
+        None,
+        "contract params",
+    )?;
+    Ok(json!({
+        "op": "set_params",
+        "submitted_at": args.submitted_at,
+        "effective_at": args.effective_at,
+        "values": values,
+    }))
+}
+
+fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Value {
+    let mut payload = json!({
+        "op": "set_model_ref",
+        "model_id": &args.model,
+        "price_ref_mu": {
+            "in_per_1k": args.in_per_1k_mu,
+            "out_per_1k": args.out_per_1k_mu,
+        },
+    });
+    if let Some(source_hash) = &args.source_hash {
+        payload["source_hash"] = json!(source_hash);
+    }
+    payload
+}
+
+fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
+    let caps = json_arg_or_file_object(
+        args.caps_json.as_deref(),
+        args.caps_file.as_ref(),
+        None,
+        "enclave caps",
+    )?;
+    Ok(json!({
+        "op": "register_enclave",
+        "enclave_id": &args.enclave_id,
+        "model_id": &args.model,
+        "backend": &args.backend,
+        "artifact_root": &args.artifact_root,
+        "manifest_hash": &args.manifest_hash,
+        "att_tier": args.att_tier,
+        "binary_hash": &args.binary_hash,
+        "caps": caps,
+    }))
+}
+
+fn admin_open_room_payload(args: &AdminOpenRoomArgs) -> Result<Value> {
+    let policy = json_arg_or_file_object(
+        args.policy_json.as_deref(),
+        args.policy_file.as_ref(),
+        Some(json!({})),
+        "room policy",
+    )?;
+    Ok(json!({
+        "op": "open_room",
+        "model_id": &args.model,
+        "nonce": &args.nonce,
+        "label": &args.label,
+        "policy": policy,
+    }))
+}
+
+fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Value {
+    json!({
+        "op": "set_price",
+        "enclave_id": &args.enclave_id,
+        "in_per_1k_mu": args.in_per_1k_mu,
+        "out_per_1k_mu": args.out_per_1k_mu,
+        "per_req_mu": args.per_req_mu,
+        "min_session_mu": args.min_session_mu,
+        "effective_at": args.effective_at,
+    })
+}
+
+fn admin_ban_provider_payload(args: &AdminBanProviderArgs) -> Result<Value> {
+    if args.reason_hash.is_some() && args.reason.is_some() {
+        bail!("pass only one of --reason-hash or --reason");
+    }
+    let reason_hash = args.reason_hash.clone().or_else(|| {
+        args.reason
+            .as_ref()
+            .map(|reason| blake3::hash(reason.as_bytes()).to_hex().to_string())
+    });
+    let mut payload = json!({
+        "op": "ban_provider",
+        "provider": &args.provider,
+    });
+    if let Some(reason_hash) = reason_hash {
+        payload["reason_hash"] = json!(reason_hash);
+    }
+    Ok(payload)
+}
+
+fn json_arg_or_file_object(
+    inline: Option<&str>,
+    file: Option<&PathBuf>,
+    default: Option<Value>,
+    label: &str,
+) -> Result<Value> {
+    let value = match (inline, file) {
+        (Some(_), Some(_)) => {
+            bail!("pass only one inline {label} JSON value or {label} JSON file")
+        }
+        (Some(inline), None) => serde_json::from_str::<Value>(inline)
+            .with_context(|| format!("parsing {label} JSON"))?,
+        (None, Some(path)) => read_json_file(path)
+            .with_context(|| format!("reading {label} JSON from {}", path.display()))?,
+        (None, None) => default.with_context(|| format!("{label} JSON is required"))?,
+    };
+    if !value.is_object() {
+        bail!("{label} JSON must be an object");
+    }
+    Ok(value)
+}
+
+async fn run_admin_command(args: &AdminTxArgs, tx_type: &'static str, value: Value) -> Result<()> {
+    let compact_command = serde_json::to_string(&value)?;
+    let copy_paste = format!(
+        "/tx --command {} --sim 1",
+        shell_single_quote(&compact_command)
+    );
+    let mut report = json!({
+        "ok": true,
+        "submitted": false,
+        "tx_type": tx_type,
+        "command": value,
+        "copy_paste": {
+            "intercom_sim": copy_paste,
+        },
+    });
+
+    if args.submit {
+        let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        let config = read_mayhem_config(&home)?;
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let wallet_password = args.wallet_password.as_deref().unwrap_or("");
+        let wallet = resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            wallet_password,
+        )
+        .await?;
+        let keypair_path = PathBuf::from(&wallet.keypair_path);
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let submitted = submit_contract_command(
+            &rpc,
+            &keypair_path,
+            wallet_password,
+            &wallet,
+            tx_type,
+            report["command"].clone(),
+            args.sim,
+        )
+        .await?;
+        report["submitted"] = json!(true);
+        report["sim"] = json!(args.sim);
+        report["rpc_url"] = json!(rpc_url);
+        report["wallet"] = json!({
+            "public_key": wallet.public_key,
+            "keypair_path": wallet.keypair_path,
+        });
+        report["tx"] = submitted;
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_admin_report(&report)?;
+    }
+    Ok(())
+}
+
+fn print_admin_report(report: &Value) -> Result<()> {
+    println!("Admin contract command ready.");
+    println!("Tx type: {}", report["tx_type"].as_str().unwrap_or(""));
+    println!("Command JSON:");
+    println!("{}", serde_json::to_string_pretty(&report["command"])?);
+    println!("Copy/paste Intercom sim command:");
+    println!(
+        "{}",
+        report["copy_paste"]["intercom_sim"].as_str().unwrap_or("")
+    );
+    if report["submitted"].as_bool() == Some(true) {
+        println!("Submitted: true");
+        if let Some(tx) = report["tx"]["tx"].as_str() {
+            println!("Tx: {tx}");
+        }
+        if let Some(command_hash) = report["tx"]["command_hash"].as_str() {
+            println!("Command hash: {command_hash}");
+        }
+    } else {
+        println!("Submitted: false (pass --submit to sign and send through peer RPC)");
+    }
+    Ok(())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
@@ -5808,7 +6353,7 @@ async fn submit_contract_command(
         || (result.get("local").and_then(Value::as_bool) == Some(true)
             && result.get("txo").is_some());
     if !accepted {
-        bail!("contract {tx_type} rejected provider command: {result}");
+        bail!("contract {tx_type} rejected command: {result}");
     }
     Ok(json!({
         "tx": tx,
@@ -7453,6 +7998,205 @@ mod tests {
     }
 
     #[test]
+    fn admin_set_price_cli_parses_hyphenated_mu_usd_flags() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "set-price",
+            "--enclave-id",
+            "enclave-a",
+            "--in-per-1k-mu",
+            "20",
+            "--out-per-1k-mu",
+            "60",
+            "--per-req-mu",
+            "1",
+            "--min-session-mu",
+            "100",
+            "--effective-at",
+            "21600",
+            "--json",
+        ])
+        .unwrap();
+
+        let Commands::Admin { command } = cli.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::SetPrice(args) = *command else {
+            panic!("expected set-price command");
+        };
+        assert_eq!(args.enclave_id, "enclave-a");
+        assert_eq!(args.in_per_1k_mu, 20);
+        assert_eq!(args.out_per_1k_mu, 60);
+        assert_eq!(args.per_req_mu, 1);
+        assert_eq!(args.min_session_mu, 100);
+        assert_eq!(args.effective_at, 21600);
+        assert!(args.tx.json);
+    }
+
+    #[test]
+    fn admin_set_price_payload_uses_canonical_mu_usd_terms() {
+        let args = AdminSetPriceArgs {
+            tx: test_admin_tx_args(),
+            enclave_id: "enclave-a".to_owned(),
+            in_per_1k_mu: 20,
+            out_per_1k_mu: 60,
+            per_req_mu: 0,
+            min_session_mu: 100,
+            effective_at: 21_600,
+        };
+
+        assert_eq!(
+            admin_set_price_payload(&args),
+            json!({
+                "op": "set_price",
+                "enclave_id": "enclave-a",
+                "in_per_1k_mu": 20,
+                "out_per_1k_mu": 60,
+                "per_req_mu": 0,
+                "min_session_mu": 100,
+                "effective_at": 21_600,
+            })
+        );
+    }
+
+    #[test]
+    fn admin_rules_and_params_payloads_cover_admin_control_plane() {
+        let rules = AdminSetRulesArgs {
+            tx: test_admin_tx_args(),
+            ver: 2,
+            hash: "aa".repeat(32),
+        };
+        assert_eq!(
+            admin_set_rules_payload(&rules),
+            json!({
+                "op": "set_rules",
+                "ver": 2,
+                "hash": "aa".repeat(32),
+            })
+        );
+
+        let params = AdminSetParamsArgs {
+            tx: test_admin_tx_args(),
+            submitted_at: 0,
+            effective_at: 86_400,
+            values_json: Some(r#"{ "fee_bps": 1500, "holdback_epochs": 168 }"#.to_owned()),
+            values_file: None,
+        };
+        assert_eq!(
+            admin_set_params_payload(&params).unwrap(),
+            json!({
+                "op": "set_params",
+                "submitted_at": 0,
+                "effective_at": 86_400,
+                "values": {
+                    "fee_bps": 1500,
+                    "holdback_epochs": 168,
+                },
+            })
+        );
+
+        let bad = AdminSetParamsArgs {
+            values_json: Some("[]".to_owned()),
+            ..params
+        };
+        let err = admin_set_params_payload(&bad).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("contract params JSON must be an object"));
+    }
+
+    #[test]
+    fn admin_open_room_payload_defaults_empty_policy_and_requires_object_policy() {
+        let args = AdminOpenRoomArgs {
+            tx: test_admin_tx_args(),
+            model: "catalog/model".to_owned(),
+            nonce: "stable-room-nonce".to_owned(),
+            label: "eu-central".to_owned(),
+            policy_json: None,
+            policy_file: None,
+        };
+
+        assert_eq!(
+            admin_open_room_payload(&args).unwrap(),
+            json!({
+                "op": "open_room",
+                "model_id": "catalog/model",
+                "nonce": "stable-room-nonce",
+                "label": "eu-central",
+                "policy": {},
+            })
+        );
+
+        let bad = AdminOpenRoomArgs {
+            policy_json: Some("[]".to_owned()),
+            ..args
+        };
+        let err = admin_open_room_payload(&bad).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("room policy JSON must be an object"));
+    }
+
+    #[test]
+    fn admin_ban_provider_payload_hashes_plaintext_reason_and_rejects_double_reason() {
+        let args = AdminBanProviderArgs {
+            tx: test_admin_tx_args(),
+            provider: "provider-a".to_owned(),
+            reason_hash: None,
+            reason: Some("served wrong artifact".to_owned()),
+        };
+        let expected_hash = blake3::hash(b"served wrong artifact").to_hex().to_string();
+
+        assert_eq!(
+            admin_ban_provider_payload(&args).unwrap(),
+            json!({
+                "op": "ban_provider",
+                "provider": "provider-a",
+                "reason_hash": expected_hash,
+            })
+        );
+
+        let err = admin_ban_provider_payload(&AdminBanProviderArgs {
+            reason_hash: Some("aa".repeat(32)),
+            ..args
+        })
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("pass only one of --reason-hash or --reason"));
+    }
+
+    #[test]
+    fn admin_payout_payload_is_admin_set_not_provider_supplied() {
+        let (tx_type, payload) = admin_command_payload(&AdminCommands::SetProviderPayout(
+            AdminSetProviderPayoutArgs {
+                tx: test_admin_tx_args(),
+                provider: "provider-a".to_owned(),
+                payout_method: AdminPayoutMethod::Tnk,
+                payout_addr: "trac1adminapproved".to_owned(),
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(tx_type, "setProviderPayout");
+        assert_eq!(
+            payload,
+            json!({
+                "op": "set_provider_payout",
+                "provider": "provider-a",
+                "payout_method": "tnk",
+                "payout_addr": "trac1adminapproved",
+            })
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_handles_embedded_quotes_for_copy_paste_commands() {
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
     fn provider_candidates_require_admin_enclave_and_matching_catalog_artifact() {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
@@ -8364,6 +9108,18 @@ mod tests {
                 .and_then(Value::as_str),
             Some("s2")
         );
+    }
+
+    fn test_admin_tx_args() -> AdminTxArgs {
+        AdminTxArgs {
+            home: None,
+            rpc_url: None,
+            peer_store_name: "main".to_owned(),
+            wallet_password: None,
+            submit: false,
+            sim: false,
+            json: true,
+        }
     }
 
     fn test_provider_start_args() -> ProviderStartArgs {
