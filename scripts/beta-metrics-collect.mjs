@@ -383,7 +383,7 @@ function collectGuardian(args) {
     trips: Number.isInteger(trips) ? trips : (tripArray ? tripArray.length : 0),
     conservation_ok: firstDefined(value, ['guardian.conservation_ok', 'conservation_ok']) === true,
     monotonic_epochs: firstDefined(value, ['guardian.monotonic_epochs', 'monotonic_epochs']) === true,
-    evidence: [source.evidence, ...asEvidenceArray(value, ['guardian.evidence', 'evidence', 'guardian.notes', 'notes'])],
+    evidence: [source.evidence, ...asEvidenceArray(value, ['guardian.evidence', 'evidence'])],
   };
 }
 
