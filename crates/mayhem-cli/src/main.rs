@@ -148,6 +148,16 @@ enum AdminCommands {
     SetProviderPayout(AdminSetProviderPayoutArgs),
     /// Ban a provider and tombstone its active serving rows.
     BanProvider(AdminBanProviderArgs),
+    /// Post a fresh TNK/USD oracle rate for payment and payout conversions.
+    RateOracle(AdminRateOracleArgs),
+    /// Confirm a memo-bound TNK deposit into the canonical credit ledger.
+    TnkDeposit(AdminTnkDepositArgs),
+    /// Confirm a fiat checkout deposit into the canonical credit ledger.
+    FiatDeposit(AdminFiatDepositArgs),
+    /// Record a fiat chargeback clawback and account freeze.
+    FiatChargeback(AdminFiatChargebackArgs),
+    /// Confirm an executed provider payout or router fee sweep.
+    PayoutConfirm(AdminPayoutConfirmArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -894,6 +904,51 @@ impl AdminPayoutMethod {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AdminFiatRail {
+    Stripe,
+    Coinbase,
+}
+
+impl AdminFiatRail {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stripe => "stripe",
+            Self::Coinbase => "coinbase",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AdminRateSource {
+    CoinbaseSpot,
+    Kraken,
+}
+
+impl AdminRateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CoinbaseSpot => "coinbase-spot",
+            Self::Kraken => "kraken",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AdminPayoutConfirmKind {
+    Provider,
+    FeeSweep,
+}
+
+impl AdminPayoutConfirmKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::FeeSweep => "fee_sweep",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 struct AdminTxArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
@@ -1118,6 +1173,144 @@ struct AdminBanProviderArgs {
     /// Plaintext reason to hash locally with BLAKE3.
     #[arg(long)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminRateOracleArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// TNK/USD rate in integer micro-USD per 1 TNK.
+    #[arg(long)]
+    tnk_usd_e6: u64,
+
+    /// Oracle source label accepted by the contract.
+    #[arg(long, value_enum)]
+    source: AdminRateSource,
+
+    /// Source observation timestamp in Unix seconds.
+    #[arg(long)]
+    ts: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminTnkDepositArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    memo_hash: String,
+
+    /// Deposited TNK amount as 18-decimal integer string.
+    #[arg(long)]
+    tnk_e18: String,
+
+    #[arg(long)]
+    msb_tx_hash: String,
+
+    #[arg(long)]
+    epoch: u64,
+
+    #[arg(long)]
+    at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminFiatDepositArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long, value_enum)]
+    rail: AdminFiatRail,
+
+    /// User public key to credit.
+    #[arg(long)]
+    who: String,
+
+    /// Credited amount in integer micro-USD.
+    #[arg(long)]
+    mu: u64,
+
+    /// Hash of the external checkout/payment reference.
+    #[arg(long)]
+    ext_ref_hash: String,
+
+    #[arg(long)]
+    epoch: u64,
+
+    #[arg(long)]
+    at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminFiatChargebackArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long, value_enum)]
+    rail: AdminFiatRail,
+
+    /// User public key to claw back and freeze.
+    #[arg(long)]
+    who: String,
+
+    /// Disputed amount in integer micro-USD.
+    #[arg(long)]
+    mu: u64,
+
+    /// Hash of the original external checkout/payment reference.
+    #[arg(long)]
+    ext_ref_hash: String,
+
+    /// Hash of the external dispute/chargeback reference.
+    #[arg(long)]
+    dispute_ref_hash: String,
+
+    #[arg(long)]
+    epoch: u64,
+
+    #[arg(long)]
+    at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPayoutConfirmArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Payout confirmation kind.
+    #[arg(long, value_enum, default_value_t = AdminPayoutConfirmKind::Provider)]
+    kind: AdminPayoutConfirmKind,
+
+    /// Executed payout rail.
+    #[arg(long, value_enum, default_value_t = AdminPayoutMethod::Tnk)]
+    rail: AdminPayoutMethod,
+
+    #[arg(long)]
+    epoch: u64,
+
+    /// Provider public key, or treasury for fee sweeps.
+    #[arg(long)]
+    who: String,
+
+    /// Confirmed amount in integer micro-USD.
+    #[arg(long)]
+    mu: u64,
+
+    /// TNK payout amount as 18-decimal integer string. Required for TNK payouts.
+    #[arg(long)]
+    tnk_e18: Option<String>,
+
+    /// MSB transfer hash. Required for TNK payouts.
+    #[arg(long)]
+    msb_tx_hash: Option<String>,
+
+    /// External fiat transfer reference. Required for Stripe/Coinbase payouts.
+    #[arg(long)]
+    external_ref: Option<String>,
+
+    #[arg(long)]
+    at: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -1940,6 +2133,11 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::SetPrice(args) => &args.tx,
         AdminCommands::SetProviderPayout(args) => &args.tx,
         AdminCommands::BanProvider(args) => &args.tx,
+        AdminCommands::RateOracle(args) => &args.tx,
+        AdminCommands::TnkDeposit(args) => &args.tx,
+        AdminCommands::FiatDeposit(args) => &args.tx,
+        AdminCommands::FiatChargeback(args) => &args.tx,
+        AdminCommands::PayoutConfirm(args) => &args.tx,
     }
 }
 
@@ -1977,6 +2175,15 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             }),
         )),
         AdminCommands::BanProvider(args) => Ok(("banProvider", admin_ban_provider_payload(args)?)),
+        AdminCommands::RateOracle(args) => Ok(("rateOracle", admin_rate_oracle_payload(args))),
+        AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
+        AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args))),
+        AdminCommands::FiatChargeback(args) => {
+            Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)))
+        }
+        AdminCommands::PayoutConfirm(args) => {
+            Ok(("payoutConfirm", admin_payout_confirm_payload(args)?))
+        }
     }
 }
 
@@ -2081,6 +2288,99 @@ fn admin_ban_provider_payload(args: &AdminBanProviderArgs) -> Result<Value> {
     });
     if let Some(reason_hash) = reason_hash {
         payload["reason_hash"] = json!(reason_hash);
+    }
+    Ok(payload)
+}
+
+fn admin_rate_oracle_payload(args: &AdminRateOracleArgs) -> Value {
+    json!({
+        "op": "rate_oracle",
+        "tnk_usd_e6": args.tnk_usd_e6,
+        "source": args.source.as_str(),
+        "ts": args.ts,
+    })
+}
+
+fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
+    json!({
+        "op": "tnk_deposit",
+        "memo_hash": &args.memo_hash,
+        "tnk_e18": &args.tnk_e18,
+        "msb_tx_hash": &args.msb_tx_hash,
+        "epoch": args.epoch,
+        "at": args.at,
+    })
+}
+
+fn admin_fiat_deposit_payload(args: &AdminFiatDepositArgs) -> Value {
+    json!({
+        "op": "fiat_deposit",
+        "rail": args.rail.as_str(),
+        "who": &args.who,
+        "mu": args.mu,
+        "ext_ref_hash": &args.ext_ref_hash,
+        "epoch": args.epoch,
+        "at": args.at,
+    })
+}
+
+fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Value {
+    json!({
+        "op": "fiat_chargeback",
+        "rail": args.rail.as_str(),
+        "who": &args.who,
+        "mu": args.mu,
+        "ext_ref_hash": &args.ext_ref_hash,
+        "dispute_ref_hash": &args.dispute_ref_hash,
+        "epoch": args.epoch,
+        "at": args.at,
+    })
+}
+
+fn admin_payout_confirm_payload(args: &AdminPayoutConfirmArgs) -> Result<Value> {
+    if args.kind == AdminPayoutConfirmKind::FeeSweep && args.rail != AdminPayoutMethod::Tnk {
+        bail!("fee-sweep payout confirmations must use --rail tnk");
+    }
+    let mut payload = json!({
+        "op": "payout_confirm",
+        "epoch": args.epoch,
+        "who": &args.who,
+        "mu": args.mu,
+        "at": args.at,
+    });
+    if args.kind != AdminPayoutConfirmKind::Provider {
+        payload["kind"] = json!(args.kind.as_str());
+    }
+    match args.rail {
+        AdminPayoutMethod::Tnk => {
+            if args.external_ref.is_some() {
+                bail!("TNK payout confirmations must not include --external-ref");
+            }
+            let tnk_e18 = args
+                .tnk_e18
+                .as_deref()
+                .context("TNK payout confirmations require --tnk-e18")?;
+            let msb_tx_hash = args
+                .msb_tx_hash
+                .as_deref()
+                .context("TNK payout confirmations require --msb-tx-hash")?;
+            payload["tnk_e18"] = json!(tnk_e18);
+            payload["msb_tx_hash"] = json!(msb_tx_hash);
+        }
+        AdminPayoutMethod::Stripe | AdminPayoutMethod::Coinbase => {
+            if args.kind == AdminPayoutConfirmKind::FeeSweep {
+                bail!("fee-sweep payout confirmations must use --rail tnk");
+            }
+            if args.tnk_e18.is_some() || args.msb_tx_hash.is_some() {
+                bail!("fiat payout confirmations must not include --tnk-e18 or --msb-tx-hash");
+            }
+            let external_ref = args
+                .external_ref
+                .as_deref()
+                .context("fiat payout confirmations require --external-ref")?;
+            payload["rail"] = json!(args.rail.as_str());
+            payload["external_ref"] = json!(external_ref);
+        }
     }
     Ok(payload)
 }
@@ -8192,6 +8492,189 @@ mod tests {
     }
 
     #[test]
+    fn admin_oracle_payment_payloads_match_contract_schemas() {
+        assert_eq!(
+            admin_rate_oracle_payload(&AdminRateOracleArgs {
+                tx: test_admin_tx_args(),
+                tnk_usd_e6: 50_000,
+                source: AdminRateSource::CoinbaseSpot,
+                ts: 3_600,
+            }),
+            json!({
+                "op": "rate_oracle",
+                "tnk_usd_e6": 50_000,
+                "source": "coinbase-spot",
+                "ts": 3_600,
+            })
+        );
+
+        assert_eq!(
+            admin_tnk_deposit_payload(&AdminTnkDepositArgs {
+                tx: test_admin_tx_args(),
+                memo_hash: "memo".to_owned(),
+                tnk_e18: "1000000000000000000".to_owned(),
+                msb_tx_hash: "msb".to_owned(),
+                epoch: 1,
+                at: 3_600,
+            }),
+            json!({
+                "op": "tnk_deposit",
+                "memo_hash": "memo",
+                "tnk_e18": "1000000000000000000",
+                "msb_tx_hash": "msb",
+                "epoch": 1,
+                "at": 3_600,
+            })
+        );
+
+        assert_eq!(
+            admin_fiat_deposit_payload(&AdminFiatDepositArgs {
+                tx: test_admin_tx_args(),
+                rail: AdminFiatRail::Stripe,
+                who: "user-a".to_owned(),
+                mu: 10_000_000,
+                ext_ref_hash: "stripe-ref-hash".to_owned(),
+                epoch: 7,
+                at: 25_200,
+            }),
+            json!({
+                "op": "fiat_deposit",
+                "rail": "stripe",
+                "who": "user-a",
+                "mu": 10_000_000,
+                "ext_ref_hash": "stripe-ref-hash",
+                "epoch": 7,
+                "at": 25_200,
+            })
+        );
+
+        assert_eq!(
+            admin_fiat_chargeback_payload(&AdminFiatChargebackArgs {
+                tx: test_admin_tx_args(),
+                rail: AdminFiatRail::Coinbase,
+                who: "user-a".to_owned(),
+                mu: 5_000_000,
+                ext_ref_hash: "coinbase-ref-hash".to_owned(),
+                dispute_ref_hash: "coinbase-dispute-hash".to_owned(),
+                epoch: 8,
+                at: 28_800,
+            }),
+            json!({
+                "op": "fiat_chargeback",
+                "rail": "coinbase",
+                "who": "user-a",
+                "mu": 5_000_000,
+                "ext_ref_hash": "coinbase-ref-hash",
+                "dispute_ref_hash": "coinbase-dispute-hash",
+                "epoch": 8,
+                "at": 28_800,
+            })
+        );
+    }
+
+    #[test]
+    fn admin_payout_confirm_payloads_enforce_rail_specific_evidence() {
+        let tnk = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
+            tx: test_admin_tx_args(),
+            kind: AdminPayoutConfirmKind::Provider,
+            rail: AdminPayoutMethod::Tnk,
+            epoch: 7,
+            who: "provider-a".to_owned(),
+            mu: 1_000_000,
+            tnk_e18: Some("500000000000000000".to_owned()),
+            msb_tx_hash: Some("msb-tx".to_owned()),
+            external_ref: None,
+            at: 25_200,
+        })
+        .unwrap();
+        assert_eq!(
+            tnk,
+            json!({
+                "op": "payout_confirm",
+                "epoch": 7,
+                "who": "provider-a",
+                "mu": 1_000_000,
+                "tnk_e18": "500000000000000000",
+                "msb_tx_hash": "msb-tx",
+                "at": 25_200,
+            })
+        );
+
+        let stripe = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
+            tx: test_admin_tx_args(),
+            kind: AdminPayoutConfirmKind::Provider,
+            rail: AdminPayoutMethod::Stripe,
+            epoch: 7,
+            who: "provider-a".to_owned(),
+            mu: 1_000_000,
+            tnk_e18: None,
+            msb_tx_hash: None,
+            external_ref: Some("tr_123".to_owned()),
+            at: 25_200,
+        })
+        .unwrap();
+        assert_eq!(
+            stripe,
+            json!({
+                "op": "payout_confirm",
+                "rail": "stripe",
+                "epoch": 7,
+                "who": "provider-a",
+                "mu": 1_000_000,
+                "external_ref": "tr_123",
+                "at": 25_200,
+            })
+        );
+
+        let fee_sweep = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
+            tx: test_admin_tx_args(),
+            kind: AdminPayoutConfirmKind::FeeSweep,
+            rail: AdminPayoutMethod::Tnk,
+            epoch: 7,
+            who: "treasury".to_owned(),
+            mu: 1_000_000,
+            tnk_e18: Some("500000000000000000".to_owned()),
+            msb_tx_hash: Some("treasury-msb-tx".to_owned()),
+            external_ref: None,
+            at: 25_200,
+        })
+        .unwrap();
+        assert_eq!(
+            fee_sweep,
+            json!({
+                "op": "payout_confirm",
+                "kind": "fee_sweep",
+                "epoch": 7,
+                "who": "treasury",
+                "mu": 1_000_000,
+                "tnk_e18": "500000000000000000",
+                "msb_tx_hash": "treasury-msb-tx",
+                "at": 25_200,
+            })
+        );
+
+        let err = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
+            rail: AdminPayoutMethod::Stripe,
+            tnk_e18: Some("1".to_owned()),
+            external_ref: Some("tr_123".to_owned()),
+            ..test_payout_confirm_args()
+        })
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("fiat payout confirmations must not include"));
+
+        let err = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
+            kind: AdminPayoutConfirmKind::FeeSweep,
+            rail: AdminPayoutMethod::Coinbase,
+            external_ref: Some("transfer_123".to_owned()),
+            ..test_payout_confirm_args()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("fee-sweep"));
+    }
+
+    #[test]
     fn shell_single_quote_handles_embedded_quotes_for_copy_paste_commands() {
         assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
@@ -9119,6 +9602,21 @@ mod tests {
             submit: false,
             sim: false,
             json: true,
+        }
+    }
+
+    fn test_payout_confirm_args() -> AdminPayoutConfirmArgs {
+        AdminPayoutConfirmArgs {
+            tx: test_admin_tx_args(),
+            kind: AdminPayoutConfirmKind::Provider,
+            rail: AdminPayoutMethod::Tnk,
+            epoch: 7,
+            who: "provider-a".to_owned(),
+            mu: 1_000_000,
+            tnk_e18: Some("500000000000000000".to_owned()),
+            msb_tx_hash: Some("msb-tx".to_owned()),
+            external_ref: None,
+            at: 25_200,
         }
     }
 
