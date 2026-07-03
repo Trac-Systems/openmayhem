@@ -240,9 +240,14 @@ struct HealthCoinbaseRail {
 
 #[derive(Debug, Serialize)]
 struct HealthControls {
+    admin_controls_economy: bool,
     admin_sets_terms: bool,
     providers_set_prices: bool,
+    providers_set_payout_terms: bool,
     providers_submit_models: bool,
+    providers_create_canonical_rooms: bool,
+    providers_only_join_admin_rooms: bool,
+    provider_payout_targets_admin_verified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -902,9 +907,14 @@ impl PaygateState {
                 },
             },
             controls: HealthControls {
+                admin_controls_economy: true,
                 admin_sets_terms: true,
                 providers_set_prices: false,
+                providers_set_payout_terms: false,
                 providers_submit_models: false,
+                providers_create_canonical_rooms: false,
+                providers_only_join_admin_rooms: true,
+                provider_payout_targets_admin_verified: true,
             },
         }
     }

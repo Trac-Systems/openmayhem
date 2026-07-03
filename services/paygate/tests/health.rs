@@ -40,9 +40,17 @@ async fn health_reports_oracle_public_key_and_redacts_seed() {
     assert_eq!(body["oracle_pubkey"], oracle_pubkey);
     assert_eq!(body["rails"]["stripe"]["enabled"], true);
     assert_eq!(body["rails"]["coinbase"]["enabled"], false);
+    assert_eq!(body["controls"]["admin_controls_economy"], true);
     assert_eq!(body["controls"]["admin_sets_terms"], true);
     assert_eq!(body["controls"]["providers_set_prices"], false);
+    assert_eq!(body["controls"]["providers_set_payout_terms"], false);
     assert_eq!(body["controls"]["providers_submit_models"], false);
+    assert_eq!(body["controls"]["providers_create_canonical_rooms"], false);
+    assert_eq!(body["controls"]["providers_only_join_admin_rooms"], true);
+    assert_eq!(
+        body["controls"]["provider_payout_targets_admin_verified"],
+        true
+    );
     assert!(!String::from_utf8_lossy(&bytes).contains(&seed_hex));
 }
 
