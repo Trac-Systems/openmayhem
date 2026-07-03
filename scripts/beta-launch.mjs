@@ -100,6 +100,18 @@ function requireArray(add, value, name, min = 0) {
   return true;
 }
 
+function requireStringArray(add, value, name, min = 0) {
+  if (!requireArray(add, value, name, min)) return;
+  const seen = new Set();
+  for (const [index, item] of value.entries()) {
+    const itemName = `${name}[${index}]`;
+    requireString(add, item, itemName);
+    if (typeof item !== 'string' || isPlaceholder(item)) continue;
+    if (seen.has(item)) add('error', `${itemName} duplicates another ${name} entry`);
+    seen.add(item);
+  }
+}
+
 function requireLiteral(add, value, expected, name) {
   if (value !== expected) add('error', `${name} must be ${JSON.stringify(expected)}`);
 }
@@ -272,8 +284,10 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
         }
       }
     }
-    if (manifest.network.dht !== undefined && requireObject(add, manifest.network.dht, 'network.dht')) {
+    if (requireObject(add, manifest.network.dht, 'network.dht')) {
       requireOnlyKeys(add, manifest.network.dht, 'network.dht', ['peer_bootstrap', 'msb_bootstrap']);
+      requireStringArray(add, manifest.network.dht.peer_bootstrap, 'network.dht.peer_bootstrap', 1);
+      requireStringArray(add, manifest.network.dht.msb_bootstrap, 'network.dht.msb_bootstrap', 1);
     }
   }
 
