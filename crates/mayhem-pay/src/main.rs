@@ -40,6 +40,9 @@ struct PayoutPlanArgs {
     /// Fresh TNK/USD e6 oracle rate. Overrides snapshot.rate_tnk_usd_e6.
     #[arg(long)]
     rate_tnk_usd_e6: Option<u64>,
+    /// Admin public key expected to have set provider payout targets. Overrides snapshot.admin.
+    #[arg(long)]
+    admin_pubkey: Option<String>,
     /// Router treasury payout target used for fee sweep intents.
     #[arg(long, default_value = "treasury")]
     treasury: String,
@@ -65,6 +68,8 @@ struct PayoutPlanArgs {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Snapshot {
+    #[serde(default)]
+    admin: Option<Value>,
     #[serde(default)]
     epoch: Option<u64>,
     #[serde(default)]
@@ -112,6 +117,10 @@ struct ProviderRecord {
 struct PayoutTarget {
     addr: String,
     method: String,
+    #[serde(default)]
+    set_by: Option<String>,
+    #[serde(default)]
+    set_by_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,11 +280,20 @@ fn main() -> Result<()> {
             let rate = args.rate_tnk_usd_e6.or(snapshot.rate_tnk_usd_e6).context(
                 "TNK/USD e6 rate required via --rate-tnk-usd-e6 or snapshot.rate_tnk_usd_e6",
             )?;
+            let admin_pubkey = args
+                .admin_pubkey
+                .as_deref()
+                .map(str::trim)
+                .filter(|admin| !admin.is_empty())
+                .map(str::to_string)
+                .or_else(|| snapshot_admin_pubkey(snapshot.admin.as_ref()))
+                .context("admin pubkey required via --admin-pubkey or snapshot.admin")?;
             let plan = build_plan(
                 &snapshot,
                 epoch,
                 args.at,
                 rate,
+                &admin_pubkey,
                 &args.treasury,
                 &RailOptions {
                     msb_tx_hash: args.msb_tx_hash,
@@ -302,11 +320,16 @@ fn build_plan(
     epoch: u64,
     at: u64,
     rate_tnk_usd_e6: u64,
+    admin_pubkey: &str,
     treasury: &str,
     rail_options: &RailOptions,
 ) -> Result<PayoutPlan> {
     if rate_tnk_usd_e6 == 0 {
         bail!("rate_tnk_usd_e6 must be positive");
+    }
+    let admin_pubkey = admin_pubkey.trim();
+    if admin_pubkey.is_empty() {
+        bail!("admin_pubkey must be non-empty");
     }
 
     let providers: HashMap<&str, &ProviderRecord> = snapshot
@@ -352,6 +375,20 @@ fn build_plan(
             });
             continue;
         };
+        let target_set_by_admin = target
+            .set_by
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|set_by| set_by == admin_pubkey)
+            && matches!(target.set_by_role.as_deref(), None | Some("admin"));
+        if !target_set_by_admin {
+            skipped.push(SkippedPayout {
+                who: earning.provider.clone(),
+                reason: "payout_target_not_admin_set".to_string(),
+                released_mu: 0,
+            });
+            continue;
+        }
         if !matches!(target.method.as_str(), "tnk" | "stripe" | "coinbase") {
             skipped.push(SkippedPayout {
                 who: earning.provider.clone(),
@@ -560,6 +597,24 @@ fn build_plan(
     })
 }
 
+fn snapshot_admin_pubkey(admin: Option<&Value>) -> Option<String> {
+    let admin = admin?;
+    value_string(admin).or_else(|| {
+        let object = admin.as_object()?;
+        ["pubkey", "public_key", "peer_pubkey", "admin"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(value_string))
+    })
+}
+
+fn value_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn normalize_holdbacks(earning: &EarningRecord) -> Result<Vec<HoldbackBucket>> {
     let buckets = match &earning.holdbacks {
         Some(holdbacks) => holdbacks.clone(),
@@ -692,6 +747,8 @@ fn payout_confirm_command(args: PayoutConfirmArgs<'_>) -> Value {
 mod tests {
     use super::*;
 
+    const ADMIN: &str = "admin-pubkey";
+
     fn provider(provider: &str, target: &str) -> ProviderRecord {
         provider_with_method(provider, target, "tnk")
     }
@@ -703,6 +760,8 @@ mod tests {
             payout: Some(PayoutTarget {
                 addr: target.to_string(),
                 method: method.to_string(),
+                set_by: Some(ADMIN.to_string()),
+                set_by_role: None,
             }),
         }
     }
@@ -736,6 +795,7 @@ mod tests {
     #[test]
     fn payout_plan_respects_holdback_and_challenge_lock() {
         let snapshot = Snapshot {
+            admin: Some(Value::String(ADMIN.to_string())),
             epoch: None,
             rate_tnk_usd_e6: None,
             params: Params::default(),
@@ -749,6 +809,7 @@ mod tests {
             100,
             1_900,
             2_000_000,
+            ADMIN,
             "treasury",
             &rail_options(),
         )
@@ -761,6 +822,7 @@ mod tests {
             169,
             1_900,
             2_000_000,
+            ADMIN,
             "treasury",
             &RailOptions {
                 msb_tx_hash: "a".repeat(64),
@@ -794,6 +856,7 @@ mod tests {
     #[test]
     fn payout_plan_includes_router_fee_sweep() {
         let snapshot = Snapshot {
+            admin: Some(Value::String(ADMIN.to_string())),
             epoch: None,
             rate_tnk_usd_e6: None,
             params: Params::default(),
@@ -811,6 +874,7 @@ mod tests {
             7,
             25_200,
             2_000_000,
+            ADMIN,
             "treasury",
             &RailOptions {
                 msb_tx_hash: "b".repeat(64),
@@ -829,6 +893,7 @@ mod tests {
     #[test]
     fn payout_plan_includes_stripe_and_coinbase_provider_intents() {
         let snapshot = Snapshot {
+            admin: Some(Value::String(ADMIN.to_string())),
             epoch: None,
             rate_tnk_usd_e6: None,
             params: Params::default(),
@@ -845,6 +910,7 @@ mod tests {
             169,
             1_900,
             2_000_000,
+            ADMIN,
             "treasury",
             &rail_options(),
         )
@@ -888,5 +954,91 @@ mod tests {
         assert_eq!(stripe_transfer.amount_cents, 170);
         assert_eq!(stripe_transfer.destination, "acct_provider");
         assert_eq!(stripe_transfer.metadata.mayhem_denom, "mu_usd");
+    }
+
+    #[test]
+    fn payout_plan_skips_non_admin_set_payout_targets() {
+        let mut provider_set = provider("provider-set", "trac1provider");
+        provider_set.payout.as_mut().expect("payout").set_by = Some("provider-set".to_string());
+        let mut missing_set_by = provider("missing-set-by", "trac1missing");
+        missing_set_by.payout.as_mut().expect("payout").set_by = None;
+        let mut wrong_role = provider("wrong-role", "trac1wrongrole");
+        wrong_role.payout.as_mut().expect("payout").set_by_role = Some("provider".to_string());
+        let snapshot = Snapshot {
+            admin: Some(Value::String(ADMIN.to_string())),
+            epoch: None,
+            rate_tnk_usd_e6: None,
+            params: Params::default(),
+            providers: vec![provider_set, missing_set_by, wrong_role],
+            earnings: vec![
+                earning("provider-set"),
+                earning("missing-set-by"),
+                earning("wrong-role"),
+            ],
+            fee: None,
+        };
+
+        let plan = build_plan(
+            &snapshot,
+            169,
+            1_900,
+            2_000_000,
+            ADMIN,
+            "treasury",
+            &rail_options(),
+        )
+        .unwrap();
+
+        assert!(plan.provider_payouts.is_empty());
+        assert_eq!(plan.skipped.len(), 3);
+        assert!(plan
+            .skipped
+            .iter()
+            .all(|skip| skip.reason == "payout_target_not_admin_set"));
+        assert_eq!(plan.totals.provider_mu, 0);
+        assert_eq!(plan.totals.transfer_count, 0);
+    }
+
+    #[test]
+    fn snapshot_admin_pubkey_accepts_string_or_admin_object() {
+        assert_eq!(
+            snapshot_admin_pubkey(Some(&json!(ADMIN))).as_deref(),
+            Some(ADMIN)
+        );
+        assert_eq!(
+            snapshot_admin_pubkey(Some(&json!({ "peer_pubkey": ADMIN }))).as_deref(),
+            Some(ADMIN)
+        );
+        assert_eq!(
+            snapshot_admin_pubkey(Some(&json!({ "pubkey": "  admin-trimmed  " }))).as_deref(),
+            Some("admin-trimmed")
+        );
+        assert_eq!(snapshot_admin_pubkey(Some(&json!({ "pubkey": "" }))), None);
+    }
+
+    #[test]
+    fn payout_plan_requires_admin_pubkey() {
+        let snapshot = Snapshot {
+            admin: None,
+            epoch: None,
+            rate_tnk_usd_e6: None,
+            params: Params::default(),
+            providers: vec![provider("provider-a", "trac1provider")],
+            earnings: vec![earning("provider-a")],
+            fee: None,
+        };
+
+        let err = build_plan(
+            &snapshot,
+            169,
+            1_900,
+            2_000_000,
+            "",
+            "treasury",
+            &rail_options(),
+        )
+        .expect_err("empty admin must fail");
+
+        assert_eq!(err.to_string(), "admin_pubkey must be non-empty");
     }
 }
