@@ -8,6 +8,7 @@ VERSION="${MAYHEM_DOCKER_VERSION:-docker-linux-check}"
 DIST_REL="${MAYHEM_DOCKER_DIST_REL:-dist/docker-linux-install-check}"
 DIST_DIR="${MAYHEM_DOCKER_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 CARGO_CACHE="${MAYHEM_DOCKER_CARGO_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mayhem/docker-cargo}"
+BUILD_APT_PACKAGES="${MAYHEM_DOCKER_BUILD_APT_PACKAGES:-clang libclang-dev cmake pkg-config}"
 TARGET_SUBDIR="${MAYHEM_DOCKER_TARGET_SUBDIR:-docker-linux-install-check}"
 STAGED_ROOT=""
 
@@ -47,6 +48,9 @@ Environment:
   MAYHEM_DOCKER_VERSION        Artifact version string (default: docker-linux-check)
   MAYHEM_DOCKER_DIST_DIR       Dist output directory (default: dist/docker-linux-install-check)
   MAYHEM_DOCKER_CARGO_CACHE    Cargo cache mount (default: ~/.cache/mayhem/docker-cargo)
+  MAYHEM_DOCKER_BUILD_APT_PACKAGES
+                                Build deps installed in the Rust image
+                                (default: clang libclang-dev cmake pkg-config)
   MAYHEM_DOCKER_KEEP_STAGE     Keep temporary staged checkout when set to 1
 USAGE
 }
@@ -90,18 +94,32 @@ gid="$(id -g)"
 
 log "building Linux release archive in $BUILD_IMAGE"
 docker run --rm \
-  --user "$uid:$gid" \
+  -e HOST_UID="$uid" \
+  -e HOST_GID="$gid" \
   -e HOME=/tmp/mayhem-home \
   -e CARGO_HOME=/tmp/cargo-home \
   -e CARGO_TARGET_DIR="/work/target/$TARGET_SUBDIR" \
   -e MAYHEM_DIST_DIR="/work/$DIST_REL" \
   -e MAYHEM_VERSION="$VERSION" \
+  -e MAYHEM_DOCKER_BUILD_APT_PACKAGES="$BUILD_APT_PACKAGES" \
   -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   -v "$WORK_ROOT:/work" \
   -v "$CARGO_CACHE:/tmp/cargo-home" \
   -w /work \
   "$BUILD_IMAGE" \
-  bash -c 'set -euo pipefail; scripts/package-release.sh --version "$MAYHEM_VERSION" --out-dir "$MAYHEM_DIST_DIR"'
+  bash -c '
+    set -euo pipefail
+    cleanup_ownership() {
+      chown -R "$HOST_UID:$HOST_GID" "$MAYHEM_DIST_DIR" "$CARGO_TARGET_DIR" /tmp/cargo-home 2>/dev/null || true
+    }
+    trap cleanup_ownership EXIT
+    if [[ -n "${MAYHEM_DOCKER_BUILD_APT_PACKAGES:-}" ]]; then
+      apt-get update >/dev/null
+      apt-get install -y --no-install-recommends $MAYHEM_DOCKER_BUILD_APT_PACKAGES >/dev/null
+      rm -rf /var/lib/apt/lists/*
+    fi
+    scripts/package-release.sh --version "$MAYHEM_VERSION" --out-dir "$MAYHEM_DIST_DIR"
+  '
 
 archive="$(
   find "$WORK_DIST_DIR" -maxdepth 1 -type f -name "mayhem-$VERSION-*-unknown-linux-gnu.tar.gz" \
