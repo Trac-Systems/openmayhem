@@ -26,6 +26,9 @@ use mayhem_enclave::{
     Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
     SEALED_STORE_MANIFEST,
 };
+use mayhem_engine::{
+    EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, ModelArtifact, ToolSpec,
+};
 use mayhem_gateway::{
     heartbeat_signing_payload,
     openai::{
@@ -889,6 +892,10 @@ struct ProviderStartArgs {
     /// Stop session serving after this many seconds; 0 means run until killed.
     #[arg(long, default_value_t = 0)]
     serve_sessions_seconds: u64,
+
+    /// Development-only: use deterministic session responses instead of the loaded engine.
+    #[arg(long, hide = true)]
+    dev_session_shim: bool,
 
     /// Print a machine-readable provider start report.
     #[arg(long)]
@@ -2136,7 +2143,9 @@ fn stable_json_value(value: &Value) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(stable_json_value).collect()),
         Value::Object(map) => {
             let mut stable = serde_json::Map::new();
-            for (key, value) in map.iter() {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
                 stable.insert(key.clone(), stable_json_value(value));
             }
             Value::Object(stable)
@@ -4245,6 +4254,7 @@ struct ProviderSessionContext<'a> {
     password: &'a str,
     wallet: &'a WalletInfo,
     selected: &'a ProviderCandidate,
+    artifact_path: &'a Path,
     rooms: &'a [LedgerRoom],
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
@@ -4271,6 +4281,49 @@ struct ProviderSessionTerms {
 enum ProviderSessionDecision {
     Accept,
     Reject { code: &'static str, reason: String },
+}
+
+trait ProviderSessionResponder {
+    fn mode(&self) -> &'static str;
+    fn respond(
+        &mut self,
+        terms: &ProviderSessionTerms,
+        body: &Value,
+    ) -> Result<ProviderSessionOutput>;
+}
+
+struct DeterministicProviderSessionResponder;
+
+impl ProviderSessionResponder for DeterministicProviderSessionResponder {
+    fn mode(&self) -> &'static str {
+        "deterministic-dev-shim"
+    }
+
+    fn respond(
+        &mut self,
+        terms: &ProviderSessionTerms,
+        body: &Value,
+    ) -> Result<ProviderSessionOutput> {
+        Ok(provider_session_response(terms, body))
+    }
+}
+
+struct EngineProviderSessionResponder {
+    backend: Box<dyn EngineBackend>,
+}
+
+impl ProviderSessionResponder for EngineProviderSessionResponder {
+    fn mode(&self) -> &'static str {
+        "mayhem-engine"
+    }
+
+    fn respond(
+        &mut self,
+        _terms: &ProviderSessionTerms,
+        body: &Value,
+    ) -> Result<ProviderSessionOutput> {
+        provider_engine_session_response(self.backend.as_mut(), body)
+    }
 }
 
 async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
@@ -4565,6 +4618,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             password: &password,
             wallet: &wallet,
             selected: &selected,
+            artifact_path: &artifact_path,
             rooms: &rooms,
             attestation: &attestation,
             attestation_head: &attestation.report_head,
@@ -5554,6 +5608,7 @@ async fn send_provider_heartbeat_round(
 
 async fn serve_provider_sessions(ctx: ProviderSessionContext<'_>) -> Result<()> {
     let terms = provider_session_terms(&ctx)?;
+    let mut responder = provider_session_responder(&ctx)?;
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
         ctx.args.sc_bridge_url.as_deref(),
@@ -5577,10 +5632,11 @@ async fn serve_provider_sessions(ctx: ProviderSessionContext<'_>) -> Result<()> 
     provider_log(
         ctx.args,
         &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s)",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {}",
             sc_bridge_url,
             terms.enclave_id,
-            ctx.rooms.len()
+            ctx.rooms.len(),
+            responder.mode()
         ),
     );
 
@@ -5640,6 +5696,7 @@ async fn serve_provider_sessions(ctx: ProviderSessionContext<'_>) -> Result<()> 
                     &mut sessions,
                     &terms,
                     ctx.attestation,
+                    responder.as_mut(),
                     event,
                 )
                 .await?;
@@ -5660,6 +5717,7 @@ async fn handle_provider_session_frame(
     sessions: &mut HashMap<String, ActiveProviderSession>,
     terms: &ProviderSessionTerms,
     attestation: &Tier1AttestationReport,
+    responder: &mut dyn ProviderSessionResponder,
     event: Value,
 ) -> Result<()> {
     let frame = event.get("frame").cloned().unwrap_or(Value::Null);
@@ -5741,7 +5799,7 @@ async fn handle_provider_session_frame(
                 .filter(|rid| !rid.is_empty())
                 .unwrap_or("missing-rid");
             let body = frame.get("body").cloned().unwrap_or(Value::Null);
-            let output = provider_session_response(terms, &body);
+            let output = responder.respond(terms, &body)?;
             send_provider_session_output(
                 bridge,
                 &active.user,
@@ -5849,6 +5907,83 @@ async fn send_provider_session_close(
     Ok(())
 }
 
+fn provider_session_responder(
+    ctx: &ProviderSessionContext<'_>,
+) -> Result<Box<dyn ProviderSessionResponder>> {
+    if ctx.args.dev_session_shim {
+        if !ctx.args.dev_skip_catalog_verify {
+            bail!("--dev-session-shim requires --dev-skip-catalog-verify and is never canonical");
+        }
+        return Ok(Box::new(DeterministicProviderSessionResponder));
+    }
+
+    provider_log(
+        ctx.args,
+        &format!(
+            "Loading {} session engine from verified admin artifact {}",
+            ctx.selected.artifact.engine,
+            ctx.artifact_path.display()
+        ),
+    );
+    let load_config = provider_engine_load_config(ctx.selected, ctx.artifact_path)?;
+    match ctx.selected.artifact.engine.as_str() {
+        "llama.cpp" => {
+            let mut backend = mayhem_engine::LlamaCppBackend::new()
+                .context("initializing llama.cpp provider session engine")?;
+            backend
+                .load(load_config)
+                .context("loading llama.cpp provider session engine")?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
+        "mlx" => {
+            let mut backend = mayhem_engine::MlxBackend::new()
+                .context("initializing MLX provider session engine")?;
+            backend
+                .load(load_config)
+                .context("loading MLX provider session engine")?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
+        other => bail!(
+            "provider session engine for {other} is not wired locally yet; do not serve this enclave until its admin-approved engine adapter is available"
+        ),
+    }
+}
+
+fn provider_engine_load_config(
+    selected: &ProviderCandidate,
+    artifact_path: &Path,
+) -> Result<LoadConfig> {
+    let ctx_size = u32::try_from(selected.model.caps.ctx_max).with_context(|| {
+        format!(
+            "catalog ctx_max {} for {} exceeds engine ctx_size range",
+            selected.model.caps.ctx_max, selected.model.model_id
+        )
+    })?;
+    let artifact = match selected.artifact.engine.as_str() {
+        "llama.cpp" => ModelArtifact::gguf(artifact_path),
+        "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
+        other => bail!("unsupported local provider session engine {other}"),
+    };
+    let artifact = if let Some(sha256) = &selected.artifact.source_sha256 {
+        artifact.with_sha256(sha256.clone())
+    } else {
+        artifact
+    };
+    let mut config = match selected.artifact.engine.as_str() {
+        "llama.cpp" => LoadConfig::gguf(artifact_path),
+        "mlx" => LoadConfig::mlx_safetensors(artifact_path),
+        other => bail!("unsupported local provider session engine {other}"),
+    };
+    config.artifact = artifact;
+    config.ctx_size = ctx_size.max(1);
+    config.gpu_layers = selected.verdict.n_layers_gpu;
+    Ok(config)
+}
+
 fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSessionTerms> {
     let price = ctx
         .selected
@@ -5927,9 +6062,159 @@ fn provider_session_open_decision(
 struct ProviderSessionOutput {
     content: String,
     tool: Option<Value>,
-    finish_reason: &'static str,
+    finish_reason: String,
     prompt_tokens: u64,
     completion_tokens: u64,
+}
+
+fn provider_engine_session_response(
+    backend: &mut dyn EngineBackend,
+    body: &Value,
+) -> Result<ProviderSessionOutput> {
+    let request = provider_engine_request_from_body(body)?;
+    let wants_tool = request
+        .grammar
+        .as_ref()
+        .is_some_and(|grammar| matches!(grammar, GrammarSpec::ToolCall { .. }));
+    let mut sink = mayhem_engine::NoopTokenSink;
+    let output = backend
+        .generate(request, &mut sink)
+        .context("generating provider session response with mayhem-engine")?;
+    let tool = wants_tool
+        .then(|| provider_engine_tool_call_output(&output.text))
+        .flatten();
+    Ok(ProviderSessionOutput {
+        content: if tool.is_some() {
+            String::new()
+        } else {
+            output.text
+        },
+        tool,
+        finish_reason: if wants_tool {
+            "tool_calls".to_owned()
+        } else {
+            output.finish_reason.to_string()
+        },
+        prompt_tokens: u64::from(output.usage.prompt_tokens),
+        completion_tokens: u64::from(output.usage.completion_tokens),
+    })
+}
+
+fn provider_engine_request_from_body(body: &Value) -> Result<GenerateRequest> {
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let prompt = provider_engine_prompt(messages);
+    let mut request = GenerateRequest::new(prompt);
+    if let Some(max_tokens) = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+    {
+        request.max_new_tokens = u32::try_from(max_tokens)
+            .context("max_tokens exceeds provider engine request range")?;
+    }
+    if let Some(temperature) = body.get("temperature").and_then(Value::as_f64) {
+        request.temperature = Some(temperature as f32);
+    }
+    if let Some(top_p) = body.get("top_p").and_then(Value::as_f64) {
+        request.top_p = Some(top_p as f32);
+    }
+    if let Some(seed) = body.get("seed").and_then(Value::as_u64) {
+        request.seed = Some(u32::try_from(seed).context("seed exceeds u32")?);
+    }
+    if body.get("tool_choice").and_then(Value::as_str) != Some("none") {
+        let tools = provider_engine_tool_specs(body)?;
+        if !tools.is_empty() {
+            request.grammar = Some(GrammarSpec::ToolCall { tools });
+            return Ok(request);
+        }
+    }
+    if provider_wants_json(body) {
+        request.grammar = Some(GrammarSpec::JsonSchema {
+            schema: provider_response_json_schema(body),
+        });
+    }
+    Ok(request)
+}
+
+fn provider_engine_prompt(messages: &[Value]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let content = provider_message_to_text(message);
+        let _ = writeln!(prompt, "{role}: {content}");
+    }
+    prompt.push_str("assistant:");
+    prompt
+}
+
+fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
+    let chosen = body
+        .get("tool_choice")
+        .and_then(|choice| choice.get("function"))
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str);
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut specs = Vec::new();
+    for tool in tools {
+        let Some(function) = tool.get("function") else {
+            continue;
+        };
+        let Some(name) = function.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if chosen.is_some_and(|chosen| chosen != name) {
+            continue;
+        }
+        let parameters = function
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true }));
+        let mut spec = ToolSpec::new(name, parameters);
+        spec.description = function
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
+fn provider_response_json_schema(body: &Value) -> Value {
+    body.get("response_format")
+        .and_then(|format| format.get("json_schema"))
+        .and_then(|json_schema| json_schema.get("schema"))
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true }))
+}
+
+fn provider_engine_tool_call_output(text: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let name = value
+        .get("tool")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)?
+        .to_owned();
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+        .to_string();
+    Some(json!({
+        "id": format!("call-{}", stable_value_hash(&json!({ "tool": name, "arguments": arguments }))),
+        "name": name,
+        "arguments": arguments,
+    }))
 }
 
 fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> ProviderSessionOutput {
@@ -5955,7 +6240,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             completion_tokens: rough_text_tokens(&content),
             content,
             tool: None,
-            finish_reason: "stop",
+            finish_reason: "stop".to_owned(),
             prompt_tokens,
         };
     }
@@ -5967,7 +6252,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
                 "name": tool_name,
                 "arguments": provider_tool_arguments(&tool_name),
             })),
-            finish_reason: "tool_calls",
+            finish_reason: "tool_calls".to_owned(),
             prompt_tokens,
             completion_tokens: 1,
         };
@@ -5990,7 +6275,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         completion_tokens: rough_text_tokens(&content),
         content,
         tool: None,
-        finish_reason: "stop",
+        finish_reason: "stop".to_owned(),
         prompt_tokens,
     }
 }
@@ -6912,6 +7197,100 @@ mod tests {
             .contains("mayhem-opencode-tool-ok"));
     }
 
+    #[test]
+    fn provider_engine_request_uses_tool_grammar_from_openai_body() {
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "be precise" },
+                { "role": "user", "content": "write a file" }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "description": "write a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "filePath": { "type": "string" } }
+                    }
+                }
+            }],
+            "tool_choice": { "type": "function", "function": { "name": "write" } },
+            "max_tokens": 12,
+            "temperature": 0,
+            "seed": 42
+        });
+        let request = provider_engine_request_from_body(&body).unwrap();
+
+        assert!(request.prompt.contains("system: be precise"));
+        assert!(request.prompt.contains("user: write a file"));
+        assert_eq!(request.max_new_tokens, 12);
+        assert_eq!(request.seed, Some(42));
+        let Some(GrammarSpec::ToolCall { tools }) = request.grammar else {
+            panic!("expected tool-call grammar");
+        };
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "write");
+        assert_eq!(tools[0].description.as_deref(), Some("write a file"));
+    }
+
+    #[test]
+    fn provider_engine_request_uses_json_schema_for_json_mode() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": "return json" }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["ok"],
+                        "properties": { "ok": { "type": "boolean" } }
+                    }
+                }
+            }
+        });
+        let request = provider_engine_request_from_body(&body).unwrap();
+
+        let Some(GrammarSpec::JsonSchema { schema }) = request.grammar else {
+            panic!("expected json schema grammar");
+        };
+        assert_eq!(schema["required"][0], "ok");
+    }
+
+    #[test]
+    fn provider_engine_load_config_uses_admin_artifact_shape() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let args = test_provider_start_args();
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        let config =
+            provider_engine_load_config(&selected, Path::new("/tmp/admin-approved.gguf")).unwrap();
+
+        assert_eq!(
+            config.artifact.path,
+            PathBuf::from("/tmp/admin-approved.gguf")
+        );
+        assert_eq!(config.artifact.format, mayhem_engine::ArtifactFormat::Gguf);
+        assert_eq!(config.ctx_size, 8192);
+        assert_eq!(config.gpu_layers, Some(0));
+    }
+
+    #[test]
+    fn provider_engine_tool_call_output_maps_engine_json_to_openai_shape() {
+        let tool = provider_engine_tool_call_output(
+            r#"{ "tool": "write", "arguments": { "filePath": "ok.txt" } }"#,
+        )
+        .expect("tool call");
+
+        assert_eq!(tool["name"], "write");
+        assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
+        assert!(tool["id"].as_str().unwrap().starts_with("call-"));
+    }
+
     #[tokio::test]
     async fn provider_local_artifact_must_match_admin_root() {
         let temp = env::temp_dir().join(format!(
@@ -7506,6 +7885,7 @@ mod tests {
             heartbeat_count: 1,
             serve_sessions: false,
             serve_sessions_seconds: 0,
+            dev_session_shim: false,
             print_json: true,
             dev_skip_catalog_verify: true,
         }

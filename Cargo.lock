@@ -1367,6 +1367,7 @@ dependencies = [
  "ed25519-dalek",
  "mayhem-bridge",
  "mayhem-enclave",
+ "mayhem-engine",
  "mayhem-gateway",
  "mayhem-hwprobe",
  "mayhem-proto",
