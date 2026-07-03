@@ -13,6 +13,7 @@ const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const testtracAddress = /^testtrac1[0-9a-z]+$/;
 const safeCommandText = /^[a-zA-Z0-9._:@/+~,\-\s<>$:"{}[\]]+$/;
 const sha256Evidence = /#sha256:[0-9a-fA-F]{64}(?:$|[#?&])/;
+const httpUrl = /^https?:\/\//;
 
 function usage() {
   console.log(`Usage: node scripts/beta-launch.mjs [--manifest PATH] [--allow-placeholders] [--json] [--no-commands]
@@ -117,6 +118,32 @@ function requireDecimalString(add, value, name) {
   }
 }
 
+function requireRailCheckoutUrl(add, value, name, rail, expectedPathSegment) {
+  requireString(add, value, name, httpUrl);
+  if (typeof value !== 'string' || isPlaceholder(value)) return;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    add('error', `${name} must be a valid URL`);
+    return;
+  }
+  if (!parsed.pathname.includes(`/${rail}/${expectedPathSegment}`)) {
+    add('error', `${name} must route to a ${rail} ${expectedPathSegment} endpoint`);
+  }
+}
+
+function validateCheckoutUrls(add, paygate) {
+  if (!requireObject(add, paygate.checkout_urls, 'paygate.checkout_urls')) return;
+  for (const rail of ['stripe', 'coinbase']) {
+    const railConfig = paygate.checkout_urls[rail];
+    const prefix = `paygate.checkout_urls.${rail}`;
+    if (!requireObject(add, railConfig, prefix)) continue;
+    requireRailCheckoutUrl(add, railConfig.success_url, `${prefix}.success_url`, rail, 'return');
+    requireRailCheckoutUrl(add, railConfig.cancel_url, `${prefix}.cancel_url`, rail, 'cancel');
+  }
+}
+
 function validateEvidenceArray(add, value, name) {
   if (!requireArray(add, value, name, 1)) return;
   const seen = new Set();
@@ -207,8 +234,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
     requireString(add, manifest.paygate.health_path, 'paygate.health_path');
     requireLiteral(add, manifest.paygate.stripe_enabled, true, 'paygate.stripe_enabled');
     requireLiteral(add, manifest.paygate.coinbase_enabled, true, 'paygate.coinbase_enabled');
-    requireString(add, manifest.paygate.checkout_success_url, 'paygate.checkout_success_url');
-    requireString(add, manifest.paygate.checkout_cancel_url, 'paygate.checkout_cancel_url');
+    validateCheckoutUrls(add, manifest.paygate);
   }
 
   if (requireObject(add, manifest.epoch_wallet, 'epoch_wallet')) {
@@ -389,6 +415,12 @@ function joinUrl(base, suffix) {
   return `${base.replace(/\/+$/, '')}${rawSuffix}`;
 }
 
+function railCheckoutUrl(paygate, rail, field) {
+  return paygate.checkout_urls?.[rail]?.[field]
+    || paygate[field]
+    || `<${rail}-${field.replace('_', '-')}>`;
+}
+
 async function deriveRoomId(enclaveId, creator, nonce) {
   const digest = await blake3(Buffer.from(`${enclaveId}${creator}${nonce}`));
   return Buffer.from(digest).toString('hex').slice(0, 32);
@@ -508,8 +540,8 @@ async function buildCommands(manifest) {
 
   const paygateHealthUrl = paygateBase ? joinUrl(paygateBase, healthPath) : '';
   const checkoutCommands = [
-    `mayhem pay stripe --paygate-url ${sh(paygateBase || '<paygate-url>')} --amount 10 --success-url ${sh(paygate.checkout_success_url || '<success-url>')} --cancel-url ${sh(paygate.checkout_cancel_url || '<cancel-url>')}`,
-    `mayhem pay coinbase --paygate-url ${sh(paygateBase || '<paygate-url>')} --amount 10 --success-url ${sh(paygate.checkout_success_url || '<success-url>')} --cancel-url ${sh(paygate.checkout_cancel_url || '<cancel-url>')}`,
+    `mayhem pay stripe --paygate-url ${sh(paygateBase || '<paygate-url>')} --amount 10 --success-url ${sh(railCheckoutUrl(paygate, 'stripe', 'success_url'))} --cancel-url ${sh(railCheckoutUrl(paygate, 'stripe', 'cancel_url'))}`,
+    `mayhem pay coinbase --paygate-url ${sh(paygateBase || '<paygate-url>')} --amount 10 --success-url ${sh(railCheckoutUrl(paygate, 'coinbase', 'success_url'))} --cancel-url ${sh(railCheckoutUrl(paygate, 'coinbase', 'cancel_url'))}`,
   ];
 
   return {

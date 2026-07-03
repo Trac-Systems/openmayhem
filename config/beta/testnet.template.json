@@ -47,8 +47,16 @@
     "health_path": "/v1/health",
     "stripe_enabled": true,
     "coinbase_enabled": true,
-    "checkout_success_url": "<https://paygate.testnet.example/stripe/return>",
-    "checkout_cancel_url": "<https://paygate.testnet.example/stripe/cancel>"
+    "checkout_urls": {
+      "stripe": {
+        "success_url": "<https://paygate.testnet.example/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}>",
+        "cancel_url": "<https://paygate.testnet.example/v1/stripe/cancel>"
+      },
+      "coinbase": {
+        "success_url": "<https://paygate.testnet.example/v1/coinbase/return>",
+        "cancel_url": "<https://paygate.testnet.example/v1/coinbase/cancel>"
+      }
+    }
   },
   "epoch_wallet": {
     "address": "<testtrac1-funded-epoch-wallet>",
