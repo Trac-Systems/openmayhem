@@ -184,6 +184,25 @@ mode = "$role"
 gateway_url = "http://127.0.0.1:11435"
 rpc_url = "http://127.0.0.1:49223/v1"
 EOF
+      cat >"$config_home/opencode/opencode.json" <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "other": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Other",
+      "models": {
+        "other-model": {
+          "name": "other-model"
+        }
+      }
+    }
+  },
+  "model": "other/other-model",
+  "enabled_providers": ["other"],
+  "theme": "system"
+}
+EOF
 
       "$install_dir/mayhem" test \
         --home "$home" \
@@ -204,12 +223,43 @@ EOF
       grep -F "\"marker_seen\": true" "/tmp/mayhem-$role-test.json" >/dev/null
       grep -F "\"expected_epoch_evidence_key\": \"ev/use/" "/tmp/mayhem-$role-test.json" >/dev/null
       test -s "$config_home/opencode/opencode.json"
+      grep -F "\"other\"" "$config_home/opencode/opencode.json" >/dev/null
+      grep -F "\"model\": \"other/other-model\"" "$config_home/opencode/opencode.json" >/dev/null
+      grep -F "\"theme\": \"system\"" "$config_home/opencode/opencode.json" >/dev/null
       grep -F "\"mayhem\"" "$config_home/opencode/opencode.json" >/dev/null
-      grep -F "\"model\": \"mayhem/" "$config_home/opencode/opencode.json" >/dev/null
     }
 
     run_role provider
     run_role user
+
+    fresh_home=/tmp/mayhem-fresh
+    fresh_config_home=/tmp/mayhem-fresh-config
+    mkdir -p "$fresh_home" "$fresh_config_home/opencode"
+    cat >"$fresh_home/config.toml" <<EOF
+[role]
+mode = "user"
+
+[network]
+gateway_url = "http://127.0.0.1:11435"
+rpc_url = "http://127.0.0.1:49223/v1"
+EOF
+    "$install_dir/mayhem" test \
+      --home "$fresh_home" \
+      --gateway-url http://127.0.0.1:11435 \
+      --skip-peer-health \
+      --sync-models \
+      --opencode-config "$fresh_config_home/opencode/opencode.json" \
+      --opencode-bin "$install_dir/opencode" \
+      --no-opencode-run \
+      --timeout-seconds 90 \
+      --json \
+      >"/tmp/mayhem-fresh-test.json"
+    cat "/tmp/mayhem-fresh-test.json"
+    grep -F "\"ok\": true" "/tmp/mayhem-fresh-test.json" >/dev/null
+    grep -F "\"skipped\": true" "/tmp/mayhem-fresh-test.json" >/dev/null
+    grep -F "\"default_model_added\": true" "/tmp/mayhem-fresh-test.json" >/dev/null
+    test -s "$fresh_config_home/opencode/opencode.json"
+    grep -F "\"model\": \"mayhem/" "$fresh_config_home/opencode/opencode.json" >/dev/null
   '
 
 log "provider/user opencode role smoke passed"
