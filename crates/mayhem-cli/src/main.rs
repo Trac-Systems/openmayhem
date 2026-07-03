@@ -4990,7 +4990,7 @@ fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayChe
                 .ok_or_else(|| anyhow::anyhow!("paygate response missing checkout_session"))?;
             Ok(PayCheckout {
                 id: required_json_string(session, "id")?,
-                url: required_json_string(session, "url")?,
+                url: required_hosted_checkout_url(session, "url")?,
                 reference: session
                     .get("payment_intent")
                     .and_then(Value::as_str)
@@ -5003,7 +5003,7 @@ fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayChe
                 .ok_or_else(|| anyhow::anyhow!("paygate response missing charge"))?;
             Ok(PayCheckout {
                 id: required_json_string(charge, "id")?,
-                url: required_json_string(charge, "hosted_url")?,
+                url: required_hosted_checkout_url(charge, "hosted_url")?,
                 reference: charge
                     .get("code")
                     .and_then(Value::as_str)
@@ -5020,6 +5020,16 @@ fn required_json_string(value: &Value, field: &str) -> Result<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("paygate response missing {field}"))
+}
+
+fn required_hosted_checkout_url(value: &Value, field: &str) -> Result<String> {
+    let url = required_json_string(value, field)?;
+    let parsed = reqwest::Url::parse(&url)
+        .with_context(|| format!("paygate response {field} is not a valid URL"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(url),
+        scheme => bail!("paygate response {field} uses unsupported URL scheme {scheme:?}"),
+    }
 }
 
 fn default_checkout_success_url(paygate_url: &str, rail: PayRail) -> String {
@@ -11266,6 +11276,26 @@ mod tests {
         assert!(checkout_from_paygate_response(
             PayRail::Coinbase,
             &json!({ "charge": { "id": "charge_test" } })
+        )
+        .is_err());
+        assert!(checkout_from_paygate_response(
+            PayRail::Stripe,
+            &json!({
+                "checkout_session": {
+                    "id": "cs_test",
+                    "url": "javascript:alert(1)"
+                }
+            }),
+        )
+        .is_err());
+        assert!(checkout_from_paygate_response(
+            PayRail::Coinbase,
+            &json!({
+                "charge": {
+                    "id": "charge_test",
+                    "hosted_url": "file:///tmp/mayhem-checkout.html"
+                }
+            }),
         )
         .is_err());
     }
