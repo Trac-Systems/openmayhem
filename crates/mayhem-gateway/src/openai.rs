@@ -639,6 +639,7 @@ impl ScBridgeGatewaySessionBackend {
                 invocation.session_id
             )));
         }
+        validate_direct_session_accept(&accept, invocation)?;
 
         let request_id = blake3_hex(
             format!(
@@ -691,6 +692,53 @@ impl ScBridgeGatewaySessionBackend {
             direct_session: true,
         })
     }
+}
+
+fn validate_direct_session_accept(
+    frame: &Value,
+    invocation: &GatewaySessionInvocation,
+) -> Result<(), GatewaySessionError> {
+    let fail = |message: String| GatewaySessionError::new(message);
+    if frame.get("t").and_then(Value::as_str) != Some("s.accept") {
+        return Err(fail("provider response was not s.accept".to_owned()));
+    }
+    if frame.get("session_id").and_then(Value::as_str) != Some(invocation.session_id.as_str()) {
+        return Err(fail(format!(
+            "provider accept session_id did not match {}",
+            invocation.session_id
+        )));
+    }
+    let report = frame
+        .get("att_report")
+        .and_then(Value::as_object)
+        .ok_or_else(|| fail("provider accept missing att_report".to_owned()))?;
+    if report.get("enclave_id").and_then(Value::as_str) != Some(invocation.enclave_id.as_str()) {
+        return Err(fail(format!(
+            "provider accept att_report enclave_id did not match {}",
+            invocation.enclave_id
+        )));
+    }
+    if let Some(provider) = invocation.provider_pubkey.as_deref() {
+        if report.get("provider_pubkey").and_then(Value::as_str) != Some(provider) {
+            return Err(fail(format!(
+                "provider accept att_report provider_pubkey did not match {provider}"
+            )));
+        }
+    }
+    let top_sig = frame
+        .get("sig")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("provider accept missing sig".to_owned()))?;
+    let report_sig = report
+        .get("sig_provider")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("provider accept att_report missing sig_provider".to_owned()))?;
+    if top_sig != report_sig {
+        return Err(fail(
+            "provider accept sig did not match att_report sig_provider".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn next_session_frame(
@@ -1747,5 +1795,87 @@ impl IntoResponse for ApiError {
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_session_accept_pins_session_enclave_provider_and_signature() {
+        let invocation = test_invocation();
+        let frame = test_accept_frame(&invocation);
+        validate_direct_session_accept(&frame, &invocation).expect("matching accept is valid");
+
+        let mut wrong_session = frame.clone();
+        wrong_session["session_id"] = json!("bb".repeat(32));
+        assert_accept_err(&wrong_session, &invocation, "session_id");
+
+        let mut wrong_enclave = frame.clone();
+        wrong_enclave["att_report"]["enclave_id"] = json!("cc".repeat(32));
+        assert_accept_err(&wrong_enclave, &invocation, "enclave_id");
+
+        let mut wrong_provider = frame.clone();
+        wrong_provider["att_report"]["provider_pubkey"] = json!("dd".repeat(32));
+        assert_accept_err(&wrong_provider, &invocation, "provider_pubkey");
+
+        let mut wrong_sig = frame;
+        wrong_sig["sig"] = json!("ee".repeat(64));
+        assert_accept_err(&wrong_sig, &invocation, "sig_provider");
+    }
+
+    fn assert_accept_err(frame: &Value, invocation: &GatewaySessionInvocation, needle: &str) {
+        let err = validate_direct_session_accept(frame, invocation)
+            .expect_err("mutated accept must be rejected");
+        assert!(
+            err.message.contains(needle),
+            "expected error to contain {needle}, got {}",
+            err.message
+        );
+    }
+
+    fn test_invocation() -> GatewaySessionInvocation {
+        let session_id = "aa".repeat(32);
+        let enclave_id = "11".repeat(32);
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver: 7,
+            max_spend_mu: 1000,
+            checkpoint_every: CheckpointPolicy {
+                tokens: 128,
+                ms: 30_000,
+            },
+        };
+        GatewaySessionInvocation {
+            session_id,
+            user_pubkey: "22".repeat(32),
+            provider_pubkey: Some("33".repeat(32)),
+            enclave_id,
+            price_ver: 7,
+            rules_ver: 3,
+            spend_voucher: SpendVoucher {
+                body: voucher_body,
+                user_sig: "44".repeat(64),
+            },
+        }
+    }
+
+    fn test_accept_frame(invocation: &GatewaySessionInvocation) -> Value {
+        let provider = invocation.provider_pubkey.as_ref().unwrap();
+        let sig = "55".repeat(64);
+        json!({
+            "t": "s.accept",
+            "v": 1,
+            "session_id": invocation.session_id,
+            "att_report": {
+                "enclave_id": invocation.enclave_id,
+                "provider_pubkey": provider,
+                "sig_provider": sig,
+            },
+            "engine": { "ctx": 8192 },
+            "sig": sig,
+        })
     }
 }
