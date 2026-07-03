@@ -148,6 +148,24 @@ function asEvidenceArray(value, paths = ['evidence']) {
   return found ? found.filter((item) => typeof item === 'string' && item.length > 0) : [];
 }
 
+function checkoutUrlFromPayReport(value) {
+  const url = firstDefined(value, ['copy_paste.checkout_url', 'checkout.url']);
+  return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : null;
+}
+
+function checkoutUrlEvidenceFromJson(value, sourceEvidence) {
+  const records = Array.isArray(value)
+    ? value
+    : (asArrayFrom(value, ['browser_handoffs.reports', 'reports', 'data']) ?? [value]);
+  const samples = [];
+  for (const record of records) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
+    const url = checkoutUrlFromPayReport(record);
+    if (url) samples.push(`${sourceEvidence}#copy_paste.checkout_url:${url}`);
+  }
+  return samples;
+}
+
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') {
@@ -312,11 +330,16 @@ function collectCanary(args) {
 function collectBrowserHandoffs(args) {
   const source = parseMaybeJsonEvidence(requireArg(args, 'browserHandoffs'));
   if (source.value && typeof source.value === 'object') {
+    const checkoutSamples = checkoutUrlEvidenceFromJson(source.value, source.evidence);
+    const explicitCopyPaste = firstDefined(source.value, [
+      'browser_handoffs.copy_paste_urls_printed',
+      'copy_paste_urls_printed',
+    ]);
     return {
-      copy_paste_urls_printed:
-        firstDefined(source.value, ['browser_handoffs.copy_paste_urls_printed', 'copy_paste_urls_printed']) === true,
+      copy_paste_urls_printed: explicitCopyPaste === true || checkoutSamples.length > 0,
       samples: [
         source.evidence,
+        ...checkoutSamples,
         ...asEvidenceArray(source.value, ['browser_handoffs.samples', 'samples', 'evidence']),
       ],
     };
