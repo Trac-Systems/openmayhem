@@ -381,6 +381,17 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
         `audit:canonical-service:v1#sha256:${summaryDigest}`,
       ],
     },
+    controls: {
+      admin_controls_economy: ok,
+      providers_set_prices: false,
+      providers_submit_models: false,
+      providers_create_canonical_rooms: false,
+      providers_only_join_admin_rooms: ok,
+      evidence: [
+        sourceEvidence,
+        `audit:admin-control-plane:v1#sha256:${summaryDigest}`,
+      ],
+    },
     errors,
     warnings,
   };

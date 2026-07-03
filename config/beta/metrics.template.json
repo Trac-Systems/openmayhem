@@ -28,7 +28,10 @@
     "providers_set_prices": false,
     "providers_submit_models": false,
     "providers_create_canonical_rooms": false,
-    "providers_only_join_admin_rooms": true
+    "providers_only_join_admin_rooms": true,
+    "evidence": [
+      "<admin-control-plane-audit-file-hash-or-url>"
+    ]
   },
   "canonical_service": {
     "admin_created_enclaves_verified": true,

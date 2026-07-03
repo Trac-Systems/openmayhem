@@ -373,15 +373,29 @@ function collectCanonicalService(args) {
   const source = readJsonEvidence(requireArg(args, 'canonicalService'));
   const value = source.value;
   const record = firstDefined(value, ['canonical_service']) ?? value;
+  const controls = firstDefined(value, ['controls']) ?? {};
   return {
-    admin_created_enclaves_verified: firstDefined(record, ['admin_created_enclaves_verified']) === true,
-    admin_created_rooms_verified: firstDefined(record, ['admin_created_rooms_verified']) === true,
-    provider_join_records_verified: firstDefined(record, ['provider_join_records_verified']) === true,
-    admin_price_records_verified: firstDefined(record, ['admin_price_records_verified']) === true,
-    evidence: [
-      source.evidence,
-      ...asEvidenceArray(value, ['canonical_service.evidence', 'evidence']),
-    ],
+    canonical_service: {
+      admin_created_enclaves_verified: firstDefined(record, ['admin_created_enclaves_verified']) === true,
+      admin_created_rooms_verified: firstDefined(record, ['admin_created_rooms_verified']) === true,
+      provider_join_records_verified: firstDefined(record, ['provider_join_records_verified']) === true,
+      admin_price_records_verified: firstDefined(record, ['admin_price_records_verified']) === true,
+      evidence: [
+        source.evidence,
+        ...asEvidenceArray(value, ['canonical_service.evidence', 'evidence']),
+      ],
+    },
+    controls: {
+      admin_controls_economy: firstDefined(controls, ['admin_controls_economy']),
+      providers_set_prices: firstDefined(controls, ['providers_set_prices']),
+      providers_submit_models: firstDefined(controls, ['providers_submit_models']),
+      providers_create_canonical_rooms: firstDefined(controls, ['providers_create_canonical_rooms']),
+      providers_only_join_admin_rooms: firstDefined(controls, ['providers_only_join_admin_rooms']),
+      evidence: [
+        source.evidence,
+        ...asEvidenceArray(value, ['controls.evidence', 'evidence']),
+      ],
+    },
   };
 }
 
@@ -419,7 +433,7 @@ function buildMetrics(args) {
   const guardian = collectGuardian(args);
   const canary = collectCanary(args);
   const browserHandoffs = collectBrowserHandoffs(args);
-  const canonicalService = collectCanonicalService(args);
+  const canonicalAudit = collectCanonicalService(args);
   const paymentRails = collectPaymentRails(args);
 
   for (const key of ['dep', 'use', 'earn', 'fee', 'pay']) {
@@ -445,14 +459,8 @@ function buildMetrics(args) {
       started_at: requireArg(args, 'windowStart'),
       ended_at: requireArg(args, 'windowEnd'),
     },
-    controls: {
-      admin_controls_economy: true,
-      providers_set_prices: false,
-      providers_submit_models: false,
-      providers_create_canonical_rooms: false,
-      providers_only_join_admin_rooms: true,
-    },
-    canonical_service: canonicalService,
+    controls: canonicalAudit.controls,
+    canonical_service: canonicalAudit.canonical_service,
     participants,
     audited_epoch: auditedEpoch,
     guardian,

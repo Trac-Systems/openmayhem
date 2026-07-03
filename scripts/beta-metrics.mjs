@@ -175,6 +175,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireBoolean(add, metrics.controls.providers_submit_models, false, 'controls.providers_submit_models');
     requireBoolean(add, metrics.controls.providers_create_canonical_rooms, false, 'controls.providers_create_canonical_rooms');
     requireBoolean(add, metrics.controls.providers_only_join_admin_rooms, true, 'controls.providers_only_join_admin_rooms');
+    validateEvidenceArray(add, metrics.controls.evidence, 'controls.evidence');
   }
 
   if (requireObject(add, metrics.canonical_service, 'canonical_service')) {
