@@ -168,8 +168,15 @@ function normalizeRail(value) {
 }
 
 function railFromUrl(url) {
-  if (/stripe\.com/i.test(url)) return 'stripe';
-  if (/coinbase\.com/i.test(url)) return 'coinbase';
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === 'checkout.stripe.com') return 'stripe';
+  if (hostname === 'commerce.coinbase.com') return 'coinbase';
   return null;
 }
 

@@ -155,6 +155,32 @@ function hasEvidenceTag(value, tag) {
   return typeof value === 'string' && value.split('#').includes(tag);
 }
 
+function checkoutUrlFromEvidence(value) {
+  if (typeof value !== 'string') return null;
+  const marker = '#copy_paste.checkout_url:';
+  const offset = value.indexOf(marker);
+  if (offset === -1) return null;
+  const rest = value.slice(offset + marker.length);
+  const end = rest.indexOf('#');
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
+function checkoutUrlMatchesRail(value, rail) {
+  const url = checkoutUrlFromEvidence(value);
+  if (!url) return false;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  const hostname = parsed.hostname.toLowerCase();
+  if (rail === 'stripe') return hostname === 'checkout.stripe.com';
+  if (rail === 'coinbase') return hostname === 'commerce.coinbase.com';
+  return false;
+}
+
 function validatePaymentRailEvidence(add, value) {
   validateEvidenceArray(add, value, 'payment_rails.evidence');
   if (!Array.isArray(value)) return;
@@ -176,8 +202,8 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
   if (!Array.isArray(railsVerified)) return;
   for (const rail of ['stripe', 'coinbase']) {
     if (!railsVerified.includes(rail)) continue;
-    if (!value.some((sample) => /#copy_paste\.checkout_url:https?:\/\//i.test(sample) && hasEvidenceTag(sample, `rail:${rail}`))) {
-      add('error', `browser_handoffs.samples must include copy_paste.checkout_url evidence for ${rail}`);
+    if (!value.some((sample) => hasEvidenceTag(sample, `rail:${rail}`) && checkoutUrlMatchesRail(sample, rail))) {
+      add('error', `browser_handoffs.samples must include hosted ${rail} checkout URL evidence`);
     }
   }
 }
