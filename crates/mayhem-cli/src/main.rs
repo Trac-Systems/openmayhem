@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use mayhem_bridge::{
     BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL,
     DEFAULT_SC_BRIDGE_URL,
@@ -42,7 +43,7 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage, SESSION_RECEIPT_SCHEMA_VERSION,
+    CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -7777,7 +7778,7 @@ async fn handle_provider_session_frame(
                 .unwrap_or("missing-rid");
             let body = frame.get("body").cloned().unwrap_or(Value::Null);
             let output = responder.respond(terms, &body)?;
-            send_provider_session_output(
+            let receipt = send_provider_session_output(
                 bridge,
                 &active,
                 request_id,
@@ -7787,6 +7788,20 @@ async fn handle_provider_session_frame(
                 runtime.runtime_keypair,
             )
             .await?;
+            if wait_for_provider_receipt_ack(bridge, &active, &receipt, Duration::from_secs(5))
+                .await
+                .is_err()
+            {
+                send_provider_session_close(
+                    bridge,
+                    &active.remote,
+                    &active.session_id,
+                    "err:receipt_ack",
+                )
+                .await?;
+                sessions.remove(&session_id);
+                return Ok(());
+            }
             send_provider_session_close(bridge, &active.remote, &active.session_id, "done").await?;
             sessions.remove(&session_id);
         }
@@ -7806,7 +7821,7 @@ async fn send_provider_session_output(
     body: &Value,
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
-) -> Result<()> {
+) -> Result<ProviderSignedSessionReceipt> {
     if let Some(tool) = &output.tool {
         bridge
             .session_send(
@@ -7878,7 +7893,96 @@ async fn send_provider_session_output(
         )
         .await
         .context("sending s.receipt")?;
-    Ok(())
+    Ok(receipt)
+}
+
+async fn wait_for_provider_receipt_ack(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    receipt: &ProviderSignedSessionReceipt,
+    wait: Duration,
+) -> Result<ReceiptAck> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "timed out waiting for s.receipt_ack on {}",
+                active.session_id
+            );
+        }
+        match bridge.next_session_frame(remaining).await {
+            Ok(event) => {
+                if event.get("session_id").and_then(Value::as_str)
+                    != Some(active.session_id.as_str())
+                {
+                    continue;
+                }
+                let frame = event.get("frame").cloned().unwrap_or(Value::Null);
+                match frame.get("t").and_then(Value::as_str) {
+                    Some("s.receipt_ack") => {
+                        return provider_session_receipt_ack_from_frame(&frame, active, receipt);
+                    }
+                    Some("s.close") => {
+                        bail!("session {} closed before s.receipt_ack", active.session_id);
+                    }
+                    _ => {}
+                }
+            }
+            Err(BridgeError::Timeout) => {
+                bail!(
+                    "timed out waiting for s.receipt_ack on {}",
+                    active.session_id
+                );
+            }
+            Err(err) => return Err(err).context("reading s.receipt_ack"),
+        }
+    }
+}
+
+fn provider_session_receipt_ack_from_frame(
+    frame: &Value,
+    active: &ActiveProviderSession,
+    receipt: &ProviderSignedSessionReceipt,
+) -> Result<ReceiptAck> {
+    if frame.get("t").and_then(Value::as_str) != Some("s.receipt_ack") {
+        bail!("receipt ack frame must have t=s.receipt_ack");
+    }
+    if frame.get("session_id").and_then(Value::as_str) != Some(active.session_id.as_str()) {
+        bail!("receipt ack session_id mismatch");
+    }
+    let ack = ReceiptAck {
+        session_id: active.session_id.clone(),
+        seq: frame
+            .get("seq")
+            .and_then(Value::as_u64)
+            .context("receipt ack missing seq")?,
+        user_sig: frame
+            .get("user_sig")
+            .and_then(Value::as_str)
+            .context("receipt ack missing user_sig")?
+            .to_owned(),
+    };
+    if ack.seq != receipt.body.seq {
+        bail!("receipt ack seq mismatch");
+    }
+    verify_provider_session_receipt_ack(&ack, &active.user_pubkey, &receipt.body)?;
+    Ok(ack)
+}
+
+fn verify_provider_session_receipt_ack(
+    ack: &ReceiptAck,
+    user_pubkey: &str,
+    body: &ReceiptBody,
+) -> Result<()> {
+    let key_bytes = hex_decode_array::<32>(user_pubkey, "receipt ack user pubkey")?;
+    let sig_bytes = hex_decode_array::<64>(&ack.user_sig, "receipt ack user signature")?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).context("invalid receipt ack user pubkey")?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    verifying_key
+        .verify(&receipt_signing_bytes(body)?, &signature)
+        .context("receipt ack user signature failed")
 }
 
 async fn send_provider_session_close(
@@ -8634,6 +8738,30 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn hex_decode_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+    if value.len() != N * 2 {
+        bail!("{label} must be {N} bytes of hex");
+    }
+    let mut out = [0_u8; N];
+    let bytes = value.as_bytes();
+    for index in 0..N {
+        let high = hex_nibble(bytes[index * 2]).with_context(|| format!("{label} is not hex"))?;
+        let low =
+            hex_nibble(bytes[index * 2 + 1]).with_context(|| format!("{label} is not hex"))?;
+        out[index] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn safe_path_component(value: &str) -> String {
     value
         .chars()
@@ -9306,7 +9434,7 @@ fn setup_admin_payout_notice(role: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
 
     struct FakeEngineBackend {
@@ -10372,6 +10500,58 @@ mod tests {
         verifying_key
             .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
+    }
+
+    #[test]
+    fn provider_session_receipt_ack_verifies_user_signature() {
+        let terms = test_provider_session_terms();
+        let user_seed = [41_u8; 32];
+        let user_key = SigningKey::from_bytes(&user_seed);
+        let active = ActiveProviderSession {
+            remote: "peer-a".to_owned(),
+            user_pubkey: hex_encode(&user_key.verifying_key().to_bytes()),
+            session_id: "aa".repeat(32),
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hello mayhem" }],
+            "stream": true
+        });
+        let output = ProviderSessionOutput {
+            content: "receipt ok".to_owned(),
+            tool: None,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 2,
+            completion_tokens: 3,
+        };
+        let receipt = provider_session_receipt(
+            &terms,
+            &active,
+            &body,
+            &output,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .unwrap();
+        let payload = receipt_signing_bytes(&receipt.body).unwrap();
+        let user_sig = hex_encode(&user_key.sign(&payload).to_bytes());
+        let frame = json!({
+            "t": "s.receipt_ack",
+            "v": 1,
+            "session_id": &active.session_id,
+            "seq": receipt.body.seq,
+            "user_sig": user_sig,
+        });
+
+        let ack = provider_session_receipt_ack_from_frame(&frame, &active, &receipt).unwrap();
+        assert_eq!(ack.session_id, active.session_id);
+        assert_eq!(ack.seq, receipt.body.seq);
+
+        let mut wrong_seq = frame.clone();
+        wrong_seq["seq"] = json!(receipt.body.seq + 1);
+        assert!(provider_session_receipt_ack_from_frame(&wrong_seq, &active, &receipt).is_err());
+
+        let mut wrong_sig = frame;
+        wrong_sig["user_sig"] = json!("11".repeat(64));
+        assert!(provider_session_receipt_ack_from_frame(&wrong_sig, &active, &receipt).is_err());
     }
 
     #[test]

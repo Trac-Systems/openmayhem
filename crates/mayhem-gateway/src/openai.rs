@@ -226,6 +226,8 @@ pub struct GatewaySessionInvocation {
     pub rules_ver: u64,
     pub spend_voucher: SpendVoucher,
     pub attestation: Option<GatewaySessionAttestation>,
+    receipt_cosign_enabled: bool,
+    receipt_user_seed: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -534,7 +536,7 @@ struct ProviderReceiptWire {
 
 struct ExpectedProviderReceipt<'a> {
     provider: &'a str,
-    usage: &'a ReceiptUsage,
+    usage: ReceiptUsage,
     mu_owed_cum: u64,
     prompt_hash: String,
 }
@@ -607,17 +609,18 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
 
     fn run_chat<'a>(
         &'a self,
-        _model: &'a GatewayModel,
+        model: &'a GatewayModel,
         request: &'a ChatCompletionRequest,
         invocation: &'a GatewaySessionInvocation,
     ) -> GatewaySessionFuture<'a> {
-        Box::pin(async move { self.run_chat_over_bridge(request, invocation).await })
+        Box::pin(async move { self.run_chat_over_bridge(model, request, invocation).await })
     }
 }
 
 impl ScBridgeGatewaySessionBackend {
     async fn run_chat_over_bridge(
         &self,
+        model: &GatewayModel,
         request: &ChatCompletionRequest,
         invocation: &GatewaySessionInvocation,
     ) -> Result<GatewaySessionResult, GatewaySessionError> {
@@ -730,6 +733,27 @@ impl ScBridgeGatewaySessionBackend {
             &accept_info.enclave_pubkey,
         )
         .await?;
+        let receipt_ack = direct_session_receipt_ack(
+            request,
+            &collected.output,
+            invocation,
+            &collected.provider_receipt,
+            provider,
+            model,
+        )?;
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.receipt_ack",
+                    "v": 1,
+                    "session_id": receipt_ack.session_id,
+                    "seq": receipt_ack.seq,
+                    "user_sig": receipt_ack.user_sig,
+                }),
+            )
+            .await?;
         let _ = bridge
             .session_send(
                 provider,
@@ -1083,6 +1107,118 @@ fn provider_signed_receipt_from_frame(
     })
 }
 
+fn direct_session_receipt_ack(
+    request: &ChatCompletionRequest,
+    output: &ChatOutput,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    provider: &str,
+    model: &GatewayModel,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new(
+            "receipt co-signing refused; session paused",
+        ));
+    }
+    let expected = expected_provider_receipt(model, request, output, provider);
+    validate_provider_receipt(model, invocation, provider_receipt, expected)?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "provider receipt ack signing payload failed: {err}"
+        ))
+    })
+}
+
+fn expected_provider_receipt<'a>(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    output: &ChatOutput,
+    provider: &'a str,
+) -> ExpectedProviderReceipt<'a> {
+    let usage = ReceiptUsage {
+        in_tokens: output.usage.prompt_tokens,
+        out_tokens: output.usage.completion_tokens,
+    };
+    ExpectedProviderReceipt {
+        provider,
+        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
+        usage,
+    }
+}
+
+fn validate_provider_receipt(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    expected: ExpectedProviderReceipt<'_>,
+) -> Result<(), GatewaySessionError> {
+    let body = &provider_receipt.body;
+    let checks = [
+        (
+            body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION,
+            "provider receipt schema_version is not supported",
+        ),
+        (
+            body.session_id == invocation.session_id,
+            "provider receipt session_id mismatch",
+        ),
+        (body.seq == 1, "provider receipt seq mismatch"),
+        (body.final_receipt, "provider receipt is not final"),
+        (
+            body.user == invocation.user_pubkey,
+            "provider receipt user mismatch",
+        ),
+        (
+            body.provider == expected.provider,
+            "provider receipt provider mismatch",
+        ),
+        (
+            body.enclave_id == invocation.enclave_id,
+            "provider receipt enclave mismatch",
+        ),
+        (body.model_id == model.id, "provider receipt model mismatch"),
+        (
+            body.price_ver == invocation.price_ver,
+            "provider receipt price_ver mismatch",
+        ),
+        (
+            body.rules_ver == invocation.rules_ver,
+            "provider receipt rules_ver mismatch",
+        ),
+        (
+            body.usage == expected.usage,
+            "provider receipt usage mismatch",
+        ),
+        (
+            body.mu_owed_cum == expected.mu_owed_cum,
+            "provider receipt amount mismatch",
+        ),
+        (
+            body.prompt_hash == expected.prompt_hash,
+            "provider receipt prompt_hash mismatch",
+        ),
+    ];
+    for (ok, message) in checks {
+        if !ok {
+            return Err(GatewaySessionError::new(message));
+        }
+    }
+    verify_provider_receipt_signature(provider_receipt)
+}
+
+fn receipt_ack_for_body(
+    user_seed: &[u8; 32],
+    body: &ReceiptBody,
+) -> Result<ReceiptAck, serde_json::Error> {
+    let payload = receipt_signing_bytes(body)?;
+    Ok(ReceiptAck {
+        session_id: body.session_id.clone(),
+        seq: body.seq,
+        user_sig: sign_hex(user_seed, &payload),
+    })
+}
+
 fn tool_call_from_session_delta(frame: &Value) -> Option<ToolCallOutput> {
     let tool = frame.get("tool")?;
     if tool.is_null() {
@@ -1306,6 +1442,8 @@ impl GatewayState {
                 user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
             },
             attestation,
+            receipt_cosign_enabled: self.receipt_config.cosign_enabled,
+            receipt_user_seed: self.receipt_config.user_seed,
         })
     }
 
@@ -1352,7 +1490,7 @@ impl GatewayState {
                 provider_receipt,
                 ExpectedProviderReceipt {
                     provider: &provider,
-                    usage: &usage,
+                    usage: usage.clone(),
                     mu_owed_cum,
                     prompt_hash: blake3_hex(prompt_text.as_bytes()),
                 },
@@ -1405,63 +1543,14 @@ impl GatewayState {
         expected: ExpectedProviderReceipt<'_>,
     ) -> Result<SessionReceipt, ApiError> {
         let body = &provider_receipt.body;
-        let checks = [
-            (
-                body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION,
-                "provider receipt schema_version is not supported",
-            ),
-            (
-                body.session_id == invocation.session_id,
-                "provider receipt session_id mismatch",
-            ),
-            (body.seq == 1, "provider receipt seq mismatch"),
-            (body.final_receipt, "provider receipt is not final"),
-            (
-                body.user == invocation.user_pubkey,
-                "provider receipt user mismatch",
-            ),
-            (
-                body.provider == expected.provider,
-                "provider receipt provider mismatch",
-            ),
-            (
-                body.enclave_id == invocation.enclave_id,
-                "provider receipt enclave mismatch",
-            ),
-            (body.model_id == model.id, "provider receipt model mismatch"),
-            (
-                body.price_ver == invocation.price_ver,
-                "provider receipt price_ver mismatch",
-            ),
-            (
-                body.rules_ver == invocation.rules_ver,
-                "provider receipt rules_ver mismatch",
-            ),
-            (
-                body.usage == *expected.usage,
-                "provider receipt usage mismatch",
-            ),
-            (
-                body.mu_owed_cum == expected.mu_owed_cum,
-                "provider receipt amount mismatch",
-            ),
-            (
-                body.prompt_hash == expected.prompt_hash,
-                "provider receipt prompt_hash mismatch",
-            ),
-        ];
-        for (ok, message) in checks {
-            if !ok {
-                return Err(ApiError::bad_gateway(message, Some("model")));
-            }
-        }
-        verify_provider_receipt_signature(provider_receipt)
+        validate_provider_receipt(model, invocation, provider_receipt, expected)
             .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
-        let receipt_payload = receipt_signing_bytes(body).map_err(ApiError::internal)?;
+        let receipt_ack = receipt_ack_for_body(&self.receipt_config.user_seed, body)
+            .map_err(ApiError::internal)?;
         Ok(SessionReceipt {
             body: body.clone(),
             enclave_sig: provider_receipt.enclave_sig.clone(),
-            user_sig: sign_hex(&self.receipt_config.user_seed, &receipt_payload),
+            user_sig: receipt_ack.user_sig,
         })
     }
 
@@ -2187,6 +2276,17 @@ mod tests {
         assert_eq!(stored.receipt.body, provider_receipt.body);
         assert_eq!(stored.receipt_ack.user_sig, stored.receipt.user_sig);
 
+        let live_ack = direct_session_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &provider_receipt,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect("direct session ack signs the accepted receipt");
+        assert_eq!(live_ack, stored.receipt_ack);
+
         let mut wrong_amount = provider_receipt.clone();
         wrong_amount.body.mu_owed_cum = wrong_amount.body.mu_owed_cum.saturating_add(1);
         wrong_amount.enclave_sig = sign_hex(
@@ -2247,7 +2347,7 @@ mod tests {
         };
         GatewaySessionInvocation {
             session_id,
-            user_pubkey: "22".repeat(32),
+            user_pubkey: verifying_key_hex(&test_user_seed()),
             provider_pubkey: Some(verifying_key_hex(&test_provider_seed())),
             enclave_id,
             price_ver: 7,
@@ -2260,6 +2360,8 @@ mod tests {
                 contract,
                 trusted_binary_hashes: BTreeSet::from([identity.binary_hash]),
             }),
+            receipt_cosign_enabled: true,
+            receipt_user_seed: test_user_seed(),
         }
     }
 
@@ -2447,6 +2549,10 @@ mod tests {
 
     fn test_provider_seed() -> [u8; 32] {
         [7; 32]
+    }
+
+    fn test_user_seed() -> [u8; 32] {
+        [41; 32]
     }
 
     fn test_enclave_seed() -> [u8; 32] {
