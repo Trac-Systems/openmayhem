@@ -318,6 +318,107 @@ test('MayhemContract requires a current admin price before provider serving rows
   assert.equal(await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`), null);
 });
 
+test('MayhemContract validates admin enclave caps as capability-only records', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  const providerFeeCaps = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: '7'.repeat(64),
+      caps: {
+        ...enclaveRegistration.caps,
+        provider_fee_bps: 1000,
+      },
+    },
+    admin.publicKey,
+    1
+  );
+  assert.match(providerFeeCaps.message, /unsupported enclave caps field.*provider_fee_bps/i);
+  assert.equal(await storage.get(`enclave/${'7'.repeat(64)}`), null);
+
+  const stringBooleanCaps = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: '8'.repeat(64),
+      caps: {
+        ...enclaveRegistration.caps,
+        tools: 'true',
+      },
+    },
+    admin.publicKey,
+    2
+  );
+  assert.match(stringBooleanCaps.message, /caps tools must be a boolean/i);
+
+  const invalidContextCaps = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: '9'.repeat(64),
+      caps: {
+        chat: true,
+        tools: false,
+        ctx: 0,
+      },
+    },
+    admin.publicKey,
+    3
+  );
+  assert.match(invalidContextCaps.message, /caps ctx must be a positive integer/i);
+
+  const catalogStyleCaps = {
+    tools: true,
+    json: true,
+    ctx_max: 8192,
+    vision: false,
+  };
+  const accepted = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'a'.repeat(64),
+      caps: catalogStyleCaps,
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(accepted.ok, true, accepted.message);
+
+  const unsupportedUpdate = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'a'.repeat(64),
+      caps: {
+        ...catalogStyleCaps,
+        price_ver: 99,
+      },
+    },
+    admin.publicKey,
+    5
+  );
+  assert.match(unsupportedUpdate.message, /unsupported enclave caps field.*price_ver/i);
+
+  const stored = await storage.get(`enclave/${'a'.repeat(64)}`);
+  assert.deepEqual(stored.value.caps, catalogStyleCaps);
+});
+
 test('MayhemContract rejects provider-authored payout and probation hints', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();

@@ -78,6 +78,19 @@ const ENCLAVE_UPDATE_FIELDS = [
   'binary_hash',
   'caps',
 ];
+const ENCLAVE_CAP_BOOLEAN_FIELDS = [
+  'chat',
+  'tools',
+  'json',
+  'embeddings',
+  'vision',
+  'audio',
+];
+const ENCLAVE_CAP_FIELDS = new Set([
+  ...ENCLAVE_CAP_BOOLEAN_FIELDS,
+  'ctx',
+  'ctx_max',
+]);
 
 export const consentMessage = (ver, hash) => `mayhem-consent${ver}${hash}`;
 export const receiptMessage = (body) => JSON.stringify({
@@ -834,6 +847,9 @@ class MayhemContract extends Contract {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
 
+    const capsError = this.validateEnclaveCaps(this.value.caps);
+    if (capsError) return capsError;
+
     const key = `enclave/${this.value.enclave_id}`;
     if ((await this.get(key)) !== null) return new Error('Enclave already registered.');
 
@@ -871,6 +887,10 @@ class MayhemContract extends Contract {
     const updated = cloneValue(record);
     for (const field of ENCLAVE_UPDATE_FIELDS) {
       if (!hasOwn(this.value, field)) continue;
+      if (field === 'caps') {
+        const capsError = this.validateEnclaveCaps(this.value.caps);
+        if (capsError) return capsError;
+      }
       updated[field] = cloneValue(this.value[field]);
       changed = true;
     }
@@ -2757,6 +2777,32 @@ class MayhemContract extends Contract {
     }
     if (value.source_hash !== undefined && !this.isSafeKeyPart(value.source_hash)) {
       return new Error('Invalid model reference source hash.');
+    }
+    return null;
+  }
+
+  validateEnclaveCaps(caps) {
+    if (!caps || typeof caps !== 'object' || Array.isArray(caps)) {
+      return new Error('Enclave caps must be an object.');
+    }
+    const unknown = Object.keys(caps).filter((key) => !ENCLAVE_CAP_FIELDS.has(key)).sort();
+    if (unknown.length > 0) {
+      return new Error(`Unsupported enclave caps field: ${unknown.join(', ')}.`);
+    }
+    for (const key of ENCLAVE_CAP_BOOLEAN_FIELDS) {
+      if (hasOwn(caps, key) && typeof caps[key] !== 'boolean') {
+        return new Error(`Enclave caps ${key} must be a boolean.`);
+      }
+    }
+    const hasCtx = hasOwn(caps, 'ctx');
+    const hasCtxMax = hasOwn(caps, 'ctx_max');
+    for (const key of ['ctx', 'ctx_max']) {
+      if (hasOwn(caps, key) && (!Number.isSafeInteger(caps[key]) || caps[key] <= 0)) {
+        return new Error(`Enclave caps ${key} must be a positive integer.`);
+      }
+    }
+    if (hasCtx && hasCtxMax && caps.ctx !== caps.ctx_max) {
+      return new Error('Enclave caps ctx and ctx_max must match when both are set.');
     }
     return null;
   }

@@ -79,7 +79,7 @@ async function setupProviderServing(ctx) {
       manifest_hash: 'manifest-hash-v1',
       att_tier: 1,
       binary_hash: 'binary-hash-v1',
-      caps: {},
+      caps: { chat: true, tools: false, ctx: 32768 },
     },
     ctx.admin.publicKey,
     5
