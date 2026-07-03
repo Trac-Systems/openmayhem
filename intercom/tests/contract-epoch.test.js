@@ -74,7 +74,9 @@ async function setupEpochContract() {
 
 const receiptBundle = (user, provider, overrides = {}) => ({
   epoch: 1,
-  fee_bps: 1_500,
+  params: {
+    fee_bps: 1_500,
+  },
   deposits: [],
   receipts: [
     {
@@ -414,7 +416,9 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
 
   const emptyEpoch = await recomputeEpoch({
     epoch: 2,
-    fee_bps: 1_500,
+    params: {
+      fee_bps: 1_500,
+    },
     deposits: [],
     receipts: [],
     payouts: [],
@@ -677,4 +681,24 @@ test('epoch root recompute script CLI matches the imported independent recompute
   });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), expected);
+});
+
+test('epoch root recompute requires admin params fee_bps and rejects loose fee_bps', async () => {
+  const { provider, user } = await setupEpochContract();
+  const bundle = receiptBundle(user, provider);
+
+  await assert.rejects(
+    recomputeEpoch({
+      ...bundle,
+      params: undefined,
+    }),
+    /params\.fee_bps is required/
+  );
+  await assert.rejects(
+    recomputeEpoch({
+      ...bundle,
+      fee_bps: 1_500,
+    }),
+    /top-level fee_bps is not accepted/
+  );
 });

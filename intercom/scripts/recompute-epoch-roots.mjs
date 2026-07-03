@@ -107,8 +107,7 @@ export async function recomputeEpoch(bundle) {
     throw new Error('epoch bundle must be an object');
   }
   const epoch = safeAmount(bundle.epoch, 'epoch');
-  const feeBps = bundle.fee_bps ?? 1_500;
-  safeAmount(feeBps, 'fee_bps', { allowZero: true });
+  const feeBps = adminFeeBps(bundle);
   if (feeBps > 10_000) throw new Error('fee_bps must be <= 10000');
 
   const deposits = Array.isArray(bundle.deposits) ? bundle.deposits : [];
@@ -212,7 +211,18 @@ export async function recomputeEpoch(bundle) {
     pay_mu: payMu,
   };
 
-  return { epoch, fee_bps: feeBps, roots, totals, debits, earnings };
+  return { epoch, params: { fee_bps: feeBps }, roots, totals, debits, earnings };
+}
+
+function adminFeeBps(bundle) {
+  if (Object.prototype.hasOwnProperty.call(bundle, 'fee_bps')) {
+    throw new Error('top-level fee_bps is not accepted; use params.fee_bps from admin contract params');
+  }
+  if (!bundle.params || typeof bundle.params !== 'object' || Array.isArray(bundle.params)) {
+    throw new Error('epoch bundle params.fee_bps is required from admin contract params');
+  }
+  const feeBps = bundle.params.fee_bps;
+  return safeAmount(feeBps, 'params.fee_bps', { allowZero: true });
 }
 
 async function main() {

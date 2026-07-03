@@ -477,8 +477,8 @@ struct ReceiptsExportArgs {
     #[arg(long, value_name = "PATH")]
     evidence_file: Option<PathBuf>,
 
-    /// Fee split in basis points for the independent root recompute.
-    #[arg(long, default_value_t = 1_500)]
+    /// Admin-set fee split in basis points for independent root recompute.
+    #[arg(long)]
     fee_bps: u64,
 
     /// Prior fee/cum.mu before this epoch.
@@ -4475,7 +4475,9 @@ async fn receipts_export(args: ReceiptsExportArgs) -> Result<()> {
     let prior_earnings = read_prior_earnings(args.prior_earnings_file.as_deref())?;
     let bundle = EpochAuditBundle {
         epoch: args.epoch,
-        fee_bps: args.fee_bps,
+        params: EpochAuditParams {
+            fee_bps: args.fee_bps,
+        },
         deposits,
         receipts,
         payouts,
@@ -5732,7 +5734,7 @@ struct EarningsView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EpochAuditBundle {
     epoch: u64,
-    fee_bps: u64,
+    params: EpochAuditParams,
     #[serde(default)]
     deposits: Vec<Value>,
     #[serde(default)]
@@ -5743,6 +5745,11 @@ struct EpochAuditBundle {
     prior_earnings: BTreeMap<String, u64>,
     #[serde(default)]
     prior_fee_cum_mu: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EpochAuditParams {
+    fee_bps: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -10360,6 +10367,42 @@ mod tests {
         };
         assert_eq!(args.room, "room-a");
         assert_eq!(args.enclave, "enclave-a");
+    }
+
+    #[test]
+    fn receipts_export_cli_requires_explicit_admin_fee_bps() {
+        let missing_fee = Cli::try_parse_from([
+            "mayhem",
+            "receipts",
+            "export",
+            "--epoch",
+            "1",
+            "--output",
+            "/tmp/mayhem-epoch.json",
+        ]);
+        assert!(missing_fee.is_err());
+
+        let export = Cli::try_parse_from([
+            "mayhem",
+            "receipts",
+            "export",
+            "--epoch",
+            "1",
+            "--fee-bps",
+            "1500",
+            "--output",
+            "/tmp/mayhem-epoch.json",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Receipts { command } = export.command else {
+            panic!("expected receipts command");
+        };
+        let ReceiptsCommands::Export(args) = command else {
+            panic!("expected receipts export command");
+        };
+        assert_eq!(args.fee_bps, 1_500);
+        assert!(args.json);
     }
 
     #[test]
