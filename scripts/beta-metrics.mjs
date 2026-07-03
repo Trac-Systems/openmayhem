@@ -9,6 +9,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const defaultMetrics = 'config/beta/metrics.template.json';
 const hex64 = /^[0-9a-fA-F]{64}$/;
 const isoUtc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const sha256Evidence = /#sha256:[0-9a-fA-F]{64}(?:$|[#?&])/;
 const thresholds = {
   externalProviders: 20,
   users: 100,
@@ -141,7 +142,12 @@ function validateBoundFileEvidence(add, evidence, filePath, name) {
 function validateEvidenceArray(add, value, name) {
   if (!requireArray(add, value, name, 1)) return;
   for (const [index, item] of value.entries()) {
-    requireString(add, item, `${name}[${index}]`);
+    const itemName = `${name}[${index}]`;
+    requireString(add, item, itemName);
+    if (typeof item !== 'string' || isPlaceholder(item)) continue;
+    if (!sha256Evidence.test(item)) {
+      add('error', `${itemName} must include #sha256:<64-hex> durable evidence`);
+    }
   }
 }
 
