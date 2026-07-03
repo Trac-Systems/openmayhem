@@ -210,8 +210,18 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
 
 function validateRequiredRails(add, value) {
   if (!requireArray(add, value, 'browser_handoffs.rails_verified', 2)) return;
+  const allowed = new Set(['stripe', 'coinbase']);
+  const seen = new Set();
   for (const [index, rail] of value.entries()) {
     requireString(add, rail, `browser_handoffs.rails_verified[${index}]`);
+    if (typeof rail !== 'string' || isPlaceholder(rail)) continue;
+    if (!allowed.has(rail)) {
+      add('error', `browser_handoffs.rails_verified[${index}] must be stripe or coinbase`);
+    }
+    if (seen.has(rail)) {
+      add('error', `browser_handoffs.rails_verified[${index}] duplicates another rail`);
+    }
+    seen.add(rail);
   }
   if (value.some((rail) => isPlaceholder(rail))) return;
   for (const rail of ['stripe', 'coinbase']) {
