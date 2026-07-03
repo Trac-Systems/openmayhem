@@ -8911,6 +8911,9 @@ fn print_human_report(report: &Value) -> Result<()> {
     if let Some(mnemonic) = report["wallet"]["mnemonic"].as_str() {
         println!("Mnemonic (shown once): {mnemonic}");
     }
+    if let Some(notice) = setup_admin_payout_notice(report["role"].as_str().unwrap_or_default()) {
+        println!("{notice}");
+    }
 
     let consent = &report["consent"];
     if consent["skipped"].as_bool().unwrap_or(false) {
@@ -8927,6 +8930,12 @@ fn print_human_report(report: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn setup_admin_payout_notice(role: &str) -> Option<&'static str> {
+    matches!(role, "provider" | "both").then_some(
+        "Provider payout target: admin-set later; setup does not set provider payout terms.",
+    )
 }
 
 #[cfg(test)]
@@ -9617,6 +9626,23 @@ mod tests {
         };
         assert_eq!(args.room, "room-a");
         assert_eq!(args.enclave, "enclave-a");
+    }
+
+    #[test]
+    fn setup_notice_keeps_provider_payout_targets_admin_set() {
+        assert_eq!(
+            setup_admin_payout_notice("provider"),
+            Some(
+                "Provider payout target: admin-set later; setup does not set provider payout terms."
+            )
+        );
+        assert_eq!(
+            setup_admin_payout_notice("both"),
+            Some(
+                "Provider payout target: admin-set later; setup does not set provider payout terms."
+            )
+        );
+        assert_eq!(setup_admin_payout_notice("user"), None);
     }
 
     #[test]
