@@ -1369,7 +1369,7 @@ struct ProviderJoinArgs {
     #[command(flatten)]
     tx: ProviderTxArgs,
 
-    /// Admin-created model id or enclave id to join.
+    /// Admin-created enclave id, or a model id that resolves to one active admin enclave.
     #[arg(long)]
     enclave: String,
 
@@ -1383,7 +1383,7 @@ struct ProviderLeaveArgs {
     #[command(flatten)]
     tx: ProviderTxArgs,
 
-    /// Admin-created model id or enclave id to leave.
+    /// Admin-created enclave id, or a model id from an active serving row.
     #[arg(long)]
     enclave: String,
 
@@ -1432,7 +1432,8 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Admin-created model id or enclave id. If omitted, the first feasible admin enclave is used.
+    /// Admin-created enclave id, or a model id that resolves to one active admin enclave.
+    /// If omitted, the first feasible admin enclave is used.
     #[arg(long)]
     enclave: Option<String>,
 
@@ -6252,7 +6253,7 @@ fn resolve_provider_lifecycle_enclave(
     matches.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
     match matches.len() {
         0 => bail!(
-            "requested enclave/model {requested} is not an active admin-created enclave"
+            "requested {requested} is not an active admin-created enclave id or model lookup"
         ),
         1 => Ok(matches.remove(0)),
         _ => bail!(
@@ -6305,7 +6306,7 @@ fn resolve_provider_leave_enclave(
     matches.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
     match matches.len() {
         0 => bail!(
-            "requested enclave/model {requested} is not a known admin-created enclave or active provider serving row"
+            "requested {requested} is not a known admin-created enclave id or active provider model lookup"
         ),
         1 => enclaves
             .iter()
@@ -9423,6 +9424,13 @@ mod tests {
         let resolved =
             resolve_provider_lifecycle_enclave(&contract.enclaves, "test/model@4bit").unwrap();
         assert_eq!(resolved.enclave_id, "11".repeat(32));
+
+        let unknown =
+            resolve_provider_lifecycle_enclave(&contract.enclaves, "provider/custom@4bit")
+                .unwrap_err();
+        assert!(unknown
+            .to_string()
+            .contains("not an active admin-created enclave id or model lookup"));
 
         contract.enclaves.push(LedgerEnclave {
             enclave_id: "22".repeat(32),
