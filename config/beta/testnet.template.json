@@ -64,6 +64,20 @@
     "set_id": "canary-launch-v1",
     "path": "catalog/canaries/canary-launch-v1.json"
   },
+  "evidence": {
+    "bootstrap_nodes": [
+      "<file:beta/bootstrap-health.json#sha256:64-hex-or-msb:bootstrap-proof#sha256:64-hex>"
+    ],
+    "epoch_wallet_funding": [
+      "<msb:epoch-wallet-funding-tx-or-balance-proof#sha256:64-hex>"
+    ],
+    "seed_provider_opt_ins": [
+      "<file:beta/seed-provider-opt-ins.json#sha256:64-hex>"
+    ],
+    "canary_set": [
+      "file:catalog/canaries/canary-launch-v1.json#sha256:5bd39e15239fde9ad9e6819502e67817be69b389b9b1abd85b01f04a4168a708"
+    ]
+  },
   "canonical_enclaves": [
     {
       "enclave_id": "llama-3-1-8b-instruct-gguf-q4km-v1",

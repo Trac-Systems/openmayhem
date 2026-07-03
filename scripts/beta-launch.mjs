@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +12,7 @@ const hex64 = /^[0-9a-fA-F]{64}$/;
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const testtracAddress = /^testtrac1[0-9a-z]+$/;
 const safeCommandText = /^[a-zA-Z0-9._:@/+~,\-\s<>$:"{}[\]]+$/;
+const sha256Evidence = /#sha256:[0-9a-fA-F]{64}(?:$|[#?&])/;
 
 function usage() {
   console.log(`Usage: node scripts/beta-launch.mjs [--manifest PATH] [--allow-placeholders] [--json] [--no-commands]
@@ -115,6 +117,43 @@ function requireDecimalString(add, value, name) {
   }
 }
 
+function validateEvidenceArray(add, value, name) {
+  if (!requireArray(add, value, name, 1)) return;
+  const seen = new Set();
+  for (const [index, item] of value.entries()) {
+    const itemName = `${name}[${index}]`;
+    requireString(add, item, itemName);
+    if (typeof item !== 'string' || isPlaceholder(item)) continue;
+    if (!sha256Evidence.test(item)) {
+      add('error', `${itemName} must include #sha256:<64-hex> durable evidence`);
+    }
+    if (seen.has(item)) add('error', `${itemName} duplicates another evidence string`);
+    seen.add(item);
+  }
+}
+
+function sha256File(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function relativeFile(filePath) {
+  const rel = path.relative(repoRoot, filePath);
+  return rel.startsWith('..') ? filePath : rel;
+}
+
+function requiredFileEvidence(filePath) {
+  return `file:${relativeFile(filePath)}#sha256:${sha256File(filePath)}`;
+}
+
+function validateCanaryEvidence(add, evidence, canaryPath) {
+  validateEvidenceArray(add, evidence, 'evidence.canary_set');
+  if (!Array.isArray(evidence) || evidence.some(isPlaceholder)) return;
+  const expected = requiredFileEvidence(canaryPath);
+  if (!evidence.includes(expected)) {
+    add('error', `evidence.canary_set must include ${expected}`);
+  }
+}
+
 function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   const { errors, warnings, add } = issueFactory({ allowPlaceholders });
   const catalogPath = path.join(repoRoot, 'catalog/models.json');
@@ -191,6 +230,18 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
     requireLiteral(add, manifest.canary.set_id, 'canary-launch-v1', 'canary.set_id');
     const canaryPath = path.join(repoRoot, manifest.canary.path || '');
     if (!fs.existsSync(canaryPath)) add('error', `canary.path does not exist: ${manifest.canary.path}`);
+  }
+
+  const canaryPath = path.join(repoRoot, manifest.canary?.path || '');
+  if (requireObject(add, manifest.evidence, 'evidence')) {
+    validateEvidenceArray(add, manifest.evidence.bootstrap_nodes, 'evidence.bootstrap_nodes');
+    validateEvidenceArray(add, manifest.evidence.epoch_wallet_funding, 'evidence.epoch_wallet_funding');
+    validateEvidenceArray(add, manifest.evidence.seed_provider_opt_ins, 'evidence.seed_provider_opt_ins');
+    if (fs.existsSync(canaryPath)) {
+      validateCanaryEvidence(add, manifest.evidence.canary_set, canaryPath);
+    } else {
+      validateEvidenceArray(add, manifest.evidence.canary_set, 'evidence.canary_set');
+    }
   }
 
   const enclaveIds = new Set();
