@@ -127,6 +127,19 @@ function requirePositiveInteger(add, value, name) {
   }
 }
 
+function requireNumberRange(add, value, name, { min = null, max = null, minExclusive = false } = {}) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    add('error', `${name} must be a finite number`);
+    return;
+  }
+  if (min !== null && (minExclusive ? value <= min : value < min)) {
+    add('error', `${name} must be ${minExclusive ? '>' : '>='} ${min}`);
+  }
+  if (max !== null && value > max) {
+    add('error', `${name} must be <= ${max}`);
+  }
+}
+
 function requireDecimalString(add, value, name) {
   if (typeof value !== 'string' || !/^[0-9]+$/.test(value) || value === '0') {
     add('error', `${name} must be a positive decimal string`);
@@ -160,6 +173,19 @@ function validateCheckoutUrls(add, paygate) {
     requireOnlyKeys(add, railConfig, prefix, ['success_url', 'cancel_url']);
     requireRailCheckoutUrl(add, railConfig.success_url, `${prefix}.success_url`, rail, 'return');
     requireRailCheckoutUrl(add, railConfig.cancel_url, `${prefix}.cancel_url`, rail, 'cancel');
+  }
+}
+
+function validateRoomPolicy(add, value, name) {
+  if (!requireObject(add, value, name)) return;
+  requireOnlyKeys(add, value, name, ['region_hint', 'canary_set', 'min_reputation', 'max_price_mult']);
+  if (value.region_hint !== undefined) requireString(add, value.region_hint, `${name}.region_hint`);
+  if (value.canary_set !== undefined) requireString(add, value.canary_set, `${name}.canary_set`);
+  if (value.min_reputation !== undefined) {
+    requireNumberRange(add, value.min_reputation, `${name}.min_reputation`, { min: 0, max: 1 });
+  }
+  if (value.max_price_mult !== undefined) {
+    requireNumberRange(add, value.max_price_mult, `${name}.max_price_mult`, { min: 0, minExclusive: true });
   }
 }
 
@@ -412,6 +438,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
           requireString(add, room.label, `${roomPrefix}.label`);
           requireString(add, room.nonce, `${roomPrefix}.nonce`);
           requireLiteral(add, room.admin_created, true, `${roomPrefix}.admin_created`);
+          validateRoomPolicy(add, room.policy, `${roomPrefix}.policy`);
           if (typeof room.label === 'string') {
             if (roomLabels.has(room.label)) {
               add('error', `${roomPrefix}.label duplicates another canonical room label`);
