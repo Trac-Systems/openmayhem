@@ -137,8 +137,11 @@ function requireRailCheckoutUrl(add, value, name, rail, expectedPathSegment) {
     add('error', `${name} must be a valid URL`);
     return;
   }
-  if (!parsed.pathname.includes(`/${rail}/${expectedPathSegment}`)) {
-    add('error', `${name} must route to a ${rail} ${expectedPathSegment} endpoint`);
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  const last = segments.at(-1);
+  const previous = segments.at(-2);
+  if (previous !== rail || last !== expectedPathSegment) {
+    add('error', `${name} must end with /${rail}/${expectedPathSegment}`);
   }
 }
 
