@@ -349,6 +349,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     );
     requireBoolean(
       add,
+      metrics.canonical_service.admin_catalog_records_verified,
+      true,
+      'canonical_service.admin_catalog_records_verified',
+    );
+    requireBoolean(
+      add,
       metrics.canonical_service.admin_created_rooms_verified,
       true,
       'canonical_service.admin_created_rooms_verified',

@@ -4,14 +4,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/blake3.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultOut = 'config/beta/canonical-service-audit.json';
+const defaultCatalog = 'catalog/models.json';
+const defaultCatalogSignature = 'catalog/signatures/models.json.sig';
+const defaultCatalogKeyDir = 'catalog/keys';
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const payoutMethods = new Set(['tnk', 'stripe', 'coinbase']);
+const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
 function usage() {
-  console.log(`Usage: node scripts/beta-canonical-service-audit.mjs --snapshot PATH [--admin-pubkey HEX] [--out PATH] [--json]
+  console.log(`Usage: node scripts/beta-canonical-service-audit.mjs --snapshot PATH [--admin-pubkey HEX] [--catalog PATH] [--catalog-signature PATH] [--catalog-key-dir PATH] [--out PATH] [--json]
 
 Audits a contract-state snapshot for P8.5 canonical service evidence. The output
 is suitable for beta-metrics-collect --canonical-service PATH.
@@ -26,6 +31,9 @@ Accepted snapshot shapes:
 
 function parseArgs(argv) {
   const args = {
+    catalog: defaultCatalog,
+    catalogSignature: defaultCatalogSignature,
+    catalogKeyDir: defaultCatalogKeyDir,
     out: defaultOut,
     json: false,
   };
@@ -39,6 +47,18 @@ function parseArgs(argv) {
       i += 1;
       if (!argv[i]) throw new Error('--admin-pubkey requires a value');
       args.adminPubkey = argv[i];
+    } else if (arg === '--catalog') {
+      i += 1;
+      if (!argv[i]) throw new Error('--catalog requires a path');
+      args.catalog = argv[i];
+    } else if (arg === '--catalog-signature') {
+      i += 1;
+      if (!argv[i]) throw new Error('--catalog-signature requires a path');
+      args.catalogSignature = argv[i];
+    } else if (arg === '--catalog-key-dir') {
+      i += 1;
+      if (!argv[i]) throw new Error('--catalog-key-dir requires a path');
+      args.catalogKeyDir = argv[i];
     } else if (arg === '--out') {
       i += 1;
       if (!argv[i]) throw new Error('--out requires a path');
@@ -70,6 +90,7 @@ function readJsonEvidence(filePath) {
   const bytes = fs.readFileSync(resolved);
   return {
     path: resolved,
+    bytes,
     value: JSON.parse(bytes.toString('utf8')),
     evidence: `file:${relativeFile(resolved)}#sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`,
   };
@@ -272,6 +293,102 @@ function isRecord(value) {
   return value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function relativePosix(filePath) {
+  return relativeFile(filePath).replaceAll(path.sep, '/');
+}
+
+function ed25519PublicKeyFromRawHex(publicKeyHex) {
+  const raw = Buffer.from(publicKeyHex, 'hex');
+  if (raw.length !== 32) throw new Error('catalog signature public_key must be a 32-byte hex Ed25519 key');
+  return crypto.createPublicKey({
+    key: Buffer.concat([ed25519SpkiPrefix, raw]),
+    format: 'der',
+    type: 'spki',
+  });
+}
+
+async function readCatalogProof(args) {
+  const catalog = readJsonEvidence(args.catalog);
+  const signature = readJsonEvidence(args.catalogSignature);
+  const errors = [];
+  const sig = signature.value;
+  if (!isRecord(sig)) {
+    errors.push('catalog signature must be an object');
+  } else {
+    if (sig.schema_version !== 1) errors.push('catalog signature schema_version must be 1');
+    if (sig.alg !== 'ed25519') errors.push('catalog signature alg must be ed25519');
+    if (sig.signed_path !== relativePosix(catalog.path)) {
+      errors.push(`catalog signature signed_path must be ${relativePosix(catalog.path)}`);
+    }
+    if (!pubkey64.test(sig.public_key || '')) errors.push('catalog signature public_key must be 64 hex chars');
+    if (typeof sig.sig !== 'string' || !/^[0-9a-fA-F]{128}$/.test(sig.sig)) {
+      errors.push('catalog signature sig must be 64 bytes of hex');
+    }
+    if (!pubkey64.test(sig.blake3 || '')) errors.push('catalog signature blake3 must be 64 hex chars');
+  }
+
+  let keyEvidence = null;
+  if (isRecord(sig) && typeof sig.key_id === 'string' && sig.key_id.length > 0) {
+    const keyPath = path.join(resolvePath(args.catalogKeyDir), `${sig.key_id}.json`);
+    const key = readJsonEvidence(keyPath);
+    keyEvidence = key.evidence;
+    if (!isRecord(key.value)) {
+      errors.push(`catalog key ${sig.key_id} must be an object`);
+    } else {
+      if (key.value.status !== 'active') errors.push(`catalog key ${sig.key_id} is not active`);
+      if (key.value.alg !== 'ed25519') errors.push(`catalog key ${sig.key_id} alg must be ed25519`);
+      if (key.value.public_key !== sig.public_key) {
+        errors.push(`catalog key ${sig.key_id} public_key does not match signature`);
+      }
+    }
+  } else {
+    errors.push('catalog signature key_id is required');
+  }
+
+  const digest = Buffer.from(await blake3(catalog.bytes)).toString('hex');
+  if (isRecord(sig) && sig.blake3 && sig.blake3.toLowerCase() !== digest) {
+    errors.push('catalog signature blake3 does not match catalog bytes');
+  }
+  if (
+    isRecord(sig)
+    && pubkey64.test(sig.public_key || '')
+    && typeof sig.sig === 'string'
+    && /^[0-9a-fA-F]{128}$/.test(sig.sig)
+  ) {
+    const publicKey = ed25519PublicKeyFromRawHex(sig.public_key);
+    const ok = crypto.verify(null, catalog.bytes, publicKey, Buffer.from(sig.sig, 'hex'));
+    if (!ok) errors.push('catalog signature verification failed');
+  }
+
+  const modelIds = new Set();
+  if (!Array.isArray(catalog.value?.models)) {
+    errors.push('catalog.models must be an array');
+  } else {
+    for (const [index, model] of catalog.value.models.entries()) {
+      if (!isRecord(model) || typeof model.model_id !== 'string' || model.model_id.length === 0) {
+        errors.push(`catalog.models[${index}].model_id is required`);
+        continue;
+      }
+      if (modelIds.has(model.model_id)) errors.push(`catalog model_id ${model.model_id} is duplicated`);
+      modelIds.add(model.model_id);
+    }
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    modelIds,
+    catalog_path: relativePosix(catalog.path),
+    signature_path: relativePosix(signature.path),
+    blake3: digest,
+    evidence: [
+      catalog.evidence,
+      signature.evidence,
+      keyEvidence,
+    ].filter(Boolean),
+  };
+}
+
 function verifyAdminStampedRecord(record, key, admin, fail) {
   if (!isRecord(record)) {
     fail(`${key} admin-stamped record is missing`);
@@ -384,11 +501,12 @@ function verifyPriceSchedule(schedule, enclaveId, enclave, admin, fail) {
   return ok;
 }
 
-function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
+function auditCanonicalService({ records, sourceEvidence, adminOverride, catalogProof }) {
   const errors = [];
   const warnings = [];
   const fail = (message) => errors.push(message);
   const warn = (message) => warnings.push(message);
+  for (const error of catalogProof?.errors || []) fail(error);
 
   const admin = adminFromRecords(records, adminOverride);
   if (!admin || !pubkey64.test(admin)) fail('admin pubkey is missing or invalid; include state key admin or pass --admin-pubkey');
@@ -454,6 +572,8 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     );
     if (typeof enclave.model_id !== 'string' || enclave.model_id.length === 0) {
       fail(`enclave/${enclaveId} is missing model_id`);
+    } else if (!catalogProof?.modelIds?.has(enclave.model_id)) {
+      fail(`enclave/${enclaveId}.model_id ${enclave.model_id} is not present in the signed admin catalog`);
     }
   }
 
@@ -575,10 +695,11 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     active_serves: activeServes.length,
     active_room_joins: activeRoomServes.length,
     admin_set_payout_targets: adminSetPayoutTargets,
+    catalog_models: catalogProof?.modelIds?.size ?? 0,
   };
   const summaryDigest = crypto
     .createHash('sha256')
-    .update(stableJson({ admin, counts, ok }))
+    .update(stableJson({ admin, catalog: catalogProof?.blake3, counts, ok }))
     .digest('hex');
 
   return {
@@ -589,9 +710,16 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
       evidence: sourceEvidence,
       admin,
       records: records.size,
+      catalog: catalogProof ? {
+        path: catalogProof.catalog_path,
+        signature_path: catalogProof.signature_path,
+        blake3: catalogProof.blake3,
+        models: catalogProof.modelIds.size,
+      } : null,
     },
     canonical_service: {
       admin_created_enclaves_verified: ok,
+      admin_catalog_records_verified: ok && catalogProof?.ok === true,
       admin_created_rooms_verified: ok,
       provider_join_records_verified: ok,
       admin_price_records_verified: ok,
@@ -601,6 +729,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
       counts,
       evidence: [
         sourceEvidence,
+        ...(catalogProof?.evidence || []),
         `audit:canonical-service:v1#sha256:${summaryDigest}`,
       ],
     },
@@ -639,7 +768,7 @@ function printHuman(report, outPath) {
   }
 }
 
-function main() {
+async function main() {
   try {
     const args = parseArgs(process.argv.slice(2));
     const source = readJsonEvidence(args.snapshot);
@@ -648,6 +777,7 @@ function main() {
       records,
       sourceEvidence: source.evidence,
       adminOverride: args.adminPubkey,
+      catalogProof: await readCatalogProof(args),
     });
     const outPath = writeJson(args.out, report);
     if (args.json) console.log(JSON.stringify({ ...report, audit_path: outPath }, null, 2));
@@ -659,4 +789,4 @@ function main() {
   }
 }
 
-main();
+await main();
