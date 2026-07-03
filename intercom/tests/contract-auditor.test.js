@@ -128,6 +128,36 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
     updated_at: makeTxKey(6),
   });
 
+  const missingEnclave = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, { probe_id: 'canary-no-enclave', enclave_id: undefined }),
+    auditor.publicKey,
+    7
+  );
+  assert.match(missingEnclave.message, /requires enclave_id/i);
+
+  const missingReceipt = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, { probe_id: 'canary-no-receipt', session_receipt_hash: undefined }),
+    auditor.publicKey,
+    7
+  );
+  assert.match(missingReceipt.message, /requires session_receipt_hash/i);
+
+  const missingEvidence = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, { probe_id: 'canary-no-evidence', evidence_hash: undefined }),
+    auditor.publicKey,
+    7
+  );
+  assert.match(missingEvidence.message, /requires evidence_hash/i);
+
   const canaryOk = await execute(
     contract,
     storage,

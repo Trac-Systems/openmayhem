@@ -3332,9 +3332,11 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
     let observed_text = gateway_chat_observed_text(&response)?;
     let evaluation = evaluate_text_match(&expected_text, &observed_text, args.min_match_bps);
     let receipts = fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/receipts")).await?;
-    let latest_receipt = latest_gateway_receipt(&receipts);
-    let session_receipt_hash = latest_receipt.as_ref().map(stable_value_hash);
-    let receipt_body = latest_receipt.as_ref().and_then(receipt_body);
+    let latest_receipt = latest_gateway_receipt(&receipts).context(
+        "canary probes must leave a gateway receipt; run the probe through the normal paid gateway path",
+    )?;
+    let session_receipt_hash = stable_value_hash(&latest_receipt);
+    let receipt_body = receipt_body(&latest_receipt);
     let provider = args
         .provider
         .clone()
@@ -3564,12 +3566,12 @@ struct CanaryProbeCommandInput {
     canary_set: String,
     match_bps: u32,
     pass: bool,
-    session_receipt_hash: Option<String>,
+    session_receipt_hash: String,
     evidence_hash: String,
 }
 
 fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
-    let mut command = json!({
+    json!({
         "op": "probe_result",
         "probe_id": input.probe_id,
         "probe_kind": "canary",
@@ -3580,12 +3582,9 @@ fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
         "canary_set": input.canary_set,
         "match_bps": input.match_bps,
         "pass": input.pass,
+        "session_receipt_hash": input.session_receipt_hash,
         "evidence_hash": input.evidence_hash,
-    });
-    if let Some(session_receipt_hash) = input.session_receipt_hash {
-        command["session_receipt_hash"] = json!(session_receipt_hash);
-    }
-    command
+    })
 }
 
 fn gateway_chat_observed_text(response: &Value) -> Result<String> {
@@ -11540,15 +11539,13 @@ mod tests {
     }
 
     #[test]
-    fn canary_probe_command_omits_absent_optional_receipt_hash() {
-        let without_receipt = canary_probe_command(test_canary_probe_command_input(None));
-        assert!(without_receipt.get("session_receipt_hash").is_none());
-        assert_eq!(without_receipt["op"], "probe_result");
-        assert_eq!(without_receipt["enclave_id"], "enclave");
+    fn canary_probe_command_requires_paid_session_receipt_hash() {
+        let command = canary_probe_command(test_canary_probe_command_input("rr".repeat(32)));
 
-        let with_receipt =
-            canary_probe_command(test_canary_probe_command_input(Some("rr".repeat(32))));
-        assert_eq!(with_receipt["session_receipt_hash"], "rr".repeat(32));
+        assert_eq!(command["op"], "probe_result");
+        assert_eq!(command["enclave_id"], "enclave");
+        assert_eq!(command["session_receipt_hash"], "rr".repeat(32));
+        assert_eq!(command["evidence_hash"], "ee".repeat(32));
     }
 
     #[test]
@@ -12033,9 +12030,7 @@ mod tests {
         }
     }
 
-    fn test_canary_probe_command_input(
-        session_receipt_hash: Option<String>,
-    ) -> CanaryProbeCommandInput {
+    fn test_canary_probe_command_input(session_receipt_hash: String) -> CanaryProbeCommandInput {
         CanaryProbeCommandInput {
             probe_id: "probe".to_owned(),
             provider: "provider".to_owned(),

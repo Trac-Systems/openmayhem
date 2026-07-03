@@ -2818,8 +2818,16 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(value.probe_id)) return new Error('Invalid probe id.');
     if (!PROBE_KINDS.has(value.probe_kind)) return new Error('Unsupported probe kind.');
     if (value.probe_kind === 'canary') {
+      if (!value.enclave_id) return new Error('Canary probe requires enclave_id.');
       if (!Number.isInteger(value.match_bps)) return new Error('Canary probe requires match_bps.');
       if (!value.canary_set) return new Error('Canary probe requires canary_set.');
+      if (!value.session_receipt_hash) return new Error('Canary probe requires session_receipt_hash.');
+      if (!value.evidence_hash) return new Error('Canary probe requires evidence_hash.');
+      if (!this.isSafeKeyPart(value.enclave_id)) return new Error('Invalid canary enclave id.');
+      if (!this.isSafeKeyPart(value.session_receipt_hash)) {
+        return new Error('Invalid canary session receipt hash.');
+      }
+      if (!this.isSafeKeyPart(value.evidence_hash)) return new Error('Invalid canary evidence hash.');
     }
     return null;
   }
