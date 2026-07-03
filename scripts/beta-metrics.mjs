@@ -159,6 +159,28 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireBoolean(add, metrics.controls.providers_only_join_admin_rooms, true, 'controls.providers_only_join_admin_rooms');
   }
 
+  if (requireObject(add, metrics.canonical_service, 'canonical_service')) {
+    requireBoolean(
+      add,
+      metrics.canonical_service.admin_created_enclaves_verified,
+      true,
+      'canonical_service.admin_created_enclaves_verified',
+    );
+    requireBoolean(
+      add,
+      metrics.canonical_service.admin_created_rooms_verified,
+      true,
+      'canonical_service.admin_created_rooms_verified',
+    );
+    requireBoolean(
+      add,
+      metrics.canonical_service.provider_join_records_verified,
+      true,
+      'canonical_service.provider_join_records_verified',
+    );
+    validateEvidenceArray(add, metrics.canonical_service.evidence, 'canonical_service.evidence');
+  }
+
   const counts = {
     external_providers: 0,
     users: 0,

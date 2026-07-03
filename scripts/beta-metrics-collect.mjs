@@ -13,7 +13,8 @@ const hex64 = /^[0-9a-fA-F]{64}$/;
 function usage() {
   console.log(`Usage: node scripts/beta-metrics-collect.mjs --window-start ISO --window-end ISO \\
   --providers PATH --users PATH --epoch PATH --guardian PATH --canary PATH \\
-  --browser-handoffs PATH --commit-tx HEX --apply-tx HEX --auditor HEX [--out PATH]
+  --browser-handoffs PATH --canonical-service PATH \\
+  --commit-tx HEX --apply-tx HEX --auditor HEX [--out PATH]
 
 Normalizes beta evidence into config/beta/metrics.json, then runs the strict
 P8.5 validator unless --no-validate is passed. Use --tracker-recorded only after
@@ -22,6 +23,7 @@ the validated metrics have also been recorded in docs/TRACKER.md.
 Accepted evidence shapes are intentionally plain:
 - providers/users: array, { data: [] }, { providers: [] }, { users: [] }, or a count record
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
+- canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
 - guardian/canary/browser: small summary JSON; browser handoffs may also be a text log`);
 }
 
@@ -45,6 +47,7 @@ function parseArgs(argv) {
     '--guardian',
     '--canary',
     '--browser-handoffs',
+    '--canonical-service',
     '--commit-tx',
     '--apply-tx',
     '--auditor',
@@ -353,6 +356,21 @@ function collectBrowserHandoffs(args) {
   };
 }
 
+function collectCanonicalService(args) {
+  const source = readJsonEvidence(requireArg(args, 'canonicalService'));
+  const value = source.value;
+  const record = firstDefined(value, ['canonical_service']) ?? value;
+  return {
+    admin_created_enclaves_verified: firstDefined(record, ['admin_created_enclaves_verified']) === true,
+    admin_created_rooms_verified: firstDefined(record, ['admin_created_rooms_verified']) === true,
+    provider_join_records_verified: firstDefined(record, ['provider_join_records_verified']) === true,
+    evidence: [
+      source.evidence,
+      ...asEvidenceArray(value, ['canonical_service.evidence', 'evidence']),
+    ],
+  };
+}
+
 function requireHex64(value, label) {
   if (typeof value !== 'string' || !hex64.test(value)) {
     throw new Error(`${label} must be a 64-character hex string`);
@@ -366,6 +384,7 @@ function buildMetrics(args) {
   const guardian = collectGuardian(args);
   const canary = collectCanary(args);
   const browserHandoffs = collectBrowserHandoffs(args);
+  const canonicalService = collectCanonicalService(args);
 
   for (const key of ['dep', 'use', 'earn', 'fee', 'pay']) {
     auditedEpoch.roots[key] = requireHex64(auditedEpoch.roots[key], `audited_epoch.roots.${key}`);
@@ -396,6 +415,7 @@ function buildMetrics(args) {
       providers_create_canonical_rooms: false,
       providers_only_join_admin_rooms: true,
     },
+    canonical_service: canonicalService,
     participants,
     audited_epoch: auditedEpoch,
     guardian,
