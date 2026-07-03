@@ -56,6 +56,24 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
+function catalogArtifactForEnclave(model, backend, artifactRoot) {
+  if (!model || typeof model !== 'object' || Array.isArray(model)) return null;
+  if (!model.artifacts || typeof model.artifacts !== 'object' || Array.isArray(model.artifacts)) return null;
+  for (const [artifactName, artifact] of Object.entries(model.artifacts)) {
+    if (
+      artifact
+      && typeof artifact === 'object'
+      && !Array.isArray(artifact)
+      && artifact.engine === backend
+      && typeof artifact.artifact_root === 'string'
+      && artifact.artifact_root.toLowerCase() === String(artifactRoot || '').toLowerCase()
+    ) {
+      return { artifactName, artifact };
+    }
+  }
+  return null;
+}
+
 function isPlaceholder(value) {
   return typeof value === 'string' && (
     value.includes('<') ||
@@ -417,6 +435,18 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
       }
       requireString(add, enclave.backend, `${prefix}.backend`);
       requireString(add, enclave.artifact_root, `${prefix}.artifact_root`, hex64);
+      if (
+        typeof enclave.model_id === 'string'
+        && typeof enclave.backend === 'string'
+        && typeof enclave.artifact_root === 'string'
+        && !isPlaceholder(enclave.model_id)
+        && !isPlaceholder(enclave.backend)
+        && !isPlaceholder(enclave.artifact_root)
+        && hex64.test(enclave.artifact_root)
+        && !catalogArtifactForEnclave(catalogModels.get(enclave.model_id), enclave.backend, enclave.artifact_root)
+      ) {
+        add('error', `${prefix}.backend/artifact_root is not present in catalog/models.json for ${enclave.model_id}`);
+      }
       requireString(add, enclave.manifest_hash, `${prefix}.manifest_hash`, hex64);
       requireString(add, enclave.binary_hash, `${prefix}.binary_hash`, hex64);
       if (enclave.att_tier !== 1 && enclave.att_tier !== 2) {

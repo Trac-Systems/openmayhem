@@ -12,6 +12,7 @@ const defaultCatalog = 'catalog/models.json';
 const defaultCatalogSignature = 'catalog/signatures/models.json.sig';
 const defaultCatalogKeyDir = 'catalog/keys';
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
+const hex64 = /^[0-9a-fA-F]{64}$/;
 const payoutMethods = new Set(['tnk', 'stripe', 'coinbase']);
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
@@ -361,6 +362,8 @@ async function readCatalogProof(args) {
   }
 
   const modelIds = new Set();
+  const models = new Map();
+  let artifactCount = 0;
   if (!Array.isArray(catalog.value?.models)) {
     errors.push('catalog.models must be an array');
   } else {
@@ -371,6 +374,24 @@ async function readCatalogProof(args) {
       }
       if (modelIds.has(model.model_id)) errors.push(`catalog model_id ${model.model_id} is duplicated`);
       modelIds.add(model.model_id);
+      models.set(model.model_id, model);
+      if (!isRecord(model.artifacts)) {
+        errors.push(`catalog model ${model.model_id} artifacts must be an object`);
+        continue;
+      }
+      for (const [artifactName, artifact] of Object.entries(model.artifacts)) {
+        artifactCount += 1;
+        if (!isRecord(artifact)) {
+          errors.push(`catalog model ${model.model_id} artifact ${artifactName} must be an object`);
+          continue;
+        }
+        if (typeof artifact.engine !== 'string' || artifact.engine.length === 0) {
+          errors.push(`catalog model ${model.model_id} artifact ${artifactName}.engine is required`);
+        }
+        if (typeof artifact.artifact_root !== 'string' || !hex64.test(artifact.artifact_root)) {
+          errors.push(`catalog model ${model.model_id} artifact ${artifactName}.artifact_root must be 64 hex chars`);
+        }
+      }
     }
   }
 
@@ -378,6 +399,8 @@ async function readCatalogProof(args) {
     ok: errors.length === 0,
     errors,
     modelIds,
+    models,
+    artifactCount,
     catalog_path: relativePosix(catalog.path),
     signature_path: relativePosix(signature.path),
     blake3: digest,
@@ -387,6 +410,22 @@ async function readCatalogProof(args) {
       keyEvidence,
     ].filter(Boolean),
   };
+}
+
+function catalogArtifactForEnclave(catalogProof, enclave) {
+  const model = catalogProof?.models?.get(enclave?.model_id);
+  if (!isRecord(model?.artifacts)) return null;
+  for (const [artifactName, artifact] of Object.entries(model.artifacts)) {
+    if (
+      isRecord(artifact)
+      && artifact.engine === enclave.backend
+      && typeof artifact.artifact_root === 'string'
+      && artifact.artifact_root.toLowerCase() === String(enclave.artifact_root || '').toLowerCase()
+    ) {
+      return { artifactName, artifact };
+    }
+  }
+  return null;
 }
 
 function verifyAdminStampedRecord(record, key, admin, fail) {
@@ -574,6 +613,27 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride, catalog
       fail(`enclave/${enclaveId} is missing model_id`);
     } else if (!catalogProof?.modelIds?.has(enclave.model_id)) {
       fail(`enclave/${enclaveId}.model_id ${enclave.model_id} is not present in the signed admin catalog`);
+    } else {
+      if (typeof enclave.backend !== 'string' || enclave.backend.length === 0) {
+        fail(`enclave/${enclaveId}.backend is required`);
+      }
+      if (typeof enclave.artifact_root !== 'string' || !hex64.test(enclave.artifact_root)) {
+        fail(`enclave/${enclaveId}.artifact_root must be 64 hex chars`);
+      }
+      if (typeof enclave.manifest_hash !== 'string' || !hex64.test(enclave.manifest_hash)) {
+        fail(`enclave/${enclaveId}.manifest_hash must be 64 hex chars`);
+      }
+      if (typeof enclave.binary_hash !== 'string' || !hex64.test(enclave.binary_hash)) {
+        fail(`enclave/${enclaveId}.binary_hash must be 64 hex chars`);
+      }
+      if (
+        typeof enclave.backend === 'string'
+        && typeof enclave.artifact_root === 'string'
+        && hex64.test(enclave.artifact_root)
+        && !catalogArtifactForEnclave(catalogProof, enclave)
+      ) {
+        fail(`enclave/${enclaveId}.backend/artifact_root is not present in the signed admin catalog for ${enclave.model_id}`);
+      }
     }
   }
 
@@ -696,6 +756,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride, catalog
     active_room_joins: activeRoomServes.length,
     admin_set_payout_targets: adminSetPayoutTargets,
     catalog_models: catalogProof?.modelIds?.size ?? 0,
+    catalog_artifacts: catalogProof?.artifactCount ?? 0,
   };
   const summaryDigest = crypto
     .createHash('sha256')
@@ -715,6 +776,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride, catalog
         signature_path: catalogProof.signature_path,
         blake3: catalogProof.blake3,
         models: catalogProof.modelIds.size,
+        artifacts: catalogProof.artifactCount,
       } : null,
     },
     canonical_service: {
