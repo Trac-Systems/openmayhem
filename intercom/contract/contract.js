@@ -2727,7 +2727,10 @@ class MayhemContract extends Contract {
       return new Error('Provider serving requires a current admin-set enclave price.');
     }
     const admin = await this.get('admin');
-    if (admin !== null && current.set_by !== admin) {
+    if (admin === null) {
+      return new Error('Provider serving requires a current admin key.');
+    }
+    if (current.set_by !== admin) {
       return new Error('Provider serving requires a current price set by the current admin.');
     }
     if (current.set_by_role !== undefined && current.set_by_role !== 'admin') {

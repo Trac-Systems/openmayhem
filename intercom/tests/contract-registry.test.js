@@ -357,6 +357,68 @@ test('MayhemContract requires a current admin price before provider serving rows
   assert.equal(await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`), null);
 });
 
+test('MayhemContract provider serving price gate fails closed without current admin key', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage();
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerEnclave',
+      value: enclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: enclaveRegistration.model_id,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+
+  const before = storage.snapshotBytes();
+  const result = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    6
+  );
+  assert.match(result.message, /current admin key/i);
+  assert.equal(storage.snapshotBytes(), before);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+});
+
 test('MayhemContract validates admin enclave caps as capability-only records', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
