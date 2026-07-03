@@ -6787,6 +6787,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
                     att_tier: enclave.att_tier,
+                    admin_pubkey: enclave.created_by.clone(),
+                    artifact_root: enclave.artifact_root.clone(),
+                    manifest_hash: enclave.manifest_hash.clone(),
+                    binary_hash: enclave.binary_hash.clone(),
                 },
             );
         let tier = format!("T{}", enclave.att_tier);
@@ -9964,6 +9968,19 @@ mod tests {
         );
         assert_eq!(models[0].mayhem.route_candidates[0].room_id, "room-a");
         assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 1);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].admin_pubkey,
+            "44".repeat(32)
+        );
+        assert_eq!(models[0].mayhem.route_candidates[0].artifact_root, root);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].manifest_hash,
+            "22".repeat(32)
+        );
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].binary_hash,
+            "33".repeat(32)
+        );
 
         contract.prices.clear();
         let err = gateway_models_from_contract(&contract)

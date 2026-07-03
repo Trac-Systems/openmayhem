@@ -8,6 +8,7 @@ use mayhem_gateway::openai::{
     GatewaySessionBackend, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
     GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, Usage,
 };
+use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
 use tower::ServiceExt;
@@ -220,7 +221,10 @@ async fn chat_completion_can_use_direct_session_backend() {
     assert_eq!(state.receipts().len(), 1);
     assert_eq!(state.receipts()[0].receipt.body.usage.out_tokens, 4);
     assert_eq!(state.receipts()[0].receipt.body.provider, "55".repeat(32));
-    assert_eq!(state.receipts()[0].receipt.body.enclave_id, "11".repeat(32));
+    assert_eq!(
+        state.receipts()[0].receipt.body.enclave_id,
+        catalog_enclave_id(&routed_test_identity())
+    );
     assert_eq!(state.receipts()[0].receipt.body.price_ver, 7);
     assert_eq!(
         state.receipts()[0].voucher.body.session_id,
@@ -235,6 +239,8 @@ async fn chat_completion_can_use_direct_session_backend() {
 fn routed_test_model() -> GatewayModel {
     let mut tiers = BTreeMap::new();
     tiers.insert("T1".to_owned(), 1);
+    let identity = routed_test_identity();
+    let enclave_id = catalog_enclave_id(&identity);
     GatewayModel {
         id: "mayhem/routed-test".to_owned(),
         created: 1_782_950_400,
@@ -258,12 +264,26 @@ fn routed_test_model() -> GatewayModel {
             source: "contract".to_owned(),
             route_candidates: vec![GatewayRouteCandidate {
                 provider: "55".repeat(32),
-                enclave_id: "11".repeat(32),
+                enclave_id,
                 room_id: "room-a".to_owned(),
                 price_ver: 7,
                 att_tier: 1,
+                admin_pubkey: identity.admin_pubkey,
+                artifact_root: identity.artifact_root,
+                manifest_hash: identity.manifest_hash,
+                binary_hash: identity.binary_hash,
             }],
         },
+    }
+}
+
+fn routed_test_identity() -> CatalogEnclaveIdentity {
+    CatalogEnclaveIdentity {
+        admin_pubkey: "44".repeat(32),
+        model_id: "mayhem/routed-test".to_owned(),
+        artifact_root: "aa".repeat(32),
+        manifest_hash: "bb".repeat(32),
+        binary_hash: "cc".repeat(32),
     }
 }
 

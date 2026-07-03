@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     future::Future,
     net::SocketAddr,
@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::{verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord};
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -22,10 +23,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    attestation_signing_bytes, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, AttestationReport, AttestationSigner,
-    CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
-    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -71,6 +72,10 @@ pub struct GatewayRouteCandidate {
     pub room_id: String,
     pub price_ver: u64,
     pub att_tier: u8,
+    pub admin_pubkey: String,
+    pub artifact_root: String,
+    pub manifest_hash: String,
+    pub binary_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,6 +217,13 @@ pub struct GatewaySessionInvocation {
     pub price_ver: u64,
     pub rules_ver: u64,
     pub spend_voucher: SpendVoucher,
+    pub attestation: Option<GatewaySessionAttestation>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewaySessionAttestation {
+    pub contract: EnclaveContractRecord,
+    pub trusted_binary_hashes: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -644,7 +656,7 @@ impl ScBridgeGatewaySessionBackend {
                 invocation.session_id
             )));
         }
-        validate_direct_session_accept(&accept, invocation, &open_head, &att_nonce)?;
+        validate_direct_session_accept(&accept, invocation, &open_head, &att_nonce, now / 1000)?;
 
         let request_id = blake3_hex(
             format!(
@@ -704,6 +716,7 @@ fn validate_direct_session_accept(
     invocation: &GatewaySessionInvocation,
     expected_open_head: &str,
     expected_att_nonce: &str,
+    now_ts: u64,
 ) -> Result<(), GatewaySessionError> {
     let fail = |message: String| GatewaySessionError::new(message);
     if frame.get("t").and_then(Value::as_str) != Some("s.accept") {
@@ -759,58 +772,25 @@ fn validate_direct_session_accept(
         .and_then(Value::as_str)
         .ok_or_else(|| fail("provider accept missing sig".to_owned()))?;
     if let Some(provider) = invocation.provider_pubkey.as_deref() {
-        if report.provider_pubkey != provider {
-            return Err(fail(format!(
-                "provider accept att_report provider_pubkey did not match {provider}"
-            )));
-        }
-        verify_direct_session_report_signature(&report, AttestationSigner::Enclave)?;
-        verify_direct_session_report_signature(&report, AttestationSigner::Provider)?;
+        let attestation = invocation.attestation.as_ref().ok_or_else(|| {
+            fail("provider accept missing admin enclave attestation metadata".to_owned())
+        })?;
+        let mut request = AttestationVerificationRequest::new(
+            &report,
+            &attestation.contract,
+            &attestation.trusted_binary_hashes,
+            expected_att_nonce,
+            now_ts,
+        );
+        request.expected_provider_pubkey = Some(provider);
+        verify_tier1_attestation(&request).map_err(|err| {
+            fail(format!(
+                "provider accept attestation verification failed: {err}"
+            ))
+        })?;
         verify_direct_session_accept_signature(frame, provider, top_sig)?;
     }
     Ok(())
-}
-
-fn verify_direct_session_report_signature(
-    report: &AttestationReport,
-    signer: AttestationSigner,
-) -> Result<(), GatewaySessionError> {
-    let (signer_name, public_key_hex, signature_hex) = match signer {
-        AttestationSigner::Enclave => (
-            "enclave",
-            report.enclave_pubkey.as_str(),
-            report.sig_enclave.as_str(),
-        ),
-        AttestationSigner::Provider => (
-            "provider",
-            report.provider_pubkey.as_str(),
-            report.sig_provider.as_str(),
-        ),
-    };
-    let public_key = decode_hex_array::<32>(
-        public_key_hex,
-        match signer {
-            AttestationSigner::Enclave => "att_report enclave pubkey",
-            AttestationSigner::Provider => "att_report provider pubkey",
-        },
-    )?;
-    let signature = decode_hex_array::<64>(
-        signature_hex,
-        match signer {
-            AttestationSigner::Enclave => "att_report sig_enclave",
-            AttestationSigner::Provider => "att_report sig_provider",
-        },
-    )?;
-    let verifying_key = VerifyingKey::from_bytes(&public_key).map_err(|err| {
-        GatewaySessionError::new(format!("invalid att_report {signer_name} pubkey: {err}"))
-    })?;
-    let signature = Signature::from_bytes(&signature);
-    let payload = attestation_signing_bytes(&report.body(), signer).map_err(|err| {
-        GatewaySessionError::new(format!("att_report signing payload failed: {err}"))
-    })?;
-    verifying_key.verify(&payload, &signature).map_err(|err| {
-        GatewaySessionError::new(format!("att_report {signer_name} signature failed: {err}"))
-    })
 }
 
 fn verify_direct_session_accept_signature(
@@ -1161,6 +1141,18 @@ impl GatewayState {
         let price_ver = route
             .map(|candidate| candidate.price_ver)
             .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let attestation = route.map(|candidate| GatewaySessionAttestation {
+            contract: EnclaveContractRecord {
+                enclave_id: candidate.enclave_id.clone(),
+                admin_pubkey: candidate.admin_pubkey.clone(),
+                model_id: model.id.clone(),
+                artifact_root: candidate.artifact_root.clone(),
+                manifest_hash: candidate.manifest_hash.clone(),
+                binary_hash: candidate.binary_hash.clone(),
+                att_tier: candidate.att_tier,
+            },
+            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+        });
         let max_spend_mu = estimate_max_spend_mu(model, request, &prompt_text);
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
@@ -1188,6 +1180,7 @@ impl GatewayState {
                 body: voucher_body,
                 user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
             },
+            attestation,
         })
     }
 
@@ -1904,6 +1897,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mayhem_proto::{attestation_signing_bytes, AttestationSigner};
 
     #[test]
     fn direct_session_accept_pins_session_enclave_provider_and_signature() {
@@ -1914,6 +1908,7 @@ mod tests {
             &invocation,
             test_open_head().as_str(),
             test_att_nonce().as_str(),
+            test_now_ts(),
         )
         .expect("matching accept is valid");
 
@@ -1939,6 +1934,14 @@ mod tests {
         sign_accept_frame(&mut wrong_report_nonce);
         assert_accept_err(&wrong_report_nonce, &invocation, "nonce_u");
 
+        let mut wrong_manifest = frame.clone();
+        wrong_manifest["att_report"] =
+            test_attestation_report_with_mutation(&invocation, test_att_nonce(), |report| {
+                report.manifest_hash = "ab".repeat(32);
+            });
+        sign_accept_frame(&mut wrong_manifest);
+        assert_accept_err(&wrong_manifest, &invocation, "manifest_hash");
+
         let mut wrong_provider = frame.clone();
         wrong_provider["att_report"]["provider_pubkey"] = json!("dd".repeat(32));
         assert_accept_err(&wrong_provider, &invocation, "provider_pubkey");
@@ -1959,6 +1962,7 @@ mod tests {
             invocation,
             test_open_head().as_str(),
             test_att_nonce().as_str(),
+            test_now_ts(),
         )
         .expect_err("mutated accept must be rejected");
         assert!(
@@ -1969,8 +1973,18 @@ mod tests {
     }
 
     fn test_invocation() -> GatewaySessionInvocation {
+        let identity = test_identity();
         let session_id = "aa".repeat(32);
-        let enclave_id = "11".repeat(32);
+        let enclave_id = mayhem_proto::catalog_enclave_id(&identity);
+        let contract = EnclaveContractRecord {
+            enclave_id: enclave_id.clone(),
+            admin_pubkey: identity.admin_pubkey.clone(),
+            model_id: identity.model_id.clone(),
+            artifact_root: identity.artifact_root.clone(),
+            manifest_hash: identity.manifest_hash.clone(),
+            binary_hash: identity.binary_hash.clone(),
+            att_tier: 1,
+        };
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             enclave_id: enclave_id.clone(),
@@ -1992,6 +2006,20 @@ mod tests {
                 body: voucher_body,
                 user_sig: "44".repeat(64),
             },
+            attestation: Some(GatewaySessionAttestation {
+                contract,
+                trusted_binary_hashes: BTreeSet::from([identity.binary_hash]),
+            }),
+        }
+    }
+
+    fn test_identity() -> mayhem_proto::CatalogEnclaveIdentity {
+        mayhem_proto::CatalogEnclaveIdentity {
+            admin_pubkey: "33".repeat(32),
+            model_id: "mayhem/test-model@q4".to_owned(),
+            artifact_root: "aa".repeat(32),
+            manifest_hash: "bb".repeat(32),
+            binary_hash: "cc".repeat(32),
         }
     }
 
@@ -2019,15 +2047,31 @@ mod tests {
         invocation: &GatewaySessionInvocation,
         nonce_u: String,
     ) -> Value {
+        test_attestation_report_with_mutation(invocation, nonce_u, |_| {})
+    }
+
+    fn test_attestation_report_with_mutation<F>(
+        invocation: &GatewaySessionInvocation,
+        nonce_u: String,
+        mutate: F,
+    ) -> Value
+    where
+        F: FnOnce(&mut AttestationReport),
+    {
+        let contract = &invocation
+            .attestation
+            .as_ref()
+            .expect("test invocation has attestation")
+            .contract;
         let mut report = AttestationReport {
             schema_version: ATTESTATION_SCHEMA_VERSION,
             alg: ATTESTATION_ALG.to_owned(),
             enclave_id: invocation.enclave_id.clone(),
             enclave_pubkey: verifying_key_hex(&test_enclave_seed()),
             provider_pubkey: invocation.provider_pubkey.clone().unwrap(),
-            manifest_hash: "aa".repeat(32),
-            binary_hash: "bb".repeat(32),
-            att_tier: 1,
+            manifest_hash: contract.manifest_hash.clone(),
+            binary_hash: contract.binary_hash.clone(),
+            att_tier: contract.att_tier,
             hw_quote: None,
             boot_epoch: 1,
             report_ts: 2,
@@ -2035,6 +2079,7 @@ mod tests {
             sig_enclave: String::new(),
             sig_provider: String::new(),
         };
+        mutate(&mut report);
         let body = report.body();
         report.sig_enclave = sign_hex(
             &test_enclave_seed(),
@@ -2069,5 +2114,9 @@ mod tests {
 
     fn test_att_nonce() -> String {
         "88".repeat(32)
+    }
+
+    fn test_now_ts() -> u64 {
+        210
     }
 }
