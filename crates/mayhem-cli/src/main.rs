@@ -2,7 +2,7 @@
 
 mod catalog;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -15,7 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use mayhem_bridge::{
-    PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL, DEFAULT_SC_BRIDGE_URL,
+    BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL,
+    DEFAULT_SC_BRIDGE_URL,
 };
 use mayhem_enclave::{
     boot_sealed_store, build_merkle_manifest, download_resumable,
@@ -880,6 +881,14 @@ struct ProviderStartArgs {
     /// Number of heartbeat frames to send to each joined room.
     #[arg(long, default_value_t = 1)]
     heartbeat_count: u32,
+
+    /// Keep running and answer direct mx/s/<session_id> requests over SC-Bridge.
+    #[arg(long)]
+    serve_sessions: bool,
+
+    /// Stop session serving after this many seconds; 0 means run until killed.
+    #[arg(long, default_value_t = 0)]
+    serve_sessions_seconds: u64,
 
     /// Print a machine-readable provider start report.
     #[arg(long)]
@@ -4230,6 +4239,40 @@ struct HeartbeatContext<'a> {
     attestation_head: &'a str,
 }
 
+struct ProviderSessionContext<'a> {
+    args: &'a ProviderStartArgs,
+    keypair_path: &'a Path,
+    password: &'a str,
+    wallet: &'a WalletInfo,
+    selected: &'a ProviderCandidate,
+    rooms: &'a [LedgerRoom],
+    attestation: &'a Tier1AttestationReport,
+    attestation_head: &'a str,
+    rules: &'a RulesRef,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveProviderSession {
+    user: String,
+    session_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderSessionTerms {
+    provider: String,
+    enclave_id: String,
+    model_id: String,
+    price_ver: u64,
+    rules_ver: u64,
+    ctx: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderSessionDecision {
+    Accept,
+    Reject { code: &'static str, reason: String },
+}
+
 async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -4273,6 +4316,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let password = args.wallet_password.clone().unwrap_or_default();
     let wallet = inspect_wallet(&keypair_path, &password).await?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
+    let rules = resolve_rules(None, None, &rpc, None).await?;
 
     provider_log(
         &args,
@@ -4482,6 +4526,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "enclave_pubkey": attestation.report.enclave_pubkey,
             "att_tier": attestation.report.att_tier,
         },
+        "rules": &rules,
         "rooms": rooms.clone(),
         "transactions": {
             "provider": provider_tx,
@@ -4511,6 +4556,21 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         );
     } else {
         println!("Provider start complete: joined canonical rooms; heartbeat bridge was not used.");
+    }
+
+    if args.serve_sessions {
+        serve_provider_sessions(ProviderSessionContext {
+            args: &args,
+            keypair_path: &keypair_path,
+            password: &password,
+            wallet: &wallet,
+            selected: &selected,
+            rooms: &rooms,
+            attestation: &attestation,
+            attestation_head: &attestation.report_head,
+            rules: &rules,
+        })
+        .await?;
     }
 
     Ok(())
@@ -5414,68 +5474,620 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
         .await
         .context("connecting to SC-Bridge for provider heartbeats")?;
     let mut sent = Vec::new();
-    for room in ctx.rooms {
-        bridge
-            .join(&room.sidechannel)
-            .await
-            .with_context(|| format!("joining sidechannel {}", room.sidechannel))?;
-        for seq in 0..ctx.args.heartbeat_count.max(1) {
-            let ts = unix_epoch_millis()?;
-            let mut heartbeat = json!({
-                "t": "hb",
-                "v": 1,
-                "provider": ctx.wallet.public_key,
-                "enclave_id": ctx.selected.enclave.enclave_id,
-                "model_id": ctx.selected.enclave.model_id,
-                "room_id": room.room_id,
-                "sat": 0.0,
-                "slots": {
-                    "active": 0,
-                    "max": ctx.selected.verdict.max_sessions,
-                },
-                "q": {
-                    "depth": 0,
-                    "est_wait_ms": 0,
-                },
-                "perf": {
-                    "tok_s": ctx.selected.verdict.est_tok_s,
-                    "ttft_ms": 0,
-                },
-                "price_ver": ctx.selected
-                    .price
-                    .as_ref()
-                    .and_then(|price| price.current.as_ref())
-                    .map(|price| price.ver)
-                    .unwrap_or(0),
-                "caps": {
-                    "tools": ctx.selected.model.caps.tools,
-                    "json": ctx.selected.model.caps.json,
-                    "ctx": ctx.selected.model.caps.ctx_max,
-                    "vision": ctx.selected.model.caps.vision,
-                },
-                "att": {
-                    "epoch": ctx.attestation.report.boot_epoch,
-                    "head": ctx.attestation_head,
-                },
-                "ts": ts,
-                "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, ctx.wallet.public_key, ts, seq).as_bytes()).to_hex().to_string(),
-            });
-            let signing_payload = String::from_utf8(heartbeat_signing_payload(&heartbeat)?)
-                .context("heartbeat signing payload was not UTF-8")?;
-            let sig = sign_message(ctx.keypair_path, ctx.password, &signing_payload).await?;
-            heartbeat["sig"] = json!(sig);
-            bridge
-                .send(&room.sidechannel, &heartbeat)
-                .await
-                .with_context(|| format!("sending heartbeat to {}", room.sidechannel))?;
-            sent.push(json!({
-                "room_id": room.room_id,
-                "sidechannel": room.sidechannel,
-                "seq": seq,
-            }));
-        }
+    let count = u64::from(ctx.args.heartbeat_count.max(1));
+    for seq in 0..count {
+        sent.extend(send_provider_heartbeat_round(&mut bridge, &ctx, seq, seq == 0).await?);
     }
     Ok(sent)
+}
+
+async fn send_provider_heartbeat_round(
+    bridge: &mut ScBridgeClient,
+    ctx: &HeartbeatContext<'_>,
+    seq: u64,
+    join_rooms: bool,
+) -> Result<Vec<Value>> {
+    let mut sent = Vec::new();
+    for room in ctx.rooms {
+        if join_rooms {
+            bridge
+                .join(&room.sidechannel)
+                .await
+                .with_context(|| format!("joining sidechannel {}", room.sidechannel))?;
+        }
+        let ts = unix_epoch_millis()?;
+        let mut heartbeat = json!({
+            "t": "hb",
+            "v": 1,
+            "provider": ctx.wallet.public_key,
+            "enclave_id": ctx.selected.enclave.enclave_id,
+            "model_id": ctx.selected.enclave.model_id,
+            "room_id": room.room_id,
+            "sat": 0.0,
+            "slots": {
+                "active": 0,
+                "max": ctx.selected.verdict.max_sessions,
+            },
+            "q": {
+                "depth": 0,
+                "est_wait_ms": 0,
+            },
+            "perf": {
+                "tok_s": ctx.selected.verdict.est_tok_s,
+                "ttft_ms": 0,
+            },
+            "price_ver": ctx.selected
+                .price
+                .as_ref()
+                .and_then(|price| price.current.as_ref())
+                .map(|price| price.ver)
+                .unwrap_or(0),
+            "caps": {
+                "tools": ctx.selected.model.caps.tools,
+                "json": ctx.selected.model.caps.json,
+                "ctx": ctx.selected.model.caps.ctx_max,
+                "vision": ctx.selected.model.caps.vision,
+            },
+            "att": {
+                "epoch": ctx.attestation.report.boot_epoch,
+                "head": ctx.attestation_head,
+            },
+            "ts": ts,
+            "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, ctx.wallet.public_key, ts, seq).as_bytes()).to_hex().to_string(),
+        });
+        let signing_payload = String::from_utf8(heartbeat_signing_payload(&heartbeat)?)
+            .context("heartbeat signing payload was not UTF-8")?;
+        let sig = sign_message(ctx.keypair_path, ctx.password, &signing_payload).await?;
+        heartbeat["sig"] = json!(sig);
+        bridge
+            .send(&room.sidechannel, &heartbeat)
+            .await
+            .with_context(|| format!("sending heartbeat to {}", room.sidechannel))?;
+        sent.push(json!({
+            "room_id": room.room_id,
+            "sidechannel": room.sidechannel,
+            "seq": seq,
+        }));
+    }
+    Ok(sent)
+}
+
+async fn serve_provider_sessions(ctx: ProviderSessionContext<'_>) -> Result<()> {
+    let terms = provider_session_terms(&ctx)?;
+    let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
+        ctx.args.home.as_ref(),
+        ctx.args.sc_bridge_url.as_deref(),
+        ctx.args.sc_bridge_token.as_deref(),
+    )?;
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(&sc_bridge_url, sc_bridge_token)?)
+        .await
+        .context("connecting to SC-Bridge for provider session serving")?;
+    let subscription = bridge
+        .session_subscribe_all()
+        .await
+        .context("subscribing to all direct session frames")?;
+    if !subscription
+        .get("all_sessions")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("SC-Bridge does not support all-session subscription; update the local Intercom app");
+    }
+
+    provider_log(
+        ctx.args,
+        &format!(
+            "Provider session server listening on {} for enclave {} across {} canonical room(s)",
+            sc_bridge_url,
+            terms.enclave_id,
+            ctx.rooms.len()
+        ),
+    );
+
+    let no_config = None;
+    let heartbeat_ctx = HeartbeatContext {
+        args: ctx.args,
+        config: &no_config,
+        keypair_path: ctx.keypair_path,
+        password: ctx.password,
+        wallet: ctx.wallet,
+        selected: ctx.selected,
+        rooms: ctx.rooms,
+        attestation: ctx.attestation,
+        attestation_head: ctx.attestation_head,
+    };
+    let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
+    let mut heartbeat_seq = 0_u64;
+    let mut heartbeat_rooms_joined = false;
+    let mut next_heartbeat_at = Instant::now();
+    let deadline = (ctx.args.serve_sessions_seconds > 0)
+        .then(|| Instant::now() + Duration::from_secs(ctx.args.serve_sessions_seconds));
+    let mut sessions = HashMap::new();
+    loop {
+        let now = Instant::now();
+        if heartbeat_enabled && now >= next_heartbeat_at {
+            send_provider_heartbeat_round(
+                &mut bridge,
+                &heartbeat_ctx,
+                heartbeat_seq,
+                !heartbeat_rooms_joined,
+            )
+            .await?;
+            heartbeat_rooms_joined = true;
+            heartbeat_seq = heartbeat_seq.saturating_add(1);
+            next_heartbeat_at = Instant::now() + Duration::from_secs(2);
+        }
+        let mut wait = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
+            .unwrap_or_else(|| Duration::from_secs(1));
+        if heartbeat_enabled {
+            let heartbeat_wait = next_heartbeat_at.saturating_duration_since(Instant::now());
+            if heartbeat_wait < wait {
+                wait = heartbeat_wait;
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        if wait.is_zero() {
+            continue;
+        }
+        match bridge.next_session_frame(wait).await {
+            Ok(event) => {
+                handle_provider_session_frame(
+                    &mut bridge,
+                    &mut sessions,
+                    &terms,
+                    ctx.attestation,
+                    event,
+                )
+                .await?;
+            }
+            Err(BridgeError::Timeout) => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break;
+                }
+            }
+            Err(err) => return Err(err).context("reading provider session frame"),
+        }
+    }
+    Ok(())
+}
+
+async fn handle_provider_session_frame(
+    bridge: &mut ScBridgeClient,
+    sessions: &mut HashMap<String, ActiveProviderSession>,
+    terms: &ProviderSessionTerms,
+    attestation: &Tier1AttestationReport,
+    event: Value,
+) -> Result<()> {
+    let frame = event.get("frame").cloned().unwrap_or(Value::Null);
+    let session_id = event
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| frame.get("session_id").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_owned();
+    let remote = event
+        .get("remote")
+        .and_then(Value::as_str)
+        .filter(|remote| !remote.is_empty())
+        .context("provider session frame missing remote peer")?
+        .to_owned();
+    match frame.get("t").and_then(Value::as_str) {
+        Some("s.open") => match provider_session_open_decision(&frame, terms) {
+            ProviderSessionDecision::Accept => {
+                sessions.insert(
+                    session_id.clone(),
+                    ActiveProviderSession {
+                        user: remote.clone(),
+                        session_id: session_id.clone(),
+                    },
+                );
+                bridge
+                    .session_send(
+                        &remote,
+                        &session_id,
+                        json!({
+                            "t": "s.accept",
+                            "v": 1,
+                            "session_id": session_id,
+                            "att_report": attestation.report,
+                            "engine": {
+                                "ctx": terms.ctx,
+                                "mode": "provider-session-server-v1",
+                            },
+                            "ts": unix_epoch_millis()?,
+                            "nonce": stable_value_hash(&json!({
+                                "session_id": frame.get("session_id"),
+                                "provider": terms.provider,
+                                "kind": "accept",
+                            })),
+                            "sig": attestation.report.sig_provider,
+                        }),
+                    )
+                    .await
+                    .context("sending s.accept")?;
+            }
+            ProviderSessionDecision::Reject { code, reason } => {
+                bridge
+                    .session_send(
+                        &remote,
+                        &session_id,
+                        json!({
+                            "t": "s.reject",
+                            "v": 1,
+                            "session_id": session_id,
+                            "code": code,
+                            "reason": reason,
+                            "retry_after_ms": 0,
+                            "alt_rooms": [],
+                        }),
+                    )
+                    .await
+                    .context("sending s.reject")?;
+            }
+        },
+        Some("s.req") => {
+            let Some(active) = sessions.get(&session_id).cloned() else {
+                send_provider_session_close(bridge, &remote, &session_id, "err:unknown_session")
+                    .await?;
+                return Ok(());
+            };
+            let request_id = frame
+                .get("rid")
+                .and_then(Value::as_str)
+                .filter(|rid| !rid.is_empty())
+                .unwrap_or("missing-rid");
+            let body = frame.get("body").cloned().unwrap_or(Value::Null);
+            let output = provider_session_response(terms, &body);
+            send_provider_session_output(
+                bridge,
+                &active.user,
+                &active.session_id,
+                request_id,
+                &output,
+            )
+            .await?;
+            send_provider_session_close(bridge, &active.user, &active.session_id, "done").await?;
+            sessions.remove(&session_id);
+        }
+        Some("s.close") => {
+            sessions.remove(&session_id);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn send_provider_session_output(
+    bridge: &mut ScBridgeClient,
+    remote: &str,
+    session_id: &str,
+    request_id: &str,
+    output: &ProviderSessionOutput,
+) -> Result<()> {
+    if let Some(tool) = &output.tool {
+        bridge
+            .session_send(
+                remote,
+                session_id,
+                json!({
+                    "t": "s.delta",
+                    "rid": request_id,
+                    "i": 0,
+                    "d": "",
+                    "tool": tool,
+                    "fin": output.finish_reason,
+                    "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
+                }),
+            )
+            .await
+            .context("sending tool-call s.delta")?;
+        return Ok(());
+    }
+
+    let mut index = 0_u64;
+    for part in provider_stream_parts(&output.content) {
+        bridge
+            .session_send(
+                remote,
+                session_id,
+                json!({
+                    "t": "s.delta",
+                    "rid": request_id,
+                    "i": index,
+                    "d": part,
+                    "tool": null,
+                    "fin": null,
+                }),
+            )
+            .await
+            .context("sending content s.delta")?;
+        index = index.saturating_add(1);
+    }
+    bridge
+        .session_send(
+            remote,
+            session_id,
+            json!({
+                "t": "s.delta",
+                "rid": request_id,
+                "i": index,
+                "d": "",
+                "tool": null,
+                "fin": output.finish_reason,
+                "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
+            }),
+        )
+        .await
+        .context("sending final s.delta")?;
+    Ok(())
+}
+
+async fn send_provider_session_close(
+    bridge: &mut ScBridgeClient,
+    remote: &str,
+    session_id: &str,
+    reason: &str,
+) -> Result<()> {
+    bridge
+        .session_send(
+            remote,
+            session_id,
+            json!({
+                "t": "s.close",
+                "v": 1,
+                "session_id": session_id,
+                "reason": reason,
+            }),
+        )
+        .await
+        .with_context(|| format!("sending s.close for {session_id}"))?;
+    let _ = bridge.session_close(remote, session_id).await;
+    Ok(())
+}
+
+fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSessionTerms> {
+    let price = ctx
+        .selected
+        .price
+        .as_ref()
+        .and_then(|schedule| schedule.current.as_ref())
+        .context("selected provider enclave has no current admin price")?;
+    Ok(ProviderSessionTerms {
+        provider: ctx.wallet.public_key.clone(),
+        enclave_id: ctx.selected.enclave.enclave_id.clone(),
+        model_id: ctx.selected.enclave.model_id.clone(),
+        price_ver: price.ver,
+        rules_ver: ctx.rules.ver,
+        ctx: ctx.selected.model.caps.ctx_max,
+    })
+}
+
+fn provider_session_open_decision(
+    frame: &Value,
+    terms: &ProviderSessionTerms,
+) -> ProviderSessionDecision {
+    let reject = |code, reason: String| ProviderSessionDecision::Reject { code, reason };
+    if frame.get("t").and_then(Value::as_str) != Some("s.open") {
+        return reject("SCHEMA", "session open frame must have t=s.open".to_owned());
+    }
+    let session_id = frame
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !is_hex_len(session_id, 64) {
+        return reject("SCHEMA", "session_id must be 32 bytes of hex".to_owned());
+    }
+    if frame.get("enclave_id").and_then(Value::as_str) != Some(terms.enclave_id.as_str()) {
+        return reject(
+            "ENCLAVE",
+            "session enclave_id is not this admin-created enclave".to_owned(),
+        );
+    }
+    if frame.get("price_ver").and_then(Value::as_u64) != Some(terms.price_ver) {
+        return reject(
+            "PRICE_VER",
+            "session price_ver does not match the current admin price".to_owned(),
+        );
+    }
+    if frame.get("rules_ver").and_then(Value::as_u64) != Some(terms.rules_ver) {
+        return reject(
+            "CONSENT",
+            "session rules_ver does not match current rules".to_owned(),
+        );
+    }
+    let voucher = frame.get("voucher").unwrap_or(&Value::Null);
+    if voucher.get("session_id").and_then(Value::as_str) != Some(session_id) {
+        return reject("VOUCHER", "voucher session_id mismatch".to_owned());
+    }
+    if voucher.get("enclave_id").and_then(Value::as_str) != Some(terms.enclave_id.as_str()) {
+        return reject("VOUCHER", "voucher enclave_id mismatch".to_owned());
+    }
+    if voucher.get("price_ver").and_then(Value::as_u64) != Some(terms.price_ver) {
+        return reject("VOUCHER", "voucher price_ver mismatch".to_owned());
+    }
+    if voucher
+        .get("max_spend_mu")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0
+    {
+        return reject(
+            "BALANCE",
+            "voucher max_spend_mu must be positive".to_owned(),
+        );
+    }
+    ProviderSessionDecision::Accept
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProviderSessionOutput {
+    content: String,
+    tool: Option<Value>,
+    finish_reason: &'static str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> ProviderSessionOutput {
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let prompt = messages
+        .iter()
+        .map(provider_message_to_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt_tokens = rough_text_tokens(&prompt);
+    if let Some(tool_result) = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .map(provider_message_to_text)
+    {
+        let content = format!("Tool result received: {tool_result}");
+        return ProviderSessionOutput {
+            completion_tokens: rough_text_tokens(&content),
+            content,
+            tool: None,
+            finish_reason: "stop",
+            prompt_tokens,
+        };
+    }
+    if let Some(tool_name) = provider_requested_tool_name(body) {
+        return ProviderSessionOutput {
+            content: String::new(),
+            tool: Some(json!({
+                "id": format!("call-{}", stable_value_hash(&json!({ "tool": tool_name, "prompt": prompt }))),
+                "name": tool_name,
+                "arguments": provider_tool_arguments(&tool_name),
+            })),
+            finish_reason: "tool_calls",
+            prompt_tokens,
+            completion_tokens: 1,
+        };
+    }
+    let content = if provider_wants_json(body) {
+        json!({
+            "ok": true,
+            "model": &terms.model_id,
+            "provider": &terms.provider,
+        })
+        .to_string()
+    } else {
+        format!(
+            "Mayhem provider response from {}: {}",
+            terms.model_id,
+            provider_last_user_text(messages)
+        )
+    };
+    ProviderSessionOutput {
+        completion_tokens: rough_text_tokens(&content),
+        content,
+        tool: None,
+        finish_reason: "stop",
+        prompt_tokens,
+    }
+}
+
+fn provider_requested_tool_name(body: &Value) -> Option<String> {
+    if body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        return None;
+    }
+    if let Some(name) = body
+        .get("tool_choice")
+        .and_then(|choice| choice.get("function"))
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+    {
+        return Some(name.to_owned());
+    }
+    body.get("tools")?.as_array()?.iter().find_map(|tool| {
+        tool.get("function")?
+            .get("name")?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
+fn provider_tool_arguments(name: &str) -> String {
+    match name {
+        "bash" => json!({ "command": "printf mayhem-opencode-tool-ok" }).to_string(),
+        "write" => {
+            json!({ "filePath": "mayhem-opencode-tool-ok.txt", "content": "mayhem-opencode-tool-ok" })
+                .to_string()
+        }
+        _ => "{}".to_owned(),
+    }
+}
+
+fn provider_wants_json(body: &Value) -> bool {
+    matches!(
+        body.get("response_format")
+            .and_then(|format| format.get("type"))
+            .and_then(Value::as_str),
+        Some("json_object" | "json_schema")
+    )
+}
+
+fn provider_last_user_text(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .map(provider_message_to_text)
+        .unwrap_or_default()
+}
+
+fn provider_message_to_text(message: &Value) -> String {
+    provider_content_to_text(message.get("content").unwrap_or(&Value::Null))
+}
+
+fn provider_content_to_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| provider_content_to_text(part))
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        other => other.to_string(),
+    }
+}
+
+fn provider_stream_parts(content: &str) -> Vec<String> {
+    let mut parts = content
+        .split_inclusive(' ')
+        .map(str::to_owned)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() && !content.is_empty() {
+        parts.push(content.to_owned());
+    }
+    parts
+}
+
+fn rough_text_tokens(text: &str) -> u64 {
+    if text.trim().is_empty() {
+        0
+    } else {
+        text.split_whitespace().count() as u64
+    }
+}
+
+fn is_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn safe_path_component(value: &str) -> String {
@@ -6227,6 +6839,79 @@ mod tests {
         assert!(format!("{err:#}").contains("no canonical contract-backed models"));
     }
 
+    #[test]
+    fn provider_session_open_enforces_admin_terms() {
+        let terms = test_provider_session_terms();
+        let frame = test_session_open_frame(&terms);
+        assert_eq!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Accept
+        );
+
+        let mut wrong_enclave = frame.clone();
+        wrong_enclave["enclave_id"] = json!("22".repeat(32));
+        assert!(matches!(
+            provider_session_open_decision(&wrong_enclave, &terms),
+            ProviderSessionDecision::Reject {
+                code: "ENCLAVE",
+                ..
+            }
+        ));
+
+        let mut wrong_price = frame.clone();
+        wrong_price["price_ver"] = json!(terms.price_ver + 1);
+        assert!(matches!(
+            provider_session_open_decision(&wrong_price, &terms),
+            ProviderSessionDecision::Reject {
+                code: "PRICE_VER",
+                ..
+            }
+        ));
+
+        let mut stale_rules = frame.clone();
+        stale_rules["rules_ver"] = json!(terms.rules_ver + 1);
+        assert!(matches!(
+            provider_session_open_decision(&stale_rules, &terms),
+            ProviderSessionDecision::Reject {
+                code: "CONSENT",
+                ..
+            }
+        ));
+
+        let mut bad_voucher = frame;
+        bad_voucher["voucher"]["price_ver"] = json!(terms.price_ver + 1);
+        assert!(matches!(
+            provider_session_open_decision(&bad_voucher, &terms),
+            ProviderSessionDecision::Reject {
+                code: "VOUCHER",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_session_response_preserves_tool_call_shape() {
+        let terms = test_provider_session_terms();
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "write", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": "auto",
+            "stream": true
+        });
+        let output = provider_session_response(&terms, &body);
+
+        assert_eq!(output.finish_reason, "tool_calls");
+        let tool = output.tool.expect("tool call");
+        assert_eq!(tool["name"], "write");
+        assert!(tool["arguments"]
+            .as_str()
+            .expect("arguments")
+            .contains("mayhem-opencode-tool-ok"));
+    }
+
     #[tokio::test]
     async fn provider_local_artifact_must_match_admin_root() {
         let temp = env::temp_dir().join(format!(
@@ -6819,9 +7504,47 @@ mod tests {
             sim: false,
             no_heartbeat: true,
             heartbeat_count: 1,
+            serve_sessions: false,
+            serve_sessions_seconds: 0,
             print_json: true,
             dev_skip_catalog_verify: true,
         }
+    }
+
+    fn test_provider_session_terms() -> ProviderSessionTerms {
+        ProviderSessionTerms {
+            provider: "55".repeat(32),
+            enclave_id: "11".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            price_ver: 7,
+            rules_ver: 3,
+            ctx: 8192,
+        }
+    }
+
+    fn test_session_open_frame(terms: &ProviderSessionTerms) -> Value {
+        let session_id = "aa".repeat(32);
+        json!({
+            "t": "s.open",
+            "v": 1,
+            "session_id": session_id,
+            "user": "66".repeat(32),
+            "enclave_id": &terms.enclave_id,
+            "price_ver": terms.price_ver,
+            "rules_ver": terms.rules_ver,
+            "voucher": {
+                "session_id": session_id,
+                "enclave_id": &terms.enclave_id,
+                "price_ver": terms.price_ver,
+                "max_spend_mu": 1000,
+                "checkpoint_every": { "tokens": 8192, "ms": 30000 },
+                "user_sig": "77".repeat(64)
+            },
+            "att_nonce": "88".repeat(32),
+            "ts": 1,
+            "nonce": "99".repeat(32),
+            "sig": "77".repeat(64)
+        })
     }
 
     fn test_hardware(fixture: FixtureProfile) -> HardwareReport {

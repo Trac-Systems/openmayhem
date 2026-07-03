@@ -155,6 +155,14 @@ impl ScBridgeClient {
         .await
     }
 
+    pub async fn session_subscribe_all(&mut self) -> Result<Value> {
+        self.request(
+            json!({ "type": "session_subscribe", "session_ids": ["*"] }),
+            "session_subscribed",
+        )
+        .await
+    }
+
     pub async fn session_open(
         &mut self,
         remote: impl AsRef<str>,

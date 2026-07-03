@@ -153,6 +153,7 @@ class ScBridge extends Feature {
     for (const client of this.clients) {
       if (!client.ready) continue;
       if (
+        !client.sessionAll &&
         client.sessionIds &&
         client.sessionIds.size > 0 &&
         !client.sessionIds.has(payload.session_id)
@@ -278,8 +279,15 @@ class ScBridge extends Feature {
             ? [message.session_id]
             : [];
         if (!client.sessionIds) client.sessionIds = new Set();
+        if (sessionIds.some((sessionId) => String(sessionId) === '*')) {
+          client.sessionAll = true;
+        }
         for (const sessionId of sessionIds) client.sessionIds.add(String(sessionId));
-        reply({ type: 'session_subscribed', session_ids: Array.from(client.sessionIds) });
+        reply({
+          type: 'session_subscribed',
+          session_ids: Array.from(client.sessionIds),
+          all_sessions: client.sessionAll === true,
+        });
         return;
       }
       case 'session_unsubscribe': {
@@ -289,8 +297,15 @@ class ScBridge extends Feature {
             ? [message.session_id]
             : [];
         if (!client.sessionIds) client.sessionIds = new Set();
-        for (const sessionId of sessionIds) client.sessionIds.delete(String(sessionId));
-        reply({ type: 'session_subscribed', session_ids: Array.from(client.sessionIds) });
+        for (const sessionId of sessionIds) {
+          if (String(sessionId) === '*') client.sessionAll = false;
+          client.sessionIds.delete(String(sessionId));
+        }
+        reply({
+          type: 'session_subscribed',
+          session_ids: Array.from(client.sessionIds),
+          all_sessions: client.sessionAll === true,
+        });
         return;
       }
       case 'session_open': {
@@ -654,6 +669,7 @@ class ScBridge extends Feature {
         filter: this.defaultFilter,
         channels: null,
         sessionIds: null,
+        sessionAll: false,
       };
       this.clients.add(client);
 
