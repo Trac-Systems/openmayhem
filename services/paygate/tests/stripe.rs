@@ -526,3 +526,111 @@ async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
     assert!(event_log.contains("evt_test_deposit_before_dispute"));
     assert!(event_log.contains("evt_test_dispute_replay"));
 }
+
+#[tokio::test]
+async fn stripe_dispute_cannot_claw_back_more_than_original_deposit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let poster = Arc::new(RecordingContractPoster::default());
+    let state = PaygateState::try_new_with_contract_poster(
+        test_config(
+            "http://127.0.0.1:9".to_owned(),
+            temp.path().join("stripe-events.jsonl"),
+        ),
+        OracleKeypair::from_seed_hex(&"34".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+    let app = paygate_router(state);
+    let deposit_payload = json!({
+        "id": "evt_test_deposit_before_oversized_dispute",
+        "object": "event",
+        "type": "payment_intent.succeeded",
+        "created": 3_600,
+        "data": {
+            "object": {
+                "id": "pi_test_oversized_dispute",
+                "object": "payment_intent",
+                "latest_charge": "ch_test_oversized_dispute",
+                "amount_received": 250,
+                "currency": "usd",
+                "metadata": {
+                    "mayhem_who": "d".repeat(64),
+                    "mayhem_mu": "2500000",
+                    "mayhem_denom": "mu_usd"
+                }
+            }
+        }
+    })
+    .to_string();
+    let deposit_signature =
+        stripe_signature_header("whsec_test", deposit_payload.as_bytes(), now_seconds())
+            .expect("deposit sig");
+    let deposit_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/stripe/webhook")
+                .header("stripe-signature", &deposit_signature)
+                .body(Body::from(deposit_payload))
+                .expect("deposit request builds"),
+        )
+        .await
+        .expect("deposit response");
+    assert_eq!(deposit_response.status(), StatusCode::OK);
+
+    let dispute_payload = json!({
+        "id": "evt_test_oversized_dispute",
+        "object": "event",
+        "type": "charge.dispute.created",
+        "created": 7_200,
+        "data": {
+            "object": {
+                "id": "dp_test_oversized",
+                "object": "dispute",
+                "amount": 300,
+                "currency": "usd",
+                "charge": "ch_test_oversized_dispute",
+                "payment_intent": "pi_test_oversized_dispute",
+                "reason": "fraudulent",
+                "status": "needs_response"
+            }
+        }
+    })
+    .to_string();
+    let dispute_signature =
+        stripe_signature_header("whsec_test", dispute_payload.as_bytes(), now_seconds())
+            .expect("dispute sig");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/stripe/webhook")
+                .header("stripe-signature", &dispute_signature)
+                .body(Body::from(dispute_payload))
+                .expect("dispute request builds"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response bytes");
+    let body: Value = serde_json::from_slice(&bytes).expect("response JSON");
+    assert_eq!(body["ok"], false);
+    assert!(body["error"]
+        .as_str()
+        .expect("error")
+        .contains("Dispute amount exceeds original deposit"));
+
+    let deposits = poster.deposits.lock().await;
+    let chargebacks = poster.chargebacks.lock().await;
+    assert_eq!(deposits.len(), 1);
+    assert_eq!(chargebacks.len(), 0);
+
+    let event_log =
+        std::fs::read_to_string(temp.path().join("stripe-events.jsonl")).expect("event log");
+    assert_eq!(event_log.lines().count(), 1);
+    assert!(event_log.contains("evt_test_deposit_before_oversized_dispute"));
+    assert!(!event_log.contains("evt_test_oversized_dispute"));
+}

@@ -1685,6 +1685,11 @@ async fn handle_stripe_dispute_created(
             "Dispute amount must be positive".to_owned(),
         ));
     }
+    if mu > deposit.mu {
+        return Err(PaygateError::Stripe(
+            "Dispute amount exceeds original deposit".to_owned(),
+        ));
+    }
     let at = event
         .created
         .or_else(|| object.get("created").and_then(Value::as_u64))
