@@ -294,7 +294,14 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   if (requireObject(add, manifest.controls, 'controls')) {
     requireOnlyKeys(add, manifest.controls, 'controls', [
       'admin_controls_economy',
+      'admin_sets_prices',
+      'admin_sets_rules',
+      'admin_sets_params',
+      'admin_sets_provider_payout_targets',
+      'admin_can_ban_providers',
       'providers_set_prices',
+      'providers_set_rules',
+      'providers_set_params',
       'providers_set_payout_terms',
       'providers_submit_models',
       'providers_create_canonical_rooms',
@@ -303,7 +310,14 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
       'browser_handoffs_print_copy_paste_url',
     ]);
     requireLiteral(add, manifest.controls.admin_controls_economy, true, 'controls.admin_controls_economy');
+    requireLiteral(add, manifest.controls.admin_sets_prices, true, 'controls.admin_sets_prices');
+    requireLiteral(add, manifest.controls.admin_sets_rules, true, 'controls.admin_sets_rules');
+    requireLiteral(add, manifest.controls.admin_sets_params, true, 'controls.admin_sets_params');
+    requireLiteral(add, manifest.controls.admin_sets_provider_payout_targets, true, 'controls.admin_sets_provider_payout_targets');
+    requireLiteral(add, manifest.controls.admin_can_ban_providers, true, 'controls.admin_can_ban_providers');
     requireLiteral(add, manifest.controls.providers_set_prices, false, 'controls.providers_set_prices');
+    requireLiteral(add, manifest.controls.providers_set_rules, false, 'controls.providers_set_rules');
+    requireLiteral(add, manifest.controls.providers_set_params, false, 'controls.providers_set_params');
     requireLiteral(add, manifest.controls.providers_set_payout_terms, false, 'controls.providers_set_payout_terms');
     requireLiteral(add, manifest.controls.providers_submit_models, false, 'controls.providers_submit_models');
     requireLiteral(add, manifest.controls.providers_create_canonical_rooms, false, 'controls.providers_create_canonical_rooms');
