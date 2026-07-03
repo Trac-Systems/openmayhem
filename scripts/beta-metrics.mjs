@@ -151,6 +151,17 @@ function validateEvidenceArray(add, value, name) {
   }
 }
 
+function validatePaymentRailEvidence(add, value) {
+  validateEvidenceArray(add, value, 'payment_rails.evidence');
+  if (!Array.isArray(value)) return;
+  if (value.some((item) => isPlaceholder(item))) return;
+  for (const rail of ['tnk', 'stripe', 'coinbase']) {
+    if (!value.some((item) => item.includes(`#rail:${rail}`) && item.includes('#credits_mu_usd'))) {
+      add('error', `payment_rails.evidence must include mu_usd credit evidence for ${rail}`);
+    }
+  }
+}
+
 function validateCheckoutHandoffSamples(add, value, railsVerified) {
   validateEvidenceArray(add, value, 'browser_handoffs.samples');
   if (!Array.isArray(value)) return;
@@ -231,7 +242,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireBoolean(add, metrics.payment_rails.stripe_enabled, true, 'payment_rails.stripe_enabled');
     requireBoolean(add, metrics.payment_rails.coinbase_enabled, true, 'payment_rails.coinbase_enabled');
     requireBoolean(add, metrics.payment_rails.rails_credit_mu_usd, true, 'payment_rails.rails_credit_mu_usd');
-    validateEvidenceArray(add, metrics.payment_rails.evidence, 'payment_rails.evidence');
+    validatePaymentRailEvidence(add, metrics.payment_rails.evidence);
   }
 
   if (requireObject(add, metrics.window, 'window')) {

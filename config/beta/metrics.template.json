@@ -26,7 +26,9 @@
     "coinbase_enabled": true,
     "rails_credit_mu_usd": true,
     "evidence": [
-      "<file:payment-rails-health.json#sha256:64-hex>"
+      "<file:tnk-credit-proof.json#sha256:64-hex#rail:tnk#credits_mu_usd>",
+      "<file:stripe-credit-proof.json#sha256:64-hex#rail:stripe#credits_mu_usd>",
+      "<file:coinbase-credit-proof.json#sha256:64-hex#rail:coinbase#credits_mu_usd>"
     ]
   },
   "window": {
