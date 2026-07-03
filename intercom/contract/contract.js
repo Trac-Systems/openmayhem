@@ -968,6 +968,8 @@ class MayhemContract extends Contract {
     const enclave = await this.get(`enclave/${this.value.enclave_id}`);
     if (!enclave) return new Error('Enclave not found.');
     if (enclave.status !== 'active') return new Error('Enclave is not active.');
+    const enclaveRoleError = this.requireAdminCreatedEnclave(enclave);
+    if (enclaveRoleError) return enclaveRoleError;
     const priceError = await this.requireCurrentAdminPrice(this.value.enclave_id);
     if (priceError) return priceError;
 
@@ -1060,6 +1062,10 @@ class MayhemContract extends Contract {
     if (!serving || serving.status !== 'active') return new Error('Provider is not serving enclave.');
     const enclave = await this.get(`enclave/${this.value.enclave_id}`);
     if (!enclave || enclave.status !== 'active') return new Error('Enclave is not active.');
+    const enclaveRoleError = this.requireAdminCreatedEnclave(enclave);
+    if (enclaveRoleError) return enclaveRoleError;
+    const roomRoleError = this.requireAdminCreatedRoom(room);
+    if (roomRoleError) return roomRoleError;
     const priceError = await this.requireCurrentAdminPrice(this.value.enclave_id);
     if (priceError) return priceError;
     if (room.enclave_id && room.enclave_id !== this.value.enclave_id) {
@@ -1184,6 +1190,8 @@ class MayhemContract extends Contract {
       const enclave = await this.get(`enclave/${this.value.enclave_id}`);
       if (!enclave) return new Error('Enclave not found.');
       if (enclave.status !== 'active') return new Error('Enclave is not active.');
+      const enclaveRoleError = this.requireAdminCreatedEnclave(enclave);
+      if (enclaveRoleError) return enclaveRoleError;
       if (this.value.model_id && this.value.model_id !== enclave.model_id) {
         return new Error('Room model does not match enclave model.');
       }
@@ -2735,6 +2743,20 @@ class MayhemContract extends Contract {
     }
     if (current.set_by_role !== undefined && current.set_by_role !== 'admin') {
       return new Error('Provider serving requires a current admin-set enclave price.');
+    }
+    return null;
+  }
+
+  requireAdminCreatedEnclave(enclave) {
+    if (enclave?.created_by_role !== undefined && enclave.created_by_role !== 'admin') {
+      return new Error('Canonical serving requires an admin-created enclave.');
+    }
+    return null;
+  }
+
+  requireAdminCreatedRoom(room) {
+    if (room?.creator_role !== undefined && room.creator_role !== 'admin') {
+      return new Error('Provider room serving requires an admin-created room.');
     }
     return null;
   }

@@ -419,6 +419,74 @@ test('MayhemContract provider serving price gate fails closed without current ad
   assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
 });
 
+test('MayhemContract provider serving rejects explicit non-admin enclave markers', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerEnclave',
+      value: enclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: enclaveRegistration.model_id,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+
+  const enclave = (await storage.get(`enclave/${enclaveId}`)).value;
+  await storage.put(`enclave/${enclaveId}`, {
+    ...enclave,
+    created_by_role: 'provider',
+  });
+
+  const before = storage.snapshotBytes();
+  const rejected = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    6
+  );
+  assert.match(rejected.message, /admin-created enclave/i);
+  assert.equal(storage.snapshotBytes(), before);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+});
+
 test('MayhemContract validates admin enclave caps as capability-only records', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();

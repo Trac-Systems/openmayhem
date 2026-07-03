@@ -385,6 +385,134 @@ test('MayhemContract validates admin room policy as canonical routing controls',
   assert.deepEqual(room.value.policy, validPolicy);
 });
 
+test('MayhemContract room serving rejects explicit non-admin authority markers', async () => {
+  const provider = await makeIdentity();
+  const { contract, storage, admin } = await setupRoomAdmin(provider);
+  const nonce = 'polluted-room';
+  const roomId = await deriveRoomId(enclaveId, admin.publicKey, nonce);
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerEnclave',
+      value: enclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+
+  const enclave = (await storage.get(`enclave/${enclaveId}`)).value;
+  await storage.put(`enclave/${enclaveId}`, {
+    ...enclave,
+    created_by_role: 'provider',
+  });
+  const pollutedEnclaveOpen = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: enclaveId,
+      model_id: modelId,
+      nonce,
+      label: 'polluted',
+      policy: {},
+    },
+    admin.publicKey,
+    6
+  );
+  assert.match(pollutedEnclaveOpen.message, /admin-created enclave/i);
+  assert.equal(await storage.get(`room/${roomId}`), null);
+
+  await storage.put(`enclave/${enclaveId}`, {
+    ...enclave,
+    created_by_role: 'admin',
+  });
+  const opened = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: enclaveId,
+      model_id: modelId,
+      nonce,
+      label: 'polluted',
+      policy: {},
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(opened.ok, true, opened.message);
+
+  const joinedEnclave = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    {
+      op: 'join_enclave',
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    8
+  );
+  assert.equal(joinedEnclave.ok, true, joinedEnclave.message);
+
+  const room = (await storage.get(`room/${roomId}`)).value;
+  await storage.put(`room/${roomId}`, {
+    ...room,
+    creator_role: 'provider',
+  });
+  const beforeRoomJoin = storage.snapshotBytes();
+  const pollutedRoomJoin = await execute(
+    contract,
+    storage,
+    'joinRoom',
+    {
+      op: 'join_room',
+      room_id: roomId,
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    9
+  );
+  assert.match(pollutedRoomJoin.message, /admin-created room/i);
+  assert.equal(storage.snapshotBytes(), beforeRoomJoin);
+  assert.equal(await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`), null);
+  assert.deepEqual((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.rooms, []);
+});
+
 test('MayhemContract keeps legacy admin model rooms joinable by matching enclave model', async () => {
   const provider = await makeIdentity();
   const { contract, storage, admin } = await setupRoomAdmin(provider);
