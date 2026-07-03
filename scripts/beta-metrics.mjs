@@ -200,6 +200,9 @@ function validatePaymentRailEvidence(add, value) {
       add('error', `payment_rails.evidence must include mu_usd credit evidence for ${rail}`);
     }
   }
+  if (!value.some((item) => hasEvidenceTag(item, 'paygate_admin_controls'))) {
+    add('error', 'payment_rails.evidence must include paygate admin-control health evidence');
+  }
 }
 
 function validateCheckoutHandoffSamples(add, value, railsVerified) {
@@ -292,6 +295,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireBoolean(add, metrics.payment_rails.stripe_enabled, true, 'payment_rails.stripe_enabled');
     requireBoolean(add, metrics.payment_rails.coinbase_enabled, true, 'payment_rails.coinbase_enabled');
     requireBoolean(add, metrics.payment_rails.rails_credit_mu_usd, true, 'payment_rails.rails_credit_mu_usd');
+    requireBoolean(
+      add,
+      metrics.payment_rails.paygate_admin_controls_verified,
+      true,
+      'payment_rails.paygate_admin_controls_verified',
+    );
     validatePaymentRailEvidence(add, metrics.payment_rails.evidence);
   }
 

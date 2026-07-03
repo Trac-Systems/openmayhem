@@ -491,6 +491,36 @@ function collectCanonicalService(args) {
   };
 }
 
+function paygateAdminControlsVerified(value) {
+  const controls = firstDefined(value, [
+    'payment_rails.controls',
+    'paygate.controls',
+    'controls',
+  ]);
+  if (!controls || typeof controls !== 'object' || Array.isArray(controls)) return false;
+  const expectedTrue = [
+    'admin_controls_economy',
+    'admin_sets_terms',
+    'admin_sets_prices',
+    'admin_sets_rules',
+    'admin_sets_params',
+    'admin_sets_provider_payout_targets',
+    'admin_can_ban_providers',
+    'providers_only_join_admin_rooms',
+    'provider_payout_targets_admin_verified',
+  ];
+  const expectedFalse = [
+    'providers_set_prices',
+    'providers_set_rules',
+    'providers_set_params',
+    'providers_set_payout_terms',
+    'providers_submit_models',
+    'providers_create_canonical_rooms',
+  ];
+  return expectedTrue.every((key) => controls[key] === true)
+    && expectedFalse.every((key) => controls[key] === false);
+}
+
 function collectPaymentRails(args) {
   const source = readJsonEvidence(requireArg(args, 'paymentRails'));
   const value = source.value;
@@ -505,6 +535,9 @@ function collectPaymentRails(args) {
       firstDefined(record, ['coinbase_enabled', 'coinbase.enabled', 'paygate.coinbase_enabled', 'rails.coinbase.enabled']) === true
       || firstDefined(value, ['paygate.coinbase_enabled', 'rails.coinbase.enabled']) === true,
     rails_credit_mu_usd: firstDefined(record, ['rails_credit_mu_usd', 'credit_mu_usd', 'credits_mu_usd']) === true,
+    paygate_admin_controls_verified:
+      firstDefined(record, ['paygate_admin_controls_verified', 'admin_economy_controls_verified']) === true
+      || paygateAdminControlsVerified(value),
     evidence: [
       source.evidence,
       ...asEvidenceArray(value, ['payment_rails.evidence', 'evidence']),

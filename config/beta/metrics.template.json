@@ -25,7 +25,9 @@
     "stripe_enabled": true,
     "coinbase_enabled": true,
     "rails_credit_mu_usd": true,
+    "paygate_admin_controls_verified": true,
     "evidence": [
+      "<file:paygate-health.json#sha256:64-hex#paygate_admin_controls>",
       "<file:tnk-credit-proof.json#sha256:64-hex#rail:tnk#credits_mu_usd>",
       "<file:stripe-credit-proof.json#sha256:64-hex#rail:stripe#credits_mu_usd>",
       "<file:coinbase-credit-proof.json#sha256:64-hex#rail:coinbase#credits_mu_usd>"
