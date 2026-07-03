@@ -205,6 +205,19 @@ function validatePaymentRailEvidence(add, value) {
   }
 }
 
+function validateCanonicalServiceEvidence(add, value) {
+  validateEvidenceArray(add, value, 'canonical_service.evidence');
+  if (!Array.isArray(value)) return;
+  if (value.some((item) => isPlaceholder(item))) return;
+  if (!value.some((item) => typeof item === 'string' && item.startsWith('audit:canonical-service:v1#sha256:'))) {
+    add('error', 'canonical_service.evidence must include audit:canonical-service:v1#sha256:<64-hex>');
+  }
+  const fileEvidenceCount = value.filter((item) => typeof item === 'string' && item.startsWith('file:')).length;
+  if (fileEvidenceCount < 3) {
+    add('error', 'canonical_service.evidence must include at least three file-hash-bound inputs');
+  }
+}
+
 function validateCheckoutHandoffSamples(add, value, railsVerified) {
   validateEvidenceArray(add, value, 'browser_handoffs.samples');
   if (!Array.isArray(value)) return;
@@ -407,7 +420,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'canonical_service.admin_provider_ban_records_verified',
     );
-    validateEvidenceArray(add, metrics.canonical_service.evidence, 'canonical_service.evidence');
+    validateCanonicalServiceEvidence(add, metrics.canonical_service.evidence);
   }
 
   const counts = {

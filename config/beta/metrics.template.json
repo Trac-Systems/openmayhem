@@ -68,7 +68,10 @@
     "admin_params_records_verified": true,
     "admin_provider_ban_records_verified": true,
     "evidence": [
-      "<file:canonical-service-audit.json#sha256:64-hex>"
+      "<file:canonical-service-audit.json#sha256:64-hex>",
+      "<file:contract-state.json#sha256:64-hex>",
+      "<file:catalog/models.json#sha256:64-hex>",
+      "<audit:canonical-service:v1#sha256:64-hex>"
     ]
   },
   "participants": {
