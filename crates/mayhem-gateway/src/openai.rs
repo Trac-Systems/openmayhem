@@ -749,6 +749,11 @@ fn validate_direct_session_accept(
             invocation.enclave_id
         )));
     }
+    if report.nonce_u != expected_att_nonce {
+        return Err(fail(
+            "provider accept att_report nonce_u did not match sent s.open".to_owned(),
+        ));
+    }
     let top_sig = frame
         .get("sig")
         .and_then(Value::as_str)
@@ -1928,6 +1933,12 @@ mod tests {
         wrong_enclave["att_report"]["enclave_id"] = json!("cc".repeat(32));
         assert_accept_err(&wrong_enclave, &invocation, "enclave_id");
 
+        let mut wrong_report_nonce = frame.clone();
+        wrong_report_nonce["att_report"] =
+            test_attestation_report_with_nonce(&invocation, "97".repeat(32));
+        sign_accept_frame(&mut wrong_report_nonce);
+        assert_accept_err(&wrong_report_nonce, &invocation, "nonce_u");
+
         let mut wrong_provider = frame.clone();
         wrong_provider["att_report"]["provider_pubkey"] = json!("dd".repeat(32));
         assert_accept_err(&wrong_provider, &invocation, "provider_pubkey");
@@ -2001,6 +2012,13 @@ mod tests {
     }
 
     fn test_attestation_report(invocation: &GatewaySessionInvocation) -> Value {
+        test_attestation_report_with_nonce(invocation, test_att_nonce())
+    }
+
+    fn test_attestation_report_with_nonce(
+        invocation: &GatewaySessionInvocation,
+        nonce_u: String,
+    ) -> Value {
         let mut report = AttestationReport {
             schema_version: ATTESTATION_SCHEMA_VERSION,
             alg: ATTESTATION_ALG.to_owned(),
@@ -2013,7 +2031,7 @@ mod tests {
             hw_quote: None,
             boot_epoch: 1,
             report_ts: 2,
-            nonce_u: test_att_nonce(),
+            nonce_u,
             sig_enclave: String::new(),
             sig_provider: String::new(),
         };

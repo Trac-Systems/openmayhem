@@ -22,9 +22,9 @@ use mayhem_enclave::{
     boot_sealed_store, build_merkle_manifest, download_resumable,
     finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
     prepare_tier1_attestation_report, seal_artifact, BootOptions, DownloadReport, DownloadRequest,
-    DownloadSource, KeyContext, RuntimeKeyContext, RuntimeKeypairStoreOptions, SealOptions,
-    Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
-    SEALED_STORE_MANIFEST,
+    DownloadSource, KeyContext, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions,
+    SealOptions, Tier1AttestationDraft, Tier1AttestationReport,
+    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
     EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, ModelArtifact, ToolSpec,
@@ -5574,6 +5574,10 @@ struct ProviderSessionRuntime<'a> {
     rooms: &'a [LedgerRoom],
     keypair_path: &'a Path,
     password: &'a str,
+    attestation_identity: CatalogEnclaveIdentity,
+    runtime_keypair: &'a RuntimeKeypair,
+    binary_path: &'a Path,
+    boot_epoch: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -5791,17 +5795,18 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     )
     .to_hex()
     .to_string();
+    let attestation_identity = CatalogEnclaveIdentity {
+        admin_pubkey: selected.enclave.created_by.clone(),
+        model_id: selected.enclave.model_id.clone(),
+        artifact_root: selected.enclave.artifact_root.clone(),
+        manifest_hash: selected.enclave.manifest_hash.clone(),
+        binary_hash: binary_hash.clone(),
+    };
     let draft = prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
-        identity: CatalogEnclaveIdentity {
-            admin_pubkey: selected.enclave.created_by.clone(),
-            model_id: selected.enclave.model_id.clone(),
-            artifact_root: selected.enclave.artifact_root.clone(),
-            manifest_hash: selected.enclave.manifest_hash.clone(),
-            binary_hash,
-        },
-        runtime_keypair,
+        identity: attestation_identity.clone(),
+        runtime_keypair: runtime_keypair.clone(),
         provider_pubkey: wallet.public_key.clone(),
-        binary_path,
+        binary_path: binary_path.clone(),
         boot_epoch: now,
         report_ts: now,
         nonce_u,
@@ -5963,6 +5968,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 rooms: &rooms,
                 keypair_path: &keypair_path,
                 password: &password,
+                attestation_identity,
+                runtime_keypair: &runtime_keypair,
+                binary_path: &binary_path,
+                boot_epoch: attestation.report.boot_epoch,
             },
             responder,
         )
@@ -7612,7 +7621,6 @@ async fn serve_provider_sessions(
                     &mut sessions,
                     &terms,
                     &runtime,
-                    ctx.attestation,
                     responder.as_mut(),
                     event,
                 )
@@ -7634,7 +7642,6 @@ async fn handle_provider_session_frame(
     sessions: &mut HashMap<String, ActiveProviderSession>,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
-    attestation: &Tier1AttestationReport,
     responder: &mut dyn ProviderSessionResponder,
     event: Value,
 ) -> Result<()> {
@@ -7673,14 +7680,21 @@ async fn handle_provider_session_frame(
                     let ts = unix_epoch_millis()?;
                     let open_head =
                         session_frame_head(&frame).context("hashing s.open frame for s.accept")?;
-                    let att_nonce = frame.get("att_nonce").cloned().unwrap_or(Value::Null);
+                    let att_nonce = frame
+                        .get("att_nonce")
+                        .and_then(Value::as_str)
+                        .context("accepted s.open missing validated att_nonce")?;
+                    let session_attestation =
+                        provider_session_attestation(runtime, terms, att_nonce)
+                            .await
+                            .context("building per-session s.accept attestation")?;
                     let mut accept_frame = json!({
                         "t": "s.accept",
                         "v": 1,
                         "session_id": session_id,
                         "open_head": open_head,
                         "att_nonce": att_nonce,
-                        "att_report": attestation.report,
+                        "att_report": session_attestation.report,
                         "engine": {
                             "ctx": terms.ctx,
                             "mode": "provider-session-server-v1",
@@ -7846,6 +7860,52 @@ async fn send_provider_session_close(
         .with_context(|| format!("sending s.close for {session_id}"))?;
     let _ = bridge.session_close(remote, session_id).await;
     Ok(())
+}
+
+async fn provider_session_attestation(
+    runtime: &ProviderSessionRuntime<'_>,
+    terms: &ProviderSessionTerms,
+    att_nonce: &str,
+) -> Result<Tier1AttestationReport> {
+    let report_ts = unix_epoch_seconds()?;
+    let draft = prepare_provider_session_attestation(
+        &runtime.attestation_identity,
+        runtime.runtime_keypair,
+        &terms.provider,
+        runtime.binary_path,
+        runtime.boot_epoch,
+        report_ts,
+        att_nonce,
+    )?;
+    let provider_attestation_sig = sign_hex(
+        runtime.keypair_path,
+        runtime.password,
+        &draft.provider_signing_message_hex,
+    )
+    .await?;
+    finalize_tier1_attestation_report(draft, provider_attestation_sig)
+        .context("finalizing per-session provider attestation")
+}
+
+fn prepare_provider_session_attestation(
+    identity: &CatalogEnclaveIdentity,
+    runtime_keypair: &RuntimeKeypair,
+    provider_pubkey: &str,
+    binary_path: &Path,
+    boot_epoch: u64,
+    report_ts: u64,
+    att_nonce: &str,
+) -> Result<Tier1AttestationDraft> {
+    prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
+        identity: identity.clone(),
+        runtime_keypair: runtime_keypair.clone(),
+        provider_pubkey: provider_pubkey.to_owned(),
+        binary_path: binary_path.to_path_buf(),
+        boot_epoch,
+        report_ts,
+        nonce_u: att_nonce.to_owned(),
+    })
+    .context("preparing per-session provider attestation")
 }
 
 fn provider_session_responder(
@@ -10084,6 +10144,53 @@ mod tests {
 
         frame["session_id"] = json!("bb".repeat(32));
         assert_ne!(session_accept_signing_bytes(&frame).unwrap(), payload);
+    }
+
+    #[test]
+    fn provider_session_attestation_draft_binds_open_nonce() {
+        let terms = test_provider_session_terms();
+        let frame = test_session_open_frame(&terms);
+        let att_nonce = frame.get("att_nonce").and_then(Value::as_str).unwrap();
+        let binary_path = std::env::current_exe().unwrap();
+        let identity = CatalogEnclaveIdentity {
+            admin_pubkey: "44".repeat(32),
+            model_id: terms.model_id.clone(),
+            artifact_root: "aa".repeat(32),
+            manifest_hash: "bb".repeat(32),
+            binary_hash: measure_binary(&binary_path).unwrap(),
+        };
+        let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
+        let draft = prepare_provider_session_attestation(
+            &identity,
+            &runtime_keypair,
+            &terms.provider,
+            &binary_path,
+            100,
+            101,
+            att_nonce,
+        )
+        .unwrap();
+
+        assert_eq!(draft.body.nonce_u, att_nonce);
+        assert_eq!(draft.body.provider_pubkey, terms.provider.as_str());
+
+        let other_nonce = "99".repeat(32);
+        let other_draft = prepare_provider_session_attestation(
+            &identity,
+            &runtime_keypair,
+            &terms.provider,
+            &binary_path,
+            100,
+            101,
+            &other_nonce,
+        )
+        .unwrap();
+        assert_eq!(other_draft.body.nonce_u, other_nonce);
+        assert_ne!(draft.sig_enclave, other_draft.sig_enclave);
+        assert_ne!(
+            draft.provider_signing_message_hex,
+            other_draft.provider_signing_message_hex
+        );
     }
 
     #[test]
