@@ -355,6 +355,37 @@ extract_archive() {
   esac
 }
 
+verify_extracted_checksums() {
+  local extract_dir="$1"
+  local sums_file sums_dir line expected rel target actual verified
+
+  sums_file="$(find "$extract_dir" -type f -name SHA256SUMS | sort | head -n 1 || true)"
+  [[ -n "$sums_file" ]] || die "artifact is missing SHA256SUMS"
+
+  sums_dir="$(dirname "$sums_file")"
+  verified=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    expected="$(printf '%s\n' "$line" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+    rel="$(printf '%s\n' "$line" | awk '{$1=""; sub(/^[[:space:]]+/, ""); print}')"
+
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "invalid SHA256SUMS entry: $line"
+    [[ -n "$rel" ]] || die "invalid SHA256SUMS entry with empty path"
+    case "$rel" in
+      /* | .. | ../* | */.. | */../*) die "unsafe SHA256SUMS path: $rel" ;;
+    esac
+
+    target="$sums_dir/$rel"
+    [[ -f "$target" ]] || die "SHA256SUMS references missing file: $rel"
+    actual="$(sha256_file "$target" | tr '[:upper:]' '[:lower:]')"
+    [[ "$actual" == "$expected" ]] || die "checksum mismatch for packaged file $rel: expected $expected, got $actual"
+    verified=$((verified + 1))
+  done < "$sums_file"
+
+  [[ "$verified" -gt 0 ]] || die "SHA256SUMS contains no files"
+  log "verified $verified packaged file checksum(s)"
+}
+
 copy_artifact_bins() {
   local extract_dir="$1"
   local bin src
@@ -378,6 +409,7 @@ install_from_artifact() {
 
   extract_dir="$(make_temp_dir)"
   extract_archive "$archive" "$extract_dir"
+  verify_extracted_checksums "$extract_dir"
   copy_artifact_bins "$extract_dir"
 }
 

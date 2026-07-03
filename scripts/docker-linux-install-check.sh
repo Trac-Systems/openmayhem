@@ -161,6 +161,7 @@ docker run --rm \
 
     cat "$out"
     grep -F "verified archive SHA-256" "$out" >/dev/null
+    grep -F "packaged file checksum(s)" "$out" >/dev/null
     grep -F "Copy/paste PATH for this shell session:" "$out" >/dev/null
     grep -F "export PATH=\"$install_dir:" "$out" >/dev/null
     grep -F "mayhem CLI smoke test passed" "$out" >/dev/null

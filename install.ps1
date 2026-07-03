@@ -295,6 +295,57 @@ function Copy-ArtifactBins {
     }
 }
 
+function Verify-ExtractedChecksums {
+    param([string]$ExtractDir)
+
+    $sums = Get-ChildItem -Path $ExtractDir -Recurse -File -Filter "SHA256SUMS" |
+        Sort-Object FullName |
+        Select-Object -First 1
+    if (-not $sums) {
+        Fail "artifact is missing SHA256SUMS"
+    }
+
+    $verified = 0
+    foreach ($line in Get-Content -Path $sums.FullName) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        $match = [regex]::Match($line, "^\s*([0-9a-fA-F]{64})\s+(.+?)\s*$")
+        if (-not $match.Success) {
+            Fail "invalid SHA256SUMS entry: $line"
+        }
+
+        $expected = $match.Groups[1].Value.ToLowerInvariant()
+        $relativePath = $match.Groups[2].Value.Trim()
+        if ([string]::IsNullOrWhiteSpace($relativePath)) {
+            Fail "invalid SHA256SUMS entry with empty path"
+        }
+        if ([System.IO.Path]::IsPathRooted($relativePath)) {
+            Fail "unsafe SHA256SUMS path: $relativePath"
+        }
+        $parts = $relativePath -split "[\\/]"
+        if ($parts -contains "..") {
+            Fail "unsafe SHA256SUMS path: $relativePath"
+        }
+
+        $target = Join-Path $sums.DirectoryName $relativePath
+        if (-not (Test-Path -Path $target -PathType Leaf)) {
+            Fail "SHA256SUMS references missing file: $relativePath"
+        }
+        $actual = (Get-FileHash -Algorithm SHA256 -Path $target).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            Fail "checksum mismatch for packaged file $relativePath`: expected $expected, got $actual"
+        }
+        $verified += 1
+    }
+
+    if ($verified -eq 0) {
+        Fail "SHA256SUMS contains no files"
+    }
+    Write-Log "verified $verified packaged file checksum(s)"
+}
+
 function Install-FromArtifact {
     $target = Get-TargetTriple
     $archive = Get-ArtifactPath -Target $target
@@ -305,6 +356,7 @@ function Install-FromArtifact {
     Verify-Archive -ArchivePath $archive
     $extractDir = New-TempDir
     Expand-MayhemArchive -ArchivePath $archive -Destination $extractDir
+    Verify-ExtractedChecksums -ExtractDir $extractDir
     Copy-ArtifactBins -ExtractDir $extractDir
 }
 

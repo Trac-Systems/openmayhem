@@ -143,6 +143,7 @@ docker run --rm \
       >/tmp/mayhem-install.out 2>&1
     cat /tmp/mayhem-install.out
     grep -F "verified archive SHA-256" /tmp/mayhem-install.out >/dev/null
+    grep -F "packaged file checksum(s)" /tmp/mayhem-install.out >/dev/null
     grep -F "installed opencode v1.17.13" /tmp/mayhem-install.out >/dev/null
     grep -F "Copy/paste PATH for this shell session:" /tmp/mayhem-install.out >/dev/null
 
