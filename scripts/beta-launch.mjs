@@ -82,6 +82,15 @@ function requireObject(add, value, name) {
   return true;
 }
 
+function requireOnlyKeys(add, value, name, allowedKeys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  const allowed = new Set(allowedKeys);
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
+  if (unknown.length > 0) {
+    add('error', `${name} contains unsupported field(s): ${unknown.join(', ')}`);
+  }
+}
+
 function requireArray(add, value, name, min = 0) {
   if (!Array.isArray(value)) {
     add('error', `${name} must be an array`);
@@ -337,11 +346,13 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
     for (const [index, provider] of manifest.seed_providers.entries()) {
       const prefix = `seed_providers[${index}]`;
       if (!requireObject(add, provider, prefix)) continue;
+      requireOnlyKeys(add, provider, prefix, ['provider_pubkey', 'payout', 'joins']);
       requireString(add, provider.provider_pubkey, `${prefix}.provider_pubkey`, pubkey64);
       if (provider.submitted_models !== undefined || provider.created_rooms !== undefined || provider.created_enclaves !== undefined) {
         add('error', `${prefix} must not contain provider-created models, rooms, or enclaves`);
       }
       if (requireObject(add, provider.payout, `${prefix}.payout`)) {
+        requireOnlyKeys(add, provider.payout, `${prefix}.payout`, ['admin_approved', 'method', 'addr']);
         requireLiteral(add, provider.payout.admin_approved, true, `${prefix}.payout.admin_approved`);
         if (!['tnk', 'stripe', 'coinbase'].includes(provider.payout.method)) {
           add('error', `${prefix}.payout.method must be tnk, stripe, or coinbase`);
@@ -352,6 +363,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
         for (const [joinIndex, join] of provider.joins.entries()) {
           const joinPrefix = `${prefix}.joins[${joinIndex}]`;
           if (!requireObject(add, join, joinPrefix)) continue;
+          requireOnlyKeys(add, join, joinPrefix, ['enclave_id', 'rooms']);
           requireString(add, join.enclave_id, `${joinPrefix}.enclave_id`);
           if (!isPlaceholder(join.enclave_id) && !enclaveIds.has(join.enclave_id)) {
             add('error', `${joinPrefix}.enclave_id is not a canonical enclave`);
