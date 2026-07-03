@@ -218,6 +218,77 @@ test('MayhemContract payoutConfirm releases earnings only after challenge plus h
   assert.equal(payRoot.merkle_root, paid.payout_root);
 });
 
+test('MayhemContract payoutConfirm rejects non-admin payout target provenance', async () => {
+  const { admin, provider, user, storage, contract } = await setupPayoutContract();
+  const settled = await execute(
+    contract,
+    storage,
+    'epochApply',
+    epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
+    admin.publicKey,
+    6
+  );
+  assert.equal(settled.ok, true, settled.message);
+
+  const record = (await storage.get(`prov/${provider.publicKey}`)).value;
+  await storage.put(`prov/${provider.publicKey}`, {
+    ...record,
+    payout: {
+      ...record.payout,
+      set_by: provider.publicKey,
+      set_by_role: 'provider',
+    },
+  });
+
+  const before = storage.snapshotBytes();
+  const rejected = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey),
+    admin.publicKey,
+    7
+  );
+  assert.match(
+    rejected.message,
+    /payout target was not set by the current admin|payout target must be admin-set/i
+  );
+  assert.equal(storage.snapshotBytes(), before);
+});
+
+test('MayhemContract payoutConfirm preserves legacy admin payout targets without role marker', async () => {
+  const { admin, provider, user, storage, contract } = await setupPayoutContract();
+  const record = (await storage.get(`prov/${provider.publicKey}`)).value;
+  const legacyPayout = { ...record.payout };
+  delete legacyPayout.set_by_role;
+  await storage.put(`prov/${provider.publicKey}`, {
+    ...record,
+    payout: legacyPayout,
+  });
+
+  const settled = await execute(
+    contract,
+    storage,
+    'epochApply',
+    epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
+    admin.publicKey,
+    6
+  );
+  assert.equal(settled.ok, true, settled.message);
+
+  const paid = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey),
+    admin.publicKey,
+    7
+  );
+  assert.equal(paid.ok, true, paid.message);
+  assert.equal(paid.kind, 'provider');
+  assert.equal(paid.rail, 'tnk');
+});
+
 test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async () => {
   for (const [rail, target, externalRef] of [
     ['stripe', 'acct_test_provider', 'tr_test_provider_payout'],

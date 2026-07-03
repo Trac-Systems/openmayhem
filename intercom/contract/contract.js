@@ -2448,6 +2448,8 @@ class MayhemContract extends Contract {
     if (!provider.payout || provider.payout.method !== rail) {
       return new Error('Provider payout target for rail is not set.');
     }
+    const payoutTargetError = await this.requireAdminSetPayoutTarget(provider);
+    if (payoutTargetError) return payoutTargetError;
 
     const earning = await this.earningRecord(this.value.who);
     const earningError = this.guardianValidateEarningRecord(earning, this.value.who);
@@ -2677,6 +2679,27 @@ class MayhemContract extends Contract {
   async requireProvider(sender = this.address) {
     const provider = await this.get(`prov/${sender}`);
     if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    return null;
+  }
+
+  async requireAdminSetPayoutTarget(provider) {
+    const payout = provider?.payout;
+    if (!payout || typeof payout !== 'object') {
+      return new Error('Provider payout target is not set.');
+    }
+    if (!payout.set_by || typeof payout.set_by !== 'string') {
+      return new Error('Provider payout target must be admin-set.');
+    }
+    const admin = await this.get('admin');
+    if (admin !== null && payout.set_by !== admin) {
+      return new Error('Provider payout target was not set by the current admin.');
+    }
+    if (admin === null && payout.set_by !== this.address) {
+      return new Error('Provider payout target was not set by the confirming admin.');
+    }
+    if (payout.set_by_role !== undefined && payout.set_by_role !== 'admin') {
+      return new Error('Provider payout target must be admin-set.');
+    }
     return null;
   }
 
