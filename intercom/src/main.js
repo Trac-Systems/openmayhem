@@ -163,6 +163,24 @@ const directSessionDebug = parseBool(
   (flags['session-debug'] && String(flags['session-debug'])) || env.SESSION_DEBUG || '',
   false
 );
+const directSessionMaxFrameBytes = Number.parseInt(
+  (flags['session-max-frame-bytes'] && String(flags['session-max-frame-bytes'])) ||
+    env.SESSION_MAX_FRAME_BYTES ||
+    '',
+  10
+);
+const directSessionRateBytesPerSecond = Number.parseInt(
+  (flags['session-rate-bytes-per-second'] && String(flags['session-rate-bytes-per-second'])) ||
+    env.SESSION_RATE_BYTES_PER_SECOND ||
+    '',
+  10
+);
+const directSessionRateBurstBytes = Number.parseInt(
+  (flags['session-rate-burst-bytes'] && String(flags['session-rate-burst-bytes'])) ||
+    env.SESSION_RATE_BURST_BYTES ||
+    '',
+  10
+);
 
 const scBridgeEnabled = parseBool(
   (flags['sc-bridge'] && String(flags['sc-bridge'])) || env.SC_BRIDGE || '',
@@ -419,6 +437,15 @@ if (scBridgeEnabled) {
 
 const directSession = new DirectSession(peer, {
   debug: directSessionDebug,
+  maxFrameBytes: Number.isSafeInteger(directSessionMaxFrameBytes)
+    ? directSessionMaxFrameBytes
+    : undefined,
+  rateBytesPerSecond: Number.isSafeInteger(directSessionRateBytesPerSecond)
+    ? directSessionRateBytesPerSecond
+    : undefined,
+  rateBurstBytes: Number.isSafeInteger(directSessionRateBurstBytes)
+    ? directSessionRateBurstBytes
+    : undefined,
   onFrame: scBridgeEnabled
     ? (event) => scBridge.handleSessionFrame(event)
     : null,

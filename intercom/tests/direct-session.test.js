@@ -10,9 +10,33 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   const stats = directSession.stats();
 
   assert.equal(stats.protocol, 'mx/s');
+  assert.equal(stats.maxFrameBytes, 256 * 1024);
   assert.equal(stats.rateBytesPerSecond, 1_000_000);
   assert.equal(stats.rateBurstBytes, 1_000_000);
   assert.equal(stats.sessionCount, 0);
+});
+
+test('DirectSession accepts explicit mx/s limiter config and ignores unsafe values', () => {
+  const configured = new DirectSession({}, {
+    maxFrameBytes: 4096,
+    rateBytesPerSecond: 2_000_000,
+    rateBurstBytes: 3_000_000,
+  });
+
+  assert.equal(configured.maxFrameBytes, 4096);
+  assert.equal(configured.stats().maxFrameBytes, 4096);
+  assert.equal(configured.stats().rateBytesPerSecond, 2_000_000);
+  assert.equal(configured.stats().rateBurstBytes, 3_000_000);
+
+  const fallback = new DirectSession({}, {
+    maxFrameBytes: -1,
+    rateBytesPerSecond: -1,
+    rateBurstBytes: -1,
+  });
+
+  assert.equal(fallback.maxFrameBytes, 256 * 1024);
+  assert.equal(fallback.stats().rateBytesPerSecond, 1_000_000);
+  assert.equal(fallback.stats().rateBurstBytes, 1_000_000);
 });
 
 test('DirectSession rejects oversized frames before transport send', () => {
@@ -30,16 +54,16 @@ test('DirectSession rejects oversized frames before transport send', () => {
 
 test('DirectSession receive bucket drops frames beyond the mx/s burst', () => {
   const frames = [];
+  const frame = { t: 's.delta', d: 'token'.repeat(8) };
+  const frameBytes = new DirectSession({}, {})._frameBytes(frame);
   const directSession = new DirectSession(
     {},
     {
+      rateBytesPerSecond: 1,
+      rateBurstBytes: frameBytes + 1,
       onFrame: (event) => frames.push(event),
     }
   );
-  const frame = { t: 's.delta', d: 'token'.repeat(8) };
-  const frameBytes = directSession._frameBytes(frame);
-  directSession.rateBytesPerSecond = 1;
-  directSession.rateBurstBytes = frameBytes + 1;
   const receiveLimiter = directSession._newLimiter();
 
   directSession._handleFrame({ sessionId, remote, receiveLimiter }, frame);

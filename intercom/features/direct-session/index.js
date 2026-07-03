@@ -30,17 +30,22 @@ const normalizeSessionId = (value) => {
 
 const sessionKey = (remote, sessionId) => `${remote}:${sessionId}`;
 
+const safeIntegerOr = (value, fallback, { min = 0 } = {}) => (
+  Number.isSafeInteger(value) && value >= min ? value : fallback
+);
+
 class DirectSession extends Feature {
   constructor(peer, config = {}) {
     super(peer, config);
     this.key = 'direct-session';
     this.started = false;
     this.debug = config.debug === true;
-    this.maxFrameBytes = Number.isSafeInteger(config.maxFrameBytes)
-      ? config.maxFrameBytes
-      : DEFAULT_MAX_FRAME_BYTES;
-    this.rateBytesPerSecond = DEFAULT_RATE_BYTES_PER_SECOND;
-    this.rateBurstBytes = DEFAULT_RATE_BURST_BYTES;
+    this.maxFrameBytes = safeIntegerOr(config.maxFrameBytes, DEFAULT_MAX_FRAME_BYTES, { min: 1 });
+    this.rateBytesPerSecond = safeIntegerOr(
+      config.rateBytesPerSecond,
+      DEFAULT_RATE_BYTES_PER_SECOND
+    );
+    this.rateBurstBytes = safeIntegerOr(config.rateBurstBytes, DEFAULT_RATE_BURST_BYTES);
     this.sessions = new Map();
     this.pairedConnections = new WeakSet();
     this.onFrame = typeof config.onFrame === 'function' ? config.onFrame : null;
@@ -64,6 +69,7 @@ class DirectSession extends Feature {
     return {
       started: this.started === true,
       protocol: SESSION_PROTOCOL,
+      maxFrameBytes: this.maxFrameBytes,
       rateBytesPerSecond: this.rateBytesPerSecond,
       rateBurstBytes: this.rateBurstBytes,
       sessionCount: this.sessions.size,
