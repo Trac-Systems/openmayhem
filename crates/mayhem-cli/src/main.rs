@@ -6460,6 +6460,7 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
     }
     require_admin_role_marker("room.creator_role", room.creator_role.as_deref())
         .with_context(|| format!("room {} is not admin-created", room.room_id))?;
+    require_canonical_room_transport(room)?;
     if !room_matches_enclave(room, enclave) {
         bail!(
             "room {} is for model {} / enclave {}, not model {} / enclave {}",
@@ -6984,7 +6985,11 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
     let open_rooms = contract
         .rooms
         .iter()
-        .filter(|room| room.status == "open" && admin_role_marker_ok(room.creator_role.as_deref()))
+        .filter(|room| {
+            room.status == "open"
+                && admin_role_marker_ok(room.creator_role.as_deref())
+                && canonical_room_transport_ok(room)
+        })
         .collect::<Vec<_>>();
     let active_providers = contract
         .providers
@@ -7194,6 +7199,20 @@ fn room_matches_enclave(room: &LedgerRoom, enclave: &LedgerEnclave) -> bool {
         })
 }
 
+fn canonical_room_transport_ok(room: &LedgerRoom) -> bool {
+    is_hex_len(&room.room_id, 32) && room.sidechannel == format!("mx/room/{}", room.room_id)
+}
+
+fn require_canonical_room_transport(room: &LedgerRoom) -> Result<()> {
+    if canonical_room_transport_ok(room) {
+        return Ok(());
+    }
+    bail!(
+        "room {} is not a canonical contract room: room_id must be 32 hex chars and sidechannel must equal mx/room/<room_id>",
+        room.room_id
+    )
+}
+
 fn empty_gateway_caps() -> ModelCaps {
     ModelCaps {
         tools: false,
@@ -7386,6 +7405,7 @@ fn select_provider_rooms(
             .filter(|room| {
                 room.status == "open"
                     && admin_role_marker_ok(room.creator_role.as_deref())
+                    && canonical_room_transport_ok(room)
                     && room_matches_enclave(room, enclave)
             })
             .cloned()
@@ -7413,6 +7433,7 @@ fn select_provider_rooms(
         }
         require_admin_role_marker("room.creator_role", room.creator_role.as_deref())
             .with_context(|| format!("room {room_id} is not admin-created"))?;
+        require_canonical_room_transport(room)?;
         if !room_matches_enclave(room, enclave) {
             bail!(
                 "room {room_id} is for model {} / enclave {}, not model {} / enclave {}",
@@ -8639,6 +8660,8 @@ fn provider_session_contract_decision(
         live_room.status == "open"
             && admin_role_marker_ok(live_room.creator_role.as_deref())
             && admin_role_marker_ok(startup_room.creator_role.as_deref())
+            && canonical_room_transport_ok(live_room)
+            && canonical_room_transport_ok(startup_room)
             && room_matches_enclave(live_room, enclave)
             && room_matches_enclave(startup_room, enclave)
     });
@@ -10595,7 +10618,10 @@ mod tests {
             models[0].mayhem.route_candidates[0].enclave_id,
             "11".repeat(32)
         );
-        assert_eq!(models[0].mayhem.route_candidates[0].room_id, "room-a");
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].room_id,
+            "aa".repeat(16)
+        );
         assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 1);
         assert_eq!(
             models[0].mayhem.route_candidates[0].admin_pubkey,
@@ -10657,6 +10683,21 @@ mod tests {
             .set_by_role = Some("provider".to_owned());
         let err = gateway_models_from_contract(&provider_priced)
             .expect_err("provider-priced record marker should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut noncanonical_room_id = test_contract(&root);
+        noncanonical_room_id.rooms[0].room_id = "provider-local-only".to_owned();
+        noncanonical_room_id.rooms[0].sidechannel = "mx/room/provider-local-only".to_owned();
+        noncanonical_room_id.roomserve[0].room_id = "provider-local-only".to_owned();
+        noncanonical_room_id.serves[0].rooms = vec!["provider-local-only".to_owned()];
+        let err = gateway_models_from_contract(&noncanonical_room_id)
+            .expect_err("raw Intercom room ids should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut wrong_sidechannel = test_contract(&root);
+        wrong_sidechannel.rooms[0].sidechannel = "mx/room/provider-made".to_owned();
+        let err = gateway_models_from_contract(&wrong_sidechannel)
+            .expect_err("wrong room sidechannel should hide model");
         assert!(format!("{err:#}").contains("no canonical contract-backed models"));
 
         let mut wrong_same_model_enclave = test_contract(&root);
@@ -10835,6 +10876,20 @@ mod tests {
         provider_startup_room[0].creator_role = Some("provider".to_owned());
         assert!(matches!(
             provider_session_contract_decision(&contract, &terms, &provider_startup_room),
+            ProviderSessionDecision::Reject { code: "ROOM", .. }
+        ));
+
+        let mut wrong_live_sidechannel = contract.clone();
+        wrong_live_sidechannel.rooms[0].sidechannel = "mx/room/provider-made".to_owned();
+        assert!(matches!(
+            provider_session_contract_decision(&wrong_live_sidechannel, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject { code: "ROOM", .. }
+        ));
+
+        let mut wrong_startup_sidechannel = startup_rooms.clone();
+        wrong_startup_sidechannel[0].sidechannel = "mx/room/provider-made".to_owned();
+        assert!(matches!(
+            provider_session_contract_decision(&contract, &terms, &wrong_startup_sidechannel),
             ProviderSessionDecision::Reject { code: "ROOM", .. }
         ));
 
@@ -11243,9 +11298,12 @@ mod tests {
         let contract = test_contract(&root);
         let enclave = &contract.enclaves[0];
         let mut canonical_rooms = contract.rooms.clone();
+        let other_model_room_id = "cc".repeat(16);
+        let other_enclave_room_id = "dd".repeat(16);
+        let provider_created_room_id = "ee".repeat(16);
         canonical_rooms.push(LedgerRoom {
-            room_id: "room-same-model-other-enclave".to_owned(),
-            sidechannel: "mx/room/room-same-model-other-enclave".to_owned(),
+            room_id: other_enclave_room_id.clone(),
+            sidechannel: format!("mx/room/{other_enclave_room_id}"),
             enclave_id: Some("66".repeat(32)),
             model_id: enclave.model_id.clone(),
             label: "other-enclave".to_owned(),
@@ -11253,26 +11311,35 @@ mod tests {
             creator_role: Some("admin".to_owned()),
         });
         canonical_rooms.push(LedgerRoom {
-            room_id: "room-provider-created".to_owned(),
-            sidechannel: "mx/room/room-provider-created".to_owned(),
+            room_id: provider_created_room_id.clone(),
+            sidechannel: format!("mx/room/{provider_created_room_id}"),
             enclave_id: Some(enclave.enclave_id.clone()),
             model_id: enclave.model_id.clone(),
             label: "provider-created".to_owned(),
             status: "open".to_owned(),
             creator_role: Some("provider".to_owned()),
         });
+        canonical_rooms.push(LedgerRoom {
+            room_id: "provider-local-only".to_owned(),
+            sidechannel: "mx/room/provider-local-only".to_owned(),
+            enclave_id: Some(enclave.enclave_id.clone()),
+            model_id: enclave.model_id.clone(),
+            label: "raw-intercom".to_owned(),
+            status: "open".to_owned(),
+            creator_role: Some("admin".to_owned()),
+        });
         let rooms = select_provider_rooms(&canonical_rooms, enclave, "auto").unwrap();
 
         assert_eq!(rooms.len(), 1);
-        assert_eq!(rooms[0].room_id, "room-a");
-        assert!(select_provider_rooms(&canonical_rooms, enclave, "room-other").is_err());
-        assert!(
-            select_provider_rooms(&canonical_rooms, enclave, "room-same-model-other-enclave")
-                .is_err()
-        );
-        let err =
-            select_provider_rooms(&canonical_rooms, enclave, "room-provider-created").unwrap_err();
+        assert_eq!(rooms[0].room_id, "aa".repeat(16));
+        assert!(select_provider_rooms(&canonical_rooms, enclave, &other_model_room_id).is_err());
+        assert!(select_provider_rooms(&canonical_rooms, enclave, &other_enclave_room_id).is_err());
+        let err = select_provider_rooms(&canonical_rooms, enclave, &provider_created_room_id)
+            .unwrap_err();
         assert!(format!("{err:#}").contains("creator_role"));
+        let err =
+            select_provider_rooms(&canonical_rooms, enclave, "provider-local-only").unwrap_err();
+        assert!(format!("{err:#}").contains("not a canonical contract room"));
     }
 
     #[test]
@@ -12067,7 +12134,7 @@ mod tests {
             provider: "55".repeat(32),
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
-            room_ids: vec!["room-a".to_owned()],
+            room_ids: vec!["aa".repeat(16)],
             price_ver: 1,
             in_per_1k_mu: 1,
             out_per_1k_mu: 2,
@@ -12258,6 +12325,9 @@ mod tests {
     }
 
     fn test_contract(root: &str) -> ContractCatalog {
+        let room_id = "aa".repeat(16);
+        let closed_room_id = "bb".repeat(16);
+        let other_room_id = "cc".repeat(16);
         let enclave = LedgerEnclave {
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
@@ -12275,8 +12345,8 @@ mod tests {
             enclaves: vec![enclave],
             rooms: vec![
                 LedgerRoom {
-                    room_id: "room-a".to_owned(),
-                    sidechannel: "mx/room/room-a".to_owned(),
+                    room_id: room_id.clone(),
+                    sidechannel: format!("mx/room/{room_id}"),
                     enclave_id: Some("11".repeat(32)),
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
@@ -12284,8 +12354,8 @@ mod tests {
                     creator_role: Some("admin".to_owned()),
                 },
                 LedgerRoom {
-                    room_id: "room-closed".to_owned(),
-                    sidechannel: "mx/room/room-closed".to_owned(),
+                    room_id: closed_room_id.clone(),
+                    sidechannel: format!("mx/room/{closed_room_id}"),
                     enclave_id: Some("11".repeat(32)),
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
@@ -12293,8 +12363,8 @@ mod tests {
                     creator_role: Some("admin".to_owned()),
                 },
                 LedgerRoom {
-                    room_id: "room-other".to_owned(),
-                    sidechannel: "mx/room/room-other".to_owned(),
+                    room_id: other_room_id.clone(),
+                    sidechannel: format!("mx/room/{other_room_id}"),
                     enclave_id: None,
                     model_id: "other/model".to_owned(),
                     label: "test".to_owned(),
@@ -12303,7 +12373,7 @@ mod tests {
                 },
             ],
             roomserve: vec![LedgerRoomServe {
-                room_id: "room-a".to_owned(),
+                room_id: room_id.clone(),
                 provider: "55".repeat(32),
                 enclave_id: "11".repeat(32),
                 model_id: "test/model@4bit".to_owned(),
@@ -12314,7 +12384,7 @@ mod tests {
                 enclave_id: "11".repeat(32),
                 model_id: "test/model@4bit".to_owned(),
                 status: "active".to_owned(),
-                rooms: vec!["room-a".to_owned()],
+                rooms: vec![room_id],
             }],
             providers: vec![LedgerProvider {
                 provider: "55".repeat(32),
