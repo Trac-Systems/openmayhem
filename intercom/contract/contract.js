@@ -2184,6 +2184,7 @@ class MayhemContract extends Contract {
       ts: this.value.ts,
       updated_at: this.tx,
       posted_by: this.address,
+      posted_by_role: 'admin',
     };
     await this.put('rate/latest', record);
     console.log('mayhem rateOracle', record);

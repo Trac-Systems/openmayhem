@@ -110,6 +110,7 @@ test('MayhemContract rateOracle is admin controlled and monotonic', async () => 
     ts: 1_000,
     updated_at: makeTxKey(6),
     posted_by: admin.publicKey,
+    posted_by_role: 'admin',
   });
 
   const older = await execute(
