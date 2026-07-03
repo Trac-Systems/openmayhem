@@ -236,8 +236,12 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
   if (!Array.isArray(railsVerified)) return;
   for (const rail of ['stripe', 'coinbase']) {
     if (!railsVerified.includes(rail)) continue;
-    if (!value.some((sample) => hasEvidenceTag(sample, `rail:${rail}`) && checkoutUrlMatchesRail(sample, rail))) {
-      add('error', `browser_handoffs.samples must include hosted ${rail} checkout URL evidence`);
+    if (!value.some((sample) => (
+      isFileEvidence(sample)
+      && hasEvidenceTag(sample, `rail:${rail}`)
+      && checkoutUrlMatchesRail(sample, rail)
+    ))) {
+      add('error', `browser_handoffs.samples must include file-bound hosted ${rail} checkout URL evidence`);
     }
   }
 }
