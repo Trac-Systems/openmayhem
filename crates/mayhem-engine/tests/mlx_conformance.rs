@@ -13,7 +13,6 @@ use mayhem_engine::{
     MlxBackend, ModelArtifact, ToolSpec,
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 const RUN_ENV: &str = "MAYHEM_RUN_MLX_TESTS";
 const BENCH_ENV: &str = "MAYHEM_RUN_MLX_BENCH";
@@ -209,11 +208,27 @@ fn assert_usage(output: &GenerateOutput) {
 }
 
 fn token_fingerprint(tokens: impl IntoIterator<Item = i32>) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     for token in tokens {
-        hasher.update(token.to_le_bytes());
+        hasher.update(&token.to_be_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hasher.finalize().to_hex().to_string()
+}
+
+#[test]
+fn token_fingerprint_uses_auditor_catalog_format() {
+    assert_eq!(
+        token_fingerprint([]),
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    );
+    assert_eq!(
+        token_fingerprint([1, 2, 3]),
+        "04a03410338d287acb82ba338ec1aea060eac0650f256eddc814f743c731cf33"
+    );
+    assert_eq!(
+        token_fingerprint([-1]),
+        "650e93bacca01942a5a787f2f3ec4ce560998eb7c250733601a880d7f0c11178"
+    );
 }
 
 fn ensure_mlx_python(python: &Path) -> TestResult {

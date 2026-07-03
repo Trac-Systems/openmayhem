@@ -17,6 +17,7 @@ llama-cpp-vulkan = ["llama-cpp", "llama-cpp-2/vulkan"]
 mlx = []
 
 [dependencies]
+blake3 = "1"
 encoding_rs = { version = "0.8", optional = true }
 llama-cpp-2 = { version = "0.1.150", optional = true, features = ["sampler"] }
 serde = { version = "1", features = ["derive"] }
