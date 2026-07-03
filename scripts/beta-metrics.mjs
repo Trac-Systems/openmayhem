@@ -251,9 +251,16 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
   if (requireObject(add, metrics.controls, 'controls')) {
     requireBoolean(add, metrics.controls.admin_controls_economy, true, 'controls.admin_controls_economy');
     requireBoolean(add, metrics.controls.providers_set_prices, false, 'controls.providers_set_prices');
+    requireBoolean(add, metrics.controls.providers_set_payout_terms, false, 'controls.providers_set_payout_terms');
     requireBoolean(add, metrics.controls.providers_submit_models, false, 'controls.providers_submit_models');
     requireBoolean(add, metrics.controls.providers_create_canonical_rooms, false, 'controls.providers_create_canonical_rooms');
     requireBoolean(add, metrics.controls.providers_only_join_admin_rooms, true, 'controls.providers_only_join_admin_rooms');
+    requireBoolean(
+      add,
+      metrics.controls.provider_payout_targets_admin_verified,
+      true,
+      'controls.provider_payout_targets_admin_verified',
+    );
     validateEvidenceArray(add, metrics.controls.evidence, 'controls.evidence');
   }
 
@@ -281,6 +288,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       metrics.canonical_service.admin_price_records_verified,
       true,
       'canonical_service.admin_price_records_verified',
+    );
+    requireBoolean(
+      add,
+      metrics.canonical_service.admin_payout_records_verified,
+      true,
+      'canonical_service.admin_payout_records_verified',
     );
     validateEvidenceArray(add, metrics.canonical_service.evidence, 'canonical_service.evidence');
   }

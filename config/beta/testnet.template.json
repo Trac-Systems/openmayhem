@@ -30,9 +30,11 @@
   "controls": {
     "admin_controls_economy": true,
     "providers_set_prices": false,
+    "providers_set_payout_terms": false,
     "providers_submit_models": false,
     "providers_create_canonical_rooms": false,
     "providers_only_join_admin_rooms": true,
+    "provider_payout_targets_admin_verified": true,
     "browser_handoffs_print_copy_paste_url": true
   },
   "admin": {
@@ -130,6 +132,7 @@
     {
       "provider_pubkey": "<seed-provider-public-key-64-hex>",
       "payout": {
+        "admin_approved": true,
         "method": "tnk",
         "addr": "<testtrac1-admin-approved-payout-target>"
       },

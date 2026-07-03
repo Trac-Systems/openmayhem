@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultOut = 'config/beta/canonical-service-audit.json';
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
+const payoutMethods = new Set(['tnk', 'stripe', 'coinbase']);
 
 function usage() {
   console.log(`Usage: node scripts/beta-canonical-service-audit.mjs --snapshot PATH [--admin-pubkey HEX] [--out PATH] [--json]
@@ -287,6 +288,26 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
   if (activeServes.length === 0) fail('no active provider serve records found');
   if (activeRoomServes.length === 0) fail('no active provider room join records found');
 
+  let adminSetPayoutTargets = 0;
+  for (const [providerId, provider] of activeProviders.entries()) {
+    const payout = provider?.payout;
+    if (!payout || typeof payout !== 'object' || Array.isArray(payout)) {
+      fail(`prov/${providerId} is missing an admin-set payout target`);
+      continue;
+    }
+    if (typeof payout.addr !== 'string' || payout.addr.length === 0) {
+      fail(`prov/${providerId}.payout.addr is missing`);
+    }
+    if (!payoutMethods.has(payout.method)) {
+      fail(`prov/${providerId}.payout.method must be tnk, stripe, or coinbase`);
+    }
+    if (payout.set_by !== admin) {
+      fail(`prov/${providerId}.payout was not set by admin ${admin}`);
+    } else {
+      adminSetPayoutTargets += 1;
+    }
+  }
+
   for (const [enclaveId, enclave] of activeEnclaves.entries()) {
     if (enclave.enclave_id !== enclaveId) fail(`enclave/${enclaveId} value.enclave_id mismatch`);
     if (enclave.created_by !== admin) fail(`enclave/${enclaveId} was not created by admin ${admin}`);
@@ -415,6 +436,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     open_rooms: openRooms.size,
     active_serves: activeServes.length,
     active_room_joins: activeRoomServes.length,
+    admin_set_payout_targets: adminSetPayoutTargets,
   };
   const summaryDigest = crypto
     .createHash('sha256')
@@ -435,6 +457,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
       admin_created_rooms_verified: ok,
       provider_join_records_verified: ok,
       admin_price_records_verified: ok,
+      admin_payout_records_verified: ok,
       counts,
       evidence: [
         sourceEvidence,
@@ -444,9 +467,11 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     controls: {
       admin_controls_economy: ok,
       providers_set_prices: false,
+      providers_set_payout_terms: false,
       providers_submit_models: false,
       providers_create_canonical_rooms: false,
       providers_only_join_admin_rooms: ok,
+      provider_payout_targets_admin_verified: ok,
       evidence: [
         sourceEvidence,
         `audit:admin-control-plane:v1#sha256:${summaryDigest}`,

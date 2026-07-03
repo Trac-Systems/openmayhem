@@ -36,9 +36,11 @@
   "controls": {
     "admin_controls_economy": true,
     "providers_set_prices": false,
+    "providers_set_payout_terms": false,
     "providers_submit_models": false,
     "providers_create_canonical_rooms": false,
     "providers_only_join_admin_rooms": true,
+    "provider_payout_targets_admin_verified": true,
     "evidence": [
       "<audit:admin-control-plane:v1#sha256:64-hex>"
     ]
@@ -48,6 +50,7 @@
     "admin_created_rooms_verified": true,
     "provider_join_records_verified": true,
     "admin_price_records_verified": true,
+    "admin_payout_records_verified": true,
     "evidence": [
       "<file:canonical-service-audit.json#sha256:64-hex>"
     ]

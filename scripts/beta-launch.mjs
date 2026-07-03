@@ -216,9 +216,11 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   if (requireObject(add, manifest.controls, 'controls')) {
     requireLiteral(add, manifest.controls.admin_controls_economy, true, 'controls.admin_controls_economy');
     requireLiteral(add, manifest.controls.providers_set_prices, false, 'controls.providers_set_prices');
+    requireLiteral(add, manifest.controls.providers_set_payout_terms, false, 'controls.providers_set_payout_terms');
     requireLiteral(add, manifest.controls.providers_submit_models, false, 'controls.providers_submit_models');
     requireLiteral(add, manifest.controls.providers_create_canonical_rooms, false, 'controls.providers_create_canonical_rooms');
     requireLiteral(add, manifest.controls.providers_only_join_admin_rooms, true, 'controls.providers_only_join_admin_rooms');
+    requireLiteral(add, manifest.controls.provider_payout_targets_admin_verified, true, 'controls.provider_payout_targets_admin_verified');
     requireLiteral(add, manifest.controls.browser_handoffs_print_copy_paste_url, true, 'controls.browser_handoffs_print_copy_paste_url');
   }
 
@@ -340,6 +342,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
         add('error', `${prefix} must not contain provider-created models, rooms, or enclaves`);
       }
       if (requireObject(add, provider.payout, `${prefix}.payout`)) {
+        requireLiteral(add, provider.payout.admin_approved, true, `${prefix}.payout.admin_approved`);
         if (!['tnk', 'stripe', 'coinbase'].includes(provider.payout.method)) {
           add('error', `${prefix}.payout.method must be tnk, stripe, or coinbase`);
         }

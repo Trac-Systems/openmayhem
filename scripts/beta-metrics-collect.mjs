@@ -447,6 +447,7 @@ function collectCanonicalService(args) {
       admin_created_rooms_verified: firstDefined(record, ['admin_created_rooms_verified']) === true,
       provider_join_records_verified: firstDefined(record, ['provider_join_records_verified']) === true,
       admin_price_records_verified: firstDefined(record, ['admin_price_records_verified']) === true,
+      admin_payout_records_verified: firstDefined(record, ['admin_payout_records_verified']) === true,
       evidence: [
         source.evidence,
         ...asEvidenceArray(value, ['canonical_service.evidence', 'evidence']),
@@ -455,9 +456,11 @@ function collectCanonicalService(args) {
     controls: {
       admin_controls_economy: firstDefined(controls, ['admin_controls_economy']),
       providers_set_prices: firstDefined(controls, ['providers_set_prices']),
+      providers_set_payout_terms: firstDefined(controls, ['providers_set_payout_terms']),
       providers_submit_models: firstDefined(controls, ['providers_submit_models']),
       providers_create_canonical_rooms: firstDefined(controls, ['providers_create_canonical_rooms']),
       providers_only_join_admin_rooms: firstDefined(controls, ['providers_only_join_admin_rooms']),
+      provider_payout_targets_admin_verified: firstDefined(controls, ['provider_payout_targets_admin_verified']),
       evidence: [
         source.evidence,
         ...asEvidenceArray(value, ['controls.evidence', 'evidence']),
