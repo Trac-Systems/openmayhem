@@ -39,6 +39,7 @@
   },
   "controls": {
     "admin_controls_economy": true,
+    "admin_can_ban_providers": true,
     "providers_set_prices": false,
     "providers_set_rules": false,
     "providers_set_params": false,
