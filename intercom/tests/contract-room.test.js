@@ -195,6 +195,7 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     model_id: modelId,
     label: 'eu-central',
     creator: admin.publicKey,
+    creator_role: 'admin',
     policy,
     serves: [{ provider: provider.publicKey, enclave_id: enclaveId }],
     serves_updated_at: makeTxKey(9),

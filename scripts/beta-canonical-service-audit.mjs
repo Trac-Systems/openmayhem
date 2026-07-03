@@ -313,6 +313,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
   for (const [enclaveId, enclave] of activeEnclaves.entries()) {
     if (enclave.enclave_id !== enclaveId) fail(`enclave/${enclaveId} value.enclave_id mismatch`);
     if (enclave.created_by !== admin) fail(`enclave/${enclaveId} was not created by admin ${admin}`);
+    if (enclave.created_by_role !== 'admin') fail(`enclave/${enclaveId}.created_by_role must be admin`);
     if (typeof enclave.model_id !== 'string' || enclave.model_id.length === 0) {
       fail(`enclave/${enclaveId} is missing model_id`);
     }
@@ -321,6 +322,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
   for (const [roomId, room] of openRooms.entries()) {
     if (room.room_id !== roomId) fail(`room/${roomId} value.room_id mismatch`);
     if (room.creator !== admin) fail(`room/${roomId} was not created by admin ${admin}`);
+    if (room.creator_role !== 'admin') fail(`room/${roomId}.creator_role must be admin`);
     if (!room.enclave_id) fail(`room/${roomId} is missing enclave_id`);
     const enclave = activeEnclaves.get(room.enclave_id);
     if (!enclave) {

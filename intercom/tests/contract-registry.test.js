@@ -192,6 +192,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   const enclaveEntry = await first.storage.get(`enclave/${enclaveId}`);
   assert.equal(enclaveEntry.value.status, 'retired');
   assert.equal(enclaveEntry.value.created_by, admin.publicKey);
+  assert.equal(enclaveEntry.value.created_by_role, 'admin');
   assert.equal(enclaveEntry.value.artifact_root, updatedArtifactRoot);
   assert.equal(enclaveEntry.value.registered_at, makeTxKey(4));
   assert.equal(enclaveEntry.value.updated_at, makeTxKey(9));
