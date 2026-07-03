@@ -383,6 +383,9 @@ verify_extracted_checksums() {
 
     target="$sums_dir/$rel"
     [[ -f "$target" ]] || die "SHA256SUMS references missing file: $rel"
+    if verified_package_file "$rel"; then
+      die "SHA256SUMS contains duplicate path: $rel"
+    fi
     actual="$(sha256_file "$target" | tr '[:upper:]' '[:lower:]')"
     [[ "$actual" == "$expected" ]] || die "checksum mismatch for packaged file $rel: expected $expected, got $actual"
     VERIFIED_PACKAGE_FILES+="$rel"$'\n'

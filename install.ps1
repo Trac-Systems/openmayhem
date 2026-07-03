@@ -343,6 +343,9 @@ function Verify-ExtractedChecksums {
         if (-not (Test-Path -Path $target -PathType Leaf)) {
             Fail "SHA256SUMS references missing file: $relativePath"
         }
+        if ($verifiedFiles -contains $normalizedRelativePath) {
+            Fail "SHA256SUMS contains duplicate path: $normalizedRelativePath"
+        }
         $actual = (Get-FileHash -Algorithm SHA256 -Path $target).Hash.ToLowerInvariant()
         if ($actual -ne $expected) {
             Fail "checksum mismatch for packaged file $relativePath`: expected $expected, got $actual"

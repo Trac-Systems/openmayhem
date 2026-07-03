@@ -24,6 +24,7 @@ Run PowerShell installer checks in Docker:
   - install a synthetic artifact whose checked package root competes with an
     unchecked shadow binary elsewhere in the archive
   - reject an archive containing multiple SHA256SUMS files
+  - reject a SHA256SUMS file containing duplicate relative paths
 
 This is local P8.1 PowerShell installer evidence. It does not replace the
 formal Windows clean-VM install gate.
@@ -142,7 +143,8 @@ function New-InstallerArtifact {
     param(
         [string]$Root,
         [switch]$IncludeShadow,
-        [switch]$IncludeSecondSums
+        [switch]$IncludeSecondSums,
+        [switch]$IncludeDuplicatePath
     )
 
     $bins = @(
@@ -165,6 +167,9 @@ function New-InstallerArtifact {
     $sums = foreach ($bin in $bins) {
         $file = Join-Path $binDir "$bin.exe"
         "$(New-ArchiveHash -Path $file)  bin/$bin.exe"
+    }
+    if ($IncludeDuplicatePath) {
+        $sums += $sums[0]
     }
     Set-Content -Path (Join-Path $package "SHA256SUMS") -Value $sums -Encoding ascii
 
@@ -280,6 +285,34 @@ try {
         throw "multiple SHA256SUMS rejection message was missing"
     }
     Write-Step "multiple SHA256SUMS archive rejected"
+
+    $duplicateRoot = Join-Path $tmp "duplicate-path"
+    New-Item -ItemType Directory -Path $duplicateRoot -Force | Out-Null
+    $duplicate = New-InstallerArtifact -Root $duplicateRoot -IncludeDuplicatePath
+    Write-Step "created duplicate-path SHA256SUMS artifact"
+    $duplicateResult = Invoke-CheckedProcess -FileName "pwsh" -Arguments @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        "/work/install.ps1",
+        "-Artifact",
+        $duplicate.Archive,
+        "-Sha256",
+        $duplicate.Sha256,
+        "-InstallDir",
+        (Join-Path $tmp "duplicate-install/bin"),
+        "-SkipPear",
+        "-SkipOpencode",
+        "-NoPathUpdate"
+    )
+    Write-Host $duplicateResult.Text
+    if ($duplicateResult.ExitCode -eq 0) {
+        throw "install.ps1 unexpectedly accepted duplicate SHA256SUMS paths"
+    }
+    if (-not $duplicateResult.Text.Contains("SHA256SUMS contains duplicate path: bin/mayhem.exe")) {
+        throw "duplicate SHA256SUMS path rejection message was missing"
+    }
+    Write-Step "duplicate SHA256SUMS path rejected"
 } finally {
     Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
