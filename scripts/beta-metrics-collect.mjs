@@ -477,6 +477,10 @@ function collectCanonicalService(args) {
     },
     controls: {
       admin_controls_economy: firstDefined(controls, ['admin_controls_economy']),
+      admin_sets_prices: firstDefined(controls, ['admin_sets_prices']),
+      admin_sets_rules: firstDefined(controls, ['admin_sets_rules']),
+      admin_sets_params: firstDefined(controls, ['admin_sets_params']),
+      admin_sets_provider_payout_targets: firstDefined(controls, ['admin_sets_provider_payout_targets']),
       admin_can_ban_providers: firstDefined(controls, ['admin_can_ban_providers']),
       providers_set_prices: firstDefined(controls, ['providers_set_prices']),
       providers_set_rules: firstDefined(controls, ['providers_set_rules']),

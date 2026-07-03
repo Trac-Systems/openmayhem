@@ -818,6 +818,11 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
     },
     controls: {
       admin_controls_economy: ok,
+      admin_sets_prices: ok,
+      admin_sets_rules: ok && adminRulesRecordsVerified,
+      admin_sets_params: ok && adminParamsRecordsVerified,
+      admin_sets_provider_payout_targets:
+        ok && activeProviders.size > 0 && adminSetPayoutTargets === activeProviders.size,
       admin_can_ban_providers: ok,
       providers_set_prices: false,
       providers_set_rules: false,
