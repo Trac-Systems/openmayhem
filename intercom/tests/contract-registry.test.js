@@ -852,6 +852,7 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerEntry.value.status, 'banned');
   assert.equal(providerEntry.value.banned_by, admin.publicKey);
+  assert.equal(providerEntry.value.banned_by_role, 'admin');
   assert.equal(providerEntry.value.banned_at, makeTxKey(8));
   assert.equal(providerEntry.value.ban_reason_hash, '7'.repeat(64));
   assert.deepEqual(providerEntry.value.enclaves, []);

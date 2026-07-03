@@ -810,6 +810,7 @@ class MayhemContract extends Contract {
       tombstoned_enclaves: tombstones.map((tombstone) => tombstone.enclave_id),
       banned_at: this.tx,
       banned_by: this.address,
+      banned_by_role: 'admin',
       ban_reason_hash: this.value.reason_hash ?? null,
       updated_at: this.tx,
     };
