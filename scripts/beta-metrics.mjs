@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -115,6 +116,28 @@ function requireBoolean(add, value, expected, name) {
   if (value !== expected) add('error', `${name} must be ${expected}`);
 }
 
+function relativeFile(filePath) {
+  const rel = path.relative(repoRoot, filePath);
+  return rel.startsWith('..') ? filePath : rel;
+}
+
+function sha256File(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function validateBoundFileEvidence(add, evidence, filePath, name) {
+  if (!Array.isArray(evidence) || evidence.some((item) => isPlaceholder(item))) return;
+  const resolved = path.resolve(repoRoot, filePath);
+  if (!fs.existsSync(resolved)) {
+    add('error', `${name} does not exist: ${filePath}`);
+    return;
+  }
+  const expected = `file:${relativeFile(resolved)}#sha256:${sha256File(resolved)}`;
+  if (!evidence.includes(expected)) {
+    add('error', `${name} evidence must include ${expected}`);
+  }
+}
+
 function validateEvidenceArray(add, value, name) {
   if (!requireArray(add, value, name, 1)) return;
   for (const [index, item] of value.entries()) {
@@ -149,11 +172,43 @@ function validateRequiredRails(add, value) {
   }
 }
 
+function validateLaunchBinding(add, metrics) {
+  if (!requireObject(add, metrics.launch, 'launch')) return;
+  requireString(add, metrics.launch.manifest_path, 'launch.manifest_path');
+  requireBoolean(add, metrics.launch.manifest_validated, true, 'launch.manifest_validated');
+  requireIntegerAtLeast(add, metrics.launch.canonical_enclaves, 1, 'launch.canonical_enclaves');
+  requireIntegerAtLeast(add, metrics.launch.canonical_rooms, 1, 'launch.canonical_rooms');
+  requireIntegerAtLeast(add, metrics.launch.seed_providers, 1, 'launch.seed_providers');
+  validateEvidenceArray(add, metrics.launch.evidence, 'launch.evidence');
+
+  if (
+    typeof metrics.launch.manifest_path !== 'string' ||
+    isPlaceholder(metrics.launch.manifest_path)
+  ) {
+    return;
+  }
+
+  validateBoundFileEvidence(add, metrics.launch.evidence, metrics.launch.manifest_path, 'launch.manifest_path');
+  const resolved = path.resolve(repoRoot, metrics.launch.manifest_path);
+  if (!fs.existsSync(resolved)) return;
+  const manifest = readJson(resolved);
+  if (!isPlaceholder(manifest.launch_id) && manifest.launch_id !== metrics.launch_id) {
+    add('error', 'launch.launch_id must match the bound launch manifest');
+  }
+  if (!isPlaceholder(manifest.network?.name) && manifest.network?.name !== metrics.network?.name) {
+    add('error', 'network.name must match the bound launch manifest');
+  }
+  if (!isPlaceholder(manifest.network?.denom) && manifest.network?.denom !== metrics.network?.denom) {
+    add('error', 'network.denom must match the bound launch manifest');
+  }
+}
+
 function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
   const { errors, warnings, add } = issueFactory({ allowPlaceholders });
 
   requireLiteral(add, metrics.schema_version, 1, 'schema_version');
   requireString(add, metrics.launch_id, 'launch_id');
+  validateLaunchBinding(add, metrics);
 
   if (requireObject(add, metrics.network, 'network')) {
     requireLiteral(add, metrics.network.name, 'testnet1', 'network.name');
@@ -316,6 +371,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     warnings,
     thresholds,
     counts,
+    launch_manifest: metrics.launch?.manifest_path ?? null,
     audited_epoch: auditedEpoch.epoch ?? null,
     guardian_trips: metrics.guardian?.trips ?? null,
     tracker_snippet: buildTrackerSnippet(metrics, metricsPath),

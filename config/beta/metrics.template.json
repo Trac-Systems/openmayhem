@@ -1,6 +1,16 @@
 {
   "schema_version": 1,
   "launch_id": "mayhem-testnet-beta-v1",
+  "launch": {
+    "manifest_path": "<config/beta/testnet.json>",
+    "manifest_validated": true,
+    "canonical_enclaves": "<canonical-enclave-count-at-least-1>",
+    "canonical_rooms": "<canonical-room-count-at-least-1>",
+    "seed_providers": "<seed-provider-count-at-least-1>",
+    "evidence": [
+      "<file:config/beta/testnet.json#sha256:64-hex>"
+    ]
+  },
   "network": {
     "name": "testnet1",
     "denom": "mu_usd",

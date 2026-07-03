@@ -12,7 +12,7 @@ const hex64 = /^[0-9a-fA-F]{64}$/;
 
 function usage() {
   console.log(`Usage: node scripts/beta-metrics-collect.mjs --window-start ISO --window-end ISO \\
-  --providers PATH --users PATH --epoch PATH --guardian PATH --canary PATH \\
+  --launch-manifest PATH --providers PATH --users PATH --epoch PATH --guardian PATH --canary PATH \\
   --browser-handoffs PATH --canonical-service PATH --payment-rails PATH \\
   --commit-tx HEX --apply-tx HEX --auditor HEX [--out PATH]
 
@@ -22,6 +22,7 @@ the validated metrics have also been recorded in docs/TRACKER.md.
 
 Accepted evidence shapes are intentionally plain:
 - providers/users: array, { data: [] }, { providers: [] }, or { users: [] }; count-only summaries are rejected
+- launch-manifest: a strict P8.4 beta launch manifest accepted by scripts/beta-launch.mjs
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
 - payment-rails: paygate/rail report proving TNK, Stripe, and Coinbase credit mu_usd
@@ -44,6 +45,7 @@ function parseArgs(argv) {
     '--launch-id',
     '--window-start',
     '--window-end',
+    '--launch-manifest',
     '--providers',
     '--users',
     '--epoch',
@@ -299,6 +301,39 @@ function collectParticipants(args) {
   };
 }
 
+function collectLaunch(args) {
+  const source = readJsonEvidence(requireArg(args, 'launchManifest'));
+  const manifestArg = path.isAbsolute(args.launchManifest)
+    ? args.launchManifest
+    : relativeFile(source.path);
+  const child = spawnSync(process.execPath, [
+    'scripts/beta-launch.mjs',
+    '--manifest',
+    manifestArg,
+    '--json',
+    '--no-commands',
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  if (child.status !== 0) {
+    const details = `${child.stdout || ''}${child.stderr || ''}`.trim();
+    throw new Error(`launch manifest did not pass strict beta-launch validation${details ? `: ${details}` : ''}`);
+  }
+  const report = JSON.parse(child.stdout);
+  return {
+    manifest_path: relativeFile(source.path),
+    manifest_validated: true,
+    canonical_enclaves: report.counts?.canonical_enclaves ?? source.value.canonical_enclaves?.length ?? 0,
+    canonical_rooms: report.counts?.canonical_rooms ?? source.value.canonical_enclaves?.flatMap((enclave) => enclave.rooms || []).length ?? 0,
+    seed_providers: report.counts?.seed_providers ?? source.value.seed_providers?.length ?? 0,
+    evidence: [
+      source.evidence,
+      ...asEvidenceArray(source.value, ['launch.evidence', 'evidence.launch']),
+    ],
+  };
+}
+
 function collectEpoch(args) {
   const source = readJsonEvidence(requireArg(args, 'epoch'));
   const value = source.value;
@@ -460,6 +495,7 @@ function requireHex64(value, label) {
 }
 
 function buildMetrics(args) {
+  const launch = collectLaunch(args);
   const participants = collectParticipants(args);
   const auditedEpoch = collectEpoch(args);
   const guardian = collectGuardian(args);
@@ -478,6 +514,7 @@ function buildMetrics(args) {
   return {
     schema_version: 1,
     launch_id: args.launchId,
+    launch,
     network: {
       name: 'testnet1',
       denom: 'mu_usd',
