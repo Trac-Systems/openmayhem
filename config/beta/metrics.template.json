@@ -42,12 +42,14 @@
   "participants": {
     "external_providers": {
       "count": "<external-provider-count-at-least-20>",
+      "identity_records_verified": true,
       "evidence": [
         "<provider-roster-report-hash-or-url>"
       ]
     },
     "users": {
       "count": "<user-count-at-least-100>",
+      "identity_records_verified": true,
       "evidence": [
         "<user-activity-report-hash-or-url>"
       ]

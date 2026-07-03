@@ -218,11 +218,23 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
         thresholds.externalProviders,
         'participants.external_providers.count',
       );
+      requireBoolean(
+        add,
+        metrics.participants.external_providers.identity_records_verified,
+        true,
+        'participants.external_providers.identity_records_verified',
+      );
       validateEvidenceArray(add, metrics.participants.external_providers.evidence, 'participants.external_providers.evidence');
     }
     if (requireObject(add, metrics.participants.users, 'participants.users')) {
       counts.users = metrics.participants.users.count;
       requireIntegerAtLeast(add, metrics.participants.users.count, thresholds.users, 'participants.users.count');
+      requireBoolean(
+        add,
+        metrics.participants.users.identity_records_verified,
+        true,
+        'participants.users.identity_records_verified',
+      );
       validateEvidenceArray(add, metrics.participants.users.evidence, 'participants.users.evidence');
     }
   }

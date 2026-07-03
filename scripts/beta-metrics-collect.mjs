@@ -21,7 +21,7 @@ P8.5 validator unless --no-validate is passed. Use --tracker-recorded only after
 the validated metrics have also been recorded in docs/TRACKER.md.
 
 Accepted evidence shapes are intentionally plain:
-- providers/users: array, { data: [] }, { providers: [] }, { users: [] }, or a count record
+- providers/users: array, { data: [] }, { providers: [] }, or { users: [] }; count-only summaries are rejected
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
 - payment-rails: paygate/rail report proving TNK, Stripe, and Coinbase credit mu_usd
@@ -208,23 +208,21 @@ function identityOf(record, fields, label) {
   throw new Error(`${label} record is missing an identity field (${fields.join(', ')})`);
 }
 
-function countIdentities(value, { label, countPaths, arrayPaths, idFields, filter }) {
-  const explicit = firstDefined(value, countPaths);
+function countIdentities(value, { label, arrayPaths, idFields, filter }) {
   const evidence = asEvidenceArray(value, [
     'evidence',
     `${label}.evidence`,
     `participants.${label}.evidence`,
   ]);
-  if (Number.isInteger(explicit)) return { count: explicit, evidence };
 
   const records = asArrayFrom(value, arrayPaths);
-  if (!records) throw new Error(`${label} evidence must include a count or records array`);
+  if (!records) throw new Error(`${label} evidence must include identity records; count-only summaries are not accepted`);
   const ids = new Set();
   for (const record of records) {
     if (filter && !filter(record)) continue;
     ids.add(identityOf(record, idFields, label));
   }
-  return { count: ids.size, evidence };
+  return { count: ids.size, identityRecordsVerified: true, evidence };
 }
 
 function providerIsExternal(record) {
@@ -239,12 +237,6 @@ function collectParticipants(args) {
   const users = readJsonEvidence(requireArg(args, 'users'));
   const providerSummary = countIdentities(providers.value, {
     label: 'external_providers',
-    countPaths: [
-      'participants.external_providers.count',
-      'external_providers.count',
-      'provider_count',
-      'count',
-    ],
     arrayPaths: [
       'participants.external_providers.records',
       'external_providers.records',
@@ -257,7 +249,6 @@ function collectParticipants(args) {
   });
   const userSummary = countIdentities(users.value, {
     label: 'users',
-    countPaths: ['participants.users.count', 'users.count', 'user_count', 'count'],
     arrayPaths: [
       'participants.users.records',
       'users.records',
@@ -272,10 +263,12 @@ function collectParticipants(args) {
   return {
     external_providers: {
       count: providerSummary.count,
+      identity_records_verified: providerSummary.identityRecordsVerified,
       evidence: [providers.evidence, ...providerSummary.evidence],
     },
     users: {
       count: userSummary.count,
+      identity_records_verified: userSummary.identityRecordsVerified,
       evidence: [users.evidence, ...userSummary.evidence],
     },
   };
