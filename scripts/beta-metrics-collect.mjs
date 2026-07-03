@@ -292,7 +292,10 @@ function collectEpoch(args) {
     receipt_batches_verified: verified,
     payout_evidence_verified: value.payout_evidence_verified === true || verified,
     auditors: Array.from(new Set(auditors.filter((item) => typeof item === 'string' && item.length > 0))),
-    evidence: source.evidence,
+    evidence: [
+      source.evidence,
+      ...asEvidenceArray(value, ['audited_epoch.evidence', 'evidence']),
+    ],
   };
 }
 
@@ -370,7 +373,6 @@ function buildMetrics(args) {
   auditedEpoch.commit_tx = requireHex64(auditedEpoch.commit_tx, 'audited_epoch.commit_tx');
   auditedEpoch.apply_tx = requireHex64(auditedEpoch.apply_tx, 'audited_epoch.apply_tx');
   auditedEpoch.auditors = auditedEpoch.auditors.map((auditor, index) => requireHex64(auditor, `audited_epoch.auditors[${index}]`));
-  delete auditedEpoch.evidence;
 
   return {
     schema_version: 1,

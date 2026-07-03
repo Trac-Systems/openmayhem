@@ -51,6 +51,9 @@
     "payout_evidence_verified": true,
     "auditors": [
       "<auditor-public-key-64-hex>"
+    ],
+    "evidence": [
+      "<receipt-export-or-recomputed-roots-file-hash-or-url>"
     ]
   },
   "guardian": {

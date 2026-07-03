@@ -200,6 +200,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
         requireString(add, auditor, `audited_epoch.auditors[${index}]`, hex64);
       }
     }
+    validateEvidenceArray(add, auditedEpoch.evidence, 'audited_epoch.evidence');
   }
 
   if (requireObject(add, metrics.guardian, 'guardian')) {
