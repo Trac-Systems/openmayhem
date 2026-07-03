@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -27,7 +28,8 @@ use mayhem_enclave::{
 use mayhem_gateway::{
     heartbeat_signing_payload,
     openai::{
-        serve as serve_gateway, GatewayModel, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
+        serve as serve_gateway, GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo,
+        ModelCaps, PriceRefMu, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
     },
 };
 use mayhem_hwprobe::{
@@ -227,6 +229,14 @@ struct UseArgs {
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
     #[arg(long)]
     rpc_url: Option<String>,
+
+    /// SC-Bridge websocket URL for direct provider sessions.
+    #[arg(long)]
+    sc_bridge_url: Option<String>,
+
+    /// SC-Bridge token for direct provider sessions.
+    #[arg(long)]
+    sc_bridge_token: Option<String>,
 
     /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
     #[arg(long)]
@@ -1462,19 +1472,34 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
-    let (state, source, model_count) = if args.dev_embedded_catalog {
+    let (state, source, model_count, backend) = if args.dev_embedded_catalog {
         let state = GatewayState::from_embedded_catalog();
-        (state, "dev-embedded-catalog".to_owned(), None)
+        (
+            state,
+            "dev-embedded-catalog".to_owned(),
+            None,
+            "local-openai-shape".to_owned(),
+        )
     } else {
         let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
         let rpc = PeerRpcClient::new(&rpc_url)?;
         let contract = read_contract_catalog(&rpc).await?;
         let models = gateway_models_from_contract(&contract)?;
         let model_count = models.len();
+        let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
+            Some(&home),
+            args.sc_bridge_url.as_deref(),
+            args.sc_bridge_token.as_deref(),
+        )?;
+        let backend = ScBridgeGatewaySessionBackend::new(ScBridgeGatewaySessionConfig::new(
+            sc_bridge_url.clone(),
+            sc_bridge_token,
+        ));
         (
-            GatewayState::from_models(models),
+            GatewayState::from_models(models).with_session_backend(Arc::new(backend)),
             format!("contract:{rpc_url}"),
             Some(model_count),
+            format!("sc-bridge-direct-session:{sc_bridge_url}"),
         )
     };
     let report = json!({
@@ -1484,6 +1509,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "gateway_url": gateway_url,
         "openai_base_url": openai_base_url,
         "source": source,
+        "backend": backend,
         "models": model_count,
     });
 
@@ -1495,11 +1521,13 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         println!("Copy/paste OpenAI base URL: {openai_base_url}");
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
+            println!("Backend: local OpenAI-shape smoke backend.");
         } else {
             println!(
                 "Model source: canonical contract state ({} models).",
                 model_count.unwrap_or(0)
             );
+            println!("Backend: {backend}");
         }
         println!("Use Ctrl-C to stop.");
     }
@@ -4637,31 +4665,21 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         prices_by_enclave.insert(schedule.enclave_id.clone(), price.clone());
     }
 
-    let mut price_by_model: BTreeMap<String, LedgerPriceRecord> = BTreeMap::new();
     let mut caps_by_model: BTreeMap<String, ModelCaps> = BTreeMap::new();
     for enclave in active_enclaves.values() {
         if rooms_by_model.get(&enclave.model_id).copied().unwrap_or(0) == 0 {
             continue;
         }
-        let Some(price) = prices_by_enclave.get(&enclave.enclave_id) else {
+        if !prices_by_enclave.contains_key(&enclave.enclave_id) {
             continue;
         };
-        price_by_model
-            .entry(enclave.model_id.clone())
-            .and_modify(|existing| {
-                if price_sort_key(price) < price_sort_key(existing) {
-                    *existing = price.clone();
-                }
-            })
-            .or_insert_with(|| price.clone());
         caps_by_model
             .entry(enclave.model_id.clone())
             .and_modify(|caps| merge_model_caps(caps, &gateway_caps_from_contract(&enclave.caps)))
             .or_insert_with(|| gateway_caps_from_contract(&enclave.caps));
     }
 
-    let mut providers_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut tiers_by_model: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    let mut served_price_by_model: BTreeMap<String, LedgerPriceRecord> = BTreeMap::new();
     for serving in contract
         .roomserve
         .iter()
@@ -4676,13 +4694,71 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         let Some(enclave) = active_enclaves.get(&serving.enclave_id) else {
             continue;
         };
-        if enclave.model_id != serving.model_id || !price_by_model.contains_key(&enclave.model_id) {
+        let Some(serving_price) = prices_by_enclave.get(&serving.enclave_id) else {
+            continue;
+        };
+        if enclave.model_id != serving.model_id {
+            continue;
+        }
+        served_price_by_model
+            .entry(enclave.model_id.clone())
+            .and_modify(|existing| {
+                if price_sort_key(serving_price) < price_sort_key(existing) {
+                    *existing = serving_price.clone();
+                }
+            })
+            .or_insert_with(|| serving_price.clone());
+    }
+
+    let mut providers_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut tiers_by_model: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    let mut route_candidates_by_model: BTreeMap<String, BTreeMap<String, GatewayRouteCandidate>> =
+        BTreeMap::new();
+    for serving in contract
+        .roomserve
+        .iter()
+        .filter(|serving| serving.status == "active")
+    {
+        if !active_providers.contains(serving.provider.as_str()) {
+            continue;
+        }
+        if !room_ids.contains(&serving.room_id) {
+            continue;
+        }
+        let Some(enclave) = active_enclaves.get(&serving.enclave_id) else {
+            continue;
+        };
+        let Some(selected_price) = served_price_by_model.get(&enclave.model_id) else {
+            continue;
+        };
+        let Some(serving_price) = prices_by_enclave.get(&serving.enclave_id) else {
+            continue;
+        };
+        if enclave.model_id != serving.model_id
+            || !same_gateway_price_terms(serving_price, selected_price)
+        {
             continue;
         }
         providers_by_model
             .entry(enclave.model_id.clone())
             .or_default()
             .insert(serving.provider.clone());
+        route_candidates_by_model
+            .entry(enclave.model_id.clone())
+            .or_default()
+            .insert(
+                format!(
+                    "{}:{}:{}",
+                    serving.provider, serving.room_id, serving.enclave_id
+                ),
+                GatewayRouteCandidate {
+                    provider: serving.provider.clone(),
+                    enclave_id: serving.enclave_id.clone(),
+                    room_id: serving.room_id.clone(),
+                    price_ver: serving_price.ver,
+                    att_tier: enclave.att_tier,
+                },
+            );
         let tier = format!("T{}", enclave.att_tier);
         tiers_by_model
             .entry(enclave.model_id.clone())
@@ -4693,8 +4769,13 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
     }
 
     let mut models = Vec::new();
-    for (model_id, price) in price_by_model {
+    for (model_id, price) in served_price_by_model {
         let rooms = rooms_by_model.get(&model_id).copied().unwrap_or(0);
+        let route_candidates = route_candidates_by_model
+            .remove(&model_id)
+            .unwrap_or_default()
+            .into_values()
+            .collect::<Vec<_>>();
         let providers_online = providers_by_model
             .get(&model_id)
             .map(|providers| usize_to_u32(providers.len()))
@@ -4725,6 +4806,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
                 source: "contract".to_owned(),
+                route_candidates,
             },
         });
     }
@@ -4743,6 +4825,13 @@ fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64) {
         price.out_per_1k_mu,
         price.ver,
     )
+}
+
+fn same_gateway_price_terms(left: &LedgerPriceRecord, right: &LedgerPriceRecord) -> bool {
+    left.ver == right.ver
+        && left.denom == right.denom
+        && left.in_per_1k_mu == right.in_per_1k_mu
+        && left.out_per_1k_mu == right.out_per_1k_mu
 }
 
 fn empty_gateway_caps() -> ModelCaps {
@@ -6108,6 +6197,17 @@ mod tests {
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
         assert!(models[0].mayhem.caps.tools);
         assert_eq!(models[0].mayhem.caps.ctx, 8192);
+        assert_eq!(models[0].mayhem.route_candidates.len(), 1);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].provider,
+            "55".repeat(32)
+        );
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].enclave_id,
+            "11".repeat(32)
+        );
+        assert_eq!(models[0].mayhem.route_candidates[0].room_id, "room-a");
+        assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 1);
 
         contract.prices.clear();
         let err = gateway_models_from_contract(&contract)

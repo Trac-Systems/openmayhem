@@ -4,11 +4,12 @@ use axum::{
     Router,
 };
 use mayhem_gateway::openai::{
-    openai_router, ChatCompletionRequest, ChatOutput, GatewayModel, GatewaySessionBackend,
-    GatewaySessionFuture, GatewaySessionResult, GatewayState, Usage,
+    openai_router, ChatCompletionRequest, ChatOutput, GatewayModel, GatewayRouteCandidate,
+    GatewaySessionBackend, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
+    GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, Usage,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tower::ServiceExt;
 
 #[derive(Debug)]
@@ -23,13 +24,17 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
         &'a self,
         model: &'a GatewayModel,
         request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
     ) -> GatewaySessionFuture<'a> {
         Box::pin(async move {
             let prompt_tokens = request.messages.len() as u64;
             let completion_tokens = 4;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
-                    content: Some(format!("direct session response from {}", model.id)),
+                    content: Some(format!(
+                        "direct session response from {} via {}",
+                        model.id, invocation.session_id
+                    )),
                     tool_call: None,
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
@@ -193,10 +198,10 @@ async fn chat_completion_returns_tool_call_and_accepts_tool_result_followup() {
 
 #[tokio::test]
 async fn chat_completion_can_use_direct_session_backend() {
-    let state = GatewayState::from_embedded_catalog()
+    let state = GatewayState::from_models(vec![routed_test_model()])
         .with_session_backend(Arc::new(TestDirectSessionBackend));
     let app = openai_router(state.clone());
-    let model = first_model_id().await;
+    let model = "mayhem/routed-test".to_owned();
     let request = json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Use a direct session." }]
@@ -214,10 +219,52 @@ async fn chat_completion_can_use_direct_session_backend() {
         .contains("direct session response"));
     assert_eq!(state.receipts().len(), 1);
     assert_eq!(state.receipts()[0].receipt.body.usage.out_tokens, 4);
+    assert_eq!(state.receipts()[0].receipt.body.provider, "55".repeat(32));
+    assert_eq!(state.receipts()[0].receipt.body.enclave_id, "11".repeat(32));
+    assert_eq!(state.receipts()[0].receipt.body.price_ver, 7);
+    assert_eq!(
+        state.receipts()[0].voucher.body.session_id,
+        state.receipts()[0].receipt.body.session_id
+    );
 
     let (status, body) = json_request(app, Method::GET, "/mayhem/status", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["backend"], "test-direct-session");
+}
+
+fn routed_test_model() -> GatewayModel {
+    let mut tiers = BTreeMap::new();
+    tiers.insert("T1".to_owned(), 1);
+    GatewayModel {
+        id: "mayhem/routed-test".to_owned(),
+        created: 1_782_950_400,
+        owned_by: "mayhem".to_owned(),
+        mayhem: MayhemModelInfo {
+            providers_online: 1,
+            rooms: 1,
+            price_ref_mu: PriceRefMu {
+                denom: "mu_usd".to_owned(),
+                ver: 7,
+                in_per_1k: 20,
+                out_per_1k: 60,
+            },
+            attestation_tiers: tiers,
+            caps: ModelCaps {
+                tools: true,
+                json: true,
+                ctx: 8192,
+                vision: false,
+            },
+            source: "contract".to_owned(),
+            route_candidates: vec![GatewayRouteCandidate {
+                provider: "55".repeat(32),
+                enclave_id: "11".repeat(32),
+                room_id: "room-a".to_owned(),
+                price_ver: 7,
+                att_tier: 1,
+            }],
+        },
+    }
 }
 
 #[tokio::test]

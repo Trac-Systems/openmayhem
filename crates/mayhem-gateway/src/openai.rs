@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -20,6 +20,7 @@ use axum::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::stream;
+use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
     receipt_signing_bytes, spend_voucher_signing_bytes, CheckpointPolicy, ReceiptAck, ReceiptBody,
     ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, SESSION_RECEIPT_SCHEMA_VERSION,
@@ -57,6 +58,17 @@ pub struct MayhemModelInfo {
     pub attestation_tiers: BTreeMap<String, u32>,
     pub caps: ModelCaps,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_candidates: Vec<GatewayRouteCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GatewayRouteCandidate {
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub price_ver: u64,
+    pub att_tier: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -178,6 +190,7 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
         &'a self,
         model: &'a GatewayModel,
         request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
     ) -> GatewaySessionFuture<'a>;
 }
 
@@ -189,12 +202,36 @@ pub struct GatewaySessionResult {
 }
 
 #[derive(Clone, Debug)]
+pub struct GatewaySessionInvocation {
+    pub session_id: String,
+    pub user_pubkey: String,
+    pub provider_pubkey: Option<String>,
+    pub enclave_id: String,
+    pub price_ver: u64,
+    pub rules_ver: u64,
+    pub spend_voucher: SpendVoucher,
+}
+
+#[derive(Clone, Debug)]
 pub struct GatewaySessionError {
     pub message: String,
 }
 
 #[derive(Debug)]
 struct LocalOpenAiShapeBackend;
+
+#[derive(Clone, Debug)]
+pub struct ScBridgeGatewaySessionConfig {
+    pub url: String,
+    pub token: String,
+    pub open_timeout: Duration,
+    pub frame_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScBridgeGatewaySessionBackend {
+    config: ScBridgeGatewaySessionConfig,
+}
 
 #[derive(Clone, Debug)]
 pub struct ChatOutput {
@@ -264,6 +301,7 @@ impl GatewayState {
                     vision: false,
                 },
                 source: "local-fixture".to_owned(),
+                route_candidates: Vec::new(),
             },
         }])
     }
@@ -462,6 +500,12 @@ impl GatewaySessionError {
     }
 }
 
+impl From<BridgeError> for GatewaySessionError {
+    fn from(error: BridgeError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 impl GatewaySessionResult {
     pub fn local_openai_shape(output: ChatOutput) -> Self {
         Self {
@@ -481,6 +525,7 @@ impl GatewaySessionBackend for LocalOpenAiShapeBackend {
         &'a self,
         model: &'a GatewayModel,
         request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
     ) -> GatewaySessionFuture<'a> {
         Box::pin(async move {
             Ok(GatewaySessionResult::local_openai_shape(
@@ -488,6 +533,353 @@ impl GatewaySessionBackend for LocalOpenAiShapeBackend {
             ))
         })
     }
+}
+
+impl ScBridgeGatewaySessionConfig {
+    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            token: token.into(),
+            open_timeout: Duration::from_secs(3),
+            frame_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+impl ScBridgeGatewaySessionBackend {
+    pub fn new(config: ScBridgeGatewaySessionConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
+    fn name(&self) -> &str {
+        "sc-bridge-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move { self.run_chat_over_bridge(request, invocation).await })
+    }
+}
+
+impl ScBridgeGatewaySessionBackend {
+    async fn run_chat_over_bridge(
+        &self,
+        request: &ChatCompletionRequest,
+        invocation: &GatewaySessionInvocation,
+    ) -> Result<GatewaySessionResult, GatewaySessionError> {
+        let provider = invocation
+            .provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        let opened = bridge
+            .session_open(provider, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "opening direct session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        if opened.get("direct").and_then(Value::as_bool) != Some(true)
+            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(GatewaySessionError::new(format!(
+                "session {} was not opened as a direct non-relayed channel",
+                invocation.session_id
+            )));
+        }
+
+        let now = now_millis_u64();
+        let open_frame = json!({
+            "t": "s.open",
+            "v": 1,
+            "session_id": invocation.session_id,
+            "user": invocation.user_pubkey,
+            "enclave_id": invocation.enclave_id,
+            "price_ver": invocation.price_ver,
+            "rules_ver": invocation.rules_ver,
+            "voucher": invocation.spend_voucher,
+            "att_nonce": blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes()),
+            "ts": now,
+            "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+            "sig": invocation.spend_voucher.user_sig,
+        });
+        bridge
+            .session_send(provider, &invocation.session_id, open_frame)
+            .await?;
+
+        let accept = next_session_frame(
+            &mut bridge,
+            &invocation.session_id,
+            self.config.open_timeout,
+            &["s.accept", "s.reject"],
+        )
+        .await?;
+        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+            let code = accept
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            return Err(GatewaySessionError::new(format!(
+                "provider rejected session {} with {code}",
+                invocation.session_id
+            )));
+        }
+
+        let request_id = blake3_hex(
+            format!(
+                "rid:{}:{}",
+                invocation.session_id,
+                serde_json::to_string(&request.messages).unwrap_or_default()
+            )
+            .as_bytes(),
+        )
+        .chars()
+        .take(32)
+        .collect::<String>();
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.req",
+                    "rid": request_id,
+                    "body": direct_session_request_body(request),
+                }),
+            )
+            .await?;
+
+        let output = collect_direct_session_output(
+            &mut bridge,
+            &invocation.session_id,
+            &request_id,
+            self.config.frame_timeout,
+            request,
+        )
+        .await?;
+        let _ = bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.close",
+                    "v": 1,
+                    "session_id": invocation.session_id,
+                    "reason": "done",
+                }),
+            )
+            .await;
+        let _ = bridge.session_close(provider, &invocation.session_id).await;
+
+        Ok(GatewaySessionResult {
+            output,
+            backend: self.name().to_owned(),
+            direct_session: true,
+        })
+    }
+}
+
+async fn next_session_frame(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    wait: Duration,
+    expected_types: &[&str],
+) -> Result<Value, GatewaySessionError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(GatewaySessionError::new(format!(
+                "timed out waiting for {} on session {}",
+                expected_types.join("|"),
+                session_id
+            )));
+        }
+        match bridge.next_session_frame(remaining).await {
+            Ok(event) => {
+                if event.get("session_id").and_then(Value::as_str) != Some(session_id) {
+                    continue;
+                }
+                let frame = event.get("frame").cloned().unwrap_or(Value::Null);
+                let frame_type = frame.get("t").and_then(Value::as_str).unwrap_or("");
+                if expected_types.contains(&frame_type) {
+                    return Ok(frame);
+                }
+            }
+            Err(BridgeError::Timeout) => {
+                return Err(GatewaySessionError::new(format!(
+                    "timed out waiting for {} on session {}",
+                    expected_types.join("|"),
+                    session_id
+                )));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
+    let mut body = json!({
+        "messages": &request.messages,
+        "stream": true,
+    });
+    set_optional_json(
+        &mut body,
+        "tools",
+        request.tools.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "tool_choice",
+        request.tool_choice.as_ref().cloned(),
+    );
+    set_optional_json(
+        &mut body,
+        "response_format",
+        request.response_format.as_ref().cloned(),
+    );
+    set_optional_json(
+        &mut body,
+        "temperature",
+        request.temperature.map(|value| json!(value)),
+    );
+    set_optional_json(&mut body, "top_p", request.top_p.map(|value| json!(value)));
+    set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
+    set_optional_json(&mut body, "stop", request.stop.as_ref().cloned());
+    set_optional_json(
+        &mut body,
+        "max_tokens",
+        request.max_tokens.map(|value| json!(value)),
+    );
+    body
+}
+
+fn set_optional_json(body: &mut Value, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        body[key] = value;
+    }
+}
+
+async fn collect_direct_session_output(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    request_id: &str,
+    wait: Duration,
+    request: &ChatCompletionRequest,
+) -> Result<ChatOutput, GatewaySessionError> {
+    let mut content = String::new();
+    let mut tool_call = None;
+    let deadline = Instant::now() + wait;
+
+    let (finish_reason, usage) = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(GatewaySessionError::new(format!(
+                "timed out waiting for s.delta on session {session_id}"
+            )));
+        }
+        let frame = next_session_frame(
+            bridge,
+            session_id,
+            remaining,
+            &["s.delta", "s.receipt", "s.close"],
+        )
+        .await?;
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
+                    content.push_str(delta);
+                }
+                if tool_call.is_none() {
+                    tool_call = tool_call_from_session_delta(&frame);
+                }
+                if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
+                    break (fin.to_owned(), usage_from_session_delta(&frame));
+                }
+            }
+            Some("s.close") => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed session {session_id} before final delta: {reason}"
+                )));
+            }
+            _ => {}
+        }
+    };
+
+    let prompt_text = chat_prompt_text(request);
+    let usage = usage.unwrap_or_else(|| usage_for(&prompt_text, &content));
+    Ok(ChatOutput {
+        content: tool_call.is_none().then_some(content),
+        tool_call,
+        finish_reason,
+        usage,
+    })
+}
+
+fn tool_call_from_session_delta(frame: &Value) -> Option<ToolCallOutput> {
+    let tool = frame.get("tool")?;
+    if tool.is_null() {
+        return None;
+    }
+    Some(ToolCallOutput {
+        id: tool
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| make_id("call")),
+        name: tool
+            .get("name")
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+            })
+            .and_then(Value::as_str)?
+            .to_owned(),
+        arguments: tool
+            .get("arguments")
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|function| function.get("arguments"))
+            })
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "{}".to_owned()),
+    })
+}
+
+fn usage_from_session_delta(frame: &Value) -> Option<Usage> {
+    let usage = frame.get("usage")?;
+    let prompt_tokens = usage
+        .get("in")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64)?;
+    let completion_tokens = usage
+        .get("out")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)?;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    })
 }
 
 async fn build_chat_completion(
@@ -521,20 +913,21 @@ async fn build_chat_completion(
 
     let id = make_id("chatcmpl");
     let created = now_secs();
+    let invocation = state.prepare_chat_invocation(&model, &request)?;
     let GatewaySessionResult {
         output,
         backend,
         direct_session,
     } = state
         .session_backend
-        .run_chat(&model, &request)
+        .run_chat(&model, &request, &invocation)
         .await
         .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
     let mayhem_meta = ResponseMayhemMeta {
         backend: &backend,
         direct_session,
     };
-    let receipt = state.meter_chat_session(&model, &request, &output)?;
+    let receipt = state.meter_chat_session(&model, &request, &output, &invocation)?;
     if request.stream {
         Ok(ChatResponse::Sse(chat_stream_chunks(
             &id,
@@ -603,23 +996,120 @@ fn build_completion(
 }
 
 impl GatewayState {
+    fn prepare_chat_invocation(
+        &self,
+        model: &GatewayModel,
+        request: &ChatCompletionRequest,
+    ) -> Result<GatewaySessionInvocation, ApiError> {
+        let prompt_text = chat_prompt_text(request);
+        let route = model.mayhem.route_candidates.first();
+        let session_id = session_id_for(&model.id, &prompt_text);
+        let enclave_id = route
+            .map(|candidate| candidate.enclave_id.clone())
+            .unwrap_or_else(|| enclave_id_for_model(&model.id));
+        let price_ver = route
+            .map(|candidate| candidate.price_ver)
+            .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let max_spend_mu = estimate_max_spend_mu(model, request, &prompt_text);
+        if max_spend_mu > self.receipt_config.balance_mu {
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver,
+            max_spend_mu,
+            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+        };
+        let voucher_payload =
+            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
+        Ok(GatewaySessionInvocation {
+            session_id,
+            user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
+            provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            enclave_id,
+            price_ver,
+            rules_ver: self.receipt_config.rules_ver,
+            spend_voucher: SpendVoucher {
+                body: voucher_body,
+                user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
+            },
+        })
+    }
+
     fn meter_chat_session(
         &self,
         model: &GatewayModel,
         request: &ChatCompletionRequest,
         output: &ChatOutput,
+        invocation: &GatewaySessionInvocation,
     ) -> Result<StoredReceipt, ApiError> {
-        let prompt_text = request
-            .messages
-            .iter()
-            .map(message_to_text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let prompt_text = chat_prompt_text(request);
         let usage = ReceiptUsage {
             in_tokens: output.usage.prompt_tokens,
             out_tokens: output.usage.completion_tokens,
         };
-        self.meter_session(model, &prompt_text, usage)
+        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            return Err(ApiError::payment_required(
+                "session usage exceeded signed spend voucher",
+                Some("model"),
+            ));
+        }
+
+        if !self.receipt_config.cosign_enabled {
+            self.pause_session(PausedSession {
+                session_id: invocation.session_id.clone(),
+                reason: "receipt co-signing refused; session paused".to_owned(),
+            });
+            return Err(ApiError::conflict(
+                "receipt co-signing refused; session paused",
+                None,
+            ));
+        }
+
+        let provider = invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let body = ReceiptBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            session_id: invocation.session_id.clone(),
+            seq: 1,
+            final_receipt: true,
+            user: invocation.user_pubkey.clone(),
+            provider,
+            enclave_id: invocation.enclave_id.clone(),
+            model_id: model.id.clone(),
+            price_ver: invocation.price_ver,
+            rules_ver: invocation.rules_ver,
+            usage,
+            mu_owed_cum,
+            prompt_hash: blake3_hex(prompt_text.as_bytes()),
+            ts: now_millis_u64(),
+        };
+        let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
+        let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
+        let receipt = SessionReceipt {
+            body,
+            enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+            user_sig: user_sig.clone(),
+        };
+        let receipt_ack = ReceiptAck {
+            session_id: receipt.body.session_id.clone(),
+            seq: receipt.body.seq,
+            user_sig,
+        };
+        let stored = StoredReceipt {
+            voucher: invocation.spend_voucher.clone(),
+            receipt,
+            receipt_ack,
+        };
+        self.record_receipt(stored.clone());
+        Ok(stored)
     }
 
     fn meter_session(
@@ -960,6 +1450,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 vision: caps.get("vision").and_then(Value::as_bool).unwrap_or(false),
             },
             source: "catalog".to_owned(),
+            route_candidates: Vec::new(),
         },
     })
 }
@@ -1093,6 +1584,15 @@ fn message_to_text(message: &ChatMessage) -> String {
     content_to_text(&message.content)
 }
 
+fn chat_prompt_text(request: &ChatCompletionRequest) -> String {
+    request
+        .messages
+        .iter()
+        .map(message_to_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn content_to_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -1144,6 +1644,18 @@ fn usage_for(input: &str, output: &str) -> Usage {
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
     }
+}
+
+fn estimate_max_spend_mu(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    prompt_text: &str,
+) -> u64 {
+    let usage = ReceiptUsage {
+        in_tokens: rough_tokens(prompt_text),
+        out_tokens: u64::from(request.max_tokens.unwrap_or(1024).max(1)),
+    };
+    calculate_mu_owed(&model.mayhem.price_ref_mu, &usage).max(1_000)
 }
 
 fn rough_tokens(text: &str) -> u64 {

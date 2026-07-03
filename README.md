@@ -19,7 +19,7 @@ Providers can only opt into admin-created enclave and room records from the cont
 ./install.sh
 mayhem setup --role user
 # terminal 1: leave the gateway running
-mayhem use
+mayhem use --sc-bridge-url "$MAYHEM_SC_BRIDGE_URL" --sc-bridge-token "$MAYHEM_SC_BRIDGE_TOKEN"
 # terminal 2
 mayhem models
 mayhem balance
@@ -27,9 +27,10 @@ mayhem test --sync-models
 opencode run --model mayhem/<model-id> "Say hello from Mayhem."
 ```
 
-`mayhem use` reads canonical contract state and requires an admin-created active
-enclave, current `mu_usd` price, and open room. For isolated API development
-only, use `mayhem use --dev-embedded-catalog`.
+`mayhem use` reads canonical contract state, requires an admin-created active
+enclave, current `mu_usd` price, open room, active provider route, and local
+SC-Bridge credentials for direct provider sessions. For isolated API
+development only, use `mayhem use --dev-embedded-catalog`.
 
 ## Install
 
