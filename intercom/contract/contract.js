@@ -1056,6 +1056,11 @@ class MayhemContract extends Contract {
       rooms,
       updated_at: this.tx,
     });
+    await this.put(`room/${this.value.room_id}`, {
+      ...room,
+      serves: this.roomServesWith(room, this.address, this.value.enclave_id),
+      serves_updated_at: this.tx,
+    });
     console.log('mayhem joinRoom', record);
     return {
       ok: true,
@@ -1076,13 +1081,27 @@ class MayhemContract extends Contract {
 
     const key = `roomserve/${this.value.room_id}/${this.address}/${this.value.enclave_id}`;
     const record = await this.get(key);
-    if (!record || record.status !== 'active') return new Error('Provider has not joined room with enclave.');
+    if (!record) return new Error('Provider has not joined room with enclave.');
+    if (record.status !== 'active') {
+      return {
+        ok: true,
+        op: 'leaveRoom',
+        room_id: this.value.room_id,
+        provider: this.address,
+        enclave_id: this.value.enclave_id,
+        sidechannel: record.sidechannel,
+        status: record.status,
+        idempotent: true,
+      };
+    }
 
     const servingKey = `serve/${this.address}/${this.value.enclave_id}`;
     const serving = await this.get(servingKey);
     const rooms = Array.isArray(serving?.rooms)
       ? serving.rooms.filter((roomId) => roomId !== this.value.room_id)
       : [];
+    const roomKey = `room/${this.value.room_id}`;
+    const room = await this.get(roomKey);
     const updated = {
       ...record,
       status: 'inactive',
@@ -1095,6 +1114,13 @@ class MayhemContract extends Contract {
         ...serving,
         rooms,
         updated_at: this.tx,
+      });
+    }
+    if (room) {
+      await this.put(roomKey, {
+        ...room,
+        serves: this.roomServesWithout(room, this.address, this.value.enclave_id),
+        serves_updated_at: this.tx,
       });
     }
     console.log('mayhem leaveRoom', updated);
@@ -1141,6 +1167,8 @@ class MayhemContract extends Contract {
       label: this.value.label,
       creator: this.address,
       policy: cloneValue(this.value.policy),
+      serves: [],
+      serves_updated_at: null,
       created_at: this.tx,
       updated_at: this.tx,
       closed_at: null,
@@ -1160,15 +1188,33 @@ class MayhemContract extends Contract {
     if (!record) return new Error('Room not found.');
     if (record.status === 'closed') return new Error('Room already closed.');
 
+    const tombstones = await this.tombstoneRoomServes(
+      this.value.room_id,
+      this.roomServingEntries(record),
+      null
+    );
+    if (tombstones instanceof Error) return tombstones;
+    const current = (await this.get(key)) ?? record;
     const updated = {
-      ...record,
+      ...current,
       status: 'closed',
+      serves: [],
+      serves_updated_at: this.tx,
+      tombstoned_serves: tombstones
+        .filter((tombstone) => tombstone.roomserve_tombstoned)
+        .map(({ provider, enclave_id }) => ({ provider, enclave_id })),
       updated_at: this.tx,
       closed_at: this.tx,
     };
     await this.put(key, updated);
     console.log('mayhem closeRoom', updated);
-    return { ok: true, op: 'closeRoom', room_id: updated.room_id, sidechannel: updated.sidechannel };
+    return {
+      ok: true,
+      op: 'closeRoom',
+      room_id: updated.room_id,
+      sidechannel: updated.sidechannel,
+      tombstoned_serves: updated.tombstoned_serves,
+    };
   }
 
   async setPrice() {
@@ -3070,6 +3116,106 @@ class MayhemContract extends Contract {
     return this.enclaveActiveProviders(enclave).filter((activeProviderId) => activeProviderId !== providerId);
   }
 
+  roomServingEntries(room) {
+    if (!room || !Array.isArray(room.serves)) return [];
+    const entries = new Map();
+    for (const entry of room.serves) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      if (!this.isSafeKeyPart(entry.provider) || !this.isSafeKeyPart(entry.enclave_id)) continue;
+      entries.set(JSON.stringify([entry.provider, entry.enclave_id]), {
+        provider: entry.provider,
+        enclave_id: entry.enclave_id,
+      });
+    }
+    return Array.from(entries.values()).sort((a, b) => (
+      a.provider.localeCompare(b.provider) || a.enclave_id.localeCompare(b.enclave_id)
+    ));
+  }
+
+  roomServesWith(room, providerId, enclaveId) {
+    const entries = this.roomServingEntries(room);
+    if (!entries.some((entry) => entry.provider === providerId && entry.enclave_id === enclaveId)) {
+      entries.push({ provider: providerId, enclave_id: enclaveId });
+    }
+    return entries.sort((a, b) => (
+      a.provider.localeCompare(b.provider) || a.enclave_id.localeCompare(b.enclave_id)
+    ));
+  }
+
+  roomServesWithout(room, providerId, enclaveId = null) {
+    return this.roomServingEntries(room).filter((entry) => (
+      entry.provider !== providerId || (enclaveId !== null && entry.enclave_id !== enclaveId)
+    ));
+  }
+
+  async tombstoneRoomServes(roomId, entries, evidenceHash) {
+    if (!this.isSafeKeyPart(roomId)) return new Error('Invalid room id.');
+    const tombstones = [];
+    for (const entry of entries) {
+      const tombstone = await this.tombstoneRoomServing(
+        roomId,
+        entry.provider,
+        entry.enclave_id,
+        evidenceHash
+      );
+      if (tombstone instanceof Error) return tombstone;
+      tombstones.push(tombstone);
+    }
+    return tombstones;
+  }
+
+  async tombstoneRoomServing(roomId, providerId, enclaveId, evidenceHash) {
+    if (!this.isSafeKeyPart(roomId)) return new Error('Invalid room id.');
+    if (!this.isSafeKeyPart(providerId)) return new Error('Invalid provider id.');
+    if (!this.isSafeKeyPart(enclaveId)) return new Error('Invalid enclave id.');
+
+    const roomServeKey = `roomserve/${roomId}/${providerId}/${enclaveId}`;
+    const roomServing = await this.get(roomServeKey);
+    const roomKey = `room/${roomId}`;
+    const room = await this.get(roomKey);
+    const servingKey = `serve/${providerId}/${enclaveId}`;
+    const serving = await this.get(servingKey);
+
+    if (room) {
+      await this.put(roomKey, {
+        ...room,
+        serves: this.roomServesWithout(room, providerId, enclaveId),
+        serves_updated_at: this.tx,
+      });
+    }
+    if (serving) {
+      await this.put(servingKey, {
+        ...serving,
+        rooms: Array.isArray(serving.rooms)
+          ? serving.rooms.filter((activeRoomId) => activeRoomId !== roomId)
+          : [],
+        updated_at: this.tx,
+      });
+    }
+    if (!roomServing || roomServing.status !== 'active') {
+      return {
+        room_id: roomId,
+        provider: providerId,
+        enclave_id: enclaveId,
+        roomserve_tombstoned: false,
+      };
+    }
+
+    await this.put(roomServeKey, {
+      ...roomServing,
+      status: 'tombstoned',
+      updated_at: this.tx,
+      tombstoned_at: this.tx,
+      tombstone_reason_hash: evidenceHash,
+    });
+    return {
+      room_id: roomId,
+      provider: providerId,
+      enclave_id: enclaveId,
+      roomserve_tombstoned: true,
+    };
+  }
+
   async tombstoneEnclaveProviders(enclaveId, providerIds, evidenceHash) {
     if (!this.isSafeKeyPart(enclaveId)) return new Error('Invalid enclave id.');
     const tombstones = [];
@@ -3118,17 +3264,9 @@ class MayhemContract extends Contract {
     const rooms = Array.isArray(serving.rooms) ? serving.rooms.slice().sort() : [];
     const tombstonedRooms = [];
     for (const roomId of rooms) {
-      const roomServeKey = `roomserve/${roomId}/${providerId}/${enclaveId}`;
-      const roomServing = await this.get(roomServeKey);
-      if (!roomServing) continue;
-      await this.put(roomServeKey, {
-        ...roomServing,
-        status: 'tombstoned',
-        updated_at: this.tx,
-        tombstoned_at: this.tx,
-        tombstone_reason_hash: evidenceHash,
-      });
-      tombstonedRooms.push(roomId);
+      const tombstone = await this.tombstoneRoomServing(roomId, providerId, enclaveId, evidenceHash);
+      if (tombstone instanceof Error) return tombstone;
+      if (tombstone.roomserve_tombstoned) tombstonedRooms.push(roomId);
     }
 
     await this.put(serveKey, {

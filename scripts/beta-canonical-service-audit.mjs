@@ -212,6 +212,40 @@ function parseRoomServeKey(key) {
   return { room_id: parts[1], provider: parts[2], enclave_id: parts[3] };
 }
 
+function roomServeIndexEntries(room) {
+  if (!Array.isArray(room?.serves)) return null;
+  const invalid = [];
+  const entries = new Map();
+  for (const [index, entry] of room.serves.entries()) {
+    if (
+      !entry
+      || typeof entry !== 'object'
+      || Array.isArray(entry)
+      || typeof entry.provider !== 'string'
+      || entry.provider.length === 0
+      || typeof entry.enclave_id !== 'string'
+      || entry.enclave_id.length === 0
+    ) {
+      invalid.push(index);
+      continue;
+    }
+    entries.set(JSON.stringify([entry.provider, entry.enclave_id]), {
+      provider: entry.provider,
+      enclave_id: entry.enclave_id,
+    });
+  }
+  return {
+    entries: Array.from(entries.values()).sort((a, b) => (
+      a.provider.localeCompare(b.provider) || a.enclave_id.localeCompare(b.enclave_id)
+    )),
+    invalid,
+  };
+}
+
+function roomServeIndexKey(roomId, entry) {
+  return `roomserve/${roomId}/${entry.provider}/${entry.enclave_id}`;
+}
+
 function adminFromRecords(records, override) {
   if (override) return override;
   const raw = records.get('admin');
@@ -274,6 +308,14 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     if (room.sidechannel && room.sidechannel !== `mx/room/${roomId}`) {
       fail(`room/${roomId} sidechannel does not match mx/room/${roomId}`);
     }
+    const serveIndex = roomServeIndexEntries(room);
+    if (!serveIndex) {
+      fail(`room/${roomId} is missing active serve index room.serves`);
+    } else {
+      for (const invalidIndex of serveIndex.invalid) {
+        fail(`room/${roomId}.serves[${invalidIndex}] is not a valid {provider,enclave_id} entry`);
+      }
+    }
   }
 
   const activeServeByKey = new Map();
@@ -331,6 +373,12 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
       fail(`${entry.key} value.model_id does not match enclave model`);
     }
     if (room && entry.value.sidechannel !== room.sidechannel) fail(`${entry.key} sidechannel does not match room sidechannel`);
+    const roomServeIndex = roomServeIndexEntries(room);
+    if (roomServeIndex && !roomServeIndex.entries.some((item) => (
+      item.provider === provider && item.enclave_id === enclaveId
+    ))) {
+      fail(`${entry.key} missing from room/${roomId}.serves`);
+    }
     if (serve && Array.isArray(serve.rooms) && !serve.rooms.includes(roomId)) {
       fail(`${entry.key} missing from serve/${provider}/${enclaveId}.rooms`);
     }
@@ -340,6 +388,18 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     }
     if (enclave && Array.isArray(enclave.providers) && !enclave.providers.includes(provider)) {
       fail(`${entry.key} missing from enclave/${enclaveId}.providers`);
+    }
+  }
+
+  for (const [roomId, room] of openRooms.entries()) {
+    const roomServeIndex = roomServeIndexEntries(room);
+    if (!roomServeIndex) continue;
+    for (const indexed of roomServeIndex.entries) {
+      const key = roomServeIndexKey(roomId, indexed);
+      const record = records.get(key);
+      if (!record || record.status !== 'active') {
+        fail(`room/${roomId}.serves references missing or inactive ${key}`);
+      }
     }
   }
 

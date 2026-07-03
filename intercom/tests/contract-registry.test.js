@@ -723,6 +723,9 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
     7
   );
   assert.equal(joinedRoom.ok, true, joinedRoom.message);
+  assert.deepEqual((await storage.get(`room/${roomId}`)).value.serves, [
+    { provider: provider.publicKey, enclave_id: enclaveId },
+  ]);
 
   const banned = await execute(
     contract,
@@ -759,6 +762,9 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
   const roomServingEntry = await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`);
   assert.equal(roomServingEntry.value.status, 'tombstoned');
   assert.equal(roomServingEntry.value.tombstone_reason_hash, '7'.repeat(64));
+  const roomEntry = await storage.get(`room/${roomId}`);
+  assert.deepEqual(roomEntry.value.serves, []);
+  assert.equal(roomEntry.value.serves_updated_at, makeTxKey(8));
 
   const joinAfterBan = await execute(
     contract,
@@ -863,6 +869,9 @@ test('MayhemContract admin retirement tombstones indexed provider room serving',
     7
   );
   assert.equal(joinedRoom.ok, true, joinedRoom.message);
+  assert.deepEqual((await storage.get(`room/${roomId}`)).value.serves, [
+    { provider: provider.publicKey, enclave_id: enclaveId },
+  ]);
 
   const retired = await execute(
     contract,
@@ -899,6 +908,9 @@ test('MayhemContract admin retirement tombstones indexed provider room serving',
   const roomServingEntry = await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`);
   assert.equal(roomServingEntry.value.status, 'tombstoned');
   assert.equal(roomServingEntry.value.tombstoned_at, makeTxKey(8));
+  const roomEntry = await storage.get(`room/${roomId}`);
+  assert.deepEqual(roomEntry.value.serves, []);
+  assert.equal(roomEntry.value.serves_updated_at, makeTxKey(8));
 });
 
 test('MayhemContract rejects provider-submitted arbitrary enclave definitions', async () => {

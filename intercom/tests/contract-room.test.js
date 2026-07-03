@@ -196,6 +196,8 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     label: 'eu-central',
     creator: admin.publicKey,
     policy,
+    serves: [{ provider: provider.publicKey, enclave_id: enclaveId }],
+    serves_updated_at: makeTxKey(9),
     created_at: makeTxKey(6),
     updated_at: makeTxKey(6),
     closed_at: null,
@@ -248,6 +250,7 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     op: 'closeRoom',
     room_id: expectedRoomId,
     sidechannel: expectedSidechannel,
+    tombstoned_serves: [{ provider: provider.publicKey, enclave_id: enclaveId }],
   });
 
   const peerBAfterClose = MemoryStorage.fromSnapshotBytes(peerAStorage.snapshotBytes());
@@ -255,6 +258,16 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
   assert.equal(closedRoom.value.status, 'closed');
   assert.equal(closedRoom.value.updated_at, makeTxKey(11));
   assert.equal(closedRoom.value.closed_at, makeTxKey(11));
+  assert.deepEqual(closedRoom.value.serves, []);
+  assert.equal(closedRoom.value.serves_updated_at, makeTxKey(11));
+  assert.deepEqual(closedRoom.value.tombstoned_serves, [{ provider: provider.publicKey, enclave_id: enclaveId }]);
+
+  const tombstonedRoomServing = await peerBAfterClose.get(`roomserve/${expectedRoomId}/${provider.publicKey}/${enclaveId}`);
+  assert.equal(tombstonedRoomServing.value.status, 'tombstoned');
+  assert.equal(tombstonedRoomServing.value.tombstoned_at, makeTxKey(11));
+  const servingAfterClose = await peerBAfterClose.get(`serve/${provider.publicKey}/${enclaveId}`);
+  assert.deepEqual(servingAfterClose.value.rooms, []);
+  assert.equal(servingAfterClose.value.updated_at, makeTxKey(11));
 
   const leave = await execute(
     contract,
@@ -275,15 +288,17 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     provider: provider.publicKey,
     enclave_id: enclaveId,
     sidechannel: expectedSidechannel,
+    status: 'tombstoned',
+    idempotent: true,
   });
 
   const leftRoomServing = await peerAStorage.get(`roomserve/${expectedRoomId}/${provider.publicKey}/${enclaveId}`);
-  assert.equal(leftRoomServing.value.status, 'inactive');
-  assert.equal(leftRoomServing.value.left_at, makeTxKey(12));
+  assert.equal(leftRoomServing.value.status, 'tombstoned');
+  assert.equal(leftRoomServing.value.tombstoned_at, makeTxKey(11));
 
   const servingAfterLeaveRoom = await peerAStorage.get(`serve/${provider.publicKey}/${enclaveId}`);
   assert.deepEqual(servingAfterLeaveRoom.value.rooms, []);
-  assert.equal(servingAfterLeaveRoom.value.updated_at, makeTxKey(12));
+  assert.equal(servingAfterLeaveRoom.value.updated_at, makeTxKey(11));
 });
 
 test('MayhemContract keeps legacy admin model rooms joinable by matching enclave model', async () => {
