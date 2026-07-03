@@ -477,15 +477,17 @@ async function buildCommands(manifest) {
     `"$MAYHEM_PEAR_RUNTIME" run . --network testnet1 --peer-store-name ${sh(adminStore)} --msb-store-name ${sh(`${adminStore}-msb`)} --msb-bootstrap ${sh(msb.bootstrap)} --msb-channel ${sh(msb.channel)} --subnet-channel ${sh(subnet.channel)} --sc-bridge 1 --sc-bridge-host 127.0.0.1 --sc-bridge-port 49222 --sc-bridge-token "$${scTokenEnv}" --rpc 1 --rpc-host 127.0.0.1 --rpc-port 49223${peerDht ? ` --peer-dht-bootstrap ${sh(peerDht)}` : ''}${msbDht ? ` --msb-dht-bootstrap ${sh(msbDht)}` : ''}`,
   ];
 
-  const adminTxs = [];
-  const providerTxs = [];
+  const adminSetupTxs = [];
+  const providerRegistrationTxs = [];
+  const adminPayoutTxs = [];
+  const providerJoinTxs = [];
   for (const enclave of manifest.canonical_enclaves || []) {
-    adminTxs.push(txCommand({
+    adminSetupTxs.push(txCommand({
       op: 'set_model_ref',
       model_id: enclave.model_id,
       price_ref_mu: enclave.model_ref_mu,
     }));
-    adminTxs.push(txCommand({
+    adminSetupTxs.push(txCommand({
       op: 'register_enclave',
       enclave_id: enclave.enclave_id,
       model_id: enclave.model_id,
@@ -496,7 +498,7 @@ async function buildCommands(manifest) {
       binary_hash: enclave.binary_hash,
       caps: enclave.caps,
     }));
-    adminTxs.push(txCommand({
+    adminSetupTxs.push(txCommand({
       op: 'set_price',
       enclave_id: enclave.enclave_id,
       in_per_1k_mu: enclave.price_mu?.in_per_1k,
@@ -507,8 +509,8 @@ async function buildCommands(manifest) {
     }));
     for (const room of enclave.rooms || []) {
       const derivedRoom = roomByLabel.get(room.label);
-      if (derivedRoom?.room_id) adminTxs.push(`# room ${room.label} => ${derivedRoom.room_id}`);
-      adminTxs.push(txCommand({
+      if (derivedRoom?.room_id) adminSetupTxs.push(`# room ${room.label} => ${derivedRoom.room_id}`);
+      adminSetupTxs.push(txCommand({
         op: 'open_room',
         enclave_id: enclave.enclave_id,
         model_id: enclave.model_id,
@@ -520,19 +522,20 @@ async function buildCommands(manifest) {
   }
 
   for (const provider of manifest.seed_providers || []) {
-    adminTxs.push(txCommand({
+    providerRegistrationTxs.push(`# provider ${provider.provider_pubkey}`);
+    providerRegistrationTxs.push(txCommand({ op: 'register_provider' }));
+    adminPayoutTxs.push(txCommand({
       op: 'set_provider_payout',
       provider: provider.provider_pubkey,
       payout_addr: provider.payout?.addr,
       payout_method: provider.payout?.method,
     }));
-    providerTxs.push(`# provider ${provider.provider_pubkey}`);
-    providerTxs.push(txCommand({ op: 'register_provider' }));
     for (const join of provider.joins || []) {
-      providerTxs.push(txCommand({ op: 'join_enclave', enclave_id: join.enclave_id }));
+      providerJoinTxs.push(`# provider ${provider.provider_pubkey}`);
+      providerJoinTxs.push(txCommand({ op: 'join_enclave', enclave_id: join.enclave_id }));
       for (const roomRef of join.rooms || []) {
         const room = roomByLabel.get(roomRef);
-        providerTxs.push(txCommand({
+        providerJoinTxs.push(txCommand({
           op: 'join_room',
           room_id: room?.room_id || `<room_id returned by open_room for ${roomRef}>`,
           enclave_id: join.enclave_id,
@@ -549,8 +552,24 @@ async function buildCommands(manifest) {
 
   return {
     boot,
-    adminTxs,
-    providerTxs,
+    adminTxs: adminSetupTxs,
+    providerTxs: [...providerRegistrationTxs, ...providerJoinTxs],
+    adminSetupTxs,
+    providerRegistrationTxs,
+    adminPayoutTxs,
+    providerJoinTxs,
+    allTxs: [
+      ...adminSetupTxs,
+      ...providerRegistrationTxs,
+      ...adminPayoutTxs,
+      ...providerJoinTxs,
+    ],
+    orderedTxs: [
+      { label: 'admin canonical setup commands', commands: adminSetupTxs },
+      { label: 'provider registration commands', commands: providerRegistrationTxs },
+      { label: 'admin provider payout commands', commands: adminPayoutTxs },
+      { label: 'provider enclave and room join commands', commands: providerJoinTxs },
+    ],
     paygateHealthUrl,
     checkoutCommands,
     emergencyBan: txCommand({
@@ -576,13 +595,11 @@ function printHuman(report, commands, { args }) {
   console.log('Copy/paste admin bootstrap command:');
   for (const line of commands.boot) console.log(line);
 
-  console.log('');
-  console.log('Copy/paste admin contract commands:');
-  for (const command of commands.adminTxs) console.log(command);
-
-  console.log('');
-  console.log('Copy/paste provider opt-in commands:');
-  for (const command of commands.providerTxs) console.log(command);
+  for (const step of commands.orderedTxs || []) {
+    console.log('');
+    console.log(`Copy/paste ${step.label}:`);
+    for (const command of step.commands) console.log(command);
+  }
 
   if (commands.paygateHealthUrl) {
     console.log('');
