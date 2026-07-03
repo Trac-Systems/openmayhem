@@ -266,6 +266,9 @@ impl ProviderTable {
     }
 
     pub fn upsert_contract(&mut self, record: ContractProviderSnapshot) {
+        if !canonical_room_id(&record.room_id) {
+            return;
+        }
         let key = ProviderKey::from_contract(&record);
         if let Some(head) = record.attestation_head.clone() {
             self.upsert_attestation_head(&record.provider, &record.enclave_id, head, 0, 0);
@@ -601,6 +604,10 @@ fn probation_weight_multiplier(entry: &ProviderTableEntry) -> f64 {
         .as_ref()
         .map(ProviderProbation::weight_multiplier)
         .unwrap_or(1.0)
+}
+
+fn canonical_room_id(value: &str) -> bool {
+    value.len() == 32 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -962,6 +969,18 @@ mod tests {
         table.upsert_heartbeat(heartbeat(1_000_000, 7, "11"), 1_000_000);
 
         assert_eq!(table.heartbeat_len(), 1);
+        assert!(table.entries(1_000_500).is_empty());
+    }
+
+    #[test]
+    fn provider_table_ignores_noncanonical_contract_room_ids() {
+        let mut table = ProviderTable::new();
+        let mut record = contract_record();
+        record.room_id = "provider-local-only".to_owned();
+
+        table.upsert_contract(record);
+
+        assert_eq!(table.contract_len(), 0);
         assert!(table.entries(1_000_500).is_empty());
     }
 

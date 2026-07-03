@@ -367,6 +367,27 @@ async fn chat_completion_can_use_direct_session_backend() {
 }
 
 #[tokio::test]
+async fn contract_model_with_noncanonical_route_is_unavailable() {
+    let mut model = routed_test_model();
+    model.mayhem.route_candidates[0].room_id = "provider-local-only".to_owned();
+    let state = GatewayState::from_models(vec![model])
+        .with_session_backend(Arc::new(TestDirectSessionBackend));
+    let app = openai_router(state);
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "This should not route." }]
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("not available"));
+}
+
+#[tokio::test]
 async fn chat_completion_retries_retryable_direct_session_route_before_metering() {
     let first_provider = "55".repeat(32);
     let second_provider = "66".repeat(32);
@@ -514,10 +535,11 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
 
 fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
     let identity = routed_test_identity();
+    let room_id = format!("{:02x}", idx + 160).repeat(16);
     GatewayRouteCandidate {
         provider: provider.to_owned(),
         enclave_id: catalog_enclave_id(&identity),
-        room_id: format!("room-{idx}"),
+        room_id,
         price_ver: 7,
         att_tier: 1,
         admin_pubkey: identity.admin_pubkey,

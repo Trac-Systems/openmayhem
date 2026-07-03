@@ -350,6 +350,7 @@ impl GatewayState {
     }
 
     fn with_models(models: Vec<GatewayModel>) -> Self {
+        let models = sanitize_gateway_models(models);
         Self {
             models: Arc::new(models),
             receipts: Arc::new(Mutex::new(Vec::new())),
@@ -565,6 +566,48 @@ struct ExpectedProviderReceipt<'a> {
     usage: ReceiptUsage,
     mu_owed_cum: u64,
     prompt_hash: String,
+}
+
+fn sanitize_gateway_models(models: Vec<GatewayModel>) -> Vec<GatewayModel> {
+    models
+        .into_iter()
+        .filter_map(|mut model| {
+            model
+                .mayhem
+                .route_candidates
+                .retain(canonical_route_candidate);
+            if !model.mayhem.route_candidates.is_empty() {
+                let providers = model
+                    .mayhem
+                    .route_candidates
+                    .iter()
+                    .map(|candidate| candidate.provider.as_str())
+                    .collect::<BTreeSet<_>>();
+                let rooms = model
+                    .mayhem
+                    .route_candidates
+                    .iter()
+                    .map(|candidate| candidate.room_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                model.mayhem.providers_online = providers.len().min(u32::MAX as usize) as u32;
+                model.mayhem.rooms = rooms.len().min(u32::MAX as usize) as u32;
+            }
+            if model.mayhem.source == "contract" && model.mayhem.route_candidates.is_empty() {
+                return None;
+            }
+            Some(model)
+        })
+        .collect()
+}
+
+fn canonical_route_candidate(candidate: &GatewayRouteCandidate) -> bool {
+    is_hex_len(&candidate.provider, 64)
+        && is_hex_len(&candidate.enclave_id, 64)
+        && is_hex_len(&candidate.room_id, 32)
+        && is_hex_len(&candidate.admin_pubkey, 64)
+        && is_hex_len(&candidate.artifact_root, 64)
+        && is_hex_len(&candidate.manifest_hash, 64)
+        && is_hex_len(&candidate.binary_hash, 64)
 }
 
 impl GatewaySessionError {
@@ -2119,6 +2162,10 @@ fn enclave_id_for_model(model_id: &str) -> String {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn is_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
 fn sign_hex(seed: &[u8; 32], payload: &[u8]) -> String {
