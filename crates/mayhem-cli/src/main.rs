@@ -5635,6 +5635,8 @@ struct LedgerEnclave {
     caps: Value,
     status: String,
     created_by: String,
+    #[serde(default)]
+    created_by_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5647,6 +5649,8 @@ struct LedgerRoom {
     #[serde(default)]
     label: String,
     status: String,
+    #[serde(default)]
+    creator_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5692,6 +5696,8 @@ struct LedgerPriceRecord {
     per_req_mu: u64,
     min_session_mu: u64,
     effective_at: u64,
+    #[serde(default)]
+    set_by_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -6452,6 +6458,8 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
     if room.status != "open" {
         bail!("room {} is not open", room.room_id);
     }
+    require_admin_role_marker("room.creator_role", room.creator_role.as_deref())
+        .with_context(|| format!("room {} is not admin-created", room.room_id))?;
     if !room_matches_enclave(room, enclave) {
         bail!(
             "room {} is for model {} / enclave {}, not model {} / enclave {}",
@@ -6562,11 +6570,20 @@ fn resolve_provider_lifecycle_enclave(
         .iter()
         .find(|enclave| enclave.enclave_id == requested && enclave.status == "active")
     {
+        require_admin_role_marker(
+            "enclave.created_by_role",
+            enclave.created_by_role.as_deref(),
+        )
+        .with_context(|| format!("enclave {} is not admin-created", enclave.enclave_id))?;
         return Ok(enclave.clone());
     }
     let mut matches = enclaves
         .iter()
-        .filter(|enclave| enclave.model_id == requested && enclave.status == "active")
+        .filter(|enclave| {
+            enclave.model_id == requested
+                && enclave.status == "active"
+                && admin_role_marker_ok(enclave.created_by_role.as_deref())
+        })
         .cloned()
         .collect::<Vec<_>>();
     matches.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
@@ -6583,7 +6600,27 @@ fn resolve_provider_lifecycle_enclave(
 
 fn current_mu_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRecord> {
     let current = schedule.current.as_ref()?;
-    (schedule.denom == "mu_usd" && current.denom == "mu_usd").then_some(current)
+    (schedule.denom == "mu_usd"
+        && current.denom == "mu_usd"
+        && admin_role_marker_ok(current.set_by_role.as_deref()))
+    .then_some(current)
+}
+
+fn admin_role_marker_ok(role: Option<&str>) -> bool {
+    match role {
+        Some(role) => role == "admin",
+        None => true,
+    }
+}
+
+fn require_admin_role_marker(field: &str, role: Option<&str>) -> Result<()> {
+    if admin_role_marker_ok(role) {
+        return Ok(());
+    }
+    bail!(
+        "{field} must be admin when present; got {}",
+        role.unwrap_or("<missing>")
+    )
 }
 
 fn require_current_mu_usd_price<'a>(
@@ -6939,13 +6976,15 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
     let active_enclaves = contract
         .enclaves
         .iter()
-        .filter(|enclave| enclave.status == "active")
+        .filter(|enclave| {
+            enclave.status == "active" && admin_role_marker_ok(enclave.created_by_role.as_deref())
+        })
         .map(|enclave| (enclave.enclave_id.clone(), enclave))
         .collect::<BTreeMap<_, _>>();
     let open_rooms = contract
         .rooms
         .iter()
-        .filter(|room| room.status == "open")
+        .filter(|room| room.status == "open" && admin_role_marker_ok(room.creator_role.as_deref()))
         .collect::<Vec<_>>();
     let active_providers = contract
         .providers
@@ -6963,15 +7002,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
 
     let mut prices_by_enclave = BTreeMap::new();
     for schedule in &contract.prices {
-        let Some(price) = schedule.current.as_ref() else {
+        let Some(price) = current_mu_usd_price(schedule) else {
             continue;
         };
-        if schedule.denom != "mu_usd" || price.denom != "mu_usd" {
-            bail!(
-                "price schedule for enclave {} uses unsupported denomination",
-                schedule.enclave_id
-            );
-        }
         prices_by_enclave.insert(schedule.enclave_id.clone(), price.clone());
     }
 
@@ -7203,11 +7236,9 @@ fn build_provider_candidates(
 ) -> Result<Vec<ProviderCandidate>> {
     let requested_backend = requested_backend(args, hardware)?;
     let mut candidates = Vec::new();
-    for enclave in contract
-        .enclaves
-        .iter()
-        .filter(|enclave| enclave.status == "active")
-    {
+    for enclave in contract.enclaves.iter().filter(|enclave| {
+        enclave.status == "active" && admin_role_marker_ok(enclave.created_by_role.as_deref())
+    }) {
         if let Some(requested) = &requested_backend {
             if &enclave.backend != requested {
                 continue;
@@ -7352,7 +7383,11 @@ fn select_provider_rooms(
     if requested.trim().eq_ignore_ascii_case("auto") {
         let mut selected = rooms
             .iter()
-            .filter(|room| room.status == "open" && room_matches_enclave(room, enclave))
+            .filter(|room| {
+                room.status == "open"
+                    && admin_role_marker_ok(room.creator_role.as_deref())
+                    && room_matches_enclave(room, enclave)
+            })
             .cloned()
             .collect::<Vec<_>>();
         selected.sort_by(|a, b| a.room_id.cmp(&b.room_id));
@@ -7376,6 +7411,8 @@ fn select_provider_rooms(
         if room.status != "open" {
             bail!("room {room_id} is not open");
         }
+        require_admin_role_marker("room.creator_role", room.creator_role.as_deref())
+            .with_context(|| format!("room {room_id} is not admin-created"))?;
         if !room_matches_enclave(room, enclave) {
             bail!(
                 "room {room_id} is for model {} / enclave {}, not model {} / enclave {}",
@@ -10218,6 +10255,7 @@ mod tests {
             caps: json!({}),
             status: "active".to_owned(),
             created_by: "admin".to_owned(),
+            created_by_role: Some("admin".to_owned()),
         });
         let err =
             resolve_provider_lifecycle_enclave(&contract.enclaves, "test/model@4bit").unwrap_err();
@@ -10227,6 +10265,25 @@ mod tests {
         let resolved =
             resolve_provider_lifecycle_enclave(&contract.enclaves, &"22".repeat(32)).unwrap();
         assert_eq!(resolved.enclave_id, "22".repeat(32));
+
+        let mut legacy = test_contract(&"aa".repeat(32));
+        legacy.enclaves[0].created_by_role = None;
+        assert!(resolve_provider_lifecycle_enclave(&legacy.enclaves, "test/model@4bit").is_ok());
+
+        let mut provider_created = test_contract(&"aa".repeat(32));
+        provider_created.enclaves[0].created_by_role = Some("provider".to_owned());
+        let by_id = resolve_provider_lifecycle_enclave(
+            &provider_created.enclaves,
+            &provider_created.enclaves[0].enclave_id,
+        )
+        .unwrap_err();
+        assert!(format!("{by_id:#}").contains("created_by_role"));
+        let by_model =
+            resolve_provider_lifecycle_enclave(&provider_created.enclaves, "test/model@4bit")
+                .unwrap_err();
+        assert!(by_model
+            .to_string()
+            .contains("not an active admin-created enclave"));
     }
 
     #[test]
@@ -10263,6 +10320,7 @@ mod tests {
             caps: json!({}),
             status: "retired".to_owned(),
             created_by: "admin".to_owned(),
+            created_by_role: Some("admin".to_owned()),
         });
         let mut ambiguous_serves = serves;
         ambiguous_serves.push(LedgerServe {
@@ -10474,6 +10532,28 @@ mod tests {
         let err = build_provider_candidates(&wrong_denom, &catalog, &hardware, &args).unwrap_err();
         assert!(err.to_string().contains("current mu_usd admin price"));
 
+        let mut provider_created = contract.clone();
+        provider_created.enclaves[0].created_by_role = Some("provider".to_owned());
+        let err =
+            build_provider_candidates(&provider_created, &catalog, &hardware, &args).unwrap_err();
+        assert!(err.to_string().contains("current mu_usd admin price"));
+
+        let mut provider_priced = contract.clone();
+        provider_priced.prices[0]
+            .current
+            .as_mut()
+            .unwrap()
+            .set_by_role = Some("provider".to_owned());
+        let err =
+            build_provider_candidates(&provider_priced, &catalog, &hardware, &args).unwrap_err();
+        assert!(err.to_string().contains("current mu_usd admin price"));
+
+        let mut legacy = contract.clone();
+        legacy.enclaves[0].created_by_role = None;
+        legacy.rooms[0].creator_role = None;
+        legacy.prices[0].current.as_mut().unwrap().set_by_role = None;
+        assert!(build_provider_candidates(&legacy, &catalog, &hardware, &args).is_ok());
+
         let mut mismatched = contract;
         mismatched.enclaves[0].artifact_root = "bb".repeat(32);
         assert!(build_provider_candidates(&mismatched, &catalog, &hardware, &args).is_err());
@@ -10538,6 +10618,37 @@ mod tests {
         contract.providers[0].status = "banned".to_owned();
         let err =
             gateway_models_from_contract(&contract).expect_err("banned provider should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut legacy = test_contract(&root);
+        legacy.enclaves[0].created_by_role = None;
+        legacy.rooms[0].creator_role = None;
+        legacy.prices[0].current.as_mut().unwrap().set_by_role = None;
+        assert!(
+            gateway_models_from_contract(&legacy).is_ok(),
+            "missing legacy role markers should remain forward-compatible"
+        );
+
+        let mut provider_created = test_contract(&root);
+        provider_created.enclaves[0].created_by_role = Some("provider".to_owned());
+        let err = gateway_models_from_contract(&provider_created)
+            .expect_err("provider-created enclave marker should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut provider_room = test_contract(&root);
+        provider_room.rooms[0].creator_role = Some("provider".to_owned());
+        let err = gateway_models_from_contract(&provider_room)
+            .expect_err("provider-created room marker should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+
+        let mut provider_priced = test_contract(&root);
+        provider_priced.prices[0]
+            .current
+            .as_mut()
+            .unwrap()
+            .set_by_role = Some("provider".to_owned());
+        let err = gateway_models_from_contract(&provider_priced)
+            .expect_err("provider-priced record marker should hide model");
         assert!(format!("{err:#}").contains("no canonical contract-backed models"));
 
         let mut wrong_same_model_enclave = test_contract(&root);
@@ -11082,6 +11193,16 @@ mod tests {
             model_id: enclave.model_id.clone(),
             label: "other-enclave".to_owned(),
             status: "open".to_owned(),
+            creator_role: Some("admin".to_owned()),
+        });
+        canonical_rooms.push(LedgerRoom {
+            room_id: "room-provider-created".to_owned(),
+            sidechannel: "mx/room/room-provider-created".to_owned(),
+            enclave_id: Some(enclave.enclave_id.clone()),
+            model_id: enclave.model_id.clone(),
+            label: "provider-created".to_owned(),
+            status: "open".to_owned(),
+            creator_role: Some("provider".to_owned()),
         });
         let rooms = select_provider_rooms(&canonical_rooms, enclave, "auto").unwrap();
 
@@ -11092,6 +11213,9 @@ mod tests {
             select_provider_rooms(&canonical_rooms, enclave, "room-same-model-other-enclave")
                 .is_err()
         );
+        let err =
+            select_provider_rooms(&canonical_rooms, enclave, "room-provider-created").unwrap_err();
+        assert!(format!("{err:#}").contains("creator_role"));
     }
 
     #[test]
@@ -12088,6 +12212,7 @@ mod tests {
             caps: json!({ "tools": true, "json": true, "ctx": 8192 }),
             status: "active".to_owned(),
             created_by: "44".repeat(32),
+            created_by_role: Some("admin".to_owned()),
         };
         ContractCatalog {
             enclaves: vec![enclave],
@@ -12099,6 +12224,7 @@ mod tests {
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
                     status: "open".to_owned(),
+                    creator_role: Some("admin".to_owned()),
                 },
                 LedgerRoom {
                     room_id: "room-closed".to_owned(),
@@ -12107,6 +12233,7 @@ mod tests {
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
                     status: "closed".to_owned(),
+                    creator_role: Some("admin".to_owned()),
                 },
                 LedgerRoom {
                     room_id: "room-other".to_owned(),
@@ -12115,6 +12242,7 @@ mod tests {
                     model_id: "other/model".to_owned(),
                     label: "test".to_owned(),
                     status: "open".to_owned(),
+                    creator_role: Some("admin".to_owned()),
                 },
             ],
             roomserve: vec![LedgerRoomServe {
@@ -12147,6 +12275,7 @@ mod tests {
                     per_req_mu: 0,
                     min_session_mu: 0,
                     effective_at: 0,
+                    set_by_role: Some("admin".to_owned()),
                 }),
                 pending: None,
             }],
