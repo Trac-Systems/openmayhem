@@ -42,7 +42,14 @@ async fn health_reports_oracle_public_key_and_redacts_seed() {
     assert_eq!(body["rails"]["coinbase"]["enabled"], false);
     assert_eq!(body["controls"]["admin_controls_economy"], true);
     assert_eq!(body["controls"]["admin_sets_terms"], true);
+    assert_eq!(body["controls"]["admin_sets_prices"], true);
+    assert_eq!(body["controls"]["admin_sets_rules"], true);
+    assert_eq!(body["controls"]["admin_sets_params"], true);
+    assert_eq!(body["controls"]["admin_sets_provider_payout_targets"], true);
+    assert_eq!(body["controls"]["admin_can_ban_providers"], true);
     assert_eq!(body["controls"]["providers_set_prices"], false);
+    assert_eq!(body["controls"]["providers_set_rules"], false);
+    assert_eq!(body["controls"]["providers_set_params"], false);
     assert_eq!(body["controls"]["providers_set_payout_terms"], false);
     assert_eq!(body["controls"]["providers_submit_models"], false);
     assert_eq!(body["controls"]["providers_create_canonical_rooms"], false);
