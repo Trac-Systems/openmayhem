@@ -112,6 +112,41 @@ const fiatPayoutConfirm = (provider, rail, externalRef, overrides = {}) => ({
   ...overrides,
 });
 
+test('MayhemContract setProviderPayout stamps admin authority evidence', async () => {
+  const { admin, provider, storage, contract } = await setupPayoutContract();
+  const registered = (await storage.get(`prov/${provider.publicKey}`)).value;
+  assert.deepEqual(registered.payout, {
+    addr: 'trac1providerpayouttarget',
+    method: 'tnk',
+    set_by: admin.publicKey,
+    set_by_role: 'admin',
+    set_at: makeTxKey(4),
+  });
+
+  const retargeted = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'acct_test_provider',
+      payout_method: 'stripe',
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(retargeted.ok, true, retargeted.message);
+  const updated = (await storage.get(`prov/${provider.publicKey}`)).value;
+  assert.deepEqual(updated.payout, {
+    addr: 'acct_test_provider',
+    method: 'stripe',
+    set_by: admin.publicKey,
+    set_by_role: 'admin',
+    set_at: makeTxKey(6),
+  });
+});
+
 test('MayhemContract payoutConfirm releases earnings only after challenge plus holdback lock', async () => {
   const { admin, provider, user, storage, contract } = await setupPayoutContract();
 

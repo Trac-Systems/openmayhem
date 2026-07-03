@@ -303,6 +303,8 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     }
     if (payout.set_by !== admin) {
       fail(`prov/${providerId}.payout was not set by admin ${admin}`);
+    } else if (payout.set_by_role !== 'admin') {
+      fail(`prov/${providerId}.payout.set_by_role must be admin`);
     } else {
       adminSetPayoutTargets += 1;
     }

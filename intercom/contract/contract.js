@@ -777,6 +777,7 @@ class MayhemContract extends Contract {
         addr: this.value.payout_addr,
         method: this.value.payout_method,
         set_by: this.address,
+        set_by_role: 'admin',
         set_at: this.tx,
       },
       updated_at: this.tx,

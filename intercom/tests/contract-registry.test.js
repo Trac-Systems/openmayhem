@@ -533,6 +533,7 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
     addr: 'admin-approved-target',
     method: 'tnk',
     set_by: admin.publicKey,
+    set_by_role: 'admin',
     set_at: makeTxKey(7),
   });
   assert.equal(updated.value.updated_at, makeTxKey(7));
