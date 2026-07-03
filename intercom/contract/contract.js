@@ -714,6 +714,11 @@ class MayhemContract extends Contract {
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
 
+    const auditor = await this.get(`auditor/${this.address}`);
+    if (auditor?.status === 'active') {
+      return new Error('Auditor keys cannot register as providers.');
+    }
+
     const key = `prov/${this.address}`;
     if ((await this.get(key)) !== null) return new Error('Provider already registered.');
 
@@ -1331,6 +1336,9 @@ class MayhemContract extends Contract {
     const consentError = await this.requireConsent(target);
     if (consentError) return consentError;
 
+    const provider = await this.get(`prov/${target}`);
+    if (provider) return new Error('Provider keys cannot register as auditors.');
+
     const adminRegistersOther = target !== this.address;
     if (adminRegistersOther) {
       const adminError = await this.requireAdmin();
@@ -1366,6 +1374,9 @@ class MayhemContract extends Contract {
   async probeResult() {
     const auditor = await this.get(`auditor/${this.address}`);
     if (!auditor || auditor.status !== 'active') return new Error('Auditor registration required.');
+    if ((await this.get(`prov/${this.address}`)) !== null) {
+      return new Error('Provider keys cannot submit auditor probes.');
+    }
 
     const validationError = this.validateProbeResult(this.value);
     if (validationError) return validationError;

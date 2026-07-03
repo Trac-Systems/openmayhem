@@ -23,7 +23,8 @@ traffic, but they do not define canonical economic or catalog terms.
 - Users may use canonical rooms and enclaves under the prices and policies
   recorded in the contract.
 - Auditors may test service quality and evidence consistency only through the
-  auditor process defined by the contract and these rules.
+  auditor process defined by the contract and these rules. Provider keys may
+  not act as auditor keys.
 - Any Intercom room, sidechannel, price, model, or offer that is not backed by
   canonical contract state is informational only and must be ignored by routers,
   users, and settlement logic.
@@ -150,7 +151,8 @@ Auditors must act as neutral testers. They may run canaries, uptime checks,
 attestation checks, receipt recomputation, and evidence-root validation. Auditors
 must not induce users or providers to violate these rules, leak private session
 content, submit fabricated probe results, or use audit access for competitive or
-personal advantage.
+personal advantage. A key registered as a provider must not register as an
+auditor or submit auditor probes.
 
 Audit findings must reference canonical contract state and verifiable evidence.
 Auditors who submit false or reckless findings may lose auditor eligibility and

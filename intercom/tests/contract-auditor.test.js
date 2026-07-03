@@ -213,6 +213,82 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
   assert.equal(updatedAuditor.value.successful_probes, 2);
 });
 
+test('MayhemContract keeps provider and auditor keys separate', async () => {
+  const { admin, provider, auditor, storage, contract } = await setupAuditorContract();
+
+  const providerSelfAuditor = await execute(
+    contract,
+    storage,
+    'auditorRegister',
+    {
+      op: 'auditor_register',
+      registered_at_seconds: 31 * 24 * 60 * 60,
+    },
+    provider.publicKey,
+    5
+  );
+  assert.match(providerSelfAuditor.message, /provider keys cannot register as auditors/i);
+
+  const adminAccreditsProvider = await execute(
+    contract,
+    storage,
+    'auditorRegister',
+    {
+      op: 'auditor_register',
+      auditor: provider.publicKey,
+      registered_at_seconds: 0,
+    },
+    admin.publicKey,
+    6
+  );
+  assert.match(adminAccreditsProvider.message, /provider keys cannot register as auditors/i);
+
+  const registeredAuditor = await execute(
+    contract,
+    storage,
+    'auditorRegister',
+    {
+      op: 'auditor_register',
+      auditor: auditor.publicKey,
+      registered_at_seconds: 0,
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(registeredAuditor.ok, true, registeredAuditor.message);
+
+  const auditorAsProvider = await execute(
+    contract,
+    storage,
+    'registerProvider',
+    providerRegistration,
+    auditor.publicKey,
+    8
+  );
+  assert.match(auditorAsProvider.message, /auditor keys cannot register as providers/i);
+
+  await storage.put(`auditor/${provider.publicKey}`, {
+    auditor: provider.publicKey,
+    status: 'active',
+    registered_at: makeTxKey(9),
+    registered_at_seconds: 0,
+    accredited_by: admin.publicKey,
+    successful_probes: 0,
+    submitted_probes: 0,
+    false_reports: 0,
+    updated_at: makeTxKey(9),
+  });
+  const providerProbe = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider),
+    provider.publicKey,
+    9
+  );
+  assert.match(providerProbe.message, /provider keys cannot submit auditor probes/i);
+});
+
 test('MayhemContract auditor probe log replays deterministically', async () => {
   const first = await setupAuditorContract();
   const second = {
