@@ -5572,6 +5572,8 @@ struct ProviderSessionContext<'a> {
 struct ProviderSessionRuntime<'a> {
     rpc: &'a PeerRpcClient,
     rooms: &'a [LedgerRoom],
+    keypair_path: &'a Path,
+    password: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -5959,6 +5961,8 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             ProviderSessionRuntime {
                 rpc: &rpc,
                 rooms: &rooms,
+                keypair_path: &keypair_path,
+                password: &password,
             },
             responder,
         )
@@ -7666,28 +7670,34 @@ async fn handle_provider_session_frame(
                             session_id: session_id.clone(),
                         },
                     );
+                    let ts = unix_epoch_millis()?;
+                    let mut accept_frame = json!({
+                        "t": "s.accept",
+                        "v": 1,
+                        "session_id": session_id,
+                        "att_report": attestation.report,
+                        "engine": {
+                            "ctx": terms.ctx,
+                            "mode": "provider-session-server-v1",
+                        },
+                        "ts": ts,
+                        "nonce": stable_value_hash(&json!({
+                            "session_id": frame.get("session_id"),
+                            "provider": terms.provider,
+                            "kind": "accept",
+                            "ts": ts,
+                        })),
+                    });
+                    let accept_sig = sign_message(
+                        runtime.keypair_path,
+                        runtime.password,
+                        &provider_session_accept_signing_payload(&accept_frame),
+                    )
+                    .await
+                    .context("signing s.accept")?;
+                    accept_frame["sig"] = json!(accept_sig);
                     bridge
-                        .session_send(
-                            &remote,
-                            &session_id,
-                            json!({
-                                "t": "s.accept",
-                                "v": 1,
-                                "session_id": session_id,
-                                "att_report": attestation.report,
-                                "engine": {
-                                    "ctx": terms.ctx,
-                                    "mode": "provider-session-server-v1",
-                                },
-                                "ts": unix_epoch_millis()?,
-                                "nonce": stable_value_hash(&json!({
-                                    "session_id": frame.get("session_id"),
-                                    "provider": terms.provider,
-                                    "kind": "accept",
-                                })),
-                                "sig": attestation.report.sig_provider,
-                            }),
-                        )
+                        .session_send(&remote, &session_id, accept_frame)
                         .await
                         .context("sending s.accept")?;
                 }
@@ -8047,6 +8057,18 @@ fn provider_session_contract_decision(
         );
     }
     ProviderSessionDecision::Accept
+}
+
+fn provider_session_accept_signing_payload(frame: &Value) -> String {
+    let mut unsigned = frame.clone();
+    if let Some(object) = unsigned.as_object_mut() {
+        object.remove("sig");
+    }
+    stable_json_value(&json!({
+        "domain": "mayhem/session-accept/v1",
+        "body": unsigned,
+    }))
+    .to_string()
 }
 
 fn provider_session_open_decision(
@@ -10014,6 +10036,30 @@ mod tests {
             provider_session_contract_decision(&tombstoned_serve, &terms, &startup_rooms),
             ProviderSessionDecision::Reject { code: "SERVE", .. }
         ));
+    }
+
+    #[test]
+    fn provider_session_accept_signing_payload_is_bound_and_sig_excluded() {
+        let mut frame = json!({
+            "t": "s.accept",
+            "v": 1,
+            "session_id": "aa".repeat(32),
+            "att_report": {
+                "enclave_id": "11".repeat(32),
+                "provider_pubkey": "55".repeat(32),
+                "sig_provider": "66".repeat(64),
+            },
+            "engine": { "ctx": 8192 },
+            "ts": 123,
+            "nonce": "77".repeat(32),
+        });
+        let payload = provider_session_accept_signing_payload(&frame);
+
+        frame["sig"] = json!("88".repeat(64));
+        assert_eq!(provider_session_accept_signing_payload(&frame), payload);
+
+        frame["session_id"] = json!("bb".repeat(32));
+        assert_ne!(provider_session_accept_signing_payload(&frame), payload);
     }
 
     #[test]

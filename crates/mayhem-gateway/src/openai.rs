@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
@@ -718,27 +718,80 @@ fn validate_direct_session_accept(
             invocation.enclave_id
         )));
     }
+    let top_sig = frame
+        .get("sig")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("provider accept missing sig".to_owned()))?;
+    report
+        .get("sig_provider")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("provider accept att_report missing sig_provider".to_owned()))?;
     if let Some(provider) = invocation.provider_pubkey.as_deref() {
         if report.get("provider_pubkey").and_then(Value::as_str) != Some(provider) {
             return Err(fail(format!(
                 "provider accept att_report provider_pubkey did not match {provider}"
             )));
         }
-    }
-    let top_sig = frame
-        .get("sig")
-        .and_then(Value::as_str)
-        .ok_or_else(|| fail("provider accept missing sig".to_owned()))?;
-    let report_sig = report
-        .get("sig_provider")
-        .and_then(Value::as_str)
-        .ok_or_else(|| fail("provider accept att_report missing sig_provider".to_owned()))?;
-    if top_sig != report_sig {
-        return Err(fail(
-            "provider accept sig did not match att_report sig_provider".to_owned(),
-        ));
+        verify_direct_session_accept_signature(frame, provider, top_sig)?;
     }
     Ok(())
+}
+
+fn verify_direct_session_accept_signature(
+    frame: &Value,
+    provider_pubkey: &str,
+    signature_hex: &str,
+) -> Result<(), GatewaySessionError> {
+    let provider_key = decode_hex_array::<32>(provider_pubkey, "provider pubkey")?;
+    let signature = decode_hex_array::<64>(signature_hex, "provider accept sig")?;
+    let verifying_key = VerifyingKey::from_bytes(&provider_key)
+        .map_err(|err| GatewaySessionError::new(format!("invalid provider pubkey: {err}")))?;
+    let signature = Signature::from_bytes(&signature);
+    verifying_key
+        .verify(
+            direct_session_accept_signing_payload(frame).as_bytes(),
+            &signature,
+        )
+        .map_err(|err| GatewaySessionError::new(format!("provider accept signature failed: {err}")))
+}
+
+fn direct_session_accept_signing_payload(frame: &Value) -> String {
+    let mut unsigned = frame.clone();
+    if let Some(object) = unsigned.as_object_mut() {
+        object.remove("sig");
+    }
+    stable_json_value(&json!({
+        "domain": "mayhem/session-accept/v1",
+        "body": unsigned,
+    }))
+    .to_string()
+}
+
+fn stable_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(stable_json_value).collect()),
+        Value::Object(map) => {
+            let mut stable = serde_json::Map::new();
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                stable.insert(key.clone(), stable_json_value(value));
+            }
+            Value::Object(stable)
+        }
+        other => other.clone(),
+    }
+}
+
+fn decode_hex_array<const N: usize>(
+    value: &str,
+    label: &'static str,
+) -> Result<[u8; N], GatewaySessionError> {
+    let bytes = hex::decode(value)
+        .map_err(|err| GatewaySessionError::new(format!("{label} is not hex: {err}")))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        GatewaySessionError::new(format!("{label} must be {N} bytes, got {}", bytes.len()))
+    })
 }
 
 async fn next_session_frame(
@@ -1822,7 +1875,7 @@ mod tests {
 
         let mut wrong_sig = frame;
         wrong_sig["sig"] = json!("ee".repeat(64));
-        assert_accept_err(&wrong_sig, &invocation, "sig_provider");
+        assert_accept_err(&wrong_sig, &invocation, "signature");
     }
 
     fn assert_accept_err(frame: &Value, invocation: &GatewaySessionInvocation, needle: &str) {
@@ -1851,7 +1904,7 @@ mod tests {
         GatewaySessionInvocation {
             session_id,
             user_pubkey: "22".repeat(32),
-            provider_pubkey: Some("33".repeat(32)),
+            provider_pubkey: Some(verifying_key_hex(&test_provider_seed())),
             enclave_id,
             price_ver: 7,
             rules_ver: 3,
@@ -1864,18 +1917,28 @@ mod tests {
 
     fn test_accept_frame(invocation: &GatewaySessionInvocation) -> Value {
         let provider = invocation.provider_pubkey.as_ref().unwrap();
-        let sig = "55".repeat(64);
-        json!({
+        let mut frame = json!({
             "t": "s.accept",
             "v": 1,
             "session_id": invocation.session_id,
             "att_report": {
                 "enclave_id": invocation.enclave_id,
                 "provider_pubkey": provider,
-                "sig_provider": sig,
+                "sig_provider": "55".repeat(64),
             },
             "engine": { "ctx": 8192 },
-            "sig": sig,
-        })
+            "ts": 123,
+            "nonce": "66".repeat(32),
+        });
+        let sig = sign_hex(
+            &test_provider_seed(),
+            direct_session_accept_signing_payload(&frame).as_bytes(),
+        );
+        frame["sig"] = json!(sig);
+        frame
+    }
+
+    fn test_provider_seed() -> [u8; 32] {
+        [7; 32]
     }
 }
