@@ -478,6 +478,8 @@ function collectCanonicalService(args) {
     controls: {
       admin_controls_economy: firstDefined(controls, ['admin_controls_economy']),
       providers_set_prices: firstDefined(controls, ['providers_set_prices']),
+      providers_set_rules: firstDefined(controls, ['providers_set_rules']),
+      providers_set_params: firstDefined(controls, ['providers_set_params']),
       providers_set_payout_terms: firstDefined(controls, ['providers_set_payout_terms']),
       providers_submit_models: firstDefined(controls, ['providers_submit_models']),
       providers_create_canonical_rooms: firstDefined(controls, ['providers_create_canonical_rooms']),

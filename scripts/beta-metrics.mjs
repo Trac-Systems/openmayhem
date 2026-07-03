@@ -321,6 +321,8 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
   if (requireObject(add, metrics.controls, 'controls')) {
     requireBoolean(add, metrics.controls.admin_controls_economy, true, 'controls.admin_controls_economy');
     requireBoolean(add, metrics.controls.providers_set_prices, false, 'controls.providers_set_prices');
+    requireBoolean(add, metrics.controls.providers_set_rules, false, 'controls.providers_set_rules');
+    requireBoolean(add, metrics.controls.providers_set_params, false, 'controls.providers_set_params');
     requireBoolean(add, metrics.controls.providers_set_payout_terms, false, 'controls.providers_set_payout_terms');
     requireBoolean(add, metrics.controls.providers_submit_models, false, 'controls.providers_submit_models');
     requireBoolean(add, metrics.controls.providers_create_canonical_rooms, false, 'controls.providers_create_canonical_rooms');

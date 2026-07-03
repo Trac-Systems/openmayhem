@@ -819,6 +819,8 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
     controls: {
       admin_controls_economy: ok,
       providers_set_prices: false,
+      providers_set_rules: false,
+      providers_set_params: false,
       providers_set_payout_terms: false,
       providers_submit_models: false,
       providers_create_canonical_rooms: false,
