@@ -66,6 +66,7 @@
     "admin_payout_records_verified": true,
     "admin_rules_records_verified": true,
     "admin_params_records_verified": true,
+    "admin_provider_ban_records_verified": true,
     "evidence": [
       "<file:canonical-service-audit.json#sha256:64-hex>"
     ]

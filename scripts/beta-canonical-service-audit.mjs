@@ -466,6 +466,21 @@ function verifyOptionalAdminMutation(record, key, admin, fail, byField, roleFiel
   return ok;
 }
 
+function verifyOptionalProviderBanProvenance(provider, key, admin, fail) {
+  if (provider?.status !== 'banned') return true;
+  let ok = true;
+  if (hasOwn(provider, 'banned_by_role')) {
+    if (provider.banned_by_role !== 'admin') {
+      fail(`${key}.banned_by_role must be admin when present`);
+      ok = false;
+    } else if (provider.banned_by !== admin) {
+      fail(`${key}.banned_by must match current admin ${admin} when banned_by_role is admin`);
+      ok = false;
+    }
+  }
+  return ok;
+}
+
 function priceScheduleRecords(schedule) {
   if (!isRecord(schedule)) return [];
   if (hasOwn(schedule, 'current') || hasOwn(schedule, 'pending')) {
@@ -563,6 +578,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
   const rooms = indexByTail(records, 'room/');
   const prices = indexByTail(records, 'price/');
   const activeProviders = new Map(Array.from(providers.entries()).filter(([, value]) => value?.status === 'active'));
+  const bannedProviders = new Map(Array.from(providers.entries()).filter(([, value]) => value?.status === 'banned'));
   const activeEnclaves = new Map(Array.from(enclaves.entries()).filter(([, value]) => value?.status === 'active'));
   const openRooms = new Map(Array.from(rooms.entries()).filter(([, value]) => value?.status === 'open'));
   const activeServes = entriesByPrefix(records, 'serve/').filter((entry) => entry.value?.status === 'active');
@@ -584,6 +600,13 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
   };
 
   let adminSetPayoutTargets = 0;
+  let providerBanRecordsVerified = true;
+  for (const [providerId, provider] of bannedProviders.entries()) {
+    providerBanRecordsVerified =
+      verifyOptionalProviderBanProvenance(provider, `prov/${providerId}`, admin, fail)
+      && providerBanRecordsVerified;
+  }
+
   for (const [providerId, provider] of activeProviders.entries()) {
     const payout = provider?.payout;
     if (!payout || typeof payout !== 'object' || Array.isArray(payout)) {
@@ -776,6 +799,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
     active_serves: activeServes.length,
     active_room_joins: activeRoomServes.length,
     admin_set_payout_targets: adminSetPayoutTargets,
+    banned_providers: bannedProviders.size,
     catalog_models: catalogProof?.modelIds?.size ?? 0,
     catalog_artifacts: catalogProof?.artifactCount ?? 0,
   };
@@ -809,6 +833,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
       admin_payout_records_verified: ok,
       admin_rules_records_verified: ok && adminRulesRecordsVerified,
       admin_params_records_verified: ok && adminParamsRecordsVerified,
+      admin_provider_ban_records_verified: ok && providerBanRecordsVerified,
       counts,
       evidence: [
         sourceEvidence,

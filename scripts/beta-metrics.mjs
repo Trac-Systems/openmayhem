@@ -401,6 +401,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'canonical_service.admin_params_records_verified',
     );
+    requireBoolean(
+      add,
+      metrics.canonical_service.admin_provider_ban_records_verified,
+      true,
+      'canonical_service.admin_provider_ban_records_verified',
+    );
     validateEvidenceArray(add, metrics.canonical_service.evidence, 'canonical_service.evidence');
   }
 

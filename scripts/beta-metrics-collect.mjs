@@ -470,6 +470,7 @@ function collectCanonicalService(args) {
       admin_payout_records_verified: firstDefined(record, ['admin_payout_records_verified']) === true,
       admin_rules_records_verified: firstDefined(record, ['admin_rules_records_verified']) === true,
       admin_params_records_verified: firstDefined(record, ['admin_params_records_verified']) === true,
+      admin_provider_ban_records_verified: firstDefined(record, ['admin_provider_ban_records_verified']) === true,
       evidence: [
         source.evidence,
         ...asEvidenceArray(value, ['canonical_service.evidence', 'evidence']),
