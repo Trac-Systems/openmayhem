@@ -4505,6 +4505,23 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         );
     }
 
+    let session_responder = if args.serve_sessions {
+        Some(provider_session_responder(&ProviderSessionContext {
+            args: &args,
+            keypair_path: &keypair_path,
+            password: &password,
+            wallet: &wallet,
+            selected: &selected,
+            artifact_path: &artifact_path,
+            rooms: &rooms,
+            attestation: &attestation,
+            attestation_head: &attestation.report_head,
+            rules: &rules,
+        })?)
+    } else {
+        None
+    };
+
     provider_log(&args, "Submitting provider opt-in transactions");
     let provider_tx =
         ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, args.sim).await?;
@@ -4611,19 +4628,22 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         println!("Provider start complete: joined canonical rooms; heartbeat bridge was not used.");
     }
 
-    if args.serve_sessions {
-        serve_provider_sessions(ProviderSessionContext {
-            args: &args,
-            keypair_path: &keypair_path,
-            password: &password,
-            wallet: &wallet,
-            selected: &selected,
-            artifact_path: &artifact_path,
-            rooms: &rooms,
-            attestation: &attestation,
-            attestation_head: &attestation.report_head,
-            rules: &rules,
-        })
+    if let Some(responder) = session_responder {
+        serve_provider_sessions(
+            ProviderSessionContext {
+                args: &args,
+                keypair_path: &keypair_path,
+                password: &password,
+                wallet: &wallet,
+                selected: &selected,
+                artifact_path: &artifact_path,
+                rooms: &rooms,
+                attestation: &attestation,
+                attestation_head: &attestation.report_head,
+                rules: &rules,
+            },
+            responder,
+        )
         .await?;
     }
 
@@ -5606,9 +5626,11 @@ async fn send_provider_heartbeat_round(
     Ok(sent)
 }
 
-async fn serve_provider_sessions(ctx: ProviderSessionContext<'_>) -> Result<()> {
+async fn serve_provider_sessions(
+    ctx: ProviderSessionContext<'_>,
+    mut responder: Box<dyn ProviderSessionResponder>,
+) -> Result<()> {
     let terms = provider_session_terms(&ctx)?;
-    let mut responder = provider_session_responder(&ctx)?;
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
         ctx.args.sc_bridge_url.as_deref(),
@@ -6080,9 +6102,18 @@ fn provider_engine_session_response(
     let output = backend
         .generate(request, &mut sink)
         .context("generating provider session response with mayhem-engine")?;
-    let tool = wants_tool
-        .then(|| provider_engine_tool_call_output(&output.text))
-        .flatten();
+    let tool = if wants_tool {
+        Some(
+            provider_engine_tool_call_output(&output.text).with_context(|| {
+                format!(
+                    "provider engine did not return valid tool-call JSON: {}",
+                    output.text.trim()
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     Ok(ProviderSessionOutput {
         content: if tool.is_some() {
             String::new()
@@ -7040,6 +7071,58 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    struct FakeEngineBackend {
+        output: mayhem_engine::GenerateOutput,
+        last_request: Option<GenerateRequest>,
+    }
+
+    impl FakeEngineBackend {
+        fn new(text: &str) -> Self {
+            Self {
+                output: mayhem_engine::GenerateOutput {
+                    text: text.to_owned(),
+                    usage: mayhem_engine::UsageCounters::new(4, 2),
+                    finish_reason: mayhem_engine::FinishReason::Stop,
+                },
+                last_request: None,
+            }
+        }
+    }
+
+    impl EngineBackend for FakeEngineBackend {
+        fn backend_id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn load(
+            &mut self,
+            config: LoadConfig,
+        ) -> mayhem_engine::Result<mayhem_engine::LoadedModelInfo> {
+            Ok(mayhem_engine::LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact,
+                ctx_size: config.ctx_size,
+                n_ctx_train: config.ctx_size,
+                n_vocab: 0,
+            })
+        }
+
+        fn tokenize(&self, text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+            Ok(mayhem_engine::Tokenization {
+                token_ids: text.bytes().map(i32::from).collect(),
+            })
+        }
+
+        fn generate(
+            &mut self,
+            request: GenerateRequest,
+            _sink: &mut dyn mayhem_engine::TokenSink,
+        ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+            self.last_request = Some(request);
+            Ok(self.output.clone())
+        }
+    }
+
     #[test]
     fn toml_string_escapes_quotes_and_backslashes() {
         assert_eq!(toml_string(r#"a"b\c"#), r#""a\"b\\c""#);
@@ -7255,6 +7338,54 @@ mod tests {
             panic!("expected json schema grammar");
         };
         assert_eq!(schema["required"][0], "ok");
+    }
+
+    #[test]
+    fn provider_engine_session_response_uses_backend_output() {
+        let mut backend = FakeEngineBackend::new("engine says hi");
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 8
+        });
+        let output = provider_engine_session_response(&mut backend, &body).unwrap();
+
+        assert_eq!(output.content, "engine says hi");
+        assert!(output.tool.is_none());
+        assert_eq!(output.finish_reason, "stop");
+        assert_eq!(output.prompt_tokens, 4);
+        assert_eq!(output.completion_tokens, 2);
+        let request = backend.last_request.expect("engine request");
+        assert!(request.prompt.contains("user: hello"));
+        assert_eq!(request.max_new_tokens, 8);
+        assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_session_response_requires_valid_tool_json() {
+        let mut backend = FakeEngineBackend::new("not json");
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "write", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": "auto"
+        });
+        let err = provider_engine_session_response(&mut backend, &body)
+            .expect_err("tool mode requires valid tool-call JSON");
+
+        assert!(
+            format!("{err:#}").contains("provider engine did not return valid tool-call JSON"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            backend
+                .last_request
+                .expect("engine request")
+                .grammar
+                .expect("tool grammar"),
+            GrammarSpec::ToolCall { .. }
+        ));
     }
 
     #[test]
