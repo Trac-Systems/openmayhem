@@ -12,6 +12,7 @@ mayhem test --sync-models
 ```
 
 Providers can only opt into admin-created enclave and room records from the contract ledger. They cannot submit arbitrary models, create canonical rooms, or set pricing.
+To opt out of all active canonical serving rows for the provider wallet, run `mayhem provider stop`.
 
 ## User Quickstart
 

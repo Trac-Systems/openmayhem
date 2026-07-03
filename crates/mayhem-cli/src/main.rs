@@ -123,7 +123,26 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum ProviderCommands {
     /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
-    Start(ProviderStartArgs),
+    Start(Box<ProviderStartArgs>),
+    /// Register if needed, then join an existing admin-created enclave and canonical rooms.
+    Join(ProviderJoinArgs),
+    /// Leave canonical rooms, then leave an existing admin-created enclave.
+    Leave(ProviderLeaveArgs),
+    /// Leave every active canonical room and enclave for this provider wallet.
+    Stop(ProviderStopArgs),
+    /// Join or leave canonical admin-created rooms for a served enclave.
+    Rooms {
+        #[command(subcommand)]
+        command: ProviderRoomsCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderRoomsCommands {
+    /// Join one canonical room with an already-served enclave.
+    Join(ProviderRoomJoinArgs),
+    /// Leave one canonical room.
+    Leave(ProviderRoomLeaveArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1314,6 +1333,95 @@ struct AdminPayoutConfirmArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderTxArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted provider keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Dry-run the provider lifecycle txs through contract simulation.
+    #[arg(long)]
+    sim: bool,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderJoinArgs {
+    #[command(flatten)]
+    tx: ProviderTxArgs,
+
+    /// Admin-created model id or enclave id to join.
+    #[arg(long)]
+    enclave: String,
+
+    /// Canonical room ids to join, comma-separated, or auto for all open admin rooms for the model.
+    #[arg(long, default_value = "auto")]
+    rooms: String,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderLeaveArgs {
+    #[command(flatten)]
+    tx: ProviderTxArgs,
+
+    /// Admin-created model id or enclave id to leave.
+    #[arg(long)]
+    enclave: String,
+
+    /// Canonical room ids to leave, comma-separated, or auto for all active rooms joined by this provider for the enclave.
+    #[arg(long, default_value = "auto")]
+    rooms: String,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderStopArgs {
+    #[command(flatten)]
+    tx: ProviderTxArgs,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderRoomJoinArgs {
+    #[command(flatten)]
+    tx: ProviderTxArgs,
+
+    /// Canonical admin-created room id.
+    #[arg(long)]
+    room: String,
+
+    /// Admin-created enclave id already served by this provider.
+    #[arg(long)]
+    enclave: String,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderRoomLeaveArgs {
+    #[command(flatten)]
+    tx: ProviderTxArgs,
+
+    /// Canonical admin-created room id.
+    #[arg(long)]
+    room: String,
+
+    /// Admin-created enclave id served in the room.
+    #[arg(long)]
+    enclave: String,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderStartArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -1556,7 +1664,14 @@ async fn main() -> Result<()> {
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
         },
         Commands::Provider { command } => match *command {
-            ProviderCommands::Start(args) => provider_start(args).await,
+            ProviderCommands::Start(args) => provider_start(*args).await,
+            ProviderCommands::Join(args) => provider_join(args).await,
+            ProviderCommands::Leave(args) => provider_leave(args).await,
+            ProviderCommands::Stop(args) => provider_stop(args).await,
+            ProviderCommands::Rooms { command } => match command {
+                ProviderRoomsCommands::Join(args) => provider_room_join(args).await,
+                ProviderRoomsCommands::Leave(args) => provider_room_leave(args).await,
+            },
         },
         Commands::Admin { command } => admin(*command).await,
         Commands::Use(args) => use_gateway(args).await,
@@ -5254,6 +5369,16 @@ struct LedgerRoomServe {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerServe {
+    provider: String,
+    enclave_id: String,
+    model_id: String,
+    status: String,
+    #[serde(default)]
+    rooms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LedgerProvider {
     provider: String,
     status: String,
@@ -5808,6 +5933,528 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .await?;
     }
 
+    Ok(())
+}
+
+struct ProviderTxContext {
+    home: PathBuf,
+    rpc_url: String,
+    rpc: PeerRpcClient,
+    wallet: WalletInfo,
+    keypair_path: PathBuf,
+    password: String,
+}
+
+async fn provider_tx_context(args: &ProviderTxArgs) -> Result<ProviderTxContext> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let password = args.wallet_password.clone().unwrap_or_default();
+    let wallet = resolve_cli_wallet(&home, config.as_ref(), &args.peer_store_name, &password)
+        .await
+        .context("resolving provider wallet")?;
+    let keypair_path = PathBuf::from(&wallet.keypair_path);
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    Ok(ProviderTxContext {
+        home,
+        rpc_url,
+        rpc,
+        wallet,
+        keypair_path,
+        password,
+    })
+}
+
+async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
+    let ctx = provider_tx_context(&args.tx).await?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
+    let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
+    let provider_tx = ensure_provider_registered(
+        &ctx.rpc,
+        &ctx.keypair_path,
+        &ctx.password,
+        &ctx.wallet,
+        args.tx.sim,
+    )
+    .await?;
+    let serve_tx = ensure_joined_enclave(
+        &ctx.rpc,
+        &ctx.keypair_path,
+        &ctx.password,
+        &ctx.wallet,
+        &enclave,
+        args.tx.sim,
+    )
+    .await?;
+    let room_txs = ensure_joined_rooms(
+        &ctx.rpc,
+        &ctx.keypair_path,
+        &ctx.password,
+        &ctx.wallet,
+        &enclave,
+        &rooms,
+        args.tx.sim,
+    )
+    .await?;
+    let report = json!({
+        "ok": true,
+        "action": "join",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "provider": ctx.wallet.public_key,
+        "sim": args.tx.sim,
+        "enclave": enclave,
+        "rooms": rooms,
+        "transactions": {
+            "provider": provider_tx,
+            "serve": serve_tx,
+            "rooms": room_txs,
+        },
+    });
+    print_provider_lifecycle_report(&report, args.tx.json)
+}
+
+async fn provider_leave(args: ProviderLeaveArgs) -> Result<()> {
+    let ctx = provider_tx_context(&args.tx).await?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let serves = read_active_provider_serves(&ctx.rpc, &ctx.wallet.public_key).await?;
+    let enclave = resolve_provider_leave_enclave(&contract.enclaves, &serves, &args.enclave)?;
+    let rooms = select_provider_rooms_to_leave(
+        &contract.roomserve,
+        &ctx.wallet.public_key,
+        &enclave.enclave_id,
+        &args.rooms,
+    )?;
+    let room_txs = leave_provider_rooms(&ctx, &enclave.enclave_id, &rooms, args.tx.sim).await?;
+    let serve_tx = ensure_left_enclave(&ctx, &enclave.enclave_id, args.tx.sim).await?;
+    let report = json!({
+        "ok": true,
+        "action": "leave",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "provider": ctx.wallet.public_key,
+        "sim": args.tx.sim,
+        "enclave": enclave,
+        "rooms": rooms,
+        "transactions": {
+            "rooms": room_txs,
+            "serve": serve_tx,
+        },
+    });
+    print_provider_lifecycle_report(&report, args.tx.json)
+}
+
+async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
+    let ctx = provider_tx_context(&args.tx).await?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let mut active_rooms = contract
+        .roomserve
+        .iter()
+        .filter(|room| room.provider == ctx.wallet.public_key && room.status == "active")
+        .cloned()
+        .collect::<Vec<_>>();
+    active_rooms.sort_by(|a, b| {
+        a.enclave_id
+            .cmp(&b.enclave_id)
+            .then_with(|| a.room_id.cmp(&b.room_id))
+    });
+    let mut room_txs = Vec::with_capacity(active_rooms.len());
+    for room in &active_rooms {
+        room_txs.push(
+            ensure_left_room(&ctx, &room.room_id, &room.enclave_id, args.tx.sim)
+                .await
+                .with_context(|| {
+                    format!(
+                        "leaving room {} for enclave {}",
+                        room.room_id, room.enclave_id
+                    )
+                })?,
+        );
+    }
+
+    let serves = read_active_provider_serves(&ctx.rpc, &ctx.wallet.public_key).await?;
+    let mut serve_txs = Vec::with_capacity(serves.len());
+    for serve in &serves {
+        serve_txs.push(
+            ensure_left_enclave(&ctx, &serve.enclave_id, args.tx.sim)
+                .await
+                .with_context(|| format!("leaving enclave {}", serve.enclave_id))?,
+        );
+    }
+    let report = json!({
+        "ok": true,
+        "action": "stop",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "provider": ctx.wallet.public_key,
+        "sim": args.tx.sim,
+        "rooms": active_rooms,
+        "enclaves": serves,
+        "transactions": {
+            "rooms": room_txs,
+            "serves": serve_txs,
+        },
+    });
+    print_provider_lifecycle_report(&report, args.tx.json)
+}
+
+async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
+    let ctx = provider_tx_context(&args.tx).await?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let enclave = contract
+        .enclaves
+        .iter()
+        .find(|enclave| enclave.enclave_id == args.enclave)
+        .with_context(|| format!("enclave {} is not in contract state", args.enclave))?;
+    if enclave.status != "active" {
+        bail!("enclave {} is not active", enclave.enclave_id);
+    }
+    let room = contract
+        .rooms
+        .iter()
+        .find(|room| room.room_id == args.room)
+        .with_context(|| format!("room {} is not in contract state", args.room))?;
+    if room.status != "open" {
+        bail!("room {} is not open", room.room_id);
+    }
+    if room.model_id != enclave.model_id {
+        bail!(
+            "room {} is for model {}, not {}",
+            room.room_id,
+            room.model_id,
+            enclave.model_id
+        );
+    }
+    let serve_key = format!("serve/{}/{}", ctx.wallet.public_key, enclave.enclave_id);
+    let serving = read_state_value(&ctx.rpc, &serve_key).await?;
+    if serving
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        != Some("active")
+    {
+        bail!(
+            "provider {} is not serving enclave {}; run `mayhem provider join --enclave {}` first",
+            ctx.wallet.public_key,
+            enclave.enclave_id,
+            enclave.enclave_id
+        );
+    }
+    let room_txs = ensure_joined_rooms(
+        &ctx.rpc,
+        &ctx.keypair_path,
+        &ctx.password,
+        &ctx.wallet,
+        enclave,
+        std::slice::from_ref(room),
+        args.tx.sim,
+    )
+    .await?;
+    let report = json!({
+        "ok": true,
+        "action": "rooms.join",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "provider": ctx.wallet.public_key,
+        "sim": args.tx.sim,
+        "enclave": enclave,
+        "rooms": [room],
+        "transactions": {
+            "rooms": room_txs,
+        },
+    });
+    print_provider_lifecycle_report(&report, args.tx.json)
+}
+
+async fn provider_room_leave(args: ProviderRoomLeaveArgs) -> Result<()> {
+    let ctx = provider_tx_context(&args.tx).await?;
+    let room_tx = ensure_left_room(&ctx, &args.room, &args.enclave, args.tx.sim).await?;
+    let report = json!({
+        "ok": true,
+        "action": "rooms.leave",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "provider": ctx.wallet.public_key,
+        "sim": args.tx.sim,
+        "room_id": args.room,
+        "enclave_id": args.enclave,
+        "transactions": {
+            "room": room_tx,
+        },
+    });
+    print_provider_lifecycle_report(&report, args.tx.json)
+}
+
+fn provider_join_enclave_payload(enclave_id: &str) -> Value {
+    json!({
+        "op": "join_enclave",
+        "enclave_id": enclave_id,
+    })
+}
+
+fn provider_leave_enclave_payload(enclave_id: &str) -> Value {
+    json!({
+        "op": "leave_enclave",
+        "enclave_id": enclave_id,
+    })
+}
+
+fn provider_join_room_payload(room_id: &str, enclave_id: &str) -> Value {
+    json!({
+        "op": "join_room",
+        "room_id": room_id,
+        "enclave_id": enclave_id,
+    })
+}
+
+fn provider_leave_room_payload(room_id: &str, enclave_id: &str) -> Value {
+    json!({
+        "op": "leave_room",
+        "room_id": room_id,
+        "enclave_id": enclave_id,
+    })
+}
+
+fn resolve_provider_lifecycle_enclave(
+    enclaves: &[LedgerEnclave],
+    requested: &str,
+) -> Result<LedgerEnclave> {
+    if let Some(enclave) = enclaves
+        .iter()
+        .find(|enclave| enclave.enclave_id == requested && enclave.status == "active")
+    {
+        return Ok(enclave.clone());
+    }
+    let mut matches = enclaves
+        .iter()
+        .filter(|enclave| enclave.model_id == requested && enclave.status == "active")
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
+    match matches.len() {
+        0 => bail!(
+            "requested enclave/model {requested} is not an active admin-created enclave"
+        ),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "model {requested} has multiple active admin-created enclaves; pass a concrete enclave id"
+        ),
+    }
+}
+
+fn resolve_provider_leave_enclave(
+    enclaves: &[LedgerEnclave],
+    serves: &[LedgerServe],
+    requested: &str,
+) -> Result<LedgerEnclave> {
+    if let Some(enclave) = enclaves
+        .iter()
+        .find(|enclave| enclave.enclave_id == requested)
+    {
+        return Ok(enclave.clone());
+    }
+    let mut matches = serves
+        .iter()
+        .filter(|serve| serve.model_id == requested && serve.status == "active")
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
+    match matches.len() {
+        0 => bail!(
+            "requested enclave/model {requested} is not a known admin-created enclave or active provider serving row"
+        ),
+        1 => enclaves
+            .iter()
+            .find(|enclave| enclave.enclave_id == matches[0].enclave_id)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "provider is serving enclave {}, but its admin-created enclave record is missing",
+                    matches[0].enclave_id
+                )
+            }),
+        _ => bail!(
+            "model {requested} has multiple active provider serving rows; pass a concrete enclave id"
+        ),
+    }
+}
+
+fn select_provider_rooms_to_leave(
+    roomserve: &[LedgerRoomServe],
+    provider: &str,
+    enclave_id: &str,
+    requested: &str,
+) -> Result<Vec<String>> {
+    let active = roomserve
+        .iter()
+        .filter(|row| {
+            row.provider == provider && row.enclave_id == enclave_id && row.status == "active"
+        })
+        .map(|row| row.room_id.clone())
+        .collect::<BTreeSet<_>>();
+    if requested.trim().eq_ignore_ascii_case("auto") {
+        return Ok(active.into_iter().collect());
+    }
+    let requested_ids = requested
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if requested_ids.is_empty() {
+        bail!("--rooms must be auto or a comma-separated list of room ids");
+    }
+    for room_id in &requested_ids {
+        if !active.contains(*room_id) {
+            bail!("provider is not actively serving room {room_id} with enclave {enclave_id}");
+        }
+    }
+    Ok(requested_ids.into_iter().map(str::to_owned).collect())
+}
+
+async fn leave_provider_rooms(
+    ctx: &ProviderTxContext,
+    enclave_id: &str,
+    rooms: &[String],
+    sim: bool,
+) -> Result<Vec<Value>> {
+    let mut reports = Vec::with_capacity(rooms.len());
+    for room_id in rooms {
+        reports.push(ensure_left_room(ctx, room_id, enclave_id, sim).await?);
+    }
+    Ok(reports)
+}
+
+async fn ensure_left_room(
+    ctx: &ProviderTxContext,
+    room_id: &str,
+    enclave_id: &str,
+    sim: bool,
+) -> Result<Value> {
+    let key = format!(
+        "roomserve/{}/{}/{}",
+        room_id, ctx.wallet.public_key, enclave_id
+    );
+    let existing = read_state_value(&ctx.rpc, &key).await?;
+    if existing
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        != Some("active")
+    {
+        return Ok(json!({
+            "room_id": room_id,
+            "enclave_id": enclave_id,
+            "skipped": true,
+            "reason": "not_joined_room",
+            "state": existing,
+        }));
+    }
+    let submitted = submit_contract_command(
+        &ctx.rpc,
+        &ctx.keypair_path,
+        &ctx.password,
+        &ctx.wallet,
+        "leaveRoom",
+        provider_leave_room_payload(room_id, enclave_id),
+        sim,
+    )
+    .await?;
+    if sim {
+        return Ok(json!({ "room_id": room_id, "enclave_id": enclave_id, "tx": submitted }));
+    }
+    let state = wait_for_state(&ctx.rpc, &key, |value| {
+        value.get("status").and_then(Value::as_str) == Some("inactive")
+    })
+    .await?;
+    Ok(json!({
+        "room_id": room_id,
+        "enclave_id": enclave_id,
+        "skipped": false,
+        "tx": submitted,
+        "state": state,
+    }))
+}
+
+async fn ensure_left_enclave(
+    ctx: &ProviderTxContext,
+    enclave_id: &str,
+    sim: bool,
+) -> Result<Value> {
+    let key = format!("serve/{}/{}", ctx.wallet.public_key, enclave_id);
+    let existing = read_state_value(&ctx.rpc, &key).await?;
+    if existing
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        != Some("active")
+    {
+        return Ok(json!({
+            "enclave_id": enclave_id,
+            "skipped": true,
+            "reason": "not_serving_enclave",
+            "state": existing,
+        }));
+    }
+    let submitted = submit_contract_command(
+        &ctx.rpc,
+        &ctx.keypair_path,
+        &ctx.password,
+        &ctx.wallet,
+        "leaveEnclave",
+        provider_leave_enclave_payload(enclave_id),
+        sim,
+    )
+    .await?;
+    if sim {
+        return Ok(json!({ "enclave_id": enclave_id, "tx": submitted }));
+    }
+    let state = wait_for_state(&ctx.rpc, &key, |value| {
+        value.get("status").and_then(Value::as_str) == Some("inactive")
+    })
+    .await?;
+    Ok(json!({
+        "enclave_id": enclave_id,
+        "skipped": false,
+        "tx": submitted,
+        "state": state,
+    }))
+}
+
+async fn read_active_provider_serves(
+    rpc: &PeerRpcClient,
+    provider: &str,
+) -> Result<Vec<LedgerServe>> {
+    let prefix = format!("serve/{provider}/");
+    let mut serves = read_prefix_entries(rpc, &prefix)
+        .await?
+        .into_iter()
+        .map(|entry| serde_json::from_value(entry.value).context("parsing provider serve record"))
+        .collect::<Result<Vec<LedgerServe>>>()?
+        .into_iter()
+        .filter(|serve| serve.provider == provider && serve.status == "active")
+        .collect::<Vec<_>>();
+    serves.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
+    Ok(serves)
+}
+
+fn print_provider_lifecycle_report(report: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Provider lifecycle command complete.");
+    println!("Action: {}", report["action"].as_str().unwrap_or(""));
+    println!("Provider: {}", report["provider"].as_str().unwrap_or(""));
+    if let Some(enclave_id) = report["enclave"]["enclave_id"].as_str() {
+        println!("Enclave: {enclave_id}");
+    }
+    let room_count = report["rooms"].as_array().map(Vec::len).unwrap_or(0);
+    println!("Rooms touched: {room_count}");
+    if report["sim"].as_bool() == Some(true) {
+        println!("Simulation: true");
+    }
     Ok(())
 }
 
@@ -6523,10 +7170,7 @@ async fn ensure_joined_enclave(
         password,
         wallet,
         "joinEnclave",
-        json!({
-            "op": "join_enclave",
-            "enclave_id": enclave.enclave_id,
-        }),
+        provider_join_enclave_payload(&enclave.enclave_id),
         sim,
     )
     .await?;
@@ -6572,11 +7216,7 @@ async fn ensure_joined_rooms(
             password,
             wallet,
             "joinRoom",
-            json!({
-                "op": "join_room",
-                "room_id": room.room_id,
-                "enclave_id": enclave.enclave_id,
-            }),
+            provider_join_room_payload(&room.room_id, &enclave.enclave_id),
             sim,
         )
         .await?;
@@ -8677,6 +9317,210 @@ mod tests {
     #[test]
     fn shell_single_quote_handles_embedded_quotes_for_copy_paste_commands() {
         assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn provider_lifecycle_payloads_are_limited_to_opt_in_and_out_ops() {
+        assert_eq!(
+            provider_join_enclave_payload("enclave-a"),
+            json!({
+                "op": "join_enclave",
+                "enclave_id": "enclave-a",
+            })
+        );
+        assert_eq!(
+            provider_leave_enclave_payload("enclave-a"),
+            json!({
+                "op": "leave_enclave",
+                "enclave_id": "enclave-a",
+            })
+        );
+        assert_eq!(
+            provider_join_room_payload("room-a", "enclave-a"),
+            json!({
+                "op": "join_room",
+                "room_id": "room-a",
+                "enclave_id": "enclave-a",
+            })
+        );
+        assert_eq!(
+            provider_leave_room_payload("room-a", "enclave-a"),
+            json!({
+                "op": "leave_room",
+                "room_id": "room-a",
+                "enclave_id": "enclave-a",
+            })
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_resolves_admin_enclave_and_rejects_ambiguous_model() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        let resolved =
+            resolve_provider_lifecycle_enclave(&contract.enclaves, "test/model@4bit").unwrap();
+        assert_eq!(resolved.enclave_id, "11".repeat(32));
+
+        contract.enclaves.push(LedgerEnclave {
+            enclave_id: "22".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            backend: "llama.cpp".to_owned(),
+            artifact_root: root,
+            manifest_hash: "cc".repeat(32),
+            att_tier: 1,
+            binary_hash: "dd".repeat(32),
+            caps: json!({}),
+            status: "active".to_owned(),
+            created_by: "admin".to_owned(),
+        });
+        let err =
+            resolve_provider_lifecycle_enclave(&contract.enclaves, "test/model@4bit").unwrap_err();
+        assert!(err.to_string().contains("multiple active"));
+
+        contract.enclaves[0].status = "retired".to_owned();
+        let resolved =
+            resolve_provider_lifecycle_enclave(&contract.enclaves, &"22".repeat(32)).unwrap();
+        assert_eq!(resolved.enclave_id, "22".repeat(32));
+    }
+
+    #[test]
+    fn provider_leave_resolves_retired_enclave_from_provider_serves() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        let provider = "55".repeat(32);
+        contract.enclaves[0].status = "retired".to_owned();
+        let serves = vec![LedgerServe {
+            provider: provider.clone(),
+            enclave_id: contract.enclaves[0].enclave_id.clone(),
+            model_id: contract.enclaves[0].model_id.clone(),
+            status: "active".to_owned(),
+            rooms: vec!["room-a".to_owned()],
+        }];
+
+        let resolved =
+            resolve_provider_leave_enclave(&contract.enclaves, &serves, "test/model@4bit").unwrap();
+        assert_eq!(resolved.enclave_id, "11".repeat(32));
+        assert_eq!(resolved.status, "retired");
+
+        let resolved =
+            resolve_provider_leave_enclave(&contract.enclaves, &serves, &"11".repeat(32)).unwrap();
+        assert_eq!(resolved.enclave_id, "11".repeat(32));
+
+        contract.enclaves.push(LedgerEnclave {
+            enclave_id: "22".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            backend: "llama.cpp".to_owned(),
+            artifact_root: root,
+            manifest_hash: "cc".repeat(32),
+            att_tier: 1,
+            binary_hash: "dd".repeat(32),
+            caps: json!({}),
+            status: "retired".to_owned(),
+            created_by: "admin".to_owned(),
+        });
+        let mut ambiguous_serves = serves;
+        ambiguous_serves.push(LedgerServe {
+            provider,
+            enclave_id: "22".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            status: "active".to_owned(),
+            rooms: vec![],
+        });
+        let err = resolve_provider_leave_enclave(
+            &contract.enclaves,
+            &ambiguous_serves,
+            "test/model@4bit",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("multiple active provider"));
+    }
+
+    #[test]
+    fn provider_rooms_to_leave_are_provider_and_enclave_scoped() {
+        let rows = vec![
+            LedgerRoomServe {
+                room_id: "room-b".to_owned(),
+                provider: "provider-a".to_owned(),
+                enclave_id: "enclave-a".to_owned(),
+                model_id: "model".to_owned(),
+                status: "active".to_owned(),
+            },
+            LedgerRoomServe {
+                room_id: "room-a".to_owned(),
+                provider: "provider-a".to_owned(),
+                enclave_id: "enclave-a".to_owned(),
+                model_id: "model".to_owned(),
+                status: "active".to_owned(),
+            },
+            LedgerRoomServe {
+                room_id: "room-other".to_owned(),
+                provider: "provider-b".to_owned(),
+                enclave_id: "enclave-a".to_owned(),
+                model_id: "model".to_owned(),
+                status: "active".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            select_provider_rooms_to_leave(&rows, "provider-a", "enclave-a", "auto").unwrap(),
+            vec!["room-a".to_owned(), "room-b".to_owned()]
+        );
+        assert_eq!(
+            select_provider_rooms_to_leave(&rows, "provider-a", "enclave-a", "room-b").unwrap(),
+            vec!["room-b".to_owned()]
+        );
+        assert!(
+            select_provider_rooms_to_leave(&rows, "provider-a", "enclave-a", "room-other").is_err()
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_cli_parses_join_leave_and_room_commands() {
+        let join = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "join",
+            "--enclave",
+            "enclave-a",
+            "--rooms",
+            "room-a,room-b",
+            "--sim",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command } = join.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Join(args) = *command else {
+            panic!("expected provider join command");
+        };
+        assert_eq!(args.enclave, "enclave-a");
+        assert_eq!(args.rooms, "room-a,room-b");
+        assert!(args.tx.sim);
+        assert!(args.tx.json);
+
+        let rooms = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "rooms",
+            "leave",
+            "--room",
+            "room-a",
+            "--enclave",
+            "enclave-a",
+        ])
+        .unwrap();
+        let Commands::Provider { command } = rooms.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Rooms { command } = *command else {
+            panic!("expected provider rooms command");
+        };
+        let ProviderRoomsCommands::Leave(args) = command else {
+            panic!("expected provider rooms leave command");
+        };
+        assert_eq!(args.room, "room-a");
+        assert_eq!(args.enclave, "enclave-a");
     }
 
     #[test]
