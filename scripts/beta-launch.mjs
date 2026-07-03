@@ -104,6 +104,12 @@ function requireLiteral(add, value, expected, name) {
   if (value !== expected) add('error', `${name} must be ${JSON.stringify(expected)}`);
 }
 
+function requireBoolean(add, value, name) {
+  if (typeof value !== 'boolean') {
+    add('error', `${name} must be a boolean`);
+  }
+}
+
 function requireString(add, value, name, regex = null) {
   if (typeof value !== 'string' || value.length === 0) {
     add('error', `${name} must be a non-empty string`);
@@ -361,6 +367,13 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
       requireString(add, enclave.binary_hash, `${prefix}.binary_hash`, hex64);
       if (enclave.att_tier !== 1 && enclave.att_tier !== 2) {
         add('error', `${prefix}.att_tier must be 1 or 2`);
+      }
+      if (requireObject(add, enclave.caps, `${prefix}.caps`)) {
+        requireOnlyKeys(add, enclave.caps, `${prefix}.caps`, ['chat', 'tools', 'json', 'ctx']);
+        requireBoolean(add, enclave.caps.chat, `${prefix}.caps.chat`);
+        requireBoolean(add, enclave.caps.tools, `${prefix}.caps.tools`);
+        requireBoolean(add, enclave.caps.json, `${prefix}.caps.json`);
+        requirePositiveInteger(add, enclave.caps.ctx, `${prefix}.caps.ctx`);
       }
       if (requireObject(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`)) {
         requireOnlyKeys(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`, ['in_per_1k', 'out_per_1k']);
