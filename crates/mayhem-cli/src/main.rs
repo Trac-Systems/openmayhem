@@ -221,6 +221,8 @@ enum CatalogCommands {
     Verify(CatalogVerifyArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
     CalibrateCanary(CatalogCalibrateCanaryArgs),
+    /// Audit per-backend canary fingerprint coverage for launch artifacts.
+    CanaryMatrix(CatalogCanaryMatrixArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -906,6 +908,25 @@ struct CatalogCalibrateCanaryArgs {
     require_match: bool,
 
     /// Print a machine-readable calibration report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogCanaryMatrixArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable coverage report.
     #[arg(long)]
     json: bool,
 }
@@ -1672,6 +1693,7 @@ async fn main() -> Result<()> {
         Commands::Catalog { command } => match command {
             CatalogCommands::Verify(args) => catalog_verify(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
+            CatalogCommands::CanaryMatrix(args) => catalog_canary_matrix(args),
         },
         Commands::Provider { command } => match *command {
             ProviderCommands::Start(args) => provider_start(*args).await,
@@ -2144,6 +2166,169 @@ fn ensure_calibration_matches_catalog(report: &CatalogCanaryCalibrationReport) -
             report.artifact
         ),
     }
+}
+
+fn catalog_canary_matrix(args: CatalogCanaryMatrixArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let report =
+        catalog_canary_matrix_report(&catalog_doc, catalog_path, canaries_dir, !args.include_dev);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Canary calibration matrix.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Canaries: {}", report.canaries_dir.display());
+        println!(
+            "Scope: {}",
+            if report.launch_only {
+                "launch models"
+            } else {
+                "launch + dev models"
+            }
+        );
+        println!(
+            "Coverage: {} models, {} artifacts, ok={}",
+            report.model_count, report.artifact_count, report.ok
+        );
+        for entry in &report.entries {
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id,
+                entry.artifact,
+                entry.engine,
+                entry.canary_set,
+                entry.calibration_status
+            );
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "canary calibration matrix has {} error(s)",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
+fn catalog_canary_matrix_report(
+    catalog_doc: &catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    canaries_dir: PathBuf,
+    launch_only: bool,
+) -> CatalogCanaryMatrixReport {
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    for model in &catalog_doc.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id);
+        for (artifact_name, artifact) in &model.artifacts {
+            let mut entry_errors = Vec::new();
+            if let Err(err) = &canary_check {
+                entry_errors.push(err.clone());
+            }
+            let fingerprint = model.canary.fingerprints.get(artifact_name).cloned();
+            match fingerprint.as_deref() {
+                Some(value) if is_hex_len(value, 64) => {}
+                Some(_) => entry_errors.push(format!(
+                    "canary fingerprint for {artifact_name} must be 32-byte hex"
+                )),
+                None => entry_errors.push(format!(
+                    "canary fingerprint missing artifact {artifact_name}"
+                )),
+            }
+            let calibration_status = match artifact.engine.as_str() {
+                "llama.cpp" | "mlx" => "local-calibration-supported",
+                "trt-llm" => "hardware-gated-calibration",
+                other => {
+                    entry_errors.push(format!("unsupported calibration engine {other}"));
+                    "unsupported-calibration-engine"
+                }
+            }
+            .to_owned();
+            let ok = entry_errors.is_empty();
+            let entry = CatalogCanaryMatrixEntry {
+                model_id: model.model_id.clone(),
+                tier: model.tier.clone(),
+                artifact: artifact_name.clone(),
+                engine: artifact.engine.clone(),
+                canary_set: model.canary.set_id.clone(),
+                prompt_count: canary_check.as_ref().ok().copied(),
+                fingerprint,
+                calibration_status,
+                ok,
+                errors: entry_errors,
+            };
+            if !entry.ok {
+                errors.extend(
+                    entry
+                        .errors
+                        .iter()
+                        .map(|error| format!("{} {}: {error}", entry.model_id, entry.artifact)),
+                );
+            }
+            entries.push(entry);
+        }
+    }
+    if entries.is_empty() {
+        errors.push(if launch_only {
+            "catalog has no launch model artifacts to audit".to_owned()
+        } else {
+            "catalog has no model artifacts to audit".to_owned()
+        });
+    }
+    let model_count = entries
+        .iter()
+        .map(|entry| entry.model_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    CatalogCanaryMatrixReport {
+        catalog_path,
+        canaries_dir,
+        launch_only,
+        model_count,
+        artifact_count: entries.len(),
+        ok: errors.is_empty(),
+        entries,
+        errors,
+    }
+}
+
+fn canary_set_matrix_check(
+    canaries_dir: &Path,
+    set_id: &str,
+) -> std::result::Result<usize, String> {
+    load_canary_prompts(Some(canaries_dir), set_id, None)
+        .map_err(|err| err.to_string())
+        .and_then(|prompts| {
+            for prompt in &prompts {
+                if prompt.temperature.unwrap_or(0.0).abs() > f64::EPSILON {
+                    return Err(format!(
+                        "canary prompt {} in {set_id} must use temperature 0",
+                        prompt.id
+                    ));
+                }
+            }
+            Ok(prompts.len())
+        })
 }
 
 fn catalog_calibration_backend(
@@ -3086,6 +3271,32 @@ struct CatalogCanaryCalibrationReport {
     existing_catalog_fingerprint: Option<String>,
     matches_existing_catalog: Option<bool>,
     prompts: Vec<CanaryCalibrationPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryMatrixReport {
+    catalog_path: PathBuf,
+    canaries_dir: PathBuf,
+    launch_only: bool,
+    model_count: usize,
+    artifact_count: usize,
+    ok: bool,
+    entries: Vec<CatalogCanaryMatrixEntry>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryMatrixEntry {
+    model_id: String,
+    tier: String,
+    artifact: String,
+    engine: String,
+    canary_set: String,
+    prompt_count: Option<usize>,
+    fingerprint: Option<String>,
+    calibration_status: String,
+    ok: bool,
+    errors: Vec<String>,
 }
 
 async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
@@ -11232,6 +11443,75 @@ mod tests {
     }
 
     #[test]
+    fn canary_matrix_covers_launch_artifacts_and_marks_hardware_gated_backends() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].canary.set_id = "test-canary-zero".to_owned();
+        let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        trt_artifact.engine = "trt-llm".to_owned();
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), trt_artifact);
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("nvfp4".to_owned(), "bb".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary-zero", 0.0);
+
+        let report = catalog_canary_matrix_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+        );
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.model_count, 1);
+        assert_eq!(report.artifact_count, 2);
+        assert!(report.entries.iter().any(|entry| {
+            entry.artifact == "nvfp4" && entry.calibration_status == "hardware-gated-calibration"
+        }));
+    }
+
+    #[test]
+    fn canary_matrix_detects_missing_backend_fingerprint_and_nonzero_prompt_temperature() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].canary.set_id = "test-canary-hot".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        let mut mlx_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        mlx_artifact.engine = "mlx".to_owned();
+        catalog.models[0]
+            .artifacts
+            .insert("mlx-4bit".to_owned(), mlx_artifact);
+        let canaries_dir = test_canary_dir("test-canary-hot", 0.7);
+
+        let report = catalog_canary_matrix_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("missing artifact mlx-4bit")));
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("must use temperature 0")));
+    }
+
+    #[test]
     fn stable_value_hash_is_object_key_order_independent() {
         let a = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
@@ -11518,6 +11798,36 @@ mod tests {
             catalog_fingerprint: fingerprint,
             prompts: vec![test_calibration_prompt("p1", "aa".repeat(32))],
         }
+    }
+
+    fn test_canary_dir(set_id: &str, temperature: f64) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let safe_set_id = set_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-canary-matrix-{}-{}-{}",
+            std::process::id(),
+            safe_set_id,
+            nanos
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{set_id}.json")),
+            json!({
+                "set_id": set_id,
+                "prompts": [{
+                    "id": "p1",
+                    "messages": [{ "role": "user", "content": "calibrate" }],
+                    "temperature": temperature,
+                    "max_tokens": 8
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
     }
 
     fn test_catalog(root: &str) -> catalog::CatalogDocument {
