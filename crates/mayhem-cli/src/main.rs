@@ -8505,7 +8505,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         .selected
         .price
         .as_ref()
-        .and_then(|schedule| schedule.current.as_ref())
+        .and_then(current_mu_usd_price)
         .context("selected provider enclave has no current admin price")?;
     Ok(ProviderSessionTerms {
         provider: ctx.wallet.public_key.clone(),
@@ -8573,6 +8573,12 @@ fn provider_session_contract_decision(
             "admin enclave is no longer active for this model".to_owned(),
         );
     }
+    if !admin_role_marker_ok(enclave.created_by_role.as_deref()) {
+        return reject(
+            "ENCLAVE",
+            "enclave record is explicitly not admin-created".to_owned(),
+        );
+    }
     if !contract.serves.iter().any(|serve| {
         serve.provider == terms.provider
             && serve.enclave_id == terms.enclave_id
@@ -8631,6 +8637,8 @@ fn provider_session_contract_decision(
             return false;
         };
         live_room.status == "open"
+            && admin_role_marker_ok(live_room.creator_role.as_deref())
+            && admin_role_marker_ok(startup_room.creator_role.as_deref())
             && room_matches_enclave(live_room, enclave)
             && room_matches_enclave(startup_room, enclave)
     });
@@ -10744,6 +10752,17 @@ mod tests {
             ProviderSessionDecision::Accept
         );
 
+        let mut legacy = contract.clone();
+        legacy.enclaves[0].created_by_role = None;
+        legacy.rooms[0].creator_role = None;
+        legacy.prices[0].current.as_mut().unwrap().set_by_role = None;
+        let mut legacy_startup_rooms = startup_rooms.clone();
+        legacy_startup_rooms[0].creator_role = None;
+        assert_eq!(
+            provider_session_contract_decision(&legacy, &terms, &legacy_startup_rooms),
+            ProviderSessionDecision::Accept
+        );
+
         let mut banned = contract.clone();
         banned.providers[0].status = "banned".to_owned();
         assert!(matches!(
@@ -10755,6 +10774,16 @@ mod tests {
         retired.enclaves[0].status = "retired".to_owned();
         assert!(matches!(
             provider_session_contract_decision(&retired, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject {
+                code: "ENCLAVE",
+                ..
+            }
+        ));
+
+        let mut provider_created_enclave = contract.clone();
+        provider_created_enclave.enclaves[0].created_by_role = Some("provider".to_owned());
+        assert!(matches!(
+            provider_session_contract_decision(&provider_created_enclave, &terms, &startup_rooms),
             ProviderSessionDecision::Reject {
                 code: "ENCLAVE",
                 ..
@@ -10779,6 +10808,34 @@ mod tests {
                 code: "PRICE_VER",
                 ..
             }
+        ));
+
+        let mut provider_priced = contract.clone();
+        provider_priced.prices[0]
+            .current
+            .as_mut()
+            .unwrap()
+            .set_by_role = Some("provider".to_owned());
+        assert!(matches!(
+            provider_session_contract_decision(&provider_priced, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject {
+                code: "PRICE_VER",
+                ..
+            }
+        ));
+
+        let mut provider_created_room = contract.clone();
+        provider_created_room.rooms[0].creator_role = Some("provider".to_owned());
+        assert!(matches!(
+            provider_session_contract_decision(&provider_created_room, &terms, &startup_rooms),
+            ProviderSessionDecision::Reject { code: "ROOM", .. }
+        ));
+
+        let mut provider_startup_room = startup_rooms.clone();
+        provider_startup_room[0].creator_role = Some("provider".to_owned());
+        assert!(matches!(
+            provider_session_contract_decision(&contract, &terms, &provider_startup_room),
+            ProviderSessionDecision::Reject { code: "ROOM", .. }
         ));
 
         let mut tombstoned_roomserve = contract.clone();
