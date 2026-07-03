@@ -5970,6 +5970,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let ctx = provider_tx_context(&args.tx).await?;
     let contract = read_contract_catalog(&ctx.rpc).await?;
     let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
+    let price = require_current_mu_usd_price(&contract.prices, &enclave.enclave_id)?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
     let provider_tx = ensure_provider_registered(
         &ctx.rpc,
@@ -6006,6 +6007,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         "provider": ctx.wallet.public_key,
         "sim": args.tx.sim,
         "enclave": enclave,
+        "price": price,
         "rooms": rooms,
         "transactions": {
             "provider": provider_tx,
@@ -6127,6 +6129,7 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
             enclave.model_id
         );
     }
+    let price = require_current_mu_usd_price(&contract.prices, &enclave.enclave_id)?;
     let serve_key = format!("serve/{}/{}", ctx.wallet.public_key, enclave.enclave_id);
     let serving = read_state_value(&ctx.rpc, &serve_key).await?;
     if serving
@@ -6160,6 +6163,7 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
         "provider": ctx.wallet.public_key,
         "sim": args.tx.sim,
         "enclave": enclave,
+        "price": price,
         "rooms": [room],
         "transactions": {
             "rooms": room_txs,
@@ -6242,6 +6246,31 @@ fn resolve_provider_lifecycle_enclave(
             "model {requested} has multiple active admin-created enclaves; pass a concrete enclave id"
         ),
     }
+}
+
+fn current_mu_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRecord> {
+    let current = schedule.current.as_ref()?;
+    (schedule.denom == "mu_usd" && current.denom == "mu_usd").then_some(current)
+}
+
+fn require_current_mu_usd_price<'a>(
+    prices: &'a [LedgerPriceSchedule],
+    enclave_id: &str,
+) -> Result<&'a LedgerPriceSchedule> {
+    let schedule = prices
+        .iter()
+        .find(|price| price.enclave_id == enclave_id)
+        .with_context(|| {
+            format!(
+                "enclave {enclave_id} has no admin price; ask the admin to run `mayhem admin set-price` before providers join it"
+            )
+        })?;
+    if current_mu_usd_price(schedule).is_none() {
+        bail!(
+            "enclave {enclave_id} has no current mu_usd admin price; ask the admin to run `mayhem admin set-price` before providers join it"
+        );
+    }
+    Ok(schedule)
 }
 
 fn resolve_provider_leave_enclave(
@@ -6851,23 +6880,27 @@ fn build_provider_candidates(
         if artifact.artifact_root != enclave.artifact_root {
             continue;
         }
-        let price = contract
+        let Some(price) = contract
             .prices
             .iter()
             .find(|price| price.enclave_id == enclave.enclave_id)
-            .cloned();
+            .filter(|price| current_mu_usd_price(price).is_some())
+            .cloned()
+        else {
+            continue;
+        };
         candidates.push(ProviderCandidate {
             enclave: enclave.clone(),
             model: model.clone(),
             artifact_name,
             artifact,
             verdict: verdict.clone(),
-            price,
+            price: Some(price),
         });
     }
     if candidates.is_empty() {
         bail!(
-            "no feasible active admin-created enclaves found in contract state; providers can only join enclaves the admin already registered"
+            "no feasible active admin-created enclaves with a current mu_usd admin price found in contract state; providers can only join priced enclaves the admin already registered"
         );
     }
     Ok(candidates)
@@ -9436,6 +9469,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_lifecycle_requires_current_admin_price() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        assert!(require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).is_ok());
+
+        contract.prices.clear();
+        let err = require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        assert!(err.to_string().contains("has no admin price"));
+
+        let mut contract = test_contract(&root);
+        contract.prices[0].current = None;
+        let err = require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("has no current mu_usd admin price"));
+
+        let mut contract = test_contract(&root);
+        contract.prices[0].current.as_mut().unwrap().denom = "provider_points".to_owned();
+        let err = require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("has no current mu_usd admin price"));
+    }
+
+    #[test]
     fn provider_rooms_to_leave_are_provider_and_enclave_scoped() {
         let rows = vec![
             LedgerRoomServe {
@@ -9539,6 +9597,16 @@ mod tests {
         let mut retired = contract.clone();
         retired.enclaves[0].status = "retired".to_owned();
         assert!(build_provider_candidates(&retired, &catalog, &hardware, &args).is_err());
+
+        let mut unpriced = contract.clone();
+        unpriced.prices.clear();
+        let err = build_provider_candidates(&unpriced, &catalog, &hardware, &args).unwrap_err();
+        assert!(err.to_string().contains("current mu_usd admin price"));
+
+        let mut wrong_denom = contract.clone();
+        wrong_denom.prices[0].denom = "provider_points".to_owned();
+        let err = build_provider_candidates(&wrong_denom, &catalog, &hardware, &args).unwrap_err();
+        assert!(err.to_string().contains("current mu_usd admin price"));
 
         let mut mismatched = contract;
         mismatched.enclaves[0].artifact_root = "bb".repeat(32);

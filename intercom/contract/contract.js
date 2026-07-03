@@ -904,6 +904,8 @@ class MayhemContract extends Contract {
     const enclave = await this.get(`enclave/${this.value.enclave_id}`);
     if (!enclave) return new Error('Enclave not found.');
     if (enclave.status !== 'active') return new Error('Enclave is not active.');
+    const priceError = await this.requireCurrentAdminPrice(this.value.enclave_id);
+    if (priceError) return priceError;
 
     const key = `serve/${this.address}/${this.value.enclave_id}`;
     const existing = await this.get(key);
@@ -972,6 +974,8 @@ class MayhemContract extends Contract {
     if (!serving || serving.status !== 'active') return new Error('Provider is not serving enclave.');
     const enclave = await this.get(`enclave/${this.value.enclave_id}`);
     if (!enclave || enclave.status !== 'active') return new Error('Enclave is not active.');
+    const priceError = await this.requireCurrentAdminPrice(this.value.enclave_id);
+    if (priceError) return priceError;
     if (serving.model_id !== enclave.model_id || enclave.model_id !== room.model_id) {
       return new Error('Enclave model does not match room model.');
     }
@@ -2512,6 +2516,21 @@ class MayhemContract extends Contract {
   async requireProvider(sender = this.address) {
     const provider = await this.get(`prov/${sender}`);
     if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    return null;
+  }
+
+  async requireCurrentAdminPrice(enclaveId) {
+    const schedule = await this.get(`price/${enclaveId}`);
+    const current = schedule?.current;
+    if (!current) {
+      return new Error('Current admin price required before provider serving.');
+    }
+    if (schedule.denom !== PRICE_DENOMINATION || current.denom !== PRICE_DENOMINATION) {
+      return new Error('Provider serving requires a current mu_usd admin price.');
+    }
+    if (current.enclave_id !== enclaveId || current.set_by_role !== 'admin') {
+      return new Error('Provider serving requires a current admin-set enclave price.');
+    }
     return null;
   }
 

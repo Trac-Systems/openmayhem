@@ -7,6 +7,7 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  seedCurrentAdminPrice,
   signConsent,
 } from './helpers/contract.js';
 
@@ -84,6 +85,12 @@ async function setupProviderServing(ctx) {
     5
   );
   assert.equal(registered.ok, true, registered.message);
+  await seedCurrentAdminPrice(ctx.storage, {
+    enclaveId,
+    modelId,
+    admin: ctx.admin.publicKey,
+    txNo: 6,
+  });
 
   const joinedEnclave = await execute(
     ctx.contract,

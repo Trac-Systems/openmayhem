@@ -45,6 +45,47 @@ export const makeOperation = (type, value, sender, txNo, writer = ZERO_HEX) => (
 export const execute = (contract, storage, type, value, sender, txNo, writer = ZERO_HEX) =>
   contract.execute(makeOperation(type, value, sender, txNo, writer), storage);
 
+export async function seedCurrentAdminPrice(
+  storage,
+  {
+    enclaveId,
+    modelId,
+    admin,
+    txNo = 1,
+    ver = 1,
+    inPer1kMu = 10,
+    outPer1kMu = 30,
+    perReqMu = 0,
+    minSessionMu = 0,
+    effectiveAt = 0,
+  }
+) {
+  const record = {
+    enclave_id: enclaveId,
+    model_id: modelId,
+    denom: 'mu_usd',
+    ver,
+    in_per_1k_mu: inPer1kMu,
+    out_per_1k_mu: outPer1kMu,
+    per_req_mu: perReqMu,
+    min_session_mu: minSessionMu,
+    effective_at: effectiveAt,
+    effective_from: makeTxKey(txNo),
+    updated_at: makeTxKey(txNo),
+    set_by: admin,
+    set_by_role: 'admin',
+  };
+  await storage.put(`price/${enclaveId}`, {
+    enclave_id: enclaveId,
+    model_id: modelId,
+    denom: 'mu_usd',
+    current: record,
+    pending: null,
+  });
+  await storage.put(`price/${enclaveId}/v/${ver}`, record);
+  return record;
+}
+
 export async function makeIdentity() {
   const wallet = new PeerWallet();
   await wallet.ready;

@@ -7,6 +7,7 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  seedCurrentAdminPrice,
   signConsent,
 } from './helpers/contract.js';
 
@@ -55,6 +56,25 @@ const enclaveRetire = {
   enclave_id: enclaveId,
 };
 
+const modelRef = {
+  op: 'set_model_ref',
+  model_id: enclaveRegistration.model_id,
+  price_ref_mu: {
+    in_per_1k: 20,
+    out_per_1k: 60,
+  },
+};
+
+const priceSchedule = {
+  op: 'set_price',
+  enclave_id: enclaveId,
+  in_per_1k_mu: 20,
+  out_per_1k_mu: 60,
+  per_req_mu: 0,
+  min_session_mu: 0,
+  effective_at: 0,
+};
+
 const providerJoin = {
   op: 'join_enclave',
   enclave_id: enclaveId,
@@ -92,22 +112,34 @@ const buildRegistryLog = (admin, provider, feePayer) => [
     txNo: 4,
   },
   {
+    type: 'setModelRef',
+    value: modelRef,
+    sender: admin.publicKey,
+    txNo: 5,
+  },
+  {
+    type: 'setPrice',
+    value: priceSchedule,
+    sender: admin.publicKey,
+    txNo: 6,
+  },
+  {
     type: 'joinEnclave',
     value: providerJoin,
     sender: provider.publicKey,
-    txNo: 5,
+    txNo: 7,
   },
   {
     type: 'updateEnclave',
     value: enclaveUpdate,
     sender: admin.publicKey,
-    txNo: 6,
+    txNo: 8,
   },
   {
     type: 'retireEnclave',
     value: enclaveRetire,
     sender: admin.publicKey,
-    txNo: 7,
+    txNo: 9,
   },
 ];
 
@@ -154,7 +186,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
       successful_sessions: 0,
     },
     registered_at: makeTxKey(3),
-    updated_at: makeTxKey(5),
+    updated_at: makeTxKey(7),
   });
 
   const enclaveEntry = await first.storage.get(`enclave/${enclaveId}`);
@@ -162,8 +194,8 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.equal(enclaveEntry.value.created_by, admin.publicKey);
   assert.equal(enclaveEntry.value.artifact_root, updatedArtifactRoot);
   assert.equal(enclaveEntry.value.registered_at, makeTxKey(4));
-  assert.equal(enclaveEntry.value.updated_at, makeTxKey(7));
-  assert.equal(enclaveEntry.value.retired_at, makeTxKey(7));
+  assert.equal(enclaveEntry.value.updated_at, makeTxKey(9));
+  assert.equal(enclaveEntry.value.retired_at, makeTxKey(9));
 
   const servingEntry = await first.storage.get(`serve/${provider.publicKey}/${enclaveId}`);
   assert.deepEqual(servingEntry.value, {
@@ -171,11 +203,114 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     enclave_id: enclaveId,
     model_id: enclaveRegistration.model_id,
     status: 'active',
-    joined_at: makeTxKey(5),
-    updated_at: makeTxKey(5),
+    joined_at: makeTxKey(7),
+    updated_at: makeTxKey(7),
     left_at: null,
     rooms: [],
   });
+});
+
+test('MayhemContract requires a current admin price before provider serving rows', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerEnclave',
+      value: enclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+
+  const unpricedJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    5
+  );
+  assert.match(unpricedJoin.message, /current admin price required/i);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: enclaveRegistration.model_id,
+    admin: admin.publicKey,
+    txNo: 6,
+  });
+  const pricedJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    6
+  );
+  assert.equal(pricedJoin.ok, true, pricedJoin.message);
+
+  const roomId = await deriveRoomId(enclaveRegistration.model_id, admin.publicKey, 'priced-room');
+  const opened = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      model_id: enclaveRegistration.model_id,
+      nonce: 'priced-room',
+      label: 'priced-room',
+      policy: {},
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(opened.ok, true, opened.message);
+  await storage.del(`price/${enclaveId}`);
+
+  const unpricedRoomJoin = await execute(
+    contract,
+    storage,
+    'joinRoom',
+    {
+      op: 'join_room',
+      room_id: roomId,
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    8
+  );
+  assert.match(unpricedRoomJoin.message, /current admin price required/i);
+  assert.equal(await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`), null);
 });
 
 test('MayhemContract rejects provider-authored payout and probation hints', async () => {
@@ -335,38 +470,56 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
       sender: admin.publicKey,
       txNo: 4,
     },
-    {
-      type: 'joinEnclave',
-      value: providerJoin,
-      sender: provider.publicKey,
-      txNo: 5,
-    },
-    {
-      type: 'openRoom',
-      value: {
-        op: 'open_room',
-        model_id: enclaveRegistration.model_id,
-        nonce: 'ban-room',
-        label: 'ban-room',
-        policy: {},
-      },
-      sender: admin.publicKey,
-      txNo: 6,
-    },
-    {
-      type: 'joinRoom',
-      value: {
-        op: 'join_room',
-        room_id: roomId,
-        enclave_id: enclaveId,
-      },
-      sender: provider.publicKey,
-      txNo: 7,
-    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: enclaveRegistration.model_id,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+
+  const joinedEnclave = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    5
+  );
+  assert.equal(joinedEnclave.ok, true, joinedEnclave.message);
+
+  const openedRoom = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      model_id: enclaveRegistration.model_id,
+      nonce: 'ban-room',
+      label: 'ban-room',
+      policy: {},
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(openedRoom.ok, true, openedRoom.message);
+
+  const joinedRoom = await execute(
+    contract,
+    storage,
+    'joinRoom',
+    {
+      op: 'join_room',
+      room_id: roomId,
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    7
+  );
+  assert.equal(joinedRoom.ok, true, joinedRoom.message);
 
   const banned = await execute(
     contract,

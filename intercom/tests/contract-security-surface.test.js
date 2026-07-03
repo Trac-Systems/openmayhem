@@ -7,6 +7,7 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  seedCurrentAdminPrice,
   signConsent,
 } from './helpers/contract.js';
 
@@ -90,6 +91,15 @@ async function setupSecuritySurface() {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId,
+    admin: admin.publicKey,
+    txNo: 6,
+    inPer1kMu: 20,
+    outPer1kMu: 60,
+    minSessionMu: 100,
+  });
 
   return { admin, provider, roomId, storage, contract };
 }
@@ -329,6 +339,9 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
   assert.equal(await storage.get('rules/2'), null);
   assert.equal(await storage.get('modelref/provider/arbitrary-model@q4'), null);
   assert.equal(await storage.get(`enclave/${'8'.repeat(64)}`), null);
-  assert.equal(await storage.get(`price/${enclaveId}`), null);
+  const price = await storage.get(`price/${enclaveId}`);
+  assert.equal(price.value.current.set_by, admin.publicKey);
+  assert.equal(price.value.current.set_by_role, 'admin');
+  assert.equal(price.value.current.ver, 1);
   assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.joined_at, makeTxKey(txNo));
 });

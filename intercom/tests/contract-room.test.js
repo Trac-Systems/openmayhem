@@ -7,6 +7,7 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  seedCurrentAdminPrice,
   signConsent,
 } from './helpers/contract.js';
 
@@ -91,6 +92,12 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
     const result = await execute(contract, peerAStorage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
+  await seedCurrentAdminPrice(peerAStorage, {
+    enclaveId,
+    modelId,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
 
   const nonAdminOpen = await execute(
     contract,
@@ -315,19 +322,29 @@ test('MayhemContract rejects non-canonical and wrong-model room offers', async (
       sender: admin.publicKey,
       txNo: 4,
     },
-    {
-      type: 'joinEnclave',
-      value: {
-        op: 'join_enclave',
-        enclave_id: otherEnclaveId,
-      },
-      sender: provider.publicKey,
-      txNo: 5,
-    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId: otherEnclaveId,
+    modelId: otherModelId,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+
+  const providerServesOther = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    {
+      op: 'join_enclave',
+      enclave_id: otherEnclaveId,
+    },
+    provider.publicKey,
+    5
+  );
+  assert.equal(providerServesOther.ok, true, providerServesOther.message);
 
   const nonCanonicalJoin = await execute(
     contract,
