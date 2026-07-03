@@ -22,6 +22,8 @@ pub struct ProviderKey {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContractProviderSnapshot {
     pub provider: String,
+    #[serde(default, alias = "status")]
+    pub provider_status: Option<String>,
     pub enclave_id: String,
     pub model_id: String,
     pub room_id: String,
@@ -266,6 +268,9 @@ impl ProviderTable {
     }
 
     pub fn upsert_contract(&mut self, record: ContractProviderSnapshot) {
+        if !provider_status_allows_routing(record.provider_status.as_deref()) {
+            return;
+        }
         if !canonical_room_id(&record.room_id) {
             return;
         }
@@ -610,6 +615,12 @@ fn canonical_room_id(value: &str) -> bool {
     value.len() == 32 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
+fn provider_status_allows_routing(value: Option<&str>) -> bool {
+    value
+        .map(|status| status.eq_ignore_ascii_case("active"))
+        .unwrap_or(true)
+}
+
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(|left, right| left.total_cmp(right));
     let mid = values.len() / 2;
@@ -718,6 +729,7 @@ mod tests {
         let key = key_for(idx);
         ContractProviderSnapshot {
             provider: key.provider,
+            provider_status: Some("active".to_owned()),
             enclave_id: key.enclave_id,
             model_id: "model/test@4bit".to_owned(),
             room_id: key.room_id,
@@ -738,6 +750,7 @@ mod tests {
         let key = key();
         ContractProviderSnapshot {
             provider: key.provider,
+            provider_status: Some("active".to_owned()),
             enclave_id: key.enclave_id,
             model_id: "model/test@4bit".to_owned(),
             room_id: key.room_id,
@@ -982,6 +995,47 @@ mod tests {
 
         assert_eq!(table.contract_len(), 0);
         assert!(table.entries(1_000_500).is_empty());
+    }
+
+    #[test]
+    fn provider_table_ignores_banned_contract_snapshots() {
+        let mut table = ProviderTable::new();
+        let mut record = contract_record();
+        record.provider_status = Some("banned".to_owned());
+
+        table.upsert_contract(record);
+
+        assert_eq!(table.contract_len(), 0);
+        assert!(table.entries(1_000_500).is_empty());
+    }
+
+    #[test]
+    fn provider_table_ignores_banned_contract_snapshot_status_alias() {
+        let mut record = serde_json::to_value(contract_record()).unwrap();
+        record
+            .as_object_mut()
+            .expect("contract snapshot object")
+            .remove("provider_status");
+        record["status"] = serde_json::json!("banned");
+        let record: ContractProviderSnapshot = serde_json::from_value(record).unwrap();
+
+        let mut table = ProviderTable::new();
+        table.upsert_contract(record);
+
+        assert_eq!(table.contract_len(), 0);
+        assert!(table.entries(1_000_500).is_empty());
+    }
+
+    #[test]
+    fn provider_table_accepts_legacy_contract_snapshots_without_status() {
+        let mut table = ProviderTable::new();
+        let mut record = contract_record();
+        record.provider_status = None;
+
+        table.upsert_contract(record);
+
+        assert_eq!(table.contract_len(), 1);
+        assert_eq!(table.entries(1_000_500).len(), 1);
     }
 
     #[test]
