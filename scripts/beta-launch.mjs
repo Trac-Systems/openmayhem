@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/blake3.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultManifest = 'config/beta/testnet.template.json';
@@ -337,7 +338,26 @@ function joinUrl(base, suffix) {
   return `${base.replace(/\/+$/, '')}${rawSuffix}`;
 }
 
-function buildCommands(manifest) {
+async function deriveRoomId(enclaveId, creator, nonce) {
+  const digest = await blake3(Buffer.from(`${enclaveId}${creator}${nonce}`));
+  return Buffer.from(digest).toString('hex').slice(0, 32);
+}
+
+async function roomIdForLaunchRoom({ enclaveId, adminPubkey, room }) {
+  if (
+    typeof enclaveId !== 'string' ||
+    typeof adminPubkey !== 'string' ||
+    typeof room?.nonce !== 'string' ||
+    isPlaceholder(enclaveId) ||
+    isPlaceholder(adminPubkey) ||
+    isPlaceholder(room.nonce)
+  ) {
+    return room?.room_id || `<room_id returned by open_room for ${room?.label || 'room'}>`;
+  }
+  return deriveRoomId(enclaveId, adminPubkey, room.nonce);
+}
+
+async function buildCommands(manifest) {
   const appDir = path.join(repoRoot, 'intercom');
   const network = manifest.network || {};
   const msb = network.msb || {};
@@ -351,6 +371,20 @@ function buildCommands(manifest) {
   const adminStore = admin.store_name || 'mayhem-beta-admin';
   const paygateBase = String(paygate.public_base_url || '').replace(/\/+$/, '');
   const healthPath = String(paygate.health_path || '/v1/health');
+  const roomByLabel = new Map();
+  for (const enclave of manifest.canonical_enclaves || []) {
+    for (const room of enclave.rooms || []) {
+      roomByLabel.set(room.label, {
+        enclave,
+        room,
+        room_id: await roomIdForLaunchRoom({
+          enclaveId: enclave.enclave_id,
+          adminPubkey: admin.peer_pubkey,
+          room,
+        }),
+      });
+    }
+  }
 
   const boot = [
     `cd ${sh(appDir)}`,
@@ -386,6 +420,8 @@ function buildCommands(manifest) {
       effective_at: enclave.price_mu?.effective_at ?? 0,
     }));
     for (const room of enclave.rooms || []) {
+      const derivedRoom = roomByLabel.get(room.label);
+      if (derivedRoom?.room_id) adminTxs.push(`# room ${room.label} => ${derivedRoom.room_id}`);
       adminTxs.push(txCommand({
         op: 'open_room',
         enclave_id: enclave.enclave_id,
@@ -394,13 +430,6 @@ function buildCommands(manifest) {
         label: room.label,
         policy: room.policy || {},
       }));
-    }
-  }
-
-  const roomByLabel = new Map();
-  for (const enclave of manifest.canonical_enclaves || []) {
-    for (const room of enclave.rooms || []) {
-      roomByLabel.set(room.label, room);
     }
   }
 
@@ -491,7 +520,7 @@ async function main() {
     manifestPath,
     allowPlaceholders: args.allowPlaceholders,
   });
-  const commands = args.commands ? buildCommands(manifest) : null;
+  const commands = args.commands ? await buildCommands(manifest) : null;
 
   if (args.json) {
     console.log(JSON.stringify({ ...report, commands }, null, 2));
