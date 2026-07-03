@@ -13,7 +13,7 @@ const hex64 = /^[0-9a-fA-F]{64}$/;
 function usage() {
   console.log(`Usage: node scripts/beta-metrics-collect.mjs --window-start ISO --window-end ISO \\
   --providers PATH --users PATH --epoch PATH --guardian PATH --canary PATH \\
-  --browser-handoffs PATH --canonical-service PATH \\
+  --browser-handoffs PATH --canonical-service PATH --payment-rails PATH \\
   --commit-tx HEX --apply-tx HEX --auditor HEX [--out PATH]
 
 Normalizes beta evidence into config/beta/metrics.json, then runs the strict
@@ -24,6 +24,7 @@ Accepted evidence shapes are intentionally plain:
 - providers/users: array, { data: [] }, { providers: [] }, { users: [] }, or a count record
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
+- payment-rails: paygate/rail report proving TNK, Stripe, and Coinbase credit mu_usd
 - guardian: small summary JSON; the source file hash is recorded as evidence
 - canary: small summary JSON; the source file hash is recorded as evidence
 - browser: small summary JSON; browser handoffs may also be a text log`);
@@ -50,6 +51,7 @@ function parseArgs(argv) {
     '--canary',
     '--browser-handoffs',
     '--canonical-service',
+    '--payment-rails',
     '--commit-tx',
     '--apply-tx',
     '--auditor',
@@ -374,6 +376,27 @@ function collectCanonicalService(args) {
   };
 }
 
+function collectPaymentRails(args) {
+  const source = readJsonEvidence(requireArg(args, 'paymentRails'));
+  const value = source.value;
+  const record = firstDefined(value, ['payment_rails']) ?? value;
+  return {
+    ledger_denom: firstDefined(record, ['ledger_denom', 'denom', 'network.denom']) ?? firstDefined(value, ['network.denom']),
+    tnk_enabled: firstDefined(record, ['tnk_enabled', 'tnk.enabled', 'rails.tnk.enabled']) === true,
+    stripe_enabled:
+      firstDefined(record, ['stripe_enabled', 'stripe.enabled', 'paygate.stripe_enabled', 'rails.stripe.enabled']) === true
+      || firstDefined(value, ['paygate.stripe_enabled', 'rails.stripe.enabled']) === true,
+    coinbase_enabled:
+      firstDefined(record, ['coinbase_enabled', 'coinbase.enabled', 'paygate.coinbase_enabled', 'rails.coinbase.enabled']) === true
+      || firstDefined(value, ['paygate.coinbase_enabled', 'rails.coinbase.enabled']) === true,
+    rails_credit_mu_usd: firstDefined(record, ['rails_credit_mu_usd', 'credit_mu_usd', 'credits_mu_usd']) === true,
+    evidence: [
+      source.evidence,
+      ...asEvidenceArray(value, ['payment_rails.evidence', 'evidence']),
+    ],
+  };
+}
+
 function requireHex64(value, label) {
   if (typeof value !== 'string' || !hex64.test(value)) {
     throw new Error(`${label} must be a 64-character hex string`);
@@ -388,6 +411,7 @@ function buildMetrics(args) {
   const canary = collectCanary(args);
   const browserHandoffs = collectBrowserHandoffs(args);
   const canonicalService = collectCanonicalService(args);
+  const paymentRails = collectPaymentRails(args);
 
   for (const key of ['dep', 'use', 'earn', 'fee', 'pay']) {
     auditedEpoch.roots[key] = requireHex64(auditedEpoch.roots[key], `audited_epoch.roots.${key}`);
@@ -407,6 +431,7 @@ function buildMetrics(args) {
         network_id: 919,
       },
     },
+    payment_rails: paymentRails,
     window: {
       started_at: requireArg(args, 'windowStart'),
       ended_at: requireArg(args, 'windowEnd'),

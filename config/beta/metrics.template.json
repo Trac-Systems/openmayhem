@@ -9,6 +9,16 @@
       "network_id": 919
     }
   },
+  "payment_rails": {
+    "ledger_denom": "mu_usd",
+    "tnk_enabled": true,
+    "stripe_enabled": true,
+    "coinbase_enabled": true,
+    "rails_credit_mu_usd": true,
+    "evidence": [
+      "<payment-rails-health-or-audit-file-hash-or-url>"
+    ]
+  },
   "window": {
     "started_at": "<2026-07-03T00:00:00Z>",
     "ended_at": "<2026-07-10T00:00:00Z>"

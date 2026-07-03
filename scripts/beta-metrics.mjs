@@ -137,6 +137,15 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     }
   }
 
+  if (requireObject(add, metrics.payment_rails, 'payment_rails')) {
+    requireLiteral(add, metrics.payment_rails.ledger_denom, 'mu_usd', 'payment_rails.ledger_denom');
+    requireBoolean(add, metrics.payment_rails.tnk_enabled, true, 'payment_rails.tnk_enabled');
+    requireBoolean(add, metrics.payment_rails.stripe_enabled, true, 'payment_rails.stripe_enabled');
+    requireBoolean(add, metrics.payment_rails.coinbase_enabled, true, 'payment_rails.coinbase_enabled');
+    requireBoolean(add, metrics.payment_rails.rails_credit_mu_usd, true, 'payment_rails.rails_credit_mu_usd');
+    validateEvidenceArray(add, metrics.payment_rails.evidence, 'payment_rails.evidence');
+  }
+
   if (requireObject(add, metrics.window, 'window')) {
     requireString(add, metrics.window.started_at, 'window.started_at', isoUtc);
     requireString(add, metrics.window.ended_at, 'window.ended_at', isoUtc);
