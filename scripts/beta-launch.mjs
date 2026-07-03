@@ -151,6 +151,7 @@ function validateCheckoutUrls(add, paygate) {
     const railConfig = paygate.checkout_urls[rail];
     const prefix = `paygate.checkout_urls.${rail}`;
     if (!requireObject(add, railConfig, prefix)) continue;
+    requireOnlyKeys(add, railConfig, prefix, ['success_url', 'cancel_url']);
     requireRailCheckoutUrl(add, railConfig.success_url, `${prefix}.success_url`, rail, 'return');
     requireRailCheckoutUrl(add, railConfig.cancel_url, `${prefix}.cancel_url`, rail, 'cancel');
   }
@@ -199,19 +200,35 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   const catalog = readJson(catalogPath);
   const catalogModels = new Map((catalog.models || []).map((model) => [model.model_id, model]));
 
+  requireOnlyKeys(add, manifest, 'manifest', [
+    'schema_version',
+    'launch_id',
+    'network',
+    'controls',
+    'admin',
+    'paygate',
+    'epoch_wallet',
+    'canary',
+    'evidence',
+    'canonical_enclaves',
+    'seed_providers',
+  ]);
   requireLiteral(add, manifest.schema_version, 1, 'schema_version');
   requireString(add, manifest.launch_id, 'launch_id');
 
   if (requireObject(add, manifest.network, 'network')) {
+    requireOnlyKeys(add, manifest.network, 'network', ['name', 'denom', 'msb', 'subnet', 'dht']);
     requireLiteral(add, manifest.network.name, 'testnet1', 'network.name');
     requireLiteral(add, manifest.network.denom, 'mu_usd', 'network.denom');
     if (requireObject(add, manifest.network.msb, 'network.msb')) {
+      requireOnlyKeys(add, manifest.network.msb, 'network.msb', ['address_prefix', 'network_id', 'bootstrap', 'channel']);
       requireLiteral(add, manifest.network.msb.address_prefix, 'testtrac', 'network.msb.address_prefix');
       requireLiteral(add, manifest.network.msb.network_id, 919, 'network.msb.network_id');
       requireString(add, manifest.network.msb.bootstrap, 'network.msb.bootstrap', hex64);
       requireString(add, manifest.network.msb.channel, 'network.msb.channel');
     }
     if (requireObject(add, manifest.network.subnet, 'network.subnet')) {
+      requireOnlyKeys(add, manifest.network.subnet, 'network.subnet', ['channel', 'bootstrap']);
       requireString(add, manifest.network.subnet.channel, 'network.subnet.channel');
       if (manifest.network.subnet.bootstrap !== null && manifest.network.subnet.bootstrap !== undefined) {
         requireString(add, manifest.network.subnet.bootstrap, 'network.subnet.bootstrap', hex64);
@@ -223,9 +240,22 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
         }
       }
     }
+    if (manifest.network.dht !== undefined && requireObject(add, manifest.network.dht, 'network.dht')) {
+      requireOnlyKeys(add, manifest.network.dht, 'network.dht', ['peer_bootstrap', 'msb_bootstrap']);
+    }
   }
 
   if (requireObject(add, manifest.controls, 'controls')) {
+    requireOnlyKeys(add, manifest.controls, 'controls', [
+      'admin_controls_economy',
+      'providers_set_prices',
+      'providers_set_payout_terms',
+      'providers_submit_models',
+      'providers_create_canonical_rooms',
+      'providers_only_join_admin_rooms',
+      'provider_payout_targets_admin_verified',
+      'browser_handoffs_print_copy_paste_url',
+    ]);
     requireLiteral(add, manifest.controls.admin_controls_economy, true, 'controls.admin_controls_economy');
     requireLiteral(add, manifest.controls.providers_set_prices, false, 'controls.providers_set_prices');
     requireLiteral(add, manifest.controls.providers_set_payout_terms, false, 'controls.providers_set_payout_terms');
@@ -237,6 +267,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   }
 
   if (requireObject(add, manifest.admin, 'admin')) {
+    requireOnlyKeys(add, manifest.admin, 'admin', ['peer_pubkey', 'store_name', 'rpc_url', 'sc_bridge_url', 'sc_bridge_token_env']);
     requireString(add, manifest.admin.peer_pubkey, 'admin.peer_pubkey', pubkey64);
     requireString(add, manifest.admin.store_name, 'admin.store_name');
     requireString(add, manifest.admin.rpc_url, 'admin.rpc_url');
@@ -244,6 +275,13 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   }
 
   if (requireObject(add, manifest.paygate, 'paygate')) {
+    requireOnlyKeys(add, manifest.paygate, 'paygate', [
+      'public_base_url',
+      'health_path',
+      'stripe_enabled',
+      'coinbase_enabled',
+      'checkout_urls',
+    ]);
     requireString(add, manifest.paygate.public_base_url, 'paygate.public_base_url');
     requireString(add, manifest.paygate.health_path, 'paygate.health_path');
     requireLiteral(add, manifest.paygate.stripe_enabled, true, 'paygate.stripe_enabled');
@@ -252,6 +290,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   }
 
   if (requireObject(add, manifest.epoch_wallet, 'epoch_wallet')) {
+    requireOnlyKeys(add, manifest.epoch_wallet, 'epoch_wallet', ['address', 'min_balance_tnk_e18', 'funded', 'pays_for']);
     requireString(add, manifest.epoch_wallet.address, 'epoch_wallet.address', testtracAddress);
     if (
       typeof manifest.epoch_wallet.address === 'string' &&
@@ -267,6 +306,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   }
 
   if (requireObject(add, manifest.canary, 'canary')) {
+    requireOnlyKeys(add, manifest.canary, 'canary', ['set_id', 'path']);
     requireLiteral(add, manifest.canary.set_id, 'canary-launch-v1', 'canary.set_id');
     const canaryPath = path.join(repoRoot, manifest.canary.path || '');
     if (!fs.existsSync(canaryPath)) add('error', `canary.path does not exist: ${manifest.canary.path}`);
@@ -274,6 +314,12 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
 
   const canaryPath = path.join(repoRoot, manifest.canary?.path || '');
   if (requireObject(add, manifest.evidence, 'evidence')) {
+    requireOnlyKeys(add, manifest.evidence, 'evidence', [
+      'bootstrap_nodes',
+      'epoch_wallet_funding',
+      'seed_provider_opt_ins',
+      'canary_set',
+    ]);
     validateEvidenceArray(add, manifest.evidence.bootstrap_nodes, 'evidence.bootstrap_nodes');
     validateEvidenceArray(add, manifest.evidence.epoch_wallet_funding, 'evidence.epoch_wallet_funding');
     validateEvidenceArray(add, manifest.evidence.seed_provider_opt_ins, 'evidence.seed_provider_opt_ins');
@@ -290,6 +336,19 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
     for (const [index, enclave] of manifest.canonical_enclaves.entries()) {
       const prefix = `canonical_enclaves[${index}]`;
       if (!requireObject(add, enclave, prefix)) continue;
+      requireOnlyKeys(add, enclave, prefix, [
+        'enclave_id',
+        'model_id',
+        'backend',
+        'artifact_root',
+        'manifest_hash',
+        'binary_hash',
+        'att_tier',
+        'caps',
+        'model_ref_mu',
+        'price_mu',
+        'rooms',
+      ]);
       requireString(add, enclave.enclave_id, `${prefix}.enclave_id`);
       if (typeof enclave.enclave_id === 'string') enclaveIds.add(enclave.enclave_id);
       requireString(add, enclave.model_id, `${prefix}.model_id`);
@@ -304,10 +363,19 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
         add('error', `${prefix}.att_tier must be 1 or 2`);
       }
       if (requireObject(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`)) {
+        requireOnlyKeys(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`, ['in_per_1k', 'out_per_1k']);
         requirePositiveInteger(add, enclave.model_ref_mu.in_per_1k, `${prefix}.model_ref_mu.in_per_1k`);
         requirePositiveInteger(add, enclave.model_ref_mu.out_per_1k, `${prefix}.model_ref_mu.out_per_1k`);
       }
       if (requireObject(add, enclave.price_mu, `${prefix}.price_mu`)) {
+        requireOnlyKeys(add, enclave.price_mu, `${prefix}.price_mu`, [
+          'denom',
+          'in_per_1k',
+          'out_per_1k',
+          'per_req',
+          'min_session',
+          'effective_at',
+        ]);
         if (enclave.price_mu.denom !== undefined) {
           requireLiteral(add, enclave.price_mu.denom, 'mu_usd', `${prefix}.price_mu.denom`);
         }
@@ -327,6 +395,7 @@ function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
         for (const [roomIndex, room] of enclave.rooms.entries()) {
           const roomPrefix = `${prefix}.rooms[${roomIndex}]`;
           if (!requireObject(add, room, roomPrefix)) continue;
+          requireOnlyKeys(add, room, roomPrefix, ['label', 'nonce', 'admin_created', 'policy']);
           requireString(add, room.label, `${roomPrefix}.label`);
           requireString(add, room.nonce, `${roomPrefix}.nonce`);
           requireLiteral(add, room.admin_created, true, `${roomPrefix}.admin_created`);
