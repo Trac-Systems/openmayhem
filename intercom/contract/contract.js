@@ -2720,7 +2720,17 @@ class MayhemContract extends Contract {
     if (schedule.denom !== PRICE_DENOMINATION || current.denom !== PRICE_DENOMINATION) {
       return new Error('Provider serving requires a current mu_usd admin price.');
     }
-    if (current.enclave_id !== enclaveId || current.set_by_role !== 'admin') {
+    if (current.enclave_id !== enclaveId) {
+      return new Error('Provider serving requires a current admin-set enclave price.');
+    }
+    if (!current.set_by || typeof current.set_by !== 'string') {
+      return new Error('Provider serving requires a current admin-set enclave price.');
+    }
+    const admin = await this.get('admin');
+    if (admin !== null && current.set_by !== admin) {
+      return new Error('Provider serving requires a current price set by the current admin.');
+    }
+    if (current.set_by_role !== undefined && current.set_by_role !== 'admin') {
       return new Error('Provider serving requires a current admin-set enclave price.');
     }
     return null;

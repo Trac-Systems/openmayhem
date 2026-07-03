@@ -274,13 +274,32 @@ test('MayhemContract requires a current admin price before provider serving rows
     admin: admin.publicKey,
     txNo: 6,
   });
-  const pricedJoin = await execute(
+  let priceScheduleEntry = await storage.get(`price/${enclaveId}`);
+  priceScheduleEntry.value.current.set_by = provider.publicKey;
+  delete priceScheduleEntry.value.current.set_by_role;
+  await storage.put(`price/${enclaveId}`, priceScheduleEntry.value);
+  const providerSetPriceJoin = await execute(
     contract,
     storage,
     'joinEnclave',
     providerJoin,
     provider.publicKey,
     6
+  );
+  assert.match(providerSetPriceJoin.message, /current price set by the current admin/i);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+
+  priceScheduleEntry = await storage.get(`price/${enclaveId}`);
+  priceScheduleEntry.value.current.set_by = admin.publicKey;
+  delete priceScheduleEntry.value.current.set_by_role;
+  await storage.put(`price/${enclaveId}`, priceScheduleEntry.value);
+  const pricedJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    7
   );
   assert.equal(pricedJoin.ok, true, pricedJoin.message);
 
@@ -298,9 +317,28 @@ test('MayhemContract requires a current admin price before provider serving rows
       policy: {},
     },
     admin.publicKey,
-    7
+    8
   );
   assert.equal(opened.ok, true, opened.message);
+
+  priceScheduleEntry = await storage.get(`price/${enclaveId}`);
+  priceScheduleEntry.value.current.set_by_role = 'provider';
+  await storage.put(`price/${enclaveId}`, priceScheduleEntry.value);
+  const providerRolePriceRoomJoin = await execute(
+    contract,
+    storage,
+    'joinRoom',
+    {
+      op: 'join_room',
+      room_id: roomId,
+      enclave_id: enclaveId,
+    },
+    provider.publicKey,
+    9
+  );
+  assert.match(providerRolePriceRoomJoin.message, /current admin-set enclave price/i);
+  assert.equal(await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`), null);
+
   await storage.del(`price/${enclaveId}`);
 
   const unpricedRoomJoin = await execute(
@@ -313,7 +351,7 @@ test('MayhemContract requires a current admin price before provider serving rows
       enclave_id: enclaveId,
     },
     provider.publicKey,
-    8
+    10
   );
   assert.match(unpricedRoomJoin.message, /current admin price required/i);
   assert.equal(await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`), null);
