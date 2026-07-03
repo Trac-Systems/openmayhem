@@ -264,6 +264,23 @@ function currentPriceFor(prices, enclaveId) {
   return schedule?.current ?? schedule;
 }
 
+function verifyAdminStampedRecord(record, key, admin, fail) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    fail(`${key} admin-stamped record is missing`);
+    return false;
+  }
+  let ok = true;
+  if (record.set_by !== admin) {
+    fail(`${key} was not set by admin ${admin}`);
+    ok = false;
+  }
+  if (record.set_by_role !== 'admin') {
+    fail(`${key}.set_by_role must be admin`);
+    ok = false;
+  }
+  return ok;
+}
+
 function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
   const errors = [];
   const warnings = [];
@@ -287,6 +304,9 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
   if (openRooms.size === 0) fail('no open admin-created room records found');
   if (activeServes.length === 0) fail('no active provider serve records found');
   if (activeRoomServes.length === 0) fail('no active provider room join records found');
+
+  const adminRulesRecordsVerified = verifyAdminStampedRecord(records.get('rules/current'), 'rules/current', admin, fail);
+  const adminParamsRecordsVerified = verifyAdminStampedRecord(records.get('params/current'), 'params/current', admin, fail);
 
   let adminSetPayoutTargets = 0;
   for (const [providerId, provider] of activeProviders.entries()) {
@@ -462,6 +482,8 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
       provider_join_records_verified: ok,
       admin_price_records_verified: ok,
       admin_payout_records_verified: ok,
+      admin_rules_records_verified: ok && adminRulesRecordsVerified,
+      admin_params_records_verified: ok && adminParamsRecordsVerified,
       counts,
       evidence: [
         sourceEvidence,
@@ -476,6 +498,7 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
       providers_create_canonical_rooms: false,
       providers_only_join_admin_rooms: ok,
       provider_payout_targets_admin_verified: ok,
+      admin_rules_params_verified: ok && adminRulesRecordsVerified && adminParamsRecordsVerified,
       evidence: [
         sourceEvidence,
         `audit:admin-control-plane:v1#sha256:${summaryDigest}`,

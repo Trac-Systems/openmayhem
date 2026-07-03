@@ -43,6 +43,7 @@
     "providers_create_canonical_rooms": false,
     "providers_only_join_admin_rooms": true,
     "provider_payout_targets_admin_verified": true,
+    "admin_rules_params_verified": true,
     "evidence": [
       "<audit:admin-control-plane:v1#sha256:64-hex>"
     ]
@@ -53,6 +54,8 @@
     "provider_join_records_verified": true,
     "admin_price_records_verified": true,
     "admin_payout_records_verified": true,
+    "admin_rules_records_verified": true,
+    "admin_params_records_verified": true,
     "evidence": [
       "<file:canonical-service-audit.json#sha256:64-hex>"
     ]

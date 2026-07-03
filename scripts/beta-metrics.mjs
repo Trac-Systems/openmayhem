@@ -322,6 +322,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'controls.provider_payout_targets_admin_verified',
     );
+    requireBoolean(
+      add,
+      metrics.controls.admin_rules_params_verified,
+      true,
+      'controls.admin_rules_params_verified',
+    );
     validateEvidenceArray(add, metrics.controls.evidence, 'controls.evidence');
   }
 
@@ -355,6 +361,18 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       metrics.canonical_service.admin_payout_records_verified,
       true,
       'canonical_service.admin_payout_records_verified',
+    );
+    requireBoolean(
+      add,
+      metrics.canonical_service.admin_rules_records_verified,
+      true,
+      'canonical_service.admin_rules_records_verified',
+    );
+    requireBoolean(
+      add,
+      metrics.canonical_service.admin_params_records_verified,
+      true,
+      'canonical_service.admin_params_records_verified',
     );
     validateEvidenceArray(add, metrics.canonical_service.evidence, 'canonical_service.evidence');
   }
