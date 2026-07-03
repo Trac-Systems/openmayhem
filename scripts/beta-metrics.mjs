@@ -165,6 +165,10 @@ function hasEvidenceTag(value, tag) {
   return typeof value === 'string' && value.split('#').includes(tag);
 }
 
+function isFileEvidence(value) {
+  return typeof value === 'string' && value.startsWith('file:');
+}
+
 function checkoutUrlFromEvidence(value) {
   if (typeof value !== 'string') return null;
   const marker = '#copy_paste.checkout_url:';
@@ -196,12 +200,16 @@ function validatePaymentRailEvidence(add, value) {
   if (!Array.isArray(value)) return;
   if (value.some((item) => isPlaceholder(item))) return;
   for (const rail of ['tnk', 'stripe', 'coinbase']) {
-    if (!value.some((item) => hasEvidenceTag(item, `rail:${rail}`) && hasEvidenceTag(item, 'credits_mu_usd'))) {
-      add('error', `payment_rails.evidence must include mu_usd credit evidence for ${rail}`);
+    if (!value.some((item) => (
+      isFileEvidence(item)
+      && hasEvidenceTag(item, `rail:${rail}`)
+      && hasEvidenceTag(item, 'credits_mu_usd')
+    ))) {
+      add('error', `payment_rails.evidence must include file-bound mu_usd credit evidence for ${rail}`);
     }
   }
-  if (!value.some((item) => hasEvidenceTag(item, 'paygate_admin_controls'))) {
-    add('error', 'payment_rails.evidence must include paygate admin-control health evidence');
+  if (!value.some((item) => isFileEvidence(item) && hasEvidenceTag(item, 'paygate_admin_controls'))) {
+    add('error', 'payment_rails.evidence must include file-bound paygate admin-control health evidence');
   }
 }
 
