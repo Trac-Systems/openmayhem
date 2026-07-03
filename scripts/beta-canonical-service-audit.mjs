@@ -261,11 +261,19 @@ function adminFromRecords(records, override) {
 
 function currentPriceFor(prices, enclaveId) {
   const schedule = prices.get(enclaveId);
-  return schedule?.current ?? schedule;
+  if (!isRecord(schedule)) return null;
+  if (hasOwn(schedule, 'current') || hasOwn(schedule, 'pending')) {
+    return isRecord(schedule.current) ? schedule.current : null;
+  }
+  return schedule;
+}
+
+function isRecord(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function verifyAdminStampedRecord(record, key, admin, fail) {
-  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+  if (!isRecord(record)) {
     fail(`${key} admin-stamped record is missing`);
     return false;
   }
@@ -277,6 +285,88 @@ function verifyAdminStampedRecord(record, key, admin, fail) {
   if (record.set_by_role !== 'admin') {
     fail(`${key}.set_by_role must be admin`);
     ok = false;
+  }
+  return ok;
+}
+
+function priceScheduleRecords(schedule) {
+  if (!isRecord(schedule)) return [];
+  if (hasOwn(schedule, 'current') || hasOwn(schedule, 'pending')) {
+    return [
+      ['current', schedule.current],
+      ['pending', schedule.pending],
+    ].filter(([, record]) => record !== undefined && record !== null);
+  }
+  return [['current', schedule]];
+}
+
+function verifyPriceRecord(record, key, enclaveId, enclave, admin, fail) {
+  if (!isRecord(record)) {
+    fail(`${key} price record is missing`);
+    return false;
+  }
+  let ok = true;
+  if (record.denom !== 'mu_usd') {
+    fail(`${key} is not denominated in mu_usd`);
+    ok = false;
+  }
+  if (record.enclave_id !== enclaveId) {
+    fail(`${key} value.enclave_id mismatch`);
+    ok = false;
+  }
+  if (enclave && record.model_id !== enclave.model_id) {
+    fail(`${key} model_id does not match enclave ${enclaveId}`);
+    ok = false;
+  }
+  if (record.set_by !== admin) {
+    fail(`${key} was not set by admin ${admin}`);
+    ok = false;
+  }
+  if (record.set_by_role !== 'admin') {
+    fail(`${key}.set_by_role must be admin`);
+    ok = false;
+  }
+  for (const field of ['in_per_1k_mu', 'out_per_1k_mu', 'per_req_mu', 'min_session_mu', 'effective_at']) {
+    if (!Number.isInteger(record[field]) || record[field] < 0) {
+      fail(`${key}.${field} must be a non-negative integer`);
+      ok = false;
+    }
+  }
+  if (!Number.isInteger(record.ver) || record.ver < 1) {
+    fail(`${key}.ver must be a positive integer`);
+    ok = false;
+  }
+  return ok;
+}
+
+function verifyPriceSchedule(schedule, enclaveId, enclave, admin, fail) {
+  if (!isRecord(schedule)) {
+    fail(`price/${enclaveId} schedule is missing or invalid`);
+    return false;
+  }
+  let ok = true;
+  const structured = hasOwn(schedule, 'current') || hasOwn(schedule, 'pending');
+  if (structured) {
+    if (schedule.denom !== 'mu_usd') {
+      fail(`price/${enclaveId} schedule is not denominated in mu_usd`);
+      ok = false;
+    }
+    if (schedule.enclave_id !== enclaveId) {
+      fail(`price/${enclaveId} schedule value.enclave_id mismatch`);
+      ok = false;
+    }
+    if (enclave && schedule.model_id !== enclave.model_id) {
+      fail(`price/${enclaveId} schedule model_id does not match enclave ${enclaveId}`);
+      ok = false;
+    }
+    if (!isRecord(schedule.current)) {
+      fail(`price/${enclaveId}.current price record is missing`);
+      ok = false;
+    }
+  }
+  for (const [slot, record] of priceScheduleRecords(schedule)) {
+    const key = structured ? `price/${enclaveId}.${slot}` : `price/${enclaveId}`;
+    if (!verifyPriceRecord(record, key, enclaveId, enclave, admin, fail)) ok = false;
   }
   return ok;
 }
@@ -307,6 +397,13 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
 
   const adminRulesRecordsVerified = verifyAdminStampedRecord(records.get('rules/current'), 'rules/current', admin, fail);
   const adminParamsRecordsVerified = verifyAdminStampedRecord(records.get('params/current'), 'params/current', admin, fail);
+  const priceScheduleVerified = new Map();
+  const verifyServedPriceSchedule = (enclaveId, enclave) => {
+    if (priceScheduleVerified.has(enclaveId)) return priceScheduleVerified.get(enclaveId);
+    const verified = verifyPriceSchedule(prices.get(enclaveId), enclaveId, enclave, admin, fail);
+    priceScheduleVerified.set(enclaveId, verified);
+    return verified;
+  };
 
   let adminSetPayoutTargets = 0;
   for (const [providerId, provider] of activeProviders.entries()) {
@@ -385,13 +482,9 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     const price = currentPriceFor(prices, enclaveId);
     if (!price) {
       fail(`${entry.key} has no current admin price for enclave ${enclaveId}`);
+      if (prices.has(enclaveId)) verifyServedPriceSchedule(enclaveId, enclave);
     } else {
-      if (price.denom !== 'mu_usd') fail(`price/${enclaveId} is not denominated in mu_usd`);
-      if (price.enclave_id !== enclaveId) fail(`price/${enclaveId} value.enclave_id mismatch`);
-      if (price.model_id !== enclave.model_id) fail(`price/${enclaveId} model_id does not match enclave ${enclaveId}`);
-      if (price.set_by !== admin || price.set_by_role !== 'admin') {
-        fail(`price/${enclaveId} was not set by admin ${admin}`);
-      }
+      verifyServedPriceSchedule(enclaveId, enclave);
     }
   }
 
