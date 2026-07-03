@@ -917,6 +917,8 @@ class MayhemContract extends Contract {
     }
     if (!changed) return new Error('No enclave fields to update.');
 
+    updated.updated_by = this.address;
+    updated.updated_by_role = 'admin';
     updated.updated_at = this.tx;
     await this.put(key, updated);
     console.log('mayhem updateEnclave', updated);
@@ -949,6 +951,10 @@ class MayhemContract extends Contract {
         .filter((tombstone) => tombstone.serve_tombstoned)
         .map((tombstone) => tombstone.provider),
       retired_at: this.tx,
+      retired_by: this.address,
+      retired_by_role: 'admin',
+      updated_by: this.address,
+      updated_by_role: 'admin',
       updated_at: this.tx,
     };
     await this.put(key, updated);
@@ -1272,6 +1278,8 @@ class MayhemContract extends Contract {
         .map(({ provider, enclave_id }) => ({ provider, enclave_id })),
       updated_at: this.tx,
       closed_at: this.tx,
+      closed_by: this.address,
+      closed_by_role: 'admin',
     };
     await this.put(key, updated);
     console.log('mayhem closeRoom', updated);

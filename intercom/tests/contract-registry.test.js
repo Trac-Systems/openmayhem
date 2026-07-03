@@ -195,8 +195,12 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.equal(enclaveEntry.value.created_by_role, 'admin');
   assert.equal(enclaveEntry.value.artifact_root, updatedArtifactRoot);
   assert.equal(enclaveEntry.value.registered_at, makeTxKey(4));
+  assert.equal(enclaveEntry.value.updated_by, admin.publicKey);
+  assert.equal(enclaveEntry.value.updated_by_role, 'admin');
   assert.equal(enclaveEntry.value.updated_at, makeTxKey(9));
   assert.equal(enclaveEntry.value.retired_at, makeTxKey(9));
+  assert.equal(enclaveEntry.value.retired_by, admin.publicKey);
+  assert.equal(enclaveEntry.value.retired_by_role, 'admin');
   assert.deepEqual(enclaveEntry.value.providers, []);
   assert.deepEqual(enclaveEntry.value.tombstoned_providers, [provider.publicKey]);
 
@@ -584,8 +588,29 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   );
   assert.match(unsupportedUpdate.message, /unsupported enclave caps field.*price_ver/i);
 
+  const updatedCaps = {
+    ...catalogStyleCaps,
+    embeddings: true,
+  };
+  const validUpdate = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'a'.repeat(64),
+      caps: updatedCaps,
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(validUpdate.ok, true, validUpdate.message);
+
   const stored = await storage.get(`enclave/${'a'.repeat(64)}`);
-  assert.deepEqual(stored.value.caps, catalogStyleCaps);
+  assert.deepEqual(stored.value.caps, updatedCaps);
+  assert.equal(stored.value.updated_by, admin.publicKey);
+  assert.equal(stored.value.updated_by_role, 'admin');
+  assert.equal(stored.value.updated_at, makeTxKey(6));
 });
 
 test('MayhemContract rejects provider-authored payout and probation hints', async () => {

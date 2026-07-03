@@ -289,6 +289,19 @@ function verifyAdminStampedRecord(record, key, admin, fail) {
   return ok;
 }
 
+function verifyOptionalAdminMutation(record, key, admin, fail, byField, roleField) {
+  let ok = true;
+  if (hasOwn(record, byField) && record[byField] !== admin) {
+    fail(`${key}.${byField} was not set by admin ${admin}`);
+    ok = false;
+  }
+  if (hasOwn(record, roleField) && record[roleField] !== 'admin') {
+    fail(`${key}.${roleField} must be admin`);
+    ok = false;
+  }
+  return ok;
+}
+
 function priceScheduleRecords(schedule) {
   if (!isRecord(schedule)) return [];
   if (hasOwn(schedule, 'current') || hasOwn(schedule, 'pending')) {
@@ -431,6 +444,14 @@ function auditCanonicalService({ records, sourceEvidence, adminOverride }) {
     if (enclave.enclave_id !== enclaveId) fail(`enclave/${enclaveId} value.enclave_id mismatch`);
     if (enclave.created_by !== admin) fail(`enclave/${enclaveId} was not created by admin ${admin}`);
     if (enclave.created_by_role !== 'admin') fail(`enclave/${enclaveId}.created_by_role must be admin`);
+    verifyOptionalAdminMutation(
+      enclave,
+      `enclave/${enclaveId}`,
+      admin,
+      fail,
+      'updated_by',
+      'updated_by_role'
+    );
     if (typeof enclave.model_id !== 'string' || enclave.model_id.length === 0) {
       fail(`enclave/${enclaveId} is missing model_id`);
     }

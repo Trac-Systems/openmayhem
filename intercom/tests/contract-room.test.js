@@ -259,6 +259,8 @@ test('MayhemContract canonical room is admin-opened and provider-joined with ser
   assert.equal(closedRoom.value.status, 'closed');
   assert.equal(closedRoom.value.updated_at, makeTxKey(11));
   assert.equal(closedRoom.value.closed_at, makeTxKey(11));
+  assert.equal(closedRoom.value.closed_by, admin.publicKey);
+  assert.equal(closedRoom.value.closed_by_role, 'admin');
   assert.deepEqual(closedRoom.value.serves, []);
   assert.equal(closedRoom.value.serves_updated_at, makeTxKey(11));
   assert.deepEqual(closedRoom.value.tombstoned_serves, [{ provider: provider.publicKey, enclave_id: enclaveId }]);
