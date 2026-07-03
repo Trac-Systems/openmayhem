@@ -122,12 +122,30 @@ function validateEvidenceArray(add, value, name) {
   }
 }
 
-function validateCheckoutHandoffSamples(add, value) {
+function validateCheckoutHandoffSamples(add, value, railsVerified) {
   validateEvidenceArray(add, value, 'browser_handoffs.samples');
   if (!Array.isArray(value)) return;
   if (value.some((sample) => isPlaceholder(sample))) return;
   if (!value.some((sample) => /#copy_paste\.checkout_url:https?:\/\//i.test(sample))) {
     add('error', 'browser_handoffs.samples must include copy_paste.checkout_url evidence');
+  }
+  if (!Array.isArray(railsVerified)) return;
+  for (const rail of ['stripe', 'coinbase']) {
+    if (!railsVerified.includes(rail)) continue;
+    if (!value.some((sample) => /#copy_paste\.checkout_url:https?:\/\//i.test(sample) && sample.includes(`#rail:${rail}`))) {
+      add('error', `browser_handoffs.samples must include copy_paste.checkout_url evidence for ${rail}`);
+    }
+  }
+}
+
+function validateRequiredRails(add, value) {
+  if (!requireArray(add, value, 'browser_handoffs.rails_verified', 2)) return;
+  for (const [index, rail] of value.entries()) {
+    requireString(add, rail, `browser_handoffs.rails_verified[${index}]`);
+  }
+  if (value.some((rail) => isPlaceholder(rail))) return;
+  for (const rail of ['stripe', 'coinbase']) {
+    if (!value.includes(rail)) add('error', `browser_handoffs.rails_verified must include ${rail}`);
   }
 }
 
@@ -278,7 +296,8 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
 
   if (requireObject(add, metrics.browser_handoffs, 'browser_handoffs')) {
     requireBoolean(add, metrics.browser_handoffs.copy_paste_urls_printed, true, 'browser_handoffs.copy_paste_urls_printed');
-    validateCheckoutHandoffSamples(add, metrics.browser_handoffs.samples);
+    validateRequiredRails(add, metrics.browser_handoffs.rails_verified);
+    validateCheckoutHandoffSamples(add, metrics.browser_handoffs.samples, metrics.browser_handoffs.rails_verified);
   }
 
   if (metrics.tracker?.metrics_recorded !== true) {

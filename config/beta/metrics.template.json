@@ -98,8 +98,12 @@
   },
   "browser_handoffs": {
     "copy_paste_urls_printed": true,
+    "rails_verified": [
+      "stripe",
+      "coinbase"
+    ],
     "samples": [
-      "<checkout-log-hash-with-copy-paste-checkout-url>"
+      "<checkout-log-hash-with-copy-paste-checkout-urls-for-stripe-and-coinbase>"
     ]
   },
   "tracker": {

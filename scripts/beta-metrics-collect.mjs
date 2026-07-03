@@ -160,32 +160,57 @@ function checkoutUrlFromPayReport(value) {
   return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : null;
 }
 
-function checkoutUrlsFromText(text) {
-  const urls = [];
+function normalizeRail(value) {
+  const normalized = typeof value === 'string' ? value.toLowerCase() : value;
+  return normalized === 'stripe' || normalized === 'coinbase' ? normalized : null;
+}
+
+function railFromUrl(url) {
+  if (/stripe\.com/i.test(url)) return 'stripe';
+  if (/coinbase\.com/i.test(url)) return 'coinbase';
+  return null;
+}
+
+function checkoutRecordsFromText(text) {
+  const records = [];
   const pattern = /Copy\/paste checkout URL:\s*(https?:\/\/\S+)/gi;
   let match = pattern.exec(text);
   while (match) {
-    urls.push(match[1].replace(/[),.;]+$/g, ''));
+    const prefix = text.slice(Math.max(0, match.index - 160), match.index);
+    const railMatches = Array.from(prefix.matchAll(/Mayhem\s+(stripe|coinbase)\s+checkout/gi));
+    const railMatch = railMatches.at(-1);
+    const url = match[1].replace(/[),.;]+$/g, '');
+    records.push({ url, rail: normalizeRail(railMatch?.[1]) ?? railFromUrl(url) });
     match = pattern.exec(text);
   }
-  return urls;
+  return records;
 }
 
-function checkoutUrlEvidence(urls, sourceEvidence) {
-  return urls.map((url) => `${sourceEvidence}#copy_paste.checkout_url:${url}`);
+function checkoutUrlEvidence(records, sourceEvidence) {
+  return records.map(({ url, rail }) => {
+    const suffix = rail ? `#rail:${rail}` : '';
+    return `${sourceEvidence}#copy_paste.checkout_url:${url}${suffix}`;
+  });
 }
 
-function checkoutUrlEvidenceFromJson(value, sourceEvidence) {
+function checkoutRecordsFromJson(value) {
   const records = Array.isArray(value)
     ? value
     : (asArrayFrom(value, ['browser_handoffs.reports', 'reports', 'data']) ?? [value]);
-  const samples = [];
+  const checkoutRecords = [];
   for (const record of records) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
     const url = checkoutUrlFromPayReport(record);
-    if (url) samples.push(...checkoutUrlEvidence([url], sourceEvidence));
+    if (url) {
+      const rail = normalizeRail(firstDefined(record, ['rail', 'checkout.rail'])) ?? railFromUrl(url);
+      checkoutRecords.push({ url, rail });
+    }
   }
-  return samples;
+  return checkoutRecords;
+}
+
+function railsFromCheckoutRecords(records) {
+  return Array.from(new Set(records.map((record) => record.rail).filter(Boolean))).sort();
 }
 
 function stableJson(value) {
@@ -348,13 +373,18 @@ function collectCanary(args) {
 function collectBrowserHandoffs(args) {
   const source = parseMaybeJsonEvidence(requireArg(args, 'browserHandoffs'));
   if (source.value && typeof source.value === 'object') {
-    const checkoutSamples = checkoutUrlEvidenceFromJson(source.value, source.evidence);
+    const checkoutRecords = checkoutRecordsFromJson(source.value);
+    const checkoutSamples = checkoutUrlEvidence(checkoutRecords, source.evidence);
     const explicitCopyPaste = firstDefined(source.value, [
       'browser_handoffs.copy_paste_urls_printed',
       'copy_paste_urls_printed',
     ]);
+    const explicitRails = asArrayFrom(source.value, ['browser_handoffs.rails_verified', 'rails_verified'])
+      ?.map(normalizeRail)
+      .filter(Boolean) ?? [];
     return {
       copy_paste_urls_printed: explicitCopyPaste === true || checkoutSamples.length > 0,
+      rails_verified: Array.from(new Set([...railsFromCheckoutRecords(checkoutRecords), ...explicitRails])).sort(),
       samples: [
         source.evidence,
         ...checkoutSamples,
@@ -362,9 +392,11 @@ function collectBrowserHandoffs(args) {
       ],
     };
   }
-  const checkoutSamples = checkoutUrlEvidence(checkoutUrlsFromText(source.text), source.evidence);
+  const checkoutRecords = checkoutRecordsFromText(source.text);
+  const checkoutSamples = checkoutUrlEvidence(checkoutRecords, source.evidence);
   return {
     copy_paste_urls_printed: checkoutSamples.length > 0,
+    rails_verified: railsFromCheckoutRecords(checkoutRecords),
     samples: [source.evidence, ...checkoutSamples],
   };
 }
