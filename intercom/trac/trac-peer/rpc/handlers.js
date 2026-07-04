@@ -8,6 +8,7 @@ import {
   contractGenerateNonce,
   contractPrepareTx,
   contractTx,
+  contractFeature,
 } from "./services.js";
 
 export async function handleHealth({ respond }) {
@@ -67,6 +68,17 @@ export async function handleContractTx({ req, respond, peer, maxBodyBytes }) {
     signature: body.signature,
     nonce: body.nonce,
     sim: body.sim,
+  });
+  respond(200, payload);
+}
+
+export async function handleContractFeature({ req, respond, peer, maxBodyBytes }) {
+  const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
+  if (!body || typeof body !== "object") return respond(400, { error: "Missing JSON body." });
+  const payload = await contractFeature(peer, {
+    feature: body.feature,
+    key: body.key,
+    value: body.value,
   });
   respond(200, payload);
 }

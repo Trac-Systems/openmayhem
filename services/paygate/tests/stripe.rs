@@ -31,6 +31,14 @@ struct StripeRequest {
     body: String,
 }
 
+fn requested_currency(body: &str) -> &'static str {
+    if body.contains("currency=eur") || body.contains("currency%5D=eur") {
+        "eur"
+    } else {
+        "usd"
+    }
+}
+
 #[derive(Clone, Default)]
 struct RecordingContractPoster {
     deposits: Arc<Mutex<Vec<FiatDepositFeature>>>,
@@ -54,6 +62,8 @@ impl ContractPoster for RecordingContractPoster {
                     "rail": feature.rail,
                     "who": feature.who,
                     "mu": feature.mu,
+                    "fiat_currency": feature.fiat_currency,
+                    "fiat_amount_minor": feature.fiat_amount_minor,
                     "epoch": feature.epoch,
                     "deposit_root": "3".repeat(64),
                 }),
@@ -77,6 +87,8 @@ impl ContractPoster for RecordingContractPoster {
                     "rail": feature.rail,
                     "who": feature.who,
                     "mu": feature.mu,
+                    "fiat_currency": feature.fiat_currency,
+                    "fiat_amount_minor": feature.fiat_amount_minor,
                     "clawback_mu": feature.mu,
                     "network_absorbed_mu": 0,
                     "deposit_root": "6".repeat(64),
@@ -92,6 +104,7 @@ async fn mock_create_payment_intent(
     body: Bytes,
 ) -> Json<Value> {
     let body = String::from_utf8(body.to_vec()).expect("form body utf8");
+    let currency = requested_currency(&body);
     capture.requests.lock().await.push(StripeRequest {
         authorization: headers
             .get("authorization")
@@ -107,7 +120,7 @@ async fn mock_create_payment_intent(
         "id": "pi_test_123",
         "object": "payment_intent",
         "amount": 250,
-        "currency": "usd",
+        "currency": currency,
         "client_secret": "pi_test_123_secret_abc",
         "status": "requires_payment_method"
     }))
@@ -119,6 +132,7 @@ async fn mock_create_checkout_session(
     body: Bytes,
 ) -> Json<Value> {
     let body = String::from_utf8(body.to_vec()).expect("form body utf8");
+    let currency = requested_currency(&body);
     capture.requests.lock().await.push(StripeRequest {
         authorization: headers
             .get("authorization")
@@ -135,7 +149,7 @@ async fn mock_create_checkout_session(
         "object": "checkout.session",
         "url": "https://checkout.stripe.com/c/pay/cs_test_123",
         "amount_total": 250,
-        "currency": "usd",
+        "currency": currency,
         "payment_intent": "pi_test_123",
         "payment_status": "unpaid",
         "status": "open",
@@ -230,6 +244,7 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
         json!({
             "who": "a".repeat(64),
             "mu": 2_500_000u64,
+            "currency": "eur",
             "idempotency_key": "stripe-route-test-1"
         }),
     )
@@ -240,6 +255,7 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
     assert_eq!(body["denom"], "mu_usd");
     assert_eq!(body["payment_intent"]["id"], "pi_test_123");
     assert_eq!(body["payment_intent"]["amount"], 250);
+    assert_eq!(body["payment_intent"]["currency"], "eur");
 
     let requests = capture.requests.lock().await;
     assert_eq!(requests.len(), 1);
@@ -253,7 +269,7 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
         Some("stripe-route-test-1")
     );
     assert!(requests[0].body.contains("amount=250"));
-    assert!(requests[0].body.contains("currency=usd"));
+    assert!(requests[0].body.contains("currency=eur"));
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_who%5D=aaaaaaaa"));
@@ -261,6 +277,12 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_denom%5D=mu_usd"));
+    assert!(requests[0]
+        .body
+        .contains("metadata%5Bmayhem_fiat_currency%5D=eur"));
+    assert!(requests[0]
+        .body
+        .contains("metadata%5Bmayhem_fiat_amount_minor%5D=250"));
 }
 
 #[tokio::test]
@@ -285,6 +307,8 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
             "mu": 2_500_000u64,
             "success_url": "http://127.0.0.1:11436/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}",
             "cancel_url": "http://127.0.0.1:11436/v1/stripe/cancel",
+            "currency": "usd",
+            "locale": "en",
             "idempotency_key": "stripe-checkout-test-1"
         }),
     )
@@ -316,12 +340,19 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
         Some("stripe-checkout-test-1")
     );
     assert!(requests[0].body.contains("mode=payment"));
+    assert!(requests[0].body.contains("locale=en"));
     assert!(requests[0]
         .body
         .contains("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=250"));
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_denom%5D=mu_usd"));
+    assert!(requests[0]
+        .body
+        .contains("metadata%5Bmayhem_fiat_currency%5D=usd"));
+    assert!(requests[0]
+        .body
+        .contains("metadata%5Bmayhem_fiat_amount_minor%5D=250"));
     assert!(requests[0]
         .body
         .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_who%5D=aaaaaaaa"));
@@ -331,6 +362,12 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
     assert!(requests[0]
         .body
         .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_denom%5D=mu_usd"));
+    assert!(requests[0]
+        .body
+        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_fiat_currency%5D=usd"));
+    assert!(requests[0]
+        .body
+        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_fiat_amount_minor%5D=250"));
 }
 
 #[tokio::test]
@@ -362,7 +399,9 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
                 "metadata": {
                     "mayhem_who": "b".repeat(64),
                     "mayhem_mu": "2500000",
-                    "mayhem_denom": "mu_usd"
+                    "mayhem_denom": "mu_usd",
+                    "mayhem_fiat_currency": "usd",
+                    "mayhem_fiat_amount_minor": "250"
                 }
             }
         }
@@ -399,6 +438,8 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
     assert_eq!(deposits[0].rail, "stripe");
     assert_eq!(deposits[0].who, "b".repeat(64));
     assert_eq!(deposits[0].mu, 2_500_000);
+    assert_eq!(deposits[0].fiat_currency, "usd");
+    assert_eq!(deposits[0].fiat_amount_minor, 250);
     assert_eq!(deposits[0].epoch, 2);
     assert_eq!(deposits[0].at, 3_600);
     assert_eq!(deposits[0].ext_ref_hash.len(), 64);
@@ -438,7 +479,9 @@ async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
                 "metadata": {
                     "mayhem_who": "c".repeat(64),
                     "mayhem_mu": "2500000",
-                    "mayhem_denom": "mu_usd"
+                    "mayhem_denom": "mu_usd",
+                    "mayhem_fiat_currency": "usd",
+                    "mayhem_fiat_amount_minor": "250"
                 }
             }
         }
@@ -519,6 +562,8 @@ async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
     assert_eq!(chargebacks[0].rail, "stripe");
     assert_eq!(chargebacks[0].who, "c".repeat(64));
     assert_eq!(chargebacks[0].mu, 2_500_000);
+    assert_eq!(chargebacks[0].fiat_currency, "usd");
+    assert_eq!(chargebacks[0].fiat_amount_minor, 250);
     assert_eq!(chargebacks[0].ext_ref_hash, deposits[0].ext_ref_hash);
     assert_eq!(chargebacks[0].dispute_ref_hash.len(), 64);
     assert_eq!(chargebacks[0].epoch, 3);
@@ -560,7 +605,9 @@ async fn stripe_dispute_cannot_claw_back_more_than_original_deposit() {
                 "metadata": {
                     "mayhem_who": "d".repeat(64),
                     "mayhem_mu": "2500000",
-                    "mayhem_denom": "mu_usd"
+                    "mayhem_denom": "mu_usd",
+                    "mayhem_fiat_currency": "usd",
+                    "mayhem_fiat_amount_minor": "250"
                 }
             }
         }

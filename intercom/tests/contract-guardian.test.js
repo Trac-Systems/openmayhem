@@ -78,7 +78,7 @@ async function setupGuardianContract() {
       value: {
         op: 'rate_oracle',
         tnk_usd_e6: 2_000_000,
-        source: 'coinbase-spot',
+        source: 'gate-spot',
         ts: 1_000,
       },
       sender: admin.publicKey,
@@ -192,7 +192,7 @@ test('MayhemContract guardian halts payoutConfirm on stale rates', async () => {
     storage,
     'payoutConfirm',
     payoutConfirm(provider.publicKey, {
-      at: 1_901,
+      at: 3_701,
       mu: 1_000_000,
       tnk_e18: '500000000000000000',
     }),

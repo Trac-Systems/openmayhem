@@ -1,0 +1,653 @@
+#!/usr/bin/env node
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/blake3.mjs';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const defaultOutDir = '.mayhem-local/p8.5-synthetic';
+const testtracAddress = 'testtrac1n57xm5deqnmzrwmzymvandzvkekkshjpaygcvpdkuwzqr4862rus5lyrjg';
+const modelId = 'meta/llama-3.1-8b-instruct@4bit';
+const backend = 'llama.cpp';
+const artifactRoot = '7144a17813133c78ba2831b7926ff04cfef830a3ca86834baed2e8abc70bac02';
+const msbBootstrap = 'c184f4ad8e9cf5e911f9415b60e7dcfb30aed73ebd8a402ef68e1b154624f5ef';
+const msbChannel = '1111trac1network1msb1testnet1111';
+const syntheticWindowStart = '2026-07-04T00:00:00Z';
+const syntheticWindowEnd = '2026-07-11T00:00:00Z';
+
+function usage() {
+  console.log(`Usage: node scripts/beta-synthetic-metrics-smoke.mjs [--out-dir PATH] [--tracker-recorded] [--json]
+
+Builds a deterministic P8.5 synthetic beta metrics rehearsal under an ignored
+local directory, runs the canonical-service audit, collects metrics, and runs
+the strict metrics validator. Use --tracker-recorded only after the validated
+result is being recorded in docs/TRACKER.md.`);
+}
+
+function parseArgs(argv) {
+  const args = {
+    outDir: defaultOutDir,
+    trackerRecorded: false,
+    json: false,
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--out-dir') {
+      i += 1;
+      if (!argv[i]) throw new Error('--out-dir requires a path');
+      args.outDir = argv[i];
+    } else if (arg === '--tracker-recorded') {
+      args.trackerRecorded = true;
+    } else if (arg === '--json') {
+      args.json = true;
+    } else if (arg === '-h' || arg === '--help') {
+      usage();
+      process.exit(0);
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+  return args;
+}
+
+function resolveOut(filePath) {
+  return path.isAbsolute(filePath) ? filePath : path.resolve(repoRoot, filePath);
+}
+
+function relativeFile(filePath) {
+  const rel = path.relative(repoRoot, filePath);
+  return rel.startsWith('..') ? filePath : rel;
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hex(label) {
+  return crypto.createHash('sha256').update(`mayhem-p8.5:${label}`).digest('hex');
+}
+
+function hex128(label) {
+  return `${hex(`${label}:0`)}${hex(`${label}:1`)}`;
+}
+
+async function blake3Hex(text) {
+  const digest = await blake3(Buffer.from(text));
+  return Buffer.from(digest).toString('hex');
+}
+
+async function deriveCatalogEnclaveId(adminPubkey, enclave) {
+  return blake3Hex(`${adminPubkey}${enclave.model_id}${enclave.artifact_root}${enclave.manifest_hash}${enclave.binary_hash}`);
+}
+
+async function deriveRoomId(enclaveId, adminPubkey, nonce) {
+  return (await blake3Hex(`${enclaveId}${adminPubkey}${nonce}`)).slice(0, 32);
+}
+
+function writeJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+  return filePath;
+}
+
+function writeText(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, value);
+  return filePath;
+}
+
+function fileEvidence(filePath, tags = []) {
+  const bytes = fs.readFileSync(filePath);
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+  const suffix = tags.length > 0 ? `#${tags.join('#')}` : '';
+  return `file:${relativeFile(filePath)}#sha256:${sha256}${suffix}`;
+}
+
+function run(command, args, { json = false } = {}) {
+  const child = spawnSync(command, args, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  if (child.status !== 0) {
+    const details = `${child.stdout || ''}${child.stderr || ''}`.trim();
+    throw new Error(`${[command, ...args].join(' ')} failed${details ? `:\n${details}` : ''}`);
+  }
+  return json ? JSON.parse(child.stdout) : child.stdout;
+}
+
+function normalizeCanonicalAudit(filePath) {
+  const audit = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  audit.generated_at = syntheticWindowStart;
+  writeJson(filePath, audit);
+}
+
+function providerPubkey(index) {
+  return hex(`provider:${String(index).padStart(2, '0')}`);
+}
+
+function userPubkey(index) {
+  return hex(`user:${String(index).padStart(3, '0')}`);
+}
+
+function buildParticipants(outDir, providerIds) {
+  const providerRows = providerIds.map((provider, index) => ({
+    provider,
+    role: 'provider',
+    joined_enclave: true,
+    synthetic: true,
+    ordinal: index,
+  }));
+  const userRows = Array.from({ length: 100 }, (_, index) => ({
+    user: userPubkey(index),
+    sessions: 1 + (index % 3),
+    mu_usd_spend: 100 + index,
+    synthetic: true,
+  }));
+  return {
+    providers: writeJson(path.join(outDir, 'provider-roster.json'), { providers: providerRows }),
+    users: writeJson(path.join(outDir, 'user-activity.json'), { users: userRows }),
+  };
+}
+
+function buildPaymentRailEvidence(outDir) {
+  const paygateHealth = writeJson(path.join(outDir, 'paygate-health.json'), {
+    ok: true,
+    paygate_admin_controls_verified: true,
+    stripe_enabled: true,
+    coinbase_enabled: false,
+    ledger_denom: 'mu_usd',
+  });
+  const tnkCredit = writeJson(path.join(outDir, 'tnk-credit-proof.json'), {
+    rail: 'tnk',
+    ledger_denom: 'mu_usd',
+    credits_mu_usd: true,
+    evidence_kind: 'synthetic-p8.5-credit',
+  });
+  const stripeCredit = writeJson(path.join(outDir, 'stripe-credit-proof.json'), {
+    rail: 'stripe',
+    ledger_denom: 'mu_usd',
+    credits_mu_usd: true,
+    evidence_kind: 'synthetic-p8.5-credit',
+  });
+  return writeJson(path.join(outDir, 'payment-rails-report.json'), {
+    payment_rails: {
+      ledger_denom: 'mu_usd',
+      tnk_enabled: true,
+      stripe_enabled: true,
+      coinbase_enabled: false,
+      rails_credit_mu_usd: true,
+      paygate_admin_controls_verified: true,
+      evidence: [
+        fileEvidence(paygateHealth, ['paygate_admin_controls']),
+        fileEvidence(tnkCredit, ['rail:tnk', 'credits_mu_usd']),
+        fileEvidence(stripeCredit, ['rail:stripe', 'credits_mu_usd']),
+      ],
+    },
+  });
+}
+
+function buildEpochEvidence(outDir) {
+  return writeJson(path.join(outDir, 'epoch-roots.json'), {
+    epoch: 85,
+    roots: {
+      dep: hex('epoch:dep'),
+      use: hex('epoch:use'),
+      earn: hex('epoch:earn'),
+      fee: hex('epoch:fee'),
+      pay: hex('epoch:pay'),
+    },
+    params: {
+      fee_bps: 1500,
+    },
+    checks: [
+      { name: 'receipt_roots_recomputed', ok: true },
+      { name: 'payout_evidence_recomputed', ok: true },
+      { name: 'fee_split_matches_admin_params', ok: true },
+    ],
+    payout_evidence_verified: true,
+  });
+}
+
+function buildGuardianEvidence(outDir) {
+  return writeJson(path.join(outDir, 'guardian-report.json'), {
+    trips: 0,
+    conservation_ok: true,
+    monotonic_epochs: true,
+    checked_epochs: [84, 85],
+  });
+}
+
+function buildCanaryEvidence(outDir) {
+  return writeJson(path.join(outDir, 'canary-report.json'), {
+    set_id: 'canary-launch-v1',
+    probes: 3,
+    failures: 0,
+    probe_records: [
+      { probe_id: 'synthetic-canary-0', pass: true },
+      { probe_id: 'synthetic-canary-1', pass: true },
+      { probe_id: 'synthetic-canary-2', pass: true },
+    ],
+  });
+}
+
+function buildBrowserHandoffs(outDir) {
+  return writeText(path.join(outDir, 'checkout-handoffs.log'), [
+    'Mayhem stripe checkout',
+    'Copy/paste checkout URL: https://checkout.stripe.com/c/pay/cs_test_p85_synthetic',
+    '',
+  ].join('\n'));
+}
+
+async function buildLaunchManifest(outDir, adminPubkey, providerIds) {
+  const manifestHash = hex('enclave:manifest');
+  const binaryHash = hex('enclave:binary');
+  const enclave = {
+    enclave_id: '',
+    model_id: modelId,
+    backend,
+    artifact_root: artifactRoot,
+    manifest_hash: manifestHash,
+    binary_hash: binaryHash,
+  };
+  enclave.enclave_id = await deriveCatalogEnclaveId(adminPubkey, enclave);
+  const roomNonce = 'p8.5-synthetic-launch-us-east';
+  const roomId = await deriveRoomId(enclave.enclave_id, adminPubkey, roomNonce);
+
+  const evidenceDir = path.join(outDir, 'launch-evidence');
+  const bootstrapEvidence = writeJson(path.join(evidenceDir, 'bootstrap-health.json'), {
+    ok: true,
+    peer_bootstrap: true,
+    msb_bootstrap: true,
+  });
+  const epochWalletEvidence = writeJson(path.join(evidenceDir, 'epoch-wallet-funding.json'), {
+    address: testtracAddress,
+    funded: true,
+    balance_tnk: '4',
+  });
+  const seedProviderEvidence = writeJson(path.join(evidenceDir, 'seed-provider-opt-ins.json'), {
+    providers: providerIds,
+    enclave_id: enclave.enclave_id,
+    room_id: roomId,
+    free_feature_lifecycle_records: true,
+  });
+  const downloadEvidence = writeJson(path.join(evidenceDir, 'enclave-downloads.json'), {
+    enclave_id: enclave.enclave_id,
+    bundle_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.tar.zst`,
+    manifest_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.json`,
+    admin_signed: true,
+  });
+
+  const manifest = {
+    schema_version: 1,
+    launch_id: 'mayhem-testnet-beta-v1',
+    network: {
+      name: 'testnet1',
+      denom: 'mu_usd',
+      msb: {
+        address_prefix: 'testtrac',
+        network_id: 919,
+        bootstrap: msbBootstrap,
+        channel: msbChannel,
+      },
+      subnet: {
+        channel: 'mayhem-testnet-beta-v1',
+        bootstrap: hex('subnet-bootstrap'),
+      },
+      dht: {
+        peer_bootstrap: [
+          '116.202.214.149:10001',
+          '157.180.12.214:10001',
+          'node1.hyperdht.org:49737',
+        ],
+        msb_bootstrap: [
+          '116.202.214.149:10001',
+          '157.180.12.214:10001',
+          'node1.hyperdht.org:49737',
+        ],
+      },
+    },
+    controls: {
+      admin_controls_economy: true,
+      admin_sets_prices: true,
+      admin_sets_rules: true,
+      admin_sets_params: true,
+      admin_sets_provider_payout_targets: true,
+      admin_can_ban_providers: true,
+      providers_set_prices: false,
+      providers_set_rules: false,
+      providers_set_params: false,
+      providers_set_payout_terms: false,
+      providers_submit_models: false,
+      providers_create_canonical_rooms: false,
+      providers_only_join_admin_rooms: true,
+      provider_payout_targets_admin_verified: true,
+      browser_handoffs_print_copy_paste_url: true,
+    },
+    admin: {
+      peer_pubkey: adminPubkey,
+      store_name: 'mayhem-beta-admin',
+      rpc_url: 'http://127.0.0.1:49223/v1',
+      sc_bridge_url: 'ws://127.0.0.1:49222',
+      sc_bridge_token_env: 'MAYHEM_BETA_SC_TOKEN',
+    },
+    paygate: {
+      public_base_url: 'https://paygate.trac.network',
+      health_path: '/v1/health',
+      tnk_treasury_address: testtracAddress,
+      stripe_enabled: true,
+      coinbase_enabled: false,
+      checkout_urls: {
+        stripe: {
+          success_url: 'https://paygate.trac.network/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}',
+          cancel_url: 'https://paygate.trac.network/v1/stripe/cancel',
+        },
+      },
+    },
+    epoch_wallet: {
+      address: testtracAddress,
+      min_balance_tnk_e18: '1000000000000000000',
+      funded: true,
+      pays_for: [
+        'epoch_commit',
+        'payment_proof_rollup',
+        'payout_fee_sweep',
+      ],
+    },
+    canary: {
+      set_id: 'canary-launch-v1',
+      path: 'catalog/canaries/canary-launch-v1.json',
+    },
+    evidence: {
+      bootstrap_nodes: [fileEvidence(bootstrapEvidence)],
+      epoch_wallet_funding: [fileEvidence(epochWalletEvidence)],
+      seed_provider_opt_ins: [fileEvidence(seedProviderEvidence)],
+      enclave_downloads: [fileEvidence(downloadEvidence)],
+      canary_set: [fileEvidence(path.join(repoRoot, 'catalog/canaries/canary-launch-v1.json'))],
+    },
+    canonical_enclaves: [
+      {
+        enclave_id: enclave.enclave_id,
+        model_id: enclave.model_id,
+        backend: enclave.backend,
+        artifact_root: enclave.artifact_root,
+        manifest_hash: enclave.manifest_hash,
+        binary_hash: enclave.binary_hash,
+        att_tier: 1,
+        caps: {
+          chat: true,
+          tools: true,
+          json: true,
+          ctx: 131072,
+        },
+        distribution: {
+          bundle_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.tar.zst`,
+          manifest_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.json`,
+          bundle_sha256: hex('distribution:bundle'),
+          bundle_bytes: 1024,
+          admin_signature: hex128('distribution:admin-signature'),
+        },
+        model_ref_mu: {
+          in_per_1k: 18,
+          out_per_1k: 55,
+        },
+        price_mu: {
+          denom: 'mu_usd',
+          in_per_1k: 18,
+          out_per_1k: 55,
+          per_req: 0,
+          min_session: 100,
+          effective_at: 21600,
+        },
+        rooms: [
+          {
+            label: 'launch-us-east',
+            nonce: roomNonce,
+            admin_created: true,
+            policy: {
+              region_hint: 'us-east',
+              canary_set: 'canary-launch-v1',
+            },
+          },
+        ],
+      },
+    ],
+    seed_providers: providerIds.map((provider) => ({
+      provider_pubkey: provider,
+      payout: {
+        admin_approved: true,
+        method: 'tnk',
+        addr: testtracAddress,
+      },
+      joins: [
+        {
+          enclave_id: enclave.enclave_id,
+          rooms: ['launch-us-east'],
+        },
+      ],
+    })),
+  };
+
+  const manifestPath = writeJson(path.join(outDir, 'testnet.json'), manifest);
+  return { manifestPath, enclave, roomId, roomNonce };
+}
+
+function buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomId) {
+  const roomServeIndex = providerIds.map((provider) => ({
+    provider,
+    enclave_id: enclave.enclave_id,
+  }));
+  const snapshot = {
+    admin: adminPubkey,
+    'rules/current': {
+      ver: 1,
+      hash: hex('rules:v1'),
+      set_by: adminPubkey,
+      set_by_role: 'admin',
+    },
+    'params/current': {
+      fee_bps: 1500,
+      set_by: adminPubkey,
+      set_by_role: 'admin',
+    },
+    providers: providerIds.map((provider) => ({
+      provider,
+      status: 'active',
+      registered_by: provider,
+      enclaves: [enclave.enclave_id],
+      payout: {
+        method: 'tnk',
+        addr: testtracAddress,
+        set_by: adminPubkey,
+        set_by_role: 'admin',
+      },
+    })),
+    enclaves: [
+      {
+        enclave_id: enclave.enclave_id,
+        model_id: enclave.model_id,
+        backend: enclave.backend,
+        artifact_root: enclave.artifact_root,
+        manifest_hash: enclave.manifest_hash,
+        binary_hash: enclave.binary_hash,
+        att_tier: 1,
+        status: 'active',
+        created_by: adminPubkey,
+        created_by_role: 'admin',
+        providers: providerIds,
+      },
+    ],
+    rooms: [
+      {
+        room_id: roomId,
+        model_id: enclave.model_id,
+        enclave_id: enclave.enclave_id,
+        status: 'open',
+        creator: adminPubkey,
+        creator_role: 'admin',
+        sidechannel: `mx/room/${roomId}`,
+        serves: roomServeIndex,
+      },
+    ],
+    serves: providerIds.map((provider) => ({
+      provider,
+      enclave_id: enclave.enclave_id,
+      model_id: enclave.model_id,
+      status: 'active',
+      rooms: [roomId],
+    })),
+    roomserve: providerIds.map((provider) => ({
+      room_id: roomId,
+      provider,
+      enclave_id: enclave.enclave_id,
+      model_id: enclave.model_id,
+      status: 'active',
+      sidechannel: `mx/room/${roomId}`,
+    })),
+    prices: [
+      {
+        enclave_id: enclave.enclave_id,
+        model_id: enclave.model_id,
+        denom: 'mu_usd',
+        current: {
+          enclave_id: enclave.enclave_id,
+          model_id: enclave.model_id,
+          denom: 'mu_usd',
+          in_per_1k_mu: 18,
+          out_per_1k_mu: 55,
+          per_req_mu: 0,
+          min_session_mu: 100,
+          effective_at: 21600,
+          ver: 1,
+          set_by: adminPubkey,
+          set_by_role: 'admin',
+        },
+      },
+    ],
+  };
+  return writeJson(path.join(outDir, 'contract-state.json'), snapshot);
+}
+
+async function buildSyntheticBundle(args) {
+  const outDir = resolveOut(args.outDir);
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const adminPubkey = hex('admin');
+  const providerIds = Array.from({ length: 20 }, (_, index) => providerPubkey(index));
+  const { manifestPath, enclave, roomId } = await buildLaunchManifest(outDir, adminPubkey, providerIds);
+  const snapshotPath = buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomId);
+  const participantPaths = buildParticipants(outDir, providerIds);
+  const paymentRailsPath = buildPaymentRailEvidence(outDir);
+  const epochPath = buildEpochEvidence(outDir);
+  const guardianPath = buildGuardianEvidence(outDir);
+  const canaryPath = buildCanaryEvidence(outDir);
+  const browserHandoffsPath = buildBrowserHandoffs(outDir);
+  const canonicalAuditPath = path.join(outDir, 'canonical-service-audit.json');
+  const metricsPath = path.join(outDir, 'metrics.json');
+
+  run(process.execPath, [
+    'scripts/beta-canonical-service-audit.mjs',
+    '--snapshot',
+    relativeFile(snapshotPath),
+    '--catalog',
+    'catalog/models.json',
+    '--catalog-signature',
+    'catalog/signatures/models.json.sig',
+    '--catalog-key-dir',
+    'catalog/keys',
+    '--out',
+    relativeFile(canonicalAuditPath),
+  ]);
+  normalizeCanonicalAudit(canonicalAuditPath);
+
+  const collectArgs = [
+    'scripts/beta-metrics-collect.mjs',
+    '--window-start',
+    syntheticWindowStart,
+    '--window-end',
+    syntheticWindowEnd,
+    '--launch-manifest',
+    relativeFile(manifestPath),
+    '--providers',
+    relativeFile(participantPaths.providers),
+    '--users',
+    relativeFile(participantPaths.users),
+    '--epoch',
+    relativeFile(epochPath),
+    '--guardian',
+    relativeFile(guardianPath),
+    '--canary',
+    relativeFile(canaryPath),
+    '--browser-handoffs',
+    relativeFile(browserHandoffsPath),
+    '--canonical-service',
+    relativeFile(canonicalAuditPath),
+    '--payment-rails',
+    relativeFile(paymentRailsPath),
+    '--commit-tx',
+    hex('epoch:commit-tx'),
+    '--apply-tx',
+    hex('epoch:apply-tx'),
+    '--auditor',
+    hex('auditor:0'),
+    '--out',
+    relativeFile(metricsPath),
+  ];
+  if (args.trackerRecorded) collectArgs.push('--tracker-recorded');
+  const collector = run(process.execPath, collectArgs, { json: false });
+  const report = run(process.execPath, [
+    'scripts/beta-metrics.mjs',
+    '--metrics',
+    relativeFile(metricsPath),
+    '--json',
+  ], { json: true });
+
+  return {
+    ok: report.ok === true,
+    out_dir: outDir,
+    launch_manifest: manifestPath,
+    contract_snapshot: snapshotPath,
+    canonical_service_audit: canonicalAuditPath,
+    metrics: metricsPath,
+    providers: 20,
+    users: 100,
+    audited_epoch: 85,
+    guardian_trips: 0,
+    metrics_digest: crypto.createHash('sha256').update(fs.readFileSync(metricsPath)).digest('hex'),
+    tracker_snippet: report.tracker_snippet,
+    collector,
+  };
+}
+
+async function main() {
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    const report = await buildSyntheticBundle(args);
+    if (args.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(`Mayhem P8.5 synthetic metrics rehearsal: ${report.ok ? 'ok' : 'not ready'}`);
+      console.log(`Copy/paste metrics path: ${relativeFile(report.metrics)}`);
+      console.log(`Provider records: ${report.providers}`);
+      console.log(`Users: ${report.users}`);
+      console.log(`Audited epoch: ${report.audited_epoch}`);
+      console.log(`Guardian trips: ${report.guardian_trips}`);
+      console.log(`Metrics SHA-256: ${report.metrics_digest}`);
+      console.log('');
+      console.log('Copy/paste tracker metrics note:');
+      console.log(report.tracker_snippet);
+    }
+    if (!report.ok) process.exitCode = 1;
+  } catch (error) {
+    console.error(`error: ${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
+await main();

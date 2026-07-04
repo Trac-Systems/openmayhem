@@ -41,6 +41,10 @@ sidecar. The check verifies:
   - install.sh accepts the sidecar checksum without --sha256
   - install.sh prints a copy/paste PATH command
   - all Mayhem binaries are installed and runnable with --help
+  - install.sh copies only from the verified package root when a shadow binary
+    exists elsewhere in the archive
+  - install.sh rejects multiple SHA256SUMS files, duplicate checksum paths,
+    dot-segment paths, and empty-segment paths
 
 Environment:
   MAYHEM_DOCKER_BUILD_IMAGE    Rust image (default: rust:1.89-bookworm)
@@ -171,5 +175,118 @@ docker run --rm \
       "$install_dir/$bin" --help >/dev/null
     done
   '
+
+log "running Linux installer synthetic hardening checks"
+docker run --rm \
+  -v "$WORK_ROOT:/work:ro" \
+  "$INSTALL_IMAGE" \
+  bash -s <<'BASH'
+    set -euo pipefail
+
+    bins="mayhem mayhem-gateway mayhem-pay mayhemd mayhem-enclave mayhem-paygate"
+
+    hash_file() {
+      sha256sum "$1" | awk '{print $1}'
+    }
+
+    make_executable() {
+      local path="$1"
+      local name="$2"
+      local exit_code="${3:-0}"
+      mkdir -p "$(dirname "$path")"
+      cat > "$path" <<SH
+#!/bin/sh
+if [ "\${1:-}" = "--help" ]; then
+  echo "verified $name help"
+  exit $exit_code
+fi
+echo "verified $name"
+exit $exit_code
+SH
+      chmod 0755 "$path"
+    }
+
+    make_artifact() {
+      local root="$1"
+      local mode="${2:-valid}"
+      local package="$root/mayhem-linux-installer-synthetic"
+      local archive="$root/mayhem-linux-installer-synthetic.tar.gz"
+      local entries="mayhem-linux-installer-synthetic"
+      mkdir -p "$package/bin"
+
+      for bin in $bins; do
+        make_executable "$package/bin/$bin" "$bin"
+      done
+
+      : > "$package/SHA256SUMS"
+      for bin in $bins; do
+        printf '%s  bin/%s\n' "$(hash_file "$package/bin/$bin")" "$bin" >> "$package/SHA256SUMS"
+      done
+
+      case "$mode" in
+        shadow)
+          make_executable "$root/000/bin/mayhem" "unchecked shadow mayhem" 42
+          entries="000 $entries"
+          ;;
+        second-sums)
+          mkdir -p "$root/001"
+          printf '%064d  nope\n' 0 > "$root/001/SHA256SUMS"
+          entries="001 $entries"
+          ;;
+        duplicate)
+          head -n 1 "$package/SHA256SUMS" >> "$package/SHA256SUMS"
+          ;;
+        dot-path)
+          sed -i '1s#bin/mayhem#bin/./mayhem#' "$package/SHA256SUMS"
+          ;;
+        empty-segment)
+          sed -i '1s#bin/mayhem#bin//mayhem#' "$package/SHA256SUMS"
+          ;;
+      esac
+
+      tar -czf "$archive" -C "$root" $entries
+      printf '%s\n' "$archive"
+    }
+
+    expect_failure() {
+      local mode="$1"
+      local expected="$2"
+      local root archive out
+      root="$(mktemp -d /tmp/mayhem-linux-installer-negative.XXXXXX)"
+      archive="$(make_artifact "$root" "$mode")"
+      out="$root/install.out"
+      if /work/install.sh \
+        --artifact "$archive" \
+        --sha256 "$(hash_file "$archive")" \
+        --install-dir "$root/install/bin" \
+        --skip-pear \
+        --skip-opencode \
+        --no-path-update \
+        >"$out" 2>&1; then
+        cat "$out"
+        echo "install.sh unexpectedly accepted $mode artifact" >&2
+        exit 1
+      fi
+      cat "$out"
+      grep -F "$expected" "$out" >/dev/null
+    }
+
+    root="$(mktemp -d /tmp/mayhem-linux-installer-shadow.XXXXXX)"
+    archive="$(make_artifact "$root" shadow)"
+    install_dir="$root/install/bin"
+    /work/install.sh \
+      --artifact "$archive" \
+      --sha256 "$(hash_file "$archive")" \
+      --install-dir "$install_dir" \
+      --skip-pear \
+      --skip-opencode \
+      --no-path-update
+    "$install_dir/mayhem" --help | grep -F "verified mayhem help" >/dev/null
+
+    expect_failure second-sums "artifact contains multiple SHA256SUMS files"
+    expect_failure duplicate "SHA256SUMS contains duplicate path: bin/mayhem"
+    expect_failure dot-path "unsafe SHA256SUMS path: bin/./mayhem"
+    expect_failure empty-segment "unsafe SHA256SUMS path: bin//mayhem"
+BASH
 
 log "Linux clean-container artifact install check passed"

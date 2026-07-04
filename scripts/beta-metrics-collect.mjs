@@ -16,16 +16,16 @@ function usage() {
   --browser-handoffs PATH --canonical-service PATH --payment-rails PATH \\
   --commit-tx HEX --apply-tx HEX --auditor HEX [--out PATH]
 
-Normalizes beta evidence into config/beta/metrics.json, then runs the strict
-P8.5 validator unless --no-validate is passed. Use --tracker-recorded only after
-the validated metrics have also been recorded in docs/TRACKER.md.
+Normalizes beta rehearsal evidence into config/beta/metrics.json, then runs the
+strict P8.5 validator unless --no-validate is passed. Use --tracker-recorded
+only after the validated metrics have also been recorded in docs/TRACKER.md.
 
 Accepted evidence shapes are intentionally plain:
-- providers/users: array, { data: [] }, { providers: [] }, or { users: [] }; count-only summaries are rejected
+- providers/users: array, { data: [] }, { providers: [] }, or { users: [] }; count-only summaries are rejected; synthetic records are accepted
 - launch-manifest: a strict P8.4 beta launch manifest accepted by scripts/beta-launch.mjs
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
-- payment-rails: paygate/rail report proving TNK, Stripe, and Coinbase credit mu_usd
+- payment-rails: paygate/rail report proving TNK and Stripe credit mu_usd; Coinbase is accepted as paused when coinbase_enabled:false
 - guardian: small summary JSON; the source file hash is recorded as evidence
 - canary: small summary JSON; the source file hash is recorded as evidence
 - browser: small summary JSON; browser handoffs may also be a text log`);
@@ -259,9 +259,8 @@ function countIdentities(value, { label, arrayPaths, idFields, filter }) {
   return { count: ids.size, identityRecordsVerified: true, evidence };
 }
 
-function providerIsExternal(record) {
+function providerRecordCounts(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return true;
-  if (record.external === false || record.internal === true) return false;
   if (record.role && !['provider', 'both'].includes(String(record.role))) return false;
   return true;
 }
@@ -279,7 +278,7 @@ function collectParticipants(args) {
       'data',
     ],
     idFields: ['provider', 'provider_pubkey', 'public_key', 'pubkey', 'id', 'address', 'who'],
-    filter: providerIsExternal,
+    filter: providerRecordCounts,
   });
   const userSummary = countIdentities(users.value, {
     label: 'users',
@@ -643,7 +642,7 @@ function printHuman(report) {
   console.log(`Mayhem beta metrics collected: ${report.validator?.ok === false ? 'not ready' : 'ok'}`);
   console.log(`Copy/paste metrics path: ${report.metrics_path}`);
   console.log(`Copy/paste validate command: node scripts/beta-metrics.mjs --metrics ${report.metrics_arg}`);
-  console.log(`External providers: ${report.external_providers}`);
+  console.log(`Provider records: ${report.external_providers}`);
   console.log(`Users: ${report.users}`);
   console.log(`Audited epoch: ${report.audited_epoch}`);
   console.log(`Guardian trips: ${report.guardian_trips}`);

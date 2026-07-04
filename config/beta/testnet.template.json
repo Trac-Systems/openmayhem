@@ -7,8 +7,8 @@
     "msb": {
       "address_prefix": "testtrac",
       "network_id": 919,
-      "bootstrap": "<testnet-msb-bootstrap-64-hex>",
-      "channel": "<testnet-msb-channel>"
+      "bootstrap": "c184f4ad8e9cf5e911f9415b60e7dcfb30aed73ebd8a402ef68e1b154624f5ef",
+      "channel": "1111trac1network1msb1testnet1111"
     },
     "subnet": {
       "channel": "mayhem-testnet-beta-v1",
@@ -16,11 +16,15 @@
     },
     "dht": {
       "peer_bootstrap": [
+        "116.202.214.149:10001",
+        "157.180.12.214:10001",
         "node1.hyperdht.org:49737",
         "node2.hyperdht.org:49737",
         "node3.hyperdht.org:49737"
       ],
       "msb_bootstrap": [
+        "116.202.214.149:10001",
+        "157.180.12.214:10001",
         "node1.hyperdht.org:49737",
         "node2.hyperdht.org:49737",
         "node3.hyperdht.org:49737"
@@ -54,16 +58,13 @@
   "paygate": {
     "public_base_url": "<https://paygate.testnet.example>",
     "health_path": "/v1/health",
+    "tnk_treasury_address": "<testtrac1-network-treasury-address>",
     "stripe_enabled": true,
-    "coinbase_enabled": true,
+    "coinbase_enabled": false,
     "checkout_urls": {
       "stripe": {
         "success_url": "<https://paygate.testnet.example/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}>",
         "cancel_url": "<https://paygate.testnet.example/v1/stripe/cancel>"
-      },
-      "coinbase": {
-        "success_url": "<https://paygate.testnet.example/v1/coinbase/return>",
-        "cancel_url": "<https://paygate.testnet.example/v1/coinbase/cancel>"
       }
     }
   },
@@ -73,7 +74,7 @@
     "funded": false,
     "pays_for": [
       "epoch_commit",
-      "sponsored_provider_registration",
+      "payment_proof_rollup",
       "payout_fee_sweep"
     ]
   },
@@ -90,6 +91,9 @@
     ],
     "seed_provider_opt_ins": [
       "<file:beta/seed-provider-opt-ins.json#sha256:64-hex>"
+    ],
+    "enclave_downloads": [
+      "<file:beta/enclave-downloads.json#sha256:64-hex>"
     ],
     "canary_set": [
       "file:catalog/canaries/canary-launch-v1.json#sha256:5bd39e15239fde9ad9e6819502e67817be69b389b9b1abd85b01f04a4168a708"
@@ -109,6 +113,13 @@
         "tools": true,
         "json": true,
         "ctx": 131072
+      },
+      "distribution": {
+        "bundle_url": "<https://downloads.testnet.example/enclaves/derived-catalog-enclave-id.tar.zst>",
+        "manifest_url": "<https://downloads.testnet.example/enclaves/derived-catalog-enclave-id.json>",
+        "bundle_sha256": "<enclave-download-bundle-sha256-64-hex>",
+        "bundle_bytes": "<enclave-download-bundle-size-bytes>",
+        "admin_signature": "<admin-ed25519-signature-over-enclave-download-manifest-128-hex>"
       },
       "model_ref_mu": {
         "in_per_1k": 18,

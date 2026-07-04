@@ -6,6 +6,7 @@ import {
   handleContractNonce,
   handleContractPrepareTx,
   handleContractTx,
+  handleContractFeature,
 } from "../handlers.js";
 
 export const v1Routes = [
@@ -17,4 +18,5 @@ export const v1Routes = [
   { method: "GET", path: "/contract/nonce", handler: handleContractNonce },
   { method: "POST", path: "/contract/tx/prepare", handler: handleContractPrepareTx },
   { method: "POST", path: "/contract/tx", handler: handleContractTx },
+  { method: "POST", path: "/contract/feature", handler: handleContractFeature },
 ];

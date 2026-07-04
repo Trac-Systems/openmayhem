@@ -18,9 +18,9 @@ const thresholds = {
 function usage() {
   console.log(`Usage: node scripts/beta-metrics.mjs [--metrics PATH] [--allow-placeholders] [--json]
 
-Validates Mayhem P8.5 beta exit metrics. Strict mode fails on template
-placeholders and on any unmet threshold. Use --allow-placeholders only to
-validate the committed template shape.`);
+Validates Mayhem P8.5 synthetic beta exit metrics. Strict mode fails on
+template placeholders and on any unmet threshold. Use --allow-placeholders only
+to validate the committed template shape.`);
 }
 
 function parseArgs(argv) {
@@ -127,6 +127,10 @@ function requireBoolean(add, value, expected, name) {
   if (value !== expected) add('error', `${name} must be ${expected}`);
 }
 
+function requireBooleanValue(add, value, name) {
+  if (typeof value !== 'boolean') add('error', `${name} must be a boolean`);
+}
+
 function relativeFile(filePath) {
   const rel = path.relative(repoRoot, filePath);
   return rel.startsWith('..') ? filePath : rel;
@@ -204,11 +208,11 @@ function checkoutUrlMatchesRail(value, rail) {
   return false;
 }
 
-function validatePaymentRailEvidence(add, value) {
+function validatePaymentRailEvidence(add, value, requiredRails = ['tnk', 'stripe']) {
   validateEvidenceArray(add, value, 'payment_rails.evidence');
   if (!Array.isArray(value)) return;
   if (value.some((item) => isPlaceholder(item))) return;
-  for (const rail of ['tnk', 'stripe', 'coinbase']) {
+  for (const rail of requiredRails) {
     if (!value.some((item) => (
       isFileEvidence(item)
       && hasEvidenceTag(item, `rail:${rail}`)
@@ -255,8 +259,8 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
   }
 }
 
-function validateRequiredRails(add, value) {
-  if (!requireArray(add, value, 'browser_handoffs.rails_verified', 2)) return;
+function validateRequiredRails(add, value, requiredRails = ['stripe']) {
+  if (!requireArray(add, value, 'browser_handoffs.rails_verified', requiredRails.length)) return;
   const allowed = new Set(['stripe', 'coinbase']);
   const seen = new Set();
   for (const [index, rail] of value.entries()) {
@@ -271,7 +275,7 @@ function validateRequiredRails(add, value) {
     seen.add(rail);
   }
   if (value.some((rail) => isPlaceholder(rail))) return;
-  for (const rail of ['stripe', 'coinbase']) {
+  for (const rail of requiredRails) {
     if (!value.includes(rail)) add('error', `browser_handoffs.rails_verified must include ${rail}`);
   }
 }
@@ -327,7 +331,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireLiteral(add, metrics.payment_rails.ledger_denom, 'mu_usd', 'payment_rails.ledger_denom');
     requireBoolean(add, metrics.payment_rails.tnk_enabled, true, 'payment_rails.tnk_enabled');
     requireBoolean(add, metrics.payment_rails.stripe_enabled, true, 'payment_rails.stripe_enabled');
-    requireBoolean(add, metrics.payment_rails.coinbase_enabled, true, 'payment_rails.coinbase_enabled');
+    requireBooleanValue(add, metrics.payment_rails.coinbase_enabled, 'payment_rails.coinbase_enabled');
     requireBoolean(add, metrics.payment_rails.rails_credit_mu_usd, true, 'payment_rails.rails_credit_mu_usd');
     requireBoolean(
       add,
@@ -335,7 +339,10 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'payment_rails.paygate_admin_controls_verified',
     );
-    validatePaymentRailEvidence(add, metrics.payment_rails.evidence);
+    const requiredCreditRails = metrics.payment_rails.coinbase_enabled === true
+      ? ['tnk', 'stripe', 'coinbase']
+      : ['tnk', 'stripe'];
+    validatePaymentRailEvidence(add, metrics.payment_rails.evidence, requiredCreditRails);
   }
 
   if (requireObject(add, metrics.window, 'window')) {
@@ -529,12 +536,15 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
 
   if (requireObject(add, metrics.browser_handoffs, 'browser_handoffs')) {
     requireBoolean(add, metrics.browser_handoffs.copy_paste_urls_printed, true, 'browser_handoffs.copy_paste_urls_printed');
-    validateRequiredRails(add, metrics.browser_handoffs.rails_verified);
+    const requiredCheckoutRails = metrics.payment_rails?.coinbase_enabled === true
+      ? ['stripe', 'coinbase']
+      : ['stripe'];
+    validateRequiredRails(add, metrics.browser_handoffs.rails_verified, requiredCheckoutRails);
     validateCheckoutHandoffSamples(add, metrics.browser_handoffs.samples, metrics.browser_handoffs.rails_verified);
   }
 
   if (metrics.tracker?.metrics_recorded !== true) {
-    add('placeholder', 'tracker.metrics_recorded must be true after docs/TRACKER.md has been updated with the real beta metrics');
+    add('placeholder', 'tracker.metrics_recorded must be true after docs/TRACKER.md has been updated with the validated beta metrics');
   }
 
   const allText = JSON.stringify(metrics);
@@ -562,13 +572,13 @@ function buildTrackerSnippet(metrics, metricsPath) {
   const epoch = metrics.audited_epoch?.epoch ?? '<epoch>';
   const guardianTrips = metrics.guardian?.trips ?? '<guardian-trips>';
   const evidenceFile = metricsPath ? path.basename(metricsPath) : path.basename(defaultMetrics).replace('.template', '');
-  return `P8.5 beta exit metrics: ${providers} external providers, ${users} users, audited epoch ${epoch}, guardian trips ${guardianTrips}. Evidence file: ${evidenceFile}.`;
+  return `P8.5 synthetic beta metrics: ${providers} provider records, ${users} user records, audited epoch ${epoch}, guardian trips ${guardianTrips}. Evidence file: ${evidenceFile}.`;
 }
 
 function printHuman(report, args) {
   console.log(`Mayhem beta metrics: ${report.ok ? 'ok' : 'not ready'}`);
   console.log(`Copy/paste metrics path: ${path.resolve(repoRoot, args.metrics)}`);
-  console.log(`External providers: ${report.counts.external_providers}`);
+  console.log(`Provider records: ${report.counts.external_providers}`);
   console.log(`Users: ${report.counts.users}`);
   console.log(`Audited epoch: ${report.audited_epoch}`);
   console.log(`Guardian trips: ${report.guardian_trips}`);

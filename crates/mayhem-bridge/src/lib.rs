@@ -387,6 +387,10 @@ impl PeerRpcClient {
         self.post("contract/tx", body).await
     }
 
+    pub async fn submit_feature(&self, body: impl Serialize) -> Result<Value> {
+        self.post("contract/feature", body).await
+    }
+
     pub async fn get(&self, path: &str) -> Result<Value> {
         let url = self.endpoint(path)?;
         self.request_json(self.http.get(url)).await

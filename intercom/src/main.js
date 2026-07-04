@@ -15,6 +15,7 @@ import MayhemContract from '../contract/contract.js';
 import Sidechannel from '../features/sidechannel/index.js';
 import DirectSession from '../features/direct-session/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
+import MayhemFeature from '../features/mayhem/index.js';
 
 const { env, storeLabel, flags } = getPearRuntime();
 
@@ -48,6 +49,19 @@ const parseBool = (value, fallback) => {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 };
 
+const flagValue = (name, fallback = undefined) => {
+  const value = flags[name];
+  if (value === undefined) return fallback;
+  if (value === true) return 'true';
+  return String(value);
+};
+
+const parseInteger = (value, fallback) => {
+  if (value === undefined || value === null || value === '') return fallback;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isSafeInteger(parsed) ? parsed : fallback;
+};
+
 const parseCsvList = (raw) => {
   if (!raw) return null;
   return String(raw)
@@ -58,10 +72,11 @@ const parseCsvList = (raw) => {
 
 const normalizeNetworkEnv = (raw) => {
   const value = String(raw || 'mainnet').trim().toLowerCase();
+  if (value === 'local') return 'local';
   if (value === 'mainnet') return 'mainnet';
   if (value === 'development' || value === 'dev') return 'development';
   if (value === 'testnet' || value === 'testnet1') return 'testnet1';
-  throw new Error(`Unsupported --network value "${raw}". Expected mainnet, testnet1, or development.`);
+  throw new Error(`Unsupported --network value "${raw}". Expected mainnet, testnet1, local, or development.`);
 };
 
 const networkEnv = normalizeNetworkEnv(
@@ -74,14 +89,39 @@ const networkEnv = normalizeNetworkEnv(
 
 const msbEnvironment = {
   mainnet: MSB_ENV.MAINNET,
+  local: MSB_ENV.DEVELOPMENT,
   development: MSB_ENV.DEVELOPMENT,
   testnet1: MSB_ENV.TESTNET1,
 }[networkEnv];
 const peerEnvironment = {
   mainnet: PEER_ENV.MAINNET,
+  local: PEER_ENV.DEVELOPMENT,
   development: PEER_ENV.DEVELOPMENT,
   testnet1: PEER_ENV.TESTNET1,
 }[networkEnv];
+
+const headless = parseBool(flagValue('headless', env.MAYHEM_HEADLESS || ''), false);
+const peerInteractive = parseBool(
+  flagValue('peer-interactive', env.PEER_INTERACTIVE || ''),
+  !headless
+);
+const peerBackgroundTasks = parseBool(
+  flagValue('peer-background-tasks', env.PEER_BACKGROUND_TASKS || ''),
+  true
+);
+const peerUpdater = parseBool(
+  flagValue('peer-updater', env.PEER_UPDATER || ''),
+  true
+);
+const peerReplicate = parseBool(
+  flagValue('peer-replicate', env.PEER_REPLICATE || ''),
+  true
+);
+const peerReplicateFlushTimeoutMs = parseInteger(
+  flagValue('peer-replicate-flush-timeout-ms', env.PEER_REPLICATE_FLUSH_TIMEOUT_MS || ''),
+  headless ? 5_000 : 0
+);
+const keepAlive = parseBool(flagValue('keep-alive', env.MAYHEM_KEEP_ALIVE || ''), headless);
 
 const peerStoreName =
   (flags['peer-store-name'] && String(flags['peer-store-name'])) ||
@@ -330,10 +370,11 @@ const peerConfig = createPeerConfig(peerEnvironment, {
   storeName: peerStoreName,
   bootstrap: subnetBootstrap || null,
   channel: subnetChannel,
-  enableInteractiveMode: true,
-  enableBackgroundTasks: true,
-  enableUpdater: true,
-  replicate: true,
+  enableInteractiveMode: peerInteractive,
+  enableBackgroundTasks: peerBackgroundTasks,
+  enableUpdater: peerUpdater,
+  replicate: peerReplicate,
+  replicateFlushTimeoutMs: peerReplicateFlushTimeoutMs,
   apiTxExposed,
   apiTxLocalApply,
   ...(peerDhtBootstrap ? { dhtBootstrap: peerDhtBootstrap } : {}),
@@ -355,6 +396,19 @@ const peer = new Peer({
   contract: MayhemContract,
 });
 await peer.ready();
+
+let mayhemFeature = null;
+{
+  const admin = await peer.base.view.get('admin');
+  if (admin && admin.value === peer.wallet.publicKey && peer.base.writable) {
+    mayhemFeature = new MayhemFeature(peer, {});
+    await peer.protocol.instance.addFeature('mayhem', mayhemFeature);
+    peer.mayhemFeature = mayhemFeature;
+    console.log('Mayhem Feature: ready (free admin-oracle lifecycle/evidence writer)');
+  } else {
+    console.log('Mayhem Feature: read-only (not admin/writable)');
+  }
+}
 
 const effectiveSubnetBootstrapHex = peer.base?.key
   ? peer.base.key.toString('hex')
@@ -393,6 +447,10 @@ console.log('Peer pubkey (hex):', peer.wallet.publicKey);
 console.log('Peer trac address (bech32m):', peer.wallet.address ?? null);
 console.log('Peer writer key (hex):', peerWriterKey);
 console.log('Sidechannel entry:', sidechannelEntry);
+console.log('Headless:', headless);
+console.log('Peer interactive:', peerInteractive);
+console.log('Peer replicate:', peerReplicate);
+console.log('Peer replicate flush timeout ms:', peerReplicateFlushTimeoutMs);
 if (sidechannelExtras.length > 0) {
   console.log('Sidechannel extras:', sidechannelExtras.join(', '));
 }
@@ -506,5 +564,26 @@ sidechannel
     console.error('Sidechannel failed to start:', err?.message ?? err);
   });
 
-const terminal = new Terminal(peer);
-await terminal.start();
+if (headless) {
+  console.log('Terminal: disabled (headless)');
+} else {
+  const terminal = new Terminal(peer);
+  await terminal.start();
+}
+
+if (keepAlive) {
+  const close = async () => {
+    try {
+      rpcServer?.close?.();
+    } catch (_e) {}
+    try {
+      await peer.close?.();
+    } catch (_e) {}
+    try {
+      await msb.close?.();
+    } catch (_e) {}
+    if (typeof Bare !== 'undefined' && Bare.exit) Bare.exit(0);
+  };
+  if (typeof Pear !== 'undefined' && Pear.teardown) Pear.teardown(close);
+  await new Promise(() => {});
+}

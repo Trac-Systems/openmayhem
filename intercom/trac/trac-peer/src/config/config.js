@@ -78,6 +78,18 @@ export class Config {
         }
         this.replicate = replicateRaw !== false;
 
+        const replicateFlushTimeoutMsRaw = this.#select("replicateFlushTimeoutMs", options, defaults);
+        if (replicateFlushTimeoutMsRaw === undefined || replicateFlushTimeoutMsRaw === null) {
+            this.replicateFlushTimeoutMs = 0;
+        } else if (
+            !Number.isSafeInteger(replicateFlushTimeoutMsRaw) ||
+            replicateFlushTimeoutMsRaw < 0
+        ) {
+            throw new Error("Peer: replicateFlushTimeoutMs must be a non-negative safe integer.");
+        } else {
+            this.replicateFlushTimeoutMs = replicateFlushTimeoutMsRaw;
+        }
+
         const channelRaw = this.#select("channel", options, defaults);
         if (channelRaw === null || channelRaw === undefined || channelRaw === "") {
             throw new Error("Peer: channel is required.");

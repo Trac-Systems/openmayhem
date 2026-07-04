@@ -4,11 +4,14 @@ import MayhemContract, { deriveRoomId } from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
+  executeFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  providerLifecycleFeatureKey,
   seedCurrentAdminPrice,
   signConsent,
+  signProviderLifecycleIntent,
 } from './helpers/contract.js';
 
 const rulesHash = '1'.repeat(64);
@@ -297,13 +300,27 @@ test('MayhemContract requires a current admin price before provider serving rows
   priceScheduleEntry.value.current.set_by = admin.publicKey;
   delete priceScheduleEntry.value.current.set_by_role;
   await storage.put(`price/${enclaveId}`, priceScheduleEntry.value);
-  const pricedJoin = await execute(
+  const missingRolePriceJoin = await execute(
     contract,
     storage,
     'joinEnclave',
     providerJoin,
     provider.publicKey,
     7
+  );
+  assert.match(missingRolePriceJoin.message, /admin-set enclave price/i);
+  assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
+
+  priceScheduleEntry = await storage.get(`price/${enclaveId}`);
+  priceScheduleEntry.value.current.set_by_role = 'admin';
+  await storage.put(`price/${enclaveId}`, priceScheduleEntry.value);
+  const pricedJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    providerJoin,
+    provider.publicKey,
+    8
   );
   assert.equal(pricedJoin.ok, true, pricedJoin.message);
 
@@ -321,7 +338,7 @@ test('MayhemContract requires a current admin price before provider serving rows
       policy: {},
     },
     admin.publicKey,
-    8
+    9
   );
   assert.equal(opened.ok, true, opened.message);
 
@@ -359,6 +376,131 @@ test('MayhemContract requires a current admin price before provider serving rows
   );
   assert.match(unpricedRoomJoin.message, /current admin price required/i);
   assert.equal(await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`), null);
+});
+
+test('MayhemContract applies consent and provider lifecycle through free mayhem feature records', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  let result = await execute(
+    contract,
+    storage,
+    'setRules',
+    { op: 'set_rules', ver: 1, hash: rulesHash },
+    admin.publicKey,
+    1
+  );
+  assert.equal(result.ok, true, result.message);
+
+  await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    `consent/${provider.publicKey}/1/${rulesHash}`,
+    {
+      op: 'consent',
+      sender: provider.publicKey,
+      ver: 1,
+      hash: rulesHash,
+      sig: signConsent(provider.wallet, 1, rulesHash),
+    },
+    admin.publicKey
+  );
+  assert.equal((await storage.get(`consent/${provider.publicKey}`)).value.via, 'feature');
+
+  const registerIntent = {
+    op: 'register_provider',
+    provider: provider.publicKey,
+    nonce: 'a'.repeat(64),
+  };
+  await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await providerLifecycleFeatureKey(registerIntent),
+    {
+      op: 'provider_lifecycle',
+      intent: registerIntent,
+      sig: signProviderLifecycleIntent(provider.wallet, registerIntent),
+    },
+    admin.publicKey
+  );
+  assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
+
+  result = await execute(contract, storage, 'registerEnclave', enclaveRegistration, admin.publicKey, 2);
+  assert.equal(result.ok, true, result.message);
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: enclaveRegistration.model_id,
+    admin: admin.publicKey,
+    txNo: 3,
+  });
+
+  const joinEnclaveIntent = {
+    op: 'join_enclave',
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    nonce: 'b'.repeat(64),
+  };
+  await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await providerLifecycleFeatureKey(joinEnclaveIntent),
+    {
+      op: 'provider_lifecycle',
+      intent: joinEnclaveIntent,
+      sig: signProviderLifecycleIntent(provider.wallet, joinEnclaveIntent),
+    },
+    admin.publicKey
+  );
+  assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.status, 'active');
+
+  const nonce = 'feature-room';
+  const roomId = await deriveRoomId(enclaveId, admin.publicKey, nonce);
+  result = await execute(
+    contract,
+    storage,
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: enclaveId,
+      model_id: enclaveRegistration.model_id,
+      nonce,
+      label: 'feature-room',
+      policy: { min_reputation: 0 },
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(result.ok, true, result.message);
+
+  const joinRoomIntent = {
+    op: 'join_room',
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    room_id: roomId,
+    nonce: 'c'.repeat(64),
+  };
+  await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await providerLifecycleFeatureKey(joinRoomIntent),
+    {
+      op: 'provider_lifecycle',
+      intent: joinRoomIntent,
+      sig: signProviderLifecycleIntent(provider.wallet, joinRoomIntent),
+    },
+    admin.publicKey
+  );
+  assert.equal(
+    (await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`)).value.status,
+    'active'
+  );
 });
 
 test('MayhemContract provider serving price gate fails closed without current admin key', async () => {

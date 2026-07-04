@@ -145,6 +145,22 @@ export async function contractTx(peer, { tx, prepared_command, address, signatur
   return { result: res };
 }
 
+export async function contractFeature(peer, { feature = "mayhem", key, value } = {}) {
+  if (!peer.base?.writable) throw new Error("Peer subnet is not writable.");
+  const featureName = String(feature ?? "").trim();
+  const recordKey = String(key ?? "").trim();
+  if (!featureName) throw new Error("Missing feature.");
+  if (!recordKey) throw new Error("Missing key.");
+  if (recordKey.length > 256) throw new Error("Invalid key. Expected at most 256 characters.");
+  if (!isObject(value)) throw new Error("Invalid value. Expected an object.");
+  const registered = peer.protocol?.instance?.features?.[featureName];
+  if (!registered || typeof registered.append !== "function") {
+    throw new Error(`Feature ${featureName} is not available.`);
+  }
+  await registered.append(recordKey, value);
+  return { ok: true, feature: featureName, key: recordKey };
+}
+
 const stateView = (peer, confirmed) => {
   if (!peer.base?.view) throw new Error("Peer view not ready.");
   if (!confirmed) return { view: peer.base.view, close: async () => {} };

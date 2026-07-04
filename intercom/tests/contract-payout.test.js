@@ -61,7 +61,7 @@ async function setupPayoutContract() {
       value: {
         op: 'rate_oracle',
         tnk_usd_e6: 2_000_000,
-        source: 'coinbase-spot',
+        source: 'gate-spot',
         ts: 1_000,
       },
       sender: admin.publicKey,
@@ -108,6 +108,8 @@ const fiatPayoutConfirm = (provider, rail, externalRef, overrides = {}) => ({
   rail,
   mu: 1_000_000,
   external_ref: externalRef,
+  fiat_currency: 'usd',
+  fiat_amount_minor: 100,
   at: 1_900,
   ...overrides,
 });
@@ -132,6 +134,7 @@ test('MayhemContract setProviderPayout stamps admin authority evidence', async (
       provider: provider.publicKey,
       payout_addr: 'acct_test_provider',
       payout_method: 'stripe',
+      payout_currency: 'eur',
     },
     admin.publicKey,
     6
@@ -141,6 +144,7 @@ test('MayhemContract setProviderPayout stamps admin authority evidence', async (
   assert.deepEqual(updated.payout, {
     addr: 'acct_test_provider',
     method: 'stripe',
+    currency: 'eur',
     set_by: admin.publicKey,
     set_by_role: 'admin',
     set_at: makeTxKey(6),
@@ -256,14 +260,14 @@ test('MayhemContract payoutConfirm rejects non-admin payout target provenance', 
   assert.equal(storage.snapshotBytes(), before);
 });
 
-test('MayhemContract payoutConfirm preserves legacy admin payout targets without role marker', async () => {
+test('MayhemContract payoutConfirm requires admin role marker on payout targets', async () => {
   const { admin, provider, user, storage, contract } = await setupPayoutContract();
   const record = (await storage.get(`prov/${provider.publicKey}`)).value;
-  const legacyPayout = { ...record.payout };
-  delete legacyPayout.set_by_role;
+  const missingRolePayout = { ...record.payout };
+  delete missingRolePayout.set_by_role;
   await storage.put(`prov/${provider.publicKey}`, {
     ...record,
-    payout: legacyPayout,
+    payout: missingRolePayout,
   });
 
   const settled = await execute(
@@ -276,7 +280,7 @@ test('MayhemContract payoutConfirm preserves legacy admin payout targets without
   );
   assert.equal(settled.ok, true, settled.message);
 
-  const paid = await execute(
+  const rejected = await execute(
     contract,
     storage,
     'payoutConfirm',
@@ -284,9 +288,7 @@ test('MayhemContract payoutConfirm preserves legacy admin payout targets without
     admin.publicKey,
     7
   );
-  assert.equal(paid.ok, true, paid.message);
-  assert.equal(paid.kind, 'provider');
-  assert.equal(paid.rail, 'tnk');
+  assert.match(rejected.message, /payout target must be admin-set/i);
 });
 
 test('MayhemContract payoutConfirm fails closed without current admin key', async () => {
@@ -337,7 +339,7 @@ test('MayhemContract payoutConfirm fails closed without current admin key', asyn
       value: {
         op: 'rate_oracle',
         tnk_usd_e6: 2_000_000,
-        source: 'coinbase-spot',
+        source: 'gate-spot',
         ts: 1_000,
       },
       sender: admin.publicKey,
@@ -394,6 +396,7 @@ test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async (
         provider: provider.publicKey,
         payout_addr: target,
         payout_method: rail,
+        payout_currency: rail === 'stripe' ? 'eur' : 'usd',
       },
       admin.publicKey,
       6
@@ -417,7 +420,8 @@ test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async (
       fiatPayoutConfirm(
         provider.publicKey,
         rail === 'stripe' ? 'coinbase' : 'stripe',
-        'wrong_rail_transfer'
+        'wrong_rail_transfer',
+        { fiat_currency: rail === 'stripe' ? 'usd' : 'eur' }
       ),
       admin.publicKey,
       8
@@ -428,7 +432,9 @@ test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async (
       contract,
       storage,
       'payoutConfirm',
-      fiatPayoutConfirm(provider.publicKey, rail, externalRef),
+      fiatPayoutConfirm(provider.publicKey, rail, externalRef, {
+        fiat_currency: rail === 'stripe' ? 'eur' : 'usd',
+      }),
       admin.publicKey,
       9
     );
@@ -439,6 +445,8 @@ test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async (
     assert.equal(confirmed.who, provider.publicKey);
     assert.equal(confirmed.mu, 1_000_000);
     assert.equal(confirmed.epoch, 169);
+    assert.equal(confirmed.fiat_currency, rail === 'stripe' ? 'eur' : 'usd');
+    assert.equal(confirmed.fiat_amount_minor, 100);
     assert.equal(confirmed.payout_root.length, 64);
     assert.equal(confirmed.external_ref_hash.length, 64);
 
@@ -446,6 +454,7 @@ test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async (
     assert.equal(earning.paid_cum_mu, 1_000_000);
     assert.equal(earning.held_mu, 0);
     assert.equal(earning.last_payout_rail, rail);
+    assert.equal(earning.last_payout_fiat_currency, rail === 'stripe' ? 'eur' : 'usd');
     assert.equal(earning.last_payout_external_ref_hash, confirmed.external_ref_hash);
     assert.equal(earning.last_payout_rate_ts, undefined);
     assert.equal(earning.last_payout_msb_tx_hash, undefined);
@@ -493,6 +502,7 @@ test('MayhemContract payoutConfirm clears previous rail metadata on rail switch'
       provider: provider.publicKey,
       payout_addr: 'acct_test_provider',
       payout_method: 'stripe',
+      payout_currency: 'usd',
     },
     admin.publicKey,
     8

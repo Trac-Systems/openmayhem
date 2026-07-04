@@ -3,6 +3,17 @@
 .env
 .env.*
 !.env.example
+.mayhem-local/
+intercom/config.toml
+stripe.txt
+**/stripe.txt
+*.local.toml
+*.secret
+*.secret.*
+*.credentials
+*.credentials.*
+*.pem
+*.p12
 node_modules/
 stores/
 **/stores/

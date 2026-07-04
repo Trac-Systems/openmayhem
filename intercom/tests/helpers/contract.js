@@ -1,6 +1,7 @@
 import b4a from 'b4a';
+import { blake3 } from '@tracsystems/blake3';
 import PeerWallet from 'trac-wallet';
-import { consentMessage } from '../../contract/contract.js';
+import { consentMessage, providerLifecycleIntentMessage } from '../../contract/contract.js';
 
 export const ZERO_HEX = '0'.repeat(64);
 
@@ -44,6 +45,22 @@ export const makeOperation = (type, value, sender, txNo, writer = ZERO_HEX) => (
 
 export const execute = (contract, storage, type, value, sender, txNo, writer = ZERO_HEX) =>
   contract.execute(makeOperation(type, value, sender, txNo, writer), storage);
+
+export const makeFeatureOperation = (featureType, key, value, sender) => ({
+  type: 'feature',
+  key: `${featureType.replace(/_feature$/, '')}_${key}`,
+  value: {
+    dispatch: {
+      type: featureType,
+      key,
+      value,
+      address: sender,
+    },
+  },
+});
+
+export const executeFeature = (contract, storage, featureType, key, value, sender) =>
+  contract.execute(makeFeatureOperation(featureType, key, value, sender), storage);
 
 export async function seedCurrentAdminPrice(
   storage,
@@ -108,3 +125,11 @@ export const makeVerifier = (wallet) => ({
 
 export const signConsent = (wallet, ver, hash) =>
   b4a.toString(wallet.sign(b4a.from(consentMessage(ver, hash))), 'hex');
+
+export const signProviderLifecycleIntent = (wallet, intent) =>
+  b4a.toString(wallet.sign(b4a.from(providerLifecycleIntentMessage(intent))), 'hex');
+
+export const providerLifecycleFeatureKey = async (intent) => {
+  const digest = await blake3(b4a.from(providerLifecycleIntentMessage(intent)));
+  return `intent/provider/${intent.provider}/${intent.op}/${b4a.toString(digest, 'hex')}`;
+};

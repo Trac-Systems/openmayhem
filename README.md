@@ -2,6 +2,21 @@
 
 Mayhem is a peer-to-peer OpenRouter built on Trac Intercom. The repo currently contains the Intercom scaffold, a Rust workspace, and local development tooling while the roadmap in `docs/` is being implemented.
 
+## Repository And Artifact Boundaries
+
+The public source repo is Mayhem as a whole, not only `intercom/`.
+`intercom/` is the embedded Pear/Intercom contract and P2P runtime subtree that
+Mayhem uses for canonical ledger state and transport. Users and providers clone
+or install Mayhem; they should not need to clone Intercom separately.
+
+Release archives are smaller than the source repo. `scripts/package-release.sh`
+packages the Mayhem binaries, `README.md`, `RULES.md`, `SHA256SUMS`, and a
+release `manifest.json`.
+
+Enclave model bundles are a third artifact type. They are not committed as repo
+blobs; production launch manifests must point at admin-signed HTTPS downloads
+with hashes, sizes, and signatures for every canonical enclave.
+
 ## Provider Quickstart
 
 ```bash

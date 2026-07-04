@@ -27,8 +27,9 @@ Run PowerShell installer checks in Docker:
   - reject a SHA256SUMS file containing duplicate relative paths
   - reject unsafe dot or empty path segments in SHA256SUMS entries
 
-This is local P8.1 PowerShell installer evidence. It does not replace the
-formal Windows clean-VM install gate.
+This is local P8.1 PowerShell installer evidence. Windows clean-VM acceptance is
+paused for beta, so this maintains parser/synthetic coverage for install.ps1
+without creating a blocking Windows VM gate.
 
 Environment:
   MAYHEM_DOCKER_PWSH_IMAGE  PowerShell image

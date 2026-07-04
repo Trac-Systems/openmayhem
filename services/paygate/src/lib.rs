@@ -44,6 +44,8 @@ pub const DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS: u64 = 300;
 pub const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 pub const MU_PER_USD_CENT: u64 = 10_000;
 pub const STRIPE_MIN_USD_CENTS: u64 = 50;
+pub const DEFAULT_STRIPE_CURRENCY: &str = "usd";
+pub const DEFAULT_STRIPE_LOCALE: &str = "en";
 
 type HmacSha256 = Hmac<Sha256>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -262,6 +264,8 @@ pub struct StripeCreatePaymentIntentRequest {
     pub who: String,
     pub mu: u64,
     #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -271,6 +275,10 @@ pub struct StripeCreateCheckoutSessionRequest {
     pub mu: u64,
     pub success_url: String,
     pub cancel_url: String,
+    #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(default)]
+    pub locale: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -360,6 +368,8 @@ pub struct FiatDepositFeature {
     pub who: String,
     pub mu: u64,
     pub ext_ref_hash: String,
+    pub fiat_currency: String,
+    pub fiat_amount_minor: u64,
     pub epoch: u64,
     pub at: u64,
 }
@@ -372,6 +382,8 @@ pub struct FiatChargebackFeature {
     pub mu: u64,
     pub ext_ref_hash: String,
     pub dispute_ref_hash: String,
+    pub fiat_currency: String,
+    pub fiat_amount_minor: u64,
     pub epoch: u64,
     pub at: u64,
 }
@@ -448,6 +460,10 @@ struct StripeEventRecord {
     dispute: Option<String>,
     who: String,
     mu: u64,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    amount_minor: Option<u64>,
     ext_ref_hash: String,
     #[serde(default)]
     dispute_ref_hash: Option<String>,
@@ -1186,7 +1202,8 @@ async fn create_payment_intent(
         ));
     }
     validate_safe_key_part("who", &request.who)?;
-    let amount_cents = mu_to_usd_cents(request.mu)?;
+    let currency = normalize_stripe_currency(request.currency.as_deref())?;
+    let amount_cents = mu_to_stripe_minor(request.mu, &currency)?;
     let secret_key = stripe
         .secret_key
         .as_deref()
@@ -1194,6 +1211,11 @@ async fn create_payment_intent(
     let intent =
         stripe_create_payment_intent(&state.http, stripe, secret_key, &request, amount_cents)
             .await?;
+    if !intent.currency.eq_ignore_ascii_case(&currency) {
+        return Err(PaygateError::Stripe(
+            "PaymentIntent response currency did not match request".to_owned(),
+        ));
+    }
     Ok(StripeCreatePaymentIntentResponse {
         ok: true,
         rail: "stripe",
@@ -1217,7 +1239,9 @@ async fn create_checkout_session(
     validate_safe_key_part("who", &request.who)?;
     validate_checkout_url("success_url", &request.success_url)?;
     validate_checkout_url("cancel_url", &request.cancel_url)?;
-    let amount_cents = mu_to_usd_cents(request.mu)?;
+    let currency = normalize_stripe_currency(request.currency.as_deref())?;
+    let _locale = normalize_stripe_locale(request.locale.as_deref())?;
+    let amount_cents = mu_to_stripe_minor(request.mu, &currency)?;
     let secret_key = stripe
         .secret_key
         .as_deref()
@@ -1225,6 +1249,16 @@ async fn create_checkout_session(
     let session =
         stripe_create_checkout_session(&state.http, stripe, secret_key, &request, amount_cents)
             .await?;
+    if !session
+        .currency
+        .as_deref()
+        .unwrap_or(&currency)
+        .eq_ignore_ascii_case(&currency)
+    {
+        return Err(PaygateError::Stripe(
+            "Checkout Session response currency did not match request".to_owned(),
+        ));
+    }
     let copy_paste = checkout_copy_paste(&session.url);
     Ok(StripeCreateCheckoutSessionResponse {
         ok: true,
@@ -1244,9 +1278,10 @@ async fn stripe_create_payment_intent(
     request: &StripeCreatePaymentIntentRequest,
     amount_cents: u64,
 ) -> Result<StripePaymentIntentSummary> {
+    let currency = normalize_stripe_currency(request.currency.as_deref())?;
     let form = [
         ("amount".to_owned(), amount_cents.to_string()),
-        ("currency".to_owned(), "usd".to_owned()),
+        ("currency".to_owned(), currency.clone()),
         (
             "automatic_payment_methods[enabled]".to_owned(),
             "true".to_owned(),
@@ -1254,6 +1289,11 @@ async fn stripe_create_payment_intent(
         ("metadata[mayhem_who]".to_owned(), request.who.to_owned()),
         ("metadata[mayhem_mu]".to_owned(), request.mu.to_string()),
         ("metadata[mayhem_denom]".to_owned(), CREDIT_DENOM.to_owned()),
+        ("metadata[mayhem_fiat_currency]".to_owned(), currency),
+        (
+            "metadata[mayhem_fiat_amount_minor]".to_owned(),
+            amount_cents.to_string(),
+        ),
     ];
     let mut builder = http
         .post(format!(
@@ -1286,13 +1326,16 @@ async fn stripe_create_checkout_session(
     request: &StripeCreateCheckoutSessionRequest,
     amount_cents: u64,
 ) -> Result<StripeCheckoutSessionSummary> {
+    let currency = normalize_stripe_currency(request.currency.as_deref())?;
+    let locale = normalize_stripe_locale(request.locale.as_deref())?;
     let form = [
         ("mode".to_owned(), "payment".to_owned()),
         ("success_url".to_owned(), request.success_url.to_owned()),
         ("cancel_url".to_owned(), request.cancel_url.to_owned()),
+        ("locale".to_owned(), locale),
         (
             "line_items[0][price_data][currency]".to_owned(),
-            "usd".to_owned(),
+            currency.clone(),
         ),
         (
             "line_items[0][price_data][product_data][name]".to_owned(),
@@ -1312,6 +1355,14 @@ async fn stripe_create_checkout_session(
         ("metadata[mayhem_mu]".to_owned(), request.mu.to_string()),
         ("metadata[mayhem_denom]".to_owned(), CREDIT_DENOM.to_owned()),
         (
+            "metadata[mayhem_fiat_currency]".to_owned(),
+            currency.clone(),
+        ),
+        (
+            "metadata[mayhem_fiat_amount_minor]".to_owned(),
+            amount_cents.to_string(),
+        ),
+        (
             "payment_intent_data[metadata][mayhem_who]".to_owned(),
             request.who.to_owned(),
         ),
@@ -1322,6 +1373,14 @@ async fn stripe_create_checkout_session(
         (
             "payment_intent_data[metadata][mayhem_denom]".to_owned(),
             CREDIT_DENOM.to_owned(),
+        ),
+        (
+            "payment_intent_data[metadata][mayhem_fiat_currency]".to_owned(),
+            currency,
+        ),
+        (
+            "payment_intent_data[metadata][mayhem_fiat_amount_minor]".to_owned(),
+            amount_cents.to_string(),
         ),
     ];
     let mut builder = http
@@ -1449,6 +1508,7 @@ async fn coinbase_create_charge(
     request: &CoinbaseCreateChargeRequest,
     amount: &str,
 ) -> Result<CoinbaseChargeSummary> {
+    let amount_minor = mu_to_stripe_minor(request.mu, "usd")?;
     let mut body = json!({
         "name": "Mayhem credits",
         "description": "Mayhem credit top-up",
@@ -1460,7 +1520,9 @@ async fn coinbase_create_charge(
         "metadata": {
             "mayhem_who": request.who,
             "mayhem_mu": request.mu.to_string(),
-            "mayhem_denom": CREDIT_DENOM
+            "mayhem_denom": CREDIT_DENOM,
+            "mayhem_fiat_currency": "usd",
+            "mayhem_fiat_amount_minor": amount_minor.to_string()
         }
     });
     if let Some(redirect_url) = request
@@ -1615,11 +1677,7 @@ async fn handle_stripe_payment_intent_succeeded(
     event: &StripeEventEnvelope,
 ) -> Result<(StripeEventRecord, ContractPostResult)> {
     let object: StripePaymentIntentObject = serde_json::from_value(event.data.object.clone())?;
-    if !object.currency.eq_ignore_ascii_case("usd") {
-        return Err(PaygateError::Stripe(
-            "PaymentIntent currency must be usd".to_owned(),
-        ));
-    }
+    let currency = normalize_stripe_currency(Some(&object.currency))?;
     let amount_cents = object
         .amount_received
         .or(object.amount)
@@ -1656,6 +1714,28 @@ async fn handle_stripe_payment_intent_succeeded(
             "PaymentIntent denomination must be mu_usd".to_owned(),
         ));
     }
+    let metadata_currency = object.metadata.get("mayhem_fiat_currency").ok_or_else(|| {
+        PaygateError::Stripe("PaymentIntent missing fiat currency metadata".to_owned())
+    })?;
+    if !metadata_currency.eq_ignore_ascii_case(&currency) {
+        return Err(PaygateError::Stripe(
+            "PaymentIntent fiat currency metadata mismatch".to_owned(),
+        ));
+    }
+    let metadata_amount = object
+        .metadata
+        .get("mayhem_fiat_amount_minor")
+        .ok_or_else(|| {
+            PaygateError::Stripe("PaymentIntent missing fiat amount metadata".to_owned())
+        })?;
+    let metadata_amount = metadata_amount.parse::<u64>().map_err(|_| {
+        PaygateError::Stripe("PaymentIntent fiat amount metadata is invalid".to_owned())
+    })?;
+    if metadata_amount != amount_cents {
+        return Err(PaygateError::Stripe(
+            "PaymentIntent fiat amount metadata mismatch".to_owned(),
+        ));
+    }
     let at = event.created.unwrap_or(unix_epoch_seconds()?);
     let ext_ref_hash = stripe_ext_ref_hash(&event.id, &object.id);
     let charge = payment_intent_charge_id(&object);
@@ -1665,6 +1745,8 @@ async fn handle_stripe_payment_intent_succeeded(
         who: who.clone(),
         mu,
         ext_ref_hash: ext_ref_hash.clone(),
+        fiat_currency: currency.clone(),
+        fiat_amount_minor: amount_cents,
         epoch: epoch_for_at(at, state.config.epoch_seconds),
         at,
     };
@@ -1681,6 +1763,8 @@ async fn handle_stripe_payment_intent_succeeded(
             dispute: None,
             who,
             mu,
+            currency: Some(currency),
+            amount_minor: Some(amount_cents),
             ext_ref_hash,
             dispute_ref_hash: None,
             credited_at: Some(at),
@@ -1698,11 +1782,7 @@ async fn handle_stripe_dispute_created(
     let dispute = json_string_field(object, "id")?;
     let amount_cents = json_u64_field(object, "amount")?;
     let currency = json_string_field(object, "currency")?;
-    if !currency.eq_ignore_ascii_case("usd") {
-        return Err(PaygateError::Stripe(
-            "Dispute currency must be usd".to_owned(),
-        ));
-    }
+    let currency = normalize_stripe_currency(Some(&currency))?;
     let charge = stripe_expandable_id(object.get("charge"));
     let payment_intent = stripe_expandable_id(object.get("payment_intent"));
     if charge.is_none() && payment_intent.is_none() {
@@ -1715,6 +1795,13 @@ async fn handle_stripe_dispute_created(
         store.lookup_deposit(payment_intent.as_deref(), charge.as_deref())
     }
     .ok_or_else(|| PaygateError::Stripe("Dispute original deposit not found".to_owned()))?;
+    if let Some(deposit_currency) = deposit.currency.as_deref() {
+        if !deposit_currency.eq_ignore_ascii_case(&currency) {
+            return Err(PaygateError::Stripe(
+                "Dispute currency does not match original deposit".to_owned(),
+            ));
+        }
+    }
     let mu = amount_cents
         .checked_mul(MU_PER_USD_CENT)
         .ok_or_else(|| PaygateError::Stripe("Dispute amount overflow".to_owned()))?;
@@ -1747,6 +1834,8 @@ async fn handle_stripe_dispute_created(
         mu,
         ext_ref_hash: deposit.ext_ref_hash.clone(),
         dispute_ref_hash: dispute_ref_hash.clone(),
+        fiat_currency: currency.clone(),
+        fiat_amount_minor: amount_cents,
         epoch: epoch_for_at(at, state.config.epoch_seconds),
         at,
     };
@@ -1763,6 +1852,8 @@ async fn handle_stripe_dispute_created(
             dispute: Some(dispute),
             who: deposit.who,
             mu,
+            currency: Some(currency),
+            amount_minor: Some(amount_cents),
             ext_ref_hash: deposit.ext_ref_hash,
             dispute_ref_hash: Some(dispute_ref_hash),
             credited_at: None,
@@ -1899,12 +1990,15 @@ async fn handle_coinbase_charge_confirmed(
     }
     let at = coinbase_event_timestamp(event).unwrap_or(unix_epoch_seconds()?);
     let ext_ref_hash = coinbase_ext_ref_hash(event_id, &charge, code.as_deref());
+    let fiat_amount_minor = mu_to_stripe_minor(mu, "usd")?;
     let feature = FiatDepositFeature {
         op: "fiat_deposit",
         rail: "coinbase",
         who: who.clone(),
         mu,
         ext_ref_hash: ext_ref_hash.clone(),
+        fiat_currency: "usd".to_owned(),
+        fiat_amount_minor,
         epoch: epoch_for_at(at, state.config.epoch_seconds),
         at,
     };
@@ -2416,6 +2510,34 @@ fn checkout_copy_paste(url: &str) -> CheckoutCopyPaste {
     }
 }
 
+fn normalize_stripe_currency(value: Option<&str>) -> Result<String> {
+    let currency = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_STRIPE_CURRENCY)
+        .to_ascii_lowercase();
+    if !matches!(currency.as_str(), "usd" | "eur") {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe currency must be usd or eur".to_owned(),
+        ));
+    }
+    Ok(currency)
+}
+
+fn normalize_stripe_locale(value: Option<&str>) -> Result<String> {
+    let locale = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_STRIPE_LOCALE)
+        .to_ascii_lowercase();
+    if locale != "en" {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe checkout locale must be en".to_owned(),
+        ));
+    }
+    Ok(locale)
+}
+
 fn is_safe_key_part(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -2424,21 +2546,21 @@ fn is_safe_key_part(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn mu_to_usd_cents(mu: u64) -> Result<u64> {
+fn mu_to_stripe_minor(mu: u64, currency: &str) -> Result<u64> {
     if mu == 0 {
         return Err(PaygateError::InvalidRequest(
             "mu must be positive".to_owned(),
         ));
     }
     if mu % MU_PER_USD_CENT != 0 {
-        return Err(PaygateError::InvalidRequest(
-            "Stripe deposits must be whole USD cents".to_owned(),
-        ));
+        return Err(PaygateError::InvalidRequest(format!(
+            "Stripe {currency} deposits must be whole cents"
+        )));
     }
     let cents = mu / MU_PER_USD_CENT;
     if cents < STRIPE_MIN_USD_CENTS {
         return Err(PaygateError::InvalidRequest(
-            "Stripe minimum deposit is 500000 mu_usd ($0.50)".to_owned(),
+            "Stripe minimum deposit is 500000 mu_usd".to_owned(),
         ));
     }
     Ok(cents)
@@ -2684,9 +2806,15 @@ mod tests {
 
     #[test]
     fn stripe_mu_to_cents_requires_cent_aligned_minimum() {
-        assert_eq!(mu_to_usd_cents(500_000).unwrap(), 50);
-        assert!(mu_to_usd_cents(499_999).is_err());
-        assert!(mu_to_usd_cents(10_001).is_err());
+        assert_eq!(mu_to_stripe_minor(500_000, "usd").unwrap(), 50);
+        assert_eq!(mu_to_stripe_minor(500_000, "eur").unwrap(), 50);
+        assert!(mu_to_stripe_minor(499_999, "usd").is_err());
+        assert!(mu_to_stripe_minor(10_001, "eur").is_err());
+        assert_eq!(normalize_stripe_currency(None).unwrap(), "usd");
+        assert_eq!(normalize_stripe_currency(Some("EUR")).unwrap(), "eur");
+        assert!(normalize_stripe_currency(Some("gbp")).is_err());
+        assert_eq!(normalize_stripe_locale(None).unwrap(), "en");
+        assert!(normalize_stripe_locale(Some("de")).is_err());
     }
 
     #[test]

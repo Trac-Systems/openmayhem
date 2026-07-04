@@ -618,7 +618,7 @@ fn canonical_room_id(value: &str) -> bool {
 fn provider_status_allows_routing(value: Option<&str>) -> bool {
     value
         .map(|status| status.eq_ignore_ascii_case("active"))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -1027,15 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_table_accepts_legacy_contract_snapshots_without_status() {
+    fn provider_table_requires_active_contract_snapshot_status() {
         let mut table = ProviderTable::new();
         let mut record = contract_record();
         record.provider_status = None;
 
         table.upsert_contract(record);
 
-        assert_eq!(table.contract_len(), 1);
-        assert_eq!(table.entries(1_000_500).len(), 1);
+        assert_eq!(table.contract_len(), 0);
+        assert!(table.entries(1_000_500).is_empty());
     }
 
     #[test]

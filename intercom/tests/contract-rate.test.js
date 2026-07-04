@@ -61,7 +61,7 @@ async function setupRateContract() {
 const rateOracle = (overrides = {}) => ({
   op: 'rate_oracle',
   tnk_usd_e6: 2_000_000,
-  source: 'coinbase-spot',
+  source: 'gate-spot',
   ts: 1_000,
   ...overrides,
 });
@@ -101,12 +101,12 @@ test('MayhemContract rateOracle is admin controlled and monotonic', async () => 
     ok: true,
     op: 'rateOracle',
     ts: 1_000,
-    source: 'coinbase-spot',
+    source: 'gate-spot',
   });
   assert.deepEqual((await storage.get('rate/latest')).value, {
     denom: 'tnk_usd_e6',
     tnk_usd_e6: 2_000_000,
-    source: 'coinbase-spot',
+    source: 'gate-spot',
     ts: 1_000,
     updated_at: makeTxKey(6),
     posted_by: admin.publicKey,
@@ -117,7 +117,7 @@ test('MayhemContract rateOracle is admin controlled and monotonic', async () => 
     contract,
     storage,
     'rateOracle',
-    rateOracle({ source: 'kraken', ts: 999 }),
+    rateOracle({ source: 'mexc-spot', ts: 999 }),
     admin.publicKey,
     7
   );
@@ -156,7 +156,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
       tnk_e18: oneTnkE18,
       msb_tx_hash: 'd'.repeat(64),
       epoch: 1,
-      at: 1_901,
+      at: 3_701,
     },
     admin.publicKey,
     5
@@ -190,7 +190,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
       mu: 1_000_000,
       tnk_e18: '500000000000000000',
       msb_tx_hash: 'e'.repeat(64),
-      at: 1_901,
+      at: 3_701,
     },
     admin.publicKey,
     7
@@ -220,6 +220,11 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     {
       op: 'deposit_tnk',
       memo_hash: 'fresh-deposit',
+      treasury_address: 'testtrac1treasury',
+      tnk_e18: oneTnkE18,
+      quoted_mu: 2_000_000,
+      rate_tnk_usd_e6: 2_000_000,
+      rate_source: 'gate-spot',
     },
     user.publicKey,
     8

@@ -118,6 +118,8 @@ struct PayoutTarget {
     addr: String,
     method: String,
     #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
     set_by: Option<String>,
     #[serde(default)]
     set_by_role: Option<String>,
@@ -199,7 +201,7 @@ struct MsbTransfer {
 struct StripeTransfer {
     destination: String,
     amount_cents: u64,
-    currency: &'static str,
+    currency: String,
     rounding_mu: u64,
     metadata: PayoutMetadata,
     network_pays_fee: bool,
@@ -230,6 +232,8 @@ struct PayoutMetadata {
     mayhem_epoch: u64,
     mayhem_mu: u64,
     mayhem_denom: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mayhem_fiat_currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -359,7 +363,7 @@ fn build_plan(
                 continue;
             }
         };
-        if provider.status.as_deref().unwrap_or("active") != "active" {
+        if provider.status.as_deref() != Some("active") {
             skipped.push(SkippedPayout {
                 who: earning.provider.clone(),
                 reason: "provider_not_active".to_string(),
@@ -380,7 +384,7 @@ fn build_plan(
             .as_deref()
             .map(str::trim)
             .is_some_and(|set_by| set_by == admin_pubkey)
-            && matches!(target.set_by_role.as_deref(), None | Some("admin"));
+            && target.set_by_role.as_deref() == Some("admin");
         if !target_set_by_admin {
             skipped.push(SkippedPayout {
                 who: earning.provider.clone(),
@@ -424,6 +428,7 @@ fn build_plan(
             mayhem_epoch: epoch,
             mayhem_mu: released_mu,
             mayhem_denom: "mu_usd",
+            mayhem_fiat_currency: None,
         };
         let payout = match target.method.as_str() {
             "tnk" => {
@@ -450,16 +455,28 @@ fn build_plan(
                         tnk_e18: Some(&tnk_e18),
                         external_ref: None,
                         msb_tx_hash: Some(&rail_options.msb_tx_hash),
+                        fiat_currency: None,
+                        fiat_amount_minor: None,
                         at,
                     }),
                 }
             }
             "stripe" => {
+                let currency = normalize_fiat_currency(
+                    target
+                        .currency
+                        .as_deref()
+                        .context("stripe payout target missing currency")?,
+                )?;
                 let amount_cents = mu_to_usd_cents_ceil(released_mu)?;
                 let rounding_mu = amount_cents
                     .checked_mul(10_000)
                     .and_then(|mu| mu.checked_sub(released_mu))
                     .context("Stripe rounding overflow")?;
+                let metadata = PayoutMetadata {
+                    mayhem_fiat_currency: Some(currency.clone()),
+                    ..metadata
+                };
                 ProviderPayout {
                     provider: earning.provider.clone(),
                     method: "stripe".to_string(),
@@ -470,7 +487,7 @@ fn build_plan(
                     stripe_transfer: Some(StripeTransfer {
                         destination: target.addr.clone(),
                         amount_cents,
-                        currency: "usd",
+                        currency: currency.clone(),
                         rounding_mu,
                         metadata,
                         network_pays_fee: true,
@@ -485,16 +502,28 @@ fn build_plan(
                         tnk_e18: None,
                         external_ref: Some(&rail_options.stripe_transfer_id),
                         msb_tx_hash: None,
+                        fiat_currency: Some(&currency),
+                        fiat_amount_minor: Some(amount_cents),
                         at,
                     }),
                 }
             }
             "coinbase" => {
+                let currency = normalize_fiat_currency(
+                    target
+                        .currency
+                        .as_deref()
+                        .context("coinbase payout target missing currency")?,
+                )?;
                 let amount_cents = mu_to_usd_cents_ceil(released_mu)?;
                 let rounding_mu = amount_cents
                     .checked_mul(10_000)
                     .and_then(|mu| mu.checked_sub(released_mu))
                     .context("Coinbase rounding overflow")?;
+                let metadata = PayoutMetadata {
+                    mayhem_fiat_currency: Some(currency.clone()),
+                    ..metadata
+                };
                 ProviderPayout {
                     provider: earning.provider.clone(),
                     method: "coinbase".to_string(),
@@ -529,6 +558,8 @@ fn build_plan(
                         tnk_e18: None,
                         external_ref: Some(&rail_options.coinbase_transfer_id),
                         msb_tx_hash: None,
+                        fiat_currency: Some(&currency),
+                        fiat_amount_minor: Some(amount_cents),
                         at,
                     }),
                 }
@@ -571,6 +602,8 @@ fn build_plan(
                         tnk_e18: Some(&tnk_e18),
                         external_ref: None,
                         msb_tx_hash: Some(&rail_options.msb_tx_hash),
+                        fiat_currency: None,
+                        fiat_amount_minor: None,
                         at,
                     }),
                 })
@@ -676,6 +709,14 @@ fn mu_to_usd_cents_ceil(mu: u64) -> Result<u64> {
     Ok(mu.div_ceil(10_000))
 }
 
+fn normalize_fiat_currency(value: &str) -> Result<String> {
+    let currency = value.trim().to_ascii_lowercase();
+    match currency.as_str() {
+        "usd" | "eur" => Ok(currency),
+        _ => bail!("fiat currency must be usd or eur"),
+    }
+}
+
 fn usd_cents_to_amount(cents: u64) -> String {
     format!("{}.{:02}", cents / 100, cents % 100)
 }
@@ -714,6 +755,8 @@ struct PayoutConfirmArgs<'a> {
     tnk_e18: Option<&'a str>,
     external_ref: Option<&'a str>,
     msb_tx_hash: Option<&'a str>,
+    fiat_currency: Option<&'a str>,
+    fiat_amount_minor: Option<u64>,
     at: u64,
 }
 
@@ -736,6 +779,12 @@ fn payout_confirm_command(args: PayoutConfirmArgs<'_>) -> Value {
     }
     if let Some(msb_tx_hash) = args.msb_tx_hash {
         command["msb_tx_hash"] = Value::String(msb_tx_hash.to_string());
+    }
+    if let Some(fiat_currency) = args.fiat_currency {
+        command["fiat_currency"] = Value::String(fiat_currency.to_string());
+    }
+    if let Some(fiat_amount_minor) = args.fiat_amount_minor {
+        command["fiat_amount_minor"] = Value::from(fiat_amount_minor);
     }
     if let Some(kind) = args.kind {
         command["kind"] = Value::String(kind.to_string());
@@ -760,8 +809,9 @@ mod tests {
             payout: Some(PayoutTarget {
                 addr: target.to_string(),
                 method: method.to_string(),
+                currency: (method != "tnk").then(|| "usd".to_string()),
                 set_by: Some(ADMIN.to_string()),
-                set_by_role: None,
+                set_by_role: Some("admin".to_string()),
             }),
         }
     }
@@ -892,13 +942,20 @@ mod tests {
 
     #[test]
     fn payout_plan_includes_stripe_and_coinbase_provider_intents() {
+        let mut stripe_provider =
+            provider_with_method("provider-stripe", "acct_provider", "stripe");
+        stripe_provider
+            .payout
+            .as_mut()
+            .expect("stripe payout")
+            .currency = Some("eur".to_string());
         let snapshot = Snapshot {
             admin: Some(Value::String(ADMIN.to_string())),
             epoch: None,
             rate_tnk_usd_e6: None,
             params: Params::default(),
             providers: vec![
-                provider_with_method("provider-stripe", "acct_provider", "stripe"),
+                stripe_provider,
                 provider_with_method("provider-coinbase", "paymentMethod_provider", "coinbase"),
             ],
             earnings: vec![earning("provider-stripe"), earning("provider-coinbase")],
@@ -930,6 +987,8 @@ mod tests {
             coinbase.confirm_command["external_ref"],
             "transfer_test_pending"
         );
+        assert_eq!(coinbase.confirm_command["fiat_currency"], "usd");
+        assert_eq!(coinbase.confirm_command["fiat_amount_minor"], 170);
         let coinbase_transfer = coinbase
             .coinbase_transfer
             .as_ref()
@@ -950,10 +1009,17 @@ mod tests {
         assert_eq!(stripe.mu, 1_700_000);
         assert_eq!(stripe.confirm_command["rail"], "stripe");
         assert_eq!(stripe.confirm_command["external_ref"], "tr_test_pending");
+        assert_eq!(stripe.confirm_command["fiat_currency"], "eur");
+        assert_eq!(stripe.confirm_command["fiat_amount_minor"], 170);
         let stripe_transfer = stripe.stripe_transfer.as_ref().expect("stripe transfer");
         assert_eq!(stripe_transfer.amount_cents, 170);
         assert_eq!(stripe_transfer.destination, "acct_provider");
+        assert_eq!(stripe_transfer.currency, "eur");
         assert_eq!(stripe_transfer.metadata.mayhem_denom, "mu_usd");
+        assert_eq!(
+            stripe_transfer.metadata.mayhem_fiat_currency.as_deref(),
+            Some("eur")
+        );
     }
 
     #[test]
@@ -995,6 +1061,43 @@ mod tests {
             .skipped
             .iter()
             .all(|skip| skip.reason == "payout_target_not_admin_set"));
+        assert_eq!(plan.totals.provider_mu, 0);
+        assert_eq!(plan.totals.transfer_count, 0);
+    }
+
+    #[test]
+    fn payout_plan_requires_explicit_active_provider_status() {
+        let mut missing_status = provider("missing-status", "trac1missingstatus");
+        missing_status.status = None;
+        let mut banned = provider("banned-provider", "trac1banned");
+        banned.status = Some("banned".to_string());
+        let snapshot = Snapshot {
+            admin: Some(Value::String(ADMIN.to_string())),
+            epoch: None,
+            rate_tnk_usd_e6: None,
+            params: Params::default(),
+            providers: vec![missing_status, banned],
+            earnings: vec![earning("missing-status"), earning("banned-provider")],
+            fee: None,
+        };
+
+        let plan = build_plan(
+            &snapshot,
+            169,
+            1_900,
+            2_000_000,
+            ADMIN,
+            "treasury",
+            &rail_options(),
+        )
+        .unwrap();
+
+        assert!(plan.provider_payouts.is_empty());
+        assert_eq!(plan.skipped.len(), 2);
+        assert!(plan
+            .skipped
+            .iter()
+            .all(|skip| skip.reason == "provider_not_active"));
         assert_eq!(plan.totals.provider_mu, 0);
         assert_eq!(plan.totals.transfer_count, 0);
     }

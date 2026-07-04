@@ -49,6 +49,8 @@ impl ContractPoster for RecordingContractPoster {
                     "rail": feature.rail,
                     "who": feature.who,
                     "mu": feature.mu,
+                    "fiat_currency": feature.fiat_currency,
+                    "fiat_amount_minor": feature.fiat_amount_minor,
                     "epoch": feature.epoch,
                     "deposit_root": "3".repeat(64),
                 }),
@@ -210,6 +212,8 @@ async fn coinbase_charge_route_posts_canonical_mu_metadata_to_commerce() {
     assert_eq!(request_body["metadata"]["mayhem_who"], "d".repeat(64));
     assert_eq!(request_body["metadata"]["mayhem_mu"], "2500000");
     assert_eq!(request_body["metadata"]["mayhem_denom"], "mu_usd");
+    assert_eq!(request_body["metadata"]["mayhem_fiat_currency"], "usd");
+    assert_eq!(request_body["metadata"]["mayhem_fiat_amount_minor"], "250");
     assert_eq!(request_body["redirect_url"], "https://mayhem.local/pay/ok");
     assert_eq!(
         request_body["cancel_url"],
@@ -288,6 +292,8 @@ async fn coinbase_webhook_verifies_signature_posts_contract_once_and_dedups_repl
     assert_eq!(deposits[0].rail, "coinbase");
     assert_eq!(deposits[0].who, "e".repeat(64));
     assert_eq!(deposits[0].mu, 2_500_000);
+    assert_eq!(deposits[0].fiat_currency, "usd");
+    assert_eq!(deposits[0].fiat_amount_minor, 250);
     assert_eq!(deposits[0].epoch, 3);
     assert_eq!(deposits[0].at, 7_200);
     assert_eq!(deposits[0].ext_ref_hash.len(), 64);

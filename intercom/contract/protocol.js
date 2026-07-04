@@ -58,17 +58,8 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'consent') {
-      return {
-        type: 'consent',
-        value: json,
-      };
-    }
-    if (json?.op === 'register_provider') {
-      return {
-        type: 'registerProvider',
-        value: json,
-      };
+    if (json?.op === 'consent' || json?.op === 'register_provider') {
+      return null;
     }
     if (json?.op === 'set_provider_payout') {
       return {
@@ -94,29 +85,13 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'join_enclave') {
-      return {
-        type: 'joinEnclave',
-        value: json,
-      };
-    }
-    if (json?.op === 'leave_enclave') {
-      return {
-        type: 'leaveEnclave',
-        value: json,
-      };
-    }
-    if (json?.op === 'join_room') {
-      return {
-        type: 'joinRoom',
-        value: json,
-      };
-    }
-    if (json?.op === 'leave_room') {
-      return {
-        type: 'leaveRoom',
-        value: json,
-      };
+    if (
+      json?.op === 'join_enclave' ||
+      json?.op === 'leave_enclave' ||
+      json?.op === 'join_room' ||
+      json?.op === 'leave_room'
+    ) {
+      return null;
     }
     if (json?.op === 'update_enclave') {
       return {
@@ -261,16 +236,11 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "set_rules", "ver": 1, "hash": "<hash>" }\' --sim 1 | sets the active rules version.');
     console.log('- /tx --command \'{ "op": "set_params", "submitted_at": 0, "effective_at": 86400, "values": { "fee_bps": 1500 } }\' --sim 1 | schedules parameter changes.');
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
-    console.log('- /tx --command \'{ "op": "consent", "ver": 1, "hash": "<hash>", "sig": "<sig>" }\' --sim 1 | records consent.');
-    console.log('- /tx --command \'{ "op": "register_provider" }\' --sim 1 | provider opts into serving admin-created enclaves.');
+    console.log('- Consent and provider lifecycle are free Mayhem Feature records submitted by the Mayhem CLI/RPC feature path, not /tx commands.');
     console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|coinbase" }\' --sim 1 | admin sets a provider payout target.');
     console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
     console.log('- /tx --command \'{ "op": "set_model_ref", "model_id": "<catalog-model-id>", "price_ref_mu": { "in_per_1k": 18, "out_per_1k": 55 } }\' --sim 1 | admin seeds catalog reference pricing in mu_usd.');
     console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | admin registers an enclave catalog entry.');
-    console.log('- /tx --command \'{ "op": "join_enclave", "enclave_id": "<id>" }\' --sim 1 | provider opts into serving an existing enclave.');
-    console.log('- /tx --command \'{ "op": "leave_enclave", "enclave_id": "<id>" }\' --sim 1 | provider stops serving an enclave.');
-    console.log('- /tx --command \'{ "op": "join_room", "room_id": "<room_id>", "enclave_id": "<id>" }\' --sim 1 | provider joins a canonical admin room with a served enclave.');
-    console.log('- /tx --command \'{ "op": "leave_room", "room_id": "<room_id>", "enclave_id": "<id>" }\' --sim 1 | provider leaves a canonical room.');
     console.log('- /tx --command \'{ "op": "open_room", "enclave_id": "<id>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | admin opens a canonical room for one admin enclave.');
     console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | admin closes a canonical room.');
     console.log('- /tx --command \'{ "op": "set_price", "enclave_id": "<id>", "in_per_1k_mu": 18, "out_per_1k_mu": 55, "per_req_mu": 0, "min_session_mu": 100, "effective_at": 21600 }\' --sim 1 | admin sets an enclave price in mu_usd.');
@@ -284,7 +254,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "dispute", "session_id": "<id>", "reason": "service_failure", "provider": "<pk>", "at": 7200, "evidence_hash": "<hash>" }\' --sim 1 | opens a dispute with a refundable 5000 mu deposit.');
     console.log('- /tx --command \'{ "op": "dispute_resolve", "dispute_id": 1, "outcome": "provider_fault", "deposit_action": "refund", "rationale_hash": "<hash>", "slash": true, "at": 10800 }\' --sim 1 | admin resolves a dispute.');
     console.log('- /tx --command \'{ "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] }\' --sim 1 | admin/oracle applies bounded credit, earning, and fee deltas.');
-    console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "coinbase-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
+    console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "gate-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
     console.log('- /tx --command \'{ "op": "deposit_tnk", "memo_hash": "<hash>" }\' --sim 1 | user creates a memo-bound TNK deposit intent.');
     console.log('- /tx --command \'{ "op": "tnk_deposit", "memo_hash": "<hash>", "tnk_e18": "1000000000000000000", "msb_tx_hash": "<hash>", "epoch": 1, "at": 3600 }\' --sim 1 | admin/oracle credits a memo-bound TNK deposit using a fresh rate.');
     console.log('- /tx --command \'{ "op": "payout_confirm", "epoch": 7, "who": "<pk>", "mu": 1000000, "tnk_e18": "500000000000000000", "msb_tx_hash": "<hash>", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated TNK provider payout.');

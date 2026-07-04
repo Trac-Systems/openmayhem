@@ -53,6 +53,7 @@ use tokio::time::sleep;
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
+const TNK_E18: u128 = 1_000_000_000_000_000_000;
 const OPENCODE_PROVIDER_ID: &str = "mayhem";
 const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
 const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
@@ -181,10 +182,16 @@ enum AdminCommands {
     FiatChargeback(AdminFiatChargebackArgs),
     /// Confirm an executed provider payout or router fee sweep.
     PayoutConfirm(AdminPayoutConfirmArgs),
+    /// Anchor recomputed epoch roots permissionlessly.
+    EpochCommit(AdminEpochCommitArgs),
+    /// Apply admin-verified epoch debits/earnings and ev/* roots.
+    EpochApply(AdminEpochApplyArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum PayCommands {
+    /// Prepare a memo-bound TNK treasury deposit.
+    Tnk(PayTnkArgs),
     /// Buy credits via Stripe hosted checkout.
     Stripe(PayRailArgs),
     /// Buy credits via Coinbase hosted checkout.
@@ -586,9 +593,17 @@ struct ReceiptsCollectArgs {
 
 #[derive(Debug, Parser)]
 struct PayRailArgs {
-    /// USD amount to buy, for example 10 or 10.25.
+    /// Fiat amount to buy, for example 10 or 10.25.
     #[arg(long)]
     amount: String,
+
+    /// Fiat checkout currency for Stripe. Defaults to USD.
+    #[arg(long, default_value = "usd")]
+    currency: String,
+
+    /// Hosted checkout locale. Stripe beta supports English checkout.
+    #[arg(long, default_value = "en")]
+    locale: String,
 
     /// Paygate base URL. Defaults to config.toml, MAYHEM_PAYGATE_URL, or local paygate.
     #[arg(long)]
@@ -639,6 +654,77 @@ struct PayRailArgs {
     poll_interval_ms: u64,
 
     /// Print a machine-readable payment report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PayTnkArgs {
+    /// USD amount of Mayhem credit to target, for example 10 or 10.25.
+    #[arg(long)]
+    amount: String,
+
+    /// Network treasury address that receives the TNK transfer.
+    #[arg(long)]
+    treasury_address: Option<String>,
+
+    /// Override TNK/USD rate in integer micro-USD per 1 TNK. Defaults to contract rate/latest.
+    #[arg(long)]
+    tnk_usd_e6: Option<u64>,
+
+    /// 32-byte hex nonce used with the wallet public key to derive the memo hash.
+    #[arg(long)]
+    nonce: Option<String>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Sign and submit the depositTnk intent through peer RPC.
+    #[arg(long)]
+    submit_intent: bool,
+
+    /// Broadcast the matching MSB transfer from this local wallet. Requires --submit-intent.
+    #[arg(long)]
+    submit_transfer: bool,
+
+    /// MSB network for --submit-transfer. Defaults to testnet1 for testtrac1... treasury addresses and mainnet for trac1...
+    #[arg(long)]
+    msb_network: Option<String>,
+
+    /// Maximum seconds to wait for MSB account sync and validator connection when --submit-transfer is used.
+    #[arg(long, default_value_t = 180)]
+    msb_transfer_timeout_seconds: u64,
+
+    /// Submit with peer RPC sim mode when --submit-intent is used.
+    #[arg(long)]
+    sim: bool,
+
+    /// Wait for the contract ledger balance to reflect the TNK credit.
+    #[arg(long)]
+    wait: bool,
+
+    /// Maximum seconds to wait for ledger credit when --wait is used.
+    #[arg(long, default_value_t = 900)]
+    timeout_seconds: u64,
+
+    /// Poll interval in milliseconds while waiting for ledger credit.
+    #[arg(long, default_value_t = 2_000)]
+    poll_interval_ms: u64,
+
+    /// Print a machine-readable TNK payment report.
     #[arg(long)]
     json: bool,
 }
@@ -965,15 +1051,15 @@ impl AdminFiatRail {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum AdminRateSource {
-    CoinbaseSpot,
-    Kraken,
+    GateSpot,
+    MexcSpot,
 }
 
 impl AdminRateSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::CoinbaseSpot => "coinbase-spot",
-            Self::Kraken => "kraken",
+            Self::GateSpot => "gate-spot",
+            Self::MexcSpot => "mexc-spot",
         }
     }
 }
@@ -1205,6 +1291,10 @@ struct AdminSetProviderPayoutArgs {
 
     #[arg(long)]
     payout_addr: String,
+
+    /// Provider payout currency for fiat payout rails.
+    #[arg(long)]
+    payout_currency: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -1284,6 +1374,14 @@ struct AdminFiatDepositArgs {
     #[arg(long)]
     ext_ref_hash: String,
 
+    /// Fiat checkout currency recorded as ledger evidence.
+    #[arg(long)]
+    fiat_currency: String,
+
+    /// Fiat amount in minor units recorded as ledger evidence.
+    #[arg(long)]
+    fiat_amount_minor: u64,
+
     #[arg(long)]
     epoch: u64,
 
@@ -1314,6 +1412,14 @@ struct AdminFiatChargebackArgs {
     /// Hash of the external dispute/chargeback reference.
     #[arg(long)]
     dispute_ref_hash: String,
+
+    /// Fiat dispute currency recorded as ledger evidence.
+    #[arg(long)]
+    fiat_currency: String,
+
+    /// Fiat dispute amount in minor units recorded as ledger evidence.
+    #[arg(long)]
+    fiat_amount_minor: u64,
 
     #[arg(long)]
     epoch: u64,
@@ -1358,8 +1464,98 @@ struct AdminPayoutConfirmArgs {
     #[arg(long)]
     external_ref: Option<String>,
 
+    /// Fiat payout currency. Required for Stripe/Coinbase payouts.
+    #[arg(long)]
+    fiat_currency: Option<String>,
+
+    /// Fiat payout amount in minor units. Required for Stripe/Coinbase payouts.
+    #[arg(long)]
+    fiat_amount_minor: Option<u64>,
+
     #[arg(long)]
     at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminEpochCommitArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Epoch number. Defaults to recomputed_file.epoch when omitted.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    #[arg(long)]
+    at: u64,
+
+    /// Output from intercom/scripts/recompute-epoch-roots.mjs.
+    #[arg(long, value_name = "PATH")]
+    recomputed_file: Option<PathBuf>,
+
+    /// JSON object containing dep/use/earn/fee/pay roots.
+    #[arg(long)]
+    roots_json: Option<String>,
+
+    /// Path to a JSON object containing dep/use/earn/fee/pay roots.
+    #[arg(long, value_name = "PATH")]
+    roots_file: Option<PathBuf>,
+
+    /// JSON object containing recomputed epoch totals.
+    #[arg(long)]
+    totals_json: Option<String>,
+
+    /// Path to a JSON object containing recomputed epoch totals.
+    #[arg(long, value_name = "PATH")]
+    totals_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminEpochApplyArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Epoch number. Defaults to recomputed_file.epoch when omitted.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    #[arg(long)]
+    at: u64,
+
+    /// Output from intercom/scripts/recompute-epoch-roots.mjs.
+    #[arg(long, value_name = "PATH")]
+    recomputed_file: Option<PathBuf>,
+
+    /// JSON array of {user,mu} debits.
+    #[arg(long)]
+    debits_json: Option<String>,
+
+    /// Path to a JSON array of {user,mu} debits.
+    #[arg(long, value_name = "PATH")]
+    debits_file: Option<PathBuf>,
+
+    /// JSON array of {provider,gross_mu} earnings.
+    #[arg(long)]
+    earnings_json: Option<String>,
+
+    /// Path to a JSON array of {provider,gross_mu} earnings.
+    #[arg(long, value_name = "PATH")]
+    earnings_file: Option<PathBuf>,
+
+    /// JSON object containing dep/use/earn/fee/pay roots.
+    #[arg(long)]
+    roots_json: Option<String>,
+
+    /// Path to a JSON object containing dep/use/earn/fee/pay roots.
+    #[arg(long, value_name = "PATH")]
+    roots_file: Option<PathBuf>,
+
+    /// JSON object containing recomputed epoch totals.
+    #[arg(long)]
+    totals_json: Option<String>,
+
+    /// Path to a JSON object containing recomputed epoch totals.
+    #[arg(long, value_name = "PATH")]
+    totals_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1380,7 +1576,7 @@ struct ProviderTxArgs {
     #[arg(long)]
     wallet_password: Option<String>,
 
-    /// Dry-run the provider lifecycle txs through contract simulation.
+    /// Build and sign provider lifecycle feature records without appending them.
     #[arg(long)]
     sim: bool,
 
@@ -1534,7 +1730,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     enclave_binary: Option<PathBuf>,
 
-    /// Dry-run the provider registration/join txs through contract simulation.
+    /// Build and sign provider registration/join feature records without appending them.
     #[arg(long)]
     sim: bool,
 
@@ -1621,6 +1817,18 @@ struct WalletInfo {
     mnemonic: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct MsbTransferOutput {
+    ok: bool,
+    network: String,
+    from: String,
+    to: String,
+    amount: String,
+    tx_hash: String,
+    before_balance: String,
+    validator_connections: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct SignOutput {
     signature: String,
@@ -1639,6 +1847,7 @@ struct ConsentReport {
     rules: Option<RulesRef>,
     tx: Option<String>,
     command_hash: Option<String>,
+    feature: Option<Value>,
     result: Option<Value>,
     state: Option<Value>,
 }
@@ -1672,6 +1881,7 @@ struct ConfigNetwork {
     sc_bridge_token: Option<String>,
     gateway_url: Option<String>,
     paygate_url: Option<String>,
+    tnk_treasury_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1709,6 +1919,7 @@ async fn main() -> Result<()> {
         Commands::Use(args) => use_gateway(args).await,
         Commands::Models(args) => models(args).await,
         Commands::Pay { command } => match command {
+            PayCommands::Tnk(args) => pay_tnk(args).await,
             PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
             PayCommands::Coinbase(args) => pay(PayRail::Coinbase, args).await,
         },
@@ -1770,6 +1981,7 @@ async fn setup(args: SetupArgs) -> Result<()> {
             rules: None,
             tx: None,
             command_hash: None,
+            feature: None,
             result: None,
             state: None,
         }
@@ -1901,6 +2113,7 @@ async fn rules_review(args: RulesReviewArgs) -> Result<()> {
             rules: Some(rules.clone()),
             tx: None,
             command_hash: None,
+            feature: None,
             result: None,
             state: prior_consent.clone(),
         }
@@ -2448,6 +2661,8 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::FiatDeposit(args) => &args.tx,
         AdminCommands::FiatChargeback(args) => &args.tx,
         AdminCommands::PayoutConfirm(args) => &args.tx,
+        AdminCommands::EpochCommit(args) => &args.tx,
+        AdminCommands::EpochApply(args) => &args.tx,
     }
 }
 
@@ -2477,23 +2692,20 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::SetPrice(args) => Ok(("setPrice", admin_set_price_payload(args))),
         AdminCommands::SetProviderPayout(args) => Ok((
             "setProviderPayout",
-            json!({
-                "op": "set_provider_payout",
-                "provider": &args.provider,
-                "payout_method": args.payout_method.as_str(),
-                "payout_addr": &args.payout_addr,
-            }),
+            admin_set_provider_payout_payload(args)?,
         )),
         AdminCommands::BanProvider(args) => Ok(("banProvider", admin_ban_provider_payload(args)?)),
         AdminCommands::RateOracle(args) => Ok(("rateOracle", admin_rate_oracle_payload(args))),
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
-        AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args))),
+        AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args)?)),
         AdminCommands::FiatChargeback(args) => {
-            Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)))
+            Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)?))
         }
         AdminCommands::PayoutConfirm(args) => {
             Ok(("payoutConfirm", admin_payout_confirm_payload(args)?))
         }
+        AdminCommands::EpochCommit(args) => Ok(("epochCommit", admin_epoch_commit_payload(args)?)),
+        AdminCommands::EpochApply(args) => Ok(("epochApply", admin_epoch_apply_payload(args)?)),
     }
 }
 
@@ -2587,6 +2799,38 @@ fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Value {
     })
 }
 
+fn normalize_admin_fiat_currency(value: &str) -> Result<String> {
+    let currency = value.trim().to_ascii_lowercase();
+    match currency.as_str() {
+        "usd" | "eur" => Ok(currency),
+        _ => bail!("fiat currency must be usd or eur"),
+    }
+}
+
+fn admin_set_provider_payout_payload(args: &AdminSetProviderPayoutArgs) -> Result<Value> {
+    let mut payload = json!({
+        "op": "set_provider_payout",
+        "provider": &args.provider,
+        "payout_method": args.payout_method.as_str(),
+        "payout_addr": &args.payout_addr,
+    });
+    match args.payout_method {
+        AdminPayoutMethod::Tnk => {
+            if args.payout_currency.is_some() {
+                bail!("TNK payout targets must not include --payout-currency");
+            }
+        }
+        AdminPayoutMethod::Stripe | AdminPayoutMethod::Coinbase => {
+            let payout_currency = args
+                .payout_currency
+                .as_deref()
+                .context("fiat payout targets require --payout-currency")?;
+            payload["payout_currency"] = json!(normalize_admin_fiat_currency(payout_currency)?);
+        }
+    }
+    Ok(payload)
+}
+
 fn admin_ban_provider_payload(args: &AdminBanProviderArgs) -> Result<Value> {
     if args.reason_hash.is_some() && args.reason.is_some() {
         bail!("pass only one of --reason-hash or --reason");
@@ -2626,29 +2870,39 @@ fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
     })
 }
 
-fn admin_fiat_deposit_payload(args: &AdminFiatDepositArgs) -> Value {
-    json!({
+fn admin_fiat_deposit_payload(args: &AdminFiatDepositArgs) -> Result<Value> {
+    if args.fiat_amount_minor == 0 {
+        bail!("fiat deposits require positive --fiat-amount-minor");
+    }
+    Ok(json!({
         "op": "fiat_deposit",
         "rail": args.rail.as_str(),
         "who": &args.who,
         "mu": args.mu,
         "ext_ref_hash": &args.ext_ref_hash,
+        "fiat_currency": normalize_admin_fiat_currency(&args.fiat_currency)?,
+        "fiat_amount_minor": args.fiat_amount_minor,
         "epoch": args.epoch,
         "at": args.at,
-    })
+    }))
 }
 
-fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Value {
-    json!({
+fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Result<Value> {
+    if args.fiat_amount_minor == 0 {
+        bail!("fiat chargebacks require positive --fiat-amount-minor");
+    }
+    Ok(json!({
         "op": "fiat_chargeback",
         "rail": args.rail.as_str(),
         "who": &args.who,
         "mu": args.mu,
         "ext_ref_hash": &args.ext_ref_hash,
         "dispute_ref_hash": &args.dispute_ref_hash,
+        "fiat_currency": normalize_admin_fiat_currency(&args.fiat_currency)?,
+        "fiat_amount_minor": args.fiat_amount_minor,
         "epoch": args.epoch,
         "at": args.at,
-    })
+    }))
 }
 
 fn admin_payout_confirm_payload(args: &AdminPayoutConfirmArgs) -> Result<Value> {
@@ -2667,8 +2921,13 @@ fn admin_payout_confirm_payload(args: &AdminPayoutConfirmArgs) -> Result<Value> 
     }
     match args.rail {
         AdminPayoutMethod::Tnk => {
-            if args.external_ref.is_some() {
-                bail!("TNK payout confirmations must not include --external-ref");
+            if args.external_ref.is_some()
+                || args.fiat_currency.is_some()
+                || args.fiat_amount_minor.is_some()
+            {
+                bail!(
+                    "TNK payout confirmations must not include --external-ref, --fiat-currency, or --fiat-amount-minor"
+                );
             }
             let tnk_e18 = args
                 .tnk_e18
@@ -2692,11 +2951,109 @@ fn admin_payout_confirm_payload(args: &AdminPayoutConfirmArgs) -> Result<Value> 
                 .external_ref
                 .as_deref()
                 .context("fiat payout confirmations require --external-ref")?;
+            let fiat_currency = args
+                .fiat_currency
+                .as_deref()
+                .context("fiat payout confirmations require --fiat-currency")?;
+            let fiat_amount_minor = args
+                .fiat_amount_minor
+                .context("fiat payout confirmations require --fiat-amount-minor")?;
+            if fiat_amount_minor == 0 {
+                bail!("fiat payout confirmations require positive --fiat-amount-minor");
+            }
             payload["rail"] = json!(args.rail.as_str());
             payload["external_ref"] = json!(external_ref);
+            payload["fiat_currency"] = json!(normalize_admin_fiat_currency(fiat_currency)?);
+            payload["fiat_amount_minor"] = json!(fiat_amount_minor);
         }
     }
     Ok(payload)
+}
+
+fn admin_epoch_commit_payload(args: &AdminEpochCommitArgs) -> Result<Value> {
+    let recomputed = read_optional_json_file(args.recomputed_file.as_ref(), "recomputed epoch")?;
+    let epoch = epoch_arg_or_recomputed(args.epoch, recomputed.as_ref())?;
+    let roots = json_arg_or_file_object(
+        args.roots_json.as_deref(),
+        args.roots_file.as_ref(),
+        recomputed_field(recomputed.as_ref(), "roots"),
+        "epoch roots",
+    )?;
+    let totals = json_arg_or_file_object(
+        args.totals_json.as_deref(),
+        args.totals_file.as_ref(),
+        recomputed_field(recomputed.as_ref(), "totals"),
+        "epoch totals",
+    )?;
+
+    Ok(json!({
+        "op": "epoch_commit",
+        "epoch": epoch,
+        "at": args.at,
+        "roots": roots,
+        "totals": totals,
+    }))
+}
+
+fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
+    let recomputed = read_optional_json_file(args.recomputed_file.as_ref(), "recomputed epoch")?;
+    let epoch = epoch_arg_or_recomputed(args.epoch, recomputed.as_ref())?;
+    let debits = json_arg_or_file_array(
+        args.debits_json.as_deref(),
+        args.debits_file.as_ref(),
+        recomputed_field(recomputed.as_ref(), "debits").or_else(|| Some(json!([]))),
+        "epoch debits",
+    )?;
+    let earnings = json_arg_or_file_array(
+        args.earnings_json.as_deref(),
+        args.earnings_file.as_ref(),
+        recomputed_field(recomputed.as_ref(), "earnings").or_else(|| Some(json!([]))),
+        "epoch earnings",
+    )?;
+    let roots = json_arg_or_file_object(
+        args.roots_json.as_deref(),
+        args.roots_file.as_ref(),
+        recomputed_field(recomputed.as_ref(), "roots"),
+        "epoch roots",
+    )?;
+    let totals = json_arg_or_file_object(
+        args.totals_json.as_deref(),
+        args.totals_file.as_ref(),
+        recomputed_field(recomputed.as_ref(), "totals"),
+        "epoch totals",
+    )?;
+
+    Ok(json!({
+        "op": "epoch_apply",
+        "epoch": epoch,
+        "at": args.at,
+        "debits": debits,
+        "earnings": earnings,
+        "roots": roots,
+        "totals": totals,
+    }))
+}
+
+fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option<Value>> {
+    path.map(|path| {
+        read_json_file(path)
+            .with_context(|| format!("reading {label} JSON from {}", path.display()))
+    })
+    .transpose()
+}
+
+fn recomputed_field(recomputed: Option<&Value>, field: &str) -> Option<Value> {
+    recomputed.and_then(|value| value.get(field).cloned())
+}
+
+fn epoch_arg_or_recomputed(epoch: Option<u64>, recomputed: Option<&Value>) -> Result<u64> {
+    let epoch = epoch
+        .or_else(|| recomputed.and_then(|value| value.get("epoch").and_then(Value::as_u64)))
+        .context("--epoch is required when --recomputed-file does not contain epoch")?;
+    if epoch == 0 {
+        bail!("--epoch must be positive");
+    }
+    Ok(epoch)
 }
 
 fn json_arg_or_file_object(
@@ -2717,6 +3074,28 @@ fn json_arg_or_file_object(
     };
     if !value.is_object() {
         bail!("{label} JSON must be an object");
+    }
+    Ok(value)
+}
+
+fn json_arg_or_file_array(
+    inline: Option<&str>,
+    file: Option<&PathBuf>,
+    default: Option<Value>,
+    label: &str,
+) -> Result<Value> {
+    let value = match (inline, file) {
+        (Some(_), Some(_)) => {
+            bail!("pass only one inline {label} JSON value or {label} JSON file")
+        }
+        (Some(inline), None) => serde_json::from_str::<Value>(inline)
+            .with_context(|| format!("parsing {label} JSON"))?,
+        (None, Some(path)) => read_json_file(path)
+            .with_context(|| format!("reading {label} JSON from {}", path.display()))?,
+        (None, None) => default.with_context(|| format!("{label} JSON is required"))?,
+    };
+    if !value.is_array() {
+        bail!("{label} JSON must be an array");
     }
     Ok(value)
 }
@@ -2808,6 +3187,264 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[derive(Debug, Clone)]
+struct PayTnkRate {
+    tnk_usd_e6: u64,
+    source: String,
+    ts: Option<u64>,
+}
+
+async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
+    if args.poll_interval_ms == 0 {
+        bail!("--poll-interval-ms must be positive");
+    }
+    if args.submit_transfer && !args.submit_intent {
+        bail!("--submit-transfer requires --submit-intent so the memo-bound contract intent exists before TNK moves");
+    }
+    if args.submit_transfer && args.sim {
+        bail!("--submit-transfer cannot be combined with --sim");
+    }
+    if args.submit_transfer && args.msb_transfer_timeout_seconds == 0 {
+        bail!("--msb-transfer-timeout-seconds must be positive");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        args.wallet_password.as_deref().unwrap_or(""),
+    )
+    .await?;
+    let amount_mu = parse_usd_amount_to_mu(&args.amount)?;
+    let treasury_address =
+        resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
+    let needs_rpc = args.tnk_usd_e6.is_none() || args.submit_intent || args.wait;
+    let rpc_url = if needs_rpc {
+        Some(resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?)
+    } else {
+        args.rpc_url.clone()
+    };
+    let rpc = match rpc_url.as_deref() {
+        Some(url) if needs_rpc => Some(PeerRpcClient::new(url)?),
+        _ => None,
+    };
+    let rate = resolve_tnk_rate(rpc.as_ref(), args.tnk_usd_e6).await?;
+    let nonce = resolve_tnk_nonce(
+        &wallet.public_key,
+        amount_mu,
+        &treasury_address,
+        &rate,
+        &args,
+    )?;
+    let memo_hash = derive_tnk_memo_hash(&wallet.public_key, &nonce)?;
+    let tnk_e18 = mu_to_tnk_e18_ceil_u128(amount_mu, rate.tnk_usd_e6)?;
+    let tnk_decimal = tnk_e18_to_decimal(tnk_e18);
+    let quoted_credit_mu = tnk_e18_to_mu_floor(tnk_e18, rate.tnk_usd_e6)?;
+    let intent_payload = pay_tnk_deposit_intent_payload(
+        &memo_hash,
+        &treasury_address,
+        tnk_e18,
+        quoted_credit_mu,
+        &rate,
+    );
+    let msb_transfer_command = format!("/transfer {} {}", treasury_address, tnk_decimal);
+    let deposit_intent_command = pay_tnk_deposit_intent_command(
+        &args.amount,
+        &treasury_address,
+        &nonce,
+        rate.tnk_usd_e6,
+        rpc_url.as_deref(),
+    );
+    let admin_confirm_command = format!(
+        "mayhem admin tnk-deposit --memo-hash {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --epoch <epoch> --at <unix-seconds>",
+        shell_single_quote(&memo_hash),
+        tnk_e18
+    );
+
+    emit_tnk_handoff(
+        args.json,
+        amount_mu,
+        &msb_transfer_command,
+        &memo_hash,
+        &deposit_intent_command,
+    )?;
+
+    let before_mu = if args.wait {
+        let rpc = rpc.as_ref().context("--wait requires peer RPC")?;
+        Some(read_user_balance_mu(rpc, &wallet.public_key).await?)
+    } else {
+        None
+    };
+
+    let submitted = if args.submit_intent {
+        let rpc = rpc.as_ref().context("--submit-intent requires peer RPC")?;
+        let keypair_path = PathBuf::from(wallet.keypair_path.clone());
+        Some(
+            submit_contract_command(
+                rpc,
+                &keypair_path,
+                args.wallet_password.as_deref().unwrap_or(""),
+                &wallet,
+                "depositTnk",
+                intent_payload.clone(),
+                args.sim,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let msb_transfer = if args.submit_transfer {
+        let keypair_path = PathBuf::from(wallet.keypair_path.clone());
+        let (stores_directory, store_name) = msb_store_from_keypair_path(&keypair_path)?;
+        let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
+        Some(
+            submit_msb_transfer(
+                &network,
+                &stores_directory,
+                &store_name,
+                &treasury_address,
+                &tnk_decimal,
+                args.msb_transfer_timeout_seconds,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let credit = if args.wait {
+        let rpc = rpc.as_ref().context("--wait requires peer RPC")?;
+        let before_mu = before_mu.context("--wait balance snapshot missing")?;
+        let target_mu = before_mu
+            .checked_add(amount_mu)
+            .context("target balance overflowed")?;
+        let status = wait_for_credit(
+            rpc,
+            &wallet.public_key,
+            before_mu,
+            target_mu,
+            Duration::from_secs(args.timeout_seconds),
+            Duration::from_millis(args.poll_interval_ms),
+        )
+        .await?;
+        Some(status)
+    } else {
+        None
+    };
+
+    let report = json!({
+        "ok": (submitted.is_some() || !args.submit_intent) && (msb_transfer.is_some() || !args.submit_transfer),
+        "rail": "tnk",
+        "denom": "mu_usd",
+        "amount_mu": amount_mu,
+        "amount_usd": mu_to_usd_amount(amount_mu),
+        "quoted_credit_mu": quoted_credit_mu,
+        "who": wallet.public_key,
+        "rpc_url": rpc_url,
+        "treasury_address": treasury_address,
+        "rate": {
+            "denom": "tnk_usd_e6",
+            "tnk_usd_e6": rate.tnk_usd_e6,
+            "source": rate.source,
+            "ts": rate.ts,
+        },
+        "deposit_intent": {
+            "tx_type": "depositTnk",
+            "command": intent_payload,
+            "submitted": submitted.is_some(),
+            "tx": submitted,
+        },
+        "tnk": {
+            "tnk_e18": tnk_e18.to_string(),
+            "amount": tnk_decimal,
+        },
+        "msb_transfer": msb_transfer,
+        "memo_hash": memo_hash,
+        "nonce": nonce,
+        "copy_paste": {
+            "msb_transfer_command": msb_transfer_command,
+            "transfer_memo_reference": memo_hash,
+            "deposit_intent_command": deposit_intent_command,
+            "admin_confirm_command": admin_confirm_command,
+        },
+        "credit": credit.as_ref().map(|status| json!({
+            "credited": status.credited,
+            "before_mu": status.before_mu,
+            "current_mu": status.current_mu,
+            "target_mu": status.target_mu,
+            "waited_ms": status.waited_ms,
+        })),
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if let Some(status) = credit.as_ref().filter(|status| !status.credited) {
+            bail!(
+                "timed out waiting for {} mu_usd credit; current balance {} mu_usd, target {} mu_usd",
+                amount_mu,
+                status.current_mu,
+                status.target_mu
+            );
+        }
+    } else {
+        println!("TNK amount: {tnk_decimal} ({tnk_e18} e18)");
+        println!("Treasury address: {treasury_address}");
+        println!("Rate: {} tnk_usd_e6 ({})", rate.tnk_usd_e6, rate.source);
+        if let Some(ts) = rate.ts {
+            println!("Rate timestamp: {ts}");
+        }
+        if submitted.is_some() {
+            println!("Submitted deposit intent: true");
+            if let Some(tx) = report["deposit_intent"]["tx"]["tx"].as_str() {
+                println!("Tx: {tx}");
+            }
+            if let Some(command_hash) = report["deposit_intent"]["tx"]["command_hash"].as_str() {
+                println!("Command hash: {command_hash}");
+            }
+        } else {
+            println!(
+                "Submitted deposit intent: false (pass --submit-intent to sign and send through peer RPC)"
+            );
+        }
+        if let Some(transfer) = report["msb_transfer"].as_object() {
+            if let Some(tx_hash) = transfer.get("tx_hash").and_then(Value::as_str) {
+                println!("Submitted MSB transfer: true");
+                println!("MSB tx: {tx_hash}");
+            }
+        } else if args.submit_transfer {
+            println!("Submitted MSB transfer: false");
+        }
+        println!("Copy/paste admin/oracle confirmation command after MSB finality:");
+        println!(
+            "{}",
+            report["copy_paste"]["admin_confirm_command"]
+                .as_str()
+                .unwrap_or("")
+        );
+        if let Some(status) = credit {
+            if status.credited {
+                println!(
+                    "Credited: balance {} -> {} mu_usd.",
+                    status.before_mu, status.current_mu
+                );
+            } else {
+                bail!(
+                    "timed out waiting for {} mu_usd credit; current balance {} mu_usd, target {} mu_usd",
+                    amount_mu,
+                    status.current_mu,
+                    status.target_mu
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     if args.poll_interval_ms == 0 {
         bail!("--poll-interval-ms must be positive");
@@ -2827,17 +3464,19 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     let paygate_url = resolve_cli_paygate_url(config.as_ref(), args.paygate_url.as_deref());
     let amount_mu = parse_usd_amount_to_mu(&args.amount)?;
     let before_mu = read_user_balance_mu(&rpc, &wallet.public_key).await?;
-    let checkout = create_pay_checkout(
+    let checkout = create_pay_checkout(PayCheckoutRequest {
         rail,
-        &paygate_url,
-        &wallet.public_key,
+        paygate_url: &paygate_url,
+        who: &wallet.public_key,
         amount_mu,
-        args.idempotency_key.as_deref(),
-        args.success_url.as_deref(),
-        args.cancel_url.as_deref(),
-    )
+        currency: &args.currency,
+        locale: &args.locale,
+        idempotency_key: args.idempotency_key.as_deref(),
+        success_url: args.success_url.as_deref(),
+        cancel_url: args.cancel_url.as_deref(),
+    })
     .await?;
-    emit_checkout_handoff(args.json, rail, amount_mu, &checkout.url)?;
+    emit_checkout_handoff(args.json, rail, amount_mu, &args.currency, &checkout.url)?;
     let opened = open_checkout_url(&checkout.url, args.no_open).await;
     let target_mu = before_mu
         .checked_add(amount_mu)
@@ -2868,6 +3507,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         "denom": "mu_usd",
         "amount_mu": amount_mu,
         "amount_usd": mu_to_usd_amount(amount_mu),
+        "currency": args.currency.to_ascii_lowercase(),
         "who": wallet.public_key,
         "paygate_url": paygate_url,
         "rpc_url": rpc_url,
@@ -4845,6 +5485,97 @@ fn resolve_cli_paygate_url(config: Option<&MayhemConfig>, paygate_url: Option<&s
         .unwrap_or_else(|| DEFAULT_PAYGATE_URL.to_owned())
 }
 
+fn resolve_cli_tnk_treasury_address(
+    config: Option<&MayhemConfig>,
+    treasury_address: Option<&str>,
+) -> Result<String> {
+    let value = treasury_address
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            env::var("MAYHEM_TNK_TREASURY_ADDRESS")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            config
+                .and_then(|config| config.network.as_ref())
+                .and_then(|network| network.tnk_treasury_address.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .context(
+            "TNK treasury address required; pass --treasury-address, set MAYHEM_TNK_TREASURY_ADDRESS, or set network.tnk_treasury_address",
+        )?;
+    if value.split_whitespace().count() != 1 {
+        bail!("TNK treasury address must not contain whitespace");
+    }
+    Ok(value)
+}
+
+fn resolve_tnk_msb_network(
+    override_network: Option<&str>,
+    treasury_address: &str,
+) -> Result<String> {
+    if let Some(network) = override_network
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return match network.to_ascii_lowercase().as_str() {
+            "mainnet" => Ok("mainnet".to_owned()),
+            "testnet" | "testnet1" => Ok("testnet1".to_owned()),
+            _ => bail!("--msb-network must be mainnet or testnet1"),
+        };
+    }
+
+    if treasury_address.starts_with("testtrac1") {
+        Ok("testnet1".to_owned())
+    } else if treasury_address.starts_with("trac1") {
+        Ok("mainnet".to_owned())
+    } else {
+        bail!(
+            "could not infer MSB network from treasury address; pass --msb-network mainnet|testnet1"
+        )
+    }
+}
+
+fn msb_store_from_keypair_path(keypair_path: &Path) -> Result<(PathBuf, String)> {
+    let keypair_file = keypair_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("wallet keypair path has no filename")?;
+    if keypair_file != "keypair.json" {
+        bail!("wallet keypair path must end in db/keypair.json for MSB transfer submission");
+    }
+    let db_dir = keypair_path
+        .parent()
+        .context("wallet keypair path has no db directory")?;
+    let db_name = db_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("wallet keypair db directory has no name")?;
+    if db_name != "db" {
+        bail!("wallet keypair path must end in db/keypair.json for MSB transfer submission");
+    }
+    let store_dir = db_dir
+        .parent()
+        .context("wallet keypair path has no store directory")?;
+    let store_name = store_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .context("wallet store directory has no name")?
+        .to_owned();
+    let stores_directory = store_dir
+        .parent()
+        .context("wallet store directory has no parent")?
+        .to_path_buf();
+    Ok((stores_directory, store_name))
+}
+
 async fn resolve_cli_wallet(
     home: &Path,
     config: Option<&MayhemConfig>,
@@ -4870,46 +5601,168 @@ async fn resolve_cli_wallet(
         .with_context(|| format!("reading wallet {}", keypair_path.display()))
 }
 
-#[derive(Debug)]
-struct PayCheckout {
-    id: String,
-    url: String,
-    reference: Option<String>,
-}
-
-#[derive(Debug)]
-struct PayCreditStatus {
-    credited: bool,
-    before_mu: u64,
-    current_mu: u64,
-    target_mu: u64,
-    waited_ms: u64,
-}
-
-fn checkout_handoff_lines(rail: PayRail, amount_mu: u64, url: &str) -> [String; 2] {
-    [
-        format!(
-            "Mayhem {} checkout for {}",
-            rail.as_str(),
-            mu_to_usd_amount(amount_mu)
-        ),
-        format!("Copy/paste checkout URL: {url}"),
-    ]
-}
-
-fn checkout_copy_paste_value(url: &str) -> Value {
+fn pay_tnk_deposit_intent_payload(
+    memo_hash: &str,
+    treasury_address: &str,
+    tnk_e18: u128,
+    quoted_mu: u64,
+    rate: &PayTnkRate,
+) -> Value {
     json!({
-        "checkout_url": url,
+        "op": "deposit_tnk",
+        "memo_hash": memo_hash,
+        "treasury_address": treasury_address,
+        "tnk_e18": tnk_e18.to_string(),
+        "quoted_mu": quoted_mu,
+        "rate_tnk_usd_e6": rate.tnk_usd_e6,
+        "rate_source": rate.source,
     })
 }
 
-fn emit_checkout_handoff(
-    json_output: bool,
-    rail: PayRail,
+async fn resolve_tnk_rate(
+    rpc: Option<&PeerRpcClient>,
+    override_rate: Option<u64>,
+) -> Result<PayTnkRate> {
+    if let Some(tnk_usd_e6) = override_rate {
+        if tnk_usd_e6 == 0 {
+            bail!("--tnk-usd-e6 must be positive");
+        }
+        return Ok(PayTnkRate {
+            tnk_usd_e6,
+            source: "cli-override".to_owned(),
+            ts: None,
+        });
+    }
+
+    let rpc = rpc.context(
+        "contract rate/latest requires peer RPC; pass --tnk-usd-e6 for offline preparation",
+    )?;
+    let value = read_state_value(rpc, "rate/latest").await?.context(
+        "contract rate/latest not found; run mayhem admin rate-oracle or pass --tnk-usd-e6",
+    )?;
+    parse_tnk_rate(&value)
+}
+
+fn parse_tnk_rate(value: &Value) -> Result<PayTnkRate> {
+    let tnk_usd_e6 = value
+        .get("tnk_usd_e6")
+        .and_then(Value::as_u64)
+        .filter(|rate| *rate > 0)
+        .context("rate/latest missing positive tnk_usd_e6")?;
+    Ok(PayTnkRate {
+        tnk_usd_e6,
+        source: value
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("rate/latest")
+            .to_owned(),
+        ts: value.get("ts").and_then(Value::as_u64),
+    })
+}
+
+fn resolve_tnk_nonce(
+    wallet_pubkey: &str,
     amount_mu: u64,
-    url: &str,
+    treasury_address: &str,
+    rate: &PayTnkRate,
+    args: &PayTnkArgs,
+) -> Result<String> {
+    if let Some(nonce) = args.nonce.as_deref() {
+        if !is_hex_len(nonce, 64) {
+            bail!("--nonce must be a 32-byte hex string");
+        }
+        return Ok(nonce.to_ascii_lowercase());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_nanos();
+    Ok(blake3::hash(
+        format!(
+            "mayhem:tnk-deposit-nonce:v1:{wallet_pubkey}:{amount_mu}:{treasury_address}:{}:{now}:{}",
+            rate.tnk_usd_e6,
+            std::process::id()
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string())
+}
+
+fn derive_tnk_memo_hash(wallet_pubkey: &str, nonce: &str) -> Result<String> {
+    let pubkey = hex_decode_array::<32>(wallet_pubkey, "wallet public key")?;
+    let nonce = hex_decode_array::<32>(nonce, "TNK deposit nonce")?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&pubkey);
+    hasher.update(&nonce);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn mu_to_tnk_e18_ceil_u128(mu: u64, rate_tnk_usd_e6: u64) -> Result<u128> {
+    if rate_tnk_usd_e6 == 0 {
+        bail!("rate_tnk_usd_e6 must be positive");
+    }
+    let numerator = u128::from(mu)
+        .checked_mul(TNK_E18)
+        .context("TNK conversion overflow")?;
+    Ok(numerator.div_ceil(u128::from(rate_tnk_usd_e6)))
+}
+
+fn tnk_e18_to_mu_floor(tnk_e18: u128, rate_tnk_usd_e6: u64) -> Result<u64> {
+    let mu = tnk_e18
+        .checked_mul(u128::from(rate_tnk_usd_e6))
+        .context("TNK credit conversion overflow")?
+        / TNK_E18;
+    u64::try_from(mu).context("TNK credit conversion overflowed u64")
+}
+
+fn tnk_e18_to_decimal(tnk_e18: u128) -> String {
+    let whole = tnk_e18 / TNK_E18;
+    let fraction = tnk_e18 % TNK_E18;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let mut fraction = format!("{fraction:018}");
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{whole}.{fraction}")
+}
+
+fn pay_tnk_deposit_intent_command(
+    amount: &str,
+    treasury_address: &str,
+    nonce: &str,
+    tnk_usd_e6: u64,
+    rpc_url: Option<&str>,
+) -> String {
+    let mut command = format!(
+        "mayhem pay tnk --amount {} --treasury-address {} --nonce {} --tnk-usd-e6 {} --submit-intent",
+        shell_single_quote(amount),
+        shell_single_quote(treasury_address),
+        shell_single_quote(nonce),
+        tnk_usd_e6
+    );
+    if let Some(rpc_url) = rpc_url.filter(|value| !value.trim().is_empty()) {
+        command.push_str(" --rpc-url ");
+        command.push_str(&shell_single_quote(rpc_url));
+    }
+    command
+}
+
+fn emit_tnk_handoff(
+    json_output: bool,
+    amount_mu: u64,
+    msb_transfer_command: &str,
+    memo_hash: &str,
+    deposit_intent_command: &str,
 ) -> Result<()> {
-    let lines = checkout_handoff_lines(rail, amount_mu, url);
+    let lines = [
+        format!("Mayhem tnk deposit for {}", mu_to_usd_amount(amount_mu)),
+        format!("Copy/paste deposit intent command: {deposit_intent_command}"),
+        format!("Copy/paste MSB transfer command: {msb_transfer_command}"),
+        format!("Copy/paste transfer memo/reference: {memo_hash}"),
+    ];
     if json_output {
         let mut stderr = io::stderr().lock();
         for line in lines {
@@ -4926,37 +5779,168 @@ fn emit_checkout_handoff(
     Ok(())
 }
 
-async fn create_pay_checkout(
+async fn submit_msb_transfer(
+    network: &str,
+    stores_directory: &Path,
+    store_name: &str,
+    to: &str,
+    amount: &str,
+    timeout_seconds: u64,
+) -> Result<MsbTransferOutput> {
+    run_msb_transfer_helper(vec![
+        "transfer".to_owned(),
+        "--network".to_owned(),
+        network.to_owned(),
+        "--stores-directory".to_owned(),
+        stores_directory.display().to_string(),
+        "--store-name".to_owned(),
+        store_name.to_owned(),
+        "--to".to_owned(),
+        to.to_owned(),
+        "--amount".to_owned(),
+        amount.to_owned(),
+        "--timeout-seconds".to_owned(),
+        timeout_seconds.to_string(),
+    ])
+    .await
+}
+
+async fn run_msb_transfer_helper<T>(args: Vec<String>) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/msb-transfer-helper.mjs");
+    let output = Command::new("node")
+        .arg(&helper)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running MSB transfer helper {}", helper.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "MSB transfer helper failed: {}{}{}",
+            stderr.trim(),
+            if stderr.trim().is_empty() || stdout.trim().is_empty() {
+                ""
+            } else {
+                "; stdout: "
+            },
+            stdout.trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parsing MSB transfer helper JSON output")
+}
+
+#[derive(Debug)]
+struct PayCheckout {
+    id: String,
+    url: String,
+    reference: Option<String>,
+}
+
+#[derive(Debug)]
+struct PayCreditStatus {
+    credited: bool,
+    before_mu: u64,
+    current_mu: u64,
+    target_mu: u64,
+    waited_ms: u64,
+}
+
+struct PayCheckoutRequest<'a> {
     rail: PayRail,
-    paygate_url: &str,
-    who: &str,
+    paygate_url: &'a str,
+    who: &'a str,
     amount_mu: u64,
-    idempotency_key: Option<&str>,
-    success_url: Option<&str>,
-    cancel_url: Option<&str>,
-) -> Result<PayCheckout> {
+    currency: &'a str,
+    locale: &'a str,
+    idempotency_key: Option<&'a str>,
+    success_url: Option<&'a str>,
+    cancel_url: Option<&'a str>,
+}
+
+#[cfg(test)]
+fn checkout_handoff_lines(rail: PayRail, amount_mu: u64, url: &str) -> [String; 2] {
+    checkout_handoff_lines_with_currency(rail, amount_mu, "usd", url)
+}
+
+fn checkout_handoff_lines_with_currency(
+    rail: PayRail,
+    amount_mu: u64,
+    currency: &str,
+    url: &str,
+) -> [String; 2] {
+    [
+        format!(
+            "Mayhem {} checkout for {} {}",
+            rail.as_str(),
+            mu_to_usd_amount(amount_mu),
+            currency.to_ascii_uppercase()
+        ),
+        format!("Copy/paste checkout URL: {url}"),
+    ]
+}
+
+fn checkout_copy_paste_value(url: &str) -> Value {
+    json!({
+        "checkout_url": url,
+    })
+}
+
+fn emit_checkout_handoff(
+    json_output: bool,
+    rail: PayRail,
+    amount_mu: u64,
+    currency: &str,
+    url: &str,
+) -> Result<()> {
+    let lines = checkout_handoff_lines_with_currency(rail, amount_mu, currency, url);
+    if json_output {
+        let mut stderr = io::stderr().lock();
+        for line in lines {
+            writeln!(stderr, "{line}")?;
+        }
+        stderr.flush()?;
+    } else {
+        let mut stdout = io::stdout().lock();
+        for line in lines {
+            writeln!(stdout, "{line}")?;
+        }
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheckout> {
     let client = reqwest::Client::new();
-    let endpoint = match rail {
+    let endpoint = match request.rail {
         PayRail::Stripe => "v1/stripe/checkout-sessions",
         PayRail::Coinbase => "v1/coinbase/charges",
     };
-    let success_url = success_url
+    let success_url = request
+        .success_url
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| default_checkout_success_url(paygate_url, rail));
-    let cancel_url = cancel_url
+        .unwrap_or_else(|| default_checkout_success_url(request.paygate_url, request.rail));
+    let cancel_url = request
+        .cancel_url
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| default_checkout_cancel_url(paygate_url, rail));
+        .unwrap_or_else(|| default_checkout_cancel_url(request.paygate_url, request.rail));
     let mut body = json!({
-        "who": who,
-        "mu": amount_mu,
+        "who": request.who,
+        "mu": request.amount_mu,
     });
-    match rail {
+    match request.rail {
         PayRail::Stripe => {
             body["success_url"] = Value::String(success_url);
             body["cancel_url"] = Value::String(cancel_url);
-            if let Some(idempotency_key) = idempotency_key.filter(|value| !value.is_empty()) {
+            body["currency"] = Value::String(request.currency.to_ascii_lowercase());
+            body["locale"] = Value::String(request.locale.to_ascii_lowercase());
+            if let Some(idempotency_key) = request.idempotency_key.filter(|value| !value.is_empty())
+            {
                 body["idempotency_key"] = Value::String(idempotency_key.to_owned());
             }
         }
@@ -4969,7 +5953,7 @@ async fn create_pay_checkout(
     let response = client
         .post(format!(
             "{}/{}",
-            paygate_url.trim_end_matches('/'),
+            request.paygate_url.trim_end_matches('/'),
             endpoint
         ))
         .json(&body)
@@ -4981,7 +5965,7 @@ async fn create_pay_checkout(
         bail!("paygate returned {status}: {response_body}");
     }
     let value: Value = serde_json::from_str(&response_body)?;
-    checkout_from_paygate_response(rail, &value)
+    checkout_from_paygate_response(request.rail, &value)
 }
 
 fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayCheckout> {
@@ -6135,10 +7119,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         None
     };
 
-    provider_log(&args, "Submitting provider opt-in transactions");
-    let provider_tx =
+    provider_log(&args, "Submitting provider opt-in feature records");
+    let provider_feature =
         ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, args.sim).await?;
-    let serve_tx = ensure_joined_enclave(
+    let serve_feature = ensure_joined_enclave(
         &rpc,
         &keypair_path,
         &password,
@@ -6147,7 +7131,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         args.sim,
     )
     .await?;
-    let room_txs = ensure_joined_rooms(
+    let room_features = ensure_joined_rooms(
         &rpc,
         &keypair_path,
         &password,
@@ -6211,10 +7195,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         },
         "rules": &rules,
         "rooms": rooms.clone(),
-        "transactions": {
-            "provider": provider_tx,
-            "serve": serve_tx,
-            "rooms": room_txs,
+        "features": {
+            "provider": provider_feature,
+            "serve": serve_feature,
+            "rooms": room_features,
         },
         "heartbeats": heartbeats,
         "self_test": {
@@ -6309,7 +7293,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
     let price = require_current_mu_usd_price(&contract.prices, &enclave.enclave_id)?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
-    let provider_tx = ensure_provider_registered(
+    let provider_feature = ensure_provider_registered(
         &ctx.rpc,
         &ctx.keypair_path,
         &ctx.password,
@@ -6317,7 +7301,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         args.tx.sim,
     )
     .await?;
-    let serve_tx = ensure_joined_enclave(
+    let serve_feature = ensure_joined_enclave(
         &ctx.rpc,
         &ctx.keypair_path,
         &ctx.password,
@@ -6326,7 +7310,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         args.tx.sim,
     )
     .await?;
-    let room_txs = ensure_joined_rooms(
+    let room_features = ensure_joined_rooms(
         &ctx.rpc,
         &ctx.keypair_path,
         &ctx.password,
@@ -6346,10 +7330,10 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         "enclave": enclave,
         "price": price,
         "rooms": rooms,
-        "transactions": {
-            "provider": provider_tx,
-            "serve": serve_tx,
-            "rooms": room_txs,
+        "features": {
+            "provider": provider_feature,
+            "serve": serve_feature,
+            "rooms": room_features,
         },
     });
     print_provider_lifecycle_report(&report, args.tx.json)
@@ -6366,8 +7350,9 @@ async fn provider_leave(args: ProviderLeaveArgs) -> Result<()> {
         &enclave.enclave_id,
         &args.rooms,
     )?;
-    let room_txs = leave_provider_rooms(&ctx, &enclave.enclave_id, &rooms, args.tx.sim).await?;
-    let serve_tx = ensure_left_enclave(&ctx, &enclave.enclave_id, args.tx.sim).await?;
+    let room_features =
+        leave_provider_rooms(&ctx, &enclave.enclave_id, &rooms, args.tx.sim).await?;
+    let serve_feature = ensure_left_enclave(&ctx, &enclave.enclave_id, args.tx.sim).await?;
     let report = json!({
         "ok": true,
         "action": "leave",
@@ -6377,9 +7362,9 @@ async fn provider_leave(args: ProviderLeaveArgs) -> Result<()> {
         "sim": args.tx.sim,
         "enclave": enclave,
         "rooms": rooms,
-        "transactions": {
-            "rooms": room_txs,
-            "serve": serve_tx,
+        "features": {
+            "rooms": room_features,
+            "serve": serve_feature,
         },
     });
     print_provider_lifecycle_report(&report, args.tx.json)
@@ -6399,9 +7384,9 @@ async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
             .cmp(&b.enclave_id)
             .then_with(|| a.room_id.cmp(&b.room_id))
     });
-    let mut room_txs = Vec::with_capacity(active_rooms.len());
+    let mut room_features = Vec::with_capacity(active_rooms.len());
     for room in &active_rooms {
-        room_txs.push(
+        room_features.push(
             ensure_left_room(&ctx, &room.room_id, &room.enclave_id, args.tx.sim)
                 .await
                 .with_context(|| {
@@ -6414,9 +7399,9 @@ async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
     }
 
     let serves = read_active_provider_serves(&ctx.rpc, &ctx.wallet.public_key).await?;
-    let mut serve_txs = Vec::with_capacity(serves.len());
+    let mut serve_features = Vec::with_capacity(serves.len());
     for serve in &serves {
-        serve_txs.push(
+        serve_features.push(
             ensure_left_enclave(&ctx, &serve.enclave_id, args.tx.sim)
                 .await
                 .with_context(|| format!("leaving enclave {}", serve.enclave_id))?,
@@ -6431,9 +7416,9 @@ async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
         "sim": args.tx.sim,
         "rooms": active_rooms,
         "enclaves": serves,
-        "transactions": {
-            "rooms": room_txs,
-            "serves": serve_txs,
+        "features": {
+            "rooms": room_features,
+            "serves": serve_features,
         },
     });
     print_provider_lifecycle_report(&report, args.tx.json)
@@ -6466,7 +7451,9 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
             "room {} is for model {} / enclave {}, not model {} / enclave {}",
             room.room_id,
             room.model_id,
-            room.enclave_id.as_deref().unwrap_or("<legacy-model-room>"),
+            room.enclave_id
+                .as_deref()
+                .unwrap_or("<missing-enclave-room>"),
             enclave.model_id,
             enclave.enclave_id
         );
@@ -6487,7 +7474,7 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
             enclave.enclave_id
         );
     }
-    let room_txs = ensure_joined_rooms(
+    let room_features = ensure_joined_rooms(
         &ctx.rpc,
         &ctx.keypair_path,
         &ctx.password,
@@ -6507,8 +7494,8 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
         "enclave": enclave,
         "price": price,
         "rooms": [room],
-        "transactions": {
-            "rooms": room_txs,
+        "features": {
+            "rooms": room_features,
         },
     });
     print_provider_lifecycle_report(&report, args.tx.json)
@@ -6516,7 +7503,7 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
 
 async fn provider_room_leave(args: ProviderRoomLeaveArgs) -> Result<()> {
     let ctx = provider_tx_context(&args.tx).await?;
-    let room_tx = ensure_left_room(&ctx, &args.room, &args.enclave, args.tx.sim).await?;
+    let room_feature = ensure_left_room(&ctx, &args.room, &args.enclave, args.tx.sim).await?;
     let report = json!({
         "ok": true,
         "action": "rooms.leave",
@@ -6526,41 +7513,77 @@ async fn provider_room_leave(args: ProviderRoomLeaveArgs) -> Result<()> {
         "sim": args.tx.sim,
         "room_id": args.room,
         "enclave_id": args.enclave,
-        "transactions": {
-            "room": room_tx,
+        "features": {
+            "room": room_feature,
         },
     });
     print_provider_lifecycle_report(&report, args.tx.json)
 }
 
-fn provider_join_enclave_payload(enclave_id: &str) -> Value {
-    json!({
-        "op": "join_enclave",
-        "enclave_id": enclave_id,
-    })
+fn provider_lifecycle_intent_message(intent: &Value) -> String {
+    format!("mayhem-provider-lifecycle-v1{}", stable_json_value(intent))
 }
 
-fn provider_leave_enclave_payload(enclave_id: &str) -> Value {
-    json!({
-        "op": "leave_enclave",
-        "enclave_id": enclave_id,
-    })
+fn provider_lifecycle_feature_key(intent: &Value) -> Result<String> {
+    let provider = intent
+        .get("provider")
+        .and_then(Value::as_str)
+        .context("provider lifecycle intent missing provider")?;
+    let op = intent
+        .get("op")
+        .and_then(Value::as_str)
+        .context("provider lifecycle intent missing op")?;
+    let digest = blake3::hash(provider_lifecycle_intent_message(intent).as_bytes())
+        .to_hex()
+        .to_string();
+    Ok(format!("intent/provider/{provider}/{op}/{digest}"))
 }
 
-fn provider_join_room_payload(room_id: &str, enclave_id: &str) -> Value {
-    json!({
-        "op": "join_room",
+fn provider_lifecycle_nonce(
+    provider: &str,
+    op: &str,
+    enclave_id: Option<&str>,
+    room_id: Option<&str>,
+) -> Result<String> {
+    Ok(stable_value_hash(&json!({
+        "domain": "mayhem-provider-lifecycle-nonce-v1",
+        "provider": provider,
+        "op": op,
+        "enclave_id": enclave_id,
         "room_id": room_id,
-        "enclave_id": enclave_id,
-    })
+        "at_ms": unix_epoch_millis()?,
+    })))
 }
 
-fn provider_leave_room_payload(room_id: &str, enclave_id: &str) -> Value {
-    json!({
-        "op": "leave_room",
-        "room_id": room_id,
-        "enclave_id": enclave_id,
-    })
+fn provider_lifecycle_intent(
+    provider: &str,
+    op: &str,
+    enclave_id: Option<&str>,
+    room_id: Option<&str>,
+) -> Result<Value> {
+    let nonce = provider_lifecycle_nonce(provider, op, enclave_id, room_id)?;
+    let value = match (enclave_id, room_id) {
+        (Some(enclave_id), Some(room_id)) => json!({
+            "op": op,
+            "provider": provider,
+            "enclave_id": enclave_id,
+            "room_id": room_id,
+            "nonce": nonce,
+        }),
+        (Some(enclave_id), None) => json!({
+            "op": op,
+            "provider": provider,
+            "enclave_id": enclave_id,
+            "nonce": nonce,
+        }),
+        (None, None) => json!({
+            "op": op,
+            "provider": provider,
+            "nonce": nonce,
+        }),
+        (None, Some(_)) => bail!("room lifecycle intent requires enclave_id"),
+    };
+    Ok(value)
 }
 
 fn resolve_provider_lifecycle_enclave(
@@ -6608,20 +7631,14 @@ fn current_mu_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRe
 }
 
 fn admin_role_marker_ok(role: Option<&str>) -> bool {
-    match role {
-        Some(role) => role == "admin",
-        None => true,
-    }
+    role == Some("admin")
 }
 
 fn require_admin_role_marker(field: &str, role: Option<&str>) -> Result<()> {
     if admin_role_marker_ok(role) {
         return Ok(());
     }
-    bail!(
-        "{field} must be admin when present; got {}",
-        role.unwrap_or("<missing>")
-    )
+    bail!("{field} must be admin; got {}", role.unwrap_or("<missing>"))
 }
 
 fn require_current_mu_usd_price<'a>(
@@ -6751,18 +7768,19 @@ async fn ensure_left_room(
             "state": existing,
         }));
     }
-    let submitted = submit_contract_command(
+    let submitted = submit_provider_lifecycle_feature(
         &ctx.rpc,
         &ctx.keypair_path,
         &ctx.password,
         &ctx.wallet,
-        "leaveRoom",
-        provider_leave_room_payload(room_id, enclave_id),
+        "leave_room",
+        Some(enclave_id),
+        Some(room_id),
         sim,
     )
     .await?;
     if sim {
-        return Ok(json!({ "room_id": room_id, "enclave_id": enclave_id, "tx": submitted }));
+        return Ok(json!({ "room_id": room_id, "enclave_id": enclave_id, "feature": submitted }));
     }
     let state = wait_for_state(&ctx.rpc, &key, |value| {
         value.get("status").and_then(Value::as_str) == Some("inactive")
@@ -6772,7 +7790,7 @@ async fn ensure_left_room(
         "room_id": room_id,
         "enclave_id": enclave_id,
         "skipped": false,
-        "tx": submitted,
+        "feature": submitted,
         "state": state,
     }))
 }
@@ -6797,18 +7815,19 @@ async fn ensure_left_enclave(
             "state": existing,
         }));
     }
-    let submitted = submit_contract_command(
+    let submitted = submit_provider_lifecycle_feature(
         &ctx.rpc,
         &ctx.keypair_path,
         &ctx.password,
         &ctx.wallet,
-        "leaveEnclave",
-        provider_leave_enclave_payload(enclave_id),
+        "leave_enclave",
+        Some(enclave_id),
+        None,
         sim,
     )
     .await?;
     if sim {
-        return Ok(json!({ "enclave_id": enclave_id, "tx": submitted }));
+        return Ok(json!({ "enclave_id": enclave_id, "feature": submitted }));
     }
     let state = wait_for_state(&ctx.rpc, &key, |value| {
         value.get("status").and_then(Value::as_str) == Some("inactive")
@@ -6817,7 +7836,7 @@ async fn ensure_left_enclave(
     Ok(json!({
         "enclave_id": enclave_id,
         "skipped": false,
-        "tx": submitted,
+        "feature": submitted,
         "state": state,
     }))
 }
@@ -7193,10 +8212,7 @@ fn same_gateway_price_terms(left: &LedgerPriceRecord, right: &LedgerPriceRecord)
 }
 
 fn room_matches_enclave(room: &LedgerRoom, enclave: &LedgerEnclave) -> bool {
-    room.model_id == enclave.model_id
-        && room.enclave_id.as_ref().map_or(true, |room_enclave_id| {
-            room_enclave_id == &enclave.enclave_id
-        })
+    room.model_id == enclave.model_id && room.enclave_id.as_ref() == Some(&enclave.enclave_id)
 }
 
 fn canonical_room_transport_ok(room: &LedgerRoom) -> bool {
@@ -7438,7 +8454,9 @@ fn select_provider_rooms(
             bail!(
                 "room {room_id} is for model {} / enclave {}, not model {} / enclave {}",
                 room.model_id,
-                room.enclave_id.as_deref().unwrap_or("<legacy-model-room>"),
+                room.enclave_id
+                    .as_deref()
+                    .unwrap_or("<missing-enclave-room>"),
                 enclave.model_id,
                 enclave.enclave_id
             );
@@ -7577,13 +8595,14 @@ async fn ensure_provider_registered(
         bail!("provider registration exists but is not active: {existing}");
     }
 
-    let submitted = submit_contract_command(
+    let submitted = submit_provider_lifecycle_feature(
         rpc,
         keypair_path,
         password,
         wallet,
-        "registerProvider",
-        json!({ "op": "register_provider" }),
+        "register_provider",
+        None,
+        None,
         sim,
     )
     .await?;
@@ -7594,7 +8613,7 @@ async fn ensure_provider_registered(
         value.get("status").and_then(Value::as_str) == Some("active")
     })
     .await?;
-    Ok(json!({ "skipped": false, "tx": submitted, "state": state }))
+    Ok(json!({ "skipped": false, "feature": submitted, "state": state }))
 }
 
 async fn ensure_joined_enclave(
@@ -7613,13 +8632,14 @@ async fn ensure_joined_enclave(
             );
         }
     }
-    let submitted = submit_contract_command(
+    let submitted = submit_provider_lifecycle_feature(
         rpc,
         keypair_path,
         password,
         wallet,
-        "joinEnclave",
-        provider_join_enclave_payload(&enclave.enclave_id),
+        "join_enclave",
+        Some(&enclave.enclave_id),
+        None,
         sim,
     )
     .await?;
@@ -7630,7 +8650,7 @@ async fn ensure_joined_enclave(
         value.get("status").and_then(Value::as_str) == Some("active")
     })
     .await?;
-    Ok(json!({ "skipped": false, "tx": submitted, "state": state }))
+    Ok(json!({ "skipped": false, "feature": submitted, "state": state }))
 }
 
 async fn ensure_joined_rooms(
@@ -7659,18 +8679,19 @@ async fn ensure_joined_rooms(
                 continue;
             }
         }
-        let submitted = submit_contract_command(
+        let submitted = submit_provider_lifecycle_feature(
             rpc,
             keypair_path,
             password,
             wallet,
-            "joinRoom",
-            provider_join_room_payload(&room.room_id, &enclave.enclave_id),
+            "join_room",
+            Some(&enclave.enclave_id),
+            Some(&room.room_id),
             sim,
         )
         .await?;
         if sim {
-            reports.push(json!({ "room_id": room.room_id, "tx": submitted }));
+            reports.push(json!({ "room_id": room.room_id, "feature": submitted }));
             continue;
         }
         let state = wait_for_state(rpc, &key, |value| {
@@ -7678,7 +8699,7 @@ async fn ensure_joined_rooms(
         })
         .await?;
         reports.push(
-            json!({ "room_id": room.room_id, "skipped": false, "tx": submitted, "state": state }),
+            json!({ "room_id": room.room_id, "skipped": false, "feature": submitted, "state": state }),
         );
     }
     Ok(reports)
@@ -7748,6 +8769,57 @@ async fn submit_contract_command(
         "tx": tx,
         "command_hash": command_hash,
         "result": result,
+    }))
+}
+
+async fn submit_provider_lifecycle_feature(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    op: &str,
+    enclave_id: Option<&str>,
+    room_id: Option<&str>,
+    sim: bool,
+) -> Result<Value> {
+    let intent = provider_lifecycle_intent(&wallet.public_key, op, enclave_id, room_id)?;
+    let sig = sign_message(
+        keypair_path,
+        password,
+        &provider_lifecycle_intent_message(&intent),
+    )
+    .await?;
+    let key = provider_lifecycle_feature_key(&intent)?;
+    let value = json!({
+        "op": "provider_lifecycle",
+        "intent": intent,
+        "sig": sig,
+    });
+    if sim {
+        return Ok(json!({
+            "feature": "mayhem",
+            "key": key,
+            "value": value,
+            "sim": true,
+            "submitted": false,
+        }));
+    }
+    let submitted = rpc
+        .submit_feature(json!({
+            "feature": "mayhem",
+            "key": key,
+            "value": value,
+        }))
+        .await
+        .with_context(|| format!("submitting free provider lifecycle feature {op}"))?;
+    if submitted.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("provider lifecycle feature {op} was not accepted: {submitted}");
+    }
+    Ok(json!({
+        "feature": "mayhem",
+        "key": key,
+        "value": value,
+        "result": submitted,
     }))
 }
 
@@ -9624,61 +10696,28 @@ async fn submit_consent(
 ) -> Result<ConsentReport> {
     let consent_message = format!("mayhem-consent{}{}", rules.ver, rules.hash);
     let consent_sig = sign_message(keypair_path, password, &consent_message).await?;
-    let prepared_command = json!({
-        "type": "consent",
-        "value": {
-            "op": "consent",
-            "ver": rules.ver,
-            "hash": rules.hash,
-            "sig": consent_sig,
-        }
+    let key = format!("consent/{}/{}/{}", wallet.public_key, rules.ver, rules.hash);
+    let value = json!({
+        "op": "consent",
+        "sender": wallet.public_key,
+        "ver": rules.ver,
+        "hash": rules.hash,
+        "sig": consent_sig,
     });
-
-    let nonce_response = rpc
-        .contract_nonce()
-        .await
-        .context("requesting contract nonce")?;
-    let nonce = nonce_response
-        .get("nonce")
-        .and_then(Value::as_str)
-        .context("RPC nonce response did not include nonce")?;
-
-    let prepared = rpc
-        .prepare_tx(json!({
-            "prepared_command": prepared_command.clone(),
-            "address": wallet.public_key,
-            "nonce": nonce,
-        }))
-        .await
-        .context("preparing consent tx")?;
-    let tx = prepared
-        .get("tx")
-        .and_then(Value::as_str)
-        .context("RPC prepare response did not include tx")?
-        .to_owned();
-    let command_hash = prepared
-        .get("command_hash")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-
-    let signature = sign_hex(keypair_path, password, &tx).await?;
-    let submitted = rpc
-        .submit_tx(json!({
-            "tx": tx,
-            "prepared_command": prepared_command.clone(),
-            "address": wallet.public_key,
-            "signature": signature,
-            "nonce": nonce,
-            "sim": sim,
-        }))
-        .await
-        .context("submitting consent tx")?;
-    let result = Some(
-        submitted
-            .get("result")
-            .cloned()
-            .unwrap_or_else(|| submitted.clone()),
-    );
+    let feature = json!({
+        "feature": "mayhem",
+        "key": key,
+        "value": value,
+    });
+    let result = if sim {
+        None
+    } else {
+        Some(
+            rpc.submit_feature(&feature)
+                .await
+                .context("submitting free consent feature")?,
+        )
+    };
 
     let state = if sim {
         None
@@ -9690,8 +10729,9 @@ async fn submit_consent(
         skipped: false,
         simulated: sim,
         rules: Some(rules),
-        tx: Some(tx),
-        command_hash,
+        tx: None,
+        command_hash: None,
+        feature: Some(feature),
         result,
         state,
     })
@@ -10020,8 +11060,9 @@ mod tests {
             AdminSetProviderPayoutArgs {
                 tx: test_admin_tx_args(),
                 provider: "provider-a".to_owned(),
-                payout_method: AdminPayoutMethod::Tnk,
-                payout_addr: "trac1adminapproved".to_owned(),
+                payout_method: AdminPayoutMethod::Stripe,
+                payout_addr: "acct_adminapproved".to_owned(),
+                payout_currency: Some("EUR".to_owned()),
             },
         ))
         .unwrap();
@@ -10032,8 +11073,9 @@ mod tests {
             json!({
                 "op": "set_provider_payout",
                 "provider": "provider-a",
-                "payout_method": "tnk",
-                "payout_addr": "trac1adminapproved",
+                "payout_method": "stripe",
+                "payout_addr": "acct_adminapproved",
+                "payout_currency": "eur",
             })
         );
     }
@@ -10044,13 +11086,13 @@ mod tests {
             admin_rate_oracle_payload(&AdminRateOracleArgs {
                 tx: test_admin_tx_args(),
                 tnk_usd_e6: 50_000,
-                source: AdminRateSource::CoinbaseSpot,
+                source: AdminRateSource::GateSpot,
                 ts: 3_600,
             }),
             json!({
                 "op": "rate_oracle",
                 "tnk_usd_e6": 50_000,
-                "source": "coinbase-spot",
+                "source": "gate-spot",
                 "ts": 3_600,
             })
         );
@@ -10081,15 +11123,20 @@ mod tests {
                 who: "user-a".to_owned(),
                 mu: 10_000_000,
                 ext_ref_hash: "stripe-ref-hash".to_owned(),
+                fiat_currency: "usd".to_owned(),
+                fiat_amount_minor: 1_000,
                 epoch: 7,
                 at: 25_200,
-            }),
+            })
+            .unwrap(),
             json!({
                 "op": "fiat_deposit",
                 "rail": "stripe",
                 "who": "user-a",
                 "mu": 10_000_000,
                 "ext_ref_hash": "stripe-ref-hash",
+                "fiat_currency": "usd",
+                "fiat_amount_minor": 1_000,
                 "epoch": 7,
                 "at": 25_200,
             })
@@ -10103,9 +11150,12 @@ mod tests {
                 mu: 5_000_000,
                 ext_ref_hash: "coinbase-ref-hash".to_owned(),
                 dispute_ref_hash: "coinbase-dispute-hash".to_owned(),
+                fiat_currency: "eur".to_owned(),
+                fiat_amount_minor: 500,
                 epoch: 8,
                 at: 28_800,
-            }),
+            })
+            .unwrap(),
             json!({
                 "op": "fiat_chargeback",
                 "rail": "coinbase",
@@ -10113,6 +11163,8 @@ mod tests {
                 "mu": 5_000_000,
                 "ext_ref_hash": "coinbase-ref-hash",
                 "dispute_ref_hash": "coinbase-dispute-hash",
+                "fiat_currency": "eur",
+                "fiat_amount_minor": 500,
                 "epoch": 8,
                 "at": 28_800,
             })
@@ -10131,6 +11183,8 @@ mod tests {
             tnk_e18: Some("500000000000000000".to_owned()),
             msb_tx_hash: Some("msb-tx".to_owned()),
             external_ref: None,
+            fiat_currency: None,
+            fiat_amount_minor: None,
             at: 25_200,
         })
         .unwrap();
@@ -10157,6 +11211,8 @@ mod tests {
             tnk_e18: None,
             msb_tx_hash: None,
             external_ref: Some("tr_123".to_owned()),
+            fiat_currency: Some("usd".to_owned()),
+            fiat_amount_minor: Some(100),
             at: 25_200,
         })
         .unwrap();
@@ -10169,6 +11225,8 @@ mod tests {
                 "who": "provider-a",
                 "mu": 1_000_000,
                 "external_ref": "tr_123",
+                "fiat_currency": "usd",
+                "fiat_amount_minor": 100,
                 "at": 25_200,
             })
         );
@@ -10183,6 +11241,8 @@ mod tests {
             tnk_e18: Some("500000000000000000".to_owned()),
             msb_tx_hash: Some("treasury-msb-tx".to_owned()),
             external_ref: None,
+            fiat_currency: None,
+            fiat_amount_minor: None,
             at: 25_200,
         })
         .unwrap();
@@ -10204,6 +11264,8 @@ mod tests {
             rail: AdminPayoutMethod::Stripe,
             tnk_e18: Some("1".to_owned()),
             external_ref: Some("tr_123".to_owned()),
+            fiat_currency: Some("usd".to_owned()),
+            fiat_amount_minor: Some(100),
             ..test_payout_confirm_args()
         })
         .unwrap_err();
@@ -10215,10 +11277,131 @@ mod tests {
             kind: AdminPayoutConfirmKind::FeeSweep,
             rail: AdminPayoutMethod::Coinbase,
             external_ref: Some("transfer_123".to_owned()),
+            fiat_currency: Some("usd".to_owned()),
+            fiat_amount_minor: Some(100),
             ..test_payout_confirm_args()
         })
         .unwrap_err();
         assert!(err.to_string().contains("fee-sweep"));
+    }
+
+    #[test]
+    fn admin_epoch_payloads_accept_recomputed_outputs() {
+        let roots = json!({
+            "dep": "d".repeat(64),
+            "use": "u".repeat(64),
+            "earn": "e".repeat(64),
+            "fee": "f".repeat(64),
+            "pay": "p".repeat(64),
+        });
+        let totals = json!({
+            "dep_count": 0,
+            "dep_mu": 0,
+            "use_count": 1,
+            "use_mu": 2_000,
+            "provider_count": 1,
+            "earn_mu": 1_700,
+            "fee_mu": 300,
+            "fee_cum_mu": 300,
+            "pay_count": 0,
+            "pay_mu": 0,
+        });
+
+        let commit = admin_epoch_commit_payload(&AdminEpochCommitArgs {
+            tx: test_admin_tx_args(),
+            epoch: Some(7),
+            at: 25_200,
+            recomputed_file: None,
+            roots_json: Some(roots.to_string()),
+            roots_file: None,
+            totals_json: Some(totals.to_string()),
+            totals_file: None,
+        })
+        .unwrap();
+        assert_eq!(
+            commit,
+            json!({
+                "op": "epoch_commit",
+                "epoch": 7,
+                "at": 25_200,
+                "roots": roots,
+                "totals": totals,
+            })
+        );
+
+        let apply = admin_epoch_apply_payload(&AdminEpochApplyArgs {
+            tx: test_admin_tx_args(),
+            epoch: Some(7),
+            at: 25_200,
+            recomputed_file: None,
+            debits_json: Some(r#"[{"user":"user-a","mu":2000}]"#.to_owned()),
+            debits_file: None,
+            earnings_json: Some(r#"[{"provider":"provider-a","gross_mu":2000}]"#.to_owned()),
+            earnings_file: None,
+            roots_json: Some(commit["roots"].to_string()),
+            roots_file: None,
+            totals_json: Some(commit["totals"].to_string()),
+            totals_file: None,
+        })
+        .unwrap();
+        assert_eq!(
+            apply,
+            json!({
+                "op": "epoch_apply",
+                "epoch": 7,
+                "at": 25_200,
+                "debits": [{"user": "user-a", "mu": 2000}],
+                "earnings": [{"provider": "provider-a", "gross_mu": 2000}],
+                "roots": commit["roots"],
+                "totals": commit["totals"],
+            })
+        );
+    }
+
+    #[test]
+    fn admin_epoch_payloads_reject_wrong_json_shapes() {
+        let roots = json!({
+            "dep": "d".repeat(64),
+            "use": "u".repeat(64),
+            "earn": "e".repeat(64),
+            "fee": "f".repeat(64),
+            "pay": "p".repeat(64),
+        });
+        let totals = json!({ "use_mu": 0 });
+
+        let bad_roots = admin_epoch_commit_payload(&AdminEpochCommitArgs {
+            tx: test_admin_tx_args(),
+            epoch: Some(1),
+            at: 1,
+            recomputed_file: None,
+            roots_json: Some("[]".to_owned()),
+            roots_file: None,
+            totals_json: Some(totals.to_string()),
+            totals_file: None,
+        })
+        .unwrap_err();
+        assert!(bad_roots
+            .to_string()
+            .contains("epoch roots JSON must be an object"));
+
+        let bad_debits = admin_epoch_apply_payload(&AdminEpochApplyArgs {
+            tx: test_admin_tx_args(),
+            epoch: Some(1),
+            at: 1,
+            recomputed_file: None,
+            debits_json: Some("{}".to_owned()),
+            debits_file: None,
+            earnings_json: Some("[]".to_owned()),
+            earnings_file: None,
+            roots_json: Some(roots.to_string()),
+            roots_file: None,
+            totals_json: Some(totals.to_string()),
+            totals_file: None,
+        })
+        .unwrap_err();
+        assert!(bad_debits
+            .to_string()
+            .contains("epoch debits JSON must be an array"));
     }
 
     #[test]
@@ -10227,35 +11410,44 @@ mod tests {
     }
 
     #[test]
-    fn provider_lifecycle_payloads_are_limited_to_opt_in_and_out_ops() {
+    fn provider_lifecycle_intents_are_limited_to_opt_in_and_out_ops() {
+        let provider = "11".repeat(32);
+        let intent = json!({
+            "op": "join_room",
+            "provider": provider,
+            "enclave_id": "enclave-a",
+            "room_id": "room-a",
+            "nonce": "22".repeat(32),
+        });
         assert_eq!(
-            provider_join_enclave_payload("enclave-a"),
-            json!({
-                "op": "join_enclave",
-                "enclave_id": "enclave-a",
-            })
+            provider_lifecycle_intent_message(&intent),
+            format!("mayhem-provider-lifecycle-v1{}", stable_json_value(&intent))
         );
         assert_eq!(
-            provider_leave_enclave_payload("enclave-a"),
+            provider_lifecycle_feature_key(&intent).unwrap(),
+            format!(
+                "intent/provider/{}/join_room/{}",
+                provider,
+                blake3::hash(provider_lifecycle_intent_message(&intent).as_bytes()).to_hex()
+            )
+        );
+
+        let register = provider_lifecycle_intent(&provider, "register_provider", None, None)
+            .expect("register intent");
+        assert_eq!(register["op"], "register_provider");
+        assert_eq!(register["provider"], provider);
+        assert!(is_hex_len(register["nonce"].as_str().unwrap(), 64));
+
+        let enclave =
+            provider_lifecycle_intent(&provider, "leave_enclave", Some("enclave-a"), None)
+                .expect("enclave intent");
+        assert_eq!(
+            enclave,
             json!({
                 "op": "leave_enclave",
+                "provider": provider,
                 "enclave_id": "enclave-a",
-            })
-        );
-        assert_eq!(
-            provider_join_room_payload("room-a", "enclave-a"),
-            json!({
-                "op": "join_room",
-                "room_id": "room-a",
-                "enclave_id": "enclave-a",
-            })
-        );
-        assert_eq!(
-            provider_leave_room_payload("room-a", "enclave-a"),
-            json!({
-                "op": "leave_room",
-                "room_id": "room-a",
-                "enclave_id": "enclave-a",
+                "nonce": enclave["nonce"].as_str().unwrap(),
             })
         );
     }
@@ -10297,9 +11489,14 @@ mod tests {
             resolve_provider_lifecycle_enclave(&contract.enclaves, &"22".repeat(32)).unwrap();
         assert_eq!(resolved.enclave_id, "22".repeat(32));
 
-        let mut legacy = test_contract(&"aa".repeat(32));
-        legacy.enclaves[0].created_by_role = None;
-        assert!(resolve_provider_lifecycle_enclave(&legacy.enclaves, "test/model@4bit").is_ok());
+        let mut missing_role = test_contract(&"aa".repeat(32));
+        missing_role.enclaves[0].created_by_role = None;
+        let missing_role_err =
+            resolve_provider_lifecycle_enclave(&missing_role.enclaves, "test/model@4bit")
+                .unwrap_err();
+        assert!(missing_role_err
+            .to_string()
+            .contains("not an active admin-created enclave"));
 
         let mut provider_created = test_contract(&"aa".repeat(32));
         provider_created.enclaves[0].created_by_role = Some("provider".to_owned());
@@ -10579,11 +11776,11 @@ mod tests {
             build_provider_candidates(&provider_priced, &catalog, &hardware, &args).unwrap_err();
         assert!(err.to_string().contains("current mu_usd admin price"));
 
-        let mut legacy = contract.clone();
-        legacy.enclaves[0].created_by_role = None;
-        legacy.rooms[0].creator_role = None;
-        legacy.prices[0].current.as_mut().unwrap().set_by_role = None;
-        assert!(build_provider_candidates(&legacy, &catalog, &hardware, &args).is_ok());
+        let mut missing_role = contract.clone();
+        missing_role.enclaves[0].created_by_role = None;
+        missing_role.rooms[0].creator_role = None;
+        missing_role.prices[0].current.as_mut().unwrap().set_by_role = None;
+        assert!(build_provider_candidates(&missing_role, &catalog, &hardware, &args).is_err());
 
         let mut mismatched = contract;
         mismatched.enclaves[0].artifact_root = "bb".repeat(32);
@@ -10654,14 +11851,13 @@ mod tests {
             gateway_models_from_contract(&contract).expect_err("banned provider should hide model");
         assert!(format!("{err:#}").contains("no canonical contract-backed models"));
 
-        let mut legacy = test_contract(&root);
-        legacy.enclaves[0].created_by_role = None;
-        legacy.rooms[0].creator_role = None;
-        legacy.prices[0].current.as_mut().unwrap().set_by_role = None;
-        assert!(
-            gateway_models_from_contract(&legacy).is_ok(),
-            "missing legacy role markers should remain forward-compatible"
-        );
+        let mut missing_role = test_contract(&root);
+        missing_role.enclaves[0].created_by_role = None;
+        missing_role.rooms[0].creator_role = None;
+        missing_role.prices[0].current.as_mut().unwrap().set_by_role = None;
+        let err = gateway_models_from_contract(&missing_role)
+            .expect_err("missing admin role markers should hide model");
+        assert!(format!("{err:#}").contains("no canonical contract-backed models"));
 
         let mut provider_created = test_contract(&root);
         provider_created.enclaves[0].created_by_role = Some("provider".to_owned());
@@ -10793,16 +11989,16 @@ mod tests {
             ProviderSessionDecision::Accept
         );
 
-        let mut legacy = contract.clone();
-        legacy.enclaves[0].created_by_role = None;
-        legacy.rooms[0].creator_role = None;
-        legacy.prices[0].current.as_mut().unwrap().set_by_role = None;
-        let mut legacy_startup_rooms = startup_rooms.clone();
-        legacy_startup_rooms[0].creator_role = None;
-        assert_eq!(
-            provider_session_contract_decision(&legacy, &terms, &legacy_startup_rooms),
-            ProviderSessionDecision::Accept
-        );
+        let mut missing_role = contract.clone();
+        missing_role.enclaves[0].created_by_role = None;
+        missing_role.rooms[0].creator_role = None;
+        missing_role.prices[0].current.as_mut().unwrap().set_by_role = None;
+        let mut missing_role_startup_rooms = startup_rooms.clone();
+        missing_role_startup_rooms[0].creator_role = None;
+        assert!(matches!(
+            provider_session_contract_decision(&missing_role, &terms, &missing_role_startup_rooms),
+            ProviderSessionDecision::Reject { .. }
+        ));
 
         let mut banned = contract.clone();
         banned.providers[0].status = "banned".to_owned();
@@ -11653,7 +12849,14 @@ mod tests {
             "https://checkout.stripe.com/c/pay/cs_test",
         );
 
-        assert_eq!(lines[0], "Mayhem stripe checkout for 10.00");
+        assert_eq!(lines[0], "Mayhem stripe checkout for 10.00 USD");
+        let eur_lines = checkout_handoff_lines_with_currency(
+            PayRail::Stripe,
+            10_000_000,
+            "eur",
+            "https://checkout.stripe.com/c/pay/cs_test",
+        );
+        assert_eq!(eur_lines[0], "Mayhem stripe checkout for 10.00 EUR");
         assert_eq!(
             lines[1],
             "Copy/paste checkout URL: https://checkout.stripe.com/c/pay/cs_test"
@@ -11664,6 +12867,115 @@ mod tests {
                 "checkout_url": "https://checkout.stripe.com/c/pay/cs_test",
             })
         );
+    }
+
+    #[test]
+    fn pay_tnk_helpers_prepare_memo_bound_transfer() {
+        let tnk_e18 = mu_to_tnk_e18_ceil_u128(10_000_000, 50_000).unwrap();
+        assert_eq!(tnk_e18, 200 * TNK_E18);
+        assert_eq!(tnk_e18_to_decimal(tnk_e18), "200");
+        assert_eq!(tnk_e18_to_decimal(1_234_567_890_000_000_000), "1.23456789");
+        assert_eq!(tnk_e18_to_mu_floor(tnk_e18, 50_000).unwrap(), 10_000_000);
+
+        let pubkey = "00".repeat(32);
+        let nonce = "11".repeat(32);
+        let memo_hash = derive_tnk_memo_hash(&pubkey, &nonce).unwrap();
+        let mut expected = blake3::Hasher::new();
+        expected.update(&[0_u8; 32]);
+        expected.update(&[0x11_u8; 32]);
+        assert_eq!(memo_hash, expected.finalize().to_hex().to_string());
+
+        assert_eq!(
+            pay_tnk_deposit_intent_payload(
+                &memo_hash,
+                "testtrac1treasury",
+                tnk_e18,
+                10_000_000,
+                &PayTnkRate {
+                    tnk_usd_e6: 50_000,
+                    source: "gate-spot".to_owned(),
+                    ts: Some(3_600),
+                },
+            ),
+            json!({
+                "op": "deposit_tnk",
+                "memo_hash": memo_hash,
+                "treasury_address": "testtrac1treasury",
+                "tnk_e18": "200000000000000000000",
+                "quoted_mu": 10_000_000,
+                "rate_tnk_usd_e6": 50_000,
+                "rate_source": "gate-spot",
+            })
+        );
+    }
+
+    #[test]
+    fn pay_tnk_copy_paste_command_is_replayable() {
+        let command = pay_tnk_deposit_intent_command(
+            "10.25",
+            "testtrac1treasury",
+            &"ab".repeat(32),
+            50_000,
+            Some("http://127.0.0.1:49223/v1"),
+        );
+
+        assert!(command.starts_with("mayhem pay tnk "));
+        assert!(command.contains("--amount '10.25'"));
+        assert!(command.contains("--treasury-address 'testtrac1treasury'"));
+        assert!(command.contains("--tnk-usd-e6 50000"));
+        assert!(command.contains(" --submit-intent"));
+        assert!(command.ends_with(" --rpc-url 'http://127.0.0.1:49223/v1'"));
+    }
+
+    #[test]
+    fn pay_tnk_treasury_address_resolves_from_config() {
+        let config = MayhemConfig {
+            identity: None,
+            network: Some(ConfigNetwork {
+                rpc_url: None,
+                sc_bridge_url: None,
+                sc_bridge_token: None,
+                gateway_url: None,
+                paygate_url: None,
+                tnk_treasury_address: Some("testtrac1treasury".to_owned()),
+            }),
+            provider: None,
+            role: None,
+        };
+
+        assert_eq!(
+            resolve_cli_tnk_treasury_address(Some(&config), None).unwrap(),
+            "testtrac1treasury"
+        );
+        assert!(resolve_cli_tnk_treasury_address(Some(&config), Some("bad address")).is_err());
+    }
+
+    #[test]
+    fn pay_tnk_msb_network_resolves_from_treasury_address_or_override() {
+        assert_eq!(
+            resolve_tnk_msb_network(None, "testtrac1treasury").unwrap(),
+            "testnet1"
+        );
+        assert_eq!(
+            resolve_tnk_msb_network(None, "trac1treasury").unwrap(),
+            "mainnet"
+        );
+        assert_eq!(
+            resolve_tnk_msb_network(Some("testnet"), "trac1treasury").unwrap(),
+            "testnet1"
+        );
+        assert!(resolve_tnk_msb_network(None, "not-an-address").is_err());
+    }
+
+    #[test]
+    fn pay_tnk_msb_store_resolves_from_wallet_keypair_path() {
+        let path = Path::new("/tmp/mayhem/stores/testnet-epoch-wallet/db/keypair.json");
+        let (stores_directory, store_name) = msb_store_from_keypair_path(path).unwrap();
+
+        assert_eq!(stores_directory, PathBuf::from("/tmp/mayhem/stores"));
+        assert_eq!(store_name, "testnet-epoch-wallet");
+        assert!(msb_store_from_keypair_path(Path::new("/tmp/keypair.json")).is_err());
+        assert!(msb_store_from_keypair_path(Path::new("/tmp/store/keypair.json")).is_err());
     }
 
     #[test]
@@ -11688,6 +13000,7 @@ mod tests {
                 sc_bridge_token: None,
                 gateway_url: Some("http://127.0.0.1:4242/v1".to_owned()),
                 paygate_url: None,
+                tnk_treasury_address: None,
             }),
             provider: None,
             role: None,
@@ -12092,6 +13405,8 @@ mod tests {
             tnk_e18: Some("500000000000000000".to_owned()),
             msb_tx_hash: Some("msb-tx".to_owned()),
             external_ref: None,
+            fiat_currency: None,
+            fiat_amount_minor: None,
             at: 25_200,
         }
     }

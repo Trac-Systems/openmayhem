@@ -466,17 +466,16 @@ function verifyOptionalAdminMutation(record, key, admin, fail, byField, roleFiel
   return ok;
 }
 
-function verifyOptionalProviderBanProvenance(provider, key, admin, fail) {
+function verifyAdminProviderBanProvenance(provider, key, admin, fail) {
   if (provider?.status !== 'banned') return true;
   let ok = true;
-  if (hasOwn(provider, 'banned_by_role')) {
-    if (provider.banned_by_role !== 'admin') {
-      fail(`${key}.banned_by_role must be admin when present`);
-      ok = false;
-    } else if (provider.banned_by !== admin) {
-      fail(`${key}.banned_by must match current admin ${admin} when banned_by_role is admin`);
-      ok = false;
-    }
+  if (provider.banned_by_role !== 'admin') {
+    fail(`${key}.banned_by_role must be admin`);
+    ok = false;
+  }
+  if (provider.banned_by !== admin) {
+    fail(`${key}.banned_by must match current admin ${admin}`);
+    ok = false;
   }
   return ok;
 }
@@ -603,7 +602,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
   let providerBanRecordsVerified = true;
   for (const [providerId, provider] of bannedProviders.entries()) {
     providerBanRecordsVerified =
-      verifyOptionalProviderBanProvenance(provider, `prov/${providerId}`, admin, fail)
+      verifyAdminProviderBanProvenance(provider, `prov/${providerId}`, admin, fail)
       && providerBanRecordsVerified;
   }
 

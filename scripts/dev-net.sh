@@ -10,6 +10,10 @@ Boots a local Intercom dev net with one admin peer and two joiners.
 Options:
   --cleanup       Remove the dev-net stores before starting. Safe to repeat.
   --keep-running  Leave peers running after verification.
+
+Environment:
+  MAYHEM_DEVNET_JOINERS=1 starts only joiner-a. The default is 2.
+  MAYHEM_DEVNET_NETWORK passes an explicit app network flag, for example development.
 USAGE
 }
 
@@ -67,6 +71,12 @@ token="${MAYHEM_DEVNET_TOKEN:-mayhem-devnet-token-$(date +%s)-$$}"
 subnet_channel="mayhem-devnet-local"
 startup_timeout_sec="${MAYHEM_DEVNET_STARTUP_TIMEOUT:-120}"
 connection_timeout_sec="${MAYHEM_DEVNET_CONNECTION_TIMEOUT:-120}"
+joiner_count="${MAYHEM_DEVNET_JOINERS:-2}"
+if [[ "$joiner_count" != "1" && "$joiner_count" != "2" ]]; then
+  echo "MAYHEM_DEVNET_JOINERS must be 1 or 2" >&2
+  exit 2
+fi
+network_env="${MAYHEM_DEVNET_NETWORK:-local}"
 
 pids=()
 cleanup_processes() {
@@ -107,9 +117,16 @@ start_peer() {
   local args=(
     run
     .
+  )
+  args+=(--network "$network_env")
+  args+=(
     --peer-store-name "$store"
     --msb-store-name "$msb_store"
     --subnet-channel "$subnet_channel"
+    --headless 1
+    --peer-interactive 0
+    --peer-replicate 1
+    --peer-replicate-flush-timeout-ms "${MAYHEM_DEVNET_REPLICATE_FLUSH_TIMEOUT_MS:-5000}"
     --sidechannel-quiet 1
     --sc-bridge 1
     --sc-bridge-host 127.0.0.1
@@ -267,16 +284,25 @@ bridge_request "$admin_port" '{"type":"cli","command":"/set_auto_add_writers --e
 
 echo "Starting joiner peers..."
 start_peer "joiner-a" "mayhem-devnet-joiner-a" "mayhem-devnet-joiner-a-msb" "$joiner_a_port" "$joiner_a_rpc_port" "$admin_bootstrap" >/dev/null
-start_peer "joiner-b" "mayhem-devnet-joiner-b" "mayhem-devnet-joiner-b-msb" "$joiner_b_port" "$joiner_b_rpc_port" "$admin_bootstrap" >/dev/null
+if [[ "$joiner_count" == "2" ]]; then
+  start_peer "joiner-b" "mayhem-devnet-joiner-b" "mayhem-devnet-joiner-b-msb" "$joiner_b_port" "$joiner_b_rpc_port" "$admin_bootstrap" >/dev/null
+fi
 wait_log_contains "$joiner_a_log" "RPC: ready" "$startup_timeout_sec"
-wait_log_contains "$joiner_b_log" "RPC: ready" "$startup_timeout_sec"
 wait_log_contains "$joiner_a_log" "Sidechannel: ready" "$startup_timeout_sec"
-wait_log_contains "$joiner_b_log" "Sidechannel: ready" "$startup_timeout_sec"
+if [[ "$joiner_count" == "2" ]]; then
+  wait_log_contains "$joiner_b_log" "RPC: ready" "$startup_timeout_sec"
+  wait_log_contains "$joiner_b_log" "Sidechannel: ready" "$startup_timeout_sec"
+fi
 
-echo "Waiting for all peers to list both other peers..."
-admin_stats="$(wait_bridge_connections admin "$admin_port" 2 "$connection_timeout_sec")"
-joiner_a_stats="$(wait_bridge_connections joiner-a "$joiner_a_port" 2 "$connection_timeout_sec")"
-joiner_b_stats="$(wait_bridge_connections joiner-b "$joiner_b_port" 2 "$connection_timeout_sec")"
+echo "Waiting for all peers to list expected peer connections..."
+expected_connections="$joiner_count"
+admin_stats="$(wait_bridge_connections admin "$admin_port" "$expected_connections" "$connection_timeout_sec")"
+joiner_a_stats="$(wait_bridge_connections joiner-a "$joiner_a_port" "$expected_connections" "$connection_timeout_sec")"
+if [[ "$joiner_count" == "2" ]]; then
+  joiner_b_stats="$(wait_bridge_connections joiner-b "$joiner_b_port" 2 "$connection_timeout_sec")"
+else
+  joiner_b_stats=""
+fi
 
 echo "Running simulated Mayhem no-op on admin (--sim 1, no MSB fee)..."
 sim_result="$(bridge_request "$admin_port" '{"type":"cli","command":"/tx --command \"noop\" --sim 1"}')"
@@ -286,7 +312,13 @@ cat <<EOF
 Mayhem dev-net ready.
   admin:    ws://127.0.0.1:$admin_port  rpc=http://127.0.0.1:$admin_rpc_port/v1  $admin_stats
   joiner-a: ws://127.0.0.1:$joiner_a_port  rpc=http://127.0.0.1:$joiner_a_rpc_port/v1  $joiner_a_stats
+EOF
+if [[ "$joiner_count" == "2" ]]; then
+  cat <<EOF
   joiner-b: ws://127.0.0.1:$joiner_b_port  rpc=http://127.0.0.1:$joiner_b_rpc_port/v1  $joiner_b_stats
+EOF
+fi
+cat <<EOF
   subnet bootstrap: $admin_bootstrap
   subnet channel:   $subnet_channel
   sc bridge token:  $token

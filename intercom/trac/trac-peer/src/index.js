@@ -254,7 +254,17 @@ export class Peer extends ReadyResource {
             });
 
             this.swarm.join(this.config.channel, { server: true, client: true });
-            await this.swarm.flush();
+            const flush = this.swarm.flush();
+            if (this.config.replicateFlushTimeoutMs > 0) {
+                await Promise.race([
+                    flush.catch((error) => {
+                        console.log('Peer swarm flush failed:', error?.message ?? error);
+                    }),
+                    new Promise((resolve) => setTimeout(resolve, this.config.replicateFlushTimeoutMs)),
+                ]);
+            } else {
+                await flush;
+            }
         }
     }
 }
