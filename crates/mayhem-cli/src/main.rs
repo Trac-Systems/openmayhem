@@ -1038,6 +1038,10 @@ struct CatalogArtifactMetadataArgs {
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: usize,
 
+    /// Published Hugging Face commit revision to write into the catalog when applying this report.
+    #[arg(long)]
+    source_revision: Option<String>,
+
     /// Write the metadata report JSON to this path.
     #[arg(long, value_name = "PATH")]
     report_output: Option<PathBuf>,
@@ -2912,6 +2916,14 @@ fn validate_catalog_key_id(key_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_catalog_source_revision(revision: &str) -> Result<String> {
+    let trimmed = revision.trim();
+    if !is_hex_len(trimmed, 40) {
+        bail!("--source-revision must be a 40-hex published Hugging Face commit revision");
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
 fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
     if args.model.is_some() ^ args.artifact.is_some() {
         bail!("--model and --artifact must be provided together");
@@ -2921,6 +2933,11 @@ fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
         .report_output
         .as_ref()
         .map(|path| absolutize(path.clone()))
+        .transpose()?;
+    let source_revision = args
+        .source_revision
+        .as_deref()
+        .map(validate_catalog_source_revision)
         .transpose()?;
     let catalog_binding = if let (Some(model_id), Some(artifact_name)) =
         (args.model.as_deref(), args.artifact.as_deref())
@@ -2949,6 +2966,7 @@ fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
             }),
         artifact_path,
         args.chunk_size,
+        source_revision,
     )?;
 
     if args.json {
@@ -2965,6 +2983,9 @@ fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
         );
         println!("artifact_root={}", report.catalog_patch.artifact_root);
         println!("source_sha256={}", report.catalog_patch.source_sha256);
+        if let Some(source_revision) = &report.catalog_patch.source_revision {
+            println!("source_revision={source_revision}");
+        }
         println!("weights_bytes={}", report.catalog_patch.weights_bytes);
         if let Some(binding) = &report.catalog_binding {
             println!("Catalog: {}", binding.catalog_path.display());
@@ -3007,6 +3028,8 @@ struct CatalogArtifactMetadataPatch {
     artifact_root_kind: String,
     artifact_root: String,
     source_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_revision: Option<String>,
     weights_bytes: u64,
 }
 
@@ -3019,6 +3042,7 @@ struct CatalogArtifactMetadataBinding {
     source_kind: String,
     source_repo: String,
     source_revision: String,
+    target_source_revision: Option<String>,
     source_path: String,
     current_artifact_root_kind: String,
     current_artifact_root: String,
@@ -3034,6 +3058,7 @@ fn catalog_artifact_metadata_report(
     catalog_binding: Option<(&catalog::CatalogDocument, PathBuf, &str, &str)>,
     artifact_path: PathBuf,
     chunk_size: usize,
+    source_revision: Option<String>,
 ) -> Result<CatalogArtifactMetadataReport> {
     if chunk_size == 0 {
         bail!("--chunk-size must be positive");
@@ -3052,6 +3077,7 @@ fn catalog_artifact_metadata_report(
         artifact_root_kind: "blake3_merkle_v1".to_owned(),
         artifact_root: merkle.root.clone(),
         source_sha256,
+        source_revision,
         weights_bytes: merkle.total_bytes,
     };
     let catalog_binding = catalog_binding
@@ -3107,9 +3133,13 @@ fn catalog_artifact_metadata_binding(
         .source_sha256
         .as_ref()
         .map(|current| current.eq_ignore_ascii_case(&patch.source_sha256));
+    let matches_target_source_revision = patch.source_revision.as_ref().map_or(true, |target| {
+        artifact.source.revision.eq_ignore_ascii_case(target)
+    });
     let matches_current_weights_bytes = artifact.weights_bytes == patch.weights_bytes;
     let update_needed = !matches_current_artifact_root
         || matches_current_source_sha256 != Some(true)
+        || !matches_target_source_revision
         || !matches_current_weights_bytes;
     Ok(CatalogArtifactMetadataBinding {
         catalog_path,
@@ -3119,6 +3149,7 @@ fn catalog_artifact_metadata_binding(
         source_kind: artifact.source.kind.clone(),
         source_repo: artifact.source.repo.clone(),
         source_revision: artifact.source.revision.clone(),
+        target_source_revision: patch.source_revision.clone(),
         source_path: artifact.path.clone(),
         current_artifact_root_kind: artifact.artifact_root_kind.clone(),
         current_artifact_root: artifact.artifact_root.clone(),
@@ -3242,6 +3273,7 @@ struct CatalogArtifactMetadataApplyEntry {
     source_kind: String,
     source_repo: String,
     source_revision: String,
+    target_source_revision: Option<String>,
     source_path: String,
     artifact_root_kind: String,
     artifact_root: String,
@@ -3323,6 +3355,12 @@ fn catalog_artifact_metadata_apply_report(
         }
         if !is_hex_len(&metadata.catalog_patch.source_sha256, 64) {
             entry_errors.push("report source_sha256 must be 32-byte hex".to_owned());
+        }
+        if let Some(source_revision) = &metadata.catalog_patch.source_revision {
+            if !is_hex_len(source_revision, 40) {
+                entry_errors
+                    .push("report source_revision must be 40-byte git commit hex".to_owned());
+            }
         }
         if metadata.catalog_patch.weights_bytes == 0 || metadata.total_bytes == 0 {
             entry_errors.push("report weights_bytes/total_bytes must be positive".to_owned());
@@ -3412,6 +3450,13 @@ fn catalog_artifact_metadata_apply_report(
             && artifact.source_sha256.as_ref().is_some_and(|value| {
                 value.eq_ignore_ascii_case(&metadata.catalog_patch.source_sha256)
             })
+            && metadata
+                .catalog_patch
+                .source_revision
+                .as_ref()
+                .map_or(true, |target| {
+                    artifact.source.revision.eq_ignore_ascii_case(target)
+                })
             && artifact.weights_bytes == metadata.catalog_patch.weights_bytes;
         let update_needed = !current_matches_patch;
         let ok = entry_errors.is_empty();
@@ -3431,6 +3476,7 @@ fn catalog_artifact_metadata_apply_report(
             source_kind: artifact.source.kind.clone(),
             source_repo: artifact.source.repo.clone(),
             source_revision: artifact.source.revision.clone(),
+            target_source_revision: metadata.catalog_patch.source_revision.clone(),
             source_path: artifact.path.clone(),
             artifact_root_kind: metadata.catalog_patch.artifact_root_kind.clone(),
             artifact_root: metadata.catalog_patch.artifact_root.clone(),
@@ -3493,6 +3539,18 @@ fn apply_artifact_metadata_reports(
         );
         artifact.insert("artifact_root".to_owned(), json!(entry.artifact_root));
         artifact.insert("source_sha256".to_owned(), json!(entry.source_sha256));
+        if let Some(target_source_revision) = &entry.target_source_revision {
+            let source = artifact
+                .get_mut("source")
+                .and_then(Value::as_object_mut)
+                .with_context(|| {
+                    format!(
+                        "artifact {} for model {} has no source object",
+                        entry.artifact, entry.model_id
+                    )
+                })?;
+            source.insert("revision".to_owned(), json!(target_source_revision));
+        }
         artifact.insert("weights_bytes".to_owned(), json!(entry.weights_bytes));
         if artifact
             .get("notes")
@@ -17417,6 +17475,7 @@ mod tests {
             )),
             path.clone(),
             5,
+            None,
         )
         .unwrap();
 
@@ -17452,6 +17511,7 @@ mod tests {
             )),
             path.clone(),
             5,
+            None,
         )
         .unwrap();
         let binding = matching.catalog_binding.as_ref().unwrap();
@@ -17547,6 +17607,7 @@ mod tests {
             )),
             path.clone(),
             7,
+            None,
         )
         .unwrap();
         let report_path = write_temp_artifact_metadata_report(&metadata);
@@ -17599,6 +17660,80 @@ mod tests {
     }
 
     #[test]
+    fn artifact_metadata_apply_can_finalize_published_source_revision() {
+        let path = env::temp_dir().join(format!(
+            "mayhem-artifact-metadata-source-revision-{}-{}.bin",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        fs::write(&path, b"mayhem published source revision").unwrap();
+        let mut catalog = test_catalog(&"00".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .artifact_root_kind = "blake3_descriptor_until_p2_4".to_owned();
+        let published_revision = "44".repeat(20);
+        let metadata = catalog_artifact_metadata_report(
+            Some((
+                &catalog,
+                PathBuf::from("catalog.json"),
+                "test/model@4bit",
+                "gguf-q4_k_m",
+            )),
+            path.clone(),
+            7,
+            Some(published_revision.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.catalog_patch.source_revision.as_deref(),
+            Some(published_revision.as_str())
+        );
+        assert!(metadata.catalog_binding.as_ref().unwrap().update_needed);
+        let report_path = write_temp_artifact_metadata_report(&metadata);
+
+        let report = catalog_artifact_metadata_apply_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            true,
+            &[report_path],
+        );
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(
+            report.entries[0].target_source_revision.as_deref(),
+            Some(published_revision.as_str())
+        );
+
+        let mut catalog_value = json!({
+            "models": [{
+                "model_id": "test/model@4bit",
+                "artifacts": {
+                    "gguf-q4_k_m": {
+                        "source": {
+                            "kind": "huggingface",
+                            "repo": "test/model",
+                            "revision": "1".repeat(40)
+                        },
+                        "artifact_root_kind": "blake3_descriptor_until_p2_4",
+                        "artifact_root": "00".repeat(32),
+                        "weights_bytes": 42
+                    }
+                }
+            }]
+        });
+        let applied = apply_artifact_metadata_reports(&mut catalog_value, &report).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(
+            catalog_value["models"][0]["artifacts"]["gguf-q4_k_m"]["source"]["revision"],
+            json!(published_revision)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn artifact_metadata_apply_rejects_stale_current_binding() {
         let path = env::temp_dir().join(format!(
             "mayhem-artifact-metadata-stale-{}-{}.bin",
@@ -17617,6 +17752,7 @@ mod tests {
             )),
             path.clone(),
             7,
+            None,
         )
         .unwrap();
         let report_path = write_temp_artifact_metadata_report(&metadata);
@@ -18167,12 +18303,14 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let seq = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let safe_set_id = set_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
         let dir = std::env::temp_dir().join(format!(
-            "mayhem-canary-matrix-{}-{}-{}",
+            "mayhem-canary-matrix-{}-{}-{}-{}",
             std::process::id(),
             safe_set_id,
-            nanos
+            nanos,
+            seq
         ));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
