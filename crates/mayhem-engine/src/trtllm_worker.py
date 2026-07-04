@@ -4,14 +4,19 @@ import os
 import sys
 
 
+protocol_stdout = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+sys.stdout = sys.stderr
+
+
 model = None
 tokenizer = None
 ctx_size = 2048
 
 
 def send(message):
-    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    protocol_stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    protocol_stdout.flush()
 
 
 def import_attr(candidates):
