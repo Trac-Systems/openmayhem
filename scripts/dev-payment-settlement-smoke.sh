@@ -134,6 +134,7 @@ SET_RULES_JSON="$TMP_DIR/admin-set-rules.json"
 SET_PARAMS_JSON="$TMP_DIR/admin-set-params.json"
 SET_MODEL_REF_JSON="$TMP_DIR/admin-set-model-ref.json"
 REGISTER_ENCLAVE_JSON="$TMP_DIR/admin-register-enclave.json"
+REGISTER_ENCLAVE_CATALOG="$TMP_DIR/admin-register-enclave-catalog.json"
 SET_PRICE_JSON="$TMP_DIR/admin-set-price.json"
 OPEN_ROOM_JSON="$TMP_DIR/admin-open-room.json"
 SET_PROVIDER_PAYOUT_JSON="$TMP_DIR/admin-set-provider-payout.json"
@@ -230,6 +231,61 @@ USER_PUBKEY="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"
 PROVIDER_PUBKEY="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).provider' "$META_JSON")"
 ENCLAVE_ID="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).enclave_id' "$META_JSON")"
 MODEL_ID="$(node -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).model_id' "$META_JSON")"
+SMOKE_ARTIFACT_ROOT="$(printf '1%.0s' {1..64})"
+SMOKE_MANIFEST_HASH="$(printf '2%.0s' {1..64})"
+SMOKE_BINARY_HASH="$(printf '3%.0s' {1..64})"
+SMOKE_ARTIFACT_REVISION="$(printf '4%.0s' {1..40})"
+
+mkdir -p "$(dirname "$REGISTER_ENCLAVE_CATALOG")"
+node - "$REGISTER_ENCLAVE_CATALOG" "$MODEL_ID" "$SMOKE_ARTIFACT_ROOT" "$SMOKE_ARTIFACT_REVISION" <<'NODE'
+const fs = require('node:fs');
+const [outPath, modelId, artifactRoot, artifactRevision] = process.argv.slice(2);
+const doc = {
+  schema_version: 1,
+  catalog_id: 'mayhem-payment-settlement-smoke',
+  generated_at: '2026-07-04T00:00:00Z',
+  models: [{
+    model_id: modelId,
+    family: 'smoke',
+    params_b: 0,
+    tier: 'dev',
+    provenance: {
+      source: {
+        kind: 'huggingface',
+        repo: 'mayhem-smoke/dev-payment-source',
+        revision: artifactRevision,
+      },
+      conversion: [],
+      license: 'smoke',
+      license_sha256: '0'.repeat(64),
+    },
+    artifacts: {
+      'gguf-q4_k_m': {
+        engine: 'llama.cpp',
+        source: {
+          kind: 'huggingface',
+          repo: 'mayhem-smoke/dev-payment',
+          revision: artifactRevision,
+        },
+        path: 'dev-payment-smoke.gguf',
+        artifact_root: artifactRoot,
+        artifact_root_kind: 'blake3_merkle_v1',
+        weights_bytes: 1,
+      },
+    },
+    caps: { tools: true, json: true, ctx_max: 8192, vision: false },
+    requirements: {
+      min_ram_gb: 1,
+      min_vram_gb_full_offload: 0,
+      cpu_flags: [],
+      backends: ['llama.cpp'],
+    },
+    canary: { set_id: 'canary-dev-v1', match_min: 0.9, fingerprints: {} },
+    price_ref_mu: { denom: 'mu_usd', in_per_1k: 20, out_per_1k: 60 },
+  }],
+};
+fs.writeFileSync(outPath, `${JSON.stringify(doc, null, 2)}\n`);
+NODE
 
 log "creating deterministic provider wallet for receipt provider"
 mkdir -p "$PROVIDER_HOME/stores/main/db"
@@ -276,13 +332,15 @@ log "seeding admin control plane"
   --enclave-id "$ENCLAVE_ID" \
   --model "$MODEL_ID" \
   --backend llama.cpp \
-  --artifact-root "$(printf '1%.0s' {1..64})" \
+  --artifact-root "$SMOKE_ARTIFACT_ROOT" \
   --artifact-root-kind blake3_merkle_v1 \
   --artifact-repo mayhem-smoke/dev-payment \
-  --artifact-revision "$(printf '4%.0s' {1..40})" \
+  --artifact-revision "$SMOKE_ARTIFACT_REVISION" \
   --artifact-path dev-payment-smoke.gguf \
-  --manifest-hash "$(printf '2%.0s' {1..64})" \
-  --binary-hash "$(printf '3%.0s' {1..64})" \
+  --catalog-path "$REGISTER_ENCLAVE_CATALOG" \
+  --dev-skip-catalog-verify \
+  --manifest-hash "$SMOKE_MANIFEST_HASH" \
+  --binary-hash "$SMOKE_BINARY_HASH" \
   --caps-json '{"chat":true,"tools":true,"json":true,"ctx":8192}' >"$REGISTER_ENCLAVE_JSON"
 "$MAYHEM_BIN" admin set-price "${ADMIN_COMMON[@]}" \
   --enclave-id "$ENCLAVE_ID" \

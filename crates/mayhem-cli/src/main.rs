@@ -1219,6 +1219,26 @@ struct AdminRegisterEnclaveArgs {
     #[arg(long)]
     source_sha256: Option<String>,
 
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Path to the detached catalog signature JSON.
+    #[arg(long, value_name = "PATH")]
+    signature_path: Option<PathBuf>,
+
+    /// Directory containing catalog maintainer public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Use an unsigned temporary catalog for local smoke fixtures only.
+    #[arg(long)]
+    dev_skip_catalog_verify: bool,
+
     #[arg(long)]
     manifest_hash: String,
 
@@ -2813,6 +2833,7 @@ fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Value {
 }
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
+    validate_admin_enclave_catalog_binding(args)?;
     let caps = json_arg_or_file_object(
         args.caps_json.as_deref(),
         args.caps_file.as_ref(),
@@ -2829,7 +2850,7 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "artifact_source": {
             "kind": "huggingface",
             "repo": &args.artifact_repo,
-            "revision": &args.artifact_revision,
+            "revision": args.artifact_revision.to_ascii_lowercase(),
             "path": &args.artifact_path,
         },
         "manifest_hash": &args.manifest_hash,
@@ -2838,9 +2859,137 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "caps": caps,
     });
     if let Some(source_sha256) = &args.source_sha256 {
-        payload["source_sha256"] = json!(source_sha256);
+        payload["source_sha256"] = json!(source_sha256.to_ascii_lowercase());
     }
     Ok(payload)
+}
+
+fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    if args.dev_skip_catalog_verify {
+        if !cfg!(debug_assertions) {
+            bail!(
+                "--dev-skip-catalog-verify is only available in debug builds for local smoke fixtures"
+            );
+        }
+    } else {
+        let signature_path = args
+            .signature_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("catalog/signatures/models.json.sig"))?;
+        let keys_dir = args
+            .keys_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("catalog/keys"))?;
+        let canaries_dir = args
+            .canaries_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+        let report = catalog::verify(catalog::VerifyOptions {
+            catalog_path: catalog_path.clone(),
+            signature_path: absolutize(signature_path)?,
+            keys_dir: absolutize(keys_dir)?,
+            canaries_dir: absolutize(canaries_dir)?,
+            check_dev_downloads: false,
+            hf_token_file: None,
+        })?;
+        if !report.ok {
+            bail!(
+                "signed admin catalog verification failed for register-enclave: {}",
+                report.errors.join("; ")
+            );
+        }
+    }
+
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let model = catalog_doc
+        .models
+        .iter()
+        .find(|model| model.model_id == args.model)
+        .with_context(|| {
+            format!(
+                "--model {} is not present in admin catalog {}",
+                args.model,
+                catalog_path.display()
+            )
+        })?;
+    let Some((_, artifact)) = model.artifacts.iter().find(|(_, artifact)| {
+        artifact.engine == args.backend
+            && artifact.source.kind == "huggingface"
+            && artifact.source.repo == args.artifact_repo
+            && artifact
+                .source
+                .revision
+                .eq_ignore_ascii_case(&args.artifact_revision)
+            && artifact.path == args.artifact_path
+    }) else {
+        bail!(
+            "register-enclave source is not greenlit: no admin catalog artifact for model {}, backend {}, Hugging Face {}/resolve/{}/{}",
+            args.model,
+            args.backend,
+            args.artifact_repo,
+            args.artifact_revision,
+            args.artifact_path
+        );
+    };
+    ensure_catalog_text_match(
+        "artifact_root_kind",
+        &args.artifact_root_kind,
+        &artifact.artifact_root_kind,
+    )?;
+    ensure_catalog_hex_match(
+        "artifact_root",
+        &args.artifact_root,
+        &artifact.artifact_root,
+    )?;
+    ensure_catalog_optional_hex_match(
+        "source_sha256",
+        args.source_sha256.as_deref(),
+        artifact.source_sha256.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn ensure_catalog_text_match(label: &str, requested: &str, catalog: &str) -> Result<()> {
+    if requested == catalog {
+        return Ok(());
+    }
+    bail!("register-enclave {label} mismatch: requested {requested}, signed catalog has {catalog}")
+}
+
+fn ensure_catalog_hex_match(label: &str, requested: &str, catalog: &str) -> Result<()> {
+    if requested.eq_ignore_ascii_case(catalog) {
+        return Ok(());
+    }
+    bail!("register-enclave {label} mismatch: requested {requested}, signed catalog has {catalog}")
+}
+
+fn ensure_catalog_optional_hex_match(
+    label: &str,
+    requested: Option<&str>,
+    catalog: Option<&str>,
+) -> Result<()> {
+    match (requested, catalog) {
+        (Some(left), Some(right)) if left.eq_ignore_ascii_case(right) => Ok(()),
+        (None, None) => Ok(()),
+        (Some(left), Some(right)) => {
+            bail!("register-enclave {label} mismatch: requested {left}, signed catalog has {right}")
+        }
+        (None, Some(right)) => bail!(
+            "register-enclave {label} mismatch: requested <missing>, signed catalog has {right}"
+        ),
+        (Some(left), None) => bail!(
+            "register-enclave {label} mismatch: requested {left}, signed catalog has <missing>"
+        ),
+    }
 }
 
 fn admin_open_room_payload(args: &AdminOpenRoomArgs) -> Result<Value> {
@@ -11534,6 +11683,96 @@ mod tests {
         assert!(err
             .to_string()
             .contains("pass only one of --reason-hash or --reason"));
+    }
+
+    #[test]
+    fn admin_register_enclave_requires_greenlit_catalog_artifact() {
+        let temp = env::temp_dir().join(format!(
+            "mayhem-cli-admin-catalog-gate-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let catalog_path = temp.join("models.json");
+        let artifact_root = "aa".repeat(32);
+        let source_sha256 = "bb".repeat(32);
+        fs::write(
+            &catalog_path,
+            format!(
+                r#"{{
+  "schema_version": 1,
+  "catalog_id": "test-admin-catalog",
+  "generated_at": "2026-07-04T00:00:00Z",
+  "models": [{{
+    "model_id": "test/model@4bit",
+    "family": "test",
+    "params_b": 1.0,
+    "tier": "dev",
+    "provenance": {{
+      "source": {{ "kind": "huggingface", "repo": "test/source", "revision": "{source_revision}" }},
+      "conversion": [],
+      "license": "test",
+      "license_sha256": "{license_sha}"
+    }},
+    "artifacts": {{
+      "gguf-q4_k_m": {{
+        "engine": "llama.cpp",
+        "source": {{ "kind": "huggingface", "repo": "admin/model", "revision": "{artifact_revision}" }},
+        "path": "model.gguf",
+        "artifact_root": "{artifact_root}",
+        "artifact_root_kind": "blake3_merkle_v1",
+        "weights_bytes": 42,
+        "source_sha256": "{source_sha256}"
+      }}
+    }},
+    "caps": {{ "tools": true, "json": true, "ctx_max": 8192, "vision": false }},
+    "requirements": {{ "min_ram_gb": 1, "min_vram_gb_full_offload": 0, "cpu_flags": [], "backends": ["llama.cpp"] }},
+    "canary": {{ "set_id": "canary-dev-v1", "match_min": 0.9, "fingerprints": {{}} }},
+    "price_ref_mu": {{ "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 }}
+  }}]
+}}
+"#,
+                source_revision = "11".repeat(20),
+                artifact_revision = "22".repeat(20),
+                license_sha = "33".repeat(32),
+            ),
+        )
+        .unwrap();
+
+        let args = AdminRegisterEnclaveArgs {
+            tx: test_admin_tx_args(),
+            enclave_id: "44".repeat(32),
+            model: "test/model@4bit".to_owned(),
+            backend: "llama.cpp".to_owned(),
+            artifact_root: artifact_root.clone(),
+            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+            artifact_repo: "admin/model".to_owned(),
+            artifact_revision: "22".repeat(20),
+            artifact_path: "model.gguf".to_owned(),
+            source_sha256: Some(source_sha256),
+            catalog_path: Some(catalog_path),
+            signature_path: None,
+            keys_dir: None,
+            canaries_dir: None,
+            dev_skip_catalog_verify: true,
+            manifest_hash: "55".repeat(32),
+            binary_hash: "66".repeat(32),
+            att_tier: 1,
+            caps_json: Some(r#"{"tools":true,"json":true,"ctx":8192}"#.to_owned()),
+            caps_file: None,
+        };
+
+        let payload = admin_register_enclave_payload(&args).unwrap();
+        assert_eq!(payload["artifact_source"]["repo"], "admin/model");
+        assert_eq!(payload["artifact_root"], artifact_root);
+
+        let mut fake_repo = args;
+        fake_repo.artifact_repo = "provider/fake-model".to_owned();
+        let err = admin_register_enclave_payload(&fake_repo)
+            .expect_err("fake provider model must not be greenlit");
+        assert!(err.to_string().contains("not greenlit"), "{err:#}");
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

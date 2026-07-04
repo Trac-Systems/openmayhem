@@ -383,6 +383,8 @@ admin_run admin-register-enclave register-enclave \
   --artifact-revision "$ARTIFACT_REVISION" \
   --artifact-path "$ARTIFACT_PATH" \
   --source-sha256 "$ARTIFACT_SHA256" \
+  --catalog-path "$TEMP_CATALOG" \
+  --dev-skip-catalog-verify \
   --manifest-hash "$MANIFEST_HASH" \
   --binary-hash "$BINARY_HASH" \
   --caps-json '{"chat":true,"tools":true,"json":true,"ctx":8192}'

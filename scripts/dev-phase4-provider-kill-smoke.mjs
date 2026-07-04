@@ -1122,6 +1122,8 @@ async function main() {
     '--artifact-revision', artifact.source.revision,
     '--artifact-path', artifact.path,
     '--source-sha256', artifactSha256,
+    '--catalog-path', tempCatalogPath,
+    '--dev-skip-catalog-verify',
     '--manifest-hash', manifestHash,
     '--binary-hash', binaryHash,
     '--caps-json', '{"chat":true,"tools":true,"json":true,"ctx":8192}',
