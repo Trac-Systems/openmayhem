@@ -85,6 +85,17 @@ pub(crate) struct SourceRef {
     pub(crate) publisher_key: Option<String>,
 }
 
+pub(crate) fn huggingface_resolve_url(source: &SourceRef, path: &str) -> Result<String> {
+    validate_huggingface_source("artifact", "source", source)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    validate_huggingface_path("artifact", "path", path)
+        .map_err(|errors| anyhow::anyhow!("{}", errors.join("; ")))?;
+    Ok(format!(
+        "https://huggingface.co/{}/resolve/{}/{}",
+        source.repo, source.revision, path
+    ))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ConversionRef {
     pub(crate) tool: String,
@@ -515,6 +526,12 @@ fn validate_artifact(
     );
     if artifact.path.trim().is_empty() {
         errors.push(format!("{model_id}/{name} path is required"));
+    } else {
+        errors.extend(
+            validate_huggingface_path(model_id, &format!("artifacts.{name}.path"), &artifact.path)
+                .err()
+                .unwrap_or_default(),
+        );
     }
     if !is_hex_len(&artifact.artifact_root, 64) {
         errors.push(format!(
@@ -557,11 +574,26 @@ fn validate_artifact(
 }
 
 fn validate_source(model_id: &str, label: &str, source: &SourceRef, errors: &mut Vec<String>) {
+    errors.extend(
+        validate_huggingface_source(model_id, label, source)
+            .err()
+            .unwrap_or_default(),
+    );
+}
+
+fn validate_huggingface_source(
+    model_id: &str,
+    label: &str,
+    source: &SourceRef,
+) -> std::result::Result<(), Vec<String>> {
+    let mut errors = Vec::new();
     if source.kind != "huggingface" {
         errors.push(format!("{model_id} {label}.kind must be huggingface"));
     }
-    if !source.repo.contains('/') {
-        errors.push(format!("{model_id} {label}.repo must be namespace/name"));
+    if !is_safe_huggingface_repo(&source.repo) {
+        errors.push(format!(
+            "{model_id} {label}.repo must be a safe namespace/name repo id"
+        ));
     }
     if !is_hex_len(&source.revision, 40) {
         errors.push(format!(
@@ -569,6 +601,72 @@ fn validate_source(model_id: &str, label: &str, source: &SourceRef, errors: &mut
         ));
     }
     let _ = &source.publisher_key;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn validate_huggingface_path(
+    model_id: &str,
+    label: &str,
+    path: &str,
+) -> std::result::Result<(), Vec<String>> {
+    if is_safe_huggingface_path(path) {
+        Ok(())
+    } else {
+        Err(vec![format!(
+            "{model_id} {label} must be a relative Hugging Face artifact path without traversal or URL syntax"
+        )])
+    }
+}
+
+fn is_safe_huggingface_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let Some(namespace) = parts.next() else {
+        return false;
+    };
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && is_safe_huggingface_component(namespace)
+        && is_safe_huggingface_component(name)
+}
+
+fn is_safe_huggingface_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 96
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !matches!(bytes.first(), Some(b'-' | b'.'))
+        && !matches!(bytes.last(), Some(b'-' | b'.'))
+        && !value.contains("..")
+        && !value.contains("--")
+}
+
+fn is_safe_huggingface_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.starts_with('\\')
+        && !path.contains('\\')
+        && !path.contains('?')
+        && !path.contains('#')
+        && !path.contains('%')
+        && !path.bytes().any(|byte| byte.is_ascii_control())
+        && path.split('/').all(is_safe_huggingface_path_segment)
+}
+
+fn is_safe_huggingface_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
 }
 
 fn validate_canary_set(canaries_dir: &Path, set_id: &str, errors: &mut Vec<String>) {
@@ -753,6 +851,36 @@ mod tests {
         assert_eq!(hex_to_vec("00ff").unwrap(), vec![0, 255]);
         assert!(hex_to_vec("0").is_err());
         assert!(hex_to_vec("zz").is_err());
+    }
+
+    #[test]
+    fn huggingface_resolve_url_requires_safe_pinned_catalog_reference() {
+        let source = SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "admin-approved/model-4bit".to_owned(),
+            revision: "1".repeat(40),
+            publisher_key: None,
+        };
+
+        assert_eq!(
+            huggingface_resolve_url(&source, "snapshots/model.safetensors").unwrap(),
+            format!(
+                "https://huggingface.co/admin-approved/model-4bit/resolve/{}/snapshots/model.safetensors",
+                "1".repeat(40)
+            )
+        );
+
+        let mut branch = source.clone();
+        branch.revision = "main".to_owned();
+        assert!(huggingface_resolve_url(&branch, "model.safetensors").is_err());
+
+        let mut unsafe_repo = source.clone();
+        unsafe_repo.repo = "admin/model/extra".to_owned();
+        assert!(huggingface_resolve_url(&unsafe_repo, "model.safetensors").is_err());
+
+        assert!(huggingface_resolve_url(&source, "../model.safetensors").is_err());
+        assert!(huggingface_resolve_url(&source, "/model.safetensors").is_err());
+        assert!(huggingface_resolve_url(&source, "model.safetensors?download=1").is_err());
     }
 
     fn hex_string(bytes: &[u8]) -> String {

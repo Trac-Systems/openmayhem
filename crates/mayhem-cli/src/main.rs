@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +48,7 @@ use mayhem_proto::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::time::sleep;
 
@@ -7851,14 +7852,16 @@ async fn ensure_left_room(
         }));
     }
     let submitted = submit_provider_lifecycle_feature(
-        &ctx.rpc,
-        &ctx.keypair_path,
-        &ctx.password,
-        &ctx.wallet,
+        ProviderLifecycleSubmitContext {
+            rpc: &ctx.rpc,
+            keypair_path: &ctx.keypair_path,
+            password: &ctx.password,
+            wallet: &ctx.wallet,
+            sim,
+        },
         "leave_room",
         Some(enclave_id),
         Some(room_id),
-        sim,
     )
     .await?;
     if sim {
@@ -7898,14 +7901,16 @@ async fn ensure_left_enclave(
         }));
     }
     let submitted = submit_provider_lifecycle_feature(
-        &ctx.rpc,
-        &ctx.keypair_path,
-        &ctx.password,
-        &ctx.wallet,
+        ProviderLifecycleSubmitContext {
+            rpc: &ctx.rpc,
+            keypair_path: &ctx.keypair_path,
+            password: &ctx.password,
+            wallet: &ctx.wallet,
+            sim,
+        },
         "leave_enclave",
         Some(enclave_id),
         None,
-        sim,
     )
     .await?;
     if sim {
@@ -8573,6 +8578,7 @@ async fn download_provider_artifact(
     downloads_dir: &Path,
     selected: &ProviderCandidate,
 ) -> Result<PathBuf> {
+    require_provider_merkle_artifact(selected)?;
     let artifact_file = format!(
         "{}-{}",
         safe_path_component(&selected.enclave.enclave_id),
@@ -8581,7 +8587,9 @@ async fn download_provider_artifact(
     let destination = downloads_dir.join(artifact_file);
     if destination.exists() {
         let merkle = build_merkle_manifest(&destination, args.chunk_size)?;
-        if merkle.root == selected.enclave.artifact_root {
+        if merkle.root == selected.enclave.artifact_root
+            && artifact_sha256_matches(&destination, &selected.artifact)?
+        {
             return Ok(destination);
         }
     }
@@ -8590,12 +8598,10 @@ async fn download_provider_artifact(
         DownloadSource::File(absolutize(path.clone())?)
     } else if selected.artifact.source.kind == "huggingface" {
         DownloadSource::Http {
-            url: format!(
-                "https://huggingface.co/{}/resolve/{}/{}",
-                selected.artifact.source.repo,
-                selected.artifact.source.revision,
-                selected.artifact.path
-            ),
+            url: catalog::huggingface_resolve_url(
+                &selected.artifact.source,
+                &selected.artifact.path,
+            )?,
             bearer_token: read_optional_token(args.hf_token_file.as_deref())?,
         }
     } else {
@@ -8614,7 +8620,57 @@ async fn download_provider_artifact(
             selected.enclave.artifact_root
         )
     })?;
+    verify_artifact_sha256(&destination, &selected.artifact)?;
     Ok(destination)
+}
+
+fn require_provider_merkle_artifact(selected: &ProviderCandidate) -> Result<()> {
+    if selected.artifact.artifact_root_kind != "blake3_merkle_v1" {
+        bail!(
+            "provider serving requires admin artifact_root_kind blake3_merkle_v1 for {}/{}; catalog has {}",
+            selected.model.model_id,
+            selected.artifact_name,
+            selected.artifact.artifact_root_kind
+        );
+    }
+    Ok(())
+}
+
+fn artifact_sha256_matches(path: &Path, artifact: &catalog::CatalogArtifact) -> Result<bool> {
+    let Some(expected) = &artifact.source_sha256 else {
+        return Ok(true);
+    };
+    if path.is_dir() {
+        return Ok(true);
+    }
+    Ok(file_sha256_hex(path)? == expected.to_ascii_lowercase())
+}
+
+fn verify_artifact_sha256(path: &Path, artifact: &catalog::CatalogArtifact) -> Result<()> {
+    if artifact_sha256_matches(path, artifact)? {
+        return Ok(());
+    }
+    bail!(
+        "artifact sha256 mismatch for {}; expected admin catalog source_sha256 {}",
+        path.display(),
+        artifact.source_sha256.as_deref().unwrap_or("<missing>")
+    )
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 64];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn read_optional_token(path: Option<&Path>) -> Result<Option<String>> {
@@ -8684,14 +8740,16 @@ async fn ensure_provider_registered(
     }
 
     let submitted = submit_provider_lifecycle_feature(
-        rpc,
-        keypair_path,
-        password,
-        wallet,
+        ProviderLifecycleSubmitContext {
+            rpc,
+            keypair_path,
+            password,
+            wallet,
+            sim,
+        },
         "register_provider",
         None,
         None,
-        sim,
     )
     .await?;
     if sim {
@@ -8721,14 +8779,16 @@ async fn ensure_joined_enclave(
         }
     }
     let submitted = submit_provider_lifecycle_feature(
-        rpc,
-        keypair_path,
-        password,
-        wallet,
+        ProviderLifecycleSubmitContext {
+            rpc,
+            keypair_path,
+            password,
+            wallet,
+            sim,
+        },
         "join_enclave",
         Some(&enclave.enclave_id),
         None,
-        sim,
     )
     .await?;
     if sim {
@@ -8768,14 +8828,16 @@ async fn ensure_joined_rooms(
             }
         }
         let submitted = submit_provider_lifecycle_feature(
-            rpc,
-            keypair_path,
-            password,
-            wallet,
+            ProviderLifecycleSubmitContext {
+                rpc,
+                keypair_path,
+                password,
+                wallet,
+                sim,
+            },
             "join_room",
             Some(&enclave.enclave_id),
             Some(&room.room_id),
-            sim,
         )
         .await?;
         if sim {
@@ -8860,20 +8922,24 @@ async fn submit_contract_command(
     }))
 }
 
+struct ProviderLifecycleSubmitContext<'a> {
+    rpc: &'a PeerRpcClient,
+    keypair_path: &'a Path,
+    password: &'a str,
+    wallet: &'a WalletInfo,
+    sim: bool,
+}
+
 async fn submit_provider_lifecycle_feature(
-    rpc: &PeerRpcClient,
-    keypair_path: &Path,
-    password: &str,
-    wallet: &WalletInfo,
+    ctx: ProviderLifecycleSubmitContext<'_>,
     op: &str,
     enclave_id: Option<&str>,
     room_id: Option<&str>,
-    sim: bool,
 ) -> Result<Value> {
-    let intent = provider_lifecycle_intent(&wallet.public_key, op, enclave_id, room_id)?;
+    let intent = provider_lifecycle_intent(&ctx.wallet.public_key, op, enclave_id, room_id)?;
     let sig = sign_message(
-        keypair_path,
-        password,
+        ctx.keypair_path,
+        ctx.password,
         &provider_lifecycle_intent_message(&intent),
     )
     .await?;
@@ -8883,7 +8949,7 @@ async fn submit_provider_lifecycle_feature(
         "intent": intent,
         "sig": sig,
     });
-    if sim {
+    if ctx.sim {
         return Ok(json!({
             "feature": "mayhem",
             "key": key,
@@ -8892,7 +8958,8 @@ async fn submit_provider_lifecycle_feature(
             "submitted": false,
         }));
     }
-    let submitted = rpc
+    let submitted = ctx
+        .rpc
         .submit_feature(json!({
             "feature": "mayhem",
             "key": key,
@@ -12884,6 +12951,77 @@ mod tests {
             .expect_err("wrong local artifact root must be rejected");
         assert!(
             format!("{err:#}").contains("artifact merkle root mismatch"),
+            "{err:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn provider_local_artifact_must_match_admin_sha256_when_present() {
+        let temp = env::temp_dir().join(format!(
+            "mayhem-cli-local-artifact-sha-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("artifact.gguf");
+        fs::write(&source, b"admin-approved artifact bytes").unwrap();
+        let root = build_merkle_manifest(&source, 8).unwrap().root;
+        let mut catalog = test_catalog(&root);
+        catalog
+            .models
+            .first_mut()
+            .unwrap()
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .source_sha256 = Some("00".repeat(32));
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let contract = test_contract(&root);
+        let mut args = test_provider_start_args();
+        args.artifact = Some(source.clone());
+        args.chunk_size = 8;
+        let selected =
+            build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap()[0].clone();
+
+        let err = download_provider_artifact(&args, &temp.join("downloads-bad"), &selected)
+            .await
+            .expect_err("wrong catalog source_sha256 must be rejected");
+        assert!(
+            format!("{err:#}").contains("artifact sha256 mismatch"),
+            "{err:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn provider_serving_requires_full_admin_merkle_artifact_root() {
+        let temp = env::temp_dir().join(format!(
+            "mayhem-cli-local-artifact-kind-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("artifact.gguf");
+        fs::write(&source, b"admin-approved artifact bytes").unwrap();
+        let root = build_merkle_manifest(&source, 8).unwrap().root;
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let contract = test_contract(&root);
+        let mut args = test_provider_start_args();
+        args.artifact = Some(source);
+        args.chunk_size = 8;
+        let mut selected =
+            build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap()[0].clone();
+        selected.artifact.artifact_root_kind = "blake3_descriptor_until_p2_4".to_owned();
+
+        let err = download_provider_artifact(&args, &temp.join("downloads-bad"), &selected)
+            .await
+            .expect_err("descriptor roots are not provider-serving artifacts");
+        assert!(
+            format!("{err:#}").contains("requires admin artifact_root_kind blake3_merkle_v1"),
             "{err:#}"
         );
 
