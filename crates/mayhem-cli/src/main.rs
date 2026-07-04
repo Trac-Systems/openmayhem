@@ -4809,7 +4809,7 @@ fn catalog_artifact_stage_preflight_command(
             hf_token_file.display()
         ));
     }
-    checks.push("test -n \"${MAYHEM_LLAMA_CPP_DIR:-}\" || { echo \"GGUF staging needs MAYHEM_LLAMA_CPP_DIR pointing at a llama.cpp checkout with build/bin/llama-quantize\" >&2; exit 1; }".to_owned());
+    checks.push("test -n \"${MAYHEM_LLAMA_CPP_DIR:-}\" || { echo \"GGUF staging needs MAYHEM_LLAMA_CPP_DIR pointing at a llama.cpp checkout\" >&2; exit 1; }".to_owned());
     checks.push("command -v python3 >/dev/null".to_owned());
     let script = checks.join(" && ");
     let mut command =
@@ -4880,7 +4880,7 @@ fn catalog_artifact_stage_gguf_command(
         .join(safe_path_component(artifact_name));
     let f16_path = build_dir.join("model.f16.gguf");
     let script = format!(
-        "test -n \"${{MAYHEM_LLAMA_CPP_DIR:-}}\" || {{ echo \"set MAYHEM_LLAMA_CPP_DIR to a llama.cpp checkout\" >&2; exit 1; }} && test -x \"$MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize\" || {{ echo \"missing $MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize\" >&2; exit 1; }} && mkdir -p {} {} && python3 \"$MAYHEM_LLAMA_CPP_DIR/convert_hf_to_gguf.py\" {} --outfile {} --outtype f16 && \"$MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize\" {} {} Q4_K_M && test -s {}",
+        "test -n \"${{MAYHEM_LLAMA_CPP_DIR:-}}\" || {{ echo \"set MAYHEM_LLAMA_CPP_DIR to a llama.cpp checkout\" >&2; exit 1; }} && LLAMA_QUANTIZE=\"${{MAYHEM_LLAMA_QUANTIZE_BIN:-$MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize}}\" && if [ ! -x \"$LLAMA_QUANTIZE\" ]; then LLAMA_QUANTIZE=\"$(find \"$MAYHEM_LLAMA_CPP_DIR\" -path '*/bin/llama-quantize' -type f -perm -111 | sort | head -n 1)\"; fi && test -x \"$LLAMA_QUANTIZE\" || {{ echo \"missing llama-quantize; set MAYHEM_LLAMA_QUANTIZE_BIN\" >&2; exit 1; }} && mkdir -p {} {} && python3 \"$MAYHEM_LLAMA_CPP_DIR/convert_hf_to_gguf.py\" {} --outfile {} --outtype f16 && \"$LLAMA_QUANTIZE\" {} {} Q4_K_M && test -s {}",
         shell_single_quote(&artifact_path.parent().unwrap_or_else(|| Path::new(".")).display().to_string()),
         shell_single_quote(&build_dir.display().to_string()),
         shell_single_quote(&source_dir.display().to_string()),
@@ -18927,6 +18927,10 @@ mod tests {
         );
         assert!(entry.stage_command.shell.contains("convert_hf_to_gguf.py"));
         assert!(entry.stage_command.shell.contains("llama-quantize"));
+        assert!(entry
+            .stage_command
+            .shell
+            .contains("MAYHEM_LLAMA_QUANTIZE_BIN"));
         assert!(entry.stage_command.shell.contains("Q4_K_M"));
         assert!(entry
             .follow_up_publish_plan
