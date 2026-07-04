@@ -26,6 +26,12 @@ const channel = explicitChannel || net?.channel || undefined;
 const address = String(args.address || args._address || process.argv.find((item) => item.startsWith('testtrac1') || item.startsWith('trac1')) || net?.admin_address || '').trim();
 const timeoutSec = Number.parseInt(args.timeout || process.env.MAYHEM_MSB_BALANCE_TIMEOUT || '60', 10);
 const json = boolArg(args.json, false);
+const printJson = process.stdout.write.bind(process.stdout);
+
+if (json) {
+  console.log = (...items) => console.error(...items);
+  process.stdout.write = process.stderr.write.bind(process.stderr);
+}
 
 if (!address) {
   throw new Error('Missing address. Pass --address testtrac1...');
@@ -76,7 +82,7 @@ const result = {
 };
 
 if (json) {
-  console.log(JSON.stringify(result, null, 2));
+  printJson(`${JSON.stringify(result, null, 2)}\n`);
 } else {
   console.log(`[msb:balance] TNK balance: ${balance}`);
   if (!entry) console.log('[msb:balance] address entry not visible before timeout');
