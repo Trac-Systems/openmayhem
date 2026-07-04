@@ -23,6 +23,8 @@ const ENGINE_DIR_ENV: &str = "MAYHEM_TRTLLM_ENGINE_DIR";
 const KV_CACHE_DTYPE_ENV: &str = "MAYHEM_TRTLLM_KV_CACHE_DTYPE";
 const PYTHON_ENV: &str = "MAYHEM_TRTLLM_PYTHON";
 const CTX_SIZE_ENV: &str = "MAYHEM_TRTLLM_CTX_SIZE";
+const MAX_BATCH_SIZE_ENV: &str = "MAYHEM_TRTLLM_MAX_BATCH_SIZE";
+const MAX_NUM_TOKENS_ENV: &str = "MAYHEM_TRTLLM_MAX_NUM_TOKENS";
 #[cfg(feature = "llama-cpp")]
 const BENCH_TOKENS_ENV: &str = "MAYHEM_TRTLLM_BENCH_TOKENS";
 #[cfg(feature = "llama-cpp")]
@@ -53,6 +55,7 @@ fn trt_llm_checkpoint_smoke_generates_constrains_and_canaries() -> TestResult {
     let mut backend = TrtLlmBackend::new()?;
     let mut config = LoadConfig::trt_llm_checkpoint(&model_path);
     config.ctx_size = trt_ctx_size();
+    apply_trt_capacity(&mut config);
     config.trt_engine_dir = Some(engine_dir(&model_path));
     config.trt_tensor_parallel = Some(1);
     config.trt_kv_cache_dtype = kv_cache_dtype(&model_path);
@@ -138,6 +141,9 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
     let trt_engine_dir = engine_dir(&model_path);
     let trt_kv_cache_dtype = kv_cache_dtype(&model_path);
     trt_config.ctx_size = ctx_size;
+    apply_trt_capacity(&mut trt_config);
+    let trt_max_batch_size = trt_config.batch_size;
+    let trt_max_num_tokens = trt_config.ubatch_size;
     trt_config.trt_engine_dir = Some(trt_engine_dir.clone());
     trt_config.trt_tensor_parallel = Some(1);
     trt_config.trt_kv_cache_dtype = trt_kv_cache_dtype.clone();
@@ -182,6 +188,8 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
             "kv_cache_dtype": trt_kv_cache_dtype,
             "baseline_gguf": gguf_path.display().to_string(),
             "ctx_size": ctx_size,
+            "trt_max_batch_size": trt_max_batch_size,
+            "trt_max_num_tokens": trt_max_num_tokens,
             "bench_prompt": prompt,
             "bench_tokens": bench_tokens,
             "bench_samples": bench_samples,
@@ -373,6 +381,11 @@ fn kv_cache_dtype(_model_path: &Path) -> Option<String> {
 
 fn trt_ctx_size() -> u32 {
     env_u32(CTX_SIZE_ENV, 1024)
+}
+
+fn apply_trt_capacity(config: &mut LoadConfig) {
+    config.batch_size = env_u32(MAX_BATCH_SIZE_ENV, 1);
+    config.ubatch_size = env_u32(MAX_NUM_TOKENS_ENV, config.ctx_size);
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {

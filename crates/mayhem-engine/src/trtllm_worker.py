@@ -105,7 +105,23 @@ def model_ctx(default):
     return int(default)
 
 
-def kv_cache_config(dtype, ctx_limit):
+def positive_int(value, default):
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else int(default)
+    except Exception:
+        return int(default)
+
+
+def load_limits(payload):
+    ctx_limit = positive_int(payload.get("ctx_size"), 2048)
+    max_batch_size = positive_int(payload.get("max_batch_size"), 1)
+    max_num_tokens = positive_int(payload.get("max_num_tokens"), max(256, ctx_limit))
+    max_num_tokens = max(max_num_tokens, ctx_limit)
+    return ctx_limit, max_batch_size, max_num_tokens
+
+
+def kv_cache_config(dtype, ctx_limit, max_batch_size, max_num_tokens):
     try:
         KvCacheConfig = import_attr(
             (
@@ -114,7 +130,11 @@ def kv_cache_config(dtype, ctx_limit):
                 ("tensorrt_llm.llmapi.llm", "KvCacheConfig"),
             )
         )
-        max_tokens = max(2048, int(ctx_limit or 2048) * 2)
+        max_tokens = max(
+            2048,
+            int(max_num_tokens or 0),
+            int(ctx_limit or 2048) * int(max_batch_size or 1),
+        )
         return KvCacheConfig(
             dtype=str(dtype or "auto"),
             max_tokens=max_tokens,
@@ -134,16 +154,18 @@ def create_llm(model_path, payload):
     )
     engine_dir = payload.get("engine_dir")
     tensor_parallel = int(payload.get("tensor_parallel") or 1)
-    ctx_limit = int(payload.get("ctx_size") or 2048)
+    ctx_limit, max_batch_size, max_num_tokens = load_limits(payload)
     require_engine_dir = bool(payload.get("require_engine_dir"))
-    kv_config = kv_cache_config(payload.get("kv_cache_dtype"), ctx_limit)
+    kv_config = kv_cache_config(
+        payload.get("kv_cache_dtype"), ctx_limit, max_batch_size, max_num_tokens
+    )
 
     attempts = []
     optional = {
-        "max_batch_size": 1,
+        "max_batch_size": max_batch_size,
         "max_input_len": ctx_limit,
         "max_seq_len": ctx_limit,
-        "max_num_tokens": max(256, ctx_limit),
+        "max_num_tokens": max_num_tokens,
     }
     if tensor_parallel > 1:
         optional["tensor_parallel_size"] = tensor_parallel
@@ -180,14 +202,16 @@ def create_engine_runner(engine_dir, payload):
             ("tensorrt_llm.runtime.model_runner_cpp", "ModelRunnerCpp"),
         )
     )
-    ctx_limit = int(payload.get("ctx_size") or 2048)
+    ctx_limit, max_batch_size, max_num_tokens = load_limits(payload)
     kwargs = {
         "engine_dir": str(engine_dir),
         "rank": 0,
-        "max_batch_size": 1,
+        "max_batch_size": max_batch_size,
         "max_beam_width": 1,
         "kv_cache_free_gpu_memory_fraction": 0.10,
-        "max_tokens_in_paged_kv_cache": max(2048, ctx_limit),
+        "max_tokens_in_paged_kv_cache": max(
+            2048, max_num_tokens, ctx_limit * max_batch_size
+        ),
         "multi_block_mode": True,
     }
     return ModelRunnerCpp.from_dir(**accepted_kwargs(ModelRunnerCpp.from_dir, kwargs))

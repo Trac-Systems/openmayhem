@@ -1324,17 +1324,7 @@ mod trt_llm_backend {
             if config.trt_require_engine_dir {
                 require_trt_engine_payload(config.trt_engine_dir.as_deref())?;
             }
-            let info: WorkerLoadInfo = self.call(
-                "load",
-                json!({
-                    "path": model_path,
-                    "ctx_size": config.ctx_size,
-                    "engine_dir": config.trt_engine_dir,
-                    "tensor_parallel": config.trt_tensor_parallel.unwrap_or(1),
-                    "kv_cache_dtype": config.trt_kv_cache_dtype,
-                    "require_engine_dir": config.trt_require_engine_dir,
-                }),
-            )?;
+            let info: WorkerLoadInfo = self.call("load", trt_load_payload(&config, &model_path))?;
             let loaded = LoadedModelInfo {
                 backend: self.backend_id().to_owned(),
                 artifact: config.artifact,
@@ -1572,6 +1562,19 @@ mod trt_llm_backend {
         })
     }
 
+    fn trt_load_payload(config: &LoadConfig, model_path: &Path) -> Value {
+        json!({
+            "path": model_path,
+            "ctx_size": config.ctx_size,
+            "max_batch_size": config.batch_size.max(1),
+            "max_num_tokens": config.ubatch_size.max(config.ctx_size).max(1),
+            "engine_dir": config.trt_engine_dir,
+            "tensor_parallel": config.trt_tensor_parallel.unwrap_or(1),
+            "kv_cache_dtype": config.trt_kv_cache_dtype,
+            "require_engine_dir": config.trt_require_engine_dir,
+        })
+    }
+
     fn require_trt_engine_payload(engine_dir: Option<&Path>) -> Result<()> {
         let engine_dir = engine_dir.ok_or_else(|| {
             EngineError::InvalidConfig(
@@ -1677,6 +1680,30 @@ mod trt_llm_backend {
             assert!(require_trt_engine_payload(Some(&engine_dir)).is_ok());
 
             let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn trt_load_payload_carries_capacity_knobs() {
+            let mut config = LoadConfig::trt_llm_checkpoint("/tmp/checkpoint");
+            config.ctx_size = 1024;
+            config.batch_size = 4;
+            config.ubatch_size = 512;
+            config.trt_engine_dir = Some(PathBuf::from("/tmp/engine"));
+            config.trt_tensor_parallel = Some(2);
+            config.trt_kv_cache_dtype = Some("fp8".to_owned());
+            config.trt_require_engine_dir = true;
+
+            let payload = trt_load_payload(&config, Path::new("/tmp/checkpoint"));
+            assert_eq!(payload["ctx_size"], json!(1024));
+            assert_eq!(payload["max_batch_size"], json!(4));
+            assert_eq!(payload["max_num_tokens"], json!(1024));
+            assert_eq!(payload["tensor_parallel"], json!(2));
+            assert_eq!(payload["kv_cache_dtype"], json!("fp8"));
+            assert_eq!(payload["require_engine_dir"], json!(true));
+
+            config.ubatch_size = 4096;
+            let payload = trt_load_payload(&config, Path::new("/tmp/checkpoint"));
+            assert_eq!(payload["max_num_tokens"], json!(4096));
         }
 
         fn safetensors_fixture() -> Vec<u8> {
