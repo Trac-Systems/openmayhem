@@ -20,6 +20,13 @@ const MODEL_ENV: &str = "MAYHEM_TRTLLM_MODEL";
 const ENGINE_DIR_ENV: &str = "MAYHEM_TRTLLM_ENGINE_DIR";
 const KV_CACHE_DTYPE_ENV: &str = "MAYHEM_TRTLLM_KV_CACHE_DTYPE";
 const PYTHON_ENV: &str = "MAYHEM_TRTLLM_PYTHON";
+const CTX_SIZE_ENV: &str = "MAYHEM_TRTLLM_CTX_SIZE";
+#[cfg(feature = "llama-cpp")]
+const BENCH_TOKENS_ENV: &str = "MAYHEM_TRTLLM_BENCH_TOKENS";
+#[cfg(feature = "llama-cpp")]
+const BENCH_SAMPLES_ENV: &str = "MAYHEM_TRTLLM_BENCH_SAMPLES";
+#[cfg(feature = "llama-cpp")]
+const LLAMA_THREADS_ENV: &str = "MAYHEM_TRTLLM_LLAMA_THREADS";
 #[cfg(feature = "llama-cpp")]
 const BASELINE_GGUF_ENV: &str = "MAYHEM_TRTLLM_BASELINE_GGUF";
 
@@ -39,7 +46,7 @@ fn trt_llm_checkpoint_smoke_generates_constrains_and_canaries() -> TestResult {
 
     let mut backend = TrtLlmBackend::new()?;
     let mut config = LoadConfig::trt_llm_checkpoint(&model_path);
-    config.ctx_size = 1024;
+    config.ctx_size = trt_ctx_size();
     config.trt_engine_dir = Some(engine_dir(&model_path));
     config.trt_tensor_parallel = Some(1);
     config.trt_kv_cache_dtype = kv_cache_dtype(&model_path);
@@ -121,7 +128,8 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
 
     let mut trt = TrtLlmBackend::new()?;
     let mut trt_config = LoadConfig::trt_llm_checkpoint(&model_path);
-    trt_config.ctx_size = 1024;
+    let ctx_size = trt_ctx_size();
+    trt_config.ctx_size = ctx_size;
     trt_config.trt_engine_dir = Some(engine_dir(&model_path));
     trt_config.trt_tensor_parallel = Some(1);
     trt_config.trt_kv_cache_dtype = kv_cache_dtype(&model_path);
@@ -130,19 +138,21 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
 
     let mut llama = LlamaCppBackend::new()?;
     let mut llama_config = LoadConfig::gguf(&gguf_path);
-    llama_config.ctx_size = 1024;
+    llama_config.ctx_size = ctx_size;
     llama_config.batch_size = 256;
     llama_config.ubatch_size = 256;
-    llama_config.threads = Some(8);
+    llama_config.threads = Some(env_usize(LLAMA_THREADS_ENV, 8) as i32);
     llama_config.gpu_layers = Some(0);
     llama.load(llama_config)?;
 
     let prompt = "Write a numbered list of short words about audited inference receipts.";
+    let bench_tokens = env_u32(BENCH_TOKENS_ENV, 128);
+    let bench_samples = env_usize(BENCH_SAMPLES_ENV, 3);
     let _ = timed_generate(&mut trt, "Warm up with three short words.", 8)?;
     let _ = timed_generate(&mut llama, "Warm up with three short words.", 8)?;
 
-    let trt_samples = throughput_samples(&mut trt, prompt, 128, 3)?;
-    let llama_samples = throughput_samples(&mut llama, prompt, 128, 3)?;
+    let trt_samples = throughput_samples(&mut trt, prompt, bench_tokens, bench_samples)?;
+    let llama_samples = throughput_samples(&mut llama, prompt, bench_tokens, bench_samples)?;
     let trt_tps = median(&trt_samples);
     let llama_tps = median(&llama_samples);
     println!(
@@ -246,6 +256,27 @@ fn kv_cache_dtype(_model_path: &Path) -> Option<String> {
         return Some(value.to_string_lossy().to_string());
     }
     None
+}
+
+fn trt_ctx_size() -> u32 {
+    env_u32(CTX_SIZE_ENV, 1024)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "llama-cpp")]
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn python_bin() -> PathBuf {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20"
+IMAGE="nvcr.io/nvidia/tensorrt-llm/release:1.2.0"
 MODEL_DIR=""
 CHECKPOINT_DIR=""
 ENGINE_DIR=""
@@ -43,6 +43,7 @@ Options:
   --tp-size N               Tensor parallel degree (default: 1)
   --workers N               trtllm-build workers (default: 1)
   --image IMAGE             TensorRT-LLM container image
+                            (default: nvcr.io/nvidia/tensorrt-llm/release:1.2.0)
   --mount-root PATH         Host path mounted into the container at the same path
   --force                   Rebuild checkpoint and engine outputs
   -h, --help                Show this help
