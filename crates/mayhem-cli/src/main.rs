@@ -172,6 +172,8 @@ enum AdminCommands {
     SetProviderPayout(AdminSetProviderPayoutArgs),
     /// Ban a provider and tombstone its active serving rows.
     BanProvider(AdminBanProviderArgs),
+    /// Accredit an auditor key for probe submission.
+    AuditorRegister(AdminAuditorRegisterArgs),
     /// Post a fresh TNK/USD oracle rate for payment and payout conversions.
     RateOracle(AdminRateOracleArgs),
     /// Confirm a memo-bound TNK deposit into the canonical credit ledger.
@@ -1324,6 +1326,20 @@ struct AdminBanProviderArgs {
     /// Plaintext reason to hash locally with BLAKE3.
     #[arg(long)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminAuditorRegisterArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Auditor public key to accredit.
+    #[arg(long)]
+    auditor: String,
+
+    /// Registration age timestamp used by the contract.
+    #[arg(long, default_value_t = 0)]
+    registered_at_seconds: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -2673,6 +2689,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::SetPrice(args) => &args.tx,
         AdminCommands::SetProviderPayout(args) => &args.tx,
         AdminCommands::BanProvider(args) => &args.tx,
+        AdminCommands::AuditorRegister(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
         AdminCommands::TnkDeposit(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
@@ -2712,6 +2729,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             admin_set_provider_payout_payload(args)?,
         )),
         AdminCommands::BanProvider(args) => Ok(("banProvider", admin_ban_provider_payload(args)?)),
+        AdminCommands::AuditorRegister(args) => {
+            Ok(("auditorRegister", admin_auditor_register_payload(args)))
+        }
         AdminCommands::RateOracle(args) => Ok(("rateOracle", admin_rate_oracle_payload(args))),
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
         AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args)?)),
@@ -2865,6 +2885,14 @@ fn admin_ban_provider_payload(args: &AdminBanProviderArgs) -> Result<Value> {
         payload["reason_hash"] = json!(reason_hash);
     }
     Ok(payload)
+}
+
+fn admin_auditor_register_payload(args: &AdminAuditorRegisterArgs) -> Value {
+    json!({
+        "op": "auditor_register",
+        "auditor": &args.auditor,
+        "registered_at_seconds": args.registered_at_seconds,
+    })
 }
 
 fn admin_rate_oracle_payload(args: &AdminRateOracleArgs) -> Value {
@@ -11301,6 +11329,27 @@ mod tests {
         assert!(err
             .to_string()
             .contains("pass only one of --reason-hash or --reason"));
+    }
+
+    #[test]
+    fn admin_auditor_register_payload_accredits_auditor_key() {
+        let (tx_type, payload) =
+            admin_command_payload(&AdminCommands::AuditorRegister(AdminAuditorRegisterArgs {
+                tx: test_admin_tx_args(),
+                auditor: "aa".repeat(32),
+                registered_at_seconds: 123,
+            }))
+            .unwrap();
+
+        assert_eq!(tx_type, "auditorRegister");
+        assert_eq!(
+            payload,
+            json!({
+                "op": "auditor_register",
+                "auditor": "aa".repeat(32),
+                "registered_at_seconds": 123,
+            })
+        );
     }
 
     #[test]
