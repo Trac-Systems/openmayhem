@@ -177,8 +177,10 @@ def make_sampling_params(payload):
         "max_tokens": int(payload.get("max_new_tokens") or 64),
         "max_new_tokens": int(payload.get("max_new_tokens") or 64),
         "temperature": float(payload.get("temperature") or 0.0),
-        "top_p": float(payload.get("top_p") or 0.0),
     }
+    top_p = payload.get("top_p")
+    if top_p is not None and float(top_p) > 0.0:
+        kwargs["top_p"] = float(top_p)
     if payload.get("seed") is not None:
         kwargs["seed"] = int(payload.get("seed"))
         kwargs["random_seed"] = int(payload.get("seed"))
