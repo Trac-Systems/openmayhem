@@ -234,18 +234,11 @@ fn engine_dir(model_path: &Path) -> PathBuf {
         })
 }
 
-fn kv_cache_dtype(model_path: &Path) -> Option<String> {
+fn kv_cache_dtype(_model_path: &Path) -> Option<String> {
     if let Some(value) = env::var_os(KV_CACHE_DTYPE_ENV) {
         return Some(value.to_string_lossy().to_string());
     }
-    let lower = model_path.to_string_lossy().to_ascii_lowercase();
-    if lower.contains("nvfp4") {
-        Some("nvfp4".to_owned())
-    } else if lower.contains("fp8") {
-        Some("fp8".to_owned())
-    } else {
-        None
-    }
+    None
 }
 
 fn python_bin() -> PathBuf {

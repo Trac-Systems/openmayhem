@@ -9887,23 +9887,24 @@ fn trt_engine_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
 }
 
 fn trt_kv_cache_dtype_for_artifact(
-    artifact_name: &str,
+    _artifact_name: &str,
     artifact: &catalog::CatalogArtifact,
 ) -> Option<String> {
-    let mut haystack = format!(
-        "{} {} {}",
-        artifact_name,
-        artifact.path,
-        artifact.min_compute_cap.as_deref().unwrap_or_default()
-    )
-    .to_ascii_lowercase();
+    let mut haystack = String::new();
     if let Some(notes) = &artifact.notes {
-        haystack.push(' ');
         haystack.push_str(&notes.to_ascii_lowercase());
     }
-    if haystack.contains("nvfp4") {
+    if haystack.contains("kv_cache_dtype=nvfp4")
+        || haystack.contains("kv-cache-dtype=nvfp4")
+        || haystack.contains("kv_cache_dtype: nvfp4")
+        || haystack.contains("kv-cache-dtype: nvfp4")
+    {
         Some("nvfp4".to_owned())
-    } else if haystack.contains("fp8") {
+    } else if haystack.contains("kv_cache_dtype=fp8")
+        || haystack.contains("kv-cache-dtype=fp8")
+        || haystack.contains("kv_cache_dtype: fp8")
+        || haystack.contains("kv-cache-dtype: fp8")
+    {
         Some("fp8".to_owned())
     } else {
         None
@@ -12828,7 +12829,7 @@ mod tests {
             mayhem_engine::ArtifactFormat::TensorRtLlmCheckpoint
         );
         assert_eq!(config.trt_tensor_parallel, Some(1));
-        assert_eq!(config.trt_kv_cache_dtype.as_deref(), Some("nvfp4"));
+        assert_eq!(config.trt_kv_cache_dtype, None);
         assert_eq!(
             config.trt_engine_dir,
             Some(PathBuf::from("/tmp/.trtllm-engines/nvfp4"))
