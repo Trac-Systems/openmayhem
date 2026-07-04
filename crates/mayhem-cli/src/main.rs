@@ -4384,6 +4384,7 @@ fn catalog_artifact_publish_preflight_command(
     hf_token_file: Option<&Path>,
 ) -> CatalogCanaryPlanCommand {
     let mut checks = vec![
+        hf_cli_path_assignment(),
         "command -v hf >/dev/null || { echo \"missing Hugging Face CLI: install with python3 -m pip install --user huggingface_hub[hf_xet]\" >&2; exit 1; }".to_owned(),
         "python3 -c 'import huggingface_hub' || { echo \"missing Python huggingface_hub module: install with python3 -m pip install --user huggingface_hub\" >&2; exit 1; }".to_owned(),
     ];
@@ -4514,6 +4515,7 @@ fn with_hf_shell_prefix(
     high_performance_upload: bool,
 ) -> String {
     let mut assignments = Vec::new();
+    assignments.push(hf_cli_path_assignment());
     if let Some(hf_token_file) = hf_token_file {
         assignments.push(format!(
             "HF_TOKEN=\"$(tr -d '\\r\\n' < {})\"",
@@ -4523,11 +4525,11 @@ fn with_hf_shell_prefix(
     if high_performance_upload {
         assignments.push("HF_XET_HIGH_PERFORMANCE=1".to_owned());
     }
-    if assignments.is_empty() {
-        shell
-    } else {
-        format!("{} {}", assignments.join(" "), shell)
-    }
+    format!("{} {}", assignments.join(" "), shell)
+}
+
+fn hf_cli_path_assignment() -> String {
+    "PATH=\"${MAYHEM_HF_VENV:+$MAYHEM_HF_VENV/bin:}$HOME/.local/bin:$PATH\"".to_owned()
 }
 
 fn catalog_artifact_plan_apply_command(
@@ -18305,6 +18307,8 @@ mod tests {
         assert_eq!(report.missing_artifact_bytes, 0);
         assert_eq!(report.artifact_base_space_ok, Some(true));
         assert!(report.preflight_command.shell.contains("command -v hf"));
+        assert!(report.preflight_command.shell.contains("$HOME/.local/bin"));
+        assert!(report.preflight_command.shell.contains("MAYHEM_HF_VENV"));
         assert!(report
             .preflight_command
             .shell
@@ -18334,8 +18338,12 @@ mod tests {
             .upload_command
             .shell
             .contains("HF_XET_HIGH_PERFORMANCE=1"));
+        assert!(entry.upload_command.shell.contains("$HOME/.local/bin"));
+        assert!(entry.upload_command.shell.contains("MAYHEM_HF_VENV"));
         assert!(entry.upload_command.shell.contains("hf-token.txt"));
         assert!(entry.revision_command.shell.contains("HfApi"));
+        assert!(entry.revision_command.shell.contains("$HOME/.local/bin"));
+        assert!(entry.revision_command.shell.contains("MAYHEM_HF_VENV"));
         assert!(entry.revision_command.shell.contains("hf-token.txt"));
         assert!(entry.metadata_command_template.argv.windows(2).any(|pair| {
             pair[0] == "--source-revision" && pair[1] == "<published-hf-commit-40-hex>"
@@ -18381,6 +18389,8 @@ mod tests {
         assert_eq!(report.missing_artifact_bytes, 42);
         assert_eq!(report.artifact_base_space_ok, Some(true));
         assert!(report.preflight_command.shell.contains("command -v hf"));
+        assert!(report.preflight_command.shell.contains("$HOME/.local/bin"));
+        assert!(report.preflight_command.shell.contains("MAYHEM_HF_VENV"));
         assert!(!report.preflight_command.shell.contains("HF token file"));
         let entry = &report.publish_commands[0];
         assert!(!entry.ok);

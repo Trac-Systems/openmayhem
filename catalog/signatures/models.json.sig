@@ -2,8 +2,8 @@
   "schema_version": 1,
   "alg": "ed25519",
   "signed_path": "catalog/models.json",
-  "key_id": "mayhem-dev-catalog-v1",
-  "public_key": "d012f4ef4ebcb79f9a93fbafcb5d3fc8a072c9644f89b9533ca0e2fe1e38b314",
-  "blake3": "6ac0f18b558f8dd5cc6d585d0686b1038364880986b2cfce09316e5084327cf9",
-  "sig": "d6658dc0108623e9413613d3ad60a577bed84d11e127af3572c747a78541847561cc289d81f325f875827a0010b77a758ea38fe0f805aa2aa8ecb88e210e920c"
+  "key_id": "mayhem-catalog-tracnetwork-v1",
+  "public_key": "aa0a2667d74e31c984a5e4ba34c4bd334f001a640b4ecf807d6812e14e817f24",
+  "blake3": "2cbe3cdf6f5d8a79c89e88729b310d9d3035123609fe8b9007020bdf7b9be4b6",
+  "sig": "1f78d74750900ca8316ac214c0a22c5b9bbf98ffe6cc1651418844c8a472d740cf5fd63d2d6122ef73cc7ec62a922e18481b8f0439c99f6572ccc60545a9d003"
 }

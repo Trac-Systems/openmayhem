@@ -108,7 +108,7 @@
       "artifact_root_kind": "blake3_merkle_v1",
       "artifact_source": {
         "kind": "huggingface",
-        "repo": "mayhem-catalog/llama-3.1-8b-instruct-GGUF",
+        "repo": "TracNetwork/mayhem-catalog-llama-3.1-8b-instruct-GGUF",
         "revision": "0e9e39f249a16976918f6564b8830bc894c89659",
         "path": "llama-3.1-8b-instruct-Q4_K_M.gguf"
       },
