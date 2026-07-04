@@ -4902,8 +4902,11 @@ fn catalog_artifact_stage_mlx_command(
     artifact_path: &Path,
 ) -> CatalogCanaryPlanCommand {
     let target_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent_dir = target_dir.parent().unwrap_or_else(|| Path::new("."));
     let script = format!(
-        "PATH=\"${{MAYHEM_MLX_VENV:+$MAYHEM_MLX_VENV/bin:}}$HOME/.local/bin:$PATH\" && export PATH && command -v python3 >/dev/null && mkdir -p {} && python3 -m mlx_lm.convert --hf-path {} --mlx-path {} --quantize && test -s {}",
+        "PATH=\"${{MAYHEM_MLX_VENV:+$MAYHEM_MLX_VENV/bin:}}$HOME/.local/bin:$PATH\" && export PATH && command -v python3 >/dev/null && mkdir -p {} && test ! -e {} || {{ echo \"MLX output path already exists; remove it or choose a clean artifact base: {}\" >&2; exit 1; }} && python3 -m mlx_lm convert --hf-path {} --mlx-path {} --quantize && test -s {}",
+        shell_single_quote(&parent_dir.display().to_string()),
+        shell_single_quote(&target_dir.display().to_string()),
         shell_single_quote(&target_dir.display().to_string()),
         shell_single_quote(&source_dir.display().to_string()),
         shell_single_quote(&target_dir.display().to_string()),
@@ -4983,6 +4986,16 @@ fn catalog_artifact_upload_command(
     current_artifact_path: &Path,
     hf_token_file: Option<&Path>,
 ) -> CatalogCanaryPlanCommand {
+    let (upload_path, repo_path) = if artifact.engine == "mlx" {
+        (
+            current_artifact_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+            ".".to_owned(),
+        )
+    } else {
+        (current_artifact_path, artifact.path.clone())
+    };
     let argv = vec![
         "hf".to_owned(),
         "upload".to_owned(),
@@ -4991,8 +5004,8 @@ fn catalog_artifact_upload_command(
         "--commit-message".to_owned(),
         format!("Mayhem admin artifact {} {}", model.model_id, artifact_name),
         artifact.source.repo.clone(),
-        current_artifact_path.display().to_string(),
-        artifact.path.clone(),
+        upload_path.display().to_string(),
+        repo_path,
     ];
     let mut command = catalog_canary_plan_command(argv);
     command.shell = with_hf_shell_prefix(command.shell, hf_token_file, true);
@@ -18955,6 +18968,75 @@ mod tests {
     }
 
     #[test]
+    fn artifact_stage_plan_mlx_does_not_precreate_output_dir() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].artifacts.insert(
+            "mlx-4bit".to_owned(),
+            catalog::CatalogArtifact {
+                engine: "mlx".to_owned(),
+                source: catalog::SourceRef {
+                    kind: "huggingface".to_owned(),
+                    repo: "test/model-mlx".to_owned(),
+                    revision: "3".repeat(40),
+                    publisher_key: None,
+                },
+                path: "model.safetensors".to_owned(),
+                artifact_root: "cc".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 24,
+                source_sha256: None,
+                tokenizer_sha256: None,
+                chat_template_sha256: None,
+                min_compute_cap: None,
+                download_check: false,
+                notes: None,
+            },
+        );
+
+        let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-stage-artifacts"),
+            source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
+            hf_token_file: None,
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        let mlx = report
+            .stage_commands
+            .iter()
+            .find(|entry| entry.artifact == "mlx-4bit")
+            .unwrap();
+        let output_dir = mlx.artifact_path.parent().unwrap().display().to_string();
+        let output_parent = mlx
+            .artifact_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(mlx
+            .stage_command
+            .shell
+            .contains("python3 -m mlx_lm convert"));
+        assert!(mlx
+            .stage_command
+            .shell
+            .contains(&format!("mkdir -p {}", shell_single_quote(&output_parent))));
+        assert!(mlx
+            .stage_command
+            .shell
+            .contains(&format!("test ! -e {}", shell_single_quote(&output_dir))));
+        assert!(!mlx.stage_command.shell.contains(&format!(
+            "mkdir -p {} && python3",
+            shell_single_quote(&output_dir)
+        )));
+    }
+
+    #[test]
     fn artifact_stage_plan_emits_trt_qformat_command() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -19107,6 +19189,77 @@ mod tests {
             .argv
             .windows(2)
             .any(|pair| pair[0] == "--hf-token-file" && pair[1].ends_with("hf-token.txt")));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn artifact_publish_plan_uploads_mlx_sidecar_directory() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].artifacts.clear();
+        catalog.models[0].artifacts.insert(
+            "mlx-4bit".to_owned(),
+            catalog::CatalogArtifact {
+                engine: "mlx".to_owned(),
+                source: catalog::SourceRef {
+                    kind: "huggingface".to_owned(),
+                    repo: "test/model-mlx".to_owned(),
+                    revision: "3".repeat(40),
+                    publisher_key: None,
+                },
+                path: "model.safetensors".to_owned(),
+                artifact_root: "cc".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 24,
+                source_sha256: None,
+                tokenizer_sha256: None,
+                chat_template_sha256: None,
+                min_compute_cap: None,
+                download_check: false,
+                notes: None,
+            },
+        );
+        let temp = env::temp_dir().join(format!(
+            "mayhem-artifact-publish-plan-mlx-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        let artifact_base = temp.join("artifacts");
+        let artifact = catalog.models[0].artifacts.get("mlx-4bit").unwrap();
+        let expected_artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
+        let expected_upload_dir = expected_artifact_path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&expected_upload_dir).unwrap();
+        fs::write(&expected_artifact_path, b"mlx model").unwrap();
+        fs::write(expected_upload_dir.join("config.json"), b"{}").unwrap();
+        fs::write(expected_upload_dir.join("tokenizer.json"), b"{}").unwrap();
+
+        let report = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: temp.join("catalog.json"),
+            artifact_base: artifact_base.clone(),
+            report_dir: temp.join("reports"),
+            catalog_output: temp.join("reports/catalog.with-artifacts.json"),
+            catalog_sign: None,
+            hf_token_file: None,
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        let entry = &report.publish_commands[0];
+        assert_eq!(entry.current_artifact_path, expected_artifact_path);
+        assert_eq!(
+            entry.upload_command.argv[7],
+            expected_upload_dir.display().to_string()
+        );
+        assert_eq!(entry.upload_command.argv[8], ".");
+        assert!(entry.upload_command.shell.contains(&shell_single_quote(
+            &expected_upload_dir.display().to_string()
+        )));
+        assert!(entry.metadata_command_template.argv.windows(2).any(|pair| {
+            pair[0] == "--artifact-path"
+                && pair[1].ends_with("<published-hf-commit-40-hex>/model.safetensors")
+        }));
 
         let _ = fs::remove_dir_all(temp);
     }
