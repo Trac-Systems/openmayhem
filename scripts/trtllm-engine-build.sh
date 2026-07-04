@@ -104,7 +104,9 @@ has_engine_payload() {
 }
 
 has_trt_checkpoint() {
-  [[ -f "$1/config.json" ]] && grep -q '"architecture"' "$1/config.json"
+  [[ -f "$1/config.json" ]] &&
+    grep -q '"architecture"' "$1/config.json" &&
+    find "$1" -maxdepth 1 -type f \( -name 'rank*.safetensors' -o -name 'rank*.bin' \) | grep -q .
 }
 
 contains_path() {
@@ -176,7 +178,50 @@ has_engine_payload() {
 }
 
 has_trt_checkpoint() {
-  [[ -f "$1/config.json" ]] && grep -q '"architecture"' "$1/config.json"
+  [[ -f "$1/config.json" ]] &&
+    grep -q '"architecture"' "$1/config.json" &&
+    find "$1" -maxdepth 1 -type f \( -name 'rank*.safetensors' -o -name 'rank*.bin' \) | grep -q .
+}
+
+reject_modelopt_hf_artifact() {
+  python3 - <<'PY'
+import json
+import os
+import sys
+
+model_dir = os.environ["MODEL_DIR"]
+quant_paths = [
+    os.path.join(model_dir, "hf_quant_config.json"),
+    os.path.join(model_dir, "quant_config.json"),
+]
+config_path = os.path.join(model_dir, "config.json")
+quant = {}
+for path in quant_paths:
+    if os.path.exists(path):
+        with open(path) as f:
+            quant.update(json.load(f).get("quantization", {}))
+if os.path.exists(config_path):
+    with open(config_path) as f:
+        config = json.load(f)
+    quant.update(config.get("quantization_config", {}))
+
+producer = quant.get("producer") if isinstance(quant, dict) else None
+producer_name = ""
+if isinstance(producer, dict):
+    producer_name = str(producer.get("name") or "")
+algo = str(quant.get("quant_algo") or quant.get("algorithm") or "").upper() if isinstance(quant, dict) else ""
+is_modelopt = producer_name.lower() == "modelopt" or bool(algo)
+if is_modelopt:
+    sys.stderr.write(
+        f"{model_dir} is a pre-quantized ModelOpt HF artifact"
+        f"{f' ({algo})' if algo else ''}, not a TensorRT-LLM checkpoint directory. "
+        "Do not patch config.json to add TensorRT metadata: trtllm-build still expects "
+        "rank-format checkpoint weights, not HF safetensors. Provide the BF16/FP16 "
+        "admin source artifact so this helper can export the TensorRT-LLM checkpoint, "
+        "or provide an admin-exported TensorRT-LLM checkpoint/prebuilt engine bundle.\n"
+    )
+    sys.exit(64)
+PY
 }
 
 copy_tokenizer_metadata() {
@@ -205,25 +250,7 @@ if ! has_trt_checkpoint "$CHECKPOINT_DIR"; then
   if has_trt_checkpoint "$MODEL_DIR"; then
     cp -a "$MODEL_DIR"/. "$tmp"/
   else
-    if [[ "$QFORMAT" != "full_prec" && -f "$MODEL_DIR/hf_quant_config.json" ]]; then
-      python3 - <<'PY'
-import json
-import os
-import sys
-path = os.path.join(os.environ["MODEL_DIR"], "hf_quant_config.json")
-with open(path) as f:
-    quant = json.load(f).get("quantization", {})
-algo = str(quant.get("quant_algo") or "").upper()
-if algo:
-    sys.stderr.write(
-        f"{path} declares a pre-quantized ModelOpt {algo} HF checkpoint. "
-        "The legacy TensorRT-LLM engine builder needs a TensorRT-LLM checkpoint "
-        "with config.json architecture metadata; provide that admin-exported "
-        "checkpoint as --model-dir/--checkpoint-dir instead of re-quantizing this HF artifact.\n"
-    )
-    sys.exit(64)
-PY
-    fi
+    reject_modelopt_hf_artifact
     args=(
       python3 /app/tensorrt_llm/examples/quantization/quantize.py
       --model_dir "$MODEL_DIR"
