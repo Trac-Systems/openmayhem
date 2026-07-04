@@ -956,7 +956,11 @@ struct CatalogVerifyArgs {
     #[arg(long)]
     check_dev_downloads: bool,
 
-    /// Hugging Face token file used only for --check-dev-downloads.
+    /// Probe launch artifact Hugging Face source URLs with HEAD requests only.
+    #[arg(long)]
+    check_launch_sources: bool,
+
+    /// Hugging Face token file used for catalog source/download checks.
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
@@ -2459,11 +2463,15 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         keys_dir,
         canaries_dir,
         check_dev_downloads: args.check_dev_downloads,
+        check_launch_sources: args.check_launch_sources,
         hf_token_file,
     })?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.ok {
+            bail!("catalog verification failed");
+        }
     } else if report.ok {
         println!(
             "Catalog OK: {} models ({} dev, {} launch), {} artifacts, hash {}",
@@ -2476,9 +2484,26 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         if !report.download_checks.is_empty() {
             println!("Dev downloads checked: {}", report.download_checks.len());
         }
+        if !report.source_checks.is_empty() {
+            println!("Launch sources checked: {}", report.source_checks.len());
+        }
     } else {
         for error in &report.errors {
             eprintln!("Catalog error: {error}");
+        }
+        for check in report.source_checks.iter().filter(|check| !check.ok) {
+            eprintln!(
+                "Catalog source error: {} / {} {}@{} {} status={}",
+                check.model_id,
+                check.artifact,
+                check.repo,
+                check.revision,
+                check.path,
+                check
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| check.error.as_deref().unwrap_or("error").to_owned())
+            );
         }
         bail!("catalog verification failed");
     }
@@ -4066,6 +4091,7 @@ fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Re
             keys_dir: absolutize(keys_dir)?,
             canaries_dir: absolutize(canaries_dir)?,
             check_dev_downloads: false,
+            check_launch_sources: false,
             hf_token_file: None,
         })?;
         if !report.ok {
@@ -9493,6 +9519,7 @@ fn verify_or_hash_catalog(args: &ProviderStartArgs, catalog_path: &Path) -> Resu
         keys_dir: absolutize(keys_dir)?,
         canaries_dir: absolutize(canaries_dir)?,
         check_dev_downloads: false,
+        check_launch_sources: false,
         hf_token_file: None,
     })?;
     if !report.ok {

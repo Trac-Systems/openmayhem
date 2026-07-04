@@ -16,6 +16,7 @@ pub struct VerifyOptions {
     pub keys_dir: PathBuf,
     pub canaries_dir: PathBuf,
     pub check_dev_downloads: bool,
+    pub check_launch_sources: bool,
     pub hf_token_file: Option<PathBuf>,
 }
 
@@ -32,6 +33,7 @@ pub struct CatalogVerifyReport {
     pub artifact_count: usize,
     pub canary_sets: Vec<String>,
     pub download_checks: Vec<DownloadCheckReport>,
+    pub source_checks: Vec<SourceCheckReport>,
     pub errors: Vec<String>,
 }
 
@@ -43,6 +45,18 @@ pub struct DownloadCheckReport {
     pub revision: String,
     pub path: String,
     pub ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceCheckReport {
+    pub model_id: String,
+    pub artifact: String,
+    pub repo: String,
+    pub revision: String,
+    pub path: String,
+    pub status: Option<u16>,
+    pub ok: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,9 +257,16 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
     } else {
         Vec::new()
     };
+    let source_checks = if options.check_launch_sources && errors.is_empty() {
+        run_source_checks(&catalog, options.hf_token_file.as_deref(), true)?
+    } else {
+        Vec::new()
+    };
 
     Ok(CatalogVerifyReport {
-        ok: errors.is_empty() && download_checks.iter().all(|check| check.ok),
+        ok: errors.is_empty()
+            && download_checks.iter().all(|check| check.ok)
+            && source_checks.iter().all(|check| check.ok),
         catalog_path: options.catalog_path,
         signature_path: options.signature_path,
         catalog_hash,
@@ -256,6 +277,7 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
         artifact_count,
         canary_sets: canary_sets.into_iter().collect(),
         download_checks,
+        source_checks,
         errors,
     })
 }
@@ -283,6 +305,7 @@ fn failed_report(
         artifact_count: 0,
         canary_sets: Vec::new(),
         download_checks: Vec::new(),
+        source_checks: Vec::new(),
         errors,
     }
 }
@@ -731,6 +754,49 @@ fn run_download_checks(
     Ok(reports)
 }
 
+fn run_source_checks(
+    catalog: &CatalogDocument,
+    hf_token_file: Option<&Path>,
+    launch_only: bool,
+) -> Result<Vec<SourceCheckReport>> {
+    let token = read_hf_token(hf_token_file)?;
+    let mut reports = Vec::new();
+    for model in &catalog.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        for (artifact_name, artifact) in &model.artifacts {
+            let check = check_hf_artifact_head(
+                &artifact.source.repo,
+                &artifact.source.revision,
+                &artifact.path,
+                &token,
+            );
+            let (status, ok, error) = match check {
+                Ok(status) => (Some(status), source_status_ok(status), None),
+                Err(err) => (None, false, Some(err.to_string())),
+            };
+            reports.push(SourceCheckReport {
+                model_id: model.model_id.clone(),
+                artifact: artifact_name.clone(),
+                repo: artifact.source.repo.clone(),
+                revision: artifact.source.revision.clone(),
+                path: artifact.path.clone(),
+                status,
+                ok,
+                error,
+            });
+        }
+    }
+    if reports.is_empty() {
+        bail!(
+            "no {}artifacts in the catalog to source-check",
+            if launch_only { "launch " } else { "" }
+        );
+    }
+    Ok(reports)
+}
+
 fn read_hf_token(path: Option<&Path>) -> Result<String> {
     if let Some(path) = path {
         return fs::read_to_string(path)
@@ -784,8 +850,55 @@ fn check_hf_artifact(repo: &str, revision: &str, path: &str, token: &str) -> Res
     Ok(true)
 }
 
+fn check_hf_artifact_head(repo: &str, revision: &str, path: &str, token: &str) -> Result<u16> {
+    let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{path}");
+    let config = format!(
+        concat!(
+            "silent\n",
+            "show-error\n",
+            "location\n",
+            "head\n",
+            "output = \"/dev/null\"\n",
+            "write-out = \"%{{http_code}}\"\n",
+            "url = \"{}\"\n",
+            "header = \"Authorization: Bearer {}\"\n"
+        ),
+        curl_config_escape(&url),
+        curl_config_escape(token)
+    );
+    let mut child = Command::new("curl")
+        .arg("-K")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning curl for Hugging Face source check")?;
+    {
+        let stdin = child.stdin.as_mut().context("opening curl stdin")?;
+        stdin
+            .write_all(config.as_bytes())
+            .context("writing curl config")?;
+    }
+    let output = child.wait_with_output().context("waiting for curl")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("curl failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let status = stdout
+        .trim()
+        .parse::<u16>()
+        .with_context(|| format!("parsing curl HTTP status {}", stdout.trim()))?;
+    Ok(status)
+}
+
 fn curl_config_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn source_status_ok(status: u16) -> bool {
+    (200..400).contains(&status)
 }
 
 fn is_hex_len(value: &str, len: usize) -> bool {
@@ -881,6 +994,15 @@ mod tests {
         assert!(huggingface_resolve_url(&source, "../model.safetensors").is_err());
         assert!(huggingface_resolve_url(&source, "/model.safetensors").is_err());
         assert!(huggingface_resolve_url(&source, "model.safetensors?download=1").is_err());
+    }
+
+    #[test]
+    fn source_status_ok_accepts_success_and_redirect_only() {
+        assert!(source_status_ok(200));
+        assert!(source_status_ok(302));
+        assert!(!source_status_ok(401));
+        assert!(!source_status_ok(404));
+        assert!(!source_status_ok(500));
     }
 
     fn hex_string(bytes: &[u8]) -> String {
