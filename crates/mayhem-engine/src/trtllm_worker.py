@@ -99,9 +99,7 @@ def model_ctx(default):
     return int(default)
 
 
-def kv_cache_config(dtype):
-    if not dtype:
-        return None
+def kv_cache_config(dtype, ctx_limit):
     try:
         KvCacheConfig = import_attr(
             (
@@ -110,7 +108,12 @@ def kv_cache_config(dtype):
                 ("tensorrt_llm.llmapi.llm", "KvCacheConfig"),
             )
         )
-        return KvCacheConfig(dtype=str(dtype))
+        max_tokens = max(2048, int(ctx_limit or 2048) * 2)
+        return KvCacheConfig(
+            dtype=str(dtype or "auto"),
+            max_tokens=max_tokens,
+            free_gpu_memory_fraction=0.10,
+        )
     except Exception:
         return None
 
@@ -125,10 +128,16 @@ def create_llm(model_path, payload):
     )
     engine_dir = payload.get("engine_dir")
     tensor_parallel = int(payload.get("tensor_parallel") or 1)
-    kv_config = kv_cache_config(payload.get("kv_cache_dtype"))
+    ctx_limit = int(payload.get("ctx_size") or 2048)
+    kv_config = kv_cache_config(payload.get("kv_cache_dtype"), ctx_limit)
 
     attempts = []
-    optional = {}
+    optional = {
+        "max_batch_size": 1,
+        "max_input_len": ctx_limit,
+        "max_seq_len": ctx_limit,
+        "max_num_tokens": max(256, ctx_limit),
+    }
     if tensor_parallel > 1:
         optional["tensor_parallel_size"] = tensor_parallel
         optional["tp_size"] = tensor_parallel
