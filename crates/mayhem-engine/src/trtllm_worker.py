@@ -12,6 +12,7 @@ sys.stdout = sys.stderr
 model = None
 tokenizer = None
 ctx_size = 2048
+model_kind = None
 
 
 def send(message):
@@ -172,6 +173,26 @@ def create_llm(model_path, payload):
     raise RuntimeError(f"could not initialize TensorRT-LLM model: {last_error}")
 
 
+def create_engine_runner(engine_dir, payload):
+    ModelRunnerCpp = import_attr(
+        (
+            ("tensorrt_llm.runtime", "ModelRunnerCpp"),
+            ("tensorrt_llm.runtime.model_runner_cpp", "ModelRunnerCpp"),
+        )
+    )
+    ctx_limit = int(payload.get("ctx_size") or 2048)
+    kwargs = {
+        "engine_dir": str(engine_dir),
+        "rank": 0,
+        "max_batch_size": 1,
+        "max_beam_width": 1,
+        "kv_cache_free_gpu_memory_fraction": 0.10,
+        "max_tokens_in_paged_kv_cache": max(2048, ctx_limit),
+        "multi_block_mode": True,
+    }
+    return ModelRunnerCpp.from_dir(**accepted_kwargs(ModelRunnerCpp.from_dir, kwargs))
+
+
 def make_sampling_params(payload):
     SamplingParams = import_attr(
         (
@@ -202,6 +223,69 @@ def make_sampling_params(payload):
         if "top_p" in kwargs:
             minimal["top_p"] = kwargs["top_p"]
         return SamplingParams(**accepted_kwargs(SamplingParams, minimal))
+
+
+def tokenizer_token_id(*names):
+    if tokenizer is None:
+        return None
+    for name in names:
+        value = getattr(tokenizer, name, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def runner_output_tokens(outputs, prompt_len, max_tokens):
+    output_ids = outputs.get("output_ids") if isinstance(outputs, dict) else outputs
+    sequence_lengths = outputs.get("sequence_lengths") if isinstance(outputs, dict) else None
+
+    try:
+        first_beam = output_ids[0][0]
+    except Exception as exc:
+        raise RuntimeError(f"TensorRT-LLM runner returned unexpected output ids: {exc}") from exc
+
+    try:
+        seq_len = int(sequence_lengths[0][0].item())
+    except Exception:
+        seq_len = int(first_beam.shape[0]) if hasattr(first_beam, "shape") else len(first_beam)
+
+    start = max(0, int(prompt_len))
+    end = max(start, min(seq_len, start + int(max_tokens)))
+    sliced = first_beam[start:end]
+    if hasattr(sliced, "detach"):
+        sliced = sliced.detach().cpu().tolist()
+    elif hasattr(sliced, "tolist"):
+        sliced = sliced.tolist()
+    return [int(token) for token in sliced]
+
+
+def runner_generate_tokens(prompt_tokens, payload, max_tokens):
+    import torch
+
+    end_id = tokenizer_token_id("eos_token_id")
+    pad_id = tokenizer_token_id("pad_token_id", "eos_token_id")
+    kwargs = {
+        "batch_input_ids": [
+            torch.tensor(prompt_tokens, dtype=torch.int32, device="cuda")
+        ],
+        "max_new_tokens": int(max_tokens),
+        "end_id": end_id,
+        "pad_id": pad_id,
+        "temperature": float(payload.get("temperature") or 0.0),
+        "top_p": float(payload.get("top_p") or 0.0),
+        "output_sequence_lengths": True,
+        "return_dict": True,
+    }
+    if kwargs["temperature"] <= 0.0:
+        kwargs["temperature"] = 1.0
+        kwargs["top_k"] = 1
+    if payload.get("seed") is not None:
+        kwargs["random_seed"] = int(payload.get("seed"))
+
+    with torch.no_grad():
+        outputs = model.generate(**kwargs)
+        torch.cuda.synchronize()
+    return runner_output_tokens(outputs, len(prompt_tokens), max_tokens)
 
 
 def first_output(response):
@@ -246,13 +330,27 @@ def output_finish_reason(response, token_count, max_tokens):
 
 
 def handle_load(payload):
-    global model, tokenizer, ctx_size
+    global model, tokenizer, ctx_size, model_kind
     path = str(payload["path"])
     ctx_size = int(payload.get("ctx_size") or 2048)
-    if payload.get("engine_dir"):
-        os.makedirs(str(payload["engine_dir"]), exist_ok=True)
     tokenizer = load_tokenizer(path)
-    model = create_llm(path, payload)
+    engine_dir = payload.get("engine_dir")
+    if engine_dir and has_engine_payload(str(engine_dir)):
+        if tokenizer is None:
+            raise RuntimeError(
+                f"TensorRT-LLM engine directory {engine_dir!r} requires tokenizer files in the admin checkpoint/source directory {path!r}"
+            )
+        model = create_engine_runner(str(engine_dir), payload)
+        model_kind = "runner_cpp"
+    elif payload.get("require_engine_dir"):
+        raise RuntimeError(
+            f"TensorRT-LLM prebuilt engine directory is required, but {engine_dir!r} has no .engine or .plan payload"
+        )
+    else:
+        if engine_dir:
+            os.makedirs(str(engine_dir), exist_ok=True)
+        model = create_llm(path, payload)
+        model_kind = "llm"
     return {
         "n_ctx_train": model_ctx(ctx_size),
         "n_vocab": int(vocab_size()),
@@ -287,14 +385,19 @@ def handle_generate(request_id, payload):
     if grammar is not None:
         return handle_grammar_generate(request_id, grammar, prompt_tokens, max_tokens)
 
-    params = make_sampling_params(payload)
-    try:
-        response = model.generate([prompt], sampling_params=params)
-    except TypeError:
-        response = model.generate(prompt, sampling_params=params)
+    if model_kind == "runner_cpp":
+        response = None
+        completion_tokens = runner_generate_tokens(prompt_tokens, payload, max_tokens)
+        text = decode_tokens(completion_tokens)
+    else:
+        params = make_sampling_params(payload)
+        try:
+            response = model.generate([prompt], sampling_params=params)
+        except TypeError:
+            response = model.generate(prompt, sampling_params=params)
 
-    text = output_text(response)
-    completion_tokens = output_token_ids(response, text)
+        text = output_text(response)
+        completion_tokens = output_token_ids(response, text)
     if len(completion_tokens) > max_tokens:
         completion_tokens = completion_tokens[:max_tokens]
         text = decode_tokens(completion_tokens) or text
@@ -330,7 +433,15 @@ def handle_generate(request_id, payload):
             "completion_tokens": completion_count,
             "total_tokens": prompt_count + completion_count,
         },
-        "finish_reason": output_finish_reason(response, completion_count, max_tokens),
+        "finish_reason": (
+            "length"
+            if model_kind == "runner_cpp" and completion_count >= max_tokens
+            else (
+                "stop"
+                if model_kind == "runner_cpp"
+                else output_finish_reason(response, completion_count, max_tokens)
+            )
+        ),
     }
 
 
@@ -404,4 +515,5 @@ for line in sys.stdin:
             request_id = int(json.loads(line).get("id", 0))
         except Exception:
             pass
-        send({"id": request_id, "type": "response", "ok": False, "error": str(exc)})
+        error = str(exc) or repr(exc) or type(exc).__name__
+        send({"id": request_id, "type": "response", "ok": False, "error": error})

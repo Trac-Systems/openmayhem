@@ -89,6 +89,8 @@ if [[ -z "$CHECKPOINT_DIR" ]]; then
 fi
 CHECKPOINT_DIR="$(realpath -m "$CHECKPOINT_DIR")"
 MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-$CTX_SIZE}"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 if [[ -n "$CALIB_DATASET" ]]; then
   CALIB_DATASET="$(realpath "$CALIB_DATASET")"
@@ -163,6 +165,8 @@ docker run --rm -i --gpus all --ipc=host \
   -e CALIB_MAX_SEQ_LENGTH="$CALIB_MAX_SEQ_LENGTH" \
   -e TP_SIZE="$TP_SIZE" \
   -e WORKERS="$WORKERS" \
+  -e HOST_UID="$HOST_UID" \
+  -e HOST_GID="$HOST_GID" \
   --entrypoint bash "$IMAGE" -s <<'INNER'
 set -euo pipefail
 
@@ -172,6 +176,24 @@ has_engine_payload() {
 
 has_trt_checkpoint() {
   [[ -f "$1/config.json" ]] && grep -q '"architecture"' "$1/config.json"
+}
+
+copy_tokenizer_metadata() {
+  local name
+  for name in \
+    tokenizer.json \
+    tokenizer_config.json \
+    special_tokens_map.json \
+    generation_config.json \
+    vocab.json \
+    merges.txt \
+    tokenizer.model \
+    sentencepiece.bpe.model \
+    added_tokens.json; do
+    if [[ -f "$MODEL_DIR/$name" && ! -f "$CHECKPOINT_DIR/$name" ]]; then
+      cp -a "$MODEL_DIR/$name" "$CHECKPOINT_DIR/$name"
+    fi
+  done
 }
 
 if ! has_trt_checkpoint "$CHECKPOINT_DIR"; then
@@ -223,6 +245,8 @@ PY
   mv "$tmp" "$CHECKPOINT_DIR"
   trap - EXIT
 fi
+
+copy_tokenizer_metadata
 
 if ! has_engine_payload "$ENGINE_DIR"; then
   tmp="${ENGINE_DIR}.tmp.$$"
@@ -290,6 +314,10 @@ manifest = {
 )
 print(json.dumps(manifest, indent=2, sort_keys=True))
 PY
+
+if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+  chown -R "$HOST_UID:$HOST_GID" "$CHECKPOINT_DIR" "$ENGINE_DIR"
+fi
 INNER
 
 if ! has_engine_payload "$ENGINE_DIR"; then
