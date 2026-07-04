@@ -1200,6 +1200,25 @@ struct AdminRegisterEnclaveArgs {
     #[arg(long)]
     artifact_root: String,
 
+    #[arg(long, default_value = "blake3_merkle_v1")]
+    artifact_root_kind: String,
+
+    /// Hugging Face artifact repo in namespace/name form.
+    #[arg(long)]
+    artifact_repo: String,
+
+    /// Hugging Face artifact git commit revision.
+    #[arg(long)]
+    artifact_revision: String,
+
+    /// Hugging Face artifact path inside the repo.
+    #[arg(long)]
+    artifact_path: String,
+
+    /// Optional SHA-256 of the admin-approved artifact file.
+    #[arg(long)]
+    source_sha256: Option<String>,
+
     #[arg(long)]
     manifest_hash: String,
 
@@ -2800,17 +2819,28 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         None,
         "enclave caps",
     )?;
-    Ok(json!({
+    let mut payload = json!({
         "op": "register_enclave",
         "enclave_id": &args.enclave_id,
         "model_id": &args.model,
         "backend": &args.backend,
         "artifact_root": &args.artifact_root,
+        "artifact_root_kind": &args.artifact_root_kind,
+        "artifact_source": {
+            "kind": "huggingface",
+            "repo": &args.artifact_repo,
+            "revision": &args.artifact_revision,
+            "path": &args.artifact_path,
+        },
         "manifest_hash": &args.manifest_hash,
         "att_tier": args.att_tier,
         "binary_hash": &args.binary_hash,
         "caps": caps,
-    }))
+    });
+    if let Some(source_sha256) = &args.source_sha256 {
+        payload["source_sha256"] = json!(source_sha256);
+    }
+    Ok(payload)
 }
 
 fn admin_open_room_payload(args: &AdminOpenRoomArgs) -> Result<Value> {
@@ -6684,6 +6714,10 @@ struct LedgerEnclave {
     model_id: String,
     backend: String,
     artifact_root: String,
+    artifact_root_kind: String,
+    artifact_source: LedgerArtifactSource,
+    #[serde(default)]
+    source_sha256: Option<String>,
     manifest_hash: String,
     att_tier: u8,
     binary_hash: String,
@@ -6693,6 +6727,14 @@ struct LedgerEnclave {
     created_by: String,
     #[serde(default)]
     created_by_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct LedgerArtifactSource {
+    kind: String,
+    repo: String,
+    revision: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -8410,7 +8452,7 @@ fn build_provider_candidates(
         else {
             continue;
         };
-        if artifact.artifact_root != enclave.artifact_root {
+        if !ledger_enclave_matches_catalog_artifact(enclave, &artifact) {
             continue;
         }
         let Some(price) = contract
@@ -8437,6 +8479,19 @@ fn build_provider_candidates(
         );
     }
     Ok(candidates)
+}
+
+fn ledger_enclave_matches_catalog_artifact(
+    enclave: &LedgerEnclave,
+    artifact: &catalog::CatalogArtifact,
+) -> bool {
+    enclave.artifact_root == artifact.artifact_root
+        && enclave.artifact_root_kind == artifact.artifact_root_kind
+        && enclave.artifact_source.kind == artifact.source.kind
+        && enclave.artifact_source.repo == artifact.source.repo
+        && enclave.artifact_source.revision == artifact.source.revision
+        && enclave.artifact_source.path == artifact.path
+        && enclave.source_sha256 == artifact.source_sha256
 }
 
 fn requested_backend(
@@ -11919,7 +11974,15 @@ mod tests {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             backend: "llama.cpp".to_owned(),
-            artifact_root: root,
+            artifact_root: root.clone(),
+            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+            artifact_source: LedgerArtifactSource {
+                kind: "huggingface".to_owned(),
+                repo: "test/model".to_owned(),
+                revision: "1".repeat(40),
+                path: "model.gguf".to_owned(),
+            },
+            source_sha256: None,
             manifest_hash: "cc".repeat(32),
             att_tier: 1,
             binary_hash: "dd".repeat(32),
@@ -11989,7 +12052,15 @@ mod tests {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             backend: "llama.cpp".to_owned(),
-            artifact_root: root,
+            artifact_root: root.clone(),
+            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+            artifact_source: LedgerArtifactSource {
+                kind: "huggingface".to_owned(),
+                repo: "test/model".to_owned(),
+                revision: "1".repeat(40),
+                path: "model.gguf".to_owned(),
+            },
+            source_sha256: None,
             manifest_hash: "cc".repeat(32),
             att_tier: 1,
             binary_hash: "dd".repeat(32),
@@ -12233,6 +12304,26 @@ mod tests {
         let mut mismatched = contract;
         mismatched.enclaves[0].artifact_root = "bb".repeat(32);
         assert!(build_provider_candidates(&mismatched, &catalog, &hardware, &args).is_err());
+    }
+
+    #[test]
+    fn provider_candidates_reject_ledger_catalog_source_mismatch() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let args = test_provider_start_args();
+
+        let mut wrong_repo = test_contract(&root);
+        wrong_repo.enclaves[0].artifact_source.repo = "provider/fake-model".to_owned();
+        assert!(build_provider_candidates(&wrong_repo, &catalog, &hardware, &args).is_err());
+
+        let mut wrong_revision = test_contract(&root);
+        wrong_revision.enclaves[0].artifact_source.revision = "2".repeat(40);
+        assert!(build_provider_candidates(&wrong_revision, &catalog, &hardware, &args).is_err());
+
+        let mut wrong_path = test_contract(&root);
+        wrong_path.enclaves[0].artifact_source.path = "fake.gguf".to_owned();
+        assert!(build_provider_candidates(&wrong_path, &catalog, &hardware, &args).is_err());
     }
 
     #[test]
@@ -12898,6 +12989,7 @@ mod tests {
 
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "trt-llm".to_owned();
+        contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
         let args = test_provider_start_args();
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
@@ -12998,7 +13090,8 @@ mod tests {
             .unwrap()
             .source_sha256 = Some("00".repeat(32));
         let hardware = test_hardware(FixtureProfile::CpuOnly);
-        let contract = test_contract(&root);
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].source_sha256 = Some("00".repeat(32));
         let mut args = test_provider_start_args();
         args.artifact = Some(source.clone());
         args.chunk_size = 8;
@@ -14240,6 +14333,14 @@ mod tests {
             model_id: "test/model@4bit".to_owned(),
             backend: "llama.cpp".to_owned(),
             artifact_root: root.to_owned(),
+            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+            artifact_source: LedgerArtifactSource {
+                kind: "huggingface".to_owned(),
+                repo: "test/model".to_owned(),
+                revision: "1".repeat(40),
+                path: "model.gguf".to_owned(),
+            },
+            source_sha256: None,
             manifest_hash: "22".repeat(32),
             att_tier: 1,
             binary_hash: "33".repeat(32),

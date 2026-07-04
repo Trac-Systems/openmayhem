@@ -22,6 +22,13 @@ const enclaveRegistration = {
   model_id: modelId,
   backend: 'llama.cpp',
   artifact_root: '3'.repeat(64),
+  artifact_root_kind: 'blake3_merkle_v1',
+  artifact_source: {
+    kind: 'huggingface',
+    repo: 'mayhem-test/security-review-model',
+    revision: '6'.repeat(40),
+    path: 'security-review-model.gguf',
+  },
   manifest_hash: '4'.repeat(64),
   att_tier: 1,
   binary_hash: '5'.repeat(64),

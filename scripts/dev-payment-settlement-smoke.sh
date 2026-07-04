@@ -275,8 +275,12 @@ log "seeding admin control plane"
 "$MAYHEM_BIN" admin register-enclave "${ADMIN_COMMON[@]}" \
   --enclave-id "$ENCLAVE_ID" \
   --model "$MODEL_ID" \
-  --backend dev-smoke \
+  --backend llama.cpp \
   --artifact-root "$(printf '1%.0s' {1..64})" \
+  --artifact-root-kind blake3_merkle_v1 \
+  --artifact-repo mayhem-smoke/dev-payment \
+  --artifact-revision "$(printf '4%.0s' {1..40})" \
+  --artifact-path dev-payment-smoke.gguf \
   --manifest-hash "$(printf '2%.0s' {1..64})" \
   --binary-hash "$(printf '3%.0s' {1..64})" \
   --caps-json '{"chat":true,"tools":true,"json":true,"ctx":8192}' >"$REGISTER_ENCLAVE_JSON"

@@ -11,6 +11,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const defaultOutDir = '.mayhem-local/enclave-distributions';
 const defaultChunkSize = 8 * 1024 * 1024;
 const hex64 = /^[0-9a-fA-F]{64}$/;
+const hex40 = /^[0-9a-fA-F]{40}$/;
 const ed25519Pkcs8SeedPrefix = Buffer.from('302e020100300506032b657004220420', 'hex');
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
@@ -26,6 +27,9 @@ Required:
   --artifact PATH                         Admin-approved artifact to publish
   --model-id ID                           Canonical catalog model id
   --backend NAME                          Backend bound to the enclave
+  --artifact-repo REPO                    Hugging Face artifact repo namespace/name
+  --artifact-revision HEX                 Hugging Face artifact git commit revision
+  --artifact-path PATH                    Hugging Face artifact path inside the repo
   --base-url HTTPS_URL                    Public HTTPS directory URL for upload
   --admin-seed-file PATH                  File with 32-byte admin Ed25519 seed hex
 
@@ -52,6 +56,9 @@ function parseArgs(argv) {
     artifact: null,
     modelId: null,
     backend: null,
+    artifactRepo: null,
+    artifactRevision: null,
+    artifactPathInRepo: null,
     baseUrl: null,
     adminSeedFile: null,
     adminSeedHex: process.env.MAYHEM_ADMIN_SEED_HEX || null,
@@ -79,6 +86,9 @@ function parseArgs(argv) {
     if (arg === '--artifact') args.artifact = next();
     else if (arg === '--model-id') args.modelId = next();
     else if (arg === '--backend') args.backend = next();
+    else if (arg === '--artifact-repo') args.artifactRepo = next();
+    else if (arg === '--artifact-revision') args.artifactRevision = next();
+    else if (arg === '--artifact-path') args.artifactPathInRepo = next();
     else if (arg === '--base-url') args.baseUrl = next();
     else if (arg === '--admin-seed-file') args.adminSeedFile = next();
     else if (arg === '--admin-seed-hex') args.adminSeedHex = next();
@@ -122,6 +132,60 @@ function assertHex64(value, name) {
   if (typeof value !== 'string' || !hex64.test(value)) {
     throw new Error(`${name} must be 64 hex characters`);
   }
+}
+
+function isSafeHuggingFaceComponent(value) {
+  return typeof value === 'string' &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value) &&
+    !value.endsWith('.') &&
+    !value.endsWith('-') &&
+    !value.includes('..') &&
+    !value.includes('--');
+}
+
+function isSafeHuggingFaceRepo(value) {
+  if (typeof value !== 'string') return false;
+  const parts = value.split('/');
+  return parts.length === 2 && parts.every(isSafeHuggingFaceComponent);
+}
+
+function isSafeHuggingFacePath(value) {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    !value.startsWith('/') &&
+    !value.startsWith('\\') &&
+    !value.includes('\\') &&
+    !value.includes('?') &&
+    !value.includes('#') &&
+    !value.includes('%') &&
+    !/[\x00-\x1f\x7f]/.test(value) &&
+    value.split('/').every((part) => (
+      part.length > 0 &&
+      part !== '.' &&
+      part !== '..' &&
+      /^[A-Za-z0-9._+-]+$/.test(part)
+    ));
+}
+
+function validateArtifactSource(args) {
+  assertRequired(args.artifactRepo, '--artifact-repo');
+  assertRequired(args.artifactRevision, '--artifact-revision');
+  assertRequired(args.artifactPathInRepo, '--artifact-path');
+  if (!isSafeHuggingFaceRepo(args.artifactRepo)) {
+    throw new Error('--artifact-repo must be a safe Hugging Face namespace/name repo id');
+  }
+  if (!hex40.test(args.artifactRevision)) {
+    throw new Error('--artifact-revision must be a 40-hex git commit');
+  }
+  if (!isSafeHuggingFacePath(args.artifactPathInRepo)) {
+    throw new Error('--artifact-path must be a safe relative Hugging Face artifact path');
+  }
+  return {
+    kind: 'huggingface',
+    repo: args.artifactRepo,
+    revision: args.artifactRevision.toLowerCase(),
+    path: args.artifactPathInRepo,
+  };
 }
 
 function assertFile(filePath, name) {
@@ -337,6 +401,9 @@ function distributionSigningPayload(adminPubkey, enclave) {
     model_id: enclave.model_id,
     backend: enclave.backend,
     artifact_root: enclave.artifact_root,
+    artifact_root_kind: enclave.artifact_root_kind,
+    artifact_source: enclave.artifact_source,
+    source_sha256: enclave.source_sha256,
     manifest_hash: enclave.manifest_hash,
     binary_hash: enclave.binary_hash,
     distribution: {
@@ -370,6 +437,7 @@ async function build(args) {
   assertRequired(args.baseUrl || (args.bundleUrl && args.manifestUrl), '--base-url or explicit --bundle-url/--manifest-url');
   if (!args.binary && !args.binaryHash) throw new Error('pass --binary PATH or --binary-hash HEX');
   if (!['tar.zst', 'tar.gz'].includes(args.format)) throw new Error('--format must be tar.zst or tar.gz');
+  const artifactSource = validateArtifactSource(args);
 
   const artifactPath = resolveRepo(args.artifact);
   const artifactStat = assertFile(artifactPath, '--artifact');
@@ -414,6 +482,9 @@ async function build(args) {
     model_id: args.modelId,
     backend: args.backend,
     artifact_root: artifactRoot,
+    artifact_root_kind: 'blake3_merkle_v1',
+    artifact_source: artifactSource,
+    source_sha256: artifactSha256,
     artifact_root_verified: artifactRootVerified,
     binary_hash: binaryHash,
     artifact: {
@@ -470,6 +541,9 @@ async function build(args) {
     model_id: args.modelId,
     backend: args.backend,
     artifact_root: artifactRoot,
+    artifact_root_kind: 'blake3_merkle_v1',
+    artifact_source: artifactSource,
+    source_sha256: artifactSha256,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
     distribution: {
@@ -494,6 +568,9 @@ async function build(args) {
     model_id: args.modelId,
     backend: args.backend,
     artifact_root: artifactRoot,
+    artifact_root_kind: 'blake3_merkle_v1',
+    artifact_source: artifactSource,
+    source_sha256: artifactSha256,
     artifact_root_verified: artifactRootVerified,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
@@ -531,6 +608,9 @@ async function build(args) {
       model_id: args.modelId,
       backend: args.backend,
       artifact_root: artifactRoot,
+      artifact_root_kind: 'blake3_merkle_v1',
+      artifact_source: artifactSource,
+      source_sha256: artifactSha256,
       manifest_hash: manifestHash,
       binary_hash: binaryHash,
       ...(caps === undefined ? {} : { caps }),
@@ -553,6 +633,9 @@ async function build(args) {
     model_id: args.modelId,
     backend: args.backend,
     artifact_root: artifactRoot,
+    artifact_root_kind: 'blake3_merkle_v1',
+    artifact_source: artifactSource,
+    source_sha256: artifactSha256,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
     distribution,

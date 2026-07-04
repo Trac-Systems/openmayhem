@@ -9,6 +9,7 @@ import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/b
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultManifest = 'config/beta/testnet.template.json';
 const hex64 = /^[0-9a-fA-F]{64}$/;
+const hex40 = /^[0-9a-fA-F]{40}$/;
 const hex128 = /^[0-9a-fA-F]{128}$/;
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const testtracAddress = /^testtrac1[0-9a-z]+$/;
@@ -59,6 +60,10 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
+function resolveRepo(filePath) {
+  return path.isAbsolute(filePath) ? filePath : path.resolve(repoRoot, filePath);
+}
+
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') {
@@ -67,7 +72,50 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
-function catalogArtifactForEnclave(model, backend, artifactRoot) {
+function isSafeHuggingFaceComponent(value) {
+  return typeof value === 'string'
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value)
+    && !value.endsWith('.')
+    && !value.endsWith('-')
+    && !value.includes('..')
+    && !value.includes('--');
+}
+
+function isSafeHuggingFaceRepo(value) {
+  if (typeof value !== 'string') return false;
+  const parts = value.split('/');
+  return parts.length === 2 && parts.every(isSafeHuggingFaceComponent);
+}
+
+function isSafeHuggingFacePath(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && !value.startsWith('/')
+    && !value.startsWith('\\')
+    && !value.includes('\\')
+    && !value.includes('?')
+    && !value.includes('#')
+    && !value.includes('%')
+    && !/[\x00-\x1f\x7f]/.test(value)
+    && value.split('/').every((part) => (
+      part.length > 0
+      && part !== '.'
+      && part !== '..'
+      && /^[A-Za-z0-9._+-]+$/.test(part)
+    ));
+}
+
+function artifactSourceMatches(enclave, artifact) {
+  const source = enclave?.artifact_source;
+  return source
+    && artifact?.source
+    && source.kind === artifact.source.kind
+    && source.repo === artifact.source.repo
+    && source.revision === artifact.source.revision
+    && source.path === artifact.path;
+}
+
+function catalogArtifactForEnclave(model, enclave) {
   if (!model || typeof model !== 'object' || Array.isArray(model)) return null;
   if (!model.artifacts || typeof model.artifacts !== 'object' || Array.isArray(model.artifacts)) return null;
   for (const [artifactName, artifact] of Object.entries(model.artifacts)) {
@@ -75,9 +123,12 @@ function catalogArtifactForEnclave(model, backend, artifactRoot) {
       artifact
       && typeof artifact === 'object'
       && !Array.isArray(artifact)
-      && artifact.engine === backend
+      && artifact.engine === enclave.backend
       && typeof artifact.artifact_root === 'string'
-      && artifact.artifact_root.toLowerCase() === String(artifactRoot || '').toLowerCase()
+      && artifact.artifact_root.toLowerCase() === String(enclave.artifact_root || '').toLowerCase()
+      && artifact.artifact_root_kind === enclave.artifact_root_kind
+      && artifactSourceMatches(enclave, artifact)
+      && (artifact.source_sha256 ?? null) === (enclave.source_sha256 ?? null)
     ) {
       return { artifactName, artifact };
     }
@@ -326,6 +377,9 @@ function enclaveDistributionSigningPayload(adminPubkey, enclave) {
     model_id: enclave.model_id,
     backend: enclave.backend,
     artifact_root: enclave.artifact_root,
+    artifact_root_kind: enclave.artifact_root_kind,
+    artifact_source: enclave.artifact_source,
+    source_sha256: enclave.source_sha256,
     manifest_hash: enclave.manifest_hash,
     binary_hash: enclave.binary_hash,
     distribution: {
@@ -345,6 +399,12 @@ function verifyEnclaveDistributionSignature(add, adminPubkey, enclave, name) {
     enclave.model_id,
     enclave.backend,
     enclave.artifact_root,
+    enclave.artifact_root_kind,
+    enclave.artifact_source?.kind,
+    enclave.artifact_source?.repo,
+    enclave.artifact_source?.revision,
+    enclave.artifact_source?.path,
+    enclave.source_sha256,
     enclave.manifest_hash,
     enclave.binary_hash,
     enclave.distribution?.bundle_url,
@@ -358,6 +418,11 @@ function verifyEnclaveDistributionSignature(add, adminPubkey, enclave, name) {
     !pubkey64.test(adminPubkey) ||
     !hex64.test(enclave.enclave_id || '') ||
     !hex64.test(enclave.artifact_root || '') ||
+    enclave.artifact_root_kind !== 'blake3_merkle_v1' ||
+    !isSafeHuggingFaceRepo(enclave.artifact_source?.repo) ||
+    !hex40.test(enclave.artifact_source?.revision || '') ||
+    !isSafeHuggingFacePath(enclave.artifact_source?.path) ||
+    !hex64.test(enclave.source_sha256 || '') ||
     !hex64.test(enclave.manifest_hash || '') ||
     !hex64.test(enclave.binary_hash || '') ||
     !hex64.test(enclave.distribution?.bundle_sha256 || '') ||
@@ -714,7 +779,7 @@ function providerHomePlaceholder(providerPubkey) {
 
 async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholders }) {
   const { errors, warnings, add } = issueFactory({ allowPlaceholders });
-  const catalogPath = path.join(repoRoot, 'catalog/models.json');
+  const catalogPath = resolveRepo(manifest.catalog?.path || 'catalog/models.json');
   const catalog = readJson(catalogPath);
   const catalogModels = new Map((catalog.models || []).map((model) => [model.model_id, model]));
 
@@ -722,6 +787,7 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
     'schema_version',
     'launch_id',
     'network',
+    'catalog',
     'controls',
     'admin',
     'paygate',
@@ -733,6 +799,11 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
   ]);
   requireLiteral(add, manifest.schema_version, 1, 'schema_version');
   requireString(add, manifest.launch_id, 'launch_id');
+
+  if (manifest.catalog !== undefined && requireObject(add, manifest.catalog, 'catalog')) {
+    requireOnlyKeys(add, manifest.catalog, 'catalog', ['path']);
+    requireString(add, manifest.catalog.path, 'catalog.path');
+  }
 
   if (requireObject(add, manifest.network, 'network')) {
     requireOnlyKeys(add, manifest.network, 'network', ['name', 'denom', 'msb', 'subnet', 'dht']);
@@ -880,6 +951,9 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
         'model_id',
         'backend',
         'artifact_root',
+        'artifact_root_kind',
+        'artifact_source',
+        'source_sha256',
         'manifest_hash',
         'binary_hash',
         'att_tier',
@@ -897,17 +971,59 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       }
       requireString(add, enclave.backend, `${prefix}.backend`);
       requireString(add, enclave.artifact_root, `${prefix}.artifact_root`, hex64);
+      if (enclave.artifact_root_kind !== 'blake3_merkle_v1' && !isPlaceholder(enclave.artifact_root_kind)) {
+        add('error', `${prefix}.artifact_root_kind must be blake3_merkle_v1`);
+      }
+      if (!requireObject(add, enclave.artifact_source, `${prefix}.artifact_source`)) {
+        // error already recorded
+      } else {
+        requireOnlyKeys(add, enclave.artifact_source, `${prefix}.artifact_source`, [
+          'kind',
+          'repo',
+          'revision',
+          'path',
+        ]);
+        if (enclave.artifact_source.kind !== 'huggingface' && !isPlaceholder(enclave.artifact_source.kind)) {
+          add('error', `${prefix}.artifact_source.kind must be huggingface`);
+        }
+        if (
+          typeof enclave.artifact_source.repo === 'string' &&
+          !isPlaceholder(enclave.artifact_source.repo) &&
+          !isSafeHuggingFaceRepo(enclave.artifact_source.repo)
+        ) {
+          add('error', `${prefix}.artifact_source.repo must be a safe namespace/name Hugging Face repo id`);
+        }
+        if (
+          typeof enclave.artifact_source.revision === 'string' &&
+          !isPlaceholder(enclave.artifact_source.revision) &&
+          !hex40.test(enclave.artifact_source.revision)
+        ) {
+          add('error', `${prefix}.artifact_source.revision must be a 40-hex git commit`);
+        }
+        if (
+          typeof enclave.artifact_source.path === 'string' &&
+          !isPlaceholder(enclave.artifact_source.path) &&
+          !isSafeHuggingFacePath(enclave.artifact_source.path)
+        ) {
+          add('error', `${prefix}.artifact_source.path must be a safe relative Hugging Face path`);
+        }
+      }
+      requireString(add, enclave.source_sha256, `${prefix}.source_sha256`, hex64);
       if (
         typeof enclave.model_id === 'string'
         && typeof enclave.backend === 'string'
         && typeof enclave.artifact_root === 'string'
+        && typeof enclave.artifact_root_kind === 'string'
+        && typeof enclave.source_sha256 === 'string'
         && !isPlaceholder(enclave.model_id)
         && !isPlaceholder(enclave.backend)
         && !isPlaceholder(enclave.artifact_root)
+        && !isPlaceholder(enclave.artifact_root_kind)
+        && !isPlaceholder(enclave.source_sha256)
         && hex64.test(enclave.artifact_root)
-        && !catalogArtifactForEnclave(catalogModels.get(enclave.model_id), enclave.backend, enclave.artifact_root)
+        && !catalogArtifactForEnclave(catalogModels.get(enclave.model_id), enclave)
       ) {
-        add('error', `${prefix}.backend/artifact_root is not present in catalog/models.json for ${enclave.model_id}`);
+        add('error', `${prefix}.backend/artifact_root/source is not present in catalog/models.json for ${enclave.model_id}`);
       }
       requireString(add, enclave.manifest_hash, `${prefix}.manifest_hash`, hex64);
       requireString(add, enclave.binary_hash, `${prefix}.binary_hash`, hex64);
@@ -1173,6 +1289,9 @@ async function buildCommands(manifest) {
       model_id: enclave.model_id,
       backend: enclave.backend,
       artifact_root: enclave.artifact_root,
+      artifact_root_kind: enclave.artifact_root_kind,
+      artifact_source: enclave.artifact_source,
+      source_sha256: enclave.source_sha256,
       manifest_hash: enclave.manifest_hash,
       att_tier: enclave.att_tier,
       binary_hash: enclave.binary_hash,

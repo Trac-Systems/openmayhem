@@ -81,11 +81,16 @@ const EPOCH_TOTAL_KEYS = [
 const ENCLAVE_UPDATE_FIELDS = [
   'backend',
   'artifact_root',
+  'artifact_root_kind',
+  'artifact_source',
+  'source_sha256',
   'manifest_hash',
   'att_tier',
   'binary_hash',
   'caps',
 ];
+const ENCLAVE_BACKENDS = new Set(['llama.cpp', 'mlx', 'trt-llm']);
+const ENCLAVE_ARTIFACT_ROOT_KIND = 'blake3_merkle_v1';
 const ENCLAVE_CAP_BOOLEAN_FIELDS = [
   'chat',
   'tools',
@@ -259,6 +264,9 @@ class MayhemContract extends Contract {
         model_id: { type: 'string', min: 1, max: 256 },
         backend: { type: 'string', min: 1, max: 64 },
         artifact_root: { type: 'string', min: 1, max: 256 },
+        artifact_root_kind: { type: 'string', min: 1, max: 64 },
+        artifact_source: { type: 'any' },
+        source_sha256: { type: 'string', min: 1, max: 128, optional: true },
         manifest_hash: { type: 'string', min: 1, max: 128 },
         att_tier: { type: 'number', integer: true, min: 1, max: 2 },
         binary_hash: { type: 'string', min: 1, max: 128 },
@@ -274,6 +282,9 @@ class MayhemContract extends Contract {
         enclave_id: { type: 'string', min: 1, max: 128 },
         backend: { type: 'string', min: 1, max: 64, optional: true },
         artifact_root: { type: 'string', min: 1, max: 256, optional: true },
+        artifact_root_kind: { type: 'string', min: 1, max: 64, optional: true },
+        artifact_source: { type: 'any', optional: true },
+        source_sha256: { type: 'string', min: 1, max: 128, optional: true },
         manifest_hash: { type: 'string', min: 1, max: 128, optional: true },
         att_tier: { type: 'number', integer: true, min: 1, max: 2, optional: true },
         binary_hash: { type: 'string', min: 1, max: 128, optional: true },
@@ -992,6 +1003,8 @@ class MayhemContract extends Contract {
 
     const capsError = this.validateEnclaveCaps(this.value.caps);
     if (capsError) return capsError;
+    const artifactError = this.validateEnclaveArtifactBinding(this.value);
+    if (artifactError) return artifactError;
 
     const key = `enclave/${this.value.enclave_id}`;
     if ((await this.get(key)) !== null) return new Error('Enclave already registered.');
@@ -1001,6 +1014,9 @@ class MayhemContract extends Contract {
       model_id: this.value.model_id,
       backend: this.value.backend,
       artifact_root: this.value.artifact_root,
+      artifact_root_kind: this.value.artifact_root_kind,
+      artifact_source: cloneValue(this.value.artifact_source),
+      source_sha256: this.value.source_sha256 ?? null,
       manifest_hash: this.value.manifest_hash,
       att_tier: this.value.att_tier,
       binary_hash: this.value.binary_hash,
@@ -1040,6 +1056,8 @@ class MayhemContract extends Contract {
       changed = true;
     }
     if (!changed) return new Error('No enclave fields to update.');
+    const artifactError = this.validateEnclaveArtifactBinding(updated);
+    if (artifactError) return artifactError;
 
     updated.updated_by = this.address;
     updated.updated_by_role = 'admin';
@@ -3122,6 +3140,52 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  validateEnclaveArtifactBinding(value) {
+    if (!ENCLAVE_BACKENDS.has(value.backend)) return new Error('Unsupported enclave backend.');
+    if (!this.isHexBytes(value.artifact_root, 32)) {
+      return new Error('Enclave artifact_root must be a 32-byte hex Merkle root.');
+    }
+    if (value.artifact_root_kind !== ENCLAVE_ARTIFACT_ROOT_KIND) {
+      return new Error(`Enclave artifact_root_kind must be ${ENCLAVE_ARTIFACT_ROOT_KIND}.`);
+    }
+    if (!this.isHexBytes(value.manifest_hash, 32)) {
+      return new Error('Enclave manifest_hash must be 32-byte hex.');
+    }
+    if (!this.isHexBytes(value.binary_hash, 32)) {
+      return new Error('Enclave binary_hash must be 32-byte hex.');
+    }
+    if (
+      value.source_sha256 !== undefined &&
+      value.source_sha256 !== null &&
+      !this.isHexBytes(value.source_sha256, 32)
+    ) {
+      return new Error('Enclave source_sha256 must be 32-byte hex.');
+    }
+    return this.validateHuggingFaceArtifactSource(value.artifact_source);
+  }
+
+  validateHuggingFaceArtifactSource(source) {
+    const shapeError = this.validateExactObjectKeys(
+      source,
+      ['kind', 'repo', 'revision', 'path'],
+      'enclave artifact_source'
+    );
+    if (shapeError) return shapeError;
+    if (source.kind !== 'huggingface') {
+      return new Error('Enclave artifact_source.kind must be huggingface.');
+    }
+    if (!this.isSafeHuggingFaceRepo(source.repo)) {
+      return new Error('Enclave artifact_source.repo must be a safe namespace/name repo id.');
+    }
+    if (!this.isHexBytes(source.revision, 20)) {
+      return new Error('Enclave artifact_source.revision must be a 20-byte git commit hex.');
+    }
+    if (!this.isSafeHuggingFacePath(source.path)) {
+      return new Error('Enclave artifact_source.path must be a safe relative Hugging Face artifact path.');
+    }
+    return null;
+  }
+
   validateRoomPolicy(policy) {
     if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
       return new Error('Room policy must be an object.');
@@ -4555,6 +4619,40 @@ class MayhemContract extends Contract {
       !value.startsWith('/') &&
       !value.endsWith('/') &&
       !value.includes('//');
+  }
+
+  isSafeHuggingFaceRepo(value) {
+    if (typeof value !== 'string') return false;
+    const parts = value.split('/');
+    return parts.length === 2 &&
+      parts.every((part) => this.isSafeHuggingFaceComponent(part));
+  }
+
+  isSafeHuggingFaceComponent(value) {
+    return typeof value === 'string' &&
+      /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value) &&
+      !value.endsWith('.') &&
+      !value.endsWith('-') &&
+      !value.includes('..') &&
+      !value.includes('--');
+  }
+
+  isSafeHuggingFacePath(value) {
+    return typeof value === 'string' &&
+      value.length > 0 &&
+      !value.startsWith('/') &&
+      !value.startsWith('\\') &&
+      !value.includes('\\') &&
+      !value.includes('?') &&
+      !value.includes('#') &&
+      !value.includes('%') &&
+      !/[\x00-\x1f\x7f]/.test(value) &&
+      value.split('/').every((part) => (
+        part.length > 0 &&
+        part !== '.' &&
+        part !== '..' &&
+        /^[A-Za-z0-9._+-]+$/.test(part)
+      ));
   }
 
   isSafeExternalRef(value) {

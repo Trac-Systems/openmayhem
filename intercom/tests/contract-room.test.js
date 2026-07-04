@@ -27,6 +27,13 @@ const enclaveRegistration = {
   model_id: modelId,
   backend: 'llama.cpp',
   artifact_root: 'a'.repeat(64),
+  artifact_root_kind: 'blake3_merkle_v1',
+  artifact_source: {
+    kind: 'huggingface',
+    repo: 'mayhem-test/llama-3.1-8b-instruct-GGUF',
+    revision: '1'.repeat(40),
+    path: 'llama-3.1-8b-instruct-Q4_K_M.gguf',
+  },
   manifest_hash: 'b'.repeat(64),
   att_tier: 1,
   binary_hash: 'c'.repeat(64),

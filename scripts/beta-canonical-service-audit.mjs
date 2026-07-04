@@ -13,6 +13,7 @@ const defaultCatalogSignature = 'catalog/signatures/models.json.sig';
 const defaultCatalogKeyDir = 'catalog/keys';
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const hex64 = /^[0-9a-fA-F]{64}$/;
+const hex40 = /^[0-9a-fA-F]{40}$/;
 const roomIdHex = /^[0-9a-fA-F]{32}$/;
 const payoutMethods = new Set(['tnk', 'stripe', 'coinbase']);
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
@@ -413,6 +414,49 @@ async function readCatalogProof(args) {
   };
 }
 
+function isSafeHuggingFaceComponent(value) {
+  return typeof value === 'string'
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value)
+    && !value.endsWith('.')
+    && !value.endsWith('-')
+    && !value.includes('..')
+    && !value.includes('--');
+}
+
+function isSafeHuggingFaceRepo(value) {
+  if (typeof value !== 'string') return false;
+  const parts = value.split('/');
+  return parts.length === 2 && parts.every(isSafeHuggingFaceComponent);
+}
+
+function isSafeHuggingFacePath(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && !value.startsWith('/')
+    && !value.startsWith('\\')
+    && !value.includes('\\')
+    && !value.includes('?')
+    && !value.includes('#')
+    && !value.includes('%')
+    && !/[\x00-\x1f\x7f]/.test(value)
+    && value.split('/').every((part) => (
+      part.length > 0
+      && part !== '.'
+      && part !== '..'
+      && /^[A-Za-z0-9._+-]+$/.test(part)
+    ));
+}
+
+function artifactSourceMatches(enclave, artifact) {
+  const source = enclave?.artifact_source;
+  return source
+    && artifact?.source
+    && source.kind === artifact.source.kind
+    && source.repo === artifact.source.repo
+    && source.revision === artifact.source.revision
+    && source.path === artifact.path;
+}
+
 function catalogArtifactForEnclave(catalogProof, enclave) {
   const model = catalogProof?.models?.get(enclave?.model_id);
   if (!isRecord(model?.artifacts)) return null;
@@ -422,6 +466,9 @@ function catalogArtifactForEnclave(catalogProof, enclave) {
       && artifact.engine === enclave.backend
       && typeof artifact.artifact_root === 'string'
       && artifact.artifact_root.toLowerCase() === String(enclave.artifact_root || '').toLowerCase()
+      && artifact.artifact_root_kind === enclave.artifact_root_kind
+      && artifactSourceMatches(enclave, artifact)
+      && (artifact.source_sha256 ?? null) === (enclave.source_sha256 ?? null)
     ) {
       return { artifactName, artifact };
     }
@@ -651,6 +698,28 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
       if (typeof enclave.artifact_root !== 'string' || !hex64.test(enclave.artifact_root)) {
         fail(`enclave/${enclaveId}.artifact_root must be 64 hex chars`);
       }
+      if (enclave.artifact_root_kind !== 'blake3_merkle_v1') {
+        fail(`enclave/${enclaveId}.artifact_root_kind must be blake3_merkle_v1`);
+      }
+      if (!isRecord(enclave.artifact_source)) {
+        fail(`enclave/${enclaveId}.artifact_source is required`);
+      } else {
+        if (enclave.artifact_source.kind !== 'huggingface') {
+          fail(`enclave/${enclaveId}.artifact_source.kind must be huggingface`);
+        }
+        if (!isSafeHuggingFaceRepo(enclave.artifact_source.repo)) {
+          fail(`enclave/${enclaveId}.artifact_source.repo must be a safe namespace/name Hugging Face repo id`);
+        }
+        if (!hex40.test(enclave.artifact_source.revision || '')) {
+          fail(`enclave/${enclaveId}.artifact_source.revision must be a 40-hex git commit`);
+        }
+        if (!isSafeHuggingFacePath(enclave.artifact_source.path)) {
+          fail(`enclave/${enclaveId}.artifact_source.path must be a safe relative Hugging Face path`);
+        }
+      }
+      if (typeof enclave.source_sha256 !== 'string' || !hex64.test(enclave.source_sha256)) {
+        fail(`enclave/${enclaveId}.source_sha256 must be 64 hex chars`);
+      }
       if (typeof enclave.manifest_hash !== 'string' || !hex64.test(enclave.manifest_hash)) {
         fail(`enclave/${enclaveId}.manifest_hash must be 64 hex chars`);
       }
@@ -663,7 +732,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
         && hex64.test(enclave.artifact_root)
         && !catalogArtifactForEnclave(catalogProof, enclave)
       ) {
-        fail(`enclave/${enclaveId}.backend/artifact_root is not present in the signed admin catalog for ${enclave.model_id}`);
+        fail(`enclave/${enclaveId}.backend/artifact_root/source is not present in the signed admin catalog for ${enclave.model_id}`);
       }
       if (
         pubkey64.test(admin || '')

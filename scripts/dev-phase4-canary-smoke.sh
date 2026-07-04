@@ -284,6 +284,9 @@ async function merkleRoot(file) {
     model_id: modelId,
     artifact_name: artifactName,
     artifact_root: merkle.root,
+    artifact_root_kind: artifact.artifact_root_kind,
+    artifact_source: artifact.source,
+    artifact_path: artifact.path,
     artifact_chunks: merkle.chunks,
     artifact_bytes: merkle.total_bytes,
     artifact_sha256: artifactSha256,
@@ -343,6 +346,11 @@ CATALOG_META="$RUN_DIR/catalog-meta.json"
 prepare_catalog "$ADMIN_PUBKEY" "$BINARY_HASH" "$ARTIFACT" "$TEMP_CATALOG" >"$CATALOG_META"
 ENCLAVE_ID="$(json_field "$CATALOG_META" enclave_id)"
 ARTIFACT_ROOT="$(json_field "$CATALOG_META" artifact_root)"
+ARTIFACT_ROOT_KIND="$(json_field "$CATALOG_META" artifact_root_kind)"
+ARTIFACT_REPO="$(json_field "$CATALOG_META" artifact_source.repo)"
+ARTIFACT_REVISION="$(json_field "$CATALOG_META" artifact_source.revision)"
+ARTIFACT_PATH="$(json_field "$CATALOG_META" artifact_path)"
+ARTIFACT_SHA256="$(json_field "$CATALOG_META" artifact_sha256)"
 MANIFEST_HASH="$(json_field "$CATALOG_META" manifest_hash)"
 
 log "seeding admin rules, enclave, price, and room"
@@ -370,6 +378,11 @@ admin_run admin-register-enclave register-enclave \
   --model "$MODEL_ID" \
   --backend llama.cpp \
   --artifact-root "$ARTIFACT_ROOT" \
+  --artifact-root-kind "$ARTIFACT_ROOT_KIND" \
+  --artifact-repo "$ARTIFACT_REPO" \
+  --artifact-revision "$ARTIFACT_REVISION" \
+  --artifact-path "$ARTIFACT_PATH" \
+  --source-sha256 "$ARTIFACT_SHA256" \
   --manifest-hash "$MANIFEST_HASH" \
   --binary-hash "$BINARY_HASH" \
   --caps-json '{"chat":true,"tools":true,"json":true,"ctx":8192}'

@@ -104,7 +104,15 @@
       "enclave_id": "<derived-catalog-enclave-id-64-hex>",
       "model_id": "meta/llama-3.1-8b-instruct@4bit",
       "backend": "llama.cpp",
-      "artifact_root": "7144a17813133c78ba2831b7926ff04cfef830a3ca86834baed2e8abc70bac02",
+      "artifact_root": "<blake3-merkle-artifact-root-64-hex-after-distribution-build>",
+      "artifact_root_kind": "blake3_merkle_v1",
+      "artifact_source": {
+        "kind": "huggingface",
+        "repo": "mayhem-catalog/llama-3.1-8b-instruct-GGUF",
+        "revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+        "path": "llama-3.1-8b-instruct-Q4_K_M.gguf"
+      },
+      "source_sha256": "<artifact-file-sha256-64-hex-after-distribution-build>",
       "manifest_hash": "<sealed-manifest-hash-64-hex>",
       "binary_hash": "<release-binary-hash-64-hex>",
       "att_tier": 1,

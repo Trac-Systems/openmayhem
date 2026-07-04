@@ -20,6 +20,12 @@ const manifestHash = '3'.repeat(64);
 const binaryHash = '4'.repeat(64);
 const artifactRoot = '5'.repeat(64);
 const updatedArtifactRoot = '6'.repeat(64);
+const artifactSource = {
+  kind: 'huggingface',
+  repo: 'mayhem-catalog/qwen2.5-4b-instruct-GGUF',
+  revision: '7'.repeat(40),
+  path: 'qwen2.5-4b-instruct-Q4_K_M.gguf',
+};
 
 const providerRegistration = {
   op: 'register_provider',
@@ -31,6 +37,8 @@ const enclaveRegistration = {
   model_id: 'qwen/qwen2.5-4b-instruct@4bit',
   backend: 'llama.cpp',
   artifact_root: artifactRoot,
+  artifact_root_kind: 'blake3_merkle_v1',
+  artifact_source: artifactSource,
   manifest_hash: manifestHash,
   att_tier: 1,
   binary_hash: binaryHash,
@@ -46,6 +54,10 @@ const enclaveUpdate = {
   op: 'update_enclave',
   enclave_id: enclaveId,
   artifact_root: updatedArtifactRoot,
+  artifact_source: {
+    ...artifactSource,
+    path: 'qwen2.5-4b-instruct-Q4_K_M.v2.gguf',
+  },
   caps: {
     chat: true,
     embeddings: false,
@@ -197,6 +209,9 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.equal(enclaveEntry.value.created_by, admin.publicKey);
   assert.equal(enclaveEntry.value.created_by_role, 'admin');
   assert.equal(enclaveEntry.value.artifact_root, updatedArtifactRoot);
+  assert.equal(enclaveEntry.value.artifact_root_kind, 'blake3_merkle_v1');
+  assert.deepEqual(enclaveEntry.value.artifact_source, enclaveUpdate.artifact_source);
+  assert.equal(enclaveEntry.value.source_sha256, null);
   assert.equal(enclaveEntry.value.registered_at, makeTxKey(4));
   assert.equal(enclaveEntry.value.updated_by, admin.publicKey);
   assert.equal(enclaveEntry.value.updated_by_role, 'admin');
@@ -1107,6 +1122,39 @@ test('MayhemContract rejects unsafe canonical registry identifiers', async () =>
   );
   assert.match(badModelRegister.message, /invalid model id/i);
   assert.equal(await storage.get(`enclave/${'a'.repeat(64)}`), null);
+
+  const badSourceRegister = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'b'.repeat(64),
+      artifact_source: {
+        ...artifactSource,
+        revision: 'main',
+      },
+    },
+    admin.publicKey,
+    3
+  );
+  assert.match(badSourceRegister.message, /artifact_source\.revision/i);
+  assert.equal(await storage.get(`enclave/${'b'.repeat(64)}`), null);
+
+  const badArtifactKindRegister = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'c'.repeat(64),
+      artifact_root_kind: 'blake3_descriptor_until_p2_4',
+    },
+    admin.publicKey,
+    3
+  );
+  assert.match(badArtifactKindRegister.message, /artifact_root_kind/i);
+  assert.equal(await storage.get(`enclave/${'c'.repeat(64)}`), null);
 
   const badUpdate = await execute(
     contract,

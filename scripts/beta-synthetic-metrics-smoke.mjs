@@ -12,7 +12,15 @@ const defaultOutDir = '.mayhem-local/p8.5-synthetic';
 const testtracAddress = 'testtrac1n57xm5deqnmzrwmzymvandzvkekkshjpaygcvpdkuwzqr4862rus5lyrjg';
 const modelId = 'meta/llama-3.1-8b-instruct@4bit';
 const backend = 'llama.cpp';
-const artifactRoot = '7144a17813133c78ba2831b7926ff04cfef830a3ca86834baed2e8abc70bac02';
+const artifactRoot = hex('artifact:root');
+const artifactRootKind = 'blake3_merkle_v1';
+const artifactSource = {
+  kind: 'huggingface',
+  repo: 'mayhem-catalog/llama-3.1-8b-instruct-GGUF',
+  revision: '0e9e39f249a16976918f6564b8830bc894c89659',
+  path: 'llama-3.1-8b-instruct-Q4_K_M.gguf',
+};
+const sourceSha256 = hex('artifact:source-sha256');
 const msbBootstrap = 'c184f4ad8e9cf5e911f9415b60e7dcfb30aed73ebd8a402ef68e1b154624f5ef';
 const msbChannel = '1111trac1network1msb1testnet1111';
 const dhtBootstrap = [
@@ -103,6 +111,11 @@ async function blake3Hex(text) {
   return Buffer.from(digest).toString('hex');
 }
 
+async function blake3HexBytes(bytes) {
+  const digest = await blake3(bytes);
+  return Buffer.from(digest).toString('hex');
+}
+
 async function deriveCatalogEnclaveId(adminPubkey, enclave) {
   return blake3Hex(`${adminPubkey}${enclave.model_id}${enclave.artifact_root}${enclave.manifest_hash}${enclave.binary_hash}`);
 }
@@ -120,6 +133,9 @@ function enclaveDistributionSigningPayload(adminPubkey, enclave) {
     model_id: enclave.model_id,
     backend: enclave.backend,
     artifact_root: enclave.artifact_root,
+    artifact_root_kind: enclave.artifact_root_kind,
+    artifact_source: enclave.artifact_source,
+    source_sha256: enclave.source_sha256,
     manifest_hash: enclave.manifest_hash,
     binary_hash: enclave.binary_hash,
     distribution: {
@@ -153,6 +169,52 @@ function fileEvidence(filePath, tags = []) {
   const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
   const suffix = tags.length > 0 ? `#${tags.join('#')}` : '';
   return `file:${relativeFile(filePath)}#sha256:${sha256}${suffix}`;
+}
+
+async function buildSyntheticCatalog(outDir) {
+  const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, 'catalog/models.json'), 'utf8'));
+  const model = catalog.models.find((entry) => entry.model_id === modelId);
+  if (!model) throw new Error(`catalog model not found: ${modelId}`);
+  const artifactEntry = Object.entries(model.artifacts || {})
+    .find(([, artifact]) => artifact.engine === backend);
+  if (!artifactEntry) throw new Error(`catalog model ${modelId} has no ${backend} artifact`);
+  const [, artifact] = artifactEntry;
+  artifact.artifact_root = artifactRoot;
+  artifact.artifact_root_kind = artifactRootKind;
+  artifact.source = { ...artifactSource };
+  artifact.path = artifactSource.path;
+  artifact.source_sha256 = sourceSha256;
+
+  const catalogDir = path.join(outDir, 'catalog');
+  const keyDir = path.join(catalogDir, 'keys');
+  const sigDir = path.join(catalogDir, 'signatures');
+  fs.mkdirSync(keyDir, { recursive: true });
+  fs.mkdirSync(sigDir, { recursive: true });
+  const catalogPath = path.join(catalogDir, 'models.json');
+  fs.writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`);
+
+  const catalogKey = deterministicEd25519Key('synthetic-catalog');
+  const keyId = 'mayhem-synthetic-catalog-v1';
+  writeJson(path.join(keyDir, `${keyId}.json`), {
+    key_id: keyId,
+    alg: 'ed25519',
+    public_key: catalogKey.publicKeyHex,
+    status: 'active',
+    created_at: syntheticWindowStart,
+  });
+  const catalogBytes = fs.readFileSync(catalogPath);
+  const signature = crypto.sign(null, catalogBytes, catalogKey.privateKey).toString('hex');
+  const signaturePath = path.join(sigDir, 'models.json.sig');
+  writeJson(signaturePath, {
+    schema_version: 1,
+    alg: 'ed25519',
+    signed_path: relativeFile(catalogPath).replaceAll(path.sep, '/'),
+    key_id: keyId,
+    public_key: catalogKey.publicKeyHex,
+    blake3: await blake3HexBytes(catalogBytes),
+    sig: signature,
+  });
+  return { catalogPath, signaturePath, keyDir };
 }
 
 function run(command, args, { json = false } = {}) {
@@ -290,7 +352,7 @@ function buildBrowserHandoffs(outDir) {
   ].join('\n'));
 }
 
-async function buildLaunchManifest(outDir, adminKey, providerIds) {
+async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatalog) {
   const adminPubkey = adminKey.publicKeyHex;
   const manifestHash = hex('enclave:manifest');
   const binaryHash = hex('enclave:binary');
@@ -299,6 +361,9 @@ async function buildLaunchManifest(outDir, adminKey, providerIds) {
     model_id: modelId,
     backend,
     artifact_root: artifactRoot,
+    artifact_root_kind: artifactRootKind,
+    artifact_source: { ...artifactSource },
+    source_sha256: sourceSha256,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
     distribution: null,
@@ -409,6 +474,9 @@ async function buildLaunchManifest(outDir, adminKey, providerIds) {
       sc_bridge_url: 'ws://127.0.0.1:49222',
       sc_bridge_token_env: 'MAYHEM_BETA_SC_TOKEN',
     },
+    catalog: {
+      path: relativeFile(syntheticCatalog.catalogPath),
+    },
     paygate: {
       public_base_url: 'https://paygate.trac.network',
       health_path: '/v1/health',
@@ -449,6 +517,9 @@ async function buildLaunchManifest(outDir, adminKey, providerIds) {
         model_id: enclave.model_id,
         backend: enclave.backend,
         artifact_root: enclave.artifact_root,
+        artifact_root_kind: enclave.artifact_root_kind,
+        artifact_source: enclave.artifact_source,
+        source_sha256: enclave.source_sha256,
         manifest_hash: enclave.manifest_hash,
         binary_hash: enclave.binary_hash,
         att_tier: 1,
@@ -540,6 +611,9 @@ function buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomI
         model_id: enclave.model_id,
         backend: enclave.backend,
         artifact_root: enclave.artifact_root,
+        artifact_root_kind: enclave.artifact_root_kind,
+        artifact_source: enclave.artifact_source,
+        source_sha256: enclave.source_sha256,
         manifest_hash: enclave.manifest_hash,
         binary_hash: enclave.binary_hash,
         att_tier: 1,
@@ -607,7 +681,13 @@ async function buildSyntheticBundle(args) {
   const adminKey = deterministicEd25519Key('synthetic-admin');
   const adminPubkey = adminKey.publicKeyHex;
   const providerIds = Array.from({ length: 20 }, (_, index) => providerPubkey(index));
-  const { manifestPath, enclave, roomId } = await buildLaunchManifest(outDir, adminKey, providerIds);
+  const syntheticCatalog = await buildSyntheticCatalog(outDir);
+  const { manifestPath, enclave, roomId } = await buildLaunchManifest(
+    outDir,
+    adminKey,
+    providerIds,
+    syntheticCatalog
+  );
   const snapshotPath = buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomId);
   const participantPaths = buildParticipants(outDir, providerIds);
   const paymentRailsPath = buildPaymentRailEvidence(outDir);
@@ -623,11 +703,11 @@ async function buildSyntheticBundle(args) {
     '--snapshot',
     relativeFile(snapshotPath),
     '--catalog',
-    'catalog/models.json',
+    relativeFile(syntheticCatalog.catalogPath),
     '--catalog-signature',
-    'catalog/signatures/models.json.sig',
+    relativeFile(syntheticCatalog.signaturePath),
     '--catalog-key-dir',
-    'catalog/keys',
+    relativeFile(syntheticCatalog.keyDir),
     '--out',
     relativeFile(canonicalAuditPath),
   ]);
