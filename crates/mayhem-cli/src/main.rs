@@ -3392,6 +3392,7 @@ struct CatalogArtifactPublishPlanReport {
     artifact_base_available_bytes: Option<u64>,
     artifact_base_space_ok: Option<bool>,
     ok: bool,
+    preflight_command: CatalogCanaryPlanCommand,
     publish_commands: Vec<CatalogArtifactPublishPlanEntry>,
     apply_command: CatalogCanaryPlanCommand,
     signature_command: Option<CatalogCanaryPlanCommand>,
@@ -3821,6 +3822,7 @@ fn catalog_artifact_publish_plan(args: CatalogArtifactPublishPlanArgs) -> Result
                 .map(|bytes| bytes.to_string())
                 .unwrap_or_else(|| "unknown".to_owned())
         );
+        println!("Preflight: {}", report.preflight_command.shell);
         for entry in &report.publish_commands {
             println!(
                 "- {} / {} ({}) [{}]: {}",
@@ -4305,6 +4307,7 @@ fn catalog_artifact_publish_plan_report(
         .map(|entry| entry.model_id.as_str())
         .collect::<BTreeSet<_>>()
         .len();
+    let preflight_command = catalog_artifact_publish_preflight_command(hf_token_file.as_deref());
     CatalogArtifactPublishPlanReport {
         catalog_path,
         artifact_base,
@@ -4320,6 +4323,7 @@ fn catalog_artifact_publish_plan_report(
         artifact_base_available_bytes,
         artifact_base_space_ok,
         ok: errors.is_empty(),
+        preflight_command,
         publish_commands: entries,
         apply_command,
         signature_command,
@@ -4373,6 +4377,27 @@ fn catalog_artifact_upload_command(
     ];
     let mut command = catalog_canary_plan_command(argv);
     command.shell = with_hf_shell_prefix(command.shell, hf_token_file, true);
+    command
+}
+
+fn catalog_artifact_publish_preflight_command(
+    hf_token_file: Option<&Path>,
+) -> CatalogCanaryPlanCommand {
+    let mut checks = vec![
+        "command -v hf >/dev/null || { echo \"missing Hugging Face CLI: install with python3 -m pip install --user huggingface_hub[hf_xet]\" >&2; exit 1; }".to_owned(),
+        "python3 -c 'import huggingface_hub' || { echo \"missing Python huggingface_hub module: install with python3 -m pip install --user huggingface_hub\" >&2; exit 1; }".to_owned(),
+    ];
+    if let Some(hf_token_file) = hf_token_file {
+        checks.push(format!(
+            "test -r {} || {{ echo \"HF token file is not readable: {}\" >&2; exit 1; }}",
+            shell_single_quote(&hf_token_file.display().to_string()),
+            hf_token_file.display()
+        ));
+    }
+    let script = checks.join(" && ");
+    let mut command =
+        catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
+    command.shell = script;
     command
 }
 
@@ -18279,6 +18304,12 @@ mod tests {
         assert_eq!(report.current_artifact_bytes, 21);
         assert_eq!(report.missing_artifact_bytes, 0);
         assert_eq!(report.artifact_base_space_ok, Some(true));
+        assert!(report.preflight_command.shell.contains("command -v hf"));
+        assert!(report
+            .preflight_command
+            .shell
+            .contains("import huggingface_hub"));
+        assert!(report.preflight_command.shell.contains("hf-token.txt"));
         let entry = &report.publish_commands[0];
         assert_eq!(entry.current_artifact_path, expected_artifact_path);
         assert_eq!(entry.catalog_weights_bytes, 42);
@@ -18349,6 +18380,8 @@ mod tests {
         assert_eq!(report.current_artifact_bytes, 0);
         assert_eq!(report.missing_artifact_bytes, 42);
         assert_eq!(report.artifact_base_space_ok, Some(true));
+        assert!(report.preflight_command.shell.contains("command -v hf"));
+        assert!(!report.preflight_command.shell.contains("HF token file"));
         let entry = &report.publish_commands[0];
         assert!(!entry.ok);
         assert!(!entry.current_artifact_exists);
