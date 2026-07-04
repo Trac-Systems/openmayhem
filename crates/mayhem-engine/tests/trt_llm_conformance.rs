@@ -1,10 +1,12 @@
 #![cfg(feature = "trt-llm")]
 
 use std::env;
+#[cfg(feature = "llama-cpp")]
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(feature = "llama-cpp")]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "llama-cpp")]
 use mayhem_engine::LlamaCppBackend;
@@ -29,6 +31,8 @@ const BENCH_SAMPLES_ENV: &str = "MAYHEM_TRTLLM_BENCH_SAMPLES";
 const LLAMA_THREADS_ENV: &str = "MAYHEM_TRTLLM_LLAMA_THREADS";
 #[cfg(feature = "llama-cpp")]
 const BASELINE_GGUF_ENV: &str = "MAYHEM_TRTLLM_BASELINE_GGUF";
+#[cfg(feature = "llama-cpp")]
+const BENCH_REPORT_ENV: &str = "MAYHEM_TRTLLM_BENCH_REPORT";
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -129,19 +133,22 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
     let mut trt = TrtLlmBackend::new()?;
     let mut trt_config = LoadConfig::trt_llm_checkpoint(&model_path);
     let ctx_size = trt_ctx_size();
+    let trt_engine_dir = engine_dir(&model_path);
+    let trt_kv_cache_dtype = kv_cache_dtype(&model_path);
     trt_config.ctx_size = ctx_size;
-    trt_config.trt_engine_dir = Some(engine_dir(&model_path));
+    trt_config.trt_engine_dir = Some(trt_engine_dir.clone());
     trt_config.trt_tensor_parallel = Some(1);
-    trt_config.trt_kv_cache_dtype = kv_cache_dtype(&model_path);
+    trt_config.trt_kv_cache_dtype = trt_kv_cache_dtype.clone();
     trt_config.trt_require_engine_dir = true;
     trt.load(trt_config)?;
 
     let mut llama = LlamaCppBackend::new()?;
     let mut llama_config = LoadConfig::gguf(&gguf_path);
+    let llama_threads = env_usize(LLAMA_THREADS_ENV, 8);
     llama_config.ctx_size = ctx_size;
     llama_config.batch_size = 256;
     llama_config.ubatch_size = 256;
-    llama_config.threads = Some(env_usize(LLAMA_THREADS_ENV, 8) as i32);
+    llama_config.threads = Some(llama_threads as i32);
     llama_config.gpu_layers = Some(0);
     llama.load(llama_config)?;
 
@@ -155,14 +162,67 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
     let llama_samples = throughput_samples(&mut llama, prompt, bench_tokens, bench_samples)?;
     let trt_tps = median(&trt_samples);
     let llama_tps = median(&llama_samples);
+    let threshold_ratio = 5.0;
+    let ratio = trt_tps / llama_tps.max(f64::MIN_POSITIVE);
+    let pass = trt_tps >= llama_tps * threshold_ratio;
+    write_benchmark_report(
+        benchmark_report_path().as_deref(),
+        &json!({
+            "schema_version": 1,
+            "kind": "mayhem.trtllm.benchmark",
+            "model": model_path.display().to_string(),
+            "engine_dir": trt_engine_dir.display().to_string(),
+            "kv_cache_dtype": trt_kv_cache_dtype,
+            "baseline_gguf": gguf_path.display().to_string(),
+            "ctx_size": ctx_size,
+            "bench_prompt": prompt,
+            "bench_tokens": bench_tokens,
+            "bench_samples": bench_samples,
+            "llama_threads": llama_threads,
+            "threshold_ratio": threshold_ratio,
+            "trt_tok_s_samples": trt_samples,
+            "llama_tok_s_samples": llama_samples,
+            "trt_tok_s_median": trt_tps,
+            "llama_tok_s_median": llama_tps,
+            "ratio": ratio,
+            "pass": pass,
+        }),
+    )?;
     println!(
         "TensorRT-LLM tok/s median: {trt_tps:.2} samples={trt_samples:?}; llama.cpp tok/s median: {llama_tps:.2} samples={llama_samples:?}"
     );
     assert!(
-        trt_tps >= llama_tps * 5.0,
+        pass,
         "TensorRT-LLM tok/s ({trt_tps:.2}) was not >= 5x llama.cpp ({llama_tps:.2})"
     );
 
+    Ok(())
+}
+
+#[cfg(feature = "llama-cpp")]
+#[test]
+fn benchmark_report_writer_creates_parent_and_json() -> TestResult {
+    let root = env::temp_dir().join(format!(
+        "mayhem-trt-bench-report-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    let path = root.join("nested").join("report.json");
+    write_benchmark_report(
+        Some(&path),
+        &json!({
+            "schema_version": 1,
+            "kind": "mayhem.trtllm.benchmark",
+            "pass": false,
+        }),
+    )?;
+
+    let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    assert_eq!(parsed["schema_version"], json!(1));
+    assert_eq!(parsed["kind"], json!("mayhem.trtllm.benchmark"));
+    assert_eq!(parsed["pass"], json!(false));
+
+    fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -213,6 +273,26 @@ fn median(values: &[f64]) -> f64 {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
+}
+
+#[cfg(feature = "llama-cpp")]
+fn benchmark_report_path() -> Option<PathBuf> {
+    env::var_os(BENCH_REPORT_ENV).map(PathBuf::from)
+}
+
+#[cfg(feature = "llama-cpp")]
+fn write_benchmark_report(path: Option<&Path>, report: &serde_json::Value) -> TestResult {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(report)?)?;
+    Ok(())
 }
 
 fn assert_usage(output: &GenerateOutput) {
