@@ -236,6 +236,8 @@ enum CatalogCommands {
     ArtifactMetadata(CatalogArtifactMetadataArgs),
     /// Apply bound artifact metadata reports into a catalog draft.
     ApplyArtifactMetadata(CatalogApplyArtifactMetadataArgs),
+    /// Print copy/paste artifact metadata/apply/sign/verify commands for the launch matrix.
+    ArtifactPlan(CatalogArtifactPlanArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
     CalibrateCanary(CatalogCalibrateCanaryArgs),
     /// Verify calibration report files cover the catalog canary matrix.
@@ -1036,6 +1038,10 @@ struct CatalogArtifactMetadataArgs {
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: usize,
 
+    /// Write the metadata report JSON to this path.
+    #[arg(long, value_name = "PATH")]
+    report_output: Option<PathBuf>,
+
     /// Print a machine-readable metadata report.
     #[arg(long)]
     json: bool,
@@ -1060,6 +1066,61 @@ struct CatalogApplyArtifactMetadataArgs {
     include_dev: bool,
 
     /// Print a machine-readable apply report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogArtifactPlanArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Base directory containing admin catalog artifacts at their catalog paths.
+    #[arg(long, value_name = "PATH")]
+    artifact_base: PathBuf,
+
+    /// Directory where artifact-metadata reports should be written by the printed commands.
+    #[arg(long, value_name = "PATH")]
+    report_dir: PathBuf,
+
+    /// Unsigned catalog draft path for the printed apply-artifact-metadata command.
+    #[arg(long, value_name = "PATH")]
+    catalog_output: Option<PathBuf>,
+
+    /// Detached signature path for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_signature_output: Option<PathBuf>,
+
+    /// Catalog maintainer key id for an optional printed catalog sign command.
+    #[arg(long)]
+    catalog_key_id: Option<String>,
+
+    /// Ignored 32-byte Ed25519 seed file for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_seed_file: Option<PathBuf>,
+
+    /// Catalog public key directory for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_keys_dir: Option<PathBuf>,
+
+    /// Include --write-key in the optional printed catalog sign command.
+    #[arg(long)]
+    catalog_write_key: bool,
+
+    /// Include --created-at in the optional printed catalog sign command.
+    #[arg(long)]
+    catalog_created_at: Option<String>,
+
+    /// Hugging Face token file for the printed launch-source verification command.
+    #[arg(long, value_name = "PATH")]
+    hf_token_file: Option<PathBuf>,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable command plan.
     #[arg(long)]
     json: bool,
 }
@@ -2253,6 +2314,7 @@ async fn main() -> Result<()> {
             CatalogCommands::Sign(args) => catalog_sign(args),
             CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
             CatalogCommands::ApplyArtifactMetadata(args) => catalog_apply_artifact_metadata(args),
+            CatalogCommands::ArtifactPlan(args) => catalog_artifact_plan(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
             CatalogCommands::ApplyCanaryReports(args) => catalog_apply_canary_reports(args),
@@ -2855,6 +2917,11 @@ fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
         bail!("--model and --artifact must be provided together");
     }
     let artifact_path = absolutize(args.artifact_path.clone())?;
+    let report_output = args
+        .report_output
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
     let catalog_binding = if let (Some(model_id), Some(artifact_name)) =
         (args.model.as_deref(), args.artifact.as_deref())
     {
@@ -2912,6 +2979,12 @@ fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
             println!("Update needed: {}", binding.update_needed);
             println!("Catalog patch JSON:");
             println!("{}", serde_json::to_string_pretty(&report.catalog_patch)?);
+        }
+    }
+    if let Some(path) = &report_output {
+        write_json_file(path, &report)?;
+        if !args.json {
+            println!("Report: {}", path.display());
         }
     }
 
@@ -3179,6 +3252,40 @@ struct CatalogArtifactMetadataApplyEntry {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactPlanReport {
+    catalog_path: PathBuf,
+    artifact_base: PathBuf,
+    report_dir: PathBuf,
+    catalog_output: PathBuf,
+    launch_only: bool,
+    model_count: usize,
+    artifact_count: usize,
+    ok: bool,
+    metadata_commands: Vec<CatalogArtifactPlanEntry>,
+    apply_command: CatalogCanaryPlanCommand,
+    signature_command: Option<CatalogCanaryPlanCommand>,
+    verify_command: Option<CatalogCanaryPlanCommand>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactPlanEntry {
+    model_id: String,
+    tier: String,
+    artifact: String,
+    engine: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_path: String,
+    artifact_path: PathBuf,
+    report_path: PathBuf,
+    command: CatalogCanaryPlanCommand,
+    ok: bool,
+    errors: Vec<String>,
+}
+
 fn catalog_artifact_metadata_apply_report(
     catalog_doc: &catalog::CatalogDocument,
     catalog_path: PathBuf,
@@ -3399,6 +3506,338 @@ fn apply_artifact_metadata_reports(
         applied += 1;
     }
     Ok(applied)
+}
+
+fn catalog_artifact_plan(args: CatalogArtifactPlanArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let artifact_base = absolutize(args.artifact_base.clone())?;
+    let report_dir = absolutize(args.report_dir.clone())?;
+    let catalog_output = args
+        .catalog_output
+        .clone()
+        .unwrap_or_else(|| report_dir.join("catalog.with-artifacts.json"));
+    let catalog_output = absolutize(catalog_output)?;
+    let catalog_sign = catalog_artifact_plan_sign_options(&args)?;
+    let hf_token_file = args.hf_token_file.clone().map(absolutize).transpose()?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+
+    let report = catalog_artifact_plan_report(CatalogArtifactPlanInput {
+        catalog_doc: &catalog_doc,
+        catalog_path,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        catalog_sign,
+        hf_token_file,
+        launch_only: !args.include_dev,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Catalog artifact metadata command plan.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Artifact base: {}", report.artifact_base.display());
+        println!("Report dir: {}", report.report_dir.display());
+        println!(
+            "Scope: {}",
+            if report.launch_only {
+                "launch models"
+            } else {
+                "launch + dev models"
+            }
+        );
+        println!(
+            "Coverage: {} models, {} artifacts, ok={}",
+            report.model_count, report.artifact_count, report.ok
+        );
+        for entry in &report.metadata_commands {
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id,
+                entry.artifact,
+                entry.engine,
+                entry.source_repo,
+                if entry.ok { "ready" } else { "error" }
+            );
+            println!("  artifact: {}", entry.artifact_path.display());
+            println!("  report: {}", entry.report_path.display());
+            println!("  command: {}", entry.command.shell);
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+        println!("Apply artifact metadata:");
+        println!("{}", report.apply_command.shell);
+        if let Some(signature_command) = &report.signature_command {
+            println!("Sign catalog draft:");
+            println!("{}", signature_command.shell);
+        }
+        if let Some(verify_command) = &report.verify_command {
+            println!("Verify signed launch sources:");
+            println!("{}", verify_command.shell);
+        } else {
+            println!(
+                "Verify signed launch sources: pass catalog signing args to emit this command."
+            );
+        }
+        for error in &report.errors {
+            println!("Global error: {error}");
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "artifact metadata command plan has {} error(s)",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
+fn catalog_artifact_plan_sign_options(
+    args: &CatalogArtifactPlanArgs,
+) -> Result<Option<CatalogCanaryPlanSignOptions>> {
+    let requested = args.catalog_signature_output.is_some()
+        || args.catalog_key_id.is_some()
+        || args.catalog_seed_file.is_some()
+        || args.catalog_keys_dir.is_some()
+        || args.catalog_write_key
+        || args.catalog_created_at.is_some();
+    if !requested {
+        return Ok(None);
+    }
+    let signature_output = args
+        .catalog_signature_output
+        .clone()
+        .context("--catalog-signature-output is required when emitting a catalog sign command")?;
+    let signature_output = absolutize(signature_output)?;
+    let key_id = args
+        .catalog_key_id
+        .clone()
+        .context("--catalog-key-id is required when emitting a catalog sign command")?;
+    validate_catalog_key_id(&key_id)?;
+    let seed_file = args
+        .catalog_seed_file
+        .clone()
+        .context("--catalog-seed-file is required when emitting a catalog sign command")?;
+    let seed_file = absolutize(seed_file)?;
+    let keys_dir = args
+        .catalog_keys_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    Ok(Some(CatalogCanaryPlanSignOptions {
+        signature_output,
+        key_id,
+        seed_file,
+        keys_dir,
+        write_key: args.catalog_write_key,
+        created_at: args.catalog_created_at.clone(),
+    }))
+}
+
+struct CatalogArtifactPlanInput<'a> {
+    catalog_doc: &'a catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    artifact_base: PathBuf,
+    report_dir: PathBuf,
+    catalog_output: PathBuf,
+    catalog_sign: Option<CatalogCanaryPlanSignOptions>,
+    hf_token_file: Option<PathBuf>,
+    launch_only: bool,
+}
+
+fn catalog_artifact_plan_report(input: CatalogArtifactPlanInput<'_>) -> CatalogArtifactPlanReport {
+    let CatalogArtifactPlanInput {
+        catalog_doc,
+        catalog_path,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        catalog_sign,
+        hf_token_file,
+        launch_only,
+    } = input;
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+
+    for model in &catalog_doc.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        for (artifact_name, artifact) in &model.artifacts {
+            let mut entry_errors = Vec::new();
+            let artifact_rel_path = PathBuf::from(&artifact.path);
+            if artifact_rel_path.is_absolute() {
+                entry_errors.push(format!(
+                    "catalog artifact path {} must be relative to --artifact-base",
+                    artifact.path
+                ));
+            }
+            if artifact.source.kind != "huggingface" {
+                entry_errors.push(format!(
+                    "artifact source kind {} is not supported by launch-source verification",
+                    artifact.source.kind
+                ));
+            }
+            let artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
+            let report_path = report_dir
+                .join(safe_path_component(&model.model_id))
+                .join(format!(
+                    "{}.artifact-metadata.json",
+                    safe_path_component(artifact_name)
+                ));
+            let command = catalog_artifact_metadata_plan_command(
+                &catalog_path,
+                model,
+                artifact_name,
+                &artifact_path,
+                &report_path,
+            );
+            let ok = entry_errors.is_empty();
+            let entry = CatalogArtifactPlanEntry {
+                model_id: model.model_id.clone(),
+                tier: model.tier.clone(),
+                artifact: artifact_name.clone(),
+                engine: artifact.engine.clone(),
+                source_kind: artifact.source.kind.clone(),
+                source_repo: artifact.source.repo.clone(),
+                source_revision: artifact.source.revision.clone(),
+                source_path: artifact.path.clone(),
+                artifact_path,
+                report_path,
+                command,
+                ok,
+                errors: entry_errors,
+            };
+            if !entry.ok {
+                errors.extend(
+                    entry
+                        .errors
+                        .iter()
+                        .map(|error| format!("{} {}: {error}", entry.model_id, entry.artifact)),
+                );
+            }
+            entries.push(entry);
+        }
+    }
+
+    if entries.is_empty() {
+        errors.push(if launch_only {
+            "catalog has no launch model artifacts to plan".to_owned()
+        } else {
+            "catalog has no model artifacts to plan".to_owned()
+        });
+    }
+
+    let report_paths = entries
+        .iter()
+        .map(|entry| entry.report_path.clone())
+        .collect::<Vec<_>>();
+    let apply_command = catalog_artifact_plan_apply_command(
+        &catalog_path,
+        &catalog_output,
+        launch_only,
+        &report_paths,
+    );
+    let signature_command = catalog_sign
+        .as_ref()
+        .map(|sign| catalog_canary_plan_sign_command(&catalog_output, sign));
+    let verify_command = catalog_sign.as_ref().map(|sign| {
+        catalog_artifact_plan_verify_command(&catalog_output, sign, hf_token_file.as_deref())
+    });
+    let model_count = entries
+        .iter()
+        .map(|entry| entry.model_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    CatalogArtifactPlanReport {
+        catalog_path,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        launch_only,
+        model_count,
+        artifact_count: entries.len(),
+        ok: errors.is_empty(),
+        metadata_commands: entries,
+        apply_command,
+        signature_command,
+        verify_command,
+        errors,
+    }
+}
+
+fn catalog_artifact_metadata_plan_command(
+    catalog_path: &Path,
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact_path: &Path,
+    report_path: &Path,
+) -> CatalogCanaryPlanCommand {
+    let mut argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "artifact-metadata".to_owned(),
+    ];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
+    push_plan_value_arg(&mut argv, "--model", &model.model_id);
+    push_plan_value_arg(&mut argv, "--artifact", artifact_name);
+    push_plan_path_arg(&mut argv, "--artifact-path", artifact_path);
+    push_plan_path_arg(&mut argv, "--report-output", report_path);
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
+}
+
+fn catalog_artifact_plan_apply_command(
+    catalog_path: &Path,
+    catalog_output: &Path,
+    launch_only: bool,
+    report_paths: &[PathBuf],
+) -> CatalogCanaryPlanCommand {
+    let mut argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "apply-artifact-metadata".to_owned(),
+    ];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
+    push_plan_path_arg(&mut argv, "--output", catalog_output);
+    if !launch_only {
+        argv.push("--include-dev".to_owned());
+    }
+    for report_path in report_paths {
+        push_plan_path_arg(&mut argv, "--report", report_path);
+    }
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
+}
+
+fn catalog_artifact_plan_verify_command(
+    catalog_path: &Path,
+    sign: &CatalogCanaryPlanSignOptions,
+    hf_token_file: Option<&Path>,
+) -> CatalogCanaryPlanCommand {
+    let mut argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "verify".to_owned(),
+    ];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
+    push_plan_path_arg(&mut argv, "--signature-path", &sign.signature_output);
+    push_plan_path_arg(&mut argv, "--keys-dir", &sign.keys_dir);
+    argv.push("--check-launch-sources".to_owned());
+    if let Some(hf_token_file) = hf_token_file {
+        push_plan_path_arg(&mut argv, "--hf-token-file", hf_token_file);
+    }
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
 }
 
 fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
@@ -17022,6 +17461,66 @@ mod tests {
         assert!(binding.matches_current_weights_bytes);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn artifact_plan_emits_metadata_apply_sign_and_verify_commands() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let sign = CatalogCanaryPlanSignOptions {
+            signature_output: PathBuf::from("/tmp/reports/models.json.sig"),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file: PathBuf::from("/tmp/catalog-seed.hex"),
+            keys_dir: PathBuf::from("/tmp/catalog-keys"),
+            write_key: true,
+            created_at: Some("2026-07-04T00:00:00Z".to_owned()),
+        };
+
+        let report = catalog_artifact_plan_report(CatalogArtifactPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/artifacts"),
+            report_dir: PathBuf::from("/tmp/reports"),
+            catalog_output: PathBuf::from("/tmp/reports/catalog.with-artifacts.json"),
+            catalog_sign: Some(sign),
+            hf_token_file: Some(PathBuf::from("/tmp/hf-token.txt")),
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.model_count, 1);
+        assert_eq!(report.artifact_count, 1);
+        let entry = &report.metadata_commands[0];
+        assert!(entry.command.shell.contains("'artifact-metadata'"));
+        assert_eq!(
+            entry.artifact_path,
+            PathBuf::from(format!(
+                "/tmp/artifacts/huggingface/test_model/{}/model.gguf",
+                "1".repeat(40)
+            ))
+        );
+        assert!(entry
+            .command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--report-output"
+                && pair[1].ends_with("gguf-q4_k_m.artifact-metadata.json")));
+        assert!(report
+            .apply_command
+            .shell
+            .contains("'apply-artifact-metadata'"));
+        let signature_command = report.signature_command.as_ref().unwrap();
+        assert!(signature_command.shell.contains("'catalog' 'sign'"));
+        let verify_command = report.verify_command.as_ref().unwrap();
+        assert!(verify_command.shell.contains("'verify'"));
+        assert!(verify_command
+            .argv
+            .iter()
+            .any(|arg| arg == "--check-launch-sources"));
+        assert!(verify_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--hf-token-file" && pair[1] == "/tmp/hf-token.txt"));
     }
 
     #[test]
