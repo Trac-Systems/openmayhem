@@ -424,6 +424,40 @@ function validateEvidenceArray(add, value, name) {
   }
 }
 
+function fileEvidenceTarget(value) {
+  if (typeof value !== 'string' || !value.startsWith('file:')) return null;
+  const hashMatch = value.match(/#sha256:([0-9a-fA-F]{64})(?:$|[#?&])/);
+  if (!hashMatch) return null;
+  const rawPath = value.slice('file:'.length, hashMatch.index);
+  if (!rawPath || path.isAbsolute(rawPath)) return null;
+  const resolved = path.resolve(repoRoot, rawPath);
+  const rel = path.relative(repoRoot, resolved);
+  if (rel.startsWith('..') || path.isAbsolute(rel) || !fs.existsSync(resolved)) return null;
+  return { rawPath, resolved };
+}
+
+function fileEvidenceJsonRecords(add, value, name) {
+  if (!Array.isArray(value) || value.some(isPlaceholder)) return [];
+  const records = [];
+  for (const [index, item] of value.entries()) {
+    const itemName = `${name}[${index}]`;
+    const target = fileEvidenceTarget(item);
+    if (!target) continue;
+    try {
+      records.push({
+        path: target.rawPath,
+        value: JSON.parse(fs.readFileSync(target.resolved, 'utf8')),
+      });
+    } catch (error) {
+      add('error', `${itemName} must point to JSON evidence: ${error.message}`);
+    }
+  }
+  if (records.length === 0) {
+    add('error', `${name} must include at least one file-bound JSON evidence record`);
+  }
+  return records;
+}
+
 function validateFileEvidenceHash(add, value, name) {
   if (typeof value !== 'string' || !value.startsWith('file:')) return;
   const hashMatch = value.match(/#sha256:([0-9a-fA-F]{64})(?:$|[#?&])/);
@@ -452,6 +486,177 @@ function validateFileEvidenceHash(add, value, name) {
   if (actual !== expected) {
     add('error', `${name} file evidence hash mismatch for ${rawPath}: expected ${expected}, got ${actual}`);
   }
+}
+
+function decimalTnkToE18(value) {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const raw = String(value).trim();
+  if (!/^[0-9]+(?:\.[0-9]+)?$/.test(raw)) return null;
+  const [whole, frac = ''] = raw.split('.');
+  if (frac.length > 18) return null;
+  return BigInt(whole) * 10n ** 18n + BigInt(frac.padEnd(18, '0'));
+}
+
+function evidenceBalanceE18(record) {
+  const value = record?.balance_tnk_e18 ?? record?.balance_e18 ?? record?.tnk_e18;
+  if (typeof value === 'string' && /^[0-9]+$/.test(value)) return BigInt(value);
+  return decimalTnkToE18(record?.balance_tnk ?? record?.balance);
+}
+
+function arrayContainsAll(actual, expected) {
+  if (!Array.isArray(actual)) return false;
+  const set = new Set(actual.map((item) => String(item)));
+  return expected.every((item) => set.has(String(item)));
+}
+
+function evidenceMatchesNetwork(record, manifest) {
+  const msb = record?.msb || record?.network?.msb || record || {};
+  return (
+    (record.network === undefined || record.network === manifest.network?.name) &&
+    (record.network_name === undefined || record.network_name === manifest.network?.name) &&
+    (msb.address_prefix === undefined || msb.address_prefix === manifest.network?.msb?.address_prefix) &&
+    (msb.network_id === undefined || msb.network_id === manifest.network?.msb?.network_id) &&
+    (msb.bootstrap === undefined || msb.bootstrap === manifest.network?.msb?.bootstrap) &&
+    (msb.msb_bootstrap === undefined || msb.msb_bootstrap === manifest.network?.msb?.bootstrap) &&
+    (msb.channel === undefined || msb.channel === manifest.network?.msb?.channel) &&
+    (msb.msb_channel === undefined || msb.msb_channel === manifest.network?.msb?.channel)
+  );
+}
+
+function validateBootstrapEvidence(add, manifest) {
+  const records = fileEvidenceJsonRecords(add, manifest.evidence?.bootstrap_nodes, 'evidence.bootstrap_nodes');
+  if (records.length === 0) return;
+  const expectedPeerDht = manifest.network?.dht?.peer_bootstrap || [];
+  const expectedMsbDht = manifest.network?.dht?.msb_bootstrap || [];
+  const ok = records.some(({ value }) => {
+    const peerDht = value.peer_dht_bootstrap || value.peer_bootstrap_nodes || value.peer_bootstrap;
+    const msbDht = value.msb_dht_bootstrap || value.msb_bootstrap_nodes || value.msb_bootstrap;
+    return (
+      value.ok === true &&
+      evidenceMatchesNetwork(value, manifest) &&
+      arrayContainsAll(peerDht, expectedPeerDht) &&
+      arrayContainsAll(msbDht, expectedMsbDht)
+    );
+  });
+  if (!ok) {
+    add('error', 'evidence.bootstrap_nodes must include JSON proof for the manifest network, MSB bootstrap/channel, and peer/MSB DHT bootstrap nodes');
+  }
+}
+
+function validateEpochWalletEvidence(add, manifest) {
+  const records = fileEvidenceJsonRecords(add, manifest.evidence?.epoch_wallet_funding, 'evidence.epoch_wallet_funding');
+  if (records.length === 0) return;
+  const min = typeof manifest.epoch_wallet?.min_balance_tnk_e18 === 'string' && /^[0-9]+$/.test(manifest.epoch_wallet.min_balance_tnk_e18)
+    ? BigInt(manifest.epoch_wallet.min_balance_tnk_e18)
+    : null;
+  const ok = records.some(({ value }) => {
+    const balance = evidenceBalanceE18(value);
+    return (
+      value.funded === true &&
+      value.address === manifest.epoch_wallet?.address &&
+      evidenceMatchesNetwork(value, manifest) &&
+      balance !== null &&
+      min !== null &&
+      balance >= min
+    );
+  });
+  if (!ok) {
+    add('error', 'evidence.epoch_wallet_funding must include JSON proof matching epoch_wallet.address with balance >= epoch_wallet.min_balance_tnk_e18 on the manifest MSB network');
+  }
+}
+
+async function expectedSeedOptIns(manifest, roomLabels) {
+  const expected = [];
+  for (const provider of manifest.seed_providers || []) {
+    for (const join of provider.joins || []) {
+      for (const roomRef of join.rooms || []) {
+        const canonicalRoom = roomLabels.get(roomRef);
+        const roomId = canonicalRoom
+          ? await roomIdForLaunchRoom({
+            enclaveId: join.enclave_id,
+            adminPubkey: manifest.admin?.peer_pubkey,
+            room: canonicalRoom.room,
+          })
+          : null;
+        expected.push({
+          provider_pubkey: provider.provider_pubkey,
+          enclave_id: join.enclave_id,
+          room_label: roomRef,
+          room_id: roomId,
+        });
+      }
+    }
+  }
+  return expected;
+}
+
+function evidenceOptInRows(record) {
+  if (Array.isArray(record?.opt_ins)) return record.opt_ins;
+  if (Array.isArray(record?.seed_provider_opt_ins)) return record.seed_provider_opt_ins;
+  if (Array.isArray(record?.providers)) {
+    return record.providers.map((provider) => ({
+      provider_pubkey: typeof provider === 'string' ? provider : provider.provider_pubkey,
+      enclave_id: record.enclave_id,
+      rooms: record.rooms,
+      room_ids: record.room_ids || (record.room_id ? [record.room_id] : undefined),
+    }));
+  }
+  return [];
+}
+
+async function validateSeedProviderEvidence(add, manifest, roomLabels) {
+  const records = fileEvidenceJsonRecords(add, manifest.evidence?.seed_provider_opt_ins, 'evidence.seed_provider_opt_ins');
+  if (records.length === 0) return;
+  const rows = records.flatMap(({ value }) => evidenceOptInRows(value));
+  const expected = await expectedSeedOptIns(manifest, roomLabels);
+  const ok = expected.every((required) => rows.some((row) => {
+    const rooms = Array.isArray(row.rooms) ? row.rooms.map(String) : [];
+    const roomIds = Array.isArray(row.room_ids) ? row.room_ids.map(String) : [];
+    return (
+      row.provider_pubkey === required.provider_pubkey &&
+      row.enclave_id === required.enclave_id &&
+      (
+        rooms.includes(required.room_label) ||
+        (required.room_id && roomIds.includes(required.room_id))
+      )
+    );
+  }));
+  const hasFreeFeatureProof = records.some(({ value }) => value.free_feature_lifecycle_records === true);
+  if (!ok || !hasFreeFeatureProof) {
+    add('error', 'evidence.seed_provider_opt_ins must include JSON proof for every manifest seed provider/enclave/room opt-in as free lifecycle feature records');
+  }
+}
+
+function evidenceDownloadRows(record) {
+  if (Array.isArray(record?.distributions)) return record.distributions;
+  if (Array.isArray(record?.enclave_downloads)) return record.enclave_downloads;
+  return record?.enclave_id ? [record] : [];
+}
+
+function validateEnclaveDownloadEvidence(add, manifest) {
+  const records = fileEvidenceJsonRecords(add, manifest.evidence?.enclave_downloads, 'evidence.enclave_downloads');
+  if (records.length === 0) return;
+  const rows = records.flatMap(({ value }) => evidenceDownloadRows(value));
+  const ok = (manifest.canonical_enclaves || []).every((enclave) => rows.some((row) => (
+    row.enclave_id === enclave.enclave_id &&
+    row.admin_signed === true &&
+    row.bundle_url === enclave.distribution?.bundle_url &&
+    row.manifest_url === enclave.distribution?.manifest_url &&
+    row.bundle_sha256 === enclave.distribution?.bundle_sha256 &&
+    row.bundle_bytes === enclave.distribution?.bundle_bytes &&
+    row.admin_signature === enclave.distribution?.admin_signature
+  )));
+  if (!ok) {
+    add('error', 'evidence.enclave_downloads must include JSON proof matching every canonical enclave distribution URL/hash/size/admin signature');
+  }
+}
+
+async function validateSemanticLaunchEvidence(add, manifest, roomLabels) {
+  if (JSON.stringify(manifest.evidence || {}).includes('<')) return;
+  validateBootstrapEvidence(add, manifest);
+  validateEpochWalletEvidence(add, manifest);
+  await validateSeedProviderEvidence(add, manifest, roomLabels);
+  validateEnclaveDownloadEvidence(add, manifest);
 }
 
 function sha256File(filePath) {
@@ -836,6 +1041,8 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       }
     }
   }
+
+  await validateSemanticLaunchEvidence(add, manifest, roomLabels);
 
   const allText = JSON.stringify(manifest);
   if (!allowPlaceholders && isPlaceholder(allText)) {

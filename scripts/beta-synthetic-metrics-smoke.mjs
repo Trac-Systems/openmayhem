@@ -15,6 +15,11 @@ const backend = 'llama.cpp';
 const artifactRoot = '7144a17813133c78ba2831b7926ff04cfef830a3ca86834baed2e8abc70bac02';
 const msbBootstrap = 'c184f4ad8e9cf5e911f9415b60e7dcfb30aed73ebd8a402ef68e1b154624f5ef';
 const msbChannel = '1111trac1network1msb1testnet1111';
+const dhtBootstrap = [
+  '116.202.214.149:10001',
+  '157.180.12.214:10001',
+  'node1.hyperdht.org:49737',
+];
 const syntheticWindowStart = '2026-07-04T00:00:00Z';
 const syntheticWindowEnd = '2026-07-11T00:00:00Z';
 const ed25519Pkcs8SeedPrefix = Buffer.from('302e020100300506032b657004220420', 'hex');
@@ -313,25 +318,46 @@ async function buildLaunchManifest(outDir, adminKey, providerIds) {
   const evidenceDir = path.join(outDir, 'launch-evidence');
   const bootstrapEvidence = writeJson(path.join(evidenceDir, 'bootstrap-health.json'), {
     ok: true,
-    peer_bootstrap: true,
-    msb_bootstrap: true,
+    network: 'testnet1',
+    msb: {
+      address_prefix: 'testtrac',
+      network_id: 919,
+      bootstrap: msbBootstrap,
+      channel: msbChannel,
+    },
+    peer_dht_bootstrap: dhtBootstrap,
+    msb_dht_bootstrap: dhtBootstrap,
   });
   const epochWalletEvidence = writeJson(path.join(evidenceDir, 'epoch-wallet-funding.json'), {
+    network: 'testnet1',
+    msb: {
+      address_prefix: 'testtrac',
+      network_id: 919,
+      bootstrap: msbBootstrap,
+      channel: msbChannel,
+    },
     address: testtracAddress,
     funded: true,
     balance_tnk: '4',
+    balance_tnk_e18: '4000000000000000000',
   });
   const seedProviderEvidence = writeJson(path.join(evidenceDir, 'seed-provider-opt-ins.json'), {
-    providers: providerIds,
-    enclave_id: enclave.enclave_id,
-    room_id: roomId,
     free_feature_lifecycle_records: true,
+    opt_ins: providerIds.map((provider) => ({
+      provider_pubkey: provider,
+      enclave_id: enclave.enclave_id,
+      rooms: ['launch-us-east'],
+      room_ids: [roomId],
+    })),
   });
   const downloadEvidence = writeJson(path.join(evidenceDir, 'enclave-downloads.json'), {
-    enclave_id: enclave.enclave_id,
-    bundle_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.tar.zst`,
-    manifest_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.json`,
-    admin_signed: true,
+    distributions: [
+      {
+        enclave_id: enclave.enclave_id,
+        admin_signed: true,
+        ...enclave.distribution,
+      },
+    ],
   });
 
   const manifest = {
@@ -352,14 +378,10 @@ async function buildLaunchManifest(outDir, adminKey, providerIds) {
       },
       dht: {
         peer_bootstrap: [
-          '116.202.214.149:10001',
-          '157.180.12.214:10001',
-          'node1.hyperdht.org:49737',
+          ...dhtBootstrap,
         ],
         msb_bootstrap: [
-          '116.202.214.149:10001',
-          '157.180.12.214:10001',
-          'node1.hyperdht.org:49737',
+          ...dhtBootstrap,
         ],
       },
     },
