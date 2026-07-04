@@ -141,18 +141,12 @@ def create_llm(model_path, payload):
     if tensor_parallel > 1:
         optional["tensor_parallel_size"] = tensor_parallel
         optional["tp_size"] = tensor_parallel
-    if engine_dir:
-        optional["engine_dir"] = str(engine_dir)
-        optional["workspace"] = str(engine_dir)
-        optional["output_dir"] = str(engine_dir)
     if kv_config is not None:
         optional["kv_cache_config"] = kv_config
 
     attempts.append({"model": model_path, **optional})
-    attempts.append({"model": model_path})
     if engine_dir and has_engine_payload(str(engine_dir)):
         attempts.insert(0, {"model": str(engine_dir), **optional})
-        attempts.insert(1, {"model": str(engine_dir)})
 
     last_error = None
     for kwargs in attempts:
@@ -163,10 +157,7 @@ def create_llm(model_path, payload):
         except Exception as exc:
             last_error = exc
 
-    try:
-        return LLM(model_path)
-    except Exception as exc:
-        raise RuntimeError(f"could not initialize TensorRT-LLM model: {exc}; previous: {last_error}")
+    raise RuntimeError(f"could not initialize TensorRT-LLM model: {last_error}")
 
 
 def make_sampling_params(payload):
