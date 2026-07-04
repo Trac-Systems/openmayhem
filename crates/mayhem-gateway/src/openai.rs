@@ -11,7 +11,7 @@ use std::{
 use crate::{
     failover::{
         x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState, SessionPriceMu,
-        DEFAULT_MAX_OPEN_ATTEMPTS,
+        DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, ProviderKey,
 };
@@ -702,8 +702,8 @@ impl ScBridgeGatewaySessionConfig {
         Self {
             url: url.into(),
             token: token.into(),
-            open_timeout: Duration::from_secs(3),
-            frame_timeout: Duration::from_secs(60),
+            open_timeout: Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS),
+            frame_timeout: Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS),
         }
     }
 }
@@ -2417,6 +2417,21 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use mayhem_proto::{attestation_signing_bytes, AttestationSigner};
+
+    #[test]
+    fn sc_bridge_direct_session_defaults_match_p4_3_failover_timeouts() {
+        let config = ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:49222", "token");
+        assert_eq!(
+            config.open_timeout,
+            Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
+        );
+        assert_eq!(
+            config.frame_timeout,
+            Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS)
+        );
+        assert!(config.open_timeout <= Duration::from_secs(3));
+        assert!(config.frame_timeout < Duration::from_secs(20));
+    }
 
     #[test]
     fn direct_session_accept_pins_session_enclave_provider_and_signature() {
