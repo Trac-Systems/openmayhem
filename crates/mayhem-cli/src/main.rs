@@ -238,6 +238,8 @@ enum CatalogCommands {
     ApplyArtifactMetadata(CatalogApplyArtifactMetadataArgs),
     /// Print copy/paste artifact metadata/apply/sign/verify commands for the launch matrix.
     ArtifactPlan(CatalogArtifactPlanArgs),
+    /// Print copy/paste source download/build commands that stage launch artifacts for upload.
+    ArtifactStagePlan(CatalogArtifactStagePlanArgs),
     /// Print copy/paste Hugging Face upload plus artifact finalization commands.
     ArtifactPublishPlan(CatalogArtifactPublishPlanArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
@@ -1127,6 +1129,33 @@ struct CatalogArtifactPlanArgs {
     include_dev: bool,
 
     /// Print a machine-readable command plan.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogArtifactStagePlanArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Base directory where admin catalog artifacts should be staged.
+    #[arg(long, value_name = "PATH")]
+    artifact_base: PathBuf,
+
+    /// Directory where approved upstream Hugging Face snapshots should be cached.
+    #[arg(long, value_name = "PATH")]
+    source_cache_dir: Option<PathBuf>,
+
+    /// Hugging Face token file for printed source-download commands.
+    #[arg(long, value_name = "PATH")]
+    hf_token_file: Option<PathBuf>,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable staging command plan.
     #[arg(long)]
     json: bool,
 }
@@ -2376,6 +2405,7 @@ async fn main() -> Result<()> {
             CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
             CatalogCommands::ApplyArtifactMetadata(args) => catalog_apply_artifact_metadata(args),
             CatalogCommands::ArtifactPlan(args) => catalog_artifact_plan(args),
+            CatalogCommands::ArtifactStagePlan(args) => catalog_artifact_stage_plan(args),
             CatalogCommands::ArtifactPublishPlan(args) => catalog_artifact_publish_plan(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
@@ -3377,6 +3407,66 @@ struct CatalogArtifactPlanEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactStagePlanReport {
+    catalog_path: PathBuf,
+    artifact_base: PathBuf,
+    source_cache_dir: PathBuf,
+    launch_only: bool,
+    hf_token_file: Option<PathBuf>,
+    model_count: usize,
+    artifact_count: usize,
+    source_count: usize,
+    catalog_expected_bytes: u64,
+    current_artifact_bytes: u64,
+    missing_artifact_bytes: u64,
+    artifact_base_available_bytes: Option<u64>,
+    artifact_base_space_ok: Option<bool>,
+    ok: bool,
+    preflight_command: CatalogCanaryPlanCommand,
+    source_commands: Vec<CatalogArtifactStageSourceEntry>,
+    stage_commands: Vec<CatalogArtifactStagePlanEntry>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactStageSourceEntry {
+    model_id: String,
+    tier: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_dir: PathBuf,
+    command: CatalogCanaryPlanCommand,
+    ok: bool,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactStagePlanEntry {
+    model_id: String,
+    tier: String,
+    artifact: String,
+    engine: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_path: String,
+    upstream_source_kind: String,
+    upstream_source_repo: String,
+    upstream_source_revision: String,
+    upstream_source_dir: PathBuf,
+    artifact_path: PathBuf,
+    catalog_weights_bytes: u64,
+    current_artifact_exists: bool,
+    current_artifact_is_file: bool,
+    current_artifact_bytes: Option<u64>,
+    stage_command: CatalogCanaryPlanCommand,
+    follow_up_publish_plan: CatalogCanaryPlanCommand,
+    ok: bool,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CatalogArtifactPublishPlanReport {
     catalog_path: PathBuf,
     artifact_base: PathBuf,
@@ -3765,6 +3855,117 @@ fn catalog_artifact_plan(args: CatalogArtifactPlanArgs) -> Result<()> {
     Ok(())
 }
 
+fn catalog_artifact_stage_plan(args: CatalogArtifactStagePlanArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let artifact_base = absolutize(args.artifact_base.clone())?;
+    let source_cache_dir = args
+        .source_cache_dir
+        .clone()
+        .unwrap_or_else(|| artifact_base.join(".source-cache"));
+    let source_cache_dir = absolutize(source_cache_dir)?;
+    let hf_token_file = args.hf_token_file.clone().map(absolutize).transpose()?;
+    let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+        catalog_doc: &catalog_doc,
+        catalog_path,
+        artifact_base,
+        source_cache_dir,
+        hf_token_file,
+        launch_only: !args.include_dev,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Catalog artifact staging command plan.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Artifact base: {}", report.artifact_base.display());
+        println!("Source cache: {}", report.source_cache_dir.display());
+        println!(
+            "Scope: {}",
+            if report.launch_only {
+                "launch models"
+            } else {
+                "launch + dev models"
+            }
+        );
+        println!(
+            "Coverage: {} models, {} artifacts, {} source snapshots, ok={}",
+            report.model_count, report.artifact_count, report.source_count, report.ok
+        );
+        println!(
+            "Staging bytes: expected={}, staged={}, missing_estimate={}, available={}",
+            report.catalog_expected_bytes,
+            report.current_artifact_bytes,
+            report.missing_artifact_bytes,
+            report
+                .artifact_base_available_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+        println!("Preflight: {}", report.preflight_command.shell);
+        println!("Source downloads:");
+        for source in &report.source_commands {
+            println!(
+                "- {} [{}@{}]: {}",
+                source.model_id,
+                source.source_repo,
+                source.source_revision,
+                if source.ok { "ready" } else { "error" }
+            );
+            println!("  source dir: {}", source.source_dir.display());
+            println!("  command: {}", source.command.shell);
+            for error in &source.errors {
+                println!("  error: {error}");
+            }
+        }
+        println!("Artifact staging:");
+        for entry in &report.stage_commands {
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id,
+                entry.artifact,
+                entry.engine,
+                entry.source_repo,
+                if entry.ok { "ready" } else { "error" }
+            );
+            println!("  source dir: {}", entry.upstream_source_dir.display());
+            println!("  artifact: {}", entry.artifact_path.display());
+            println!("  catalog weights_bytes: {}", entry.catalog_weights_bytes);
+            println!(
+                "  staged now: exists={}, file={}, bytes={}",
+                entry.current_artifact_exists,
+                entry.current_artifact_is_file,
+                entry
+                    .current_artifact_bytes
+                    .map(|bytes| bytes.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            );
+            println!("  command: {}", entry.stage_command.shell);
+            println!("  follow-up: {}", entry.follow_up_publish_plan.shell);
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+        for error in &report.errors {
+            println!("Global error: {error}");
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "artifact staging command plan has {} error(s)",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
 fn catalog_artifact_publish_plan(args: CatalogArtifactPublishPlanArgs) -> Result<()> {
     let catalog_path = args
         .catalog_path
@@ -4111,6 +4312,233 @@ fn catalog_artifact_plan_report(input: CatalogArtifactPlanInput<'_>) -> CatalogA
     }
 }
 
+struct CatalogArtifactStagePlanInput<'a> {
+    catalog_doc: &'a catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    artifact_base: PathBuf,
+    source_cache_dir: PathBuf,
+    hf_token_file: Option<PathBuf>,
+    launch_only: bool,
+}
+
+fn catalog_artifact_stage_plan_report(
+    input: CatalogArtifactStagePlanInput<'_>,
+) -> CatalogArtifactStagePlanReport {
+    let CatalogArtifactStagePlanInput {
+        catalog_doc,
+        catalog_path,
+        artifact_base,
+        source_cache_dir,
+        hf_token_file,
+        launch_only,
+    } = input;
+    let mut source_commands = Vec::new();
+    let mut stage_commands = Vec::new();
+    let mut errors = Vec::new();
+    let mut planned_sources = BTreeSet::new();
+    let artifact_base_available_bytes = available_bytes_for_path(&artifact_base).ok().flatten();
+    let mut catalog_expected_bytes = 0u64;
+    let mut current_artifact_bytes_total = 0u64;
+    let mut missing_artifact_bytes = 0u64;
+
+    for model in &catalog_doc.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        let source_dir =
+            catalog_artifact_stage_source_dir(&source_cache_dir, &model.provenance.source);
+        let source_key = (
+            model.provenance.source.kind.clone(),
+            model.provenance.source.repo.clone(),
+            model.provenance.source.revision.clone(),
+        );
+        if planned_sources.insert(source_key) {
+            let mut source_errors = Vec::new();
+            if model.provenance.source.kind != "huggingface" {
+                source_errors.push(format!(
+                    "provenance source kind {} is not supported by artifact staging",
+                    model.provenance.source.kind
+                ));
+            }
+            let command = catalog_artifact_stage_source_download_command(
+                &model.provenance.source,
+                &source_dir,
+                hf_token_file.as_deref(),
+            );
+            let ok = source_errors.is_empty();
+            let entry = CatalogArtifactStageSourceEntry {
+                model_id: model.model_id.clone(),
+                tier: model.tier.clone(),
+                source_kind: model.provenance.source.kind.clone(),
+                source_repo: model.provenance.source.repo.clone(),
+                source_revision: model.provenance.source.revision.clone(),
+                source_dir: source_dir.clone(),
+                command,
+                ok,
+                errors: source_errors,
+            };
+            if !entry.ok {
+                errors.extend(
+                    entry
+                        .errors
+                        .iter()
+                        .map(|error| format!("{} source: {error}", entry.model_id)),
+                );
+            }
+            source_commands.push(entry);
+        }
+
+        for (artifact_name, artifact) in &model.artifacts {
+            let mut entry_errors = Vec::new();
+            catalog_expected_bytes = catalog_expected_bytes.saturating_add(artifact.weights_bytes);
+            let artifact_rel_path = PathBuf::from(&artifact.path);
+            if artifact_rel_path.is_absolute() {
+                entry_errors.push(format!(
+                    "catalog artifact path {} must be relative to --artifact-base",
+                    artifact.path
+                ));
+            }
+            if artifact.source.kind != "huggingface" {
+                entry_errors.push(format!(
+                    "artifact source kind {} cannot be published with Hugging Face upload",
+                    artifact.source.kind
+                ));
+            }
+            let artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
+            let (current_artifact_exists, current_artifact_is_file, current_artifact_bytes) =
+                match fs::metadata(&artifact_path) {
+                    Ok(metadata) => {
+                        let is_file = metadata.is_file();
+                        if !is_file {
+                            entry_errors.push(format!(
+                                "local artifact path {} exists but is not a file",
+                                artifact_path.display()
+                            ));
+                        }
+                        (true, is_file, is_file.then_some(metadata.len()))
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, false, None),
+                    Err(err) => {
+                        entry_errors.push(format!(
+                            "could not stat local artifact path {}: {err}",
+                            artifact_path.display()
+                        ));
+                        (false, false, None)
+                    }
+                };
+            if let Some(bytes) = current_artifact_bytes {
+                current_artifact_bytes_total = current_artifact_bytes_total.saturating_add(bytes);
+            } else {
+                missing_artifact_bytes =
+                    missing_artifact_bytes.saturating_add(artifact.weights_bytes);
+            }
+            let stage_command = match catalog_artifact_stage_command(
+                model,
+                artifact_name,
+                artifact,
+                &source_dir,
+                &artifact_base,
+                &artifact_path,
+            ) {
+                Ok(command) => command,
+                Err(err) => {
+                    entry_errors.push(err.to_string());
+                    catalog_canary_plan_command(vec![
+                        "false".to_owned(),
+                        format!(
+                            "unsupported artifact staging command for {} {}",
+                            model.model_id, artifact_name
+                        ),
+                    ])
+                }
+            };
+            let follow_up_publish_plan = catalog_artifact_stage_follow_up_command(
+                &catalog_path,
+                &artifact_base,
+                hf_token_file.as_deref(),
+            );
+            let ok = entry_errors.is_empty();
+            let entry = CatalogArtifactStagePlanEntry {
+                model_id: model.model_id.clone(),
+                tier: model.tier.clone(),
+                artifact: artifact_name.clone(),
+                engine: artifact.engine.clone(),
+                source_kind: artifact.source.kind.clone(),
+                source_repo: artifact.source.repo.clone(),
+                source_revision: artifact.source.revision.clone(),
+                source_path: artifact.path.clone(),
+                upstream_source_kind: model.provenance.source.kind.clone(),
+                upstream_source_repo: model.provenance.source.repo.clone(),
+                upstream_source_revision: model.provenance.source.revision.clone(),
+                upstream_source_dir: source_dir.clone(),
+                artifact_path,
+                catalog_weights_bytes: artifact.weights_bytes,
+                current_artifact_exists,
+                current_artifact_is_file,
+                current_artifact_bytes,
+                stage_command,
+                follow_up_publish_plan,
+                ok,
+                errors: entry_errors,
+            };
+            if !entry.ok {
+                errors.extend(
+                    entry
+                        .errors
+                        .iter()
+                        .map(|error| format!("{} {}: {error}", entry.model_id, entry.artifact)),
+                );
+            }
+            stage_commands.push(entry);
+        }
+    }
+
+    if stage_commands.is_empty() {
+        errors.push(if launch_only {
+            "catalog has no launch model artifacts to stage".to_owned()
+        } else {
+            "catalog has no model artifacts to stage".to_owned()
+        });
+    }
+
+    let artifact_base_space_ok = artifact_base_available_bytes
+        .map(|available| available >= missing_artifact_bytes || missing_artifact_bytes == 0);
+    if artifact_base_space_ok == Some(false) {
+        errors.push(format!(
+            "artifact base filesystem has {} byte(s) available but {} byte(s) are still missing by catalog estimate",
+            artifact_base_available_bytes.unwrap_or(0),
+            missing_artifact_bytes
+        ));
+    }
+
+    let model_count = stage_commands
+        .iter()
+        .map(|entry| entry.model_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let preflight_command = catalog_artifact_stage_preflight_command(hf_token_file.as_deref());
+    CatalogArtifactStagePlanReport {
+        catalog_path,
+        artifact_base,
+        source_cache_dir,
+        launch_only,
+        hf_token_file,
+        model_count,
+        artifact_count: stage_commands.len(),
+        source_count: source_commands.len(),
+        catalog_expected_bytes,
+        current_artifact_bytes: current_artifact_bytes_total,
+        missing_artifact_bytes,
+        artifact_base_available_bytes,
+        artifact_base_space_ok,
+        ok: errors.is_empty(),
+        preflight_command,
+        source_commands,
+        stage_commands,
+        errors,
+    }
+}
+
 struct CatalogArtifactPublishPlanInput<'a> {
     catalog_doc: &'a catalog::CatalogDocument,
     catalog_path: PathBuf,
@@ -4352,6 +4780,195 @@ fn catalog_artifact_metadata_plan_command(
     push_plan_path_arg(&mut argv, "--report-output", report_path);
     if let Some(source_revision) = source_revision {
         push_plan_value_arg(&mut argv, "--source-revision", source_revision);
+    }
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
+}
+
+fn catalog_artifact_stage_source_dir(
+    source_cache_dir: &Path,
+    source: &catalog::SourceRef,
+) -> PathBuf {
+    source_cache_dir
+        .join(safe_path_component(&source.kind))
+        .join(safe_path_component(&source.repo))
+        .join(safe_path_component(&source.revision))
+}
+
+fn catalog_artifact_stage_preflight_command(
+    hf_token_file: Option<&Path>,
+) -> CatalogCanaryPlanCommand {
+    let mut checks = vec![
+        hf_cli_path_assignment(),
+        "python3 -c 'import huggingface_hub' || { echo \"missing Python huggingface_hub module: install with python3 -m pip install --user huggingface_hub[hf_xet]\" >&2; exit 1; }".to_owned(),
+    ];
+    if let Some(hf_token_file) = hf_token_file {
+        checks.push(format!(
+            "test -r {} || {{ echo \"HF token file is not readable: {}\" >&2; exit 1; }}",
+            shell_single_quote(&hf_token_file.display().to_string()),
+            hf_token_file.display()
+        ));
+    }
+    checks.push("test -n \"${MAYHEM_LLAMA_CPP_DIR:-}\" || { echo \"GGUF staging needs MAYHEM_LLAMA_CPP_DIR pointing at a llama.cpp checkout with build/bin/llama-quantize\" >&2; exit 1; }".to_owned());
+    checks.push("command -v python3 >/dev/null".to_owned());
+    let script = checks.join(" && ");
+    let mut command =
+        catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
+    command.shell = script;
+    command
+}
+
+fn catalog_artifact_stage_source_download_command(
+    source: &catalog::SourceRef,
+    source_dir: &Path,
+    hf_token_file: Option<&Path>,
+) -> CatalogCanaryPlanCommand {
+    let repo = serde_json::to_string(&source.repo).expect("repo string serializes");
+    let revision = serde_json::to_string(&source.revision).expect("revision string serializes");
+    let local_dir =
+        serde_json::to_string(&source_dir.display().to_string()).expect("path string serializes");
+    let script = format!(
+        "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id={repo}, revision={revision}, local_dir={local_dir}, token=os.environ.get('HF_TOKEN'))"
+    );
+    let mut command =
+        catalog_canary_plan_command(vec!["python3".to_owned(), "-c".to_owned(), script]);
+    command.shell = with_hf_shell_prefix(command.shell, hf_token_file, false);
+    command
+}
+
+fn catalog_artifact_stage_command(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    source_dir: &Path,
+    artifact_base: &Path,
+    artifact_path: &Path,
+) -> Result<CatalogCanaryPlanCommand> {
+    match artifact.engine.as_str() {
+        "llama.cpp" => Ok(catalog_artifact_stage_gguf_command(
+            model,
+            artifact_name,
+            source_dir,
+            artifact_base,
+            artifact_path,
+        )),
+        "mlx" => Ok(catalog_artifact_stage_mlx_command(
+            source_dir,
+            artifact_path,
+        )),
+        "trt-llm" => Ok(catalog_artifact_stage_trt_command(
+            model,
+            artifact_name,
+            source_dir,
+            artifact_base,
+            artifact_path,
+        )?),
+        other => bail!("unsupported artifact engine {other} for staging"),
+    }
+}
+
+fn catalog_artifact_stage_gguf_command(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    source_dir: &Path,
+    artifact_base: &Path,
+    artifact_path: &Path,
+) -> CatalogCanaryPlanCommand {
+    let build_dir = artifact_base
+        .join(".build")
+        .join(safe_path_component(&model.model_id))
+        .join(safe_path_component(artifact_name));
+    let f16_path = build_dir.join("model.f16.gguf");
+    let script = format!(
+        "test -n \"${{MAYHEM_LLAMA_CPP_DIR:-}}\" || {{ echo \"set MAYHEM_LLAMA_CPP_DIR to a llama.cpp checkout\" >&2; exit 1; }} && test -x \"$MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize\" || {{ echo \"missing $MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize\" >&2; exit 1; }} && mkdir -p {} {} && python3 \"$MAYHEM_LLAMA_CPP_DIR/convert_hf_to_gguf.py\" {} --outfile {} --outtype f16 && \"$MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize\" {} {} Q4_K_M && test -s {}",
+        shell_single_quote(&artifact_path.parent().unwrap_or_else(|| Path::new(".")).display().to_string()),
+        shell_single_quote(&build_dir.display().to_string()),
+        shell_single_quote(&source_dir.display().to_string()),
+        shell_single_quote(&f16_path.display().to_string()),
+        shell_single_quote(&f16_path.display().to_string()),
+        shell_single_quote(&artifact_path.display().to_string()),
+        shell_single_quote(&artifact_path.display().to_string())
+    );
+    let mut command =
+        catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
+    command.shell = script;
+    command
+}
+
+fn catalog_artifact_stage_mlx_command(
+    source_dir: &Path,
+    artifact_path: &Path,
+) -> CatalogCanaryPlanCommand {
+    let target_dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+    let script = format!(
+        "PATH=\"${{MAYHEM_MLX_VENV:+$MAYHEM_MLX_VENV/bin:}}$HOME/.local/bin:$PATH\" && export PATH && command -v python3 >/dev/null && mkdir -p {} && python3 -m mlx_lm.convert --hf-path {} --mlx-path {} --quantize && test -s {}",
+        shell_single_quote(&target_dir.display().to_string()),
+        shell_single_quote(&source_dir.display().to_string()),
+        shell_single_quote(&target_dir.display().to_string()),
+        shell_single_quote(&artifact_path.display().to_string())
+    );
+    let mut command =
+        catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
+    command.shell = script;
+    command
+}
+
+fn catalog_artifact_stage_trt_command(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    source_dir: &Path,
+    artifact_base: &Path,
+    artifact_path: &Path,
+) -> Result<CatalogCanaryPlanCommand> {
+    let qformat = match artifact_name {
+        "nvfp4" => "nvfp4",
+        "trt-fp8" => "fp8",
+        other => bail!("unsupported TensorRT artifact {other}; expected nvfp4 or trt-fp8"),
+    };
+    let trt_base = artifact_base.join(".trtllm-build");
+    let safe_model = safe_path_component(&model.model_id);
+    let safe_artifact = safe_path_component(artifact_name);
+    let checkpoint_dir = trt_base
+        .join("checkpoints")
+        .join(&safe_model)
+        .join(&safe_artifact);
+    let engine_dir = trt_base
+        .join("engines")
+        .join(&safe_model)
+        .join(&safe_artifact);
+    let script = format!(
+        "SCRIPT=\"${{MAYHEM_TRTLLM_BUILD_SCRIPT:-scripts/trtllm-engine-build.sh}}\" && test -x \"$SCRIPT\" || {{ echo \"set MAYHEM_TRTLLM_BUILD_SCRIPT or run from the Mayhem repo root\" >&2; exit 1; }} && mkdir -p {} && \"$SCRIPT\" --model-dir {} --checkpoint-dir {} --engine-dir {} --qformat {} && PAYLOAD=\"$(find {} -maxdepth 1 -type f -name 'rank*.safetensors' | sort | head -n 1)\" && test -n \"$PAYLOAD\" && cp -f \"$PAYLOAD\" {} && test -s {}",
+        shell_single_quote(&artifact_path.parent().unwrap_or_else(|| Path::new(".")).display().to_string()),
+        shell_single_quote(&source_dir.display().to_string()),
+        shell_single_quote(&checkpoint_dir.display().to_string()),
+        shell_single_quote(&engine_dir.display().to_string()),
+        shell_single_quote(qformat),
+        shell_single_quote(&checkpoint_dir.display().to_string()),
+        shell_single_quote(&artifact_path.display().to_string()),
+        shell_single_quote(&artifact_path.display().to_string())
+    );
+    let mut command =
+        catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
+    command.shell = script;
+    Ok(command)
+}
+
+fn catalog_artifact_stage_follow_up_command(
+    catalog_path: &Path,
+    artifact_base: &Path,
+    hf_token_file: Option<&Path>,
+) -> CatalogCanaryPlanCommand {
+    let report_dir = artifact_base.join(".publish-reports");
+    let mut argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "artifact-publish-plan".to_owned(),
+    ];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
+    push_plan_path_arg(&mut argv, "--artifact-base", artifact_base);
+    push_plan_path_arg(&mut argv, "--report-dir", &report_dir);
+    if let Some(hf_token_file) = hf_token_file {
+        push_plan_path_arg(&mut argv, "--hf-token-file", hf_token_file);
     }
     argv.push("--json".to_owned());
     catalog_canary_plan_command(argv)
@@ -18259,6 +18876,119 @@ mod tests {
             .argv
             .windows(2)
             .any(|pair| pair[0] == "--hf-token-file" && pair[1] == "/tmp/hf-token.txt"));
+    }
+
+    #[test]
+    fn artifact_stage_plan_emits_source_build_and_followup_commands() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-stage-artifacts"),
+            source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
+            hf_token_file: Some(PathBuf::from("/tmp/hf-token.txt")),
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.model_count, 1);
+        assert_eq!(report.artifact_count, 1);
+        assert_eq!(report.source_count, 1);
+        assert_eq!(report.catalog_expected_bytes, 42);
+        assert_eq!(report.current_artifact_bytes, 0);
+        assert_eq!(report.missing_artifact_bytes, 42);
+        assert!(report
+            .preflight_command
+            .shell
+            .contains("MAYHEM_LLAMA_CPP_DIR"));
+        assert!(report.preflight_command.shell.contains("hf-token.txt"));
+
+        let source = &report.source_commands[0];
+        assert_eq!(
+            source.source_dir,
+            PathBuf::from(format!(
+                "/tmp/mayhem-source-cache/huggingface/test_source/{}",
+                "2".repeat(40)
+            ))
+        );
+        assert!(source.command.shell.contains("snapshot_download"));
+        assert!(source.command.shell.contains("test/source"));
+        assert!(source.command.shell.contains("hf-token.txt"));
+
+        let entry = &report.stage_commands[0];
+        assert!(!entry.current_artifact_exists);
+        assert_eq!(
+            entry.artifact_path,
+            PathBuf::from(format!(
+                "/tmp/mayhem-stage-artifacts/huggingface/test_model/{}/model.gguf",
+                "1".repeat(40)
+            ))
+        );
+        assert!(entry.stage_command.shell.contains("convert_hf_to_gguf.py"));
+        assert!(entry.stage_command.shell.contains("llama-quantize"));
+        assert!(entry.stage_command.shell.contains("Q4_K_M"));
+        assert!(entry
+            .follow_up_publish_plan
+            .shell
+            .contains("'artifact-publish-plan'"));
+        assert!(entry
+            .follow_up_publish_plan
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--hf-token-file" && pair[1] == "/tmp/hf-token.txt"));
+    }
+
+    #[test]
+    fn artifact_stage_plan_emits_trt_qformat_command() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].artifacts.insert(
+            "nvfp4".to_owned(),
+            catalog::CatalogArtifact {
+                engine: "trt-llm".to_owned(),
+                source: catalog::SourceRef {
+                    kind: "huggingface".to_owned(),
+                    repo: "test/model-nvfp4".to_owned(),
+                    revision: "4".repeat(40),
+                    publisher_key: None,
+                },
+                path: "checkpoint.nvfp4.safetensors".to_owned(),
+                artifact_root: "bb".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 24,
+                source_sha256: None,
+                tokenizer_sha256: None,
+                chat_template_sha256: None,
+                min_compute_cap: Some("10.0".to_owned()),
+                download_check: false,
+                notes: None,
+            },
+        );
+
+        let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-stage-artifacts"),
+            source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
+            hf_token_file: None,
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.artifact_count, 2);
+        let trt = report
+            .stage_commands
+            .iter()
+            .find(|entry| entry.artifact == "nvfp4")
+            .unwrap();
+        assert!(trt.stage_command.shell.contains("trtllm-engine-build.sh"));
+        assert!(trt.stage_command.shell.contains("--qformat 'nvfp4'"));
+        assert!(trt.stage_command.shell.contains("rank*.safetensors"));
+        assert!(trt
+            .stage_command
+            .shell
+            .contains("checkpoint.nvfp4.safetensors"));
     }
 
     #[test]
