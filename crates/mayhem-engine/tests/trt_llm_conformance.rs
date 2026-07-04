@@ -43,6 +43,7 @@ fn trt_llm_checkpoint_smoke_generates_constrains_and_canaries() -> TestResult {
     config.trt_engine_dir = Some(engine_dir(&model_path));
     config.trt_tensor_parallel = Some(1);
     config.trt_kv_cache_dtype = kv_cache_dtype(&model_path);
+    config.trt_require_engine_dir = true;
     let info = backend.load(config)?;
     assert_eq!(info.backend, "trt-llm");
     assert_eq!(info.artifact.path, model_path);
@@ -124,6 +125,7 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
     trt_config.trt_engine_dir = Some(engine_dir(&model_path));
     trt_config.trt_tensor_parallel = Some(1);
     trt_config.trt_kv_cache_dtype = kv_cache_dtype(&model_path);
+    trt_config.trt_require_engine_dir = true;
     trt.load(trt_config)?;
 
     let mut llama = LlamaCppBackend::new()?;

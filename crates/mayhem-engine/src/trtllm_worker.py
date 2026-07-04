@@ -134,6 +134,7 @@ def create_llm(model_path, payload):
     engine_dir = payload.get("engine_dir")
     tensor_parallel = int(payload.get("tensor_parallel") or 1)
     ctx_limit = int(payload.get("ctx_size") or 2048)
+    require_engine_dir = bool(payload.get("require_engine_dir"))
     kv_config = kv_cache_config(payload.get("kv_cache_dtype"), ctx_limit)
 
     attempts = []
@@ -149,9 +150,15 @@ def create_llm(model_path, payload):
     if kv_config is not None:
         optional["kv_cache_config"] = kv_config
 
-    attempts.append({"model": model_path, **optional})
     if engine_dir and has_engine_payload(str(engine_dir)):
         attempts.insert(0, {"model": str(engine_dir), **optional})
+    elif require_engine_dir:
+        raise RuntimeError(
+            f"TensorRT-LLM prebuilt engine directory is required, but {engine_dir!r} has no .engine or .plan payload"
+        )
+
+    if not require_engine_dir:
+        attempts.append({"model": model_path, **optional})
 
     last_error = None
     for kwargs in attempts:

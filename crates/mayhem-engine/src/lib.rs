@@ -159,6 +159,8 @@ pub struct LoadConfig {
     pub trt_tensor_parallel: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trt_kv_cache_dtype: Option<String>,
+    #[serde(default)]
+    pub trt_require_engine_dir: bool,
     #[serde(default = "default_true")]
     pub use_mmap: bool,
     #[serde(default)]
@@ -200,6 +202,7 @@ impl Default for LoadConfig {
             trt_engine_dir: None,
             trt_tensor_parallel: None,
             trt_kv_cache_dtype: None,
+            trt_require_engine_dir: false,
             use_mmap: true,
             use_mlock: false,
         }
@@ -1309,6 +1312,9 @@ mod trt_llm_backend {
             verify_artifact(&config.artifact)?;
 
             let model_path = trt_llm_model_path(&config.artifact.path)?;
+            if config.trt_require_engine_dir {
+                require_trt_engine_payload(config.trt_engine_dir.as_deref())?;
+            }
             let info: WorkerLoadInfo = self.call(
                 "load",
                 json!({
@@ -1317,6 +1323,7 @@ mod trt_llm_backend {
                     "engine_dir": config.trt_engine_dir,
                     "tensor_parallel": config.trt_tensor_parallel.unwrap_or(1),
                     "kv_cache_dtype": config.trt_kv_cache_dtype,
+                    "require_engine_dir": config.trt_require_engine_dir,
                 }),
             )?;
             let loaded = LoadedModelInfo {
@@ -1556,6 +1563,40 @@ mod trt_llm_backend {
         })
     }
 
+    fn require_trt_engine_payload(engine_dir: Option<&Path>) -> Result<()> {
+        let engine_dir = engine_dir.ok_or_else(|| {
+            EngineError::InvalidConfig(
+                "TensorRT-LLM loading requires a prebuilt engine directory; run the seal-time engine build first".to_owned(),
+            )
+        })?;
+        if !engine_dir.is_dir() {
+            return Err(EngineError::InvalidConfig(format!(
+                "TensorRT-LLM engine directory {} is missing; run the seal-time engine build first",
+                engine_dir.display()
+            )));
+        }
+        if has_trt_engine_payload(engine_dir)? {
+            return Ok(());
+        }
+        Err(EngineError::InvalidConfig(format!(
+            "TensorRT-LLM engine directory {} contains no .engine or .plan payload; run the seal-time engine build first",
+            engine_dir.display()
+        )))
+    }
+
+    fn has_trt_engine_payload(engine_dir: &Path) -> Result<bool> {
+        for entry in std::fs::read_dir(engine_dir)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|ext| matches!(ext.to_str(), Some("engine" | "plan")))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn default_message_kind() -> String {
         "response".to_owned()
     }
@@ -1588,6 +1629,54 @@ mod trt_llm_backend {
             assert!(format!("{err}").contains("timed out after 1s"), "{err}");
 
             let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn trt_load_requires_prebuilt_engine_when_requested() {
+            let root =
+                env::temp_dir().join(format!("mayhem-trt-require-engine-{}", std::process::id()));
+            let checkpoint = root.join("checkpoint");
+            fs::create_dir_all(&checkpoint).expect("checkpoint dir");
+            fs::write(checkpoint.join("config.json"), "{}").expect("checkpoint config");
+            fs::write(checkpoint.join("model.safetensors"), safetensors_fixture())
+                .expect("checkpoint weights");
+
+            let mut backend = TrtLlmBackend::with_python("/does/not/matter").expect("backend");
+            let mut config = LoadConfig::trt_llm_checkpoint(&checkpoint);
+            config.trt_require_engine_dir = true;
+
+            let err = backend
+                .load(config.clone())
+                .expect_err("missing engine dir must fail before worker spawn");
+            assert!(
+                format!("{err}").contains("prebuilt engine directory"),
+                "{err}"
+            );
+
+            let engine_dir = root.join("engine");
+            fs::create_dir_all(&engine_dir).expect("engine dir");
+            config.trt_engine_dir = Some(engine_dir.clone());
+            let err = backend
+                .load(config.clone())
+                .expect_err("empty engine dir must fail before worker spawn");
+            assert!(
+                format!("{err}").contains("contains no .engine or .plan"),
+                "{err}"
+            );
+
+            fs::write(engine_dir.join("rank0.engine"), b"engine").expect("engine file");
+            assert!(require_trt_engine_payload(Some(&engine_dir)).is_ok());
+
+            let _ = fs::remove_dir_all(root);
+        }
+
+        fn safetensors_fixture() -> Vec<u8> {
+            let header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header);
+            bytes.extend_from_slice(&[0_u8; 4]);
+            bytes
         }
     }
 }

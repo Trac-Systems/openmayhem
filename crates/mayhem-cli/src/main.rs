@@ -9954,6 +9954,7 @@ fn provider_engine_load_config(
         config.trt_tensor_parallel = Some(1);
         config.trt_kv_cache_dtype =
             trt_kv_cache_dtype_for_artifact(&selected.artifact_name, &selected.artifact);
+        config.trt_require_engine_dir = true;
     }
     Ok(config)
 }
@@ -12915,6 +12916,7 @@ mod tests {
         );
         assert_eq!(config.trt_tensor_parallel, Some(1));
         assert_eq!(config.trt_kv_cache_dtype, None);
+        assert!(config.trt_require_engine_dir);
         assert_eq!(
             config.trt_engine_dir,
             Some(PathBuf::from("/tmp/.trtllm-engines/nvfp4"))
