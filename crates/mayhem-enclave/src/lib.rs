@@ -16,8 +16,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
-    AttestationBody, AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuote,
-    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    AttestationBody, AttestationReport, AttestationRuntimeConfig, AttestationSigner,
+    CatalogEnclaveIdentity, HardwareQuote, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -140,6 +140,7 @@ pub struct Tier1AttestationOptions {
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
+    pub runtime_config: AttestationRuntimeConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +153,7 @@ pub struct Tier2AttestationOptions {
     pub report_ts: u64,
     pub nonce_u: String,
     pub hw_quote: HardwareQuote,
+    pub runtime_config: AttestationRuntimeConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +165,7 @@ pub struct Tier1ExternalProviderAttestationOptions {
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
+    pub runtime_config: AttestationRuntimeConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1263,6 +1266,7 @@ pub fn build_tier1_attestation_report(
         boot_epoch: options.boot_epoch,
         report_ts: options.report_ts,
         nonce_u: options.nonce_u.clone(),
+        runtime_config: options.runtime_config.clone(),
     };
 
     let enclave_signing_key = options.runtime_keypair.signing_key();
@@ -1283,6 +1287,7 @@ pub fn build_tier1_attestation_report(
         boot_epoch: body.boot_epoch,
         report_ts: body.report_ts,
         nonce_u: body.nonce_u,
+        runtime_config: body.runtime_config,
         sig_enclave,
         sig_provider,
     };
@@ -1331,6 +1336,7 @@ pub fn build_tier2_attestation_report(
         boot_epoch: options.boot_epoch,
         report_ts: options.report_ts,
         nonce_u: options.nonce_u.clone(),
+        runtime_config: options.runtime_config.clone(),
     };
     let binding =
         hardware_quote_binding(&body).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
@@ -1359,6 +1365,7 @@ pub fn build_tier2_attestation_report(
         boot_epoch: body.boot_epoch,
         report_ts: body.report_ts,
         nonce_u: body.nonce_u,
+        runtime_config: body.runtime_config,
         sig_enclave,
         sig_provider,
     };
@@ -1401,6 +1408,7 @@ pub fn prepare_tier1_attestation_report(
         boot_epoch: options.boot_epoch,
         report_ts: options.report_ts,
         nonce_u: options.nonce_u.clone(),
+        runtime_config: options.runtime_config.clone(),
     };
 
     let enclave_signing_key = options.runtime_keypair.signing_key();
@@ -1437,6 +1445,7 @@ pub fn finalize_tier1_attestation_report(
         boot_epoch: draft.body.boot_epoch,
         report_ts: draft.body.report_ts,
         nonce_u: draft.body.nonce_u,
+        runtime_config: draft.body.runtime_config,
         sig_enclave: draft.sig_enclave,
         sig_provider,
     };
@@ -2382,6 +2391,7 @@ mod tests {
             boot_epoch: 100,
             report_ts: 200,
             nonce_u: "aa".repeat(32),
+            runtime_config: AttestationRuntimeConfig::default(),
         })?;
         assert_eq!(report.report.binary_hash, binary_hash);
         assert_eq!(report.report.manifest_hash, identity.manifest_hash);
@@ -2397,6 +2407,7 @@ mod tests {
             boot_epoch: 100,
             report_ts: 200,
             nonce_u: "aa".repeat(32),
+            runtime_config: AttestationRuntimeConfig::default(),
         })
         .expect_err("wrong identity binary hash must fail before signing");
         assert!(err.to_string().contains("does not match measured"));
@@ -2426,6 +2437,7 @@ mod tests {
             boot_epoch: 100,
             report_ts: 200,
             nonce_u: "aa".repeat(32),
+            runtime_config: AttestationRuntimeConfig::default(),
         })?;
         let provider_message = hex::decode(&draft.provider_signing_message_hex)?;
         let sig_provider = provider_key.sign(&provider_message);

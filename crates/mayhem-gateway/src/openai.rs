@@ -83,6 +83,8 @@ pub struct GatewayRouteCandidate {
     pub artifact_root: String,
     pub manifest_hash: String,
     pub binary_hash: String,
+    #[serde(default)]
+    pub caps: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1605,6 +1607,7 @@ impl GatewayState {
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
                 att_tier: candidate.att_tier,
+                caps: candidate.caps.clone(),
             },
             trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
         });
@@ -2591,6 +2594,7 @@ mod tests {
             manifest_hash: identity.manifest_hash.clone(),
             binary_hash: identity.binary_hash.clone(),
             att_tier: 1,
+            caps: json!({}),
         };
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
@@ -2781,6 +2785,7 @@ mod tests {
             boot_epoch: 1,
             report_ts: 2,
             nonce_u,
+            runtime_config: mayhem_proto::AttestationRuntimeConfig::default(),
             sig_enclave: String::new(),
             sig_provider: String::new(),
         };

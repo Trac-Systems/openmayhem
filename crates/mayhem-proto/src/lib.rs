@@ -38,6 +38,30 @@ pub struct AttestationBody {
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
+    pub runtime_config: AttestationRuntimeConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttestationRuntimeConfig {
+    pub backend: String,
+    pub ctx: u32,
+    pub tp_degree: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_tokens: Option<u32>,
+}
+
+impl Default for AttestationRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            backend: "unknown".to_owned(),
+            ctx: 0,
+            tp_degree: 1,
+            max_batch_size: None,
+            max_num_tokens: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -72,6 +96,7 @@ pub struct AttestationReport {
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
+    pub runtime_config: AttestationRuntimeConfig,
     pub sig_enclave: String,
     pub sig_provider: String,
 }
@@ -180,6 +205,7 @@ impl AttestationReport {
             boot_epoch: self.boot_epoch,
             report_ts: self.report_ts,
             nonce_u: self.nonce_u.clone(),
+            runtime_config: self.runtime_config.clone(),
         }
     }
 }
@@ -328,6 +354,7 @@ mod tests {
             boot_epoch: 1,
             report_ts: 2,
             nonce_u: "aa".repeat(32),
+            runtime_config: AttestationRuntimeConfig::default(),
         };
         let base = hardware_quote_binding(&body).unwrap();
         body.hw_quote = Some(HardwareQuote {

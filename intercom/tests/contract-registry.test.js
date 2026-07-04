@@ -728,6 +728,42 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   );
   assert.equal(accepted.ok, true, accepted.message);
 
+  const tensorParallelCaps = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'b'.repeat(64),
+      caps: {
+        ...catalogStyleCaps,
+        tp_degree: 2,
+        max_batch_size: 4,
+        max_num_tokens: 4096,
+      },
+    },
+    admin.publicKey,
+    5
+  );
+  assert.equal(tensorParallelCaps.ok, true, tensorParallelCaps.message);
+
+  const invalidTensorParallelCaps = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'c'.repeat(64),
+      caps: {
+        ...catalogStyleCaps,
+        tp_degree: 0,
+      },
+    },
+    admin.publicKey,
+    6
+  );
+  assert.match(invalidTensorParallelCaps.message, /caps tp_degree must be a positive integer/i);
+
   const unsupportedUpdate = await execute(
     contract,
     storage,
@@ -741,7 +777,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
       },
     },
     admin.publicKey,
-    5
+    7
   );
   assert.match(unsupportedUpdate.message, /unsupported enclave caps field.*price_ver/i);
 
@@ -759,7 +795,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
       caps: updatedCaps,
     },
     admin.publicKey,
-    6
+    8
   );
   assert.equal(validUpdate.ok, true, validUpdate.message);
 
@@ -767,7 +803,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   assert.deepEqual(stored.value.caps, updatedCaps);
   assert.equal(stored.value.updated_by, admin.publicKey);
   assert.equal(stored.value.updated_by_role, 'admin');
-  assert.equal(stored.value.updated_at, makeTxKey(6));
+  assert.equal(stored.value.updated_at, makeTxKey(8));
 });
 
 test('MayhemContract rejects provider-authored payout and probation hints', async () => {

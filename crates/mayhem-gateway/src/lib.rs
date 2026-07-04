@@ -114,6 +114,7 @@ pub struct EnclaveContractRecord {
     pub manifest_hash: String,
     pub binary_hash: String,
     pub att_tier: u8,
+    pub caps: Value,
 }
 
 #[derive(Debug)]
@@ -410,6 +411,11 @@ pub fn verify_tier1_attestation(
         &request.contract.att_tier.to_string(),
         &report.att_tier.to_string(),
     )?;
+    compare_field(
+        "runtime_config.tp_degree",
+        &expected_tp_degree(&request.contract.caps).to_string(),
+        &report.runtime_config.tp_degree.to_string(),
+    )?;
 
     let expected_enclave_id = catalog_enclave_id(&request.contract.identity());
     if request.contract.enclave_id != expected_enclave_id {
@@ -497,6 +503,14 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
             kind: "nvidia_nras_jwt".to_owned(),
         }),
     }
+}
+
+fn expected_tp_degree(caps: &Value) -> u32 {
+    caps.get("tp_degree")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
 }
 
 fn compare_field(field: &'static str, expected: &str, actual: &str) -> Result<()> {
@@ -796,7 +810,9 @@ fn hex_to_array<const N: usize>(value: &str) -> std::result::Result<[u8; N], Str
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use mayhem_proto::{AttestationBody, AttestationReport, ATTESTATION_ALG};
+    use mayhem_proto::{
+        AttestationBody, AttestationReport, AttestationRuntimeConfig, ATTESTATION_ALG,
+    };
     use serde_json::json;
 
     fn sample_report() -> AttestationReport {
@@ -813,6 +829,7 @@ mod tests {
             boot_epoch: 100,
             report_ts: 200,
             nonce_u: "aa".repeat(32),
+            runtime_config: AttestationRuntimeConfig::default(),
             sig_enclave: "33".repeat(64),
             sig_provider: "44".repeat(64),
         }
@@ -843,6 +860,7 @@ mod tests {
                 boot_epoch: report.boot_epoch,
                 report_ts: report.report_ts,
                 nonce_u: report.nonce_u,
+                runtime_config: report.runtime_config,
             }
         );
     }

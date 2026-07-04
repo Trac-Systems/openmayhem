@@ -103,6 +103,9 @@ const ENCLAVE_CAP_FIELDS = new Set([
   ...ENCLAVE_CAP_BOOLEAN_FIELDS,
   'ctx',
   'ctx_max',
+  'tp_degree',
+  'max_batch_size',
+  'max_num_tokens',
 ]);
 const ROOM_POLICY_FIELDS = new Set([
   'region_hint',
@@ -3129,7 +3132,7 @@ class MayhemContract extends Contract {
     }
     const hasCtx = hasOwn(caps, 'ctx');
     const hasCtxMax = hasOwn(caps, 'ctx_max');
-    for (const key of ['ctx', 'ctx_max']) {
+    for (const key of ['ctx', 'ctx_max', 'tp_degree', 'max_batch_size', 'max_num_tokens']) {
       if (hasOwn(caps, key) && (!Number.isSafeInteger(caps[key]) || caps[key] <= 0)) {
         return new Error(`Enclave caps ${key} must be a positive integer.`);
       }

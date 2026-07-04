@@ -12,8 +12,9 @@ use mayhem_gateway::{
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, GatewayError,
 };
 use mayhem_proto::{
-    catalog_enclave_id, hardware_quote_binding, AttestationBody, CatalogEnclaveIdentity,
-    HardwareQuote, HardwareQuoteKind, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    catalog_enclave_id, hardware_quote_binding, AttestationBody, AttestationRuntimeConfig,
+    CatalogEnclaveIdentity, HardwareQuote, HardwareQuoteKind, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION,
 };
 
 fn test_report() -> (
@@ -42,6 +43,7 @@ fn test_report() -> (
         boot_epoch: 100,
         report_ts: 200,
         nonce_u: "aa".repeat(32),
+        runtime_config: AttestationRuntimeConfig::default(),
     })
     .expect("build report");
     let contract = EnclaveContractRecord {
@@ -52,6 +54,7 @@ fn test_report() -> (
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
         att_tier: 1,
+        caps: serde_json::json!({}),
     };
     let trusted = BTreeSet::from([attestation.report.binary_hash.clone()]);
 
@@ -92,6 +95,7 @@ fn test_tier2_report(
         boot_epoch: 100,
         report_ts: 200,
         nonce_u: "aa".repeat(32),
+        runtime_config: AttestationRuntimeConfig::default(),
     };
     let quote = HardwareQuote {
         kind: quote_kind,
@@ -108,6 +112,7 @@ fn test_tier2_report(
         report_ts: body.report_ts,
         nonce_u: body.nonce_u.clone(),
         hw_quote: quote,
+        runtime_config: body.runtime_config.clone(),
     })
     .expect("build tier2 report");
     let contract = EnclaveContractRecord {
@@ -118,6 +123,7 @@ fn test_tier2_report(
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
         att_tier: TIER2_ATTESTATION_TIER,
+        caps: serde_json::json!({}),
     };
     let trusted = BTreeSet::from([attestation.report.binary_hash.clone()]);
 
@@ -137,6 +143,24 @@ fn verifies_signed_tier1_report() {
     assert_eq!(verified.provider_pubkey, report.provider_pubkey);
     assert_eq!(verified.enclave_pubkey, report.enclave_pubkey);
     assert!(!verified.report_head.is_empty());
+}
+
+#[test]
+fn verification_rejects_runtime_tp_degree_mismatch() {
+    let (_temp, report, mut contract, trusted) = test_report();
+    contract.caps = serde_json::json!({ "tp_degree": 2 });
+    let request =
+        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+
+    let err = verify_tier1_attestation(&request).expect_err("tp_degree must match admin caps");
+
+    assert!(matches!(
+        err,
+        GatewayError::ContractMismatch {
+            field: "runtime_config.tp_degree",
+            ..
+        }
+    ));
 }
 
 #[test]

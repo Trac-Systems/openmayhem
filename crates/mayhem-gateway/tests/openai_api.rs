@@ -605,6 +605,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         artifact_root: identity.artifact_root,
         manifest_hash: identity.manifest_hash,
         binary_hash: identity.binary_hash,
+        caps: serde_json::json!({}),
     }
 }
 

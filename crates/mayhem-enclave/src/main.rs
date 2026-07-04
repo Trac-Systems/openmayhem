@@ -13,7 +13,7 @@ use mayhem_enclave::{
     SandboxConfig, SandboxPlatform, SealOptions, Tier1AttestationOptions, DEFAULT_CHUNK_SIZE,
     DEFAULT_TCP_PROBE_TIMEOUT_MS,
 };
-use mayhem_proto::CatalogEnclaveIdentity;
+use mayhem_proto::{AttestationRuntimeConfig, CatalogEnclaveIdentity};
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem-enclave")]
@@ -405,6 +405,7 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
         boot_epoch: args.boot_epoch.unwrap_or(now),
         report_ts: args.report_ts.unwrap_or(now),
         nonce_u: args.nonce_u,
+        runtime_config: AttestationRuntimeConfig::default(),
     })?;
 
     if report.report.enclave_id != args.enclave_id {

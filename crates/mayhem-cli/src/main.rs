@@ -43,7 +43,8 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage, SESSION_RECEIPT_SCHEMA_VERSION,
+    AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -7528,6 +7529,7 @@ struct ProviderSessionRuntime<'a> {
     keypair_path: &'a Path,
     password: &'a str,
     attestation_identity: CatalogEnclaveIdentity,
+    runtime_config: AttestationRuntimeConfig,
     runtime_keypair: &'a RuntimeKeypair,
     binary_path: &'a Path,
     boot_epoch: u64,
@@ -7775,6 +7777,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         manifest_hash: selected.enclave.manifest_hash.clone(),
         binary_hash: binary_hash.clone(),
     };
+    let runtime_config = provider_attestation_runtime_config(&selected)?;
     let draft = prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
         identity: attestation_identity.clone(),
         runtime_keypair: runtime_keypair.clone(),
@@ -7783,6 +7786,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         boot_epoch: now,
         report_ts: now,
         nonce_u,
+        runtime_config: runtime_config.clone(),
     })?;
     let provider_attestation_sig = sign_hex(
         &keypair_path,
@@ -7889,6 +7893,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "head": attestation.report_head,
             "enclave_pubkey": attestation.report.enclave_pubkey,
             "att_tier": attestation.report.att_tier,
+            "runtime_config": attestation.report.runtime_config,
         },
         "rules": &rules,
         "rooms": rooms.clone(),
@@ -7944,6 +7949,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 keypair_path: &keypair_path,
                 password: &password,
                 attestation_identity,
+                runtime_config,
                 runtime_keypair: &runtime_keypair,
                 binary_path: &binary_path,
                 boot_epoch: attestation.report.boot_epoch,
@@ -8860,6 +8866,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     artifact_root: enclave.artifact_root.clone(),
                     manifest_hash: enclave.manifest_hash.clone(),
                     binary_hash: enclave.binary_hash.clone(),
+                    caps: enclave.caps.clone(),
                 },
             );
         let tier = format!("T{}", enclave.att_tier);
@@ -8978,6 +8985,43 @@ fn gateway_caps_from_contract(caps: &Value) -> ModelCaps {
     }
 }
 
+fn enclave_cap_u32(caps: &Value, key: &'static str, default: u32) -> Result<u32> {
+    match caps.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .with_context(|| format!("enclave caps {key} must be a positive u32")),
+    }
+}
+
+fn enclave_tp_degree(caps: &Value) -> Result<u32> {
+    enclave_cap_u32(caps, "tp_degree", 1)
+}
+
+fn enclave_max_batch_size(caps: &Value) -> Result<Option<u32>> {
+    match caps.get("max_batch_size") {
+        None => Ok(None),
+        Some(_) => Ok(Some(enclave_cap_u32(caps, "max_batch_size", 1)?)),
+    }
+}
+
+fn enclave_max_num_tokens(caps: &Value) -> Result<Option<u32>> {
+    match caps.get("max_num_tokens") {
+        None => Ok(None),
+        Some(_) => Ok(Some(enclave_cap_u32(caps, "max_num_tokens", 1)?)),
+    }
+}
+
+fn tensor_parallel_capable_gpu_count(hardware: &HardwareReport) -> usize {
+    hardware
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.supports_tensor_parallel)
+        .count()
+}
+
 fn merge_model_caps(target: &mut ModelCaps, next: &ModelCaps) {
     target.tools |= next.tools;
     target.json |= next.json;
@@ -9020,6 +9064,17 @@ fn build_provider_candidates(
         else {
             continue;
         };
+        if enclave.backend == "trt-llm" {
+            let Ok(tp_degree) = enclave_tp_degree(&enclave.caps) else {
+                continue;
+            };
+            if tp_degree > 1
+                && tensor_parallel_capable_gpu_count(hardware)
+                    < usize::try_from(tp_degree).unwrap_or(usize::MAX)
+            {
+                continue;
+            }
+        }
         let Some((artifact_name, artifact)) =
             select_catalog_artifact(model, &enclave.backend, hardware)
         else {
@@ -10459,6 +10514,7 @@ async fn provider_session_attestation(
         runtime.boot_epoch,
         report_ts,
         att_nonce,
+        runtime.runtime_config.clone(),
     )?;
     let provider_attestation_sig = sign_hex(
         runtime.keypair_path,
@@ -10478,6 +10534,7 @@ fn prepare_provider_session_attestation(
     boot_epoch: u64,
     report_ts: u64,
     att_nonce: &str,
+    runtime_config: AttestationRuntimeConfig,
 ) -> Result<Tier1AttestationDraft> {
     prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
         identity: identity.clone(),
@@ -10487,6 +10544,7 @@ fn prepare_provider_session_attestation(
         boot_epoch,
         report_ts,
         nonce_u: att_nonce.to_owned(),
+        runtime_config,
     })
     .context("preparing per-session provider attestation")
 }
@@ -10579,12 +10637,43 @@ fn provider_engine_load_config(
     config.gpu_layers = selected.verdict.n_layers_gpu;
     if selected.artifact.engine == "trt-llm" {
         config.trt_engine_dir = Some(trt_engine_cache_dir(artifact_path, &selected.artifact_name));
-        config.trt_tensor_parallel = Some(1);
+        config.trt_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
+        if let Some(max_batch_size) = enclave_max_batch_size(&selected.enclave.caps)? {
+            config.batch_size = max_batch_size;
+        }
+        if let Some(max_num_tokens) = enclave_max_num_tokens(&selected.enclave.caps)? {
+            config.ubatch_size = max_num_tokens.max(config.ctx_size);
+        }
         config.trt_kv_cache_dtype =
             trt_kv_cache_dtype_for_artifact(&selected.artifact_name, &selected.artifact);
         config.trt_require_engine_dir = true;
     }
     Ok(config)
+}
+
+fn provider_attestation_runtime_config(
+    selected: &ProviderCandidate,
+) -> Result<AttestationRuntimeConfig> {
+    let ctx = u32::try_from(selected.model.caps.ctx_max).with_context(|| {
+        format!(
+            "catalog ctx_max {} for {} exceeds attestation runtime config range",
+            selected.model.caps.ctx_max, selected.model.model_id
+        )
+    })?;
+    let tp_degree = if selected.artifact.engine == "trt-llm" {
+        enclave_tp_degree(&selected.enclave.caps)?
+    } else {
+        1
+    };
+    let max_num_tokens =
+        enclave_max_num_tokens(&selected.enclave.caps)?.map(|tokens| tokens.max(ctx));
+    Ok(AttestationRuntimeConfig {
+        backend: selected.artifact.engine.clone(),
+        ctx,
+        tp_degree,
+        max_batch_size: enclave_max_batch_size(&selected.enclave.caps)?,
+        max_num_tokens,
+    })
 }
 
 fn trt_engine_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
@@ -12919,7 +13008,8 @@ mod tests {
     fn provider_candidates_require_admin_enclave_and_matching_catalog_artifact() {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
-        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.gpus.truncate(1);
         let args = test_provider_start_args();
         let contract = test_contract(&root);
 
@@ -13346,6 +13436,13 @@ mod tests {
             binary_hash: measure_binary(&binary_path).unwrap(),
         };
         let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
+        let runtime_config = AttestationRuntimeConfig {
+            backend: "trt-llm".to_owned(),
+            ctx: 8192,
+            tp_degree: 2,
+            max_batch_size: Some(4),
+            max_num_tokens: Some(4096),
+        };
         let draft = prepare_provider_session_attestation(
             &identity,
             &runtime_keypair,
@@ -13354,11 +13451,13 @@ mod tests {
             100,
             101,
             att_nonce,
+            runtime_config.clone(),
         )
         .unwrap();
 
         assert_eq!(draft.body.nonce_u, att_nonce);
         assert_eq!(draft.body.provider_pubkey, terms.provider.as_str());
+        assert_eq!(draft.body.runtime_config, runtime_config);
 
         let other_nonce = "99".repeat(32);
         let other_draft = prepare_provider_session_attestation(
@@ -13369,6 +13468,7 @@ mod tests {
             100,
             101,
             &other_nonce,
+            runtime_config,
         )
         .unwrap();
         assert_eq!(other_draft.body.nonce_u, other_nonce);
@@ -13653,6 +13753,14 @@ mod tests {
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "trt-llm".to_owned();
         contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        contract.enclaves[0].caps = json!({
+            "tools": true,
+            "json": true,
+            "ctx": 8192,
+            "tp_degree": 2,
+            "max_batch_size": 4,
+            "max_num_tokens": 16384
+        });
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
         let args = test_provider_start_args();
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
@@ -13669,13 +13777,57 @@ mod tests {
             config.artifact.format,
             mayhem_engine::ArtifactFormat::TensorRtLlmCheckpoint
         );
-        assert_eq!(config.trt_tensor_parallel, Some(1));
+        assert_eq!(config.trt_tensor_parallel, Some(2));
+        assert_eq!(config.batch_size, 4);
+        assert_eq!(config.ubatch_size, 16384);
+        assert_eq!(
+            provider_attestation_runtime_config(&selected).unwrap(),
+            AttestationRuntimeConfig {
+                backend: "trt-llm".to_owned(),
+                ctx: 8192,
+                tp_degree: 2,
+                max_batch_size: Some(4),
+                max_num_tokens: Some(16384),
+            }
+        );
         assert_eq!(config.trt_kv_cache_dtype, None);
         assert!(config.trt_require_engine_dir);
         assert_eq!(
             config.trt_engine_dir,
             Some(PathBuf::from("/tmp/.trtllm-engines/nvfp4"))
         );
+    }
+
+    #[test]
+    fn provider_candidates_skip_tp2_enclave_without_two_capable_gpus() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        trt_artifact.engine = "trt-llm".to_owned();
+        trt_artifact.path = "checkpoint.nvfp4.safetensors".to_owned();
+        trt_artifact.min_compute_cap = Some("10.0".to_owned());
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), trt_artifact);
+        catalog.models[0].requirements.backends = vec!["trt-llm".to_owned()];
+
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].backend = "trt-llm".to_owned();
+        contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        contract.enclaves[0].caps = json!({
+            "tools": true,
+            "json": true,
+            "ctx": 8192,
+            "tp_degree": 2
+        });
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.gpus.truncate(1);
+        let args = test_provider_start_args();
+
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("no feasible active admin-created enclaves"));
     }
 
     #[test]
