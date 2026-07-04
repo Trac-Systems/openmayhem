@@ -11,11 +11,22 @@ KV_CACHE_DTYPE=""
 CTX_SIZE="1024"
 MAX_BATCH_SIZE="1"
 MAX_NUM_TOKENS=""
+OPT_NUM_TOKENS=""
 CALIB_SIZE="8"
 CALIB_MAX_SEQ_LENGTH="128"
 TP_SIZE="1"
 WORKERS="1"
 MOUNT_ROOT=""
+GPT_ATTENTION_PLUGIN=""
+CONTEXT_FMHA=""
+REMOVE_INPUT_PADDING=""
+USE_PAGED_CONTEXT_FMHA=""
+USE_FP8_CONTEXT_FMHA=""
+FUSE_FP4_QUANT=""
+MULTIPLE_PROFILES=""
+PROFILING_VERBOSITY=""
+INPUT_TIMING_CACHE=""
+OUTPUT_TIMING_CACHE=""
 FORCE=0
 
 usage() {
@@ -37,11 +48,24 @@ Options:
   --ctx-size N              Max input/sequence length for the engine (default: 1024)
   --max-batch-size N        Engine max batch size (default: 1)
   --max-num-tokens N        Engine max batched tokens (default: ctx-size)
+  --opt-num-tokens N        Preferred batched token profile for TensorRT tactic choice
   --calib-dataset PATH      Local HF dataset dir with train split/text column
   --calib-size N            Calibration samples for quantized export (default: 8)
   --calib-max-seq-length N  Calibration sequence length (default: 128)
   --tp-size N               Tensor parallel degree (default: 1)
   --workers N               trtllm-build workers (default: 1)
+  --gpt-attention-plugin V  auto,float16,bfloat16,float32,int32,disable
+  --context-fmha V          enable or disable
+  --remove-input-padding V  enable or disable
+  --use-paged-context-fmha V
+                            enable or disable
+  --use-fp8-context-fmha V  enable or disable
+  --fuse-fp4-quant V        enable or disable
+  --multiple-profiles V     enable or disable
+  --profiling-verbosity V   layer_names_only,detailed,none
+  --input-timing-cache PATH Read TensorRT timing cache when present
+  --output-timing-cache PATH
+                            Write TensorRT timing cache
   --image IMAGE             TensorRT-LLM container image
                             (default: nvcr.io/nvidia/tensorrt-llm/release:1.2.0)
   --mount-root PATH         Host path mounted into the container at the same path
@@ -61,10 +85,21 @@ while [[ $# -gt 0 ]]; do
     --ctx-size) CTX_SIZE="$2"; shift 2 ;;
     --max-batch-size) MAX_BATCH_SIZE="$2"; shift 2 ;;
     --max-num-tokens) MAX_NUM_TOKENS="$2"; shift 2 ;;
+    --opt-num-tokens) OPT_NUM_TOKENS="$2"; shift 2 ;;
     --calib-size) CALIB_SIZE="$2"; shift 2 ;;
     --calib-max-seq-length) CALIB_MAX_SEQ_LENGTH="$2"; shift 2 ;;
     --tp-size) TP_SIZE="$2"; shift 2 ;;
     --workers) WORKERS="$2"; shift 2 ;;
+    --gpt-attention-plugin) GPT_ATTENTION_PLUGIN="$2"; shift 2 ;;
+    --context-fmha) CONTEXT_FMHA="$2"; shift 2 ;;
+    --remove-input-padding) REMOVE_INPUT_PADDING="$2"; shift 2 ;;
+    --use-paged-context-fmha) USE_PAGED_CONTEXT_FMHA="$2"; shift 2 ;;
+    --use-fp8-context-fmha) USE_FP8_CONTEXT_FMHA="$2"; shift 2 ;;
+    --fuse-fp4-quant) FUSE_FP4_QUANT="$2"; shift 2 ;;
+    --multiple-profiles) MULTIPLE_PROFILES="$2"; shift 2 ;;
+    --profiling-verbosity) PROFILING_VERBOSITY="$2"; shift 2 ;;
+    --input-timing-cache) INPUT_TIMING_CACHE="$2"; shift 2 ;;
+    --output-timing-cache) OUTPUT_TIMING_CACHE="$2"; shift 2 ;;
     --image) IMAGE="$2"; shift 2 ;;
     --mount-root) MOUNT_ROOT="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
@@ -90,6 +125,12 @@ if [[ -z "$CHECKPOINT_DIR" ]]; then
 fi
 CHECKPOINT_DIR="$(realpath -m "$CHECKPOINT_DIR")"
 MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-$CTX_SIZE}"
+if [[ -n "$INPUT_TIMING_CACHE" ]]; then
+  INPUT_TIMING_CACHE="$(realpath -m "$INPUT_TIMING_CACHE")"
+fi
+if [[ -n "$OUTPUT_TIMING_CACHE" ]]; then
+  OUTPUT_TIMING_CACHE="$(realpath -m "$OUTPUT_TIMING_CACHE")"
+fi
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
@@ -122,6 +163,8 @@ common_mount_root() {
     if contains_path "$parent" "$MODEL_DIR" &&
       contains_path "$parent" "$CHECKPOINT_DIR" &&
       contains_path "$parent" "$ENGINE_DIR" &&
+      { [[ -z "$INPUT_TIMING_CACHE" ]] || contains_path "$parent" "$INPUT_TIMING_CACHE"; } &&
+      { [[ -z "$OUTPUT_TIMING_CACHE" ]] || contains_path "$parent" "$OUTPUT_TIMING_CACHE"; } &&
       { [[ -z "$CALIB_DATASET" ]] || contains_path "$parent" "$CALIB_DATASET"; }; then
       printf '%s\n' "$parent"
       return
@@ -164,10 +207,21 @@ docker run --rm -i --gpus all --ipc=host \
   -e CTX_SIZE="$CTX_SIZE" \
   -e MAX_BATCH_SIZE="$MAX_BATCH_SIZE" \
   -e MAX_NUM_TOKENS="$MAX_NUM_TOKENS" \
+  -e OPT_NUM_TOKENS="$OPT_NUM_TOKENS" \
   -e CALIB_SIZE="$CALIB_SIZE" \
   -e CALIB_MAX_SEQ_LENGTH="$CALIB_MAX_SEQ_LENGTH" \
   -e TP_SIZE="$TP_SIZE" \
   -e WORKERS="$WORKERS" \
+  -e GPT_ATTENTION_PLUGIN="$GPT_ATTENTION_PLUGIN" \
+  -e CONTEXT_FMHA="$CONTEXT_FMHA" \
+  -e REMOVE_INPUT_PADDING="$REMOVE_INPUT_PADDING" \
+  -e USE_PAGED_CONTEXT_FMHA="$USE_PAGED_CONTEXT_FMHA" \
+  -e USE_FP8_CONTEXT_FMHA="$USE_FP8_CONTEXT_FMHA" \
+  -e FUSE_FP4_QUANT="$FUSE_FP4_QUANT" \
+  -e MULTIPLE_PROFILES="$MULTIPLE_PROFILES" \
+  -e PROFILING_VERBOSITY="$PROFILING_VERBOSITY" \
+  -e INPUT_TIMING_CACHE="$INPUT_TIMING_CACHE" \
+  -e OUTPUT_TIMING_CACHE="$OUTPUT_TIMING_CACHE" \
   -e HOST_UID="$HOST_UID" \
   -e HOST_GID="$HOST_GID" \
   --entrypoint bash "$IMAGE" -s <<'INNER'
@@ -291,6 +345,24 @@ if ! has_engine_payload "$ENGINE_DIR"; then
     --workers "$WORKERS"
     --log_level info
   )
+  append_build_arg() {
+    local flag="$1"
+    local value="$2"
+    if [[ -n "$value" ]]; then
+      build_args+=("$flag" "$value")
+    fi
+  }
+  append_build_arg --opt_num_tokens "$OPT_NUM_TOKENS"
+  append_build_arg --gpt_attention_plugin "$GPT_ATTENTION_PLUGIN"
+  append_build_arg --context_fmha "$CONTEXT_FMHA"
+  append_build_arg --remove_input_padding "$REMOVE_INPUT_PADDING"
+  append_build_arg --use_paged_context_fmha "$USE_PAGED_CONTEXT_FMHA"
+  append_build_arg --use_fp8_context_fmha "$USE_FP8_CONTEXT_FMHA"
+  append_build_arg --fuse_fp4_quant "$FUSE_FP4_QUANT"
+  append_build_arg --multiple_profiles "$MULTIPLE_PROFILES"
+  append_build_arg --profiling_verbosity "$PROFILING_VERBOSITY"
+  append_build_arg --input_timing_cache "$INPUT_TIMING_CACHE"
+  append_build_arg --output_timing_cache "$OUTPUT_TIMING_CACHE"
   case "$QFORMAT" in
     nvfp4) build_args+=(--gemm_plugin nvfp4) ;;
     fp8) build_args+=(--gemm_plugin fp8) ;;
@@ -334,7 +406,20 @@ manifest = {
     "ctx_size": int(os.environ["CTX_SIZE"]),
     "max_batch_size": int(os.environ["MAX_BATCH_SIZE"]),
     "max_num_tokens": int(os.environ["MAX_NUM_TOKENS"]),
+    "opt_num_tokens": int(os.environ["OPT_NUM_TOKENS"]) if os.environ["OPT_NUM_TOKENS"] else None,
     "tp_size": int(os.environ["TP_SIZE"]),
+    "build_options": {
+        "gpt_attention_plugin": os.environ["GPT_ATTENTION_PLUGIN"] or None,
+        "context_fmha": os.environ["CONTEXT_FMHA"] or None,
+        "remove_input_padding": os.environ["REMOVE_INPUT_PADDING"] or None,
+        "use_paged_context_fmha": os.environ["USE_PAGED_CONTEXT_FMHA"] or None,
+        "use_fp8_context_fmha": os.environ["USE_FP8_CONTEXT_FMHA"] or None,
+        "fuse_fp4_quant": os.environ["FUSE_FP4_QUANT"] or None,
+        "multiple_profiles": os.environ["MULTIPLE_PROFILES"] or None,
+        "profiling_verbosity": os.environ["PROFILING_VERBOSITY"] or None,
+        "input_timing_cache": os.environ["INPUT_TIMING_CACHE"] or None,
+        "output_timing_cache": os.environ["OUTPUT_TIMING_CACHE"] or None,
+    },
     "files": files,
 }
 (engine_dir / "mayhem-trtllm-engine-manifest.json").write_text(
