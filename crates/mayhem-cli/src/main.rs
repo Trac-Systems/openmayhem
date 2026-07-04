@@ -356,6 +356,10 @@ struct UseArgs {
     #[arg(long)]
     session_frame_timeout_seconds: Option<u64>,
 
+    /// Trusted NVIDIA NRAS JWKS JSON file for verifying Tier-2 NVIDIA hardware quotes.
+    #[arg(long, value_name = "PATH")]
+    nvidia_nras_jwks_file: Option<PathBuf>,
+
     /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
     #[arg(long)]
     bind: Option<String>,
@@ -8246,6 +8250,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
+    let nvidia_nras_jwks = match &args.nvidia_nras_jwks_file {
+        Some(path) => {
+            let path = absolutize(path.clone())?;
+            Some(
+                read_json_file(&path)
+                    .with_context(|| format!("loading NVIDIA NRAS JWKS from {}", path.display()))?,
+            )
+        }
+        None => None,
+    };
     let (state, source, model_count, backend) = if args.dev_embedded_catalog {
         let state = GatewayState::from_embedded_catalog();
         (
@@ -8287,6 +8301,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             format!("sc-bridge-direct-session:{sc_bridge_url}"),
         )
     };
+    let state = if let Some(jwks) = nvidia_nras_jwks {
+        state.with_nvidia_nras_jwks(jwks)
+    } else {
+        state
+    };
     let report = json!({
         "ok": true,
         "home": home,
@@ -8296,6 +8315,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "source": source,
         "backend": backend,
         "models": model_count,
+        "nvidia_nras_jwks": args.nvidia_nras_jwks_file.is_some(),
     });
 
     if args.json {
@@ -8313,6 +8333,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 model_count.unwrap_or(0)
             );
             println!("Backend: {backend}");
+            if args.nvidia_nras_jwks_file.is_some() {
+                println!("Tier-2 NVIDIA NRAS verification: trusted JWKS loaded.");
+            }
         }
         println!("Use Ctrl-C to stop.");
     }

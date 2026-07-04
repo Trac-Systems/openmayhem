@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fs;
 
 use ed25519_dalek::SigningKey;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use mayhem_enclave::{
     build_tier1_attestation_report, build_tier2_attestation_report, measure_binary, RuntimeKeypair,
     Tier1AttestationOptions, Tier2AttestationOptions, TIER2_ATTESTATION_TIER,
@@ -69,6 +70,18 @@ fn test_tier2_report(
     EnclaveContractRecord,
     BTreeSet<String>,
 ) {
+    test_tier2_report_with_evidence(quote_kind, |_| "mock-hardware-quote".to_owned())
+}
+
+fn test_tier2_report_with_evidence(
+    quote_kind: HardwareQuoteKind,
+    evidence_for_binding: impl FnOnce(&str) -> String,
+) -> (
+    tempfile::TempDir,
+    mayhem_proto::AttestationReport,
+    EnclaveContractRecord,
+    BTreeSet<String>,
+) {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("mayhem-enclave-test-bin");
     fs::write(&binary, b"measured tier2 enclave binary").expect("write test binary");
@@ -97,10 +110,11 @@ fn test_tier2_report(
         nonce_u: "aa".repeat(32),
         runtime_config: AttestationRuntimeConfig::default(),
     };
+    let binding = hardware_quote_binding(&body).expect("binding");
     let quote = HardwareQuote {
         kind: quote_kind,
-        evidence: "mock-hardware-quote".to_owned(),
-        binding: hardware_quote_binding(&body).expect("binding"),
+        evidence: evidence_for_binding(&binding),
+        binding,
         endorsements: vec!["mock-root".to_owned()],
     };
     let attestation = build_tier2_attestation_report(&Tier2AttestationOptions {
@@ -128,6 +142,87 @@ fn test_tier2_report(
     let trusted = BTreeSet::from([attestation.report.binary_hash.clone()]);
 
     (temp, attestation.report, contract, trusted)
+}
+
+const TEST_NVIDIA_NRAS_KID: &str = "nras-test-kid";
+const TEST_NVIDIA_NRAS_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDCAHpFQ62QnGCEvYh/p
+E9QmR1C9aLcDItRbslbmhen/h1tt8AyMhskeenT+rAyyPhGhZANiAAQLW5ZJePZz
+MIPAxMtZXkEWbDF0zo9f2n4+T1h/2sh/fviblc/VTyrv10GEtIi5qiOy85Pf1RRw
+8lE5IPUWpgu553SteKigiKLUPeNpbqmYZUkWGh3MLfVzLmx85ii2vMU=
+-----END PRIVATE KEY-----"#;
+
+fn test_nvidia_jwks() -> serde_json::Value {
+    serde_json::json!({
+        "keys": [{
+            "kty": "EC",
+            "crv": "P-384",
+            "x": "C1uWSXj2czCDwMTLWV5BFmwxdM6PX9p-Pk9Yf9rIf374m5XP1U8q79dBhLSIuaoj",
+            "y": "svOT39UUcPJROSD1FqYLued0rXiooIii1D3jaW6pmGVJFhodzC31cy5sfOYotrzF",
+            "kid": TEST_NVIDIA_NRAS_KID,
+            "use": "sig"
+        }]
+    })
+}
+
+fn test_nvidia_signed_eat(claims: serde_json::Value) -> String {
+    let mut header = Header::new(Algorithm::ES384);
+    header.kid = Some(TEST_NVIDIA_NRAS_KID.to_owned());
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_ec_pem(TEST_NVIDIA_NRAS_PRIVATE_KEY_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+fn test_nvidia_evidence(binding: &str, gpu_measurement_success: bool) -> String {
+    let exp = 4_102_444_800_u64;
+    let overall = test_nvidia_signed_eat(serde_json::json!({
+        "iss": "https://nras.attestation.nvidia.com",
+        "sub": "NVIDIA-PLATFORM-ATTESTATION",
+        "exp": exp,
+        "eat_nonce": binding,
+        "x-nvidia-overall-att-result": true
+    }));
+    let gpu = test_nvidia_signed_eat(serde_json::json!({
+        "iss": "https://nras.attestation.nvidia.com",
+        "sub": "NVIDIA-GPU-ATTESTATION",
+        "exp": exp,
+        "eat_nonce": binding,
+        "x-nvidia-device-type": "gpu",
+        "measres": if gpu_measurement_success { "Success" } else { "Failure" },
+        "secboot": true,
+        "dbgstat": "disabled",
+        "hwmodel": "GH100 A01 GSP BROM",
+        "ueid": "test-ueid",
+        "oemid": "5703",
+        "x-nvidia-gpu-driver-version": "575.32",
+        "x-nvidia-gpu-vbios-version": "96.00.AF.00.01",
+        "x-nvidia-gpu-arch-check": true,
+        "x-nvidia-gpu-attestation-report-cert-chain-fwid-match": true,
+        "x-nvidia-gpu-attestation-report-parsed": true,
+        "x-nvidia-gpu-attestation-report-nonce-match": true,
+        "x-nvidia-gpu-attestation-report-signature-verified": true,
+        "x-nvidia-gpu-driver-rim-fetched": true,
+        "x-nvidia-gpu-driver-rim-schema-validated": true,
+        "x-nvidia-gpu-driver-rim-signature-verified": true,
+        "x-nvidia-gpu-driver-rim-version-match": true,
+        "x-nvidia-gpu-driver-rim-measurements-available": true,
+        "x-nvidia-gpu-vbios-rim-fetched": true,
+        "x-nvidia-gpu-vbios-rim-schema-validated": true,
+        "x-nvidia-gpu-vbios-rim-version-match": true,
+        "x-nvidia-gpu-vbios-rim-signature-verified": true,
+        "x-nvidia-gpu-vbios-rim-measurements-available": true,
+        "x-nvidia-gpu-vbios-index-no-conflict": true
+    }));
+    serde_json::json!({
+        "detached_eat": [
+            ["JWT", overall],
+            { "GPU-0": gpu }
+        ]
+    })
+    .to_string()
 }
 
 #[test]
@@ -188,7 +283,63 @@ fn tier2_report_requires_hardware_quote_verification() {
 }
 
 #[test]
-fn real_tier2_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
+fn verifies_nvidia_nras_tier2_report_with_trusted_jwks() {
+    let (_temp, report, contract, trusted) =
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |binding| {
+            test_nvidia_evidence(binding, true)
+        });
+    let jwks = test_nvidia_jwks();
+    let mut request =
+        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    request.trusted_nvidia_nras_jwks = Some(&jwks);
+
+    let verified =
+        verify_tier1_attestation(&request).expect("signed NVIDIA NRAS tier2 report verifies");
+
+    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.enclave_id, contract.enclave_id);
+}
+
+#[test]
+fn nvidia_nras_tier2_report_requires_trusted_jwks() {
+    let (_temp, report, contract, trusted) =
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |binding| {
+            test_nvidia_evidence(binding, true)
+        });
+    let request =
+        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+
+    let err = verify_tier1_attestation(&request).expect_err("NVIDIA NRAS quotes need trusted JWKS");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteTrustRootMissing { .. }
+    ));
+}
+
+#[test]
+fn nvidia_nras_tier2_report_rejects_signed_failed_appraisal() {
+    let (_temp, report, contract, trusted) =
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |binding| {
+            test_nvidia_evidence(binding, false)
+        });
+    let jwks = test_nvidia_jwks();
+    let mut request =
+        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    request.trusted_nvidia_nras_jwks = Some(&jwks);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("signed failed NVIDIA appraisal must be rejected");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("measres")
+    ));
+}
+
+#[test]
+fn sev_snp_and_tdx_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
     let (_temp, report, contract, trusted) = test_tier2_report(HardwareQuoteKind::IntelTdxDcap);
     let mut request =
         AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);

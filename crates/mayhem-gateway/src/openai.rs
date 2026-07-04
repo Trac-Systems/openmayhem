@@ -50,6 +50,7 @@ pub struct GatewayState {
     paused_sessions: Arc<Mutex<Vec<PausedSession>>>,
     receipt_config: ReceiptConfig,
     session_backend: Arc<dyn GatewaySessionBackend>,
+    hardware_quote_trust: Arc<HardwareQuoteTrust>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,6 +126,11 @@ struct ReceiptConfig {
     user_seed: [u8; 32],
     provider_seed: [u8; 32],
     enclave_seed: [u8; 32],
+}
+
+#[derive(Clone, Debug, Default)]
+struct HardwareQuoteTrust {
+    nvidia_nras_jwks: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +256,7 @@ pub struct GatewayHedgeInvocation {
 pub struct GatewaySessionAttestation {
     pub contract: EnclaveContractRecord,
     pub trusted_binary_hashes: BTreeSet<String>,
+    pub trusted_nvidia_nras_jwks: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +366,7 @@ impl GatewayState {
             paused_sessions: Arc::new(Mutex::new(Vec::new())),
             receipt_config: ReceiptConfig::default(),
             session_backend: Arc::new(LocalOpenAiShapeBackend),
+            hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
         }
     }
 
@@ -369,6 +377,13 @@ impl GatewayState {
 
     pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
         self.session_backend = backend;
+        self
+    }
+
+    pub fn with_nvidia_nras_jwks(mut self, jwks: Value) -> Self {
+        self.hardware_quote_trust = Arc::new(HardwareQuoteTrust {
+            nvidia_nras_jwks: Some(jwks),
+        });
         self
     }
 
@@ -985,6 +1000,7 @@ fn validate_direct_session_accept(
             now_ts,
         );
         request.expected_provider_pubkey = Some(provider);
+        request.trusted_nvidia_nras_jwks = attestation.trusted_nvidia_nras_jwks.as_ref();
         verify_tier1_attestation(&request).map_err(|err| {
             fail(format!(
                 "provider accept attestation verification failed: {err}"
@@ -1610,6 +1626,7 @@ impl GatewayState {
                 caps: candidate.caps.clone(),
             },
             trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
         });
         let max_spend_mu = estimate_max_spend_mu(model, request, &prompt_text);
         if max_spend_mu > self.receipt_config.balance_mu {
@@ -2620,6 +2637,7 @@ mod tests {
             attestation: Some(GatewaySessionAttestation {
                 contract,
                 trusted_binary_hashes: BTreeSet::from([identity.binary_hash]),
+                trusted_nvidia_nras_jwks: None,
             }),
             hedge: GatewayHedgeInvocation::default(),
             receipt_cosign_enabled: true,

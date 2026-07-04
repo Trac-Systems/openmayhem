@@ -13,6 +13,11 @@ pub use reputation::*;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use jsonwebtoken::{
+    decode, decode_header,
+    jwk::{JwkSet, KeyAlgorithm},
+    Algorithm, DecodingKey, Validation,
+};
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
     AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind,
@@ -29,6 +34,7 @@ pub const HEARTBEAT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = 30_000;
 pub const DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS: u64 = 5_000;
 pub const DEFAULT_HEARTBEAT_REPLAY_CACHE_CAPACITY: usize = 5_000;
+const NVIDIA_NRAS_ISSUER: &str = "https://nras.attestation.nvidia.com";
 
 type Result<T> = std::result::Result<T, GatewayError>;
 
@@ -83,6 +89,10 @@ pub enum GatewayError {
     MockHardwareQuoteDisabled,
     #[error("hardware quote kind {kind} is not verified by this build")]
     HardwareQuoteUnsupported { kind: String },
+    #[error("hardware quote kind {kind} requires a trusted verifier root")]
+    HardwareQuoteTrustRootMissing { kind: String },
+    #[error("hardware quote kind {kind} is invalid: {reason}")]
+    HardwareQuoteInvalid { kind: String, reason: String },
     #[error("heartbeat JSON error: {0}")]
     HeartbeatJson(String),
     #[error("heartbeat must have t=\"hb\" and v={expected_version}")]
@@ -128,6 +138,7 @@ pub struct AttestationVerificationRequest<'a> {
     pub max_report_age_secs: u64,
     pub max_report_clock_skew_secs: u64,
     pub allow_mock_hardware_quote: bool,
+    pub trusted_nvidia_nras_jwks: Option<&'a Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,6 +264,7 @@ impl<'a> AttestationVerificationRequest<'a> {
             max_report_age_secs: DEFAULT_MAX_REPORT_AGE_SECS,
             max_report_clock_skew_secs: DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS,
             allow_mock_hardware_quote: false,
+            trusted_nvidia_nras_jwks: None,
         }
     }
 }
@@ -499,9 +511,275 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
         HardwareQuoteKind::IntelTdxDcap => Err(GatewayError::HardwareQuoteUnsupported {
             kind: "intel_tdx_dcap".to_owned(),
         }),
-        HardwareQuoteKind::NvidiaNrasJwt => Err(GatewayError::HardwareQuoteUnsupported {
+        HardwareQuoteKind::NvidiaNrasJwt => {
+            verify_nvidia_nras_quote(&quote.evidence, request.trusted_nvidia_nras_jwks, &expected)
+        }
+    }
+}
+
+fn verify_nvidia_nras_quote(
+    evidence: &str,
+    trusted_jwks: Option<&Value>,
+    expected_nonce: &str,
+) -> Result<()> {
+    let trusted_jwks = trusted_jwks.ok_or_else(|| GatewayError::HardwareQuoteTrustRootMissing {
+        kind: "nvidia_nras_jwt".to_owned(),
+    })?;
+    let jwks = parse_nvidia_jwks(trusted_jwks)?;
+    let tokens = nvidia_eat_tokens(evidence)?;
+    if tokens.is_empty() {
+        return Err(nvidia_quote_invalid("no JWT found in NVIDIA NRAS evidence"));
+    }
+
+    let mut saw_gpu_success = false;
+    let mut saw_overall_success = false;
+    for token in tokens {
+        let claims = decode_nvidia_nras_jwt(&token, &jwks)?;
+        match nvidia_claim_class(&claims) {
+            NvidiaClaimClass::Gpu => {
+                validate_nvidia_gpu_claims(&claims, expected_nonce)?;
+                saw_gpu_success = true;
+            }
+            NvidiaClaimClass::Overall => {
+                validate_nvidia_overall_claims(&claims, expected_nonce)?;
+                saw_overall_success = true;
+            }
+            NvidiaClaimClass::Other => {}
+        }
+    }
+
+    if !saw_gpu_success {
+        return Err(nvidia_quote_invalid(
+            "NVIDIA NRAS evidence did not contain a successful GPU claim",
+        ));
+    }
+    if evidence_contains_detached_eat(evidence) && !saw_overall_success {
+        return Err(nvidia_quote_invalid(
+            "NVIDIA NRAS detached EAT did not contain a successful overall claim",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_nvidia_jwks(value: &Value) -> Result<JwkSet> {
+    let jwks_value = value.get("jwks").unwrap_or(value).clone();
+    serde_json::from_value(jwks_value).map_err(|err| GatewayError::HardwareQuoteInvalid {
+        kind: "nvidia_nras_jwt".to_owned(),
+        reason: format!("trusted JWKS is invalid: {err}"),
+    })
+}
+
+fn nvidia_eat_tokens(evidence: &str) -> Result<Vec<String>> {
+    if looks_like_jwt(evidence.trim()) {
+        return Ok(vec![evidence.trim().to_owned()]);
+    }
+    let value: Value =
+        serde_json::from_str(evidence).map_err(|err| GatewayError::HardwareQuoteInvalid {
             kind: "nvidia_nras_jwt".to_owned(),
-        }),
+            reason: format!("NVIDIA NRAS evidence is neither a JWT nor JSON: {err}"),
+        })?;
+    let root = value.get("detached_eat").unwrap_or(&value);
+    let mut tokens = Vec::new();
+    collect_nvidia_eat_tokens(root, &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    Ok(tokens)
+}
+
+fn collect_nvidia_eat_tokens(value: &Value, tokens: &mut Vec<String>) {
+    match value {
+        Value::String(text) if looks_like_jwt(text) => tokens.push(text.clone()),
+        Value::Array(values) => {
+            if values.len() == 2
+                && values[0].as_str() == Some("JWT")
+                && values[1].as_str().is_some_and(looks_like_jwt)
+            {
+                tokens.push(values[1].as_str().unwrap().to_owned());
+            }
+            for child in values {
+                collect_nvidia_eat_tokens(child, tokens);
+            }
+        }
+        Value::Object(object) => {
+            for child in object.values() {
+                collect_nvidia_eat_tokens(child, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    value.split('.').count() == 3 && !value.chars().any(char::is_whitespace)
+}
+
+fn evidence_contains_detached_eat(evidence: &str) -> bool {
+    serde_json::from_str::<Value>(evidence)
+        .ok()
+        .and_then(|value| value.get("detached_eat").cloned())
+        .is_some()
+}
+
+fn decode_nvidia_nras_jwt(token: &str, jwks: &JwkSet) -> Result<Value> {
+    let header = decode_header(token).map_err(|err| GatewayError::HardwareQuoteInvalid {
+        kind: "nvidia_nras_jwt".to_owned(),
+        reason: format!("JWT header decode failed: {err}"),
+    })?;
+    if header.alg != Algorithm::ES384 {
+        return Err(nvidia_quote_invalid("NVIDIA NRAS JWT must use ES384"));
+    }
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| nvidia_quote_invalid("NVIDIA NRAS JWT is missing kid"))?;
+    let jwk = jwks
+        .find(kid)
+        .ok_or_else(|| nvidia_quote_invalid("NVIDIA NRAS JWT kid is not in trusted JWKS"))?;
+    if jwk
+        .common
+        .key_algorithm
+        .as_ref()
+        .is_some_and(|alg| *alg != KeyAlgorithm::ES384)
+    {
+        return Err(nvidia_quote_invalid(
+            "trusted NVIDIA NRAS JWK declares a non-ES384 alg",
+        ));
+    }
+    let decoding_key =
+        DecodingKey::from_jwk(jwk).map_err(|err| GatewayError::HardwareQuoteInvalid {
+            kind: "nvidia_nras_jwt".to_owned(),
+            reason: format!("trusted NVIDIA NRAS JWK is invalid: {err}"),
+        })?;
+    let mut validation = Validation::new(Algorithm::ES384);
+    validation.validate_aud = false;
+    validation.set_issuer(&[NVIDIA_NRAS_ISSUER]);
+    validation.set_required_spec_claims(&["exp", "iss"]);
+    decode::<Value>(token, &decoding_key, &validation)
+        .map(|token| token.claims)
+        .map_err(|err| GatewayError::HardwareQuoteInvalid {
+            kind: "nvidia_nras_jwt".to_owned(),
+            reason: format!("NVIDIA NRAS JWT verification failed: {err}"),
+        })
+}
+
+enum NvidiaClaimClass {
+    Gpu,
+    Overall,
+    Other,
+}
+
+fn nvidia_claim_class(claims: &Value) -> NvidiaClaimClass {
+    if claims
+        .get("x-nvidia-device-type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "gpu")
+    {
+        NvidiaClaimClass::Gpu
+    } else if claims.get("x-nvidia-overall-att-result").is_some()
+        || claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains("NVIDIA") && value.contains("ATTESTATION"))
+    {
+        NvidiaClaimClass::Overall
+    } else {
+        NvidiaClaimClass::Other
+    }
+}
+
+fn validate_nvidia_overall_claims(claims: &Value, expected_nonce: &str) -> Result<()> {
+    require_nvidia_nonce(claims, expected_nonce)?;
+    require_bool_claim(claims, "x-nvidia-overall-att-result")?;
+    Ok(())
+}
+
+fn validate_nvidia_gpu_claims(claims: &Value, expected_nonce: &str) -> Result<()> {
+    require_nvidia_nonce(claims, expected_nonce)?;
+    require_string_claim_ci(claims, "measres", "success")?;
+    for field in [
+        "x-nvidia-gpu-arch-check",
+        "x-nvidia-gpu-attestation-report-cert-chain-fwid-match",
+        "x-nvidia-gpu-attestation-report-parsed",
+        "x-nvidia-gpu-attestation-report-nonce-match",
+        "x-nvidia-gpu-attestation-report-signature-verified",
+        "x-nvidia-gpu-driver-rim-fetched",
+        "x-nvidia-gpu-driver-rim-schema-validated",
+        "x-nvidia-gpu-driver-rim-signature-verified",
+        "x-nvidia-gpu-driver-rim-version-match",
+        "x-nvidia-gpu-driver-rim-measurements-available",
+        "x-nvidia-gpu-vbios-rim-fetched",
+        "x-nvidia-gpu-vbios-rim-schema-validated",
+        "x-nvidia-gpu-vbios-rim-version-match",
+        "x-nvidia-gpu-vbios-rim-signature-verified",
+        "x-nvidia-gpu-vbios-rim-measurements-available",
+        "x-nvidia-gpu-vbios-index-no-conflict",
+    ] {
+        require_bool_claim(claims, field)?;
+    }
+    if claims
+        .get("secboot")
+        .and_then(Value::as_bool)
+        .is_some_and(|secboot| !secboot)
+    {
+        return Err(nvidia_quote_invalid("NVIDIA GPU claim secboot is false"));
+    }
+    if claims
+        .get("dbgstat")
+        .and_then(Value::as_str)
+        .is_some_and(|dbgstat| dbgstat != "disabled")
+    {
+        return Err(nvidia_quote_invalid(
+            "NVIDIA GPU claim dbgstat must be disabled when present",
+        ));
+    }
+    Ok(())
+}
+
+fn require_nvidia_nonce(claims: &Value, expected_nonce: &str) -> Result<()> {
+    let nonce = claims
+        .get("eat_nonce")
+        .and_then(Value::as_str)
+        .ok_or_else(|| nvidia_quote_invalid("NVIDIA NRAS claim is missing eat_nonce"))?;
+    if !nonce.eq_ignore_ascii_case(expected_nonce) {
+        return Err(nvidia_quote_invalid(
+            "NVIDIA NRAS eat_nonce does not match quote binding",
+        ));
+    }
+    Ok(())
+}
+
+fn require_bool_claim(claims: &Value, field: &'static str) -> Result<()> {
+    if claims.get(field).and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(nvidia_quote_invalid(format!(
+            "NVIDIA GPU claim {field} is not true"
+        )))
+    }
+}
+
+fn require_string_claim_ci(
+    claims: &Value,
+    field: &'static str,
+    expected: &'static str,
+) -> Result<()> {
+    if claims
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+    {
+        Ok(())
+    } else {
+        Err(nvidia_quote_invalid(format!(
+            "NVIDIA GPU claim {field} is not {expected}"
+        )))
+    }
+}
+
+fn nvidia_quote_invalid(reason: impl Into<String>) -> GatewayError {
+    GatewayError::HardwareQuoteInvalid {
+        kind: "nvidia_nras_jwt".to_owned(),
+        reason: reason.into(),
     }
 }
 
