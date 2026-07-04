@@ -111,6 +111,35 @@ impl GatewaySessionBackend for RetryThenDirectSessionBackend {
 }
 
 #[derive(Debug)]
+struct AlwaysRetryDirectSessionBackend {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl GatewaySessionBackend for AlwaysRetryDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-always-retry-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let provider = invocation
+                .provider_pubkey
+                .clone()
+                .unwrap_or_else(|| "<none>".to_owned());
+            self.calls.lock().expect("calls lock").push(provider);
+            Err(GatewaySessionError::retryable(
+                "simulated direct open timeout before spend",
+            ))
+        })
+    }
+}
+
+#[derive(Debug)]
 struct HedgeInspectBackend {
     invocations: Arc<Mutex<Vec<(String, bool, usize)>>>,
 }
@@ -420,6 +449,36 @@ async fn chat_completion_retries_retryable_direct_session_route_before_metering(
     );
     assert_eq!(state.receipts().len(), 1);
     assert_eq!(state.receipts()[0].receipt.body.provider, second_provider);
+}
+
+#[tokio::test]
+async fn chat_completion_caps_retryable_direct_session_routes_at_four_without_receipts() {
+    let providers = (1..=5)
+        .map(|idx| format!("{idx:02x}").repeat(32))
+        .collect::<Vec<_>>();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&providers)])
+        .with_session_backend(Arc::new(AlwaysRetryDirectSessionBackend {
+            calls: calls.clone(),
+        }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Every direct open times out." }]
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("all 4 route attempt(s) failed before spend"));
+    assert_eq!(
+        calls.lock().expect("calls lock").clone(),
+        providers[0..4].to_vec()
+    );
+    assert!(state.receipts().is_empty());
 }
 
 #[tokio::test]
