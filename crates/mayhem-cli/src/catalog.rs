@@ -54,9 +54,13 @@ pub struct SourceCheckReport {
     pub repo: String,
     pub revision: String,
     pub path: String,
+    pub url: String,
+    pub artifact_root_kind: String,
+    pub source_sha256: Option<String>,
     pub status: Option<u16>,
     pub ok: bool,
     pub error: Option<String>,
+    pub metadata_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -766,6 +770,12 @@ fn run_source_checks(
             continue;
         }
         for (artifact_name, artifact) in &model.artifacts {
+            let url = huggingface_resolve_url(&artifact.source, &artifact.path)?;
+            let metadata_errors = if model.tier == "launch" {
+                launch_source_metadata_errors(model, artifact_name, artifact)
+            } else {
+                Vec::new()
+            };
             let check = check_hf_artifact_head(
                 &artifact.source.repo,
                 &artifact.source.revision,
@@ -773,7 +783,11 @@ fn run_source_checks(
                 &token,
             );
             let (status, ok, error) = match check {
-                Ok(status) => (Some(status), source_status_ok(status), None),
+                Ok(status) => (
+                    Some(status),
+                    source_status_ok(status) && metadata_errors.is_empty(),
+                    None,
+                ),
                 Err(err) => (None, false, Some(err.to_string())),
             };
             reports.push(SourceCheckReport {
@@ -782,9 +796,13 @@ fn run_source_checks(
                 repo: artifact.source.repo.clone(),
                 revision: artifact.source.revision.clone(),
                 path: artifact.path.clone(),
+                url,
+                artifact_root_kind: artifact.artifact_root_kind.clone(),
+                source_sha256: artifact.source_sha256.clone(),
                 status,
                 ok,
                 error,
+                metadata_errors,
             });
         }
     }
@@ -795,6 +813,32 @@ fn run_source_checks(
         );
     }
     Ok(reports)
+}
+
+fn launch_source_metadata_errors(
+    model: &CatalogModel,
+    artifact_name: &str,
+    artifact: &CatalogArtifact,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if artifact.artifact_root_kind != "blake3_merkle_v1" {
+        errors.push(format!(
+            "{} / {} artifact_root_kind must be blake3_merkle_v1 for launch calibration, got {}",
+            model.model_id, artifact_name, artifact.artifact_root_kind
+        ));
+    }
+    match artifact.source_sha256.as_deref() {
+        Some(value) if is_hex_len(value, 64) => {}
+        Some(value) => errors.push(format!(
+            "{} / {} source_sha256 must be 32-byte hex for launch calibration, got {}",
+            model.model_id, artifact_name, value
+        )),
+        None => errors.push(format!(
+            "{} / {} source_sha256 is required before launch calibration",
+            model.model_id, artifact_name
+        )),
+    }
+    errors
 }
 
 fn read_hf_token(path: Option<&Path>) -> Result<String> {
@@ -809,7 +853,7 @@ fn read_hf_token(path: Option<&Path>) -> Result<String> {
             return Ok(token);
         }
     }
-    bail!("set HF_TOKEN or pass --hf-token-file for --check-dev-downloads")
+    bail!("set HF_TOKEN or pass --hf-token-file for catalog source/download checks")
 }
 
 fn check_hf_artifact(repo: &str, revision: &str, path: &str, token: &str) -> Result<bool> {
@@ -1003,6 +1047,85 @@ mod tests {
         assert!(!source_status_ok(401));
         assert!(!source_status_ok(404));
         assert!(!source_status_ok(500));
+    }
+
+    #[test]
+    fn launch_source_metadata_requires_merkle_root_and_source_sha() {
+        let mut model = CatalogModel {
+            model_id: "admin/model@4bit".to_owned(),
+            family: "admin".to_owned(),
+            params_b: 4.0,
+            tier: "launch".to_owned(),
+            provenance: Provenance {
+                source: SourceRef {
+                    kind: "huggingface".to_owned(),
+                    repo: "admin/source".to_owned(),
+                    revision: "1".repeat(40),
+                    publisher_key: None,
+                },
+                conversion: Vec::new(),
+                license: "apache-2.0".to_owned(),
+                license_sha256: "a".repeat(64),
+            },
+            artifacts: BTreeMap::new(),
+            caps: CatalogCaps {
+                tools: true,
+                json: true,
+                ctx_max: 1024,
+                vision: false,
+            },
+            requirements: CatalogRequirements {
+                min_ram_gb: 8,
+                min_vram_gb_full_offload: 0,
+                cpu_flags: Vec::new(),
+                backends: vec!["llama.cpp".to_owned()],
+            },
+            canary: CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                fingerprints: BTreeMap::new(),
+            },
+            price_ref_mu: PriceRef {
+                denom: "mu_usd".to_owned(),
+                in_per_1k: 1,
+                out_per_1k: 1,
+            },
+        };
+        let mut artifact = CatalogArtifact {
+            engine: "llama.cpp".to_owned(),
+            source: SourceRef {
+                kind: "huggingface".to_owned(),
+                repo: "admin/model".to_owned(),
+                revision: "2".repeat(40),
+                publisher_key: None,
+            },
+            path: "model.gguf".to_owned(),
+            artifact_root: "b".repeat(64),
+            artifact_root_kind: "blake3_descriptor_until_p2_4".to_owned(),
+            weights_bytes: 1,
+            source_sha256: None,
+            tokenizer_sha256: None,
+            chat_template_sha256: None,
+            min_compute_cap: None,
+            download_check: false,
+            notes: None,
+        };
+
+        let errors = launch_source_metadata_errors(&model, "gguf-q4_k_m", &artifact);
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("artifact_root_kind must be blake3_merkle_v1")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("source_sha256 is required")));
+
+        artifact.artifact_root_kind = "blake3_merkle_v1".to_owned();
+        artifact.source_sha256 = Some("c".repeat(64));
+        model
+            .artifacts
+            .insert("gguf-q4_k_m".to_owned(), artifact.clone());
+        assert!(launch_source_metadata_errors(&model, "gguf-q4_k_m", &artifact).is_empty());
     }
 
     fn hex_string(bytes: &[u8]) -> String {

@@ -2492,8 +2492,13 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
             eprintln!("Catalog error: {error}");
         }
         for check in report.source_checks.iter().filter(|check| !check.ok) {
+            let metadata_errors = if check.metadata_errors.is_empty() {
+                String::new()
+            } else {
+                format!(" metadata={}", check.metadata_errors.join(" | "))
+            };
             eprintln!(
-                "Catalog source error: {} / {} {}@{} {} status={}",
+                "Catalog source error: {} / {} {}@{} {} status={}{}",
                 check.model_id,
                 check.artifact,
                 check.repo,
@@ -2502,7 +2507,8 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
                 check
                     .status
                     .map(|status| status.to_string())
-                    .unwrap_or_else(|| check.error.as_deref().unwrap_or("error").to_owned())
+                    .unwrap_or_else(|| check.error.as_deref().unwrap_or("error").to_owned()),
+                metadata_errors
             );
         }
         bail!("catalog verification failed");
