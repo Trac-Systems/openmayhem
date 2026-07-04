@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultManifest = 'config/beta/testnet.json';
@@ -22,10 +22,12 @@ Options:
   --write-manifest PATH                  Write updated manifest with evidence refs
   --seed-provider-opt-ins PATH           JSON proof from real provider lifecycle feature records
   --derive-seed-opt-ins-for-smoke        Derive seed opt-in proof from manifest for local rehearsal only
+  --skip-dht-probe                       Do not run public DHT bootstrap round-trip
   --skip-msb-probe                       Do not run public MSB balance probe
   --epoch-wallet-balance-tnk VALUE       Balance to use with --skip-msb-probe
   --skip-download-head                   Do not HEAD public distribution URLs
   --verify-bundle-hash                   Stream bundle URLs and verify SHA-256
+  --dht-timeout SECONDS                  DHT bootstrap probe timeout per set (default: 20)
   --msb-timeout SECONDS                  MSB balance probe timeout (default: 90)
   --http-timeout SECONDS                 URL probe timeout (default: 20)
   --no-validate                          Do not run strict beta-launch validation
@@ -39,11 +41,13 @@ function parseArgs(argv) {
     writeManifest: null,
     seedProviderOptIns: null,
     deriveSeedOptInsForSmoke: false,
+    skipDhtProbe: false,
     skipMsbProbe: false,
     epochWalletBalanceTnk: null,
     skipDownloadHead: false,
     verifyBundleHash: false,
     validate: true,
+    dhtTimeout: 20,
     msbTimeout: 90,
     httpTimeout: 20,
     json: false,
@@ -60,10 +64,12 @@ function parseArgs(argv) {
     else if (arg === '--write-manifest') args.writeManifest = next();
     else if (arg === '--seed-provider-opt-ins') args.seedProviderOptIns = next();
     else if (arg === '--derive-seed-opt-ins-for-smoke') args.deriveSeedOptInsForSmoke = true;
+    else if (arg === '--skip-dht-probe') args.skipDhtProbe = true;
     else if (arg === '--skip-msb-probe') args.skipMsbProbe = true;
     else if (arg === '--epoch-wallet-balance-tnk') args.epochWalletBalanceTnk = next();
     else if (arg === '--skip-download-head') args.skipDownloadHead = true;
     else if (arg === '--verify-bundle-hash') args.verifyBundleHash = true;
+    else if (arg === '--dht-timeout') args.dhtTimeout = Number.parseInt(next(), 10);
     else if (arg === '--msb-timeout') args.msbTimeout = Number.parseInt(next(), 10);
     else if (arg === '--http-timeout') args.httpTimeout = Number.parseInt(next(), 10);
     else if (arg === '--no-validate') args.validate = false;
@@ -151,13 +157,100 @@ function runJson(command, args) {
   return JSON.parse(child.stdout);
 }
 
-function collectBootstrapEvidence(manifest) {
-  return {
+function withTimeout(promise, timeoutMs, label) {
+  let timeout = null;
+  const timer = new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timer]).finally(() => clearTimeout(timeout));
+}
+
+async function loadHyperDht() {
+  const modulePath = path.join(repoRoot, 'intercom/node_modules/hyperdht/index.js');
+  const imported = await import(pathToFileURL(modulePath).href);
+  return imported.default || imported;
+}
+
+function bufferHex(value) {
+  return Buffer.from(value || []).toString('hex');
+}
+
+async function dhtRoundTrip({ label, bootstrap, timeoutSec }) {
+  const DHT = await loadHyperDht();
+  const node = new DHT({ bootstrap, port: 0 });
+  const timeoutMs = timeoutSec * 1000;
+  const startedAt = new Date().toISOString();
+  try {
+    const probeValue = Buffer.from(`mayhem-p8.4-bootstrap-probe:${label}:${startedAt}:${crypto.randomBytes(16).toString('hex')}`);
+    const valueSha256 = crypto.createHash('sha256').update(probeValue).digest('hex');
+    const put = await withTimeout(
+      node.immutablePut(probeValue),
+      timeoutMs,
+      `${label} DHT immutablePut`
+    );
+    const got = await withTimeout(
+      node.immutableGet(put.hash),
+      timeoutMs,
+      `${label} DHT immutableGet`
+    );
+    const gotValue = got?.value ? Buffer.from(got.value) : null;
+    const ok = !!gotValue && gotValue.equals(probeValue);
+    return {
+      ok,
+      label,
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+      bootstrap,
+      record_hash: bufferHex(put.hash),
+      value_sha256: valueSha256,
+      value_bytes: probeValue.byteLength,
+      closest_nodes: Array.isArray(put.closestNodes) ? put.closestNodes.length : 0,
+      retrieved_from: got?.from ? String(got.from) : null,
+    };
+  } finally {
+    await node.destroy({ force: true });
+  }
+}
+
+async function collectBootstrapEvidenceChecked(manifest, args) {
+  const base = {
     ok: true,
+    proof_kind: 'dht_bootstrap_roundtrip_v1',
     network: manifest.network.name,
     msb: msbRecord(manifest),
+    subnet_bootstrap: manifest.network.subnet.bootstrap,
     peer_dht_bootstrap: manifest.network.dht.peer_bootstrap,
     msb_dht_bootstrap: manifest.network.dht.msb_bootstrap,
+  };
+  if (args.skipDhtProbe) {
+    return {
+      ...base,
+      dht_probe: {
+        skipped: true,
+        reason: '--skip-dht-probe',
+      },
+    };
+  }
+  const [peer, msb] = await Promise.all([
+    dhtRoundTrip({
+      label: 'peer',
+      bootstrap: manifest.network.dht.peer_bootstrap,
+      timeoutSec: args.dhtTimeout,
+    }),
+    dhtRoundTrip({
+      label: 'msb',
+      bootstrap: manifest.network.dht.msb_bootstrap,
+      timeoutSec: args.dhtTimeout,
+    }),
+  ]);
+  return {
+    ...base,
+    ok: peer.ok === true && msb.ok === true,
+    dht_probe: {
+      skipped: false,
+      peer,
+      msb,
+    },
   };
 }
 
@@ -358,7 +451,10 @@ async function collect(args) {
   assertNoPlaceholders(manifest, '--manifest');
   const outDir = resolveRepo(args.outDir);
 
-  const bootstrap = writeJson(evidencePath(outDir, 'bootstrap-health.json'), collectBootstrapEvidence(manifest));
+  const bootstrap = writeJson(
+    evidencePath(outDir, 'bootstrap-health.json'),
+    await collectBootstrapEvidenceChecked(manifest, args)
+  );
   const epochWallet = writeJson(evidencePath(outDir, 'epoch-wallet-funding.json'), collectEpochWalletEvidence(manifest, args));
   const seedProviders = writeJson(evidencePath(outDir, 'seed-provider-opt-ins.json'), collectSeedProviderEvidence(manifest, args));
   const downloads = writeJson(evidencePath(outDir, 'enclave-downloads.json'), await collectDownloadEvidence(manifest, args));

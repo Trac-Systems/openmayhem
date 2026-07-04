@@ -531,8 +531,16 @@ function validateBootstrapEvidence(add, manifest) {
   const ok = records.some(({ value }) => {
     const peerDht = value.peer_dht_bootstrap || value.peer_bootstrap_nodes || value.peer_bootstrap;
     const msbDht = value.msb_dht_bootstrap || value.msb_bootstrap_nodes || value.msb_bootstrap;
+    const dhtProbe = value.dht_probe;
+    const dhtProbeOk = !dhtProbe || dhtProbe.skipped === true || (
+      dhtProbe.peer?.ok === true &&
+      dhtProbe.msb?.ok === true &&
+      arrayContainsAll(dhtProbe.peer?.bootstrap, expectedPeerDht) &&
+      arrayContainsAll(dhtProbe.msb?.bootstrap, expectedMsbDht)
+    );
     return (
       value.ok === true &&
+      dhtProbeOk &&
       evidenceMatchesNetwork(value, manifest) &&
       arrayContainsAll(peerDht, expectedPeerDht) &&
       arrayContainsAll(msbDht, expectedMsbDht)
