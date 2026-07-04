@@ -230,6 +230,8 @@ enum AuditorCommands {
 enum CatalogCommands {
     /// Verify catalog structure, maintainer signature, canary refs, and optional dev downloads.
     Verify(CatalogVerifyArgs),
+    /// Compute launch catalog metadata for a local admin artifact without loading model weights.
+    ArtifactMetadata(CatalogArtifactMetadataArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
     CalibrateCanary(CatalogCalibrateCanaryArgs),
     /// Verify calibration report files cover the catalog canary matrix.
@@ -965,6 +967,33 @@ struct CatalogVerifyArgs {
     hf_token_file: Option<PathBuf>,
 
     /// Print a machine-readable verification report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogArtifactMetadataArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog when --model/--artifact are set.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Catalog model id to bind this artifact metadata to.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Artifact key in the model's artifacts map, e.g. gguf-q4_k_m or mlx-4bit.
+    #[arg(long)]
+    artifact: Option<String>,
+
+    /// Local admin artifact file to hash and Merkle-root. Does not load model weights.
+    #[arg(long, value_name = "PATH")]
+    artifact_path: PathBuf,
+
+    /// Artifact Merkle chunk size.
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+    chunk_size: usize,
+
+    /// Print a machine-readable metadata report.
     #[arg(long)]
     json: bool,
 }
@@ -2131,6 +2160,7 @@ async fn main() -> Result<()> {
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
             CatalogCommands::Verify(args) => catalog_verify(args),
+            CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
             CatalogCommands::ApplyCanaryReports(args) => catalog_apply_canary_reports(args),
@@ -2514,6 +2544,214 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         bail!("catalog verification failed");
     }
     Ok(())
+}
+
+fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
+    if args.model.is_some() ^ args.artifact.is_some() {
+        bail!("--model and --artifact must be provided together");
+    }
+    let artifact_path = absolutize(args.artifact_path.clone())?;
+    let catalog_binding = if let (Some(model_id), Some(artifact_name)) =
+        (args.model.as_deref(), args.artifact.as_deref())
+    {
+        let catalog_path = args
+            .catalog_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+        let catalog_path = absolutize(catalog_path)?;
+        let catalog_doc = catalog::load_document(&catalog_path)?;
+        Some((
+            catalog_doc,
+            catalog_path,
+            model_id.to_owned(),
+            artifact_name.to_owned(),
+        ))
+    } else {
+        None
+    };
+    let report = catalog_artifact_metadata_report(
+        catalog_binding
+            .as_ref()
+            .map(|(doc, path, model_id, artifact_name)| {
+                (doc, path.clone(), model_id.as_str(), artifact_name.as_str())
+            }),
+        artifact_path,
+        args.chunk_size,
+    )?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Catalog artifact metadata.");
+        println!("Artifact: {}", report.artifact_path.display());
+        println!("Bytes: {}", report.total_bytes);
+        println!("Chunk size: {}", report.chunk_size);
+        println!("Chunks: {}", report.chunk_count);
+        println!(
+            "artifact_root_kind={}",
+            report.catalog_patch.artifact_root_kind
+        );
+        println!("artifact_root={}", report.catalog_patch.artifact_root);
+        println!("source_sha256={}", report.catalog_patch.source_sha256);
+        println!("weights_bytes={}", report.catalog_patch.weights_bytes);
+        if let Some(binding) = &report.catalog_binding {
+            println!("Catalog: {}", binding.catalog_path.display());
+            println!(
+                "Binding: {} / {} ({})",
+                binding.model_id, binding.artifact, binding.engine
+            );
+            println!(
+                "Source: {}@{} {}",
+                binding.source_repo, binding.source_revision, binding.source_path
+            );
+            println!("Update needed: {}", binding.update_needed);
+            println!("Catalog patch JSON:");
+            println!("{}", serde_json::to_string_pretty(&report.catalog_patch)?);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogArtifactMetadataReport {
+    ok: bool,
+    artifact_path: PathBuf,
+    chunk_size: usize,
+    total_bytes: u64,
+    chunk_count: usize,
+    catalog_patch: CatalogArtifactMetadataPatch,
+    catalog_binding: Option<CatalogArtifactMetadataBinding>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CatalogArtifactMetadataPatch {
+    artifact_root_kind: String,
+    artifact_root: String,
+    source_sha256: String,
+    weights_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogArtifactMetadataBinding {
+    catalog_path: PathBuf,
+    model_id: String,
+    artifact: String,
+    engine: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_path: String,
+    current_artifact_root_kind: String,
+    current_artifact_root: String,
+    current_source_sha256: Option<String>,
+    current_weights_bytes: u64,
+    matches_current_artifact_root: bool,
+    matches_current_source_sha256: Option<bool>,
+    matches_current_weights_bytes: bool,
+    update_needed: bool,
+}
+
+fn catalog_artifact_metadata_report(
+    catalog_binding: Option<(&catalog::CatalogDocument, PathBuf, &str, &str)>,
+    artifact_path: PathBuf,
+    chunk_size: usize,
+) -> Result<CatalogArtifactMetadataReport> {
+    if chunk_size == 0 {
+        bail!("--chunk-size must be positive");
+    }
+    let metadata = fs::metadata(&artifact_path)
+        .with_context(|| format!("stat {}", artifact_path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "artifact metadata currently requires a file artifact; archive snapshots before catalog finalization: {}",
+            artifact_path.display()
+        );
+    }
+    let source_sha256 = file_sha256_hex(&artifact_path)?;
+    let merkle = build_merkle_manifest(&artifact_path, chunk_size)?;
+    let catalog_patch = CatalogArtifactMetadataPatch {
+        artifact_root_kind: "blake3_merkle_v1".to_owned(),
+        artifact_root: merkle.root.clone(),
+        source_sha256,
+        weights_bytes: merkle.total_bytes,
+    };
+    let catalog_binding = catalog_binding
+        .map(|(catalog_doc, catalog_path, model_id, artifact_name)| {
+            catalog_artifact_metadata_binding(
+                catalog_doc,
+                catalog_path,
+                model_id,
+                artifact_name,
+                &catalog_patch,
+            )
+        })
+        .transpose()?;
+    Ok(CatalogArtifactMetadataReport {
+        ok: true,
+        artifact_path,
+        chunk_size: merkle.chunk_size,
+        total_bytes: merkle.total_bytes,
+        chunk_count: merkle.chunks.len(),
+        catalog_patch,
+        catalog_binding,
+    })
+}
+
+fn catalog_artifact_metadata_binding(
+    catalog_doc: &catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    model_id: &str,
+    artifact_name: &str,
+    patch: &CatalogArtifactMetadataPatch,
+) -> Result<CatalogArtifactMetadataBinding> {
+    let model = catalog_doc
+        .models
+        .iter()
+        .find(|model| model.model_id == model_id)
+        .with_context(|| format!("model {model_id} not found in {}", catalog_path.display()))?;
+    let artifact = model.artifacts.get(artifact_name).with_context(|| {
+        format!(
+            "artifact {} not found for model {}; available: {}",
+            artifact_name,
+            model.model_id,
+            model
+                .artifacts
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let matches_current_artifact_root = artifact.artifact_root_kind == patch.artifact_root_kind
+        && artifact.artifact_root == patch.artifact_root;
+    let matches_current_source_sha256 = artifact
+        .source_sha256
+        .as_ref()
+        .map(|current| current.eq_ignore_ascii_case(&patch.source_sha256));
+    let matches_current_weights_bytes = artifact.weights_bytes == patch.weights_bytes;
+    let update_needed = !matches_current_artifact_root
+        || matches_current_source_sha256 != Some(true)
+        || !matches_current_weights_bytes;
+    Ok(CatalogArtifactMetadataBinding {
+        catalog_path,
+        model_id: model.model_id.clone(),
+        artifact: artifact_name.to_owned(),
+        engine: artifact.engine.clone(),
+        source_kind: artifact.source.kind.clone(),
+        source_repo: artifact.source.repo.clone(),
+        source_revision: artifact.source.revision.clone(),
+        source_path: artifact.path.clone(),
+        current_artifact_root_kind: artifact.artifact_root_kind.clone(),
+        current_artifact_root: artifact.artifact_root.clone(),
+        current_source_sha256: artifact.source_sha256.clone(),
+        current_weights_bytes: artifact.weights_bytes,
+        matches_current_artifact_root,
+        matches_current_source_sha256,
+        matches_current_weights_bytes,
+        update_needed,
+    })
 }
 
 fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
@@ -12847,6 +13085,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct FakeEngineBackend {
         output: mayhem_engine::GenerateOutput,
@@ -15959,6 +16200,73 @@ mod tests {
     }
 
     #[test]
+    fn artifact_metadata_computes_launch_catalog_patch() {
+        let path = env::temp_dir().join(format!(
+            "mayhem-artifact-metadata-{}-{}.bin",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        fs::write(&path, b"mayhem artifact metadata").unwrap();
+        let merkle = build_merkle_manifest(&path, 5).unwrap();
+        let sha256 = file_sha256_hex(&path).unwrap();
+        let catalog = test_catalog(&"00".repeat(32));
+
+        let report = catalog_artifact_metadata_report(
+            Some((
+                &catalog,
+                PathBuf::from("catalog.json"),
+                "test/model@4bit",
+                "gguf-q4_k_m",
+            )),
+            path.clone(),
+            5,
+        )
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(report.catalog_patch.artifact_root_kind, "blake3_merkle_v1");
+        assert_eq!(report.catalog_patch.artifact_root, merkle.root);
+        assert_eq!(report.catalog_patch.source_sha256, sha256);
+        assert_eq!(report.catalog_patch.weights_bytes, merkle.total_bytes);
+        let binding = report.catalog_binding.as_ref().unwrap();
+        assert!(binding.update_needed);
+        assert!(!binding.matches_current_artifact_root);
+        assert_eq!(binding.matches_current_source_sha256, None);
+        assert!(!binding.matches_current_weights_bytes);
+
+        let mut matching_catalog = test_catalog(&report.catalog_patch.artifact_root);
+        matching_catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .source_sha256 = Some(report.catalog_patch.source_sha256.clone());
+        matching_catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .weights_bytes = report.catalog_patch.weights_bytes;
+
+        let matching = catalog_artifact_metadata_report(
+            Some((
+                &matching_catalog,
+                PathBuf::from("catalog.json"),
+                "test/model@4bit",
+                "gguf-q4_k_m",
+            )),
+            path.clone(),
+            5,
+        )
+        .unwrap();
+        let binding = matching.catalog_binding.as_ref().unwrap();
+        assert!(!binding.update_needed);
+        assert!(binding.matches_current_artifact_root);
+        assert_eq!(binding.matches_current_source_sha256, Some(true));
+        assert!(binding.matches_current_weights_bytes);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn stable_value_hash_is_object_key_order_independent() {
         let a = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
@@ -16422,8 +16730,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let seq = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "mayhem-canary-calibration-report-{}-{nanos}.json",
+            "mayhem-canary-calibration-report-{}-{nanos}-{seq}.json",
             std::process::id()
         ));
         write_json_file(&path, report).unwrap();
