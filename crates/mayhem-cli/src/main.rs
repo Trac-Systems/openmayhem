@@ -2585,9 +2585,7 @@ fn catalog_calibration_backend(
     let mut config = match artifact.engine.as_str() {
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
-        "trt-llm" => bail!(
-            "TensorRT-LLM canary calibration is gated on the P2b.2/P2b.3 backend and reference hardware"
-        ),
+        "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
     };
     config.ctx_size = args.ctx_size.max(1);
@@ -2612,6 +2610,16 @@ fn catalog_calibration_backend(
             backend
                 .load(config)
                 .context("loading MLX canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "trt-llm" => {
+            config.trt_engine_dir = Some(trt_engine_cache_dir(artifact_path, "calibration"));
+            config.trt_kv_cache_dtype = trt_kv_cache_dtype_for_artifact("calibration", artifact);
+            let mut backend =
+                mayhem_engine::TrtLlmBackend::new().context("initializing TensorRT-LLM backend")?;
+            backend
+                .load(config)
+                .context("loading TensorRT-LLM canary calibration artifact")?;
             Ok(Box::new(backend))
         }
         _ => unreachable!("unsupported engines returned above"),
@@ -9810,6 +9818,16 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "trt-llm" => {
+            let mut backend = mayhem_engine::TrtLlmBackend::new()
+                .context("initializing TensorRT-LLM provider session engine")?;
+            backend
+                .load(load_config)
+                .context("loading TensorRT-LLM provider session engine")?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         other => bail!(
             "provider session engine for {other} is not wired locally yet; do not serve this enclave until its admin-approved engine adapter is available"
         ),
@@ -9829,6 +9847,7 @@ fn provider_engine_load_config(
     let artifact = match selected.artifact.engine.as_str() {
         "llama.cpp" => ModelArtifact::gguf(artifact_path),
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
+        "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
     };
     let artifact = if let Some(sha256) = &selected.artifact.source_sha256 {
@@ -9839,12 +9858,56 @@ fn provider_engine_load_config(
     let mut config = match selected.artifact.engine.as_str() {
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
+        "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
     };
     config.artifact = artifact;
     config.ctx_size = ctx_size.max(1);
     config.gpu_layers = selected.verdict.n_layers_gpu;
+    if selected.artifact.engine == "trt-llm" {
+        config.trt_engine_dir = Some(trt_engine_cache_dir(artifact_path, &selected.artifact_name));
+        config.trt_tensor_parallel = Some(1);
+        config.trt_kv_cache_dtype =
+            trt_kv_cache_dtype_for_artifact(&selected.artifact_name, &selected.artifact);
+    }
     Ok(config)
+}
+
+fn trt_engine_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
+    let base = if artifact_path.is_dir() {
+        artifact_path.to_path_buf()
+    } else {
+        artifact_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    base.join(".trtllm-engines")
+        .join(safe_path_component(artifact_name))
+}
+
+fn trt_kv_cache_dtype_for_artifact(
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+) -> Option<String> {
+    let mut haystack = format!(
+        "{} {} {}",
+        artifact_name,
+        artifact.path,
+        artifact.min_compute_cap.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if let Some(notes) = &artifact.notes {
+        haystack.push(' ');
+        haystack.push_str(&notes.to_ascii_lowercase());
+    }
+    if haystack.contains("nvfp4") {
+        Some("nvfp4".to_owned())
+    } else if haystack.contains("fp8") {
+        Some("fp8".to_owned())
+    } else {
+        None
+    }
 }
 
 fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSessionTerms> {
@@ -12730,6 +12793,46 @@ mod tests {
         assert_eq!(config.artifact.format, mayhem_engine::ArtifactFormat::Gguf);
         assert_eq!(config.ctx_size, 8192);
         assert_eq!(config.gpu_layers, Some(0));
+    }
+
+    #[test]
+    fn provider_engine_load_config_wires_trt_admin_artifact() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        trt_artifact.engine = "trt-llm".to_owned();
+        trt_artifact.path = "checkpoint.nvfp4.safetensors".to_owned();
+        trt_artifact.min_compute_cap = Some("10.0".to_owned());
+        trt_artifact.notes = Some("NVFP4 Blackwell checkpoint".to_owned());
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), trt_artifact);
+        catalog.models[0].requirements.backends = vec!["trt-llm".to_owned()];
+
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].backend = "trt-llm".to_owned();
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let args = test_provider_start_args();
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        let config = provider_engine_load_config(
+            &selected,
+            Path::new("/tmp/admin-approved-checkpoint.safetensors"),
+        )
+        .unwrap();
+
+        assert_eq!(selected.artifact_name, "nvfp4");
+        assert_eq!(
+            config.artifact.format,
+            mayhem_engine::ArtifactFormat::TensorRtLlmCheckpoint
+        );
+        assert_eq!(config.trt_tensor_parallel, Some(1));
+        assert_eq!(config.trt_kv_cache_dtype.as_deref(), Some("nvfp4"));
+        assert_eq!(
+            config.trt_engine_dir,
+            Some(PathBuf::from("/tmp/.trtllm-engines/nvfp4"))
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
 mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-enclave = { path = "../mayhem-enclave" }
-mayhem-engine = { path = "../mayhem-engine", features = ["mlx"] }
+mayhem-engine = { path = "../mayhem-engine", features = ["mlx", "trt-llm"] }
 mayhem-gateway = { path = "../mayhem-gateway" }
 mayhem-hwprobe = { path = "../mayhem-hwprobe" }
 mayhem-proto = { path = "../mayhem-proto" }

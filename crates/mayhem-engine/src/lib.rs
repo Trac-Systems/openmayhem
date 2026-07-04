@@ -42,6 +42,8 @@ pub enum EngineError {
     PromptTooLong { prompt_tokens: usize, ctx_size: u32 },
     #[error("MLX backend error: {0}")]
     Mlx(String),
+    #[error("TensorRT-LLM backend error: {0}")]
+    TrtLlm(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -77,6 +79,7 @@ pub enum EngineError {
 pub enum ArtifactFormat {
     Gguf,
     MlxSafetensors,
+    TensorRtLlmCheckpoint,
 }
 
 impl ArtifactFormat {
@@ -84,6 +87,7 @@ impl ArtifactFormat {
         match self {
             Self::Gguf => b"GGUF",
             Self::MlxSafetensors => b"",
+            Self::TensorRtLlmCheckpoint => b"",
         }
     }
 
@@ -91,6 +95,7 @@ impl ArtifactFormat {
         match self {
             Self::Gguf => "GGUF",
             Self::MlxSafetensors => "MLX safetensors",
+            Self::TensorRtLlmCheckpoint => "TensorRT-LLM checkpoint",
         }
     }
 }
@@ -120,6 +125,14 @@ impl ModelArtifact {
         }
     }
 
+    pub fn trt_llm_checkpoint(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::TensorRtLlmCheckpoint,
+            sha256: None,
+        }
+    }
+
     #[must_use]
     pub fn with_sha256(mut self, sha256: impl Into<String>) -> Self {
         self.sha256 = Some(sha256.into());
@@ -140,6 +153,12 @@ pub struct LoadConfig {
     pub threads: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_layers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trt_engine_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trt_tensor_parallel: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trt_kv_cache_dtype: Option<String>,
     #[serde(default = "default_true")]
     pub use_mmap: bool,
     #[serde(default)]
@@ -160,6 +179,13 @@ impl LoadConfig {
             ..Self::default()
         }
     }
+
+    pub fn trt_llm_checkpoint(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::trt_llm_checkpoint(path),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for LoadConfig {
@@ -171,6 +197,9 @@ impl Default for LoadConfig {
             ubatch_size: DEFAULT_UBATCH_SIZE,
             threads: None,
             gpu_layers: None,
+            trt_engine_dir: None,
+            trt_tensor_parallel: None,
+            trt_kv_cache_dtype: None,
             use_mmap: true,
             use_mlock: false,
         }
@@ -436,8 +465,15 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
         }
         ArtifactFormat::MlxSafetensors => {
             let weights = mlx_weights_path(&artifact.path)?;
-            verify_safetensors_header(&weights)?;
+            verify_safetensors_header_as(&weights, artifact.format.label())?;
             weights
+        }
+        ArtifactFormat::TensorRtLlmCheckpoint => {
+            let payload = trt_llm_payload_path(&artifact.path)?;
+            if payload.extension().is_some_and(|ext| ext == "safetensors") {
+                verify_safetensors_header_as(&payload, artifact.format.label())?;
+            }
+            payload
         }
     };
 
@@ -521,13 +557,13 @@ fn mlx_weights_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn verify_safetensors_header(path: &PathBuf) -> Result<()> {
+fn verify_safetensors_header_as(path: &PathBuf, expected: &'static str) -> Result<()> {
     let mut file = File::open(path)?;
     let mut header_len_bytes = [0_u8; 8];
     file.read_exact(&mut header_len_bytes)
         .map_err(|_| EngineError::UnsupportedArtifactHeader {
             path: path.clone(),
-            expected: ArtifactFormat::MlxSafetensors.label(),
+            expected,
             actual: Vec::new(),
         })?;
     let header_len = u64::from_le_bytes(header_len_bytes);
@@ -536,7 +572,7 @@ fn verify_safetensors_header(path: &PathBuf) -> Result<()> {
     {
         return Err(EngineError::UnsupportedArtifactHeader {
             path: path.clone(),
-            expected: ArtifactFormat::MlxSafetensors.label(),
+            expected,
             actual: header_len_bytes.to_vec(),
         });
     }
@@ -552,11 +588,47 @@ fn verify_safetensors_header(path: &PathBuf) -> Result<()> {
     if !header.is_object() {
         return Err(EngineError::UnsupportedArtifactHeader {
             path: path.clone(),
-            expected: ArtifactFormat::MlxSafetensors.label(),
+            expected,
             actual: header_len_bytes.to_vec(),
         });
     }
     Ok(())
+}
+
+fn trt_llm_payload_path(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    }
+
+    let config = path.join("config.json");
+    if config.is_file() {
+        let config_value: Value = serde_json::from_reader(File::open(&config)?)?;
+        if !config_value.is_object() {
+            return Err(EngineError::InvalidConfig(format!(
+                "TensorRT-LLM checkpoint config {} is not a JSON object",
+                config.display()
+            )));
+        }
+    }
+
+    let mut candidates = std::fs::read_dir(path)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| matches!(ext.to_str(), Some("safetensors" | "engine" | "plan")))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().ok_or_else(|| {
+        EngineError::InvalidConfig(format!(
+            "TensorRT-LLM artifact directory {} contains no .safetensors, .engine, or .plan payload",
+            path.display()
+        ))
+    })
 }
 
 fn file_sha256_hex(path: &PathBuf) -> Result<String> {
@@ -608,6 +680,9 @@ pub use llama_cpp_backend::LlamaCppBackend;
 
 #[cfg(feature = "mlx")]
 pub use mlx_backend::MlxBackend;
+
+#[cfg(feature = "trt-llm")]
+pub use trt_llm_backend::TrtLlmBackend;
 
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_backend {
@@ -1112,6 +1187,279 @@ mod mlx_backend {
     }
 }
 
+#[cfg(feature = "trt-llm")]
+mod trt_llm_backend {
+    use super::{
+        validate_load_config, verify_artifact, ArtifactFormat, EngineBackend, EngineError,
+        FinishReason, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result,
+        TokenChunk, TokenSink, Tokenization, UsageCounters,
+    };
+    use serde::de::DeserializeOwned;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use std::cell::{Cell, RefCell};
+    use std::env;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+    const WORKER: &str = include_str!("trtllm_worker.py");
+    const PYTHON_ENV: &str = "MAYHEM_TRTLLM_PYTHON";
+
+    pub struct TrtLlmBackend {
+        python: PathBuf,
+        worker: RefCell<Option<TrtLlmWorker>>,
+        loaded: Option<LoadedModelInfo>,
+        next_id: Cell<u64>,
+    }
+
+    impl TrtLlmBackend {
+        pub fn new() -> Result<Self> {
+            let python = env::var_os(PYTHON_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("python3"));
+            Self::with_python(python)
+        }
+
+        pub fn with_python(python: impl Into<PathBuf>) -> Result<Self> {
+            Ok(Self {
+                python: python.into(),
+                worker: RefCell::new(None),
+                loaded: None,
+                next_id: Cell::new(1),
+            })
+        }
+
+        fn call<T>(&self, op: &str, payload: Value) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            self.call_streaming(op, payload, &mut |_| Ok(()))
+        }
+
+        fn call_streaming<T>(
+            &self,
+            op: &str,
+            payload: Value,
+            sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let id = self.next_id.get();
+            self.next_id.set(id.saturating_add(1));
+            let mut worker = self.worker.borrow_mut();
+            if worker.is_none() {
+                *worker = Some(TrtLlmWorker::spawn(&self.python)?);
+            }
+            let worker = worker.as_mut().ok_or_else(|| {
+                EngineError::TrtLlm("failed to start TensorRT-LLM backend worker".to_owned())
+            })?;
+            worker.send(id, op, payload)?;
+
+            loop {
+                let message = worker.read_message()?;
+                if message.id != id {
+                    return Err(EngineError::TrtLlm(format!(
+                        "worker response id {} did not match request id {id}",
+                        message.id
+                    )));
+                }
+
+                if message.kind == "token" {
+                    let chunk = message.chunk.ok_or_else(|| {
+                        EngineError::TrtLlm("worker token message missing chunk".to_owned())
+                    })?;
+                    sink(chunk)?;
+                    continue;
+                }
+
+                if message.ok.unwrap_or(false) {
+                    let result = message.result.unwrap_or(Value::Null);
+                    return Ok(serde_json::from_value(result)?);
+                }
+
+                return Err(EngineError::TrtLlm(
+                    message
+                        .error
+                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
+                ));
+            }
+        }
+    }
+
+    impl EngineBackend for TrtLlmBackend {
+        fn backend_id(&self) -> &'static str {
+            "trt-llm"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::TensorRtLlmCheckpoint {
+                return Err(EngineError::InvalidConfig(format!(
+                    "TensorRT-LLM backend requires TensorRT-LLM checkpoint artifacts, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+
+            let model_path = trt_llm_model_path(&config.artifact.path)?;
+            let info: WorkerLoadInfo = self.call(
+                "load",
+                json!({
+                    "path": model_path,
+                    "ctx_size": config.ctx_size,
+                    "engine_dir": config.trt_engine_dir,
+                    "tensor_parallel": config.trt_tensor_parallel.unwrap_or(1),
+                    "kv_cache_dtype": config.trt_kv_cache_dtype,
+                }),
+            )?;
+            let loaded = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact,
+                ctx_size: config.ctx_size,
+                n_ctx_train: if info.n_ctx_train == 0 {
+                    config.ctx_size
+                } else {
+                    info.n_ctx_train
+                },
+                n_vocab: info.n_vocab,
+            };
+            self.loaded = Some(loaded.clone());
+            Ok(loaded)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            self.call("tokenize", json!({ "text": text }))
+        }
+
+        fn generate(
+            &mut self,
+            request: GenerateRequest,
+            sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            if request.max_new_tokens == 0 {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    usage: UsageCounters::default(),
+                    finish_reason: FinishReason::Length,
+                });
+            }
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+
+            self.call_streaming("generate", serde_json::to_value(request)?, &mut |chunk| {
+                sink.on_token(chunk)
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerLoadInfo {
+        #[serde(default)]
+        n_ctx_train: u32,
+        #[serde(default)]
+        n_vocab: i32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerMessage {
+        id: u64,
+        #[serde(default = "default_message_kind", rename = "type")]
+        kind: String,
+        #[serde(default)]
+        ok: Option<bool>,
+        #[serde(default)]
+        result: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        chunk: Option<TokenChunk>,
+    }
+
+    struct TrtLlmWorker {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl TrtLlmWorker {
+        fn spawn(python: &Path) -> Result<Self> {
+            let mut child = Command::new(python)
+                .arg("-u")
+                .arg("-c")
+                .arg(WORKER)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|err| {
+                    EngineError::TrtLlm(format!(
+                        "spawning TensorRT-LLM Python worker with {} failed: {err}",
+                        python.display()
+                    ))
+                })?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| EngineError::TrtLlm("opening worker stdin failed".to_owned()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| EngineError::TrtLlm("opening worker stdout failed".to_owned()))?;
+            Ok(Self {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+            })
+        }
+
+        fn send(&mut self, id: u64, op: &str, payload: Value) -> Result<()> {
+            let message = json!({
+                "id": id,
+                "op": op,
+                "payload": payload,
+            });
+            serde_json::to_writer(&mut self.stdin, &message)?;
+            self.stdin.write_all(b"\n")?;
+            self.stdin.flush()?;
+            Ok(())
+        }
+
+        fn read_message(&mut self) -> Result<WorkerMessage> {
+            let mut line = String::new();
+            let read = self.stdout.read_line(&mut line)?;
+            if read == 0 {
+                return Err(EngineError::TrtLlm(
+                    "TensorRT-LLM backend worker exited before replying".to_owned(),
+                ));
+            }
+            Ok(serde_json::from_str(line.trim_end())?)
+        }
+    }
+
+    impl Drop for TrtLlmWorker {
+        fn drop(&mut self) {
+            let _ = self.send(0, "shutdown", Value::Null);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn trt_llm_model_path(path: &Path) -> Result<PathBuf> {
+        if path.is_dir() {
+            return Ok(path.to_path_buf());
+        }
+        path.parent().map(Path::to_path_buf).ok_or_else(|| {
+            EngineError::InvalidConfig("TensorRT-LLM checkpoint path has no parent".to_owned())
+        })
+    }
+
+    fn default_message_kind() -> String {
+        "response".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,6 +1520,42 @@ mod tests {
         verify_artifact(&ModelArtifact::mlx_safetensors(&path)).expect("valid safetensors file");
         verify_artifact(&ModelArtifact::mlx_safetensors(&dir)).expect("valid safetensors dir");
         std::fs::remove_dir_all(dir).expect("remove temp mlx dir");
+    }
+
+    #[test]
+    fn verifies_trt_llm_checkpoint_payloads() {
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "trt-llm"
+        ));
+        std::fs::create_dir_all(&dir).expect("temp trt dir");
+        std::fs::write(dir.join("config.json"), br#"{"architecture":"test"}"#)
+            .expect("write config");
+        let path = dir.join("rank0.safetensors");
+        let header = br#"{"__metadata__":{}}"#;
+        let mut file = File::create(&path).expect("temp safetensors");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("write header length");
+        file.write_all(header).expect("write header");
+        file.write_all(b"weights").expect("write body");
+        drop(file);
+
+        verify_artifact(&ModelArtifact::trt_llm_checkpoint(&path))
+            .expect("valid TensorRT-LLM safetensors file");
+        verify_artifact(&ModelArtifact::trt_llm_checkpoint(&dir))
+            .expect("valid TensorRT-LLM checkpoint dir");
+
+        let mut config = LoadConfig::trt_llm_checkpoint(&dir);
+        config.trt_engine_dir = Some(dir.join("engine-cache"));
+        config.trt_tensor_parallel = Some(2);
+        config.trt_kv_cache_dtype = Some("nvfp4".to_owned());
+        assert_eq!(
+            config.artifact.format,
+            ArtifactFormat::TensorRtLlmCheckpoint
+        );
+        assert_eq!(config.trt_tensor_parallel, Some(2));
+        std::fs::remove_dir_all(dir).expect("remove temp trt dir");
     }
 
     #[cfg(feature = "llama-cpp")]
