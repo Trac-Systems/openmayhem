@@ -3386,6 +3386,11 @@ struct CatalogArtifactPublishPlanReport {
     hf_token_file: Option<PathBuf>,
     model_count: usize,
     artifact_count: usize,
+    catalog_expected_bytes: u64,
+    current_artifact_bytes: u64,
+    missing_artifact_bytes: u64,
+    artifact_base_available_bytes: Option<u64>,
+    artifact_base_space_ok: Option<bool>,
     ok: bool,
     publish_commands: Vec<CatalogArtifactPublishPlanEntry>,
     apply_command: CatalogCanaryPlanCommand,
@@ -3404,6 +3409,7 @@ struct CatalogArtifactPublishPlanEntry {
     source_repo: String,
     current_source_revision: String,
     source_path: String,
+    catalog_weights_bytes: u64,
     current_artifact_path: PathBuf,
     current_artifact_exists: bool,
     current_artifact_is_file: bool,
@@ -3805,6 +3811,16 @@ fn catalog_artifact_publish_plan(args: CatalogArtifactPublishPlanArgs) -> Result
             "Coverage: {} models, {} artifacts, ok={}",
             report.model_count, report.artifact_count, report.ok
         );
+        println!(
+            "Staging bytes: expected={}, staged={}, missing_estimate={}, available={}",
+            report.catalog_expected_bytes,
+            report.current_artifact_bytes,
+            report.missing_artifact_bytes,
+            report
+                .artifact_base_available_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
         for entry in &report.publish_commands {
             println!(
                 "- {} / {} ({}) [{}]: {}",
@@ -3818,6 +3834,7 @@ fn catalog_artifact_publish_plan(args: CatalogArtifactPublishPlanArgs) -> Result
                 "  local artifact: {}",
                 entry.current_artifact_path.display()
             );
+            println!("  catalog weights_bytes: {}", entry.catalog_weights_bytes);
             println!(
                 "  local artifact ready: exists={}, file={}, bytes={}",
                 entry.current_artifact_exists,
@@ -4118,6 +4135,10 @@ fn catalog_artifact_publish_plan_report(
     } = input;
     let mut entries = Vec::new();
     let mut errors = Vec::new();
+    let artifact_base_available_bytes = available_bytes_for_path(&artifact_base).ok().flatten();
+    let mut catalog_expected_bytes = 0u64;
+    let mut current_artifact_bytes_total = 0u64;
+    let mut missing_artifact_bytes = 0u64;
 
     for model in &catalog_doc.models {
         if launch_only && model.tier != "launch" {
@@ -4125,6 +4146,7 @@ fn catalog_artifact_publish_plan_report(
         }
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
+            catalog_expected_bytes = catalog_expected_bytes.saturating_add(artifact.weights_bytes);
             let artifact_rel_path = PathBuf::from(&artifact.path);
             if artifact_rel_path.is_absolute() {
                 entry_errors.push(format!(
@@ -4166,6 +4188,12 @@ fn catalog_artifact_publish_plan_report(
                         (false, false, None)
                     }
                 };
+            if let Some(bytes) = current_artifact_bytes {
+                current_artifact_bytes_total = current_artifact_bytes_total.saturating_add(bytes);
+            } else {
+                missing_artifact_bytes =
+                    missing_artifact_bytes.saturating_add(artifact.weights_bytes);
+            }
             let published_artifact_path_template =
                 catalog_artifact_published_template_path(&artifact_base, artifact);
             let report_path = report_dir
@@ -4213,6 +4241,7 @@ fn catalog_artifact_publish_plan_report(
                 source_repo: artifact.source.repo.clone(),
                 current_source_revision: artifact.source.revision.clone(),
                 source_path: artifact.path.clone(),
+                catalog_weights_bytes: artifact.weights_bytes,
                 current_artifact_path,
                 current_artifact_exists,
                 current_artifact_is_file,
@@ -4245,6 +4274,15 @@ fn catalog_artifact_publish_plan_report(
             "catalog has no model artifacts to publish".to_owned()
         });
     }
+    let artifact_base_space_ok = artifact_base_available_bytes
+        .map(|available| available >= missing_artifact_bytes || missing_artifact_bytes == 0);
+    if artifact_base_space_ok == Some(false) {
+        errors.push(format!(
+            "artifact base filesystem has {} byte(s) available but {} byte(s) are still missing by catalog estimate",
+            artifact_base_available_bytes.unwrap_or(0),
+            missing_artifact_bytes
+        ));
+    }
 
     let report_paths = entries
         .iter()
@@ -4276,6 +4314,11 @@ fn catalog_artifact_publish_plan_report(
         hf_token_file,
         model_count,
         artifact_count: entries.len(),
+        catalog_expected_bytes,
+        current_artifact_bytes: current_artifact_bytes_total,
+        missing_artifact_bytes,
+        artifact_base_available_bytes,
+        artifact_base_space_ok,
         ok: errors.is_empty(),
         publish_commands: entries,
         apply_command,
@@ -4418,6 +4461,26 @@ fn catalog_artifact_published_template_path(
         .join(safe_path_component(&artifact.source.repo))
         .join("<published-hf-commit-40-hex>")
         .join(&artifact.path)
+}
+
+fn available_bytes_for_path(path: &Path) -> Result<Option<u64>> {
+    let mut candidate = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    loop {
+        if candidate.exists() {
+            return fs2::available_space(&candidate)
+                .map(Some)
+                .with_context(|| format!("checking available space for {}", candidate.display()));
+        }
+        if !candidate.pop() {
+            return Ok(None);
+        }
+    }
 }
 
 fn with_hf_shell_prefix(
@@ -18212,8 +18275,13 @@ mod tests {
         assert!(report.ok, "{:?}", report.errors);
         assert_eq!(report.model_count, 1);
         assert_eq!(report.artifact_count, 1);
+        assert_eq!(report.catalog_expected_bytes, 42);
+        assert_eq!(report.current_artifact_bytes, 21);
+        assert_eq!(report.missing_artifact_bytes, 0);
+        assert_eq!(report.artifact_base_space_ok, Some(true));
         let entry = &report.publish_commands[0];
         assert_eq!(entry.current_artifact_path, expected_artifact_path);
+        assert_eq!(entry.catalog_weights_bytes, 42);
         assert!(entry.current_artifact_exists);
         assert!(entry.current_artifact_is_file);
         assert_eq!(entry.current_artifact_bytes, Some(21));
@@ -18277,6 +18345,10 @@ mod tests {
 
         assert!(!report.ok);
         assert_eq!(report.artifact_count, 1);
+        assert_eq!(report.catalog_expected_bytes, 42);
+        assert_eq!(report.current_artifact_bytes, 0);
+        assert_eq!(report.missing_artifact_bytes, 42);
+        assert_eq!(report.artifact_base_space_ok, Some(true));
         let entry = &report.publish_commands[0];
         assert!(!entry.ok);
         assert!(!entry.current_artifact_exists);
