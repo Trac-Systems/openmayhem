@@ -3203,6 +3203,14 @@ class MayhemContract extends Contract {
     if (!this.isHttpsUrl(value.catalog_url) || !this.isHttpsUrl(value.signature_url)) {
       return new Error('Catalog release URLs must be HTTPS.');
     }
+    if (value.source_kind === 'huggingface') {
+      if (!this.isPinnedHuggingFaceResolveUrl(value.catalog_url)) {
+        return new Error('Hugging Face catalog URL must use huggingface.co/resolve/<40-hex-revision>/.');
+      }
+      if (!this.isPinnedHuggingFaceResolveUrl(value.signature_url)) {
+        return new Error('Hugging Face catalog signature URL must use huggingface.co/resolve/<40-hex-revision>/.');
+      }
+    }
     if (!this.isHexBytes(value.catalog_hash, 32)) {
       return new Error('Catalog hash must be a 32-byte hex BLAKE3 hash.');
     }
@@ -3217,6 +3225,9 @@ class MayhemContract extends Contract {
     for (const entry of value.canaries) {
       const entryError = this.validateCatalogCanaryRef(entry);
       if (entryError) return entryError;
+      if (value.source_kind === 'huggingface' && !this.isPinnedHuggingFaceResolveUrl(entry.url)) {
+        return new Error('Hugging Face catalog canary URL must use huggingface.co/resolve/<40-hex-revision>/.');
+      }
       if (seen.has(entry.set_id)) return new Error('Duplicate catalog canary set.');
       seen.add(entry.set_id);
     }
@@ -4787,6 +4798,16 @@ class MayhemContract extends Contract {
     } catch {
       return false;
     }
+  }
+
+  isPinnedHuggingFaceResolveUrl(value) {
+    if (!this.isHttpsUrl(value)) return false;
+    const parsed = new URL(value);
+    if (parsed.hostname !== 'huggingface.co') return false;
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    const resolveIndex = parts.indexOf('resolve');
+    if (resolveIndex < 0 || resolveIndex + 2 >= parts.length) return false;
+    return this.isHexBytes(parts[resolveIndex + 1], 20);
   }
 
   isSafeExternalRef(value) {

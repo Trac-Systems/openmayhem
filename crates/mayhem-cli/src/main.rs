@@ -7199,9 +7199,13 @@ fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Value {
 }
 
 fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value> {
-    validate_https_url(&args.catalog_url, "--catalog-url")?;
-    validate_https_url(&args.signature_url, "--signature-url")?;
-    validate_https_url(&args.canaries_base_url, "--canaries-base-url")?;
+    validate_catalog_source_url(&args.source_kind, &args.catalog_url, "--catalog-url")?;
+    validate_catalog_source_url(&args.source_kind, &args.signature_url, "--signature-url")?;
+    validate_catalog_source_url(
+        &args.source_kind,
+        &args.canaries_base_url,
+        "--canaries-base-url",
+    )?;
 
     let catalog_path = args
         .catalog_path
@@ -9175,8 +9179,16 @@ async fn read_catalog_release_anchor(rpc: &PeerRpcClient) -> Result<CatalogRelea
     if release.published_by_role.as_deref() != Some("admin") {
         bail!("catalog/current is not admin-published");
     }
-    validate_https_url(&release.catalog_url, "catalog/current catalog_url")?;
-    validate_https_url(&release.signature_url, "catalog/current signature_url")?;
+    validate_catalog_source_url(
+        &release.source_kind,
+        &release.catalog_url,
+        "catalog/current catalog_url",
+    )?;
+    validate_catalog_source_url(
+        &release.source_kind,
+        &release.signature_url,
+        "catalog/current signature_url",
+    )?;
     if !is_hex_len(&release.catalog_hash, 64)
         || !is_hex_len(&release.signature_hash, 64)
         || !is_hex_len(&release.public_key, 64)
@@ -9219,7 +9231,11 @@ async fn fetch_catalog_release_files(
     )
     .await?;
     for canary in &release.canaries {
-        validate_https_url(&canary.url, "catalog/current canary URL")?;
+        validate_catalog_source_url(
+            &release.source_kind,
+            &canary.url,
+            "catalog/current canary URL",
+        )?;
         if !is_hex_len(&canary.hash, 64) {
             bail!("catalog/current canary {} has invalid hash", canary.set_id);
         }
@@ -11468,6 +11484,39 @@ fn validate_https_url(value: &str, label: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(value).with_context(|| format!("{label} is not a URL"))?;
     if parsed.scheme() != "https" || parsed.host_str().is_none() {
         bail!("{label} must be an HTTPS URL");
+    }
+    Ok(())
+}
+
+fn validate_catalog_source_url(source_kind: &str, value: &str, label: &str) -> Result<()> {
+    validate_https_url(value, label)?;
+    match source_kind {
+        "https" => Ok(()),
+        "huggingface" => validate_pinned_huggingface_resolve_url(value, label),
+        _ => bail!("unsupported catalog source kind: {source_kind}"),
+    }
+}
+
+fn validate_pinned_huggingface_resolve_url(value: &str, label: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(value).with_context(|| format!("{label} is not a URL"))?;
+    if parsed.host_str() != Some("huggingface.co") {
+        bail!("{label} must use huggingface.co for source_kind=huggingface");
+    }
+    let segments = parsed
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(resolve_index) = segments.iter().position(|segment| *segment == "resolve") else {
+        bail!("{label} must use a pinned Hugging Face /resolve/<40-hex-revision>/ URL");
+    };
+    let Some(revision) = segments.get(resolve_index + 1) else {
+        bail!("{label} must include a pinned Hugging Face revision");
+    };
+    if !is_hex_len(revision, 40) {
+        bail!("{label} must use a 40-hex Hugging Face commit revision");
+    }
+    if segments.get(resolve_index + 2).is_none() {
+        bail!("{label} must include a file path after the Hugging Face revision");
     }
     Ok(())
 }
@@ -16519,6 +16568,27 @@ mod tests {
                     .unwrap()
                     .ends_with("/canaries/canary-launch-v1.json")
         }));
+    }
+
+    #[test]
+    fn admin_publish_catalog_payload_rejects_mutable_huggingface_release_urls() {
+        let args = AdminPublishCatalogArgs {
+            tx: test_admin_tx_args(),
+            catalog_path: None,
+            signature_path: None,
+            keys_dir: None,
+            canaries_dir: None,
+            catalog_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/main/models.json".to_owned(),
+            signature_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig".to_owned(),
+            canaries_base_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries".to_owned(),
+            source_kind: "huggingface".to_owned(),
+        };
+
+        let err = admin_publish_catalog_payload(&args).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--catalog-url must use a 40-hex Hugging Face commit revision"));
     }
 
     #[test]

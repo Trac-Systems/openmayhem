@@ -272,6 +272,30 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   });
 });
 
+test('MayhemContract requires Hugging Face catalog anchors to use pinned revisions', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const mutableRelease = {
+    ...catalogRelease,
+    catalog_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/main/models.json',
+  };
+
+  const result = await execute(
+    contract,
+    storage,
+    'publishCatalog',
+    mutableRelease,
+    admin.publicKey,
+    1
+  );
+
+  assert.ok(result instanceof Error);
+  assert.match(result.message, /40-hex-revision/i);
+  assert.equal(await storage.get('catalog/current'), null);
+});
+
 test('MayhemContract requires a current admin price before provider serving rows', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
