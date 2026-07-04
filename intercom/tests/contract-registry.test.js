@@ -80,6 +80,25 @@ const modelRef = {
   },
 };
 
+const catalogRelease = {
+  op: 'publish_catalog',
+  catalog_id: 'mayhem-models',
+  source_kind: 'huggingface',
+  catalog_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json',
+  signature_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig',
+  catalog_hash: '8'.repeat(64),
+  signature_hash: '9'.repeat(64),
+  key_id: 'mayhem-catalog-tracnetwork-v1',
+  public_key: 'a'.repeat(64),
+  model_count: 3,
+  artifact_count: 5,
+  canaries: [{
+    set_id: 'canary-launch-v1',
+    url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-launch-v1.json',
+    hash: 'b'.repeat(64),
+  }],
+};
+
 const priceSchedule = {
   op: 'set_price',
   enclave_id: enclaveId,
@@ -133,28 +152,34 @@ const buildRegistryLog = (admin, provider, feePayer) => [
     txNo: 5,
   },
   {
+    type: 'publishCatalog',
+    value: catalogRelease,
+    sender: admin.publicKey,
+    txNo: 6,
+  },
+  {
     type: 'setPrice',
     value: priceSchedule,
     sender: admin.publicKey,
-    txNo: 6,
+    txNo: 7,
   },
   {
     type: 'joinEnclave',
     value: providerJoin,
     sender: provider.publicKey,
-    txNo: 7,
+    txNo: 8,
   },
   {
     type: 'updateEnclave',
     value: enclaveUpdate,
     sender: admin.publicKey,
-    txNo: 8,
+    txNo: 9,
   },
   {
     type: 'retireEnclave',
     value: enclaveRetire,
     sender: admin.publicKey,
-    txNo: 9,
+    txNo: 10,
   },
 ];
 
@@ -201,8 +226,18 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
       successful_sessions: 0,
     },
     registered_at: makeTxKey(3),
-    updated_at: makeTxKey(9),
+    updated_at: makeTxKey(10),
   });
+
+  const catalogEntry = await first.storage.get('catalog/current');
+  assert.equal(catalogEntry.value.catalog_hash, catalogRelease.catalog_hash);
+  assert.equal(catalogEntry.value.signature_hash, catalogRelease.signature_hash);
+  assert.equal(catalogEntry.value.published_by, admin.publicKey);
+  assert.equal(catalogEntry.value.published_by_role, 'admin');
+  assert.equal(catalogEntry.value.ver, 1);
+  assert.deepEqual(catalogEntry.value.canaries, catalogRelease.canaries);
+  const catalogReleaseEntry = await first.storage.get(`catalog/release/${catalogRelease.catalog_hash}`);
+  assert.deepEqual(catalogReleaseEntry.value, catalogEntry.value);
 
   const enclaveEntry = await first.storage.get(`enclave/${enclaveId}`);
   assert.equal(enclaveEntry.value.status, 'retired');
@@ -215,8 +250,8 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.equal(enclaveEntry.value.registered_at, makeTxKey(4));
   assert.equal(enclaveEntry.value.updated_by, admin.publicKey);
   assert.equal(enclaveEntry.value.updated_by_role, 'admin');
-  assert.equal(enclaveEntry.value.updated_at, makeTxKey(9));
-  assert.equal(enclaveEntry.value.retired_at, makeTxKey(9));
+  assert.equal(enclaveEntry.value.updated_at, makeTxKey(10));
+  assert.equal(enclaveEntry.value.retired_at, makeTxKey(10));
   assert.equal(enclaveEntry.value.retired_by, admin.publicKey);
   assert.equal(enclaveEntry.value.retired_by_role, 'admin');
   assert.deepEqual(enclaveEntry.value.providers, []);
@@ -228,10 +263,10 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     enclave_id: enclaveId,
     model_id: enclaveRegistration.model_id,
     status: 'tombstoned',
-    joined_at: makeTxKey(7),
-    updated_at: makeTxKey(9),
+    joined_at: makeTxKey(8),
+    updated_at: makeTxKey(10),
     left_at: null,
-    tombstoned_at: makeTxKey(9),
+    tombstoned_at: makeTxKey(10),
     tombstone_reason_hash: null,
     rooms: [],
   });

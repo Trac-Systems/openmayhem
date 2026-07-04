@@ -95,7 +95,7 @@ enum Commands {
     },
     /// Start the local OpenAI-compatible user gateway.
     Use(UseArgs),
-    /// List models from the local OpenAI-compatible gateway.
+    /// List models from the ledger-anchored admin catalog release.
     Models(ModelsArgs),
     /// Buy Mayhem credits through fiat/crypto rails.
     Pay {
@@ -160,6 +160,8 @@ enum AdminCommands {
     SetParams(AdminSetParamsArgs),
     /// Set the admin model reference price used to bound enclave prices.
     SetModelRef(AdminSetModelRefArgs),
+    /// Publish the latest signed catalog release anchor for network discovery.
+    PublishCatalog(AdminPublishCatalogArgs),
     /// Register an admin-created and attested canonical enclave.
     RegisterEnclave(AdminRegisterEnclaveArgs),
     /// Retire an admin-created enclave.
@@ -228,6 +230,8 @@ enum AuditorCommands {
 
 #[derive(Debug, Subcommand)]
 enum CatalogCommands {
+    /// List admin-approved catalog models and downloadable artifacts.
+    List(CatalogListArgs),
     /// Verify catalog structure, maintainer signature, canary refs, and optional dev downloads.
     Verify(CatalogVerifyArgs),
     /// Sign an admin-reviewed catalog draft with an operator-held Ed25519 seed file.
@@ -252,6 +256,13 @@ enum CatalogCommands {
     CanaryMatrix(CatalogCanaryMatrixArgs),
     /// Print copy/paste calibration commands for the catalog canary matrix.
     CanaryPlan(CatalogCanaryPlanArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CatalogListTier {
+    Launch,
+    Dev,
+    All,
 }
 
 #[derive(Debug, Parser)]
@@ -368,13 +379,21 @@ struct ModelsArgs {
     #[arg(long)]
     gateway_url: Option<String>,
 
+    /// Peer JSON-RPC base URL for ledger catalog discovery.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// HTTP timeout in seconds for gateway calls.
+    /// HTTP timeout in seconds for ledger catalog and gateway calls.
     #[arg(long, default_value_t = 30)]
     timeout_seconds: u64,
+
+    /// List models from a running gateway instead of the ledger-anchored catalog release.
+    #[arg(long)]
+    gateway: bool,
 
     /// Print a machine-readable model list.
     #[arg(long)]
@@ -944,6 +963,33 @@ struct DoctorArgs {
     /// Size of the temporary disk benchmark write.
     #[arg(long, default_value_t = 16)]
     disk_bench_mib: u64,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogListArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Path to the detached catalog signature JSON.
+    #[arg(long, value_name = "PATH")]
+    signature_path: Option<PathBuf>,
+
+    /// Directory containing catalog maintainer public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Catalog tier to list. Defaults to launch so public beta users avoid dev fixtures.
+    #[arg(long, value_enum, default_value_t = CatalogListTier::Launch)]
+    tier: CatalogListTier,
+
+    /// Print a machine-readable catalog listing.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1607,6 +1653,44 @@ struct AdminSetModelRefArgs {
     /// Optional source hash for the catalog/price reference evidence.
     #[arg(long)]
     source_hash: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPublishCatalogArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Path to the detached catalog signature JSON.
+    #[arg(long, value_name = "PATH")]
+    signature_path: Option<PathBuf>,
+
+    /// Directory containing catalog maintainer public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Immutable HTTPS URL for the published models.json.
+    #[arg(long)]
+    catalog_url: String,
+
+    /// Immutable HTTPS URL for the published models.json.sig.
+    #[arg(long)]
+    signature_url: String,
+
+    /// HTTPS base URL for canary set JSON files, e.g. https://.../catalog/canaries.
+    #[arg(long)]
+    canaries_base_url: String,
+
+    /// Source label for the release URLs.
+    #[arg(long, default_value = "huggingface")]
+    source_kind: String,
 }
 
 #[derive(Debug, Parser)]
@@ -2400,6 +2484,7 @@ async fn main() -> Result<()> {
         Commands::Setup(args) => setup(args).await,
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
+            CatalogCommands::List(args) => catalog_list(args),
             CatalogCommands::Verify(args) => catalog_verify(args),
             CatalogCommands::Sign(args) => catalog_sign(args),
             CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
@@ -2708,6 +2793,304 @@ fn doctor(args: DoctorArgs) -> Result<()> {
         print!("{}", human_report(&report));
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListReport {
+    ok: bool,
+    catalog_path: PathBuf,
+    signature_path: PathBuf,
+    catalog_hash: String,
+    key_id: String,
+    tier_filter: String,
+    authority: String,
+    model_count: usize,
+    artifact_count: usize,
+    models: Vec<CatalogListModel>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListModel {
+    model_id: String,
+    family: String,
+    params_b: f64,
+    tier: String,
+    license: String,
+    price_ref_mu: CatalogListPrice,
+    caps: CatalogListCaps,
+    requirements: CatalogListRequirements,
+    canary_set: String,
+    canary_match_min: f64,
+    artifacts: Vec<CatalogListArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListPrice {
+    denom: String,
+    in_per_1k: u64,
+    out_per_1k: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListCaps {
+    tools: bool,
+    json: bool,
+    ctx_max: u64,
+    vision: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListRequirements {
+    min_ram_gb: u64,
+    min_vram_gb_full_offload: u64,
+    backends: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListArtifact {
+    artifact: String,
+    engine: String,
+    artifact_root: String,
+    artifact_root_kind: String,
+    weights_bytes: u64,
+    weights_human: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_path: String,
+    source_url: Option<String>,
+    source_sha256: Option<String>,
+    canary_fingerprint: Option<String>,
+    notes: Option<String>,
+}
+
+fn catalog_list(args: CatalogListArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let signature_path = args
+        .signature_path
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/signatures/models.json.sig"))?;
+    let signature_path = absolutize(signature_path)?;
+    let keys_dir = args
+        .keys_dir
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    let canaries_dir = args
+        .canaries_dir
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+
+    let verification = catalog::verify(catalog::VerifyOptions {
+        catalog_path: catalog_path.clone(),
+        signature_path: signature_path.clone(),
+        keys_dir,
+        canaries_dir,
+        check_dev_downloads: false,
+        check_launch_sources: false,
+        hf_token_file: None,
+    })?;
+    if !verification.ok {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&verification)?);
+        } else {
+            for error in &verification.errors {
+                eprintln!("Catalog error: {error}");
+            }
+        }
+        bail!("catalog verification failed");
+    }
+
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let report = catalog_list_report(
+        &catalog_doc,
+        catalog_path,
+        signature_path,
+        verification.catalog_hash,
+        verification.key_id,
+        args.tier,
+    );
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_catalog_list_report(&report);
+    }
+    Ok(())
+}
+
+fn catalog_list_report(
+    catalog_doc: &catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    signature_path: PathBuf,
+    catalog_hash: String,
+    key_id: String,
+    tier: CatalogListTier,
+) -> CatalogListReport {
+    let models = catalog_doc
+        .models
+        .iter()
+        .filter(|model| catalog_list_tier_matches(model.tier.as_str(), tier))
+        .map(catalog_list_model)
+        .collect::<Vec<_>>();
+    let artifact_count = models.iter().map(|model| model.artifacts.len()).sum();
+    CatalogListReport {
+        ok: true,
+        catalog_path,
+        signature_path,
+        catalog_hash,
+        key_id,
+        tier_filter: catalog_list_tier_name(tier).to_owned(),
+        authority: "admin-signed catalog; live routability still requires active contract ledger enclave, room, admin price, and provider join".to_owned(),
+        model_count: models.len(),
+        artifact_count,
+        models,
+    }
+}
+
+fn catalog_list_tier_matches(model_tier: &str, filter: CatalogListTier) -> bool {
+    match filter {
+        CatalogListTier::Launch => model_tier == "launch",
+        CatalogListTier::Dev => model_tier == "dev",
+        CatalogListTier::All => true,
+    }
+}
+
+fn catalog_list_tier_name(tier: CatalogListTier) -> &'static str {
+    match tier {
+        CatalogListTier::Launch => "launch",
+        CatalogListTier::Dev => "dev",
+        CatalogListTier::All => "all",
+    }
+}
+
+fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
+    let artifacts = model
+        .artifacts
+        .iter()
+        .map(|(artifact_name, artifact)| CatalogListArtifact {
+            artifact: artifact_name.clone(),
+            engine: artifact.engine.clone(),
+            artifact_root: artifact.artifact_root.clone(),
+            artifact_root_kind: artifact.artifact_root_kind.clone(),
+            weights_bytes: artifact.weights_bytes,
+            weights_human: human_bytes(artifact.weights_bytes),
+            source_kind: artifact.source.kind.clone(),
+            source_repo: artifact.source.repo.clone(),
+            source_revision: artifact.source.revision.clone(),
+            source_path: artifact.path.clone(),
+            source_url: catalog::huggingface_resolve_url(&artifact.source, &artifact.path).ok(),
+            source_sha256: artifact.source_sha256.clone(),
+            canary_fingerprint: model.canary.fingerprints.get(artifact_name).cloned(),
+            notes: artifact.notes.clone(),
+        })
+        .collect();
+    CatalogListModel {
+        model_id: model.model_id.clone(),
+        family: model.family.clone(),
+        params_b: model.params_b,
+        tier: model.tier.clone(),
+        license: model.provenance.license.clone(),
+        price_ref_mu: CatalogListPrice {
+            denom: model.price_ref_mu.denom.clone(),
+            in_per_1k: model.price_ref_mu.in_per_1k,
+            out_per_1k: model.price_ref_mu.out_per_1k,
+        },
+        caps: CatalogListCaps {
+            tools: model.caps.tools,
+            json: model.caps.json,
+            ctx_max: model.caps.ctx_max,
+            vision: model.caps.vision,
+        },
+        requirements: CatalogListRequirements {
+            min_ram_gb: model.requirements.min_ram_gb,
+            min_vram_gb_full_offload: model.requirements.min_vram_gb_full_offload,
+            backends: model.requirements.backends.clone(),
+        },
+        canary_set: model.canary.set_id.clone(),
+        canary_match_min: model.canary.match_min,
+        artifacts,
+    }
+}
+
+fn print_catalog_list_report(report: &CatalogListReport) {
+    println!(
+        "Signed catalog: {} (hash {}, key {})",
+        report.catalog_path.display(),
+        report.catalog_hash,
+        report.key_id
+    );
+    println!(
+        "Scope: {} models, {} artifacts, tier filter {}",
+        report.model_count, report.artifact_count, report.tier_filter
+    );
+    println!(
+        "Authority: catalog approval is admin-signed; live routing comes from contract ledger state."
+    );
+
+    for model in &report.models {
+        println!();
+        println!(
+            "{} [{}] {:.1}B {}",
+            model.model_id, model.tier, model.params_b, model.family
+        );
+        println!(
+            "  price ref: {} input={} output={} per 1k tokens",
+            model.price_ref_mu.denom, model.price_ref_mu.in_per_1k, model.price_ref_mu.out_per_1k
+        );
+        println!(
+            "  caps: ctx_max={} tools={} json={} vision={}",
+            model.caps.ctx_max, model.caps.tools, model.caps.json, model.caps.vision
+        );
+        println!(
+            "  requirements: ram>={}GB vram_full_offload>={}GB backends={}",
+            model.requirements.min_ram_gb,
+            model.requirements.min_vram_gb_full_offload,
+            model.requirements.backends.join(",")
+        );
+        println!(
+            "  canary: {} match_min={}",
+            model.canary_set, model.canary_match_min
+        );
+        for artifact in &model.artifacts {
+            println!(
+                "  - {} ({}) {} root={} canary={}",
+                artifact.artifact,
+                artifact.engine,
+                artifact.weights_human,
+                short_hash(&artifact.artifact_root),
+                artifact
+                    .canary_fingerprint
+                    .as_deref()
+                    .map(short_hash)
+                    .unwrap_or("missing")
+            );
+            println!(
+                "    source: {}@{} {}",
+                artifact.source_repo, artifact.source_revision, artifact.source_path
+            );
+        }
+    }
+}
+
+fn short_hash(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2}GiB", bytes as f64 / GIB)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2}MiB", bytes as f64 / MIB)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
@@ -6709,6 +7092,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::SetRules(args) => &args.tx,
         AdminCommands::SetParams(args) => &args.tx,
         AdminCommands::SetModelRef(args) => &args.tx,
+        AdminCommands::PublishCatalog(args) => &args.tx,
         AdminCommands::RegisterEnclave(args) => &args.tx,
         AdminCommands::RetireEnclave(args) => &args.tx,
         AdminCommands::OpenRoom(args) => &args.tx,
@@ -6732,6 +7116,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::SetRules(args) => Ok(("setRules", admin_set_rules_payload(args))),
         AdminCommands::SetParams(args) => Ok(("setParams", admin_set_params_payload(args)?)),
         AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args))),
+        AdminCommands::PublishCatalog(args) => {
+            Ok(("publishCatalog", admin_publish_catalog_payload(args)?))
+        }
         AdminCommands::RegisterEnclave(args) => {
             Ok(("registerEnclave", admin_register_enclave_payload(args)?))
         }
@@ -6809,6 +7196,84 @@ fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Value {
         payload["source_hash"] = json!(source_hash);
     }
     payload
+}
+
+fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value> {
+    validate_https_url(&args.catalog_url, "--catalog-url")?;
+    validate_https_url(&args.signature_url, "--signature-url")?;
+    validate_https_url(&args.canaries_base_url, "--canaries-base-url")?;
+
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let signature_path = args
+        .signature_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/signatures/models.json.sig"))?;
+    let signature_path = absolutize(signature_path)?;
+    let keys_dir = args
+        .keys_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+
+    let report = catalog::verify(catalog::VerifyOptions {
+        catalog_path: catalog_path.clone(),
+        signature_path: signature_path.clone(),
+        keys_dir,
+        canaries_dir: canaries_dir.clone(),
+        check_dev_downloads: false,
+        check_launch_sources: false,
+        hf_token_file: None,
+    })?;
+    if !report.ok {
+        bail!("catalog verification failed; refusing to publish catalog anchor");
+    }
+
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let signature = read_json_file(&signature_path)
+        .with_context(|| format!("reading {}", signature_path.display()))?;
+    let key_id = required_json_string_for(&signature, "key_id", "catalog signature")?;
+    let public_key = required_json_string_for(&signature, "public_key", "catalog signature")?;
+    let signature_hash = blake3_file_hex(&signature_path)?;
+    let canaries = report
+        .canary_sets
+        .iter()
+        .map(|set_id| {
+            let path = canaries_dir.join(format!("{set_id}.json"));
+            Ok(json!({
+                "set_id": set_id,
+                "url": catalog_release_url_join(&args.canaries_base_url, &format!("{set_id}.json"))?,
+                "hash": blake3_file_hex(&path)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(json!({
+        "op": "publish_catalog",
+        "catalog_id": catalog_doc.catalog_id,
+        "source_kind": args.source_kind,
+        "catalog_url": args.catalog_url,
+        "signature_url": args.signature_url,
+        "catalog_hash": report.catalog_hash,
+        "signature_hash": signature_hash,
+        "key_id": key_id,
+        "public_key": public_key,
+        "model_count": report.model_count,
+        "artifact_count": report.artifact_count,
+        "canaries": canaries,
+    }))
 }
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
@@ -7862,21 +8327,56 @@ async fn models(args: ModelsArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
-    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
     let timeout = Duration::from_secs(args.timeout_seconds);
     let client = reqwest::Client::builder().timeout(timeout).build()?;
-    let models = fetch_gateway_models(&client, &gateway_root).await?;
-    let summaries = gateway_model_summaries(&models)?;
-    let report = json!({
-        "ok": true,
-        "gateway_url": gateway_root,
-        "models": summaries,
-    });
 
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    if args.gateway {
+        let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+        let models = fetch_gateway_models(&client, &gateway_root).await?;
+        let summaries = gateway_model_summaries(&models)?;
+        let report = json!({
+            "ok": true,
+            "source": "gateway_live",
+            "gateway_url": gateway_root,
+            "models": summaries,
+        });
+
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_models_report(&report)?;
+        }
     } else {
-        print_models_report(&report)?;
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let release = read_catalog_release_anchor(&rpc).await?;
+        let files = fetch_catalog_release_files(&client, &home, &release).await?;
+        let catalog_doc = catalog::load_document(&files.catalog_path)?;
+        let catalog_report = catalog_list_report(
+            &catalog_doc,
+            files.catalog_path,
+            files.signature_path,
+            release.catalog_hash.clone(),
+            release.key_id.clone(),
+            CatalogListTier::Launch,
+        );
+
+        if args.json {
+            let report = json!({
+                "ok": true,
+                "source": "ledger_catalog",
+                "rpc_url": rpc_url,
+                "release": release,
+                "catalog": catalog_report,
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("Ledger catalog release: catalog/current via {rpc_url}");
+            println!("Published catalog URL: {}", release.catalog_url);
+            print_catalog_list_report(&catalog_report);
+            println!();
+            println!("Live routable provider capacity: run `mayhem models --gateway`.");
+        }
     }
     Ok(())
 }
@@ -8656,6 +9156,171 @@ async fn fetch_gateway_models(client: &reqwest::Client, gateway_root: &str) -> R
         .context("gateway /v1/models returned no models")?
         .clone();
     Ok(models)
+}
+
+struct CatalogReleaseFiles {
+    catalog_path: PathBuf,
+    signature_path: PathBuf,
+}
+
+async fn read_catalog_release_anchor(rpc: &PeerRpcClient) -> Result<CatalogReleaseAnchor> {
+    let value = read_state_value(rpc, "catalog/current").await?.context(
+        "catalog/current not found; ask the admin to run `mayhem admin publish-catalog`",
+    )?;
+    let release: CatalogReleaseAnchor =
+        serde_json::from_value(value).context("parsing catalog/current")?;
+    if release.status != "active" {
+        bail!("catalog/current is not active");
+    }
+    if release.published_by_role.as_deref() != Some("admin") {
+        bail!("catalog/current is not admin-published");
+    }
+    validate_https_url(&release.catalog_url, "catalog/current catalog_url")?;
+    validate_https_url(&release.signature_url, "catalog/current signature_url")?;
+    if !is_hex_len(&release.catalog_hash, 64)
+        || !is_hex_len(&release.signature_hash, 64)
+        || !is_hex_len(&release.public_key, 64)
+    {
+        bail!("catalog/current has invalid hash or public key fields");
+    }
+    Ok(release)
+}
+
+async fn fetch_catalog_release_files(
+    client: &reqwest::Client,
+    home: &Path,
+    release: &CatalogReleaseAnchor,
+) -> Result<CatalogReleaseFiles> {
+    let cache_dir = home.join("catalog-cache").join(&release.catalog_hash);
+    let catalog_path = cache_dir.join("models.json");
+    let signature_path = cache_dir.join("models.json.sig");
+    let keys_dir = cache_dir.join("keys");
+    let canaries_dir = cache_dir.join("canaries");
+    fs::create_dir_all(&keys_dir).with_context(|| format!("creating {}", keys_dir.display()))?;
+    fs::create_dir_all(&canaries_dir)
+        .with_context(|| format!("creating {}", canaries_dir.display()))?;
+
+    cache_release_url(
+        client,
+        &release.catalog_url,
+        &catalog_path,
+        &release.catalog_hash,
+        64 * 1024 * 1024,
+        "catalog models.json",
+    )
+    .await?;
+    cache_release_url(
+        client,
+        &release.signature_url,
+        &signature_path,
+        &release.signature_hash,
+        1024 * 1024,
+        "catalog signature",
+    )
+    .await?;
+    for canary in &release.canaries {
+        validate_https_url(&canary.url, "catalog/current canary URL")?;
+        if !is_hex_len(&canary.hash, 64) {
+            bail!("catalog/current canary {} has invalid hash", canary.set_id);
+        }
+        cache_release_url(
+            client,
+            &canary.url,
+            &canaries_dir.join(format!("{}.json", canary.set_id)),
+            &canary.hash,
+            1024 * 1024,
+            "catalog canary set",
+        )
+        .await?;
+    }
+
+    write_json_file(
+        &keys_dir.join(format!("{}.json", release.key_id)),
+        &json!({
+            "key_id": release.key_id,
+            "alg": "ed25519",
+            "public_key": release.public_key,
+            "status": "active",
+            "created_at": "ledger-catalog-release",
+        }),
+    )?;
+
+    let report = catalog::verify(catalog::VerifyOptions {
+        catalog_path: catalog_path.clone(),
+        signature_path: signature_path.clone(),
+        keys_dir,
+        canaries_dir,
+        check_dev_downloads: false,
+        check_launch_sources: false,
+        hf_token_file: None,
+    })?;
+    if !report.ok {
+        bail!("ledger catalog release verification failed");
+    }
+    if report.catalog_hash != release.catalog_hash
+        || report.key_id != release.key_id
+        || report.model_count != release.model_count
+        || report.artifact_count != release.artifact_count
+    {
+        bail!("ledger catalog release metadata does not match fetched catalog");
+    }
+
+    Ok(CatalogReleaseFiles {
+        catalog_path,
+        signature_path,
+    })
+}
+
+async fn cache_release_url(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    expected_hash: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<()> {
+    if let Ok(bytes) = fs::read(path) {
+        if blake3_bytes_hex(&bytes) == expected_hash {
+            return Ok(());
+        }
+    }
+    let bytes = fetch_release_bytes(client, url, max_bytes, label).await?;
+    let actual = blake3_bytes_hex(&bytes);
+    if actual != expected_hash {
+        bail!("{label} hash mismatch from {url}: expected {expected_hash}, got {actual}");
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+async fn fetch_release_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    validate_https_url(url, label)?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("requesting {label} {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("{label} fetch returned {status} for {url}: {body}");
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading {label} body from {url}"))?;
+    if bytes.len() > max_bytes {
+        bail!("{label} from {url} exceeded {max_bytes} bytes");
+    }
+    Ok(bytes.to_vec())
 }
 
 fn select_test_model(models: &[Value], requested: Option<&str>) -> Result<TestModel> {
@@ -10781,6 +11446,41 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
+fn blake3_file_hex(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn blake3_bytes_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+fn required_json_string_for(value: &Value, field: &str, label: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{label} missing {field}"))
+}
+
+fn validate_https_url(value: &str, label: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(value).with_context(|| format!("{label} is not a URL"))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        bail!("{label} must be an HTTPS URL");
+    }
+    Ok(())
+}
+
+fn catalog_release_url_join(base: &str, path: &str) -> Result<String> {
+    validate_https_url(base, "catalog release base URL")?;
+    let mut base = base.trim().trim_end_matches('/').to_owned();
+    base.push('/');
+    let joined = format!("{base}{}", path.trim_start_matches('/'));
+    validate_https_url(&joined, "catalog release URL")?;
+    Ok(joined)
+}
+
 fn temp_audit_bundle_path(epoch: u64) -> Result<PathBuf> {
     Ok(env::temp_dir().join(format!(
         "mayhem-receipts-export-{epoch}-{}-{}.json",
@@ -11045,6 +11745,35 @@ struct PrefixStateResponse {
 struct PrefixStateEntry {
     key: String,
     value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CatalogReleaseAnchor {
+    catalog_id: String,
+    source_kind: String,
+    catalog_url: String,
+    signature_url: String,
+    catalog_hash: String,
+    signature_hash: String,
+    key_id: String,
+    public_key: String,
+    model_count: usize,
+    artifact_count: usize,
+    #[serde(default)]
+    canaries: Vec<CatalogReleaseCanaryRef>,
+    ver: u64,
+    #[serde(default)]
+    supersedes: Option<String>,
+    status: String,
+    #[serde(default)]
+    published_by_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CatalogReleaseCanaryRef {
+    set_id: String,
+    url: String,
+    hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -15762,6 +16491,37 @@ mod tests {
     }
 
     #[test]
+    fn admin_publish_catalog_payload_anchors_signed_release_urls() {
+        let args = AdminPublishCatalogArgs {
+            tx: test_admin_tx_args(),
+            catalog_path: None,
+            signature_path: None,
+            keys_dir: None,
+            canaries_dir: None,
+            catalog_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json".to_owned(),
+            signature_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig".to_owned(),
+            canaries_base_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries".to_owned(),
+            source_kind: "huggingface".to_owned(),
+        };
+
+        let payload = admin_publish_catalog_payload(&args).unwrap();
+
+        assert_eq!(payload["op"], "publish_catalog");
+        assert_eq!(payload["source_kind"], "huggingface");
+        assert!(is_hex_len(payload["catalog_hash"].as_str().unwrap(), 64));
+        assert!(is_hex_len(payload["signature_hash"].as_str().unwrap(), 64));
+        assert_eq!(payload["model_count"], 5);
+        assert_eq!(payload["artifact_count"], 7);
+        assert!(payload["canaries"].as_array().unwrap().iter().any(|entry| {
+            entry["set_id"] == "canary-launch-v1"
+                && entry["url"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/canaries/canary-launch-v1.json")
+        }));
+    }
+
+    #[test]
     fn admin_rules_and_params_payloads_cover_admin_control_plane() {
         let rules = AdminSetRulesArgs {
             tx: test_admin_tx_args(),
@@ -18183,6 +18943,40 @@ mod tests {
         assert!(!summaries[0].json);
         assert_eq!(summaries[0].context, 8192);
         assert_eq!(summaries[0].attestation_tiers["T2"], 1);
+    }
+
+    #[test]
+    fn catalog_list_report_filters_launch_and_surfaces_download_sources() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "bb".repeat(32));
+        let mut launch = catalog.models[0].clone();
+        launch.model_id = "test/launch@4bit".to_owned();
+        launch.tier = "launch".to_owned();
+        catalog.models.push(launch);
+
+        let report = catalog_list_report(
+            &catalog,
+            PathBuf::from("catalog/models.json"),
+            PathBuf::from("catalog/signatures/models.json.sig"),
+            "cc".repeat(32),
+            "test-key".to_owned(),
+            CatalogListTier::Launch,
+        );
+
+        assert!(report.ok);
+        assert_eq!(report.tier_filter, "launch");
+        assert_eq!(report.model_count, 1);
+        assert_eq!(report.artifact_count, 1);
+        assert_eq!(report.models[0].model_id, "test/launch@4bit");
+        assert_eq!(report.models[0].artifacts[0].source_repo, "test/model");
+        assert_eq!(
+            report.models[0].artifacts[0].source_url.as_deref(),
+            Some("https://huggingface.co/test/model/resolve/1111111111111111111111111111111111111111/model.gguf")
+        );
+        assert!(report.authority.contains("contract ledger"));
     }
 
     #[test]

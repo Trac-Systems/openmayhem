@@ -225,8 +225,8 @@
         "set_id": "canary-launch-v1",
         "match_min": 0.9,
         "fingerprints": {
-          "gguf-q4_k_m": "bf4046fa02886e8b5c4d1527867790d51aa67b143d48497011dbfd10e06a4759",
-          "mlx-4bit": "69539ac705ce86bfdf087dc8e82146f5289331acea878dd425c6d6c2cd2d8e08"
+          "gguf-q4_k_m": "adc99e6dfef1326b5223f4cb119757c0a92ab046936db3c0510797345f3952cd",
+          "mlx-4bit": "4442b127e37385bed1687abdd4fda085db65a7265623c5deeb55da2384f35922"
         }
       },
       "price_ref_mu": {
@@ -315,8 +315,8 @@
         "set_id": "canary-launch-v1",
         "match_min": 0.9,
         "fingerprints": {
-          "gguf-q4_k_m": "fbdd291b18fe0b354390643ed1bcc38bd780fa0a330717f1e0df48a0acd6e6c0",
-          "mlx-4bit": "90c777e6ffe4bdf8df7ce5933801ebdf555cdacc28a8f586f596ee8a9c0a38f7"
+          "gguf-q4_k_m": "cfa9cfcb89cd07fec93aff0ce9ccaa2aa9a1a8a1406c70162bc0fa8f2505f91e",
+          "mlx-4bit": "ab6b87858805cf0a1ef6168792e0db85bc5286d06ed1b9ed0c8d54ca4ab2b0a0"
         }
       },
       "price_ref_mu": {
@@ -384,7 +384,7 @@
         "set_id": "canary-launch-v1",
         "match_min": 0.9,
         "fingerprints": {
-          "gguf-q4_k_m": "d4a7c5ec47da1593e42e3eff3c2f08dd2c022c45dcb24a403a9e4e29e8f4bfe2"
+          "gguf-q4_k_m": "967d6b270bebe55e75e868569c0ba93eb7a9f2bd44f1b50bfaee325525f55425"
         }
       },
       "price_ref_mu": {

@@ -155,6 +155,27 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
       },
     ],
     [
+      'publishCatalog',
+      {
+        op: 'publish_catalog',
+        catalog_id: 'provider-catalog',
+        source_kind: 'huggingface',
+        catalog_url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json',
+        signature_url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig',
+        catalog_hash: '8'.repeat(64),
+        signature_hash: '9'.repeat(64),
+        key_id: 'provider-key',
+        public_key: 'a'.repeat(64),
+        model_count: 1,
+        artifact_count: 1,
+        canaries: [{
+          set_id: 'provider-canary',
+          url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/provider-canary.json',
+          hash: 'b'.repeat(64),
+        }],
+      },
+    ],
+    [
       'registerEnclave',
       {
         ...enclaveRegistration,

@@ -10,6 +10,7 @@ const FIAT_DEPOSIT_RAILS = new Set(['stripe', 'coinbase']);
 const FIAT_CURRENCIES = new Set(['usd', 'eur']);
 const PRICE_DENOMINATION = 'mu_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
+const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
 const PROVIDER_LIFECYCLE_OPS = new Set([
   'register_provider',
   'join_enclave',
@@ -255,6 +256,25 @@ class MayhemContract extends Contract {
         model_id: { type: 'string', min: 1, max: 256 },
         price_ref_mu: { type: 'any' },
         source_hash: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
+    this.addSchema('publishCatalog', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        catalog_id: { type: 'string', min: 1, max: 128 },
+        source_kind: { type: 'string', min: 1, max: 32 },
+        catalog_url: { type: 'string', min: 1, max: 512 },
+        signature_url: { type: 'string', min: 1, max: 512 },
+        catalog_hash: { type: 'string', min: 1, max: 128 },
+        signature_hash: { type: 'string', min: 1, max: 128 },
+        key_id: { type: 'string', min: 1, max: 128 },
+        public_key: { type: 'string', min: 1, max: 128 },
+        model_count: { type: 'number', integer: true, min: 1 },
+        artifact_count: { type: 'number', integer: true, min: 1 },
+        canaries: { type: 'array', max: 64, items: { type: 'any' } },
       },
     });
 
@@ -996,6 +1016,44 @@ class MayhemContract extends Contract {
     await this.put(key, record);
     console.log('mayhem setModelRef', record);
     return { ok: true, op: 'setModelRef', model_id: record.model_id, ver: record.ver };
+  }
+
+  async publishCatalog() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const validationError = this.validateCatalogRelease(this.value);
+    if (validationError) return validationError;
+
+    const current = await this.get('catalog/current');
+    const record = {
+      catalog_id: this.value.catalog_id,
+      source_kind: this.value.source_kind,
+      catalog_url: this.value.catalog_url,
+      signature_url: this.value.signature_url,
+      catalog_hash: this.value.catalog_hash,
+      signature_hash: this.value.signature_hash,
+      key_id: this.value.key_id,
+      public_key: this.value.public_key,
+      model_count: this.value.model_count,
+      artifact_count: this.value.artifact_count,
+      canaries: cloneValue(this.value.canaries),
+      ver: (current?.ver ?? 0) + 1,
+      supersedes: current?.catalog_hash ?? null,
+      status: 'active',
+      published_at: this.tx,
+      published_by: this.address,
+      published_by_role: 'admin',
+    };
+    await this.put(`catalog/release/${record.catalog_hash}`, record);
+    await this.put('catalog/current', record);
+    console.log('mayhem publishCatalog', record);
+    return {
+      ok: true,
+      op: 'publishCatalog',
+      catalog_hash: record.catalog_hash,
+      ver: record.ver,
+    };
   }
 
   async registerEnclave() {
@@ -3117,6 +3175,69 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  validateCatalogRelease(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'catalog_id',
+        'source_kind',
+        'catalog_url',
+        'signature_url',
+        'catalog_hash',
+        'signature_hash',
+        'key_id',
+        'public_key',
+        'model_count',
+        'artifact_count',
+        'canaries',
+      ],
+      'catalog release'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'publish_catalog') return new Error('Invalid publish_catalog op.');
+    if (!this.isSafeKeyPart(value.catalog_id)) return new Error('Invalid catalog id.');
+    if (!CATALOG_SOURCE_KINDS.has(value.source_kind)) {
+      return new Error('Unsupported catalog source kind.');
+    }
+    if (!this.isHttpsUrl(value.catalog_url) || !this.isHttpsUrl(value.signature_url)) {
+      return new Error('Catalog release URLs must be HTTPS.');
+    }
+    if (!this.isHexBytes(value.catalog_hash, 32)) {
+      return new Error('Catalog hash must be a 32-byte hex BLAKE3 hash.');
+    }
+    if (!this.isHexBytes(value.signature_hash, 32)) {
+      return new Error('Catalog signature hash must be a 32-byte hex BLAKE3 hash.');
+    }
+    if (!this.isSafeKeyPart(value.key_id)) return new Error('Invalid catalog key id.');
+    if (!this.isHexBytes(value.public_key, 32)) {
+      return new Error('Catalog public key must be 32-byte hex.');
+    }
+    const seen = new Set();
+    for (const entry of value.canaries) {
+      const entryError = this.validateCatalogCanaryRef(entry);
+      if (entryError) return entryError;
+      if (seen.has(entry.set_id)) return new Error('Duplicate catalog canary set.');
+      seen.add(entry.set_id);
+    }
+    return null;
+  }
+
+  validateCatalogCanaryRef(entry) {
+    const shapeError = this.validateExactObjectKeys(
+      entry,
+      ['set_id', 'url', 'hash'],
+      'catalog canary ref'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isSafeKeyPart(entry.set_id)) return new Error('Invalid catalog canary set id.');
+    if (!this.isHttpsUrl(entry.url)) return new Error('Catalog canary URL must be HTTPS.');
+    if (!this.isHexBytes(entry.hash, 32)) {
+      return new Error('Catalog canary hash must be a 32-byte hex BLAKE3 hash.');
+    }
+    return null;
+  }
+
   validateEnclaveCaps(caps) {
     if (!caps || typeof caps !== 'object' || Array.isArray(caps)) {
       return new Error('Enclave caps must be an object.');
@@ -4656,6 +4777,16 @@ class MayhemContract extends Contract {
         part !== '..' &&
         /^[A-Za-z0-9._+-]+$/.test(part)
       ));
+  }
+
+  isHttpsUrl(value) {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 512) return false;
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol === 'https:' && !!parsed.hostname;
+    } catch {
+      return false;
+    }
   }
 
   isSafeExternalRef(value) {

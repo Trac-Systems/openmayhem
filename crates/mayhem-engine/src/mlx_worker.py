@@ -118,8 +118,13 @@ def handle_generate(request_id, payload):
     ):
         segment = str(getattr(response, "text", ""))
         token = int(getattr(response, "token", -1))
-        generated = int(getattr(response, "generation_tokens", completion_tokens))
-        if segment:
+        generated_attr = getattr(response, "generation_tokens", None)
+        generated = (
+            int(generated_attr)
+            if generated_attr is not None
+            else completion_tokens + (1 if token >= 0 else 0)
+        )
+        if token >= 0:
             send(
                 {
                     "id": request_id,
@@ -131,6 +136,7 @@ def handle_generate(request_id, payload):
                     },
                 }
             )
+        if segment:
             text += segment
         completion_tokens = max(completion_tokens, generated)
         final_reason = getattr(response, "finish_reason", None)

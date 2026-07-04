@@ -79,6 +79,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'publish_catalog') {
+      return {
+        type: 'publishCatalog',
+        value: json,
+      };
+    }
     if (json?.op === 'register_enclave') {
       return {
         type: 'registerEnclave',
@@ -240,6 +246,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|coinbase" }\' --sim 1 | admin sets a provider payout target.');
     console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
     console.log('- /tx --command \'{ "op": "set_model_ref", "model_id": "<catalog-model-id>", "price_ref_mu": { "in_per_1k": 18, "out_per_1k": 55 } }\' --sim 1 | admin seeds catalog reference pricing in mu_usd.');
+    console.log('- /tx --command \'{ "op": "publish_catalog", "catalog_id": "mayhem-models", "source_kind": "huggingface", "catalog_url": "https://...", "signature_url": "https://...", "catalog_hash": "<blake3>", "signature_hash": "<blake3>", "key_id": "<id>", "public_key": "<hex>", "model_count": 3, "artifact_count": 5, "canaries": [{ "set_id": "canary-launch-v1", "url": "https://...", "hash": "<blake3>" }] }\' --sim 1 | admin anchors the latest signed catalog release for network discovery.');
     console.log('- /tx --command \'{ "op": "register_enclave", ... }\' --sim 1 | admin registers an enclave catalog entry.');
     console.log('- /tx --command \'{ "op": "open_room", "enclave_id": "<id>", "nonce": "<nonce>", "label": "<label>", "policy": {} }\' --sim 1 | admin opens a canonical room for one admin enclave.');
     console.log('- /tx --command \'{ "op": "close_room", "room_id": "<room_id>" }\' --sim 1 | admin closes a canonical room.');

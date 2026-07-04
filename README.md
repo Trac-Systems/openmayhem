@@ -22,11 +22,13 @@ with hashes, sizes, and signatures for every canonical enclave.
 ```bash
 ./install.sh
 mayhem setup --role provider
+mayhem models
 mayhem provider start --enclave <admin-enclave-id> --rooms auto --serve-sessions
 mayhem test --sync-models
 ```
 
 Providers can only opt into admin-created enclave and room records with current admin `mu_usd` prices from the contract ledger. They cannot submit arbitrary models, create canonical rooms, or set pricing.
+`mayhem models` reads the ledger `catalog/current` anchor, fetches the signed admin catalog JSONs from the published release URLs, verifies them, and lists approved launch artifacts without requiring a repo update. `mayhem catalog list` is the offline/local signed-catalog view.
 To opt out of all active canonical serving rows for the provider wallet, run `mayhem provider stop`.
 
 ## User Quickstart
@@ -47,6 +49,10 @@ opencode run --model mayhem/<model-id> "Say hello from Mayhem."
 enclave, current `mu_usd` price, open room, active provider route, and local
 SC-Bridge credentials for direct provider sessions. For isolated API
 development only, use `mayhem use --dev-embedded-catalog`.
+`mayhem models` discovers the current admin catalog release from the ledger and
+verifies the fetched JSONs before printing launch models. Use
+`mayhem models --gateway` to inspect what the currently connected local gateway
+can route right now.
 
 ## Install
 
