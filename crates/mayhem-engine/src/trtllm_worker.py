@@ -201,11 +201,16 @@ def make_sampling_params(payload):
             ("tensorrt_llm.llmapi.llm", "SamplingParams"),
         )
     )
+    ignore_eos = bool(payload.get("ignore_eos"))
     kwargs = {
         "max_tokens": int(payload.get("max_new_tokens") or 64),
         "max_new_tokens": int(payload.get("max_new_tokens") or 64),
         "temperature": float(payload.get("temperature") or 0.0),
+        "ignore_eos": ignore_eos,
     }
+    if ignore_eos:
+        kwargs["min_tokens"] = kwargs["max_tokens"]
+        kwargs["min_new_tokens"] = kwargs["max_tokens"]
     top_p = payload.get("top_p")
     if top_p is not None and float(top_p) > 0.0:
         kwargs["top_p"] = float(top_p)
@@ -262,20 +267,20 @@ def runner_output_tokens(outputs, prompt_len, max_tokens):
 def runner_generate_tokens(prompt_tokens, payload, max_tokens):
     import torch
 
-    end_id = tokenizer_token_id("eos_token_id")
     pad_id = tokenizer_token_id("pad_token_id", "eos_token_id")
     kwargs = {
         "batch_input_ids": [
             torch.tensor(prompt_tokens, dtype=torch.int32, device="cuda")
         ],
         "max_new_tokens": int(max_tokens),
-        "end_id": end_id,
         "pad_id": pad_id,
         "temperature": float(payload.get("temperature") or 0.0),
         "top_p": float(payload.get("top_p") or 0.0),
         "output_sequence_lengths": True,
         "return_dict": True,
     }
+    if not bool(payload.get("ignore_eos")):
+        kwargs["end_id"] = tokenizer_token_id("eos_token_id")
     if kwargs["temperature"] <= 0.0:
         kwargs["temperature"] = 1.0
         kwargs["top_k"] = 1

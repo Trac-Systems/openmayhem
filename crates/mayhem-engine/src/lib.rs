@@ -248,6 +248,8 @@ pub struct GenerateRequest {
     pub top_p: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u32>,
+    #[serde(default)]
+    pub ignore_eos: bool,
 }
 
 impl GenerateRequest {
@@ -259,6 +261,7 @@ impl GenerateRequest {
             temperature: None,
             top_p: None,
             seed: None,
+            ignore_eos: false,
         }
     }
 
@@ -271,6 +274,12 @@ impl GenerateRequest {
     #[must_use]
     pub fn with_grammar(mut self, grammar: GrammarSpec) -> Self {
         self.grammar = Some(grammar);
+        self
+    }
+
+    #[must_use]
+    pub fn with_ignore_eos(mut self, ignore_eos: bool) -> Self {
+        self.ignore_eos = ignore_eos;
         self
     }
 }
@@ -844,7 +853,7 @@ mod llama_cpp_backend {
 
             while completion_tokens < request.max_new_tokens {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-                if model.is_eog_token(token) {
+                if model.is_eog_token(token) && !request.ignore_eos {
                     finish_reason = FinishReason::Stop;
                     break;
                 }

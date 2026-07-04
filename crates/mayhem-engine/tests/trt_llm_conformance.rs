@@ -33,6 +33,8 @@ const LLAMA_THREADS_ENV: &str = "MAYHEM_TRTLLM_LLAMA_THREADS";
 const BASELINE_GGUF_ENV: &str = "MAYHEM_TRTLLM_BASELINE_GGUF";
 #[cfg(feature = "llama-cpp")]
 const BENCH_REPORT_ENV: &str = "MAYHEM_TRTLLM_BENCH_REPORT";
+#[cfg(feature = "llama-cpp")]
+const BENCH_IGNORE_EOS_ENV: &str = "MAYHEM_TRTLLM_BENCH_IGNORE_EOS";
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -155,13 +157,18 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
     let prompt = "Write a numbered list of short words about audited inference receipts.";
     let bench_tokens = env_u32(BENCH_TOKENS_ENV, 128);
     let bench_samples = env_usize(BENCH_SAMPLES_ENV, 3);
-    let _ = timed_generate(&mut trt, "Warm up with three short words.", 8)?;
-    let _ = timed_generate(&mut llama, "Warm up with three short words.", 8)?;
+    let ignore_eos = env_bool(BENCH_IGNORE_EOS_ENV);
+    let _ = timed_generate(&mut trt, "Warm up with three short words.", 8, false)?;
+    let _ = timed_generate(&mut llama, "Warm up with three short words.", 8, false)?;
 
-    let trt_samples = throughput_samples(&mut trt, prompt, bench_tokens, bench_samples)?;
-    let llama_samples = throughput_samples(&mut llama, prompt, bench_tokens, bench_samples)?;
-    let trt_tps = median(&trt_samples);
-    let llama_tps = median(&llama_samples);
+    let trt_samples =
+        throughput_samples(&mut trt, prompt, bench_tokens, bench_samples, ignore_eos)?;
+    let llama_samples =
+        throughput_samples(&mut llama, prompt, bench_tokens, bench_samples, ignore_eos)?;
+    let trt_rates = sample_rates(&trt_samples);
+    let llama_rates = sample_rates(&llama_samples);
+    let trt_tps = median(&trt_rates);
+    let llama_tps = median(&llama_rates);
     let threshold_ratio = 5.0;
     let ratio = trt_tps / llama_tps.max(f64::MIN_POSITIVE);
     let pass = trt_tps >= llama_tps * threshold_ratio;
@@ -178,10 +185,13 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
             "bench_prompt": prompt,
             "bench_tokens": bench_tokens,
             "bench_samples": bench_samples,
+            "ignore_eos": ignore_eos,
             "llama_threads": llama_threads,
             "threshold_ratio": threshold_ratio,
-            "trt_tok_s_samples": trt_samples,
-            "llama_tok_s_samples": llama_samples,
+            "trt_tok_s_samples": trt_rates,
+            "llama_tok_s_samples": llama_rates,
+            "trt_samples": trt_samples,
+            "llama_samples": llama_samples,
             "trt_tok_s_median": trt_tps,
             "llama_tok_s_median": llama_tps,
             "ratio": ratio,
@@ -189,7 +199,7 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
         }),
     )?;
     println!(
-        "TensorRT-LLM tok/s median: {trt_tps:.2} samples={trt_samples:?}; llama.cpp tok/s median: {llama_tps:.2} samples={llama_samples:?}"
+        "TensorRT-LLM tok/s median: {trt_tps:.2} samples={trt_samples:?}; llama.cpp tok/s median: {llama_tps:.2} samples={llama_samples:?}; ignore_eos={ignore_eos}"
     );
     assert!(
         pass,
@@ -235,14 +245,26 @@ fn trt_llm_benchmark_requires_llama_cpp_feature() {
 }
 
 #[cfg(feature = "llama-cpp")]
+#[derive(Clone, Debug, serde::Serialize)]
+struct BenchmarkSample {
+    tok_s: f64,
+    completion_tokens: u32,
+    finish_reason: String,
+    elapsed_ms: u128,
+}
+
+#[cfg(feature = "llama-cpp")]
 fn timed_generate<B: EngineBackend>(
     backend: &mut B,
     prompt: &str,
     max_new_tokens: u32,
+    ignore_eos: bool,
 ) -> Result<(GenerateOutput, Duration), mayhem_engine::EngineError> {
     let start = Instant::now();
     let output = backend.generate(
-        GenerateRequest::new(prompt).with_max_new_tokens(max_new_tokens),
+        GenerateRequest::new(prompt)
+            .with_max_new_tokens(max_new_tokens)
+            .with_ignore_eos(ignore_eos),
         &mut |_chunk| Ok(()),
     )?;
     Ok((output, start.elapsed()))
@@ -254,13 +276,24 @@ fn throughput_samples<B: EngineBackend>(
     prompt: &str,
     max_new_tokens: u32,
     samples: usize,
-) -> Result<Vec<f64>, mayhem_engine::EngineError> {
+    ignore_eos: bool,
+) -> Result<Vec<BenchmarkSample>, mayhem_engine::EngineError> {
     let mut results = Vec::with_capacity(samples);
     for _ in 0..samples {
-        let (output, elapsed) = timed_generate(backend, prompt, max_new_tokens)?;
-        results.push(tokens_per_second(&output, elapsed));
+        let (output, elapsed) = timed_generate(backend, prompt, max_new_tokens, ignore_eos)?;
+        results.push(BenchmarkSample {
+            tok_s: tokens_per_second(&output, elapsed),
+            completion_tokens: output.usage.completion_tokens,
+            finish_reason: output.finish_reason.to_string(),
+            elapsed_ms: elapsed.as_millis(),
+        });
     }
     Ok(results)
+}
+
+#[cfg(feature = "llama-cpp")]
+fn sample_rates(samples: &[BenchmarkSample]) -> Vec<f64> {
+    samples.iter().map(|sample| sample.tok_s).collect()
 }
 
 #[cfg(feature = "llama-cpp")]
@@ -357,6 +390,14 @@ fn env_usize(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+#[cfg(feature = "llama-cpp")]
+fn env_bool(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn python_bin() -> PathBuf {
