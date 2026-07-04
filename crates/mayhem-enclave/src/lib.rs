@@ -1835,22 +1835,15 @@ fn bounded_ratio_f64(numerator: f64, denominator: f64) -> f64 {
 }
 
 fn macos_sandbox_exec_profile(config: &SandboxConfig) -> String {
-    let sealed_store = sandbox_quote_path(&config.sealed_store_dir);
+    let sealed_store = sandbox_quote_existing_or_raw_path(&config.sealed_store_dir);
     let ipc_socket = sandbox_quote_path(&config.ipc_socket_path);
-    let ipc_parent = config
-        .ipc_socket_path
-        .parent()
-        .map(sandbox_quote_path)
-        .unwrap_or_else(|| "\"/tmp\"".to_owned());
-
     format!(
         r#"(version 1)
 (allow default)
 (deny network*)
 (allow file-read* (subpath {sealed_store}))
-(deny file-write* (subpath {sealed_store}))
 (allow file-read* file-write* (literal {ipc_socket}))
-(allow file-read* file-write* (subpath {ipc_parent}))
+(deny file-write* (subpath {sealed_store}))
 "#
     )
 }
@@ -1865,7 +1858,7 @@ fn linux_seccomp_policy_document() -> String {
             { "syscall": "socket", "arg": "domain", "values": ["AF_INET", "AF_INET6", "AF_PACKET", "AF_NETLINK"] }
         ],
         "fs": {
-            "sealed_store": "read-only by mount/permissions before applying seccomp",
+            "sealed_store": "read-only enforced by sandbox-run permission guard; direct apply requires pre-existing read-only permissions",
             "ipc_socket": "AF_UNIX only"
         }
     })
@@ -1898,6 +1891,11 @@ fn sandbox_quote_path(path: &Path) -> String {
     )
 }
 
+fn sandbox_quote_existing_or_raw_path(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    sandbox_quote_path(&resolved)
+}
+
 fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<ExitStatus> {
     #[cfg(target_os = "macos")]
     {
@@ -1912,6 +1910,8 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
 
     #[cfg(target_os = "linux")]
     {
+        let _sealed_store_guard =
+            linux_sandbox_fs::SealedStoreReadOnlyGuard::apply(&config.sealed_store_dir)?;
         apply_current_process_sandbox(config)?;
         Command::new(&command[0])
             .args(&command[1..])
@@ -1939,7 +1939,7 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
 fn apply_platform_sandbox(config: &SandboxConfig) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let _ = config;
+        linux_sandbox_fs::ensure_sealed_store_read_only(&config.sealed_store_dir)?;
         linux::apply_network_deny_seccomp()
     }
 
@@ -1973,6 +1973,100 @@ fn is_tcp_denied_error(err: &std::io::Error) -> bool {
         return true;
     }
     matches!(err.raw_os_error(), Some(1 | 13))
+}
+
+#[cfg(target_os = "linux")]
+mod linux_sandbox_fs {
+    use super::{EnclaveError, Result};
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    pub struct SealedStoreReadOnlyGuard {
+        entries: Vec<(PathBuf, Permissions)>,
+    }
+
+    impl SealedStoreReadOnlyGuard {
+        pub fn apply(path: &Path) -> Result<Self> {
+            ensure_not_effective_root()?;
+            let mut entries = Vec::new();
+            collect_entries(path, &mut entries)?;
+            for (path, permissions) in &entries {
+                let mut read_only = permissions.clone();
+                read_only.set_mode(permissions.mode() & !0o222);
+                fs::set_permissions(path, read_only).map_err(EnclaveError::Io)?;
+            }
+            Ok(Self { entries })
+        }
+    }
+
+    impl Drop for SealedStoreReadOnlyGuard {
+        fn drop(&mut self) {
+            for (path, permissions) in self.entries.iter().rev() {
+                let _ = fs::set_permissions(path, permissions.clone());
+            }
+        }
+    }
+
+    pub fn ensure_sealed_store_read_only(path: &Path) -> Result<()> {
+        ensure_not_effective_root()?;
+        let mut entries = Vec::new();
+        collect_entries(path, &mut entries)?;
+        for (path, permissions) in entries {
+            if permissions.mode() & 0o222 != 0 {
+                return Err(EnclaveError::InvalidInput(format!(
+                    "sealed store path {} is writable before Linux seccomp apply",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_entries(path: &Path, entries: &mut Vec<(PathBuf, Permissions)>) -> Result<()> {
+        let metadata = fs::symlink_metadata(path).map_err(EnclaveError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(EnclaveError::InvalidInput(format!(
+                "sealed store path {} must not be a symlink",
+                path.display()
+            )));
+        }
+        entries.push((path.to_path_buf(), metadata.permissions()));
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).map_err(EnclaveError::Io)? {
+                let entry = entry.map_err(EnclaveError::Io)?;
+                collect_entries(&entry.path(), entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_not_effective_root() -> Result<()> {
+        if linux_effective_uid()? == 0 {
+            return Err(EnclaveError::InvalidInput(
+                "Linux sealed-store read-only sandbox enforcement requires a non-root provider process"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn linux_effective_uid() -> Result<u32> {
+        let status = fs::read_to_string("/proc/self/status").map_err(EnclaveError::Io)?;
+        let uid_line = status
+            .lines()
+            .find(|line| line.starts_with("Uid:"))
+            .ok_or_else(|| {
+                EnclaveError::InvalidInput("missing Uid in /proc/self/status".to_owned())
+            })?;
+        let effective = uid_line
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| EnclaveError::InvalidInput("missing effective uid".to_owned()))?;
+        effective
+            .parse::<u32>()
+            .map_err(|err| EnclaveError::InvalidInput(format!("invalid effective uid: {err}")))
+    }
 }
 
 fn validate_manifest_context(expected: &KeyContext, actual: &KeyContext) -> Result<()> {
@@ -2561,6 +2655,7 @@ mod tests {
         assert!(profile.policy.contains("seccomp-bpf"));
         assert!(profile.policy.contains("AF_INET"));
         assert!(profile.policy.contains("AF_INET6"));
+        assert!(profile.policy.contains("read-only enforced"));
         assert!(profile.policy.contains("AF_UNIX only"));
         Ok(())
     }

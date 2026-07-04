@@ -43,8 +43,8 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SESSION_RECEIPT_SCHEMA_VERSION,
+    spend_voucher_signing_bytes, AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck,
+    ReceiptBody, ReceiptUsage, SpendVoucher, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -15384,28 +15384,52 @@ fn provider_session_open_decision(
             "session rules_ver does not match current rules".to_owned(),
         );
     }
-    let voucher = frame.get("voucher").unwrap_or(&Value::Null);
-    if voucher.get("session_id").and_then(Value::as_str) != Some(session_id) {
+    let voucher = match frame
+        .get("voucher")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing voucher"))
+        .and_then(|voucher| {
+            serde_json::from_value::<SpendVoucher>(voucher).context("invalid spend voucher")
+        }) {
+        Ok(voucher) => voucher,
+        Err(err) => return reject("VOUCHER", format!("{err:#}")),
+    };
+    if voucher.body.session_id.as_str() != session_id {
         return reject("VOUCHER", "voucher session_id mismatch".to_owned());
     }
-    if voucher.get("enclave_id").and_then(Value::as_str) != Some(terms.enclave_id.as_str()) {
+    if voucher.body.enclave_id.as_str() != terms.enclave_id.as_str() {
         return reject("VOUCHER", "voucher enclave_id mismatch".to_owned());
     }
-    if voucher.get("price_ver").and_then(Value::as_u64) != Some(terms.price_ver) {
+    if voucher.body.price_ver != terms.price_ver {
         return reject("VOUCHER", "voucher price_ver mismatch".to_owned());
     }
-    if voucher
-        .get("max_spend_mu")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        == 0
-    {
+    if voucher.body.max_spend_mu == 0 {
         return reject(
             "BALANCE",
             "voucher max_spend_mu must be positive".to_owned(),
         );
     }
+    if frame.get("sig").and_then(Value::as_str) != Some(voucher.user_sig.as_str()) {
+        return reject(
+            "SIGNATURE",
+            "session open signature must match voucher user_sig".to_owned(),
+        );
+    }
+    if let Err(err) = verify_provider_session_spend_voucher(&voucher, user) {
+        return reject("SIGNATURE", format!("{err:#}"));
+    }
     ProviderSessionDecision::Accept
+}
+
+fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &str) -> Result<()> {
+    let key_bytes = hex_decode_array::<32>(user_pubkey, "spend voucher user pubkey")?;
+    let sig_bytes = hex_decode_array::<64>(&voucher.user_sig, "spend voucher user signature")?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).context("invalid spend voucher user pubkey")?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    verifying_key
+        .verify(&spend_voucher_signing_bytes(&voucher.body)?, &signature)
+        .context("spend voucher user signature failed")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -17814,6 +17838,28 @@ mod tests {
             provider_session_open_decision(&bad_voucher, &terms),
             ProviderSessionDecision::Reject {
                 code: "VOUCHER",
+                ..
+            }
+        ));
+
+        let frame = test_session_open_frame(&terms);
+        let mut bad_voucher_sig = frame.clone();
+        bad_voucher_sig["voucher"]["user_sig"] = json!("11".repeat(64));
+        bad_voucher_sig["sig"] = json!("11".repeat(64));
+        assert!(matches!(
+            provider_session_open_decision(&bad_voucher_sig, &terms),
+            ProviderSessionDecision::Reject {
+                code: "SIGNATURE",
+                ..
+            }
+        ));
+
+        let mut mismatched_open_sig = frame;
+        mismatched_open_sig["sig"] = json!("11".repeat(64));
+        assert!(matches!(
+            provider_session_open_decision(&mismatched_open_sig, &terms),
+            ProviderSessionDecision::Reject {
+                code: "SIGNATURE",
                 ..
             }
         ));
@@ -20768,26 +20814,46 @@ mod tests {
 
     fn test_session_open_frame(terms: &ProviderSessionTerms) -> Value {
         let session_id = "aa".repeat(32);
+        let user_key = SigningKey::from_bytes(&[6_u8; 32]);
+        let user = hex_encode(&user_key.verifying_key().to_bytes());
+        let voucher_body = mayhem_proto::SpendVoucherBody {
+            session_id: session_id.clone(),
+            enclave_id: terms.enclave_id.clone(),
+            price_ver: terms.price_ver,
+            max_spend_mu: 1000,
+            checkpoint_every: mayhem_proto::CheckpointPolicy {
+                tokens: 8192,
+                ms: 30000,
+            },
+        };
+        let voucher_sig = hex_encode(
+            &user_key
+                .sign(&spend_voucher_signing_bytes(&voucher_body).unwrap())
+                .to_bytes(),
+        );
         json!({
             "t": "s.open",
             "v": 1,
             "session_id": session_id,
-            "user": "66".repeat(32),
+            "user": user,
             "enclave_id": &terms.enclave_id,
             "price_ver": terms.price_ver,
             "rules_ver": terms.rules_ver,
             "voucher": {
-                "session_id": session_id,
-                "enclave_id": &terms.enclave_id,
-                "price_ver": terms.price_ver,
-                "max_spend_mu": 1000,
-                "checkpoint_every": { "tokens": 8192, "ms": 30000 },
-                "user_sig": "77".repeat(64)
+                "session_id": voucher_body.session_id,
+                "enclave_id": voucher_body.enclave_id,
+                "price_ver": voucher_body.price_ver,
+                "max_spend_mu": voucher_body.max_spend_mu,
+                "checkpoint_every": {
+                    "tokens": voucher_body.checkpoint_every.tokens,
+                    "ms": voucher_body.checkpoint_every.ms
+                },
+                "user_sig": voucher_sig.clone()
             },
             "att_nonce": "88".repeat(32),
             "ts": 1,
             "nonce": "99".repeat(32),
-            "sig": "77".repeat(64)
+            "sig": voucher_sig
         })
     }
 

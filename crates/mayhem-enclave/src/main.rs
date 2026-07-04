@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -46,6 +47,8 @@ enum Commands {
     SandboxRun(SandboxRunArgs),
     /// Probe whether outbound TCP is denied from this process.
     SandboxProbeTcp(SandboxProbeTcpArgs),
+    /// Probe whether sealed-store writes are denied from this process.
+    SandboxProbeStoreWrite(SandboxProbeStoreWriteArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -330,6 +333,21 @@ struct SandboxProbeTcpArgs {
     json: bool,
 }
 
+#[derive(Debug, Parser)]
+struct SandboxProbeStoreWriteArgs {
+    /// Sealed store directory to probe.
+    #[arg(long, value_name = "PATH")]
+    sealed_store: PathBuf,
+
+    /// Treat sandbox-denied writes as success and successful writes as failure.
+    #[arg(long)]
+    expect_denied: bool,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() {
     match run() {
         Ok(code) => std::process::exit(code),
@@ -350,6 +368,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         Commands::SandboxProfile(args) => sandbox_profile(args)?,
         Commands::SandboxRun(args) => return sandbox_run(args),
         Commands::SandboxProbeTcp(args) => sandbox_probe_tcp(args)?,
+        Commands::SandboxProbeStoreWrite(args) => sandbox_probe_store_write(args)?,
     }
     Ok(0)
 }
@@ -620,6 +639,64 @@ fn sandbox_probe_tcp(args: SandboxProbeTcpArgs) -> Result<(), Box<dyn std::error
         println!(
             "outbound tcp failed: {} kind={:?} raw_os_error={:?}",
             report.addr, report.error_kind, report.raw_os_error
+        );
+    }
+    Ok(())
+}
+
+fn sandbox_probe_store_write(
+    args: SandboxProbeStoreWriteArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = args.sealed_store.join(format!(
+        ".mayhem-sandbox-write-probe-{}",
+        std::process::id()
+    ));
+    let mut wrote = false;
+    let mut denied = false;
+    let mut error_kind = None;
+    let mut raw_os_error = None;
+
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            wrote = true;
+            file.write_all(b"write-probe")?;
+            let _ = fs::remove_file(&path);
+        }
+        Err(err) => {
+            denied = err.kind() == std::io::ErrorKind::PermissionDenied
+                || matches!(err.raw_os_error(), Some(1 | 13 | 30));
+            error_kind = Some(format!("{:?}", err.kind()));
+            raw_os_error = err.raw_os_error();
+        }
+    }
+
+    if args.expect_denied && !denied {
+        return Err(format!(
+            "sealed-store write was not denied: wrote={wrote} error_kind={error_kind:?} raw_os_error={raw_os_error:?}"
+        )
+        .into());
+    }
+
+    let report = serde_json::json!({
+        "path": path,
+        "wrote": wrote,
+        "denied": denied,
+        "error_kind": error_kind,
+        "raw_os_error": raw_os_error,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if denied {
+        println!("sealed-store write denied: {}", report["path"]);
+    } else if wrote {
+        println!(
+            "sealed-store write succeeded unexpectedly: {}",
+            report["path"]
+        );
+    } else {
+        println!(
+            "sealed-store write failed without denial: {}",
+            report["path"]
         );
     }
     Ok(())
