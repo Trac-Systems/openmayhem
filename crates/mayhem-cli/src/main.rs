@@ -2435,6 +2435,8 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         &model.canary.set_id,
         args.prompt_id.as_deref(),
     )?;
+    let canary_set_sha256 =
+        canary_set_file_sha256(&canaries_dir, &model.canary.set_id).map_err(anyhow::Error::msg)?;
     let mut backend = catalog_calibration_backend(artifact, &artifact_path, &args)?;
     let mut reports = Vec::with_capacity(prompts.len());
     for prompt in &prompts {
@@ -2451,12 +2453,16 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     let matches_existing = existing
         .as_ref()
         .map(|existing| existing == &catalog_fingerprint);
+    let runtime_config = catalog_canary_runtime_config(artifact, &artifact_path, &args)?;
     let report = CatalogCanaryCalibrationReport {
         model_id: model.model_id.clone(),
         artifact: args.artifact.clone(),
         engine: artifact.engine.clone(),
         artifact_path,
+        artifact_binding: catalog_canary_artifact_binding(artifact),
+        runtime_config,
         canary_set: model.canary.set_id.clone(),
+        canary_set_sha256,
         prompt_count: reports.len(),
         catalog_fingerprint,
         existing_catalog_fingerprint: existing,
@@ -2520,6 +2526,69 @@ fn validate_calibration_args_for_artifact(
         );
     }
     Ok(())
+}
+
+fn catalog_canary_artifact_binding(
+    artifact: &catalog::CatalogArtifact,
+) -> CatalogCanaryArtifactBinding {
+    CatalogCanaryArtifactBinding {
+        artifact_root: artifact.artifact_root.clone(),
+        artifact_root_kind: artifact.artifact_root_kind.clone(),
+        source_kind: artifact.source.kind.clone(),
+        source_repo: artifact.source.repo.clone(),
+        source_revision: artifact.source.revision.clone(),
+        source_path: artifact.path.clone(),
+        source_sha256: artifact.source_sha256.clone(),
+        weights_bytes: artifact.weights_bytes,
+        tokenizer_sha256: artifact.tokenizer_sha256.clone(),
+        chat_template_sha256: artifact.chat_template_sha256.clone(),
+        min_compute_cap: artifact.min_compute_cap.clone(),
+    }
+}
+
+fn catalog_canary_runtime_config(
+    artifact: &catalog::CatalogArtifact,
+    artifact_path: &Path,
+    args: &CatalogCalibrateCanaryArgs,
+) -> Result<CatalogCanaryRuntimeConfig> {
+    let trt_engine_dir = if artifact.engine == "trt-llm" {
+        Some(
+            args.trt_engine_dir
+                .as_ref()
+                .map(|path| absolutize(path.clone()))
+                .transpose()?
+                .unwrap_or_else(|| trt_engine_cache_dir(artifact_path, "calibration")),
+        )
+    } else {
+        None
+    };
+    let trt_max_num_tokens = args
+        .trt_max_num_tokens
+        .map(|tokens| tokens.max(args.ctx_size.max(1)).max(1));
+    Ok(CatalogCanaryRuntimeConfig {
+        ctx_size: args.ctx_size.max(1),
+        seed: args.seed,
+        threads: args.threads,
+        gpu_layers: args.gpu_layers,
+        trt_engine_dir,
+        trt_require_engine_dir: artifact.engine == "trt-llm"
+            && (args.trt_require_engine_dir || args.trt_engine_dir.is_some()),
+        trt_tensor_parallel: (artifact.engine == "trt-llm")
+            .then_some(args.trt_tensor_parallel.unwrap_or(1)),
+        trt_kv_cache_dtype: if artifact.engine == "trt-llm" {
+            args.trt_kv_cache_dtype
+                .clone()
+                .or_else(|| trt_kv_cache_dtype_for_artifact("calibration", artifact))
+        } else {
+            None
+        },
+        trt_max_batch_size: (artifact.engine == "trt-llm")
+            .then(|| args.trt_max_batch_size.map(|size| size.max(1)))
+            .flatten(),
+        trt_max_num_tokens: (artifact.engine == "trt-llm")
+            .then_some(trt_max_num_tokens)
+            .flatten(),
+    })
 }
 
 fn ensure_calibration_matches_catalog(report: &CatalogCanaryCalibrationReport) -> Result<()> {
@@ -2690,10 +2759,24 @@ fn catalog_canary_evidence_report(
             continue;
         }
         let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id);
+        let canary_set_sha256 = match canary_set_file_sha256(&canaries_dir, &model.canary.set_id) {
+            Ok(hash) => Some(hash),
+            Err(err) => {
+                let message = format!("canary set hash error for {}: {err}", model.canary.set_id);
+                errors.push(message.clone());
+                None
+            }
+        };
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
             if let Err(err) = &canary_check {
                 entry_errors.push(err.clone());
+            }
+            if canary_set_sha256.is_none() {
+                entry_errors.push(format!(
+                    "canary set {} sha256 could not be computed",
+                    model.canary.set_id
+                ));
             }
             let expected_fingerprint = model.canary.fingerprints.get(artifact_name).cloned();
             match expected_fingerprint.as_deref() {
@@ -2714,10 +2797,14 @@ fn catalog_canary_evidence_report(
                 artifact: artifact_name.clone(),
                 engine: artifact.engine.clone(),
                 canary_set: model.canary.set_id.clone(),
+                canary_set_sha256: canary_set_sha256.clone(),
                 prompt_count,
                 expected_fingerprint,
+                expected_artifact_binding: catalog_canary_artifact_binding(artifact),
                 report_path: None,
                 report_fingerprint: None,
+                report_canary_set_sha256: None,
+                report_artifact_binding: None,
                 matches_catalog: None,
                 ok: entry_errors.is_empty(),
                 errors: entry_errors,
@@ -2776,6 +2863,8 @@ fn catalog_canary_evidence_report(
 
         entry.report_path = Some(path.clone());
         entry.report_fingerprint = Some(calibration.catalog_fingerprint.clone());
+        entry.report_canary_set_sha256 = Some(calibration.canary_set_sha256.clone());
+        entry.report_artifact_binding = Some(calibration.artifact_binding.clone());
         let matches_catalog = entry
             .expected_fingerprint
             .as_ref()
@@ -2793,6 +2882,19 @@ fn catalog_canary_evidence_report(
                 "report canary set {} does not match catalog canary set {}",
                 calibration.canary_set, entry.canary_set
             ));
+        }
+        if Some(&calibration.canary_set_sha256) != entry.canary_set_sha256.as_ref() {
+            entry.errors.push(format!(
+                "report canary_set_sha256 {} does not match current canary set hash {}",
+                calibration.canary_set_sha256,
+                entry.canary_set_sha256.as_deref().unwrap_or("<missing>")
+            ));
+        }
+        if calibration.artifact_binding != entry.expected_artifact_binding {
+            entry.errors.push(
+                "report artifact binding does not match current catalog artifact root/source"
+                    .to_owned(),
+            );
         }
         if calibration.prompt_count != calibration.prompts.len() {
             entry.errors.push(format!(
@@ -2813,6 +2915,28 @@ fn catalog_canary_evidence_report(
             entry
                 .errors
                 .push("report catalog_fingerprint must be 32-byte hex".to_owned());
+        }
+        if !is_hex_len(&calibration.canary_set_sha256, 64) {
+            entry
+                .errors
+                .push("report canary_set_sha256 must be 32-byte hex".to_owned());
+        }
+        if calibration.runtime_config.ctx_size == 0 {
+            entry
+                .errors
+                .push("report runtime_config.ctx_size must be positive".to_owned());
+        }
+        if calibration.engine == "trt-llm"
+            && calibration
+                .runtime_config
+                .trt_tensor_parallel
+                .unwrap_or_default()
+                == 0
+        {
+            entry.errors.push(
+                "report runtime_config.trt_tensor_parallel must be positive for TensorRT"
+                    .to_owned(),
+            );
         }
         if calibration.existing_catalog_fingerprint != entry.expected_fingerprint {
             entry.errors.push(
@@ -2993,6 +3117,13 @@ fn canary_set_matrix_check(
             }
             Ok(prompts.len())
         })
+}
+
+fn canary_set_file_sha256(
+    canaries_dir: &Path,
+    set_id: &str,
+) -> std::result::Result<String, String> {
+    file_sha256_hex(&canaries_dir.join(format!("{set_id}.json"))).map_err(|err| err.to_string())
 }
 
 fn catalog_calibration_backend(
@@ -4533,6 +4664,35 @@ struct TextMatchEvaluation {
     pass: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct CatalogCanaryArtifactBinding {
+    artifact_root: String,
+    artifact_root_kind: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_path: String,
+    source_sha256: Option<String>,
+    weights_bytes: u64,
+    tokenizer_sha256: Option<String>,
+    chat_template_sha256: Option<String>,
+    min_compute_cap: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CatalogCanaryRuntimeConfig {
+    ctx_size: u32,
+    seed: u32,
+    threads: Option<i32>,
+    gpu_layers: Option<u32>,
+    trt_engine_dir: Option<PathBuf>,
+    trt_require_engine_dir: bool,
+    trt_tensor_parallel: Option<u32>,
+    trt_kv_cache_dtype: Option<String>,
+    trt_max_batch_size: Option<u32>,
+    trt_max_num_tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CanaryCalibrationPromptReport {
     prompt_id: String,
@@ -4550,7 +4710,10 @@ struct CatalogCanaryCalibrationReport {
     artifact: String,
     engine: String,
     artifact_path: PathBuf,
+    artifact_binding: CatalogCanaryArtifactBinding,
+    runtime_config: CatalogCanaryRuntimeConfig,
     canary_set: String,
+    canary_set_sha256: String,
     prompt_count: usize,
     catalog_fingerprint: String,
     existing_catalog_fingerprint: Option<String>,
@@ -4604,10 +4767,14 @@ struct CatalogCanaryEvidenceEntry {
     artifact: String,
     engine: String,
     canary_set: String,
+    canary_set_sha256: Option<String>,
     prompt_count: Option<usize>,
     expected_fingerprint: Option<String>,
+    expected_artifact_binding: CatalogCanaryArtifactBinding,
     report_path: Option<PathBuf>,
     report_fingerprint: Option<String>,
+    report_canary_set_sha256: Option<String>,
+    report_artifact_binding: Option<CatalogCanaryArtifactBinding>,
     matches_catalog: Option<bool>,
     ok: bool,
     errors: Vec<String>,
@@ -10506,16 +10673,16 @@ async fn provider_session_attestation(
     att_nonce: &str,
 ) -> Result<Tier1AttestationReport> {
     let report_ts = unix_epoch_seconds()?;
-    let draft = prepare_provider_session_attestation(
-        &runtime.attestation_identity,
-        runtime.runtime_keypair,
-        &terms.provider,
-        runtime.binary_path,
-        runtime.boot_epoch,
+    let draft = prepare_provider_session_attestation(ProviderSessionAttestationInput {
+        identity: &runtime.attestation_identity,
+        runtime_keypair: runtime.runtime_keypair,
+        provider_pubkey: &terms.provider,
+        binary_path: runtime.binary_path,
+        boot_epoch: runtime.boot_epoch,
         report_ts,
         att_nonce,
-        runtime.runtime_config.clone(),
-    )?;
+        runtime_config: runtime.runtime_config.clone(),
+    })?;
     let provider_attestation_sig = sign_hex(
         runtime.keypair_path,
         runtime.password,
@@ -10526,25 +10693,29 @@ async fn provider_session_attestation(
         .context("finalizing per-session provider attestation")
 }
 
-fn prepare_provider_session_attestation(
-    identity: &CatalogEnclaveIdentity,
-    runtime_keypair: &RuntimeKeypair,
-    provider_pubkey: &str,
-    binary_path: &Path,
+struct ProviderSessionAttestationInput<'a> {
+    identity: &'a CatalogEnclaveIdentity,
+    runtime_keypair: &'a RuntimeKeypair,
+    provider_pubkey: &'a str,
+    binary_path: &'a Path,
     boot_epoch: u64,
     report_ts: u64,
-    att_nonce: &str,
+    att_nonce: &'a str,
     runtime_config: AttestationRuntimeConfig,
+}
+
+fn prepare_provider_session_attestation(
+    input: ProviderSessionAttestationInput<'_>,
 ) -> Result<Tier1AttestationDraft> {
     prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
-        identity: identity.clone(),
-        runtime_keypair: runtime_keypair.clone(),
-        provider_pubkey: provider_pubkey.to_owned(),
-        binary_path: binary_path.to_path_buf(),
-        boot_epoch,
-        report_ts,
-        nonce_u: att_nonce.to_owned(),
-        runtime_config,
+        identity: input.identity.clone(),
+        runtime_keypair: input.runtime_keypair.clone(),
+        provider_pubkey: input.provider_pubkey.to_owned(),
+        binary_path: input.binary_path.to_path_buf(),
+        boot_epoch: input.boot_epoch,
+        report_ts: input.report_ts,
+        nonce_u: input.att_nonce.to_owned(),
+        runtime_config: input.runtime_config,
     })
     .context("preparing per-session provider attestation")
 }
@@ -13443,16 +13614,16 @@ mod tests {
             max_batch_size: Some(4),
             max_num_tokens: Some(4096),
         };
-        let draft = prepare_provider_session_attestation(
-            &identity,
-            &runtime_keypair,
-            &terms.provider,
-            &binary_path,
-            100,
-            101,
+        let draft = prepare_provider_session_attestation(ProviderSessionAttestationInput {
+            identity: &identity,
+            runtime_keypair: &runtime_keypair,
+            provider_pubkey: &terms.provider,
+            binary_path: &binary_path,
+            boot_epoch: 100,
+            report_ts: 101,
             att_nonce,
-            runtime_config.clone(),
-        )
+            runtime_config: runtime_config.clone(),
+        })
         .unwrap();
 
         assert_eq!(draft.body.nonce_u, att_nonce);
@@ -13460,16 +13631,16 @@ mod tests {
         assert_eq!(draft.body.runtime_config, runtime_config);
 
         let other_nonce = "99".repeat(32);
-        let other_draft = prepare_provider_session_attestation(
-            &identity,
-            &runtime_keypair,
-            &terms.provider,
-            &binary_path,
-            100,
-            101,
-            &other_nonce,
+        let other_draft = prepare_provider_session_attestation(ProviderSessionAttestationInput {
+            identity: &identity,
+            runtime_keypair: &runtime_keypair,
+            provider_pubkey: &terms.provider,
+            binary_path: &binary_path,
+            boot_epoch: 100,
+            report_ts: 101,
+            att_nonce: &other_nonce,
             runtime_config,
-        )
+        })
         .unwrap();
         assert_eq!(other_draft.body.nonce_u, other_nonce);
         assert_ne!(draft.sig_enclave, other_draft.sig_enclave);
@@ -14716,6 +14887,7 @@ mod tests {
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
         let report_path = write_temp_calibration_report(&calibration);
 
         let report = catalog_canary_evidence_report(
@@ -14769,6 +14941,7 @@ mod tests {
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("bb".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
         let report_path = write_temp_calibration_report(&calibration);
 
         let report = catalog_canary_evidence_report(
@@ -14781,6 +14954,115 @@ mod tests {
 
         assert!(!report.ok);
         assert!(report.errors.iter().any(|error| {
+            error.contains("does not match catalog fingerprint")
+                || error.contains("was not generated as a catalog match")
+        }));
+    }
+
+    #[test]
+    fn canary_evidence_rejects_stale_artifact_binding() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        calibration.artifact_binding.artifact_root = "bb".repeat(32);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("artifact binding does not match")));
+    }
+
+    #[test]
+    fn canary_evidence_rejects_stale_canary_set_hash() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        calibration.canary_set_sha256 = "00".repeat(32);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("canary_set_sha256")));
+    }
+
+    #[test]
+    fn canary_evidence_rejects_cross_backend_fingerprint_swap() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let mut mlx_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        mlx_artifact.engine = "mlx".to_owned();
+        mlx_artifact.artifact_root = "bb".repeat(32);
+        catalog.models[0]
+            .artifacts
+            .insert("mlx-4bit".to_owned(), mlx_artifact);
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("mlx-4bit".to_owned(), "bb".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("bb".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        calibration.artifact = "mlx-4bit".to_owned();
+        calibration.engine = "mlx".to_owned();
+        calibration.artifact_binding =
+            catalog_canary_artifact_binding(&catalog.models[0].artifacts["mlx-4bit"]);
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+        );
+
+        assert!(!report.ok);
+        let mlx_entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.artifact == "mlx-4bit")
+            .unwrap();
+        assert!(!mlx_entry.ok);
+        assert!(mlx_entry.errors.iter().any(|error| {
             error.contains("does not match catalog fingerprint")
                 || error.contains("was not generated as a catalog match")
         }));
@@ -15129,13 +15411,44 @@ mod tests {
             artifact: "gguf-q4_k_m".to_owned(),
             engine: "llama.cpp".to_owned(),
             artifact_path: PathBuf::from("model.gguf"),
+            artifact_binding: CatalogCanaryArtifactBinding {
+                artifact_root: "aa".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                source_kind: "huggingface".to_owned(),
+                source_repo: "test/model".to_owned(),
+                source_revision: "1".repeat(40),
+                source_path: "model.gguf".to_owned(),
+                source_sha256: None,
+                weights_bytes: 42,
+                tokenizer_sha256: None,
+                chat_template_sha256: None,
+                min_compute_cap: None,
+            },
+            runtime_config: CatalogCanaryRuntimeConfig {
+                ctx_size: 1024,
+                seed: 0,
+                threads: None,
+                gpu_layers: None,
+                trt_engine_dir: None,
+                trt_require_engine_dir: false,
+                trt_tensor_parallel: None,
+                trt_kv_cache_dtype: None,
+                trt_max_batch_size: None,
+                trt_max_num_tokens: None,
+            },
             canary_set: "test-canary".to_owned(),
+            canary_set_sha256: String::new(),
             prompt_count: 1,
             matches_existing_catalog: existing.as_ref().map(|existing| existing == &fingerprint),
             existing_catalog_fingerprint: existing,
             catalog_fingerprint: fingerprint,
             prompts: vec![test_calibration_prompt("p1", "aa".repeat(32))],
         }
+    }
+
+    fn stamp_test_calibration_report(report: &mut CatalogCanaryCalibrationReport, dir: &Path) {
+        report.canary_set_sha256 =
+            file_sha256_hex(&dir.join(format!("{}.json", report.canary_set))).unwrap();
     }
 
     fn test_calibrate_canary_args() -> CatalogCalibrateCanaryArgs {
