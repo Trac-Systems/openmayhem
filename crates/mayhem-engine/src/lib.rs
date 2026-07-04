@@ -1200,8 +1200,6 @@ mod trt_llm_backend {
     use std::cell::{Cell, RefCell};
     use std::env;
     use std::io::{BufRead, BufReader, Write};
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -1407,8 +1405,6 @@ mod trt_llm_backend {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
-            #[cfg(unix)]
-            command.process_group(0);
             let mut child = command.spawn().map_err(|err| {
                 EngineError::TrtLlm(format!(
                     "spawning TensorRT-LLM Python worker with {} failed: {err}",
@@ -1521,31 +1517,30 @@ mod trt_llm_backend {
     }
 
     fn terminate_worker_process(child: &mut Child) {
-        #[cfg(unix)]
-        {
-            let pgid = child.id().to_string();
-            let _ = Command::new("kill")
-                .arg("-TERM")
-                .arg(format!("-{pgid}"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            thread::sleep(Duration::from_millis(500));
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{pgid}"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     impl Drop for TrtLlmWorker {
         fn drop(&mut self) {
             let _ = self.send(0, "shutdown", Value::Null);
-            self.terminate();
+            if wait_for_child_exit(&mut self.child, Duration::from_secs(3)) {
+                self.terminated = true;
+            } else {
+                self.terminate();
+            }
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
             }
@@ -1577,7 +1572,7 @@ mod trt_llm_backend {
         fn trt_worker_read_timeout_kills_silent_child() {
             let path =
                 env::temp_dir().join(format!("mayhem-silent-trt-worker-{}", std::process::id()));
-            fs::write(&path, "#!/bin/sh\nsleep 20 & wait\n").expect("write fake worker");
+            fs::write(&path, "#!/bin/sh\nexec sleep 20\n").expect("write fake worker");
             let mut perms = fs::metadata(&path).expect("metadata").permissions();
             perms.set_mode(0o700);
             fs::set_permissions(&path, perms).expect("chmod fake worker");

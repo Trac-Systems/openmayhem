@@ -6995,6 +6995,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 }
 
 async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
+    validate_provider_start_security_mode(&args, cfg!(debug_assertions))?;
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
@@ -7968,6 +7969,23 @@ fn provider_log(args: &ProviderStartArgs, message: &str) {
     if !args.print_json {
         println!("-> {message}");
     }
+}
+
+fn validate_provider_start_security_mode(
+    args: &ProviderStartArgs,
+    debug_build: bool,
+) -> Result<()> {
+    if args.serve_sessions && args.dev_session_shim && !debug_build {
+        bail!(
+            "--dev-session-shim is debug-build only and cannot serve from an admin-trusted release binary"
+        );
+    }
+    if args.serve_sessions && args.dev_skip_catalog_verify && !debug_build {
+        bail!(
+            "--serve-sessions requires a signed admin catalog in release builds; --dev-skip-catalog-verify is smoke-test only"
+        );
+    }
+    Ok(())
 }
 
 fn provider_session_debug(message: impl AsRef<str>) {
@@ -13983,6 +14001,37 @@ mod tests {
             print_json: true,
             dev_skip_catalog_verify: true,
         }
+    }
+
+    #[test]
+    fn release_provider_serving_requires_signed_catalog_and_real_responder() {
+        let mut args = test_provider_start_args();
+        args.serve_sessions = true;
+        args.dev_skip_catalog_verify = true;
+        args.dev_session_shim = false;
+        let err = validate_provider_start_security_mode(&args, false)
+            .expect_err("release serving must reject unsigned catalogs");
+        assert!(
+            format!("{err:#}").contains("requires a signed admin catalog"),
+            "{err:#}"
+        );
+
+        args.dev_session_shim = true;
+        let err = validate_provider_start_security_mode(&args, false)
+            .expect_err("release serving must reject fake responders");
+        assert!(format!("{err:#}").contains("debug-build only"), "{err:#}");
+
+        assert!(
+            validate_provider_start_security_mode(&args, true).is_ok(),
+            "debug smokes may still use the unsigned deterministic shim"
+        );
+
+        args.dev_session_shim = false;
+        args.dev_skip_catalog_verify = false;
+        assert!(
+            validate_provider_start_security_mode(&args, false).is_ok(),
+            "release serving with a signed catalog is allowed"
+        );
     }
 
     fn test_provider_session_terms() -> ProviderSessionTerms {
