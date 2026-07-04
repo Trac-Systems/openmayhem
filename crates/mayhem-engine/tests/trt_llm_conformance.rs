@@ -3,6 +3,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "llama-cpp")]
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "llama-cpp")]
@@ -161,6 +162,7 @@ fn trt_llm_benchmark_requires_llama_cpp_feature() {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 fn timed_generate<B: EngineBackend>(
     backend: &mut B,
     prompt: &str,
@@ -174,6 +176,7 @@ fn timed_generate<B: EngineBackend>(
     Ok((output, start.elapsed()))
 }
 
+#[cfg(feature = "llama-cpp")]
 fn throughput_samples<B: EngineBackend>(
     backend: &mut B,
     prompt: &str,
@@ -188,10 +191,12 @@ fn throughput_samples<B: EngineBackend>(
     Ok(results)
 }
 
+#[cfg(feature = "llama-cpp")]
 fn tokens_per_second(output: &GenerateOutput, elapsed: Duration) -> f64 {
     output.usage.completion_tokens as f64 / elapsed.as_secs_f64().max(0.001)
 }
 
+#[cfg(feature = "llama-cpp")]
 fn median(values: &[f64]) -> f64 {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);

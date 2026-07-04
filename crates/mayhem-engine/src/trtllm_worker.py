@@ -191,8 +191,9 @@ def make_sampling_params(payload):
         minimal = {
             "max_tokens": kwargs["max_tokens"],
             "temperature": kwargs["temperature"],
-            "top_p": kwargs["top_p"],
         }
+        if "top_p" in kwargs:
+            minimal["top_p"] = kwargs["top_p"]
         return SamplingParams(**accepted_kwargs(SamplingParams, minimal))
 
 

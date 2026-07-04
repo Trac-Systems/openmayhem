@@ -1200,11 +1200,18 @@ mod trt_llm_backend {
     use std::cell::{Cell, RefCell};
     use std::env;
     use std::io::{BufRead, BufReader, Write};
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     const WORKER: &str = include_str!("trtllm_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_TRTLLM_PYTHON";
+    const REQUEST_TIMEOUT_ENV: &str = "MAYHEM_TRTLLM_REQUEST_TIMEOUT_SECS";
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
     pub struct TrtLlmBackend {
         python: PathBuf,
@@ -1380,25 +1387,34 @@ mod trt_llm_backend {
     struct TrtLlmWorker {
         child: Child,
         stdin: ChildStdin,
-        stdout: BufReader<ChildStdout>,
+        stdout_rx: Receiver<WorkerRead>,
+        reader: Option<JoinHandle<()>>,
+        request_timeout: Duration,
+        terminated: bool,
     }
 
     impl TrtLlmWorker {
         fn spawn(python: &Path) -> Result<Self> {
-            let mut child = Command::new(python)
+            Self::spawn_with_timeout(python, request_timeout())
+        }
+
+        fn spawn_with_timeout(python: &Path, request_timeout: Duration) -> Result<Self> {
+            let mut command = Command::new(python);
+            command
                 .arg("-u")
                 .arg("-c")
                 .arg(WORKER)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(|err| {
-                    EngineError::TrtLlm(format!(
-                        "spawning TensorRT-LLM Python worker with {} failed: {err}",
-                        python.display()
-                    ))
-                })?;
+                .stderr(Stdio::inherit());
+            #[cfg(unix)]
+            command.process_group(0);
+            let mut child = command.spawn().map_err(|err| {
+                EngineError::TrtLlm(format!(
+                    "spawning TensorRT-LLM Python worker with {} failed: {err}",
+                    python.display()
+                ))
+            })?;
             let stdin = child
                 .stdin
                 .take()
@@ -1407,10 +1423,15 @@ mod trt_llm_backend {
                 .stdout
                 .take()
                 .ok_or_else(|| EngineError::TrtLlm("opening worker stdout failed".to_owned()))?;
+            let (stdout_tx, stdout_rx) = mpsc::channel();
+            let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
             Ok(Self {
                 child,
                 stdin,
-                stdout: BufReader::new(stdout),
+                stdout_rx,
+                reader: Some(reader),
+                request_timeout,
+                terminated: false,
             })
         }
 
@@ -1427,22 +1448,107 @@ mod trt_llm_backend {
         }
 
         fn read_message(&mut self) -> Result<WorkerMessage> {
-            let mut line = String::new();
-            let read = self.stdout.read_line(&mut line)?;
-            if read == 0 {
-                return Err(EngineError::TrtLlm(
-                    "TensorRT-LLM backend worker exited before replying".to_owned(),
-                ));
-            }
+            let line = match self.stdout_rx.recv_timeout(self.request_timeout) {
+                Ok(WorkerRead::Line(line)) => line,
+                Ok(WorkerRead::Eof) => {
+                    return Err(EngineError::TrtLlm(
+                        "TensorRT-LLM backend worker exited before replying".to_owned(),
+                    ));
+                }
+                Ok(WorkerRead::Error(error)) => return Err(EngineError::TrtLlm(error)),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.terminate();
+                    return Err(EngineError::TrtLlm(format!(
+                        "TensorRT-LLM backend worker timed out after {}s waiting for a response",
+                        self.request_timeout.as_secs()
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(EngineError::TrtLlm(
+                        "TensorRT-LLM backend worker stdout reader stopped".to_owned(),
+                    ));
+                }
+            };
             Ok(serde_json::from_str(line.trim_end())?)
         }
+
+        fn terminate(&mut self) {
+            if self.terminated {
+                return;
+            }
+            terminate_worker_process(&mut self.child);
+            self.terminated = true;
+        }
+    }
+
+    enum WorkerRead {
+        Line(String),
+        Eof,
+        Error(String),
+    }
+
+    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::Sender<WorkerRead>) {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(WorkerRead::Eof);
+                    return;
+                }
+                Ok(_) => {
+                    if sender.send(WorkerRead::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = sender.send(WorkerRead::Error(format!(
+                        "reading TensorRT-LLM backend worker stdout failed: {err}"
+                    )));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn request_timeout() -> Duration {
+        env::var(REQUEST_TIMEOUT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    fn terminate_worker_process(child: &mut Child) {
+        #[cfg(unix)]
+        {
+            let pgid = child.id().to_string();
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(format!("-{pgid}"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            thread::sleep(Duration::from_millis(500));
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{pgid}"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     impl Drop for TrtLlmWorker {
         fn drop(&mut self) {
             let _ = self.send(0, "shutdown", Value::Null);
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            self.terminate();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
         }
     }
 
@@ -1457,6 +1563,37 @@ mod trt_llm_backend {
 
     fn default_message_kind() -> String {
         "response".to_owned()
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)]
+    mod tests {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn trt_worker_read_timeout_kills_silent_child() {
+            let path =
+                env::temp_dir().join(format!("mayhem-silent-trt-worker-{}", std::process::id()));
+            fs::write(&path, "#!/bin/sh\nsleep 20 & wait\n").expect("write fake worker");
+            let mut perms = fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&path, perms).expect("chmod fake worker");
+
+            let mut worker =
+                TrtLlmWorker::spawn_with_timeout(&path, Duration::from_secs(1)).expect("spawn");
+            worker
+                .send(1, "load", Value::Null)
+                .expect("send request to fake worker");
+            let start = Instant::now();
+            let err = worker.read_message().expect_err("silent worker times out");
+            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(format!("{err}").contains("timed out after 1s"), "{err}");
+
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
