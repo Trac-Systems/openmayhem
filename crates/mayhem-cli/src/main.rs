@@ -9422,6 +9422,7 @@ async fn send_provider_session_output(
                 )
                 .await
                 .context("sending content s.delta")?;
+            maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
         }
         provider_session_debug(format!(
@@ -9467,6 +9468,35 @@ async fn send_provider_session_output(
         .await
         .context("sending s.receipt")?;
     Ok(receipt)
+}
+
+async fn maybe_provider_session_delta_delay(session_id: &str, request_id: &str, index: u64) {
+    let Some(delay) = provider_session_delta_delay() else {
+        return;
+    };
+    if index >= provider_session_delta_delay_count() {
+        return;
+    }
+    provider_session_debug(format!(
+        "delaying after content s.delta #{index} for session {session_id} request {request_id} by {}ms",
+        delay.as_millis()
+    ));
+    tokio::time::sleep(delay).await;
+}
+
+fn provider_session_delta_delay() -> Option<Duration> {
+    let millis = std::env::var("MAYHEM_PROVIDER_SESSION_DELTA_DELAY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    (millis > 0).then(|| Duration::from_millis(millis.min(60_000)))
+}
+
+fn provider_session_delta_delay_count() -> u64 {
+    std::env::var("MAYHEM_PROVIDER_SESSION_DELTA_DELAY_COUNT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1)
 }
 
 async fn send_provider_session_error(
@@ -13636,6 +13666,7 @@ mod tests {
             enclave: None,
             rooms: "auto".to_owned(),
             rpc_url: None,
+            session_rpc_url: None,
             sc_bridge_url: None,
             sc_bridge_token: None,
             wallet_password: None,

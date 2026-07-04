@@ -357,6 +357,24 @@ class ScBridge extends Feature {
         });
         return;
       }
+      case 'peer_connect': {
+        if (!this.directSession) {
+          sendError('Direct session feature not ready.');
+          return;
+        }
+        const remote = String(message.remote || '').trim();
+        const waitMs = Number.isSafeInteger(message.wait_ms) ? message.wait_ms : 10_000;
+        if (this.debug) {
+          console.log(`[sc-bridge] client ${client.id} peer_connect ${remote}`);
+        }
+        this.directSession
+          .connectPeer(remote, waitMs)
+          .then((peer) => reply({ type: 'peer_connected', ...peer }))
+          .catch((err) => {
+            sendError(err?.message ? `Peer connect failed: ${err.message}` : 'Peer connect failed.');
+          });
+        return;
+      }
       case 'session_open': {
         if (!this.directSession) {
           sendError('Direct session feature not ready.');

@@ -748,6 +748,15 @@ impl ScBridgeGatewaySessionBackend {
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
+        bridge
+            .peer_connect(provider, self.config.open_timeout)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting direct peer {} for session {} failed: {err}",
+                    provider, invocation.session_id
+                ))
+            })?;
         let opened = bridge
             .session_open(provider, &invocation.session_id)
             .await

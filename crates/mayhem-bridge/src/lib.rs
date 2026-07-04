@@ -187,6 +187,19 @@ impl ScBridgeClient {
         .await
     }
 
+    pub async fn peer_connect(&mut self, remote: impl AsRef<str>, wait: Duration) -> Result<Value> {
+        let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        self.request(
+            json!({
+                "type": "peer_connect",
+                "remote": remote.as_ref(),
+                "wait_ms": wait_ms,
+            }),
+            "peer_connected",
+        )
+        .await
+    }
+
     pub async fn session_send(
         &mut self,
         remote: impl AsRef<str>,

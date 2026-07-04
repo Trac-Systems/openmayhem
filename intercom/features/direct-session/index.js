@@ -99,6 +99,31 @@ class DirectSession extends Feature {
     return this._sessionInfo(session);
   }
 
+  async connectPeer(remote, waitMs = 10_000) {
+    const normalizedRemote = this._normalizeRemote(remote);
+    if (!normalizedRemote) throw new Error('Invalid remote peer key.');
+    const existing = this._findConnection(normalizedRemote);
+    if (existing) {
+      this._prepareConnection(existing);
+      return this._peerInfo(normalizedRemote, true);
+    }
+    if (!this.peer?.swarm?.joinPeer) {
+      throw new Error('Peer swarm does not support targeted peer joins.');
+    }
+    this.peer.swarm.joinPeer(b4a.from(normalizedRemote, 'hex'));
+    const maxWaitMs = Math.max(1, Math.min(Number(waitMs) || 10_000, 120_000));
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      const connection = this._findConnection(normalizedRemote);
+      if (connection) {
+        this._prepareConnection(connection);
+        return this._peerInfo(normalizedRemote, true);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`Timed out connecting to peer ${normalizedRemote}.`);
+  }
+
   async send(remote, sessionId, frame) {
     const session = await this.open(remote, sessionId);
     const key = sessionKey(session.remote, session.session_id);
@@ -174,6 +199,15 @@ class DirectSession extends Feature {
 
   _remoteKey(connection) {
     return normalizeKeyHex(connection?.remotePublicKey);
+  }
+
+  _peerInfo(remote, connected) {
+    return {
+      remote,
+      connected,
+      direct: connected === true,
+      relayed: false,
+    };
   }
 
   _ensureSession(connection, sessionId) {
