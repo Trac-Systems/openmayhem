@@ -244,6 +244,8 @@ pub fn attestation_report_head(report: &AttestationReport) -> Result<String, ser
 pub fn hardware_quote_binding(body: &AttestationBody) -> Result<String, serde_json::Error> {
     let mut bound_body = body.clone();
     bound_body.hw_quote = None;
+    bound_body.report_ts = 0;
+    bound_body.nonce_u.clear();
     Ok(
         blake3::hash(&serde_json::to_vec(&AttestationHardwareQuoteBinding {
             domain: HARDWARE_QUOTE_BINDING_DOMAIN,
@@ -340,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn hardware_quote_binding_excludes_quote_but_includes_nonce_and_identity() {
+    fn hardware_quote_binding_excludes_quote_session_fields_but_includes_identity() {
         let mut body = AttestationBody {
             schema_version: ATTESTATION_SCHEMA_VERSION,
             alg: ATTESTATION_ALG.to_owned(),
@@ -365,6 +367,9 @@ mod tests {
         });
         assert_eq!(hardware_quote_binding(&body).unwrap(), base);
         body.nonce_u = "bb".repeat(32);
+        body.report_ts = 99;
+        assert_eq!(hardware_quote_binding(&body).unwrap(), base);
+        body.manifest_hash = "other-manifest".to_owned();
         assert_ne!(hardware_quote_binding(&body).unwrap(), base);
     }
 

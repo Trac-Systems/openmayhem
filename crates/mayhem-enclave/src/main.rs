@@ -1,19 +1,24 @@
 #![forbid(unsafe_code)]
 
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mayhem_enclave::{
     boot_sealed_store, build_merkle_manifest, build_sandbox_profile,
-    build_tier1_attestation_report, expect_outbound_tcp_denied, hex_secret,
-    load_or_create_runtime_keypair_store, measure_binary, measure_current_binary,
-    probe_outbound_tcp, provider_signing_seed_from_hex, run_sandboxed_command, seal_artifact,
-    unix_timestamp_now, BootOptions, KeyContext, RuntimeKeyContext, RuntimeKeypairStoreOptions,
-    SandboxConfig, SandboxPlatform, SealOptions, Tier1AttestationOptions, DEFAULT_CHUNK_SIZE,
-    DEFAULT_TCP_PROBE_TIMEOUT_MS,
+    build_tier1_attestation_report, build_tier2_attestation_report, expect_outbound_tcp_denied,
+    hex_secret, load_or_create_runtime_keypair_store, measure_binary, measure_current_binary,
+    prepare_tier2_hardware_quote_binding, probe_outbound_tcp, provider_signing_seed_from_hex,
+    run_sandboxed_command, seal_artifact, unix_timestamp_now, BootOptions, KeyContext,
+    RuntimeKeyContext, RuntimeKeypairStoreOptions, SandboxConfig, SandboxPlatform, SealOptions,
+    Tier1AttestationOptions, Tier2AttestationOptions, Tier2HardwareQuoteBindingOptions,
+    DEFAULT_CHUNK_SIZE, DEFAULT_TCP_PROBE_TIMEOUT_MS,
 };
-use mayhem_proto::{AttestationRuntimeConfig, CatalogEnclaveIdentity};
+use mayhem_proto::{
+    catalog_enclave_id, AttestationRuntimeConfig, CatalogEnclaveIdentity, HardwareQuote,
+    HardwareQuoteKind,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem-enclave")]
@@ -34,7 +39,7 @@ enum Commands {
     /// Create or load the provider-sealed runtime attestation keypair.
     InitKeypair(RuntimeKeypairArgs),
     /// Build and sign a Tier-1 attestation report for a challenge nonce.
-    Attest(AttestArgs),
+    Attest(Box<AttestArgs>),
     /// Print the platform sandbox policy for a sealed enclave process.
     SandboxProfile(SandboxProfileArgs),
     /// Run a command under the current platform sandbox.
@@ -165,7 +170,7 @@ struct AttestArgs {
     #[arg(long)]
     provider_id: String,
 
-    /// Admin-created enclave identity expected for this report.
+    /// Admin-created enclave identity expected for this report, or "auto" to compute it.
     #[arg(long)]
     enclave_id: String,
 
@@ -205,9 +210,63 @@ struct AttestArgs {
     #[arg(long)]
     report_ts: Option<u64>,
 
+    /// Runtime config JSON to bind into the report.
+    #[arg(long, value_name = "JSON")]
+    runtime_config_json: Option<String>,
+
+    /// Print the Tier-2 hardware quote binding and exit. Use it as the vendor attestation nonce.
+    #[arg(long)]
+    print_hw_quote_binding: bool,
+
+    /// Tier-2 hardware quote kind.
+    #[arg(long, value_enum, default_value_t = HardwareQuoteKindArg::NvidiaNrasJwt)]
+    hw_quote_kind: HardwareQuoteKindArg,
+
+    /// Tier-2 hardware quote evidence file.
+    #[arg(long, value_name = "PATH")]
+    hw_quote_evidence_file: Option<PathBuf>,
+
+    /// Tier-2 hardware quote binding. Must match the printed binding used as quote nonce.
+    #[arg(long)]
+    hw_quote_binding: Option<String>,
+
+    /// Optional Tier-2 hardware quote endorsement string. Repeatable.
+    #[arg(long)]
+    hw_quote_endorsement: Vec<String>,
+
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HardwareQuoteKindArg {
+    AmdSevSnpVcek,
+    IntelTdxDcap,
+    NvidiaNrasJwt,
+    MockTier2,
+}
+
+impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
+    fn from(value: HardwareQuoteKindArg) -> Self {
+        match value {
+            HardwareQuoteKindArg::AmdSevSnpVcek => HardwareQuoteKind::AmdSevSnpVcek,
+            HardwareQuoteKindArg::IntelTdxDcap => HardwareQuoteKind::IntelTdxDcap,
+            HardwareQuoteKindArg::NvidiaNrasJwt => HardwareQuoteKind::NvidiaNrasJwt,
+            HardwareQuoteKindArg::MockTier2 => HardwareQuoteKind::MockTier2,
+        }
+    }
+}
+
+impl HardwareQuoteKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            HardwareQuoteKindArg::AmdSevSnpVcek => "amd_sev_snp_vcek",
+            HardwareQuoteKindArg::IntelTdxDcap => "intel_tdx_dcap",
+            HardwareQuoteKindArg::NvidiaNrasJwt => "nvidia_nras_jwt",
+            HardwareQuoteKindArg::MockTier2 => "mock_tier2",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -287,7 +346,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         Commands::BootCheck(args) => boot_check(args)?,
         Commands::MeasureBinary(args) => measure_binary_command(args)?,
         Commands::InitKeypair(args) => init_keypair(args)?,
-        Commands::Attest(args) => attest(args)?,
+        Commands::Attest(args) => attest(*args)?,
         Commands::SandboxProfile(args) => sandbox_profile(args)?,
         Commands::SandboxRun(args) => return sandbox_run(args),
         Commands::SandboxProbeTcp(args) => sandbox_probe_tcp(args)?,
@@ -377,41 +436,116 @@ fn init_keypair(args: RuntimeKeypairArgs) -> Result<(), Box<dyn std::error::Erro
 
 fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
     let now = unix_timestamp_now()?;
-    let context = RuntimeKeyContext {
-        provider_id: args.provider_id,
-        enclave_id: args.enclave_id.clone(),
-    };
-    let keypair_options = RuntimeKeypairStoreOptions::new(
-        args.keypair_store,
-        context,
-        hex_secret(&args.provider_secret_hex)?,
-    );
-    let runtime_keypair = load_or_create_runtime_keypair_store(&keypair_options)?;
     let binary_path = match args.binary {
         Some(path) => path,
         None => std::env::current_exe()?,
     };
-    let report = build_tier1_attestation_report(&Tier1AttestationOptions {
-        identity: CatalogEnclaveIdentity {
-            admin_pubkey: args.admin_pubkey,
-            model_id: args.model_id,
-            artifact_root: args.artifact_root,
-            manifest_hash: args.manifest_hash,
-            binary_hash: String::new(),
-        },
-        runtime_keypair,
-        provider_signing_seed: provider_signing_seed_from_hex(&args.provider_signing_seed_hex)?,
-        binary_path,
-        boot_epoch: args.boot_epoch.unwrap_or(now),
-        report_ts: args.report_ts.unwrap_or(now),
-        nonce_u: args.nonce_u,
-        runtime_config: AttestationRuntimeConfig::default(),
-    })?;
-
-    if report.report.enclave_id != args.enclave_id {
+    let measured_binary_hash = measure_binary(&binary_path)?;
+    let identity = CatalogEnclaveIdentity {
+        admin_pubkey: args.admin_pubkey.clone(),
+        model_id: args.model_id.clone(),
+        artifact_root: args.artifact_root.clone(),
+        manifest_hash: args.manifest_hash.clone(),
+        binary_hash: measured_binary_hash.clone(),
+    };
+    let computed_enclave_id = catalog_enclave_id(&identity);
+    if args.enclave_id != "auto" && args.enclave_id != computed_enclave_id {
         return Err(format!(
             "computed enclave_id {} does not match expected {}",
-            report.report.enclave_id, args.enclave_id
+            computed_enclave_id, args.enclave_id
+        )
+        .into());
+    }
+    let context = RuntimeKeyContext {
+        provider_id: args.provider_id.clone(),
+        enclave_id: computed_enclave_id.clone(),
+    };
+    let keypair_options = RuntimeKeypairStoreOptions::new(
+        args.keypair_store.clone(),
+        context,
+        hex_secret(&args.provider_secret_hex)?,
+    );
+    let runtime_keypair = load_or_create_runtime_keypair_store(&keypair_options)?;
+    let provider_signing_seed = provider_signing_seed_from_hex(&args.provider_signing_seed_hex)?;
+    let boot_epoch = args.boot_epoch.unwrap_or(now);
+    let report_ts = args.report_ts.unwrap_or(now);
+    let runtime_config = parse_runtime_config(args.runtime_config_json.as_deref())?;
+
+    if args.print_hw_quote_binding {
+        let binding = prepare_tier2_hardware_quote_binding(&Tier2HardwareQuoteBindingOptions {
+            identity: identity.clone(),
+            runtime_keypair,
+            provider_signing_seed,
+            binary_path,
+            boot_epoch,
+            report_ts,
+            nonce_u: args.nonce_u,
+            runtime_config,
+        })?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "hw_quote_binding": binding,
+                    "nonce": binding,
+                    "enclave_id": computed_enclave_id,
+                    "binary_hash": measured_binary_hash,
+                    "quote_kind": args.hw_quote_kind.as_str(),
+                }))?
+            );
+        } else {
+            println!("hw_quote_binding={binding}");
+            println!("enclave_id={computed_enclave_id}");
+            println!("binary_hash={measured_binary_hash}");
+            println!("Use this value as the hardware attestation nonce.");
+        }
+        return Ok(());
+    }
+
+    let report = if let Some(evidence_file) = args.hw_quote_evidence_file {
+        let binding = args
+            .hw_quote_binding
+            .ok_or("Tier-2 attestation requires --hw-quote-binding")?;
+        let evidence = fs::read_to_string(&evidence_file)?;
+        build_tier2_attestation_report(&Tier2AttestationOptions {
+            identity,
+            runtime_keypair,
+            provider_signing_seed,
+            binary_path,
+            boot_epoch,
+            report_ts,
+            nonce_u: args.nonce_u,
+            hw_quote: HardwareQuote {
+                kind: args.hw_quote_kind.into(),
+                evidence,
+                binding,
+                endorsements: args.hw_quote_endorsement,
+            },
+            runtime_config,
+        })?
+    } else {
+        if args.hw_quote_binding.is_some() || !args.hw_quote_endorsement.is_empty() {
+            return Err(
+                "hardware quote flags require --hw-quote-evidence-file or --print-hw-quote-binding"
+                    .into(),
+            );
+        }
+        build_tier1_attestation_report(&Tier1AttestationOptions {
+            identity,
+            runtime_keypair,
+            provider_signing_seed,
+            binary_path,
+            boot_epoch,
+            report_ts,
+            nonce_u: args.nonce_u,
+            runtime_config,
+        })?
+    };
+
+    if report.report.enclave_id != computed_enclave_id {
+        return Err(format!(
+            "computed enclave_id {} does not match expected {}",
+            report.report.enclave_id, computed_enclave_id
         )
         .into());
     }
@@ -428,6 +562,15 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("report_head={}", report.report_head);
     }
     Ok(())
+}
+
+fn parse_runtime_config(
+    runtime_config_json: Option<&str>,
+) -> Result<AttestationRuntimeConfig, Box<dyn std::error::Error>> {
+    match runtime_config_json {
+        Some(json) => Ok(serde_json::from_str(json)?),
+        None => Ok(AttestationRuntimeConfig::default()),
+    }
 }
 
 fn sandbox_profile(args: SandboxProfileArgs) -> Result<(), Box<dyn std::error::Error>> {

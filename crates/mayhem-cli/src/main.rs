@@ -13515,6 +13515,9 @@ fn build_provider_candidates(
                 continue;
             }
         }
+        if enclave.att_tier > hardware.tee.tier {
+            continue;
+        }
         let Some(model) = catalog_doc
             .models
             .iter()
@@ -17602,6 +17605,27 @@ mod tests {
         let mut wrong_path = test_contract(&root);
         wrong_path.enclaves[0].artifact_source.path = "fake.gguf".to_owned();
         assert!(build_provider_candidates(&wrong_path, &catalog, &hardware, &args).is_err());
+    }
+
+    #[test]
+    fn provider_candidates_require_hardware_tier_for_tier2_enclave() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let args = test_provider_start_args();
+        let mut contract = test_contract(&root);
+
+        assert_eq!(hardware.tee.tier, 1);
+        assert_eq!(
+            build_provider_candidates(&contract, &catalog, &hardware, &args)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        contract.enclaves[0].att_tier = 2;
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap_err();
+        assert!(err.to_string().contains("active admin-created enclaves"));
     }
 
     #[test]
