@@ -251,6 +251,12 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
         canary_sets.insert(model.canary.set_id.clone());
         validate_model(model, &mut errors);
     }
+    if dev_model_count < 2 {
+        errors.push("catalog must contain at least two dev entries".to_owned());
+    }
+    if launch_model_count < 1 {
+        errors.push("catalog must contain at least one launch entry".to_owned());
+    }
 
     for set_id in &canary_sets {
         validate_canary_set(&options.canaries_dir, set_id, &mut errors);
@@ -401,11 +407,6 @@ fn validate_catalog(catalog: &CatalogDocument, errors: &mut Vec<String>) {
     if catalog.generated_at.trim().is_empty() {
         errors.push("generated_at is required".to_owned());
     }
-    if catalog.models.len() < 7 {
-        errors.push(
-            "catalog must contain at least two dev entries and five launch entries".to_owned(),
-        );
-    }
 }
 
 fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -460,7 +461,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     for (name, artifact) in &model.artifacts {
-        validate_artifact(&model.model_id, name, artifact, errors);
+        validate_artifact(&model.model_id, &model.tier, name, artifact, errors);
     }
     if model.caps.ctx_max == 0 {
         errors.push(format!("{} caps.ctx_max must be positive", model.model_id));
@@ -483,6 +484,33 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             "{} requirements.backends must not be empty",
             model.model_id
         ));
+    }
+    let artifact_engines = model
+        .artifacts
+        .values()
+        .map(|artifact| artifact.engine.as_str())
+        .collect::<BTreeSet<_>>();
+    let requirement_backends = model
+        .requirements
+        .backends
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for engine in &artifact_engines {
+        if !requirement_backends.contains(engine) {
+            errors.push(format!(
+                "{} artifact engine {} is missing from requirements.backends",
+                model.model_id, engine
+            ));
+        }
+    }
+    for backend in &requirement_backends {
+        if !artifact_engines.contains(backend) {
+            errors.push(format!(
+                "{} requirements.backends references unused backend {}",
+                model.model_id, backend
+            ));
+        }
     }
     let _ = (
         model.requirements.min_vram_gb_full_offload,
@@ -535,6 +563,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
 
 fn validate_artifact(
     model_id: &str,
+    tier: &str,
     name: &str,
     artifact: &CatalogArtifact,
     errors: &mut Vec<String>,
@@ -568,6 +597,11 @@ fn validate_artifact(
     if artifact.artifact_root_kind.trim().is_empty() {
         errors.push(format!("{model_id}/{name} artifact_root_kind is required"));
     }
+    if tier == "launch" && artifact.artifact_root_kind != "blake3_merkle_v1" {
+        errors.push(format!(
+            "{model_id}/{name} launch artifact_root_kind must be blake3_merkle_v1"
+        ));
+    }
     if artifact.weights_bytes == 0 {
         errors.push(format!("{model_id}/{name} weights_bytes must be positive"));
     }
@@ -577,6 +611,11 @@ fn validate_artifact(
                 "{model_id}/{name} source_sha256 must be 32-byte hex"
             ));
         }
+    }
+    if tier == "launch" && artifact.source_sha256.is_none() {
+        errors.push(format!(
+            "{model_id}/{name} launch source_sha256 is required"
+        ));
     }
     if let Some(value) = &artifact.tokenizer_sha256 {
         if !is_hex_len(value, 64) {
