@@ -9,6 +9,7 @@ import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/b
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultOutDir = '.mayhem-local/enclave-distributions';
+const defaultCatalogPath = 'catalog/models.json';
 const defaultChunkSize = 8 * 1024 * 1024;
 const hex64 = /^[0-9a-fA-F]{64}$/;
 const hex40 = /^[0-9a-fA-F]{40}$/;
@@ -34,6 +35,8 @@ Required:
   --admin-seed-file PATH                  File with 32-byte admin Ed25519 seed hex
 
 Options:
+  --catalog PATH                          Signed admin catalog to require exact HF binding
+                                           (default: ${defaultCatalogPath})
   --admin-seed-hex HEX                    Alternative seed source; prefer file/env
   --admin-pubkey HEX                      Require derived admin pubkey to match
   --artifact-root HEX                     Expected artifact Merkle root
@@ -48,6 +51,8 @@ Options:
   --mirror HTTPS_URL                      Add a public bundle mirror (repeatable)
   --allow-artifact-root-mismatch-for-smoke
                                            Local rehearsal only; never launch evidence
+  --allow-catalog-source-mismatch-for-smoke
+                                           Local rehearsal only; never launch evidence
   --json                                  Print JSON report`);
 }
 
@@ -59,6 +64,7 @@ function parseArgs(argv) {
     artifactRepo: null,
     artifactRevision: null,
     artifactPathInRepo: null,
+    catalogPath: defaultCatalogPath,
     baseUrl: null,
     adminSeedFile: null,
     adminSeedHex: process.env.MAYHEM_ADMIN_SEED_HEX || null,
@@ -74,6 +80,7 @@ function parseArgs(argv) {
     manifestUrl: null,
     mirrors: [],
     allowArtifactRootMismatchForSmoke: false,
+    allowCatalogSourceMismatchForSmoke: false,
     json: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -89,6 +96,7 @@ function parseArgs(argv) {
     else if (arg === '--artifact-repo') args.artifactRepo = next();
     else if (arg === '--artifact-revision') args.artifactRevision = next();
     else if (arg === '--artifact-path') args.artifactPathInRepo = next();
+    else if (arg === '--catalog') args.catalogPath = next();
     else if (arg === '--base-url') args.baseUrl = next();
     else if (arg === '--admin-seed-file') args.adminSeedFile = next();
     else if (arg === '--admin-seed-hex') args.adminSeedHex = next();
@@ -104,6 +112,7 @@ function parseArgs(argv) {
     else if (arg === '--manifest-url') args.manifestUrl = next();
     else if (arg === '--mirror') args.mirrors.push(next());
     else if (arg === '--allow-artifact-root-mismatch-for-smoke') args.allowArtifactRootMismatchForSmoke = true;
+    else if (arg === '--allow-catalog-source-mismatch-for-smoke') args.allowCatalogSourceMismatchForSmoke = true;
     else if (arg === '--json') args.json = true;
     else if (arg === '-h' || arg === '--help') {
       usage();
@@ -186,6 +195,96 @@ function validateArtifactSource(args) {
     revision: args.artifactRevision.toLowerCase(),
     path: args.artifactPathInRepo,
   };
+}
+
+function requireObject(value, name) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${name} must be an object`);
+  }
+  return value;
+}
+
+function readCatalog(catalogPath) {
+  const resolved = resolveRepo(catalogPath);
+  const catalog = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  requireObject(catalog, '--catalog');
+  if (!Array.isArray(catalog.models)) {
+    throw new Error('--catalog must contain a models array');
+  }
+  return { path: resolved, catalog };
+}
+
+function sameArtifactSource(left, right) {
+  return left?.kind === right.kind &&
+    left?.repo === right.repo &&
+    String(left?.revision || '').toLowerCase() === right.revision &&
+    left?.path === right.path;
+}
+
+function catalogSourceBindingError(args, artifactSource) {
+  const { path: catalogPath, catalog } = readCatalog(args.catalogPath);
+  const model = catalog.models.find((entry) => entry?.model_id === args.modelId);
+  if (!model) {
+    return {
+      error: `--model-id ${args.modelId} is not present in ${relativeFile(catalogPath)}`,
+      catalogPath,
+      binding: null,
+    };
+  }
+  const artifacts = Object.entries(requireObject(model.artifacts, `${args.modelId}.artifacts`));
+  const backendArtifacts = artifacts.filter(([, artifact]) => artifact?.engine === args.backend);
+  if (backendArtifacts.length === 0) {
+    return {
+      error: `${args.modelId} has no ${args.backend} artifact in ${relativeFile(catalogPath)}`,
+      catalogPath,
+      binding: null,
+    };
+  }
+
+  const matches = backendArtifacts.filter(([, artifact]) => (
+    sameArtifactSource(
+      { ...artifact?.source, path: artifact?.path },
+      artifactSource
+    ) &&
+    (!args.artifactRoot || String(artifact?.artifact_root || '').toLowerCase() === args.artifactRoot.toLowerCase())
+  ));
+  if (matches.length !== 1) {
+    const available = backendArtifacts
+      .map(([name, artifact]) => {
+        const source = artifact?.source || {};
+        return `${name}:${source.repo || '<missing-repo>'}@${source.revision || '<missing-revision>'}/${artifact?.path || '<missing-path>'}`;
+      })
+      .join(', ');
+    return {
+      error: `${args.modelId}/${args.backend} Hugging Face source is not an exact signed catalog artifact in ${relativeFile(catalogPath)}; available: ${available}`,
+      catalogPath,
+      binding: null,
+    };
+  }
+
+  const [artifactName, artifact] = matches[0];
+  return {
+    error: null,
+    catalogPath,
+    binding: {
+      artifactName,
+      artifact,
+    },
+  };
+}
+
+function requireCatalogSourceBinding(args, artifactSource) {
+  const verdict = catalogSourceBindingError(args, artifactSource);
+  if (!verdict.error) return verdict;
+  if (args.allowCatalogSourceMismatchForSmoke) {
+    console.error(`warning: catalog source mismatch allowed for smoke only; ${verdict.error}`);
+    return {
+      catalogPath: verdict.catalogPath,
+      binding: null,
+      smoke_only: true,
+    };
+  }
+  throw new Error(`${verdict.error}; providers can only serve admin-greenlit catalog artifacts`);
 }
 
 function assertFile(filePath, name) {
@@ -438,6 +537,13 @@ async function build(args) {
   if (!args.binary && !args.binaryHash) throw new Error('pass --binary PATH or --binary-hash HEX');
   if (!['tar.zst', 'tar.gz'].includes(args.format)) throw new Error('--format must be tar.zst or tar.gz');
   const artifactSource = validateArtifactSource(args);
+  const catalogBinding = requireCatalogSourceBinding(args, artifactSource);
+  const catalogBindingEvidence = {
+    catalog: relativeFile(catalogBinding.catalogPath),
+    artifact: catalogBinding.binding?.artifactName ?? null,
+    exact: catalogBinding.binding !== null,
+    smoke_only: catalogBinding.smoke_only === true,
+  };
 
   const artifactPath = resolveRepo(args.artifact);
   const artifactStat = assertFile(artifactPath, '--artifact');
@@ -455,6 +561,15 @@ async function build(args) {
   }
 
   const artifactSha256 = await sha256File(artifactPath);
+  const catalogSourceSha256 = catalogBinding.binding?.artifact?.source_sha256;
+  if (
+    typeof catalogSourceSha256 === 'string' &&
+    catalogSourceSha256.toLowerCase() !== artifactSha256
+  ) {
+    throw new Error(
+      `artifact SHA-256 mismatch: signed catalog has source_sha256 ${catalogSourceSha256.toLowerCase()}, local artifact is ${artifactSha256}`
+    );
+  }
   const merkle = await buildMerkleManifest(artifactPath, args.chunkSize);
   let artifactRoot = merkle.root;
   let artifactRootVerified = true;
@@ -485,6 +600,7 @@ async function build(args) {
     artifact_root_kind: 'blake3_merkle_v1',
     artifact_source: artifactSource,
     source_sha256: artifactSha256,
+    catalog_binding: catalogBindingEvidence,
     artifact_root_verified: artifactRootVerified,
     binary_hash: binaryHash,
     artifact: {
@@ -571,6 +687,7 @@ async function build(args) {
     artifact_root_kind: 'blake3_merkle_v1',
     artifact_source: artifactSource,
     source_sha256: artifactSha256,
+    catalog_binding: catalogBindingEvidence,
     artifact_root_verified: artifactRootVerified,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
@@ -636,6 +753,7 @@ async function build(args) {
     artifact_root_kind: 'blake3_merkle_v1',
     artifact_source: artifactSource,
     source_sha256: artifactSha256,
+    catalog_binding: catalogBindingEvidence,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
     distribution,
