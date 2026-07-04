@@ -231,6 +231,8 @@ enum CatalogCommands {
     Verify(CatalogVerifyArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
     CalibrateCanary(CatalogCalibrateCanaryArgs),
+    /// Verify calibration report files cover the catalog canary matrix.
+    CanaryEvidence(CatalogCanaryEvidenceArgs),
     /// Audit per-backend canary fingerprint coverage for launch artifacts.
     CanaryMatrix(CatalogCanaryMatrixArgs),
 }
@@ -1056,6 +1058,29 @@ struct CatalogCanaryMatrixArgs {
     include_dev: bool,
 
     /// Print a machine-readable coverage report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogCanaryEvidenceArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Calibration report JSON produced by `mayhem catalog calibrate-canary`.
+    #[arg(long = "report", value_name = "PATH", required = true)]
+    reports: Vec<PathBuf>,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable evidence coverage report.
     #[arg(long)]
     json: bool,
 }
@@ -2004,6 +2029,7 @@ async fn main() -> Result<()> {
         Commands::Catalog { command } => match command {
             CatalogCommands::Verify(args) => catalog_verify(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
+            CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
             CatalogCommands::CanaryMatrix(args) => catalog_canary_matrix(args),
         },
         Commands::Provider { command } => match *command {
@@ -2573,6 +2599,295 @@ fn catalog_canary_matrix(args: CatalogCanaryMatrixArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn catalog_canary_evidence(args: CatalogCanaryEvidenceArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+    let report_paths = args
+        .reports
+        .iter()
+        .map(|path| absolutize(path.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let report = catalog_canary_evidence_report(
+        &catalog_doc,
+        catalog_path,
+        canaries_dir,
+        !args.include_dev,
+        &report_paths,
+    );
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Canary calibration evidence.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Canaries: {}", report.canaries_dir.display());
+        println!(
+            "Scope: {}",
+            if report.launch_only {
+                "launch models"
+            } else {
+                "launch + dev models"
+            }
+        );
+        println!(
+            "Coverage: {} models, {} artifacts, {} reports, ok={}",
+            report.model_count, report.artifact_count, report.report_count, report.ok
+        );
+        for entry in &report.entries {
+            let status = if entry.ok { "ok" } else { "error" };
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id, entry.artifact, entry.engine, entry.canary_set, status
+            );
+            if let Some(path) = &entry.report_path {
+                println!("  report: {}", path.display());
+            }
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+        for error in &report.errors {
+            println!("Global error: {error}");
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "canary calibration evidence has {} error(s)",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
+fn catalog_canary_evidence_report(
+    catalog_doc: &catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    canaries_dir: PathBuf,
+    launch_only: bool,
+    report_paths: &[PathBuf],
+) -> CatalogCanaryEvidenceReport {
+    let mut entries = Vec::new();
+    let mut entry_index = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for model in &catalog_doc.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id);
+        for (artifact_name, artifact) in &model.artifacts {
+            let mut entry_errors = Vec::new();
+            if let Err(err) = &canary_check {
+                entry_errors.push(err.clone());
+            }
+            let expected_fingerprint = model.canary.fingerprints.get(artifact_name).cloned();
+            match expected_fingerprint.as_deref() {
+                Some(value) if is_hex_len(value, 64) => {}
+                Some(_) => entry_errors.push(format!(
+                    "canary fingerprint for {artifact_name} must be 32-byte hex"
+                )),
+                None => entry_errors.push(format!(
+                    "canary fingerprint missing artifact {artifact_name}"
+                )),
+            }
+            let prompt_count = canary_check.as_ref().ok().copied();
+            let key = (model.model_id.clone(), artifact_name.clone());
+            entry_index.insert(key, entries.len());
+            entries.push(CatalogCanaryEvidenceEntry {
+                model_id: model.model_id.clone(),
+                tier: model.tier.clone(),
+                artifact: artifact_name.clone(),
+                engine: artifact.engine.clone(),
+                canary_set: model.canary.set_id.clone(),
+                prompt_count,
+                expected_fingerprint,
+                report_path: None,
+                report_fingerprint: None,
+                matches_catalog: None,
+                ok: entry_errors.is_empty(),
+                errors: entry_errors,
+            });
+        }
+    }
+
+    if entries.is_empty() {
+        errors.push(if launch_only {
+            "catalog has no launch model artifacts to verify".to_owned()
+        } else {
+            "catalog has no model artifacts to verify".to_owned()
+        });
+    }
+
+    for path in report_paths {
+        let report_value = match read_json_file(path) {
+            Ok(value) => value,
+            Err(err) => {
+                errors.push(format!("{}: {err}", path.display()));
+                continue;
+            }
+        };
+        let calibration =
+            match serde_json::from_value::<CatalogCanaryCalibrationReport>(report_value) {
+                Ok(report) => report,
+                Err(err) => {
+                    errors.push(format!(
+                        "{}: parsing calibration report: {err}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+        let key = (calibration.model_id.clone(), calibration.artifact.clone());
+        let Some(entry_idx) = entry_index.get(&key).copied() else {
+            errors.push(format!(
+                "{} references {} / {}, which is outside the requested catalog scope",
+                path.display(),
+                calibration.model_id,
+                calibration.artifact
+            ));
+            continue;
+        };
+        let entry = &mut entries[entry_idx];
+        if entry.report_path.is_some() {
+            let message = format!(
+                "duplicate calibration report for {} / {}",
+                calibration.model_id, calibration.artifact
+            );
+            entry.errors.push(message.clone());
+            errors.push(format!("{}: {message}", path.display()));
+            entry.ok = false;
+            continue;
+        }
+
+        entry.report_path = Some(path.clone());
+        entry.report_fingerprint = Some(calibration.catalog_fingerprint.clone());
+        let matches_catalog = entry
+            .expected_fingerprint
+            .as_ref()
+            .map(|expected| expected == &calibration.catalog_fingerprint);
+        entry.matches_catalog = matches_catalog;
+
+        if calibration.engine != entry.engine {
+            entry.errors.push(format!(
+                "report engine {} does not match catalog engine {}",
+                calibration.engine, entry.engine
+            ));
+        }
+        if calibration.canary_set != entry.canary_set {
+            entry.errors.push(format!(
+                "report canary set {} does not match catalog canary set {}",
+                calibration.canary_set, entry.canary_set
+            ));
+        }
+        if calibration.prompt_count != calibration.prompts.len() {
+            entry.errors.push(format!(
+                "report prompt_count {} does not match {} prompt reports",
+                calibration.prompt_count,
+                calibration.prompts.len()
+            ));
+        }
+        if let Some(expected_count) = entry.prompt_count {
+            if calibration.prompt_count != expected_count {
+                entry.errors.push(format!(
+                    "report prompt_count {} does not match canary set prompt count {}",
+                    calibration.prompt_count, expected_count
+                ));
+            }
+        }
+        if !is_hex_len(&calibration.catalog_fingerprint, 64) {
+            entry
+                .errors
+                .push("report catalog_fingerprint must be 32-byte hex".to_owned());
+        }
+        if calibration.existing_catalog_fingerprint != entry.expected_fingerprint {
+            entry.errors.push(
+                "report existing_catalog_fingerprint does not match current catalog".to_owned(),
+            );
+        }
+        if matches_catalog != Some(true) {
+            entry.errors.push(format!(
+                "report fingerprint {} does not match catalog fingerprint {}",
+                calibration.catalog_fingerprint,
+                entry.expected_fingerprint.as_deref().unwrap_or("<missing>")
+            ));
+        }
+        if calibration.matches_existing_catalog != Some(true) {
+            entry
+                .errors
+                .push("report was not generated as a catalog match".to_owned());
+        }
+        let mut prompt_ids = BTreeSet::new();
+        for prompt in &calibration.prompts {
+            if !prompt_ids.insert(prompt.prompt_id.clone()) {
+                entry
+                    .errors
+                    .push(format!("duplicate prompt report {}", prompt.prompt_id));
+            }
+            if !is_hex_len(&prompt.fingerprint, 64) {
+                entry.errors.push(format!(
+                    "prompt {} fingerprint must be 32-byte hex",
+                    prompt.prompt_id
+                ));
+            }
+            if prompt.token_count != prompt.completion_tokens as usize {
+                entry.errors.push(format!(
+                    "prompt {} token_count {} does not match completion_tokens {}",
+                    prompt.prompt_id, prompt.token_count, prompt.completion_tokens
+                ));
+            }
+        }
+        entry.ok = entry.errors.is_empty();
+    }
+
+    for entry in &mut entries {
+        if entry.report_path.is_none() {
+            entry.errors.push("missing calibration report".to_owned());
+        }
+        entry.ok = entry.errors.is_empty();
+        if !entry.ok {
+            errors.extend(
+                entry
+                    .errors
+                    .iter()
+                    .map(|error| format!("{} {}: {error}", entry.model_id, entry.artifact)),
+            );
+        }
+    }
+
+    let model_count = entries
+        .iter()
+        .map(|entry| entry.model_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let report_count = entries
+        .iter()
+        .filter(|entry| entry.report_path.is_some())
+        .count();
+    CatalogCanaryEvidenceReport {
+        catalog_path,
+        canaries_dir,
+        launch_only,
+        model_count,
+        artifact_count: entries.len(),
+        report_count,
+        ok: errors.is_empty(),
+        entries,
+        errors,
+    }
 }
 
 fn catalog_canary_matrix_report(
@@ -4217,7 +4532,7 @@ struct TextMatchEvaluation {
     pass: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CanaryCalibrationPromptReport {
     prompt_id: String,
     max_tokens: u32,
@@ -4228,7 +4543,7 @@ struct CanaryCalibrationPromptReport {
     output_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CatalogCanaryCalibrationReport {
     model_id: String,
     artifact: String,
@@ -4264,6 +4579,35 @@ struct CatalogCanaryMatrixEntry {
     prompt_count: Option<usize>,
     fingerprint: Option<String>,
     calibration_status: String,
+    ok: bool,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryEvidenceReport {
+    catalog_path: PathBuf,
+    canaries_dir: PathBuf,
+    launch_only: bool,
+    model_count: usize,
+    artifact_count: usize,
+    report_count: usize,
+    ok: bool,
+    entries: Vec<CatalogCanaryEvidenceEntry>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryEvidenceEntry {
+    model_id: String,
+    tier: String,
+    artifact: String,
+    engine: String,
+    canary_set: String,
+    prompt_count: Option<usize>,
+    expected_fingerprint: Option<String>,
+    report_path: Option<PathBuf>,
+    report_fingerprint: Option<String>,
+    matches_catalog: Option<bool>,
     ok: bool,
     errors: Vec<String>,
 }
@@ -14210,6 +14554,87 @@ mod tests {
     }
 
     #[test]
+    fn canary_evidence_accepts_full_launch_report_set() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+        );
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.model_count, 1);
+        assert_eq!(report.artifact_count, 1);
+        assert_eq!(report.report_count, 1);
+        assert_eq!(report.entries[0].matches_catalog, Some(true));
+    }
+
+    #[test]
+    fn canary_evidence_requires_report_for_every_launch_artifact() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[],
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("missing calibration report")));
+    }
+
+    #[test]
+    fn canary_evidence_rejects_report_catalog_mismatch() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("bb".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+        );
+
+        assert!(!report.ok);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("does not match catalog fingerprint")
+                || error.contains("was not generated as a catalog match")
+        }));
+    }
+
+    #[test]
     fn stable_value_hash_is_object_key_order_independent() {
         let a = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
@@ -14614,6 +15039,19 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    fn write_temp_calibration_report(report: &CatalogCanaryCalibrationReport) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mayhem-canary-calibration-report-{}-{nanos}.json",
+            std::process::id()
+        ));
+        write_json_file(&path, report).unwrap();
+        path
     }
 
     fn test_catalog(root: &str) -> catalog::CatalogDocument {
