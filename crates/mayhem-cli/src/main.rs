@@ -3405,6 +3405,9 @@ struct CatalogArtifactPublishPlanEntry {
     current_source_revision: String,
     source_path: String,
     current_artifact_path: PathBuf,
+    current_artifact_exists: bool,
+    current_artifact_is_file: bool,
+    current_artifact_bytes: Option<u64>,
     published_artifact_path_template: PathBuf,
     report_path: PathBuf,
     upload_command: CatalogCanaryPlanCommand,
@@ -3816,6 +3819,15 @@ fn catalog_artifact_publish_plan(args: CatalogArtifactPublishPlanArgs) -> Result
                 entry.current_artifact_path.display()
             );
             println!(
+                "  local artifact ready: exists={}, file={}, bytes={}",
+                entry.current_artifact_exists,
+                entry.current_artifact_is_file,
+                entry
+                    .current_artifact_bytes
+                    .map(|bytes| bytes.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            );
+            println!(
                 "  published artifact: {}",
                 entry.published_artifact_path_template.display()
             );
@@ -4127,6 +4139,33 @@ fn catalog_artifact_publish_plan_report(
                 ));
             }
             let current_artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
+            let (current_artifact_exists, current_artifact_is_file, current_artifact_bytes) =
+                match fs::metadata(&current_artifact_path) {
+                    Ok(metadata) => {
+                        let is_file = metadata.is_file();
+                        if !is_file {
+                            entry_errors.push(format!(
+                                "local artifact path {} exists but is not a file",
+                                current_artifact_path.display()
+                            ));
+                        }
+                        (true, is_file, is_file.then_some(metadata.len()))
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        entry_errors.push(format!(
+                            "local artifact file is missing at {}",
+                            current_artifact_path.display()
+                        ));
+                        (false, false, None)
+                    }
+                    Err(err) => {
+                        entry_errors.push(format!(
+                            "could not stat local artifact path {}: {err}",
+                            current_artifact_path.display()
+                        ));
+                        (false, false, None)
+                    }
+                };
             let published_artifact_path_template =
                 catalog_artifact_published_template_path(&artifact_base, artifact);
             let report_path = report_dir
@@ -4175,6 +4214,9 @@ fn catalog_artifact_publish_plan_report(
                 current_source_revision: artifact.source.revision.clone(),
                 source_path: artifact.path.clone(),
                 current_artifact_path,
+                current_artifact_exists,
+                current_artifact_is_file,
+                current_artifact_bytes,
                 published_artifact_path_template,
                 report_path,
                 upload_command,
@@ -18133,23 +18175,37 @@ mod tests {
     fn artifact_publish_plan_emits_upload_revision_metadata_and_followups() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
+        let temp = env::temp_dir().join(format!(
+            "mayhem-artifact-publish-plan-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        let artifact_base = temp.join("artifacts");
+        let expected_artifact_path = artifact_base
+            .join("huggingface")
+            .join("test_model")
+            .join("1".repeat(40))
+            .join("model.gguf");
+        fs::create_dir_all(expected_artifact_path.parent().unwrap()).unwrap();
+        fs::write(&expected_artifact_path, b"publish-plan artifact").unwrap();
         let sign = CatalogCanaryPlanSignOptions {
-            signature_output: PathBuf::from("/tmp/reports/models.json.sig"),
+            signature_output: temp.join("reports/models.json.sig"),
             key_id: "test-catalog-key".to_owned(),
-            seed_file: PathBuf::from("/tmp/catalog-seed.hex"),
-            keys_dir: PathBuf::from("/tmp/catalog-keys"),
+            seed_file: temp.join("catalog-seed.hex"),
+            keys_dir: temp.join("catalog-keys"),
             write_key: true,
             created_at: Some("2026-07-04T00:00:00Z".to_owned()),
         };
+        let report_dir = temp.join("reports");
 
         let report = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
             catalog_doc: &catalog,
-            catalog_path: PathBuf::from("/tmp/catalog.json"),
-            artifact_base: PathBuf::from("/tmp/artifacts"),
-            report_dir: PathBuf::from("/tmp/reports"),
-            catalog_output: PathBuf::from("/tmp/reports/catalog.with-artifacts.json"),
+            catalog_path: temp.join("catalog.json"),
+            artifact_base: artifact_base.clone(),
+            report_dir: report_dir.clone(),
+            catalog_output: report_dir.join("catalog.with-artifacts.json"),
             catalog_sign: Some(sign),
-            hf_token_file: Some(PathBuf::from("/tmp/hf-token.txt")),
+            hf_token_file: Some(temp.join("hf-token.txt")),
             launch_only: true,
         });
 
@@ -18157,18 +18213,17 @@ mod tests {
         assert_eq!(report.model_count, 1);
         assert_eq!(report.artifact_count, 1);
         let entry = &report.publish_commands[0];
-        assert_eq!(
-            entry.current_artifact_path,
-            PathBuf::from(format!(
-                "/tmp/artifacts/huggingface/test_model/{}/model.gguf",
-                "1".repeat(40)
-            ))
-        );
+        assert_eq!(entry.current_artifact_path, expected_artifact_path);
+        assert!(entry.current_artifact_exists);
+        assert!(entry.current_artifact_is_file);
+        assert_eq!(entry.current_artifact_bytes, Some(21));
         assert_eq!(
             entry.published_artifact_path_template,
-            PathBuf::from(
-                "/tmp/artifacts/huggingface/test_model/<published-hf-commit-40-hex>/model.gguf"
-            )
+            artifact_base
+                .join("huggingface")
+                .join("test_model")
+                .join("<published-hf-commit-40-hex>")
+                .join("model.gguf")
         );
         assert_eq!(entry.upload_command.argv[0], "hf");
         assert!(entry
@@ -18180,9 +18235,9 @@ mod tests {
             .upload_command
             .shell
             .contains("HF_XET_HIGH_PERFORMANCE=1"));
-        assert!(entry.upload_command.shell.contains("/tmp/hf-token.txt"));
+        assert!(entry.upload_command.shell.contains("hf-token.txt"));
         assert!(entry.revision_command.shell.contains("HfApi"));
-        assert!(entry.revision_command.shell.contains("/tmp/hf-token.txt"));
+        assert!(entry.revision_command.shell.contains("hf-token.txt"));
         assert!(entry.metadata_command_template.argv.windows(2).any(|pair| {
             pair[0] == "--source-revision" && pair[1] == "<published-hf-commit-40-hex>"
         }));
@@ -18199,7 +18254,40 @@ mod tests {
         assert!(verify_command
             .argv
             .windows(2)
-            .any(|pair| pair[0] == "--hf-token-file" && pair[1] == "/tmp/hf-token.txt"));
+            .any(|pair| pair[0] == "--hf-token-file" && pair[1].ends_with("hf-token.txt")));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn artifact_publish_plan_marks_missing_local_artifacts_not_ready() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+
+        let report = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-missing-artifacts"),
+            report_dir: PathBuf::from("/tmp/reports"),
+            catalog_output: PathBuf::from("/tmp/reports/catalog.with-artifacts.json"),
+            catalog_sign: None,
+            hf_token_file: None,
+            launch_only: true,
+        });
+
+        assert!(!report.ok);
+        assert_eq!(report.artifact_count, 1);
+        let entry = &report.publish_commands[0];
+        assert!(!entry.ok);
+        assert!(!entry.current_artifact_exists);
+        assert!(entry
+            .errors
+            .iter()
+            .any(|error| error.contains("local artifact file is missing")));
+        assert!(entry.upload_command.shell.contains("'hf' 'upload'"));
+        assert!(entry
+            .metadata_after_publish_shell
+            .contains("PUBLISHED_REVISION=$("));
     }
 
     #[test]
