@@ -17,6 +17,8 @@ const msbBootstrap = 'c184f4ad8e9cf5e911f9415b60e7dcfb30aed73ebd8a402ef68e1b1546
 const msbChannel = '1111trac1network1msb1testnet1111';
 const syntheticWindowStart = '2026-07-04T00:00:00Z';
 const syntheticWindowEnd = '2026-07-11T00:00:00Z';
+const ed25519Pkcs8SeedPrefix = Buffer.from('302e020100300506032b657004220420', 'hex');
+const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
 function usage() {
   console.log(`Usage: node scripts/beta-synthetic-metrics-smoke.mjs [--out-dir PATH] [--tracker-recorded] [--json]
@@ -74,8 +76,21 @@ function hex(label) {
   return crypto.createHash('sha256').update(`mayhem-p8.5:${label}`).digest('hex');
 }
 
-function hex128(label) {
-  return `${hex(`${label}:0`)}${hex(`${label}:1`)}`;
+function deterministicEd25519Key(label) {
+  const seed = crypto.createHash('sha256').update(`mayhem-p8.5:${label}`).digest();
+  const privateKey = crypto.createPrivateKey({
+    key: Buffer.concat([ed25519Pkcs8SeedPrefix, seed]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const publicDer = crypto.createPublicKey(privateKey).export({ format: 'der', type: 'spki' });
+  if (!Buffer.from(publicDer.subarray(0, ed25519SpkiPrefix.length)).equals(ed25519SpkiPrefix)) {
+    throw new Error('unexpected Ed25519 public key DER prefix');
+  }
+  return {
+    privateKey,
+    publicKeyHex: Buffer.from(publicDer.subarray(ed25519SpkiPrefix.length)).toString('hex'),
+  };
 }
 
 async function blake3Hex(text) {
@@ -89,6 +104,31 @@ async function deriveCatalogEnclaveId(adminPubkey, enclave) {
 
 async function deriveRoomId(enclaveId, adminPubkey, nonce) {
   return (await blake3Hex(`${enclaveId}${adminPubkey}${nonce}`)).slice(0, 32);
+}
+
+function enclaveDistributionSigningPayload(adminPubkey, enclave) {
+  return Buffer.from(stableJson({
+    schema_version: 1,
+    kind: 'mayhem-enclave-distribution-v1',
+    admin_pubkey: adminPubkey,
+    enclave_id: enclave.enclave_id,
+    model_id: enclave.model_id,
+    backend: enclave.backend,
+    artifact_root: enclave.artifact_root,
+    manifest_hash: enclave.manifest_hash,
+    binary_hash: enclave.binary_hash,
+    distribution: {
+      bundle_url: enclave.distribution?.bundle_url,
+      manifest_url: enclave.distribution?.manifest_url,
+      bundle_sha256: enclave.distribution?.bundle_sha256,
+      bundle_bytes: enclave.distribution?.bundle_bytes,
+      mirrors: enclave.distribution?.mirrors || [],
+    },
+  }));
+}
+
+function signEnclaveDistribution(adminKey, enclave) {
+  return crypto.sign(null, enclaveDistributionSigningPayload(adminKey.publicKeyHex, enclave), adminKey.privateKey).toString('hex');
 }
 
 function writeJson(filePath, value) {
@@ -245,7 +285,8 @@ function buildBrowserHandoffs(outDir) {
   ].join('\n'));
 }
 
-async function buildLaunchManifest(outDir, adminPubkey, providerIds) {
+async function buildLaunchManifest(outDir, adminKey, providerIds) {
+  const adminPubkey = adminKey.publicKeyHex;
   const manifestHash = hex('enclave:manifest');
   const binaryHash = hex('enclave:binary');
   const enclave = {
@@ -255,8 +296,17 @@ async function buildLaunchManifest(outDir, adminPubkey, providerIds) {
     artifact_root: artifactRoot,
     manifest_hash: manifestHash,
     binary_hash: binaryHash,
+    distribution: null,
   };
   enclave.enclave_id = await deriveCatalogEnclaveId(adminPubkey, enclave);
+  enclave.distribution = {
+    bundle_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.tar.zst`,
+    manifest_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.json`,
+    bundle_sha256: hex('distribution:bundle'),
+    bundle_bytes: 1024,
+    admin_signature: null,
+  };
+  enclave.distribution.admin_signature = signEnclaveDistribution(adminKey, enclave);
   const roomNonce = 'p8.5-synthetic-launch-us-east';
   const roomId = await deriveRoomId(enclave.enclave_id, adminPubkey, roomNonce);
 
@@ -386,13 +436,7 @@ async function buildLaunchManifest(outDir, adminPubkey, providerIds) {
           json: true,
           ctx: 131072,
         },
-        distribution: {
-          bundle_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.tar.zst`,
-          manifest_url: `https://downloads.trac.network/mayhem/testnet/enclaves/${enclave.enclave_id}.json`,
-          bundle_sha256: hex('distribution:bundle'),
-          bundle_bytes: 1024,
-          admin_signature: hex128('distribution:admin-signature'),
-        },
+        distribution: enclave.distribution,
         model_ref_mu: {
           in_per_1k: 18,
           out_per_1k: 55,
@@ -538,9 +582,10 @@ async function buildSyntheticBundle(args) {
   const outDir = resolveOut(args.outDir);
   fs.mkdirSync(outDir, { recursive: true });
 
-  const adminPubkey = hex('admin');
+  const adminKey = deterministicEd25519Key('synthetic-admin');
+  const adminPubkey = adminKey.publicKeyHex;
   const providerIds = Array.from({ length: 20 }, (_, index) => providerPubkey(index));
-  const { manifestPath, enclave, roomId } = await buildLaunchManifest(outDir, adminPubkey, providerIds);
+  const { manifestPath, enclave, roomId } = await buildLaunchManifest(outDir, adminKey, providerIds);
   const snapshotPath = buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomId);
   const participantPaths = buildParticipants(outDir, providerIds);
   const paymentRailsPath = buildPaymentRailEvidence(outDir);

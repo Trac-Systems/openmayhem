@@ -16,6 +16,7 @@ const safeCommandText = /^[a-zA-Z0-9._:@/+~,\-\s<>$:"{}[\]]+$/;
 const sha256Evidence = /#sha256:[0-9a-fA-F]{64}(?:$|[#?&])/;
 const httpUrl = /^https?:\/\//;
 const httpsUrl = /^https:\/\//;
+const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
 function usage() {
   console.log(`Usage: node scripts/beta-launch.mjs [--manifest PATH] [--allow-placeholders] [--json] [--no-commands]
@@ -56,6 +57,14 @@ function parseArgs(argv) {
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function catalogArtifactForEnclave(model, backend, artifactRoot) {
@@ -297,6 +306,77 @@ function validateEnclaveDistribution(add, distribution, name) {
         validateHttpsDownloadUrl(add, mirror, `${name}.mirrors[${index}]`);
       }
     }
+  }
+}
+
+function ed25519PublicKeyFromRawHex(publicKeyHex) {
+  return crypto.createPublicKey({
+    key: Buffer.concat([ed25519SpkiPrefix, Buffer.from(publicKeyHex, 'hex')]),
+    format: 'der',
+    type: 'spki',
+  });
+}
+
+function enclaveDistributionSigningPayload(adminPubkey, enclave) {
+  return Buffer.from(stableJson({
+    schema_version: 1,
+    kind: 'mayhem-enclave-distribution-v1',
+    admin_pubkey: adminPubkey,
+    enclave_id: enclave.enclave_id,
+    model_id: enclave.model_id,
+    backend: enclave.backend,
+    artifact_root: enclave.artifact_root,
+    manifest_hash: enclave.manifest_hash,
+    binary_hash: enclave.binary_hash,
+    distribution: {
+      bundle_url: enclave.distribution?.bundle_url,
+      manifest_url: enclave.distribution?.manifest_url,
+      bundle_sha256: enclave.distribution?.bundle_sha256,
+      bundle_bytes: enclave.distribution?.bundle_bytes,
+      mirrors: enclave.distribution?.mirrors || [],
+    },
+  }));
+}
+
+function verifyEnclaveDistributionSignature(add, adminPubkey, enclave, name) {
+  const fields = [
+    adminPubkey,
+    enclave.enclave_id,
+    enclave.model_id,
+    enclave.backend,
+    enclave.artifact_root,
+    enclave.manifest_hash,
+    enclave.binary_hash,
+    enclave.distribution?.bundle_url,
+    enclave.distribution?.manifest_url,
+    enclave.distribution?.bundle_sha256,
+    enclave.distribution?.admin_signature,
+  ];
+  if (
+    fields.some((value) => typeof value !== 'string' || isPlaceholder(value)) ||
+    !Number.isInteger(enclave.distribution?.bundle_bytes) ||
+    !pubkey64.test(adminPubkey) ||
+    !hex64.test(enclave.enclave_id || '') ||
+    !hex64.test(enclave.artifact_root || '') ||
+    !hex64.test(enclave.manifest_hash || '') ||
+    !hex64.test(enclave.binary_hash || '') ||
+    !hex64.test(enclave.distribution?.bundle_sha256 || '') ||
+    !hex128.test(enclave.distribution?.admin_signature || '')
+  ) {
+    return;
+  }
+  try {
+    const ok = crypto.verify(
+      null,
+      enclaveDistributionSigningPayload(adminPubkey, enclave),
+      ed25519PublicKeyFromRawHex(adminPubkey),
+      Buffer.from(enclave.distribution.admin_signature, 'hex'),
+    );
+    if (!ok) {
+      add('error', `${name}.admin_signature must verify against admin.peer_pubkey over the enclave distribution payload`);
+    }
+  } catch (error) {
+    add('error', `${name}.admin_signature verification failed: ${error.message}`);
   }
 }
 
@@ -655,6 +735,9 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
         requirePositiveInteger(add, enclave.caps.ctx, `${prefix}.caps.ctx`);
       }
       validateEnclaveDistribution(add, enclave.distribution, `${prefix}.distribution`);
+      if (manifest.admin?.peer_pubkey) {
+        verifyEnclaveDistributionSignature(add, manifest.admin.peer_pubkey, enclave, `${prefix}.distribution`);
+      }
       if (requireObject(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`)) {
         requireOnlyKeys(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`, ['in_per_1k', 'out_per_1k']);
         requirePositiveInteger(add, enclave.model_ref_mu.in_per_1k, `${prefix}.model_ref_mu.in_per_1k`);
