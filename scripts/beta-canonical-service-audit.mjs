@@ -15,7 +15,7 @@ const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const hex64 = /^[0-9a-fA-F]{64}$/;
 const hex40 = /^[0-9a-fA-F]{40}$/;
 const roomIdHex = /^[0-9a-fA-F]{32}$/;
-const payoutMethods = new Set(['tnk', 'stripe', 'coinbase']);
+const payoutMethods = new Set(['tnk', 'stripe']);
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
 function usage() {
@@ -663,7 +663,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
       fail(`prov/${providerId}.payout.addr is missing`);
     }
     if (!payoutMethods.has(payout.method)) {
-      fail(`prov/${providerId}.payout.method must be tnk, stripe, or coinbase`);
+      fail(`prov/${providerId}.payout.method must be tnk or stripe`);
     }
     if (payout.set_by !== admin) {
       fail(`prov/${providerId}.payout was not set by admin ${admin}`);

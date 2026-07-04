@@ -204,7 +204,6 @@ function checkoutUrlMatchesRail(value, rail) {
   if (parsed.protocol !== 'https:') return false;
   const hostname = parsed.hostname.toLowerCase();
   if (rail === 'stripe') return hostname === 'checkout.stripe.com';
-  if (rail === 'coinbase') return hostname === 'commerce.coinbase.com';
   return false;
 }
 
@@ -247,7 +246,7 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
     add('error', 'browser_handoffs.samples must include copy_paste.checkout_url evidence');
   }
   if (!Array.isArray(railsVerified)) return;
-  for (const rail of ['stripe', 'coinbase']) {
+  for (const rail of ['stripe']) {
     if (!railsVerified.includes(rail)) continue;
     if (!value.some((sample) => (
       isFileEvidence(sample)
@@ -261,13 +260,13 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
 
 function validateRequiredRails(add, value, requiredRails = ['stripe']) {
   if (!requireArray(add, value, 'browser_handoffs.rails_verified', requiredRails.length)) return;
-  const allowed = new Set(['stripe', 'coinbase']);
+  const allowed = new Set(['stripe']);
   const seen = new Set();
   for (const [index, rail] of value.entries()) {
     requireString(add, rail, `browser_handoffs.rails_verified[${index}]`);
     if (typeof rail !== 'string' || isPlaceholder(rail)) continue;
     if (!allowed.has(rail)) {
-      add('error', `browser_handoffs.rails_verified[${index}] must be stripe or coinbase`);
+      add('error', `browser_handoffs.rails_verified[${index}] must be stripe`);
     }
     if (seen.has(rail)) {
       add('error', `browser_handoffs.rails_verified[${index}] duplicates another rail`);
@@ -331,7 +330,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireLiteral(add, metrics.payment_rails.ledger_denom, 'mu_usd', 'payment_rails.ledger_denom');
     requireBoolean(add, metrics.payment_rails.tnk_enabled, true, 'payment_rails.tnk_enabled');
     requireBoolean(add, metrics.payment_rails.stripe_enabled, true, 'payment_rails.stripe_enabled');
-    requireBooleanValue(add, metrics.payment_rails.coinbase_enabled, 'payment_rails.coinbase_enabled');
+    requireBoolean(add, metrics.payment_rails.coinbase_enabled, false, 'payment_rails.coinbase_enabled');
     requireBoolean(add, metrics.payment_rails.rails_credit_mu_usd, true, 'payment_rails.rails_credit_mu_usd');
     requireBoolean(
       add,
@@ -339,10 +338,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'payment_rails.paygate_admin_controls_verified',
     );
-    const requiredCreditRails = metrics.payment_rails.coinbase_enabled === true
-      ? ['tnk', 'stripe', 'coinbase']
-      : ['tnk', 'stripe'];
-    validatePaymentRailEvidence(add, metrics.payment_rails.evidence, requiredCreditRails);
+    validatePaymentRailEvidence(add, metrics.payment_rails.evidence, ['tnk', 'stripe']);
   }
 
   if (requireObject(add, metrics.window, 'window')) {
@@ -536,10 +532,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
 
   if (requireObject(add, metrics.browser_handoffs, 'browser_handoffs')) {
     requireBoolean(add, metrics.browser_handoffs.copy_paste_urls_printed, true, 'browser_handoffs.copy_paste_urls_printed');
-    const requiredCheckoutRails = metrics.payment_rails?.coinbase_enabled === true
-      ? ['stripe', 'coinbase']
-      : ['stripe'];
-    validateRequiredRails(add, metrics.browser_handoffs.rails_verified, requiredCheckoutRails);
+    validateRequiredRails(add, metrics.browser_handoffs.rails_verified, ['stripe']);
     validateCheckoutHandoffSamples(add, metrics.browser_handoffs.samples, metrics.browser_handoffs.rails_verified);
   }
 

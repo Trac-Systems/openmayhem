@@ -448,7 +448,6 @@ function verifyEnclaveDistributionSignature(add, adminPubkey, enclave, name) {
 function validateCheckoutUrls(add, paygate, expectedOrigin = null) {
   if (!requireObject(add, paygate.checkout_urls, 'paygate.checkout_urls')) return;
   const activeRails = ['stripe'];
-  if (paygate.coinbase_enabled === true) activeRails.push('coinbase');
   requireOnlyKeys(add, paygate.checkout_urls, 'paygate.checkout_urls', activeRails);
   for (const rail of activeRails) {
     const railConfig = paygate.checkout_urls[rail];
@@ -892,7 +891,7 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
     requireString(add, manifest.paygate.health_path, 'paygate.health_path');
     requireString(add, manifest.paygate.tnk_treasury_address, 'paygate.tnk_treasury_address', testtracAddress);
     requireLiteral(add, manifest.paygate.stripe_enabled, true, 'paygate.stripe_enabled');
-    requireBoolean(add, manifest.paygate.coinbase_enabled, 'paygate.coinbase_enabled');
+    requireLiteral(add, manifest.paygate.coinbase_enabled, false, 'paygate.coinbase_enabled');
     validateCheckoutUrls(add, manifest.paygate, paygateOrigin);
   }
 
@@ -1132,8 +1131,8 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       if (requireObject(add, provider.payout, `${prefix}.payout`)) {
         requireOnlyKeys(add, provider.payout, `${prefix}.payout`, ['admin_approved', 'method', 'addr']);
         requireLiteral(add, provider.payout.admin_approved, true, `${prefix}.payout.admin_approved`);
-        if (!['tnk', 'stripe', 'coinbase'].includes(provider.payout.method)) {
-          add('error', `${prefix}.payout.method must be tnk, stripe, or coinbase`);
+        if (!['tnk', 'stripe'].includes(provider.payout.method)) {
+          add('error', `${prefix}.payout.method must be tnk or stripe`);
         }
         requireString(add, provider.payout.addr, `${prefix}.payout.addr`);
       }
@@ -1348,11 +1347,6 @@ async function buildCommands(manifest) {
     `mayhem pay tnk --rpc-url ${sh(manifest.admin?.rpc_url || '<peer-rpc-url>')} --treasury-address ${sh(paygate.tnk_treasury_address || '<tnk-treasury-address>')} --amount 10`,
     `mayhem pay stripe --paygate-url ${sh(paygateBase || '<paygate-url>')} --amount 10 --success-url ${sh(railCheckoutUrl(paygate, 'stripe', 'success_url'))} --cancel-url ${sh(railCheckoutUrl(paygate, 'stripe', 'cancel_url'))}`,
   ];
-  if (paygate.coinbase_enabled === true) {
-    checkoutCommands.push(
-      `mayhem pay coinbase --paygate-url ${sh(paygateBase || '<paygate-url>')} --amount 10 --success-url ${sh(railCheckoutUrl(paygate, 'coinbase', 'success_url'))} --cancel-url ${sh(railCheckoutUrl(paygate, 'coinbase', 'cancel_url'))}`,
-    );
-  }
 
   return {
     boot,

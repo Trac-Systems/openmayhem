@@ -52,18 +52,6 @@ struct PayoutPlanArgs {
     /// Placeholder used in generated payout_confirm commands until Stripe transfer IDs exist.
     #[arg(long, default_value = "PENDING_STRIPE_TRANSFER_ID")]
     stripe_transfer_id: String,
-    /// Placeholder used in generated payout_confirm commands until Coinbase transfer IDs exist.
-    #[arg(long, default_value = "PENDING_COINBASE_TRANSFER_ID")]
-    coinbase_transfer_id: String,
-    /// Coinbase CDP custodial source account used for generated transfer intents.
-    #[arg(long, default_value = "COINBASE_SOURCE_ACCOUNT")]
-    coinbase_source_account: String,
-    /// Coinbase transfer asset for generated intents.
-    #[arg(long, default_value = "usd")]
-    coinbase_asset: String,
-    /// Coinbase onchain target network when the target is an address.
-    #[arg(long, default_value = "base")]
-    coinbase_network: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,8 +164,6 @@ struct ProviderPayout {
     msb_transfer: Option<MsbTransfer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stripe_transfer: Option<StripeTransfer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coinbase_transfer: Option<CoinbaseTransfer>,
     confirm_command: Value,
 }
 
@@ -208,25 +194,6 @@ struct StripeTransfer {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct CoinbaseTransfer {
-    source: CoinbaseTransferSource,
-    target: Value,
-    amount: String,
-    asset: String,
-    rounding_mu: u64,
-    execute: bool,
-    metadata: PayoutMetadata,
-    network_pays_fee: bool,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct CoinbaseTransferSource {
-    #[serde(rename = "accountId")]
-    account_id: String,
-    asset: String,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct PayoutMetadata {
     mayhem_provider: String,
     mayhem_epoch: u64,
@@ -254,10 +221,6 @@ struct PlanTotals {
 struct RailOptions {
     msb_tx_hash: String,
     stripe_transfer_id: String,
-    coinbase_transfer_id: String,
-    coinbase_source_account: String,
-    coinbase_asset: String,
-    coinbase_network: String,
 }
 
 fn default_holdback_epochs() -> u64 {
@@ -302,10 +265,6 @@ fn main() -> Result<()> {
                 &RailOptions {
                     msb_tx_hash: args.msb_tx_hash,
                     stripe_transfer_id: args.stripe_transfer_id,
-                    coinbase_transfer_id: args.coinbase_transfer_id,
-                    coinbase_source_account: args.coinbase_source_account,
-                    coinbase_asset: args.coinbase_asset,
-                    coinbase_network: args.coinbase_network,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -393,7 +352,15 @@ fn build_plan(
             });
             continue;
         }
-        if !matches!(target.method.as_str(), "tnk" | "stripe" | "coinbase") {
+        if target.method == "coinbase" {
+            skipped.push(SkippedPayout {
+                who: earning.provider.clone(),
+                reason: "payout_method_retired".to_string(),
+                released_mu: 0,
+            });
+            continue;
+        }
+        if !matches!(target.method.as_str(), "tnk" | "stripe") {
             skipped.push(SkippedPayout {
                 who: earning.provider.clone(),
                 reason: "unsupported_payout_method".to_string(),
@@ -445,7 +412,6 @@ fn build_plan(
                         network_pays_fee: true,
                     }),
                     stripe_transfer: None,
-                    coinbase_transfer: None,
                     confirm_command: payout_confirm_command(PayoutConfirmArgs {
                         kind: None,
                         rail: "tnk",
@@ -492,7 +458,6 @@ fn build_plan(
                         metadata,
                         network_pays_fee: true,
                     }),
-                    coinbase_transfer: None,
                     confirm_command: payout_confirm_command(PayoutConfirmArgs {
                         kind: None,
                         rail: "stripe",
@@ -501,62 +466,6 @@ fn build_plan(
                         mu: released_mu,
                         tnk_e18: None,
                         external_ref: Some(&rail_options.stripe_transfer_id),
-                        msb_tx_hash: None,
-                        fiat_currency: Some(&currency),
-                        fiat_amount_minor: Some(amount_cents),
-                        at,
-                    }),
-                }
-            }
-            "coinbase" => {
-                let currency = normalize_fiat_currency(
-                    target
-                        .currency
-                        .as_deref()
-                        .context("coinbase payout target missing currency")?,
-                )?;
-                let amount_cents = mu_to_usd_cents_ceil(released_mu)?;
-                let rounding_mu = amount_cents
-                    .checked_mul(10_000)
-                    .and_then(|mu| mu.checked_sub(released_mu))
-                    .context("Coinbase rounding overflow")?;
-                let metadata = PayoutMetadata {
-                    mayhem_fiat_currency: Some(currency.clone()),
-                    ..metadata
-                };
-                ProviderPayout {
-                    provider: earning.provider.clone(),
-                    method: "coinbase".to_string(),
-                    target: target.addr.clone(),
-                    mu: released_mu,
-                    tnk_e18: None,
-                    msb_transfer: None,
-                    stripe_transfer: None,
-                    coinbase_transfer: Some(CoinbaseTransfer {
-                        source: CoinbaseTransferSource {
-                            account_id: rail_options.coinbase_source_account.clone(),
-                            asset: rail_options.coinbase_asset.clone(),
-                        },
-                        target: coinbase_target_payload(
-                            &target.addr,
-                            &rail_options.coinbase_asset,
-                            &rail_options.coinbase_network,
-                        ),
-                        amount: usd_cents_to_amount(amount_cents),
-                        asset: rail_options.coinbase_asset.clone(),
-                        rounding_mu,
-                        execute: true,
-                        metadata,
-                        network_pays_fee: true,
-                    }),
-                    confirm_command: payout_confirm_command(PayoutConfirmArgs {
-                        kind: None,
-                        rail: "coinbase",
-                        epoch,
-                        who: &earning.provider,
-                        mu: released_mu,
-                        tnk_e18: None,
-                        external_ref: Some(&rail_options.coinbase_transfer_id),
                         msb_tx_hash: None,
                         fiat_currency: Some(&currency),
                         fiat_amount_minor: Some(amount_cents),
@@ -717,35 +626,6 @@ fn normalize_fiat_currency(value: &str) -> Result<String> {
     }
 }
 
-fn usd_cents_to_amount(cents: u64) -> String {
-    format!("{}.{:02}", cents / 100, cents % 100)
-}
-
-fn coinbase_target_payload(target: &str, asset: &str, network: &str) -> Value {
-    if target.starts_with("paymentMethod_") {
-        json!({
-            "paymentMethodId": target,
-            "asset": asset,
-        })
-    } else if target.starts_with("account_") {
-        json!({
-            "accountId": target,
-            "asset": asset,
-        })
-    } else if target.contains('@') {
-        json!({
-            "email": target,
-            "asset": asset,
-        })
-    } else {
-        json!({
-            "address": target,
-            "network": network,
-            "asset": asset,
-        })
-    }
-}
-
 struct PayoutConfirmArgs<'a> {
     kind: Option<&'a str>,
     rail: &'a str,
@@ -820,10 +700,6 @@ mod tests {
         RailOptions {
             msb_tx_hash: DEFAULT_MSB_TX_PLACEHOLDER.to_string(),
             stripe_transfer_id: "tr_test_pending".to_string(),
-            coinbase_transfer_id: "transfer_test_pending".to_string(),
-            coinbase_source_account: "account_test_source".to_string(),
-            coinbase_asset: "usd".to_string(),
-            coinbase_network: "base".to_string(),
         }
     }
 
@@ -941,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn payout_plan_includes_stripe_and_coinbase_provider_intents() {
+    fn payout_plan_includes_stripe_and_skips_retired_coinbase_targets() {
         let mut stripe_provider =
             provider_with_method("provider-stripe", "acct_provider", "stripe");
         stripe_provider
@@ -972,34 +848,12 @@ mod tests {
             &rail_options(),
         )
         .unwrap();
-        assert_eq!(plan.provider_payouts.len(), 2);
-        assert_eq!(plan.totals.provider_mu, 3_400_000);
-        assert_eq!(plan.totals.transfer_count, 2);
-
-        let coinbase = plan
-            .provider_payouts
-            .iter()
-            .find(|payout| payout.method == "coinbase")
-            .expect("coinbase payout");
-        assert_eq!(coinbase.mu, 1_700_000);
-        assert_eq!(coinbase.confirm_command["rail"], "coinbase");
-        assert_eq!(
-            coinbase.confirm_command["external_ref"],
-            "transfer_test_pending"
-        );
-        assert_eq!(coinbase.confirm_command["fiat_currency"], "usd");
-        assert_eq!(coinbase.confirm_command["fiat_amount_minor"], 170);
-        let coinbase_transfer = coinbase
-            .coinbase_transfer
-            .as_ref()
-            .expect("coinbase transfer");
-        assert_eq!(coinbase_transfer.amount, "1.70");
-        assert_eq!(coinbase_transfer.source.account_id, "account_test_source");
-        assert_eq!(
-            coinbase_transfer.target["paymentMethodId"],
-            "paymentMethod_provider"
-        );
-        assert_eq!(coinbase_transfer.metadata.mayhem_denom, "mu_usd");
+        assert_eq!(plan.provider_payouts.len(), 1);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].who, "provider-coinbase");
+        assert_eq!(plan.skipped[0].reason, "payout_method_retired");
+        assert_eq!(plan.totals.provider_mu, 1_700_000);
+        assert_eq!(plan.totals.transfer_count, 1);
 
         let stripe = plan
             .provider_payouts

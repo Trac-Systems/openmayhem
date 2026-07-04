@@ -25,7 +25,7 @@ Accepted evidence shapes are intentionally plain:
 - launch-manifest: a strict P8.4 beta launch manifest accepted by scripts/beta-launch.mjs
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
-- payment-rails: paygate/rail report proving TNK and Stripe credit mu_usd; Coinbase is accepted as paused when coinbase_enabled:false
+- payment-rails: paygate/rail report proving TNK and Stripe credit mu_usd; Coinbase is retired and must remain coinbase_enabled:false
 - guardian: small summary JSON; the source file hash is recorded as evidence
 - canary: small summary JSON; the source file hash is recorded as evidence
 - browser: small summary JSON; browser handoffs may also be a text log`);
@@ -164,7 +164,7 @@ function checkoutUrlFromPayReport(value) {
 
 function normalizeRail(value) {
   const normalized = typeof value === 'string' ? value.toLowerCase() : value;
-  return normalized === 'stripe' || normalized === 'coinbase' ? normalized : null;
+  return normalized === 'stripe' ? normalized : null;
 }
 
 function railFromUrl(url) {
@@ -176,7 +176,6 @@ function railFromUrl(url) {
   }
   const hostname = parsed.hostname.toLowerCase();
   if (hostname === 'checkout.stripe.com') return 'stripe';
-  if (hostname === 'commerce.coinbase.com') return 'coinbase';
   return null;
 }
 
@@ -186,7 +185,7 @@ function checkoutRecordsFromText(text) {
   let match = pattern.exec(text);
   while (match) {
     const prefix = text.slice(Math.max(0, match.index - 160), match.index);
-    const railMatches = Array.from(prefix.matchAll(/Mayhem\s+(stripe|coinbase)\s+checkout/gi));
+    const railMatches = Array.from(prefix.matchAll(/Mayhem\s+(stripe)\s+checkout/gi));
     const railMatch = railMatches.at(-1);
     const url = match[1].replace(/[),.;]+$/g, '');
     records.push({ url, rail: normalizeRail(railMatch?.[1]) ?? railFromUrl(url) });
@@ -539,9 +538,7 @@ function collectPaymentRails(args) {
     stripe_enabled:
       firstDefined(record, ['stripe_enabled', 'stripe.enabled', 'paygate.stripe_enabled', 'rails.stripe.enabled']) === true
       || firstDefined(value, ['paygate.stripe_enabled', 'rails.stripe.enabled']) === true,
-    coinbase_enabled:
-      firstDefined(record, ['coinbase_enabled', 'coinbase.enabled', 'paygate.coinbase_enabled', 'rails.coinbase.enabled']) === true
-      || firstDefined(value, ['paygate.coinbase_enabled', 'rails.coinbase.enabled']) === true,
+    coinbase_enabled: false,
     rails_credit_mu_usd: firstDefined(record, ['rails_credit_mu_usd', 'credit_mu_usd', 'credits_mu_usd']) === true,
     paygate_admin_controls_verified:
       firstDefined(record, ['paygate_admin_controls_verified', 'admin_economy_controls_verified']) === true
