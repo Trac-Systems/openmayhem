@@ -234,6 +234,8 @@ enum CatalogCommands {
     CalibrateCanary(CatalogCalibrateCanaryArgs),
     /// Verify calibration report files cover the catalog canary matrix.
     CanaryEvidence(CatalogCanaryEvidenceArgs),
+    /// Apply bound calibration report fingerprints into a catalog draft.
+    ApplyCanaryReports(CatalogApplyCanaryReportsArgs),
     /// Audit per-backend canary fingerprint coverage for launch artifacts.
     CanaryMatrix(CatalogCanaryMatrixArgs),
 }
@@ -1082,6 +1084,33 @@ struct CatalogCanaryEvidenceArgs {
     include_dev: bool,
 
     /// Print a machine-readable evidence coverage report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogApplyCanaryReportsArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Calibration report JSON produced by `mayhem catalog calibrate-canary`.
+    #[arg(long = "report", value_name = "PATH", required = true)]
+    reports: Vec<PathBuf>,
+
+    /// Write the updated catalog draft to this path. Refuses to overwrite input catalog.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable apply report.
     #[arg(long)]
     json: bool,
 }
@@ -2031,6 +2060,7 @@ async fn main() -> Result<()> {
             CatalogCommands::Verify(args) => catalog_verify(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
+            CatalogCommands::ApplyCanaryReports(args) => catalog_apply_canary_reports(args),
             CatalogCommands::CanaryMatrix(args) => catalog_canary_matrix(args),
         },
         Commands::Provider { command } => match *command {
@@ -2696,6 +2726,7 @@ fn catalog_canary_evidence(args: CatalogCanaryEvidenceArgs) -> Result<()> {
         canaries_dir,
         !args.include_dev,
         &report_paths,
+        CatalogCanaryReportMode::VerifyMatchesCatalog,
     );
 
     if args.json {
@@ -2743,12 +2774,106 @@ fn catalog_canary_evidence(args: CatalogCanaryEvidenceArgs) -> Result<()> {
     Ok(())
 }
 
+fn catalog_apply_canary_reports(args: CatalogApplyCanaryReportsArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+    let output = absolutize(args.output.clone())?;
+    if output == catalog_path {
+        bail!(
+            "refusing to overwrite {}; pass a separate --output path for the unsigned catalog draft",
+            catalog_path.display()
+        );
+    }
+    let report_paths = args
+        .reports
+        .iter()
+        .map(|path| absolutize(path.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut catalog_value = read_json_file(&catalog_path)?;
+    let catalog_doc: catalog::CatalogDocument = serde_json::from_value(catalog_value.clone())
+        .with_context(|| {
+            format!(
+                "parsing catalog {} before applying canary reports",
+                catalog_path.display()
+            )
+        })?;
+    let mut report = catalog_canary_evidence_report(
+        &catalog_doc,
+        catalog_path,
+        canaries_dir,
+        !args.include_dev,
+        &report_paths,
+        CatalogCanaryReportMode::ApplyToCatalog,
+    );
+
+    if report.ok {
+        let applied = apply_canary_report_fingerprints(&mut catalog_value, &report)?;
+        report.applied_count = Some(applied);
+        write_json_file(&output, &catalog_value)?;
+        report.output_path = Some(output.clone());
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Canary calibration catalog apply.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Output: {}", output.display());
+        println!(
+            "Coverage: {} models, {} artifacts, {} reports, applied={}, ok={}",
+            report.model_count,
+            report.artifact_count,
+            report.report_count,
+            report.applied_count.unwrap_or(0),
+            report.ok
+        );
+        for entry in &report.entries {
+            let status = if entry.ok { "ok" } else { "error" };
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id, entry.artifact, entry.engine, entry.canary_set, status
+            );
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+        for error in &report.errors {
+            println!("Global error: {error}");
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "canary calibration catalog apply has {} error(s); no output was written",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogCanaryReportMode {
+    VerifyMatchesCatalog,
+    ApplyToCatalog,
+}
+
 fn catalog_canary_evidence_report(
     catalog_doc: &catalog::CatalogDocument,
     catalog_path: PathBuf,
     canaries_dir: PathBuf,
     launch_only: bool,
     report_paths: &[PathBuf],
+    mode: CatalogCanaryReportMode,
 ) -> CatalogCanaryEvidenceReport {
     let mut entries = Vec::new();
     let mut entry_index = BTreeMap::new();
@@ -2943,14 +3068,16 @@ fn catalog_canary_evidence_report(
                 "report existing_catalog_fingerprint does not match current catalog".to_owned(),
             );
         }
-        if matches_catalog != Some(true) {
+        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog && matches_catalog != Some(true) {
             entry.errors.push(format!(
                 "report fingerprint {} does not match catalog fingerprint {}",
                 calibration.catalog_fingerprint,
                 entry.expected_fingerprint.as_deref().unwrap_or("<missing>")
             ));
         }
-        if calibration.matches_existing_catalog != Some(true) {
+        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
+            && calibration.matches_existing_catalog != Some(true)
+        {
             entry
                 .errors
                 .push("report was not generated as a catalog match".to_owned());
@@ -3005,14 +3132,53 @@ fn catalog_canary_evidence_report(
     CatalogCanaryEvidenceReport {
         catalog_path,
         canaries_dir,
+        output_path: None,
         launch_only,
         model_count,
         artifact_count: entries.len(),
         report_count,
+        applied_count: None,
         ok: errors.is_empty(),
         entries,
         errors,
     }
+}
+
+fn apply_canary_report_fingerprints(
+    catalog_value: &mut Value,
+    report: &CatalogCanaryEvidenceReport,
+) -> Result<usize> {
+    let models = catalog_value
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .context("catalog JSON must contain models array")?;
+    let mut applied = 0usize;
+    for entry in &report.entries {
+        let Some(fingerprint) = &entry.report_fingerprint else {
+            continue;
+        };
+        let model = models
+            .iter_mut()
+            .find(|model| model.get("model_id").and_then(Value::as_str) == Some(&entry.model_id))
+            .with_context(|| format!("model {} disappeared from catalog JSON", entry.model_id))?;
+        let canary = model
+            .get_mut("canary")
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("model {} has no canary object", entry.model_id))?;
+        let fingerprints = canary
+            .entry("fingerprints")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "model {} canary.fingerprints is not an object",
+                    entry.model_id
+                )
+            })?;
+        fingerprints.insert(entry.artifact.clone(), json!(fingerprint));
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 fn catalog_canary_matrix_report(
@@ -4751,10 +4917,12 @@ struct CatalogCanaryMatrixEntry {
 struct CatalogCanaryEvidenceReport {
     catalog_path: PathBuf,
     canaries_dir: PathBuf,
+    output_path: Option<PathBuf>,
     launch_only: bool,
     model_count: usize,
     artifact_count: usize,
     report_count: usize,
+    applied_count: Option<usize>,
     ok: bool,
     entries: Vec<CatalogCanaryEvidenceEntry>,
     errors: Vec<String>,
@@ -14896,6 +15064,7 @@ mod tests {
             canaries_dir,
             true,
             &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
         );
 
         assert!(report.ok, "{:?}", report.errors);
@@ -14921,6 +15090,7 @@ mod tests {
             canaries_dir,
             true,
             &[],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
         );
 
         assert!(!report.ok);
@@ -14950,6 +15120,7 @@ mod tests {
             canaries_dir,
             true,
             &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
         );
 
         assert!(!report.ok);
@@ -14980,6 +15151,7 @@ mod tests {
             canaries_dir,
             true,
             &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
         );
 
         assert!(!report.ok);
@@ -15010,6 +15182,7 @@ mod tests {
             canaries_dir,
             true,
             &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
         );
 
         assert!(!report.ok);
@@ -15053,6 +15226,7 @@ mod tests {
             canaries_dir,
             true,
             &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
         );
 
         assert!(!report.ok);
@@ -15066,6 +15240,54 @@ mod tests {
             error.contains("does not match catalog fingerprint")
                 || error.contains("was not generated as a catalog match")
         }));
+    }
+
+    #[test]
+    fn canary_apply_updates_catalog_fingerprint_from_bound_report() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "00".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("00".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.entries[0].matches_catalog, Some(false));
+
+        let mut catalog_value = json!({
+            "models": [{
+                "model_id": "test/model@4bit",
+                "canary": {
+                    "fingerprints": {
+                        "gguf-q4_k_m": "00".repeat(32)
+                    }
+                }
+            }]
+        });
+        let applied = apply_canary_report_fingerprints(&mut catalog_value, &report).unwrap();
+
+        assert_eq!(applied, 1);
+        assert_eq!(
+            catalog_value["models"][0]["canary"]["fingerprints"]["gguf_q4_k_m"],
+            Value::Null
+        );
+        assert_eq!(
+            catalog_value["models"][0]["canary"]["fingerprints"]["gguf-q4_k_m"],
+            json!("aa".repeat(32))
+        );
     }
 
     #[test]
