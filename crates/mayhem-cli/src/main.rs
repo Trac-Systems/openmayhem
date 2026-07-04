@@ -232,6 +232,8 @@ enum CatalogCommands {
     Verify(CatalogVerifyArgs),
     /// Compute launch catalog metadata for a local admin artifact without loading model weights.
     ArtifactMetadata(CatalogArtifactMetadataArgs),
+    /// Apply bound artifact metadata reports into a catalog draft.
+    ApplyArtifactMetadata(CatalogApplyArtifactMetadataArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
     CalibrateCanary(CatalogCalibrateCanaryArgs),
     /// Verify calibration report files cover the catalog canary matrix.
@@ -994,6 +996,29 @@ struct CatalogArtifactMetadataArgs {
     chunk_size: usize,
 
     /// Print a machine-readable metadata report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogApplyArtifactMetadataArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Artifact metadata JSON produced by `mayhem catalog artifact-metadata --json`.
+    #[arg(long = "report", value_name = "PATH", required = true)]
+    reports: Vec<PathBuf>,
+
+    /// Write the updated catalog draft to this path. Refuses to overwrite input catalog.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable apply report.
     #[arg(long)]
     json: bool,
 }
@@ -2161,6 +2186,7 @@ async fn main() -> Result<()> {
         Commands::Catalog { command } => match command {
             CatalogCommands::Verify(args) => catalog_verify(args),
             CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
+            CatalogCommands::ApplyArtifactMetadata(args) => catalog_apply_artifact_metadata(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
             CatalogCommands::ApplyCanaryReports(args) => catalog_apply_canary_reports(args),
@@ -2614,7 +2640,7 @@ fn catalog_artifact_metadata(args: CatalogArtifactMetadataArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CatalogArtifactMetadataReport {
     ok: bool,
     artifact_path: PathBuf,
@@ -2625,7 +2651,7 @@ struct CatalogArtifactMetadataReport {
     catalog_binding: Option<CatalogArtifactMetadataBinding>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CatalogArtifactMetadataPatch {
     artifact_root_kind: String,
     artifact_root: String,
@@ -2633,7 +2659,7 @@ struct CatalogArtifactMetadataPatch {
     weights_bytes: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CatalogArtifactMetadataBinding {
     catalog_path: PathBuf,
     model_id: String,
@@ -2752,6 +2778,349 @@ fn catalog_artifact_metadata_binding(
         matches_current_weights_bytes,
         update_needed,
     })
+}
+
+fn catalog_apply_artifact_metadata(args: CatalogApplyArtifactMetadataArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let output = absolutize(args.output.clone())?;
+    if output == catalog_path {
+        bail!(
+            "refusing to overwrite {}; pass a separate --output path for the unsigned catalog draft",
+            catalog_path.display()
+        );
+    }
+    let report_paths = args
+        .reports
+        .iter()
+        .map(|path| absolutize(path.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut catalog_value = read_json_file(&catalog_path)?;
+    let catalog_doc: catalog::CatalogDocument = serde_json::from_value(catalog_value.clone())
+        .with_context(|| {
+            format!(
+                "parsing catalog {} before applying artifact metadata",
+                catalog_path.display()
+            )
+        })?;
+    let mut report = catalog_artifact_metadata_apply_report(
+        &catalog_doc,
+        catalog_path,
+        !args.include_dev,
+        &report_paths,
+    );
+
+    if report.ok {
+        let applied = apply_artifact_metadata_reports(&mut catalog_value, &report)?;
+        report.applied_count = Some(applied);
+        report.output_path = Some(output.clone());
+        write_json_file(&output, &catalog_value)?;
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Catalog artifact metadata apply.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Output: {}", output.display());
+        println!(
+            "Scope: {}",
+            if report.launch_only {
+                "launch models"
+            } else {
+                "launch + dev models"
+            }
+        );
+        println!(
+            "Reports: {}, applied={}, ok={}",
+            report.report_count,
+            report.applied_count.unwrap_or(0),
+            report.ok
+        );
+        for entry in &report.entries {
+            let status = if entry.ok { "ok" } else { "error" };
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id, entry.artifact, entry.engine, entry.source_repo, status
+            );
+            println!("  report: {}", entry.report_path.display());
+            println!("  artifact_root={}", entry.artifact_root);
+            println!("  source_sha256={}", entry.source_sha256);
+            println!("  weights_bytes={}", entry.weights_bytes);
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+        for error in &report.errors {
+            println!("Global error: {error}");
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "catalog artifact metadata apply has {} error(s); no output was written",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogArtifactMetadataApplyReport {
+    ok: bool,
+    catalog_path: PathBuf,
+    output_path: Option<PathBuf>,
+    launch_only: bool,
+    report_count: usize,
+    applied_count: Option<usize>,
+    entries: Vec<CatalogArtifactMetadataApplyEntry>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogArtifactMetadataApplyEntry {
+    report_path: PathBuf,
+    model_id: String,
+    tier: String,
+    artifact: String,
+    engine: String,
+    source_kind: String,
+    source_repo: String,
+    source_revision: String,
+    source_path: String,
+    artifact_root_kind: String,
+    artifact_root: String,
+    source_sha256: String,
+    weights_bytes: u64,
+    update_needed: bool,
+    ok: bool,
+    errors: Vec<String>,
+}
+
+fn catalog_artifact_metadata_apply_report(
+    catalog_doc: &catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    launch_only: bool,
+    report_paths: &[PathBuf],
+) -> CatalogArtifactMetadataApplyReport {
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for path in report_paths {
+        let mut entry_errors = Vec::new();
+        let metadata = match read_json_file(path).and_then(|value| {
+            serde_json::from_value::<CatalogArtifactMetadataReport>(value)
+                .with_context(|| format!("parsing artifact metadata report {}", path.display()))
+        }) {
+            Ok(report) => report,
+            Err(err) => {
+                errors.push(format!("{}: {err}", path.display()));
+                continue;
+            }
+        };
+
+        if !metadata.ok {
+            entry_errors.push("artifact metadata report ok=false".to_owned());
+        }
+        if metadata.catalog_patch.artifact_root_kind != "blake3_merkle_v1" {
+            entry_errors.push(format!(
+                "report artifact_root_kind must be blake3_merkle_v1, got {}",
+                metadata.catalog_patch.artifact_root_kind
+            ));
+        }
+        if !is_hex_len(&metadata.catalog_patch.artifact_root, 64) {
+            entry_errors.push("report artifact_root must be 32-byte hex".to_owned());
+        }
+        if !is_hex_len(&metadata.catalog_patch.source_sha256, 64) {
+            entry_errors.push("report source_sha256 must be 32-byte hex".to_owned());
+        }
+        if metadata.catalog_patch.weights_bytes == 0 || metadata.total_bytes == 0 {
+            entry_errors.push("report weights_bytes/total_bytes must be positive".to_owned());
+        }
+        if metadata.catalog_patch.weights_bytes != metadata.total_bytes {
+            entry_errors.push(format!(
+                "report patch weights_bytes {} does not match total_bytes {}",
+                metadata.catalog_patch.weights_bytes, metadata.total_bytes
+            ));
+        }
+        if metadata.chunk_size == 0 || metadata.chunk_count == 0 {
+            entry_errors.push("report chunk_size/chunk_count must be positive".to_owned());
+        }
+
+        let Some(binding) = metadata.catalog_binding.as_ref() else {
+            errors.push(format!(
+                "{}: artifact metadata report is not catalog-bound; rerun artifact-metadata with --model and --artifact",
+                path.display()
+            ));
+            continue;
+        };
+        let key = (binding.model_id.clone(), binding.artifact.clone());
+        if !seen.insert(key.clone()) {
+            entry_errors.push(format!(
+                "duplicate artifact metadata report for {} / {}",
+                binding.model_id, binding.artifact
+            ));
+        }
+
+        let Some(model) = catalog_doc
+            .models
+            .iter()
+            .find(|model| model.model_id == binding.model_id)
+        else {
+            errors.push(format!(
+                "{}: model {} is not present in current catalog",
+                path.display(),
+                binding.model_id
+            ));
+            continue;
+        };
+        if launch_only && model.tier != "launch" {
+            entry_errors.push(format!(
+                "model {} tier {} is outside launch-only scope",
+                model.model_id, model.tier
+            ));
+        }
+        let Some(artifact) = model.artifacts.get(&binding.artifact) else {
+            errors.push(format!(
+                "{}: artifact {} is not present for model {} in current catalog",
+                path.display(),
+                binding.artifact,
+                model.model_id
+            ));
+            continue;
+        };
+
+        if binding.engine != artifact.engine {
+            entry_errors.push(format!(
+                "report engine {} does not match current catalog engine {}",
+                binding.engine, artifact.engine
+            ));
+        }
+        if binding.source_kind != artifact.source.kind
+            || binding.source_repo != artifact.source.repo
+            || binding.source_revision != artifact.source.revision
+            || binding.source_path != artifact.path
+        {
+            entry_errors.push(
+                "report source tuple does not match current catalog artifact source".to_owned(),
+            );
+        }
+        if binding.current_artifact_root_kind != artifact.artifact_root_kind
+            || binding.current_artifact_root != artifact.artifact_root
+            || binding.current_source_sha256 != artifact.source_sha256
+            || binding.current_weights_bytes != artifact.weights_bytes
+        {
+            entry_errors.push(
+                "report current catalog fields are stale for this artifact; rerun artifact-metadata"
+                    .to_owned(),
+            );
+        }
+
+        let current_matches_patch = artifact.artifact_root_kind
+            == metadata.catalog_patch.artifact_root_kind
+            && artifact.artifact_root == metadata.catalog_patch.artifact_root
+            && artifact.source_sha256.as_ref().is_some_and(|value| {
+                value.eq_ignore_ascii_case(&metadata.catalog_patch.source_sha256)
+            })
+            && artifact.weights_bytes == metadata.catalog_patch.weights_bytes;
+        let update_needed = !current_matches_patch;
+        let ok = entry_errors.is_empty();
+        if !ok {
+            errors.extend(
+                entry_errors
+                    .iter()
+                    .map(|error| format!("{} {}: {error}", binding.model_id, binding.artifact)),
+            );
+        }
+        entries.push(CatalogArtifactMetadataApplyEntry {
+            report_path: path.clone(),
+            model_id: binding.model_id.clone(),
+            tier: model.tier.clone(),
+            artifact: binding.artifact.clone(),
+            engine: artifact.engine.clone(),
+            source_kind: artifact.source.kind.clone(),
+            source_repo: artifact.source.repo.clone(),
+            source_revision: artifact.source.revision.clone(),
+            source_path: artifact.path.clone(),
+            artifact_root_kind: metadata.catalog_patch.artifact_root_kind.clone(),
+            artifact_root: metadata.catalog_patch.artifact_root.clone(),
+            source_sha256: metadata.catalog_patch.source_sha256.to_ascii_lowercase(),
+            weights_bytes: metadata.catalog_patch.weights_bytes,
+            update_needed,
+            ok,
+            errors: entry_errors,
+        });
+    }
+
+    if entries.is_empty() {
+        errors.push("no artifact metadata reports were accepted".to_owned());
+    }
+    CatalogArtifactMetadataApplyReport {
+        ok: errors.is_empty(),
+        catalog_path,
+        output_path: None,
+        launch_only,
+        report_count: entries.len(),
+        applied_count: None,
+        entries,
+        errors,
+    }
+}
+
+fn apply_artifact_metadata_reports(
+    catalog_value: &mut Value,
+    report: &CatalogArtifactMetadataApplyReport,
+) -> Result<usize> {
+    let models = catalog_value
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .context("catalog JSON must contain models array")?;
+    let mut applied = 0usize;
+    for entry in &report.entries {
+        if !entry.ok || !entry.update_needed {
+            continue;
+        }
+        let model = models
+            .iter_mut()
+            .find(|model| model.get("model_id").and_then(Value::as_str) == Some(&entry.model_id))
+            .with_context(|| format!("model {} disappeared from catalog JSON", entry.model_id))?;
+        let artifacts = model
+            .get_mut("artifacts")
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("model {} has no artifacts object", entry.model_id))?;
+        let artifact = artifacts
+            .get_mut(&entry.artifact)
+            .and_then(Value::as_object_mut)
+            .with_context(|| {
+                format!(
+                    "artifact {} disappeared from catalog JSON for model {}",
+                    entry.artifact, entry.model_id
+                )
+            })?;
+        artifact.insert(
+            "artifact_root_kind".to_owned(),
+            json!(entry.artifact_root_kind),
+        );
+        artifact.insert("artifact_root".to_owned(), json!(entry.artifact_root));
+        artifact.insert("source_sha256".to_owned(), json!(entry.source_sha256));
+        artifact.insert("weights_bytes".to_owned(), json!(entry.weights_bytes));
+        if artifact
+            .get("notes")
+            .and_then(Value::as_str)
+            .is_some_and(|notes| {
+                notes.contains("planned launch artifact") || notes.contains("until_p2_4")
+            })
+        {
+            artifact.remove("notes");
+        }
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
@@ -16267,6 +16636,122 @@ mod tests {
     }
 
     #[test]
+    fn artifact_metadata_apply_updates_catalog_draft() {
+        let path = env::temp_dir().join(format!(
+            "mayhem-artifact-metadata-apply-{}-{}.bin",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        fs::write(&path, b"mayhem artifact metadata apply").unwrap();
+        let mut catalog = test_catalog(&"00".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .artifact_root_kind = "blake3_descriptor_until_p2_4".to_owned();
+        let metadata = catalog_artifact_metadata_report(
+            Some((
+                &catalog,
+                PathBuf::from("catalog.json"),
+                "test/model@4bit",
+                "gguf-q4_k_m",
+            )),
+            path.clone(),
+            7,
+        )
+        .unwrap();
+        let report_path = write_temp_artifact_metadata_report(&metadata);
+
+        let report = catalog_artifact_metadata_apply_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            true,
+            &[report_path],
+        );
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.report_count, 1);
+        assert!(report.entries[0].update_needed);
+
+        let mut catalog_value = json!({
+            "models": [{
+                "model_id": "test/model@4bit",
+                "artifacts": {
+                    "gguf-q4_k_m": {
+                        "artifact_root_kind": "blake3_descriptor_until_p2_4",
+                        "artifact_root": "00".repeat(32),
+                        "weights_bytes": 42,
+                        "notes": "planned launch artifact; full BLAKE3 chunk Merkle root is produced during P2.4 sealing"
+                    }
+                }
+            }]
+        });
+        let applied = apply_artifact_metadata_reports(&mut catalog_value, &report).unwrap();
+        assert_eq!(applied, 1);
+        let artifact = &catalog_value["models"][0]["artifacts"]["gguf-q4_k_m"];
+        assert_eq!(
+            artifact["artifact_root_kind"],
+            json!(metadata.catalog_patch.artifact_root_kind)
+        );
+        assert_eq!(
+            artifact["artifact_root"],
+            json!(metadata.catalog_patch.artifact_root)
+        );
+        assert_eq!(
+            artifact["source_sha256"],
+            json!(metadata.catalog_patch.source_sha256)
+        );
+        assert_eq!(
+            artifact["weights_bytes"],
+            json!(metadata.catalog_patch.weights_bytes)
+        );
+        assert_eq!(artifact["notes"], Value::Null);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn artifact_metadata_apply_rejects_stale_current_binding() {
+        let path = env::temp_dir().join(format!(
+            "mayhem-artifact-metadata-stale-{}-{}.bin",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        fs::write(&path, b"mayhem stale artifact metadata").unwrap();
+        let mut old_catalog = test_catalog(&"00".repeat(32));
+        old_catalog.models[0].tier = "launch".to_owned();
+        let metadata = catalog_artifact_metadata_report(
+            Some((
+                &old_catalog,
+                PathBuf::from("catalog.json"),
+                "test/model@4bit",
+                "gguf-q4_k_m",
+            )),
+            path.clone(),
+            7,
+        )
+        .unwrap();
+        let report_path = write_temp_artifact_metadata_report(&metadata);
+        let mut current_catalog = test_catalog(&"11".repeat(32));
+        current_catalog.models[0].tier = "launch".to_owned();
+
+        let report = catalog_artifact_metadata_apply_report(
+            &current_catalog,
+            PathBuf::from("catalog.json"),
+            true,
+            &[report_path],
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("current catalog fields are stale")));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn stable_value_hash_is_object_key_order_independent() {
         let a = json!({ "b": 2, "a": { "d": 4, "c": 3 } });
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
@@ -16733,6 +17218,20 @@ mod tests {
         let seq = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "mayhem-canary-calibration-report-{}-{nanos}-{seq}.json",
+            std::process::id()
+        ));
+        write_json_file(&path, report).unwrap();
+        path
+    }
+
+    fn write_temp_artifact_metadata_report(report: &CatalogArtifactMetadataReport) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mayhem-artifact-metadata-report-{}-{nanos}-{seq}.json",
             std::process::id()
         ));
         write_json_file(&path, report).unwrap();
