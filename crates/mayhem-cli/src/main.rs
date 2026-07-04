@@ -3403,7 +3403,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                     artifact.path
                 ));
             }
-            let artifact_path = artifact_base.join(&artifact.path);
+            let artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
             let report_path = report_dir
                 .join(safe_path_component(&model.model_id))
                 .join(format!(
@@ -3575,6 +3575,17 @@ fn catalog_canary_calibration_plan_command(
     push_plan_path_arg(&mut argv, "--report-output", report_path);
     argv.push("--json".to_owned());
     catalog_canary_plan_command(argv)
+}
+
+fn catalog_canary_plan_artifact_path(
+    artifact_base: &Path,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    artifact_base
+        .join(safe_path_component(&artifact.source.kind))
+        .join(safe_path_component(&artifact.source.repo))
+        .join(safe_path_component(&artifact.source.revision))
+        .join(&artifact.path)
 }
 
 fn catalog_canary_plan_apply_command(
@@ -15592,6 +15603,13 @@ mod tests {
             .iter()
             .find(|entry| entry.artifact == "gguf-q4_k_m")
             .unwrap();
+        assert_eq!(
+            gguf.artifact_path,
+            PathBuf::from(format!(
+                "/tmp/artifacts/huggingface/test_model/{}/model.gguf",
+                "1".repeat(40)
+            ))
+        );
         assert!(gguf.command.shell.contains("'calibrate-canary'"));
         assert!(!gguf
             .command
