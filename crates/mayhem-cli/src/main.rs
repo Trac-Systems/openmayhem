@@ -1004,9 +1004,37 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long)]
     include_output: bool,
 
+    /// Write the calibration report JSON to this path.
+    #[arg(long, value_name = "PATH")]
+    report_output: Option<PathBuf>,
+
     /// Exit nonzero when the calibrated fingerprint is absent or differs from the catalog.
     #[arg(long)]
     require_match: bool,
+
+    /// TensorRT-LLM prebuilt engine directory to calibrate against.
+    #[arg(long, value_name = "PATH")]
+    trt_engine_dir: Option<PathBuf>,
+
+    /// Require the TensorRT-LLM prebuilt engine directory to contain .engine/.plan payloads.
+    #[arg(long)]
+    trt_require_engine_dir: bool,
+
+    /// TensorRT-LLM tensor-parallel degree for calibration.
+    #[arg(long)]
+    trt_tensor_parallel: Option<u32>,
+
+    /// TensorRT-LLM KV cache dtype override for calibration.
+    #[arg(long)]
+    trt_kv_cache_dtype: Option<String>,
+
+    /// TensorRT-LLM runtime max batch size for calibration.
+    #[arg(long)]
+    trt_max_batch_size: Option<u32>,
+
+    /// TensorRT-LLM runtime max token capacity for calibration.
+    #[arg(long)]
+    trt_max_num_tokens: Option<u32>,
 
     /// Print a machine-readable calibration report.
     #[arg(long)]
@@ -2344,6 +2372,11 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .unwrap_or_else(|| repo_path("catalog/canaries"))?;
     let canaries_dir = absolutize(canaries_dir)?;
     let artifact_path = absolutize(args.artifact_path.clone())?;
+    let report_output = args
+        .report_output
+        .as_ref()
+        .map(|path| absolutize(path.clone()))
+        .transpose()?;
     let catalog_doc = catalog::load_document(&catalog_path)?;
     let model = catalog_doc
         .models
@@ -2369,6 +2402,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
                 .join(", ")
         )
     })?;
+    validate_calibration_args_for_artifact(artifact, &args)?;
     let prompts = load_canary_prompts(
         Some(&canaries_dir),
         &model.canary.set_id,
@@ -2392,7 +2426,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .map(|existing| existing == &catalog_fingerprint);
     let report = CatalogCanaryCalibrationReport {
         model_id: model.model_id.clone(),
-        artifact: args.artifact,
+        artifact: args.artifact.clone(),
         engine: artifact.engine.clone(),
         artifact_path,
         canary_set: model.canary.set_id.clone(),
@@ -2427,8 +2461,36 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             );
         }
     }
+    if let Some(path) = &report_output {
+        write_json_file(path, &report)?;
+        if !args.json {
+            println!("Report: {}", path.display());
+        }
+    }
     if args.require_match {
         ensure_calibration_matches_catalog(&report)?;
+    }
+    Ok(())
+}
+
+fn validate_calibration_args_for_artifact(
+    artifact: &catalog::CatalogArtifact,
+    args: &CatalogCalibrateCanaryArgs,
+) -> Result<()> {
+    if artifact.engine == "trt-llm" {
+        return Ok(());
+    }
+    if args.trt_engine_dir.is_some()
+        || args.trt_require_engine_dir
+        || args.trt_tensor_parallel.is_some()
+        || args.trt_kv_cache_dtype.is_some()
+        || args.trt_max_batch_size.is_some()
+        || args.trt_max_num_tokens.is_some()
+    {
+        bail!(
+            "TensorRT calibration options require a trt-llm artifact, got {}",
+            artifact.engine
+        );
     }
     Ok(())
 }
@@ -2631,6 +2693,12 @@ fn catalog_calibration_backend(
     config.ctx_size = args.ctx_size.max(1);
     config.threads = args.threads;
     config.gpu_layers = args.gpu_layers;
+    if let Some(max_batch_size) = args.trt_max_batch_size {
+        config.batch_size = max_batch_size.max(1);
+    }
+    if let Some(max_num_tokens) = args.trt_max_num_tokens {
+        config.ubatch_size = max_num_tokens.max(config.ctx_size).max(1);
+    }
     if let Some(sha256) = &artifact.source_sha256 {
         config.artifact = config.artifact.with_sha256(sha256.clone());
     }
@@ -2653,8 +2721,20 @@ fn catalog_calibration_backend(
             Ok(Box::new(backend))
         }
         "trt-llm" => {
-            config.trt_engine_dir = Some(trt_engine_cache_dir(artifact_path, "calibration"));
-            config.trt_kv_cache_dtype = trt_kv_cache_dtype_for_artifact("calibration", artifact);
+            config.trt_engine_dir = Some(
+                args.trt_engine_dir
+                    .as_ref()
+                    .map(|path| absolutize(path.clone()))
+                    .transpose()?
+                    .unwrap_or_else(|| trt_engine_cache_dir(artifact_path, "calibration")),
+            );
+            config.trt_tensor_parallel = Some(args.trt_tensor_parallel.unwrap_or(1));
+            config.trt_kv_cache_dtype = args
+                .trt_kv_cache_dtype
+                .clone()
+                .or_else(|| trt_kv_cache_dtype_for_artifact("calibration", artifact));
+            config.trt_require_engine_dir =
+                args.trt_require_engine_dir || args.trt_engine_dir.is_some();
             let mut backend =
                 mayhem_engine::TrtLlmBackend::new().context("initializing TensorRT-LLM backend")?;
             backend
@@ -14042,6 +14122,25 @@ mod tests {
     }
 
     #[test]
+    fn calibration_args_restrict_trt_knobs_to_trt_artifacts() {
+        let catalog = test_catalog(&"aa".repeat(32));
+        let artifact = &catalog.models[0].artifacts["gguf-q4_k_m"];
+        let mut args = test_calibrate_canary_args();
+        args.trt_engine_dir = Some(PathBuf::from("/tmp/engine"));
+
+        let err = validate_calibration_args_for_artifact(artifact, &args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TensorRT calibration options require a trt-llm artifact"),
+            "{err}"
+        );
+
+        let mut trt_artifact = artifact.clone();
+        trt_artifact.engine = "trt-llm".to_owned();
+        validate_calibration_args_for_artifact(&trt_artifact, &args).unwrap();
+    }
+
+    #[test]
     fn canary_matrix_covers_launch_artifacts_and_marks_hardware_gated_backends() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -14459,6 +14558,31 @@ mod tests {
             existing_catalog_fingerprint: existing,
             catalog_fingerprint: fingerprint,
             prompts: vec![test_calibration_prompt("p1", "aa".repeat(32))],
+        }
+    }
+
+    fn test_calibrate_canary_args() -> CatalogCalibrateCanaryArgs {
+        CatalogCalibrateCanaryArgs {
+            catalog_path: None,
+            canaries_dir: None,
+            model: "test/model".to_owned(),
+            artifact: "gguf-q4_k_m".to_owned(),
+            artifact_path: PathBuf::from("/tmp/model.gguf"),
+            prompt_id: None,
+            ctx_size: 1024,
+            threads: None,
+            gpu_layers: None,
+            seed: 0,
+            include_output: false,
+            report_output: None,
+            require_match: false,
+            trt_engine_dir: None,
+            trt_require_engine_dir: false,
+            trt_tensor_parallel: None,
+            trt_kv_cache_dtype: None,
+            trt_max_batch_size: None,
+            trt_max_num_tokens: None,
+            json: false,
         }
     }
 
