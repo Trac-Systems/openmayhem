@@ -30,6 +30,8 @@ const BENCH_TOKENS_ENV: &str = "MAYHEM_TRTLLM_BENCH_TOKENS";
 #[cfg(feature = "llama-cpp")]
 const BENCH_SAMPLES_ENV: &str = "MAYHEM_TRTLLM_BENCH_SAMPLES";
 #[cfg(feature = "llama-cpp")]
+const BENCH_BATCH_SIZE_ENV: &str = "MAYHEM_TRTLLM_BENCH_BATCH_SIZE";
+#[cfg(feature = "llama-cpp")]
 const LLAMA_THREADS_ENV: &str = "MAYHEM_TRTLLM_LLAMA_THREADS";
 #[cfg(feature = "llama-cpp")]
 const BASELINE_GGUF_ENV: &str = "MAYHEM_TRTLLM_BASELINE_GGUF";
@@ -140,8 +142,16 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
     let ctx_size = trt_ctx_size();
     let trt_engine_dir = engine_dir(&model_path);
     let trt_kv_cache_dtype = kv_cache_dtype(&model_path);
+    let bench_batch_size = env_usize(BENCH_BATCH_SIZE_ENV, 1);
     trt_config.ctx_size = ctx_size;
     apply_trt_capacity(&mut trt_config);
+    if bench_batch_size > trt_config.batch_size as usize {
+        return Err(format!(
+            "{BENCH_BATCH_SIZE_ENV}={bench_batch_size} exceeds {MAX_BATCH_SIZE_ENV}={}; set runtime batch capacity to match the built TensorRT engine",
+            trt_config.batch_size
+        )
+        .into());
+    }
     let trt_max_batch_size = trt_config.batch_size;
     let trt_max_num_tokens = trt_config.ubatch_size;
     trt_config.trt_engine_dir = Some(trt_engine_dir.clone());
@@ -167,10 +177,30 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
     let _ = timed_generate(&mut trt, "Warm up with three short words.", 8, false)?;
     let _ = timed_generate(&mut llama, "Warm up with three short words.", 8, false)?;
 
-    let trt_samples =
-        throughput_samples(&mut trt, prompt, bench_tokens, bench_samples, ignore_eos)?;
-    let llama_samples =
-        throughput_samples(&mut llama, prompt, bench_tokens, bench_samples, ignore_eos)?;
+    let trt_samples = if bench_batch_size == 1 {
+        throughput_samples(&mut trt, prompt, bench_tokens, bench_samples, ignore_eos)?
+    } else {
+        throughput_batch_samples_trt(
+            &mut trt,
+            prompt,
+            bench_tokens,
+            bench_samples,
+            bench_batch_size,
+            ignore_eos,
+        )?
+    };
+    let llama_samples = if bench_batch_size == 1 {
+        throughput_samples(&mut llama, prompt, bench_tokens, bench_samples, ignore_eos)?
+    } else {
+        throughput_batch_samples_sequential(
+            &mut llama,
+            prompt,
+            bench_tokens,
+            bench_samples,
+            bench_batch_size,
+            ignore_eos,
+        )?
+    };
     let trt_rates = sample_rates(&trt_samples);
     let llama_rates = sample_rates(&llama_samples);
     let trt_tps = median(&trt_rates);
@@ -193,6 +223,8 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
             "bench_prompt": prompt,
             "bench_tokens": bench_tokens,
             "bench_samples": bench_samples,
+            "bench_batch_size": bench_batch_size,
+            "benchmark_mode": if bench_batch_size == 1 { "single_request" } else { "aggregate_batch" },
             "ignore_eos": ignore_eos,
             "llama_threads": llama_threads,
             "threshold_ratio": threshold_ratio,
@@ -207,7 +239,7 @@ fn trt_llm_nvfp4_beats_llama_cpp_baseline_by_5x() -> TestResult {
         }),
     )?;
     println!(
-        "TensorRT-LLM tok/s median: {trt_tps:.2} samples={trt_samples:?}; llama.cpp tok/s median: {llama_tps:.2} samples={llama_samples:?}; ignore_eos={ignore_eos}"
+        "TensorRT-LLM tok/s median: {trt_tps:.2} samples={trt_samples:?}; llama.cpp tok/s median: {llama_tps:.2} samples={llama_samples:?}; batch_size={bench_batch_size}; ignore_eos={ignore_eos}"
     );
     assert!(
         pass,
@@ -256,6 +288,7 @@ fn trt_llm_benchmark_requires_llama_cpp_feature() {
 #[derive(Clone, Debug, serde::Serialize)]
 struct BenchmarkSample {
     tok_s: f64,
+    request_count: usize,
     completion_tokens: u32,
     finish_reason: String,
     elapsed_ms: u128,
@@ -291,12 +324,136 @@ fn throughput_samples<B: EngineBackend>(
         let (output, elapsed) = timed_generate(backend, prompt, max_new_tokens, ignore_eos)?;
         results.push(BenchmarkSample {
             tok_s: tokens_per_second(&output, elapsed),
+            request_count: 1,
             completion_tokens: output.usage.completion_tokens,
             finish_reason: output.finish_reason.to_string(),
             elapsed_ms: elapsed.as_millis(),
         });
     }
     Ok(results)
+}
+
+#[cfg(feature = "llama-cpp")]
+fn timed_generate_batch_trt(
+    backend: &mut TrtLlmBackend,
+    prompt: &str,
+    max_new_tokens: u32,
+    batch_size: usize,
+    ignore_eos: bool,
+) -> Result<(Vec<GenerateOutput>, Duration), mayhem_engine::EngineError> {
+    let requests = batch_requests(prompt, max_new_tokens, batch_size, ignore_eos);
+    let start = Instant::now();
+    let outputs = backend.generate_batch(&requests)?;
+    Ok((outputs, start.elapsed()))
+}
+
+#[cfg(feature = "llama-cpp")]
+fn timed_generate_batch_sequential<B: EngineBackend>(
+    backend: &mut B,
+    prompt: &str,
+    max_new_tokens: u32,
+    batch_size: usize,
+    ignore_eos: bool,
+) -> Result<(Vec<GenerateOutput>, Duration), mayhem_engine::EngineError> {
+    let requests = batch_requests(prompt, max_new_tokens, batch_size, ignore_eos);
+    let start = Instant::now();
+    let mut outputs = Vec::with_capacity(requests.len());
+    for request in requests {
+        outputs.push(backend.generate(request, &mut |_chunk| Ok(()))?);
+    }
+    Ok((outputs, start.elapsed()))
+}
+
+#[cfg(feature = "llama-cpp")]
+fn throughput_batch_samples_trt(
+    backend: &mut TrtLlmBackend,
+    prompt: &str,
+    max_new_tokens: u32,
+    samples: usize,
+    batch_size: usize,
+    ignore_eos: bool,
+) -> Result<Vec<BenchmarkSample>, mayhem_engine::EngineError> {
+    let mut results = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let (outputs, elapsed) =
+            timed_generate_batch_trt(backend, prompt, max_new_tokens, batch_size, ignore_eos)?;
+        results.push(batch_sample(&outputs, elapsed));
+    }
+    Ok(results)
+}
+
+#[cfg(feature = "llama-cpp")]
+fn throughput_batch_samples_sequential<B: EngineBackend>(
+    backend: &mut B,
+    prompt: &str,
+    max_new_tokens: u32,
+    samples: usize,
+    batch_size: usize,
+    ignore_eos: bool,
+) -> Result<Vec<BenchmarkSample>, mayhem_engine::EngineError> {
+    let mut results = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let (outputs, elapsed) = timed_generate_batch_sequential(
+            backend,
+            prompt,
+            max_new_tokens,
+            batch_size,
+            ignore_eos,
+        )?;
+        results.push(batch_sample(&outputs, elapsed));
+    }
+    Ok(results)
+}
+
+#[cfg(feature = "llama-cpp")]
+fn batch_requests(
+    prompt: &str,
+    max_new_tokens: u32,
+    batch_size: usize,
+    ignore_eos: bool,
+) -> Vec<GenerateRequest> {
+    (0..batch_size)
+        .map(|index| {
+            let prompt = if batch_size == 1 {
+                prompt.to_owned()
+            } else {
+                format!("{prompt}\nRequest slot: {}.", index + 1)
+            };
+            GenerateRequest::new(prompt)
+                .with_max_new_tokens(max_new_tokens)
+                .with_ignore_eos(ignore_eos)
+        })
+        .collect()
+}
+
+#[cfg(feature = "llama-cpp")]
+fn batch_sample(outputs: &[GenerateOutput], elapsed: Duration) -> BenchmarkSample {
+    let completion_tokens = outputs
+        .iter()
+        .map(|output| output.usage.completion_tokens)
+        .sum();
+    BenchmarkSample {
+        tok_s: completion_tokens as f64 / elapsed.as_secs_f64().max(0.001),
+        request_count: outputs.len(),
+        completion_tokens,
+        finish_reason: aggregate_finish_reason(outputs),
+        elapsed_ms: elapsed.as_millis(),
+    }
+}
+
+#[cfg(feature = "llama-cpp")]
+fn aggregate_finish_reason(outputs: &[GenerateOutput]) -> String {
+    let Some(first) = outputs.first() else {
+        return "empty".to_owned();
+    };
+    if outputs
+        .iter()
+        .all(|output| output.finish_reason == first.finish_reason)
+    {
+        first.finish_reason.to_string()
+    } else {
+        "mixed".to_owned()
+    }
 }
 
 #[cfg(feature = "llama-cpp")]

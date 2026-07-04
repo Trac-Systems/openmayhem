@@ -264,37 +264,56 @@ def tokenizer_token_id(*names):
     return None
 
 
+def request_max_tokens(payload):
+    value = payload.get("max_new_tokens")
+    return 64 if value is None else int(value)
+
+
 def runner_output_tokens(outputs, prompt_len, max_tokens):
+    return runner_batch_output_tokens(outputs, [prompt_len], max_tokens)[0]
+
+
+def runner_batch_output_tokens(outputs, prompt_lens, max_tokens):
     output_ids = outputs.get("output_ids") if isinstance(outputs, dict) else outputs
     sequence_lengths = outputs.get("sequence_lengths") if isinstance(outputs, dict) else None
 
-    try:
-        first_beam = output_ids[0][0]
-    except Exception as exc:
-        raise RuntimeError(f"TensorRT-LLM runner returned unexpected output ids: {exc}") from exc
+    batch_tokens = []
+    for batch_index, prompt_len in enumerate(prompt_lens):
+        try:
+            first_beam = output_ids[batch_index][0]
+        except Exception as exc:
+            raise RuntimeError(
+                f"TensorRT-LLM runner returned unexpected output ids for batch index {batch_index}: {exc}"
+            ) from exc
 
-    try:
-        seq_len = int(sequence_lengths[0][0].item())
-    except Exception:
-        seq_len = int(first_beam.shape[0]) if hasattr(first_beam, "shape") else len(first_beam)
+        try:
+            seq_len = int(sequence_lengths[batch_index][0].item())
+        except Exception:
+            seq_len = int(first_beam.shape[0]) if hasattr(first_beam, "shape") else len(first_beam)
 
-    start = max(0, int(prompt_len))
-    end = max(start, min(seq_len, start + int(max_tokens)))
-    sliced = first_beam[start:end]
-    if hasattr(sliced, "detach"):
-        sliced = sliced.detach().cpu().tolist()
-    elif hasattr(sliced, "tolist"):
-        sliced = sliced.tolist()
-    return [int(token) for token in sliced]
+        start = max(0, int(prompt_len))
+        end = max(start, min(seq_len, start + int(max_tokens)))
+        sliced = first_beam[start:end]
+        if hasattr(sliced, "detach"):
+            sliced = sliced.detach().cpu().tolist()
+        elif hasattr(sliced, "tolist"):
+            sliced = sliced.tolist()
+        batch_tokens.append([int(token) for token in sliced])
+    return batch_tokens
 
 
 def runner_generate_tokens(prompt_tokens, payload, max_tokens):
+    return runner_generate_batch_tokens([prompt_tokens], payload, max_tokens)[0]
+
+
+def runner_generate_batch_tokens(prompt_batches, payload, max_tokens):
     import torch
 
     pad_id = tokenizer_token_id("pad_token_id", "eos_token_id")
     kwargs = {
         "batch_input_ids": [
             torch.tensor(prompt_tokens, dtype=torch.int32, device="cuda")
+            for prompt_tokens in prompt_batches
         ],
         "max_new_tokens": int(max_tokens),
         "pad_id": pad_id,
@@ -314,7 +333,9 @@ def runner_generate_tokens(prompt_tokens, payload, max_tokens):
     with torch.no_grad():
         outputs = model.generate(**kwargs)
         torch.cuda.synchronize()
-    return runner_output_tokens(outputs, len(prompt_tokens), max_tokens)
+    return runner_batch_output_tokens(
+        outputs, [len(prompt_tokens) for prompt_tokens in prompt_batches], max_tokens
+    )
 
 
 def first_output(response):
@@ -392,17 +413,61 @@ def handle_tokenize(payload):
     return {"token_ids": encode_text(str(payload.get("text", "")))}
 
 
-def handle_generate(request_id, payload):
-    if model is None:
-        raise RuntimeError("model has not been loaded")
-
-    max_tokens = int(payload.get("max_new_tokens") or 64)
+def prepare_prompt(payload):
     prompt = str(payload.get("prompt", ""))
     prompt_tokens = encode_text(prompt)
     if prompt_tokens and len(prompt_tokens) >= ctx_size:
         raise ValueError(
             f"prompt has {len(prompt_tokens)} tokens, leaving no room in ctx_size={ctx_size}"
         )
+    return prompt, prompt_tokens
+
+
+def runner_result(prompt_tokens, completion_tokens, max_tokens):
+    if len(completion_tokens) > max_tokens:
+        completion_tokens = completion_tokens[:max_tokens]
+    text = decode_tokens(completion_tokens)
+    prompt_count = len(prompt_tokens)
+    completion_count = len(completion_tokens) if completion_tokens else (1 if text else 0)
+    return {
+        "text": text,
+        "usage": {
+            "prompt_tokens": prompt_count,
+            "completion_tokens": completion_count,
+            "total_tokens": prompt_count + completion_count,
+        },
+        "finish_reason": "length" if completion_count >= max_tokens else "stop",
+    }
+
+
+def batch_generation_settings(payload):
+    return (
+        request_max_tokens(payload),
+        bool(payload.get("ignore_eos")),
+        float(payload.get("temperature") or 0.0),
+        float(payload.get("top_p") or 0.0),
+        payload.get("seed"),
+    )
+
+
+def can_runner_batch(payloads):
+    if model_kind != "runner_cpp" or not payloads:
+        return False
+    settings = batch_generation_settings(payloads[0])
+    for payload in payloads:
+        if payload.get("grammar") is not None:
+            return False
+        if batch_generation_settings(payload) != settings:
+            return False
+    return True
+
+
+def handle_generate(request_id, payload):
+    if model is None:
+        raise RuntimeError("model has not been loaded")
+
+    max_tokens = request_max_tokens(payload)
+    prompt, prompt_tokens = prepare_prompt(payload)
     if max_tokens <= 0:
         return {
             "text": "",
@@ -474,6 +539,41 @@ def handle_generate(request_id, payload):
     }
 
 
+def handle_generate_batch(request_id, payload):
+    if model is None:
+        raise RuntimeError("model has not been loaded")
+    if not isinstance(payload, list):
+        raise ValueError("generate_batch payload must be a list of requests")
+
+    payloads = []
+    for item in payload:
+        if item is None:
+            item = {}
+        if not isinstance(item, dict):
+            raise ValueError("generate_batch entries must be request objects")
+        payloads.append(item)
+    if not payloads:
+        return []
+
+    if not can_runner_batch(payloads):
+        return [handle_generate(request_id, item) for item in payloads]
+
+    max_tokens = request_max_tokens(payloads[0])
+    prepared = [prepare_prompt(item)[1] for item in payloads]
+    if max_tokens <= 0:
+        return [runner_result(prompt_tokens, [], max_tokens) for prompt_tokens in prepared]
+
+    completion_batches = runner_generate_batch_tokens(prepared, payloads[0], max_tokens)
+    if len(completion_batches) != len(prepared):
+        raise RuntimeError(
+            f"TensorRT-LLM runner returned {len(completion_batches)} batch outputs for {len(prepared)} requests"
+        )
+    return [
+        runner_result(prompt_tokens, completion_tokens, max_tokens)
+        for prompt_tokens, completion_tokens in zip(prepared, completion_batches)
+    ]
+
+
 def handle_grammar_generate(request_id, grammar, prompt_tokens, max_tokens):
     if grammar.get("kind") != "tool_call":
         raise ValueError("TensorRT-LLM backend currently supports tool_call grammar constraints")
@@ -523,6 +623,8 @@ def handle(request_id, op, payload):
         return handle_tokenize(payload or {})
     if op == "generate":
         return handle_generate(request_id, payload or {})
+    if op == "generate_batch":
+        return handle_generate_batch(request_id, payload or [])
     if op == "shutdown":
         raise SystemExit(0)
     raise ValueError(f"unknown TensorRT-LLM worker op {op!r}")

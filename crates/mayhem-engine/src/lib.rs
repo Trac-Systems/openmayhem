@@ -1303,6 +1303,17 @@ mod trt_llm_backend {
                 ));
             }
         }
+
+        pub fn generate_batch(
+            &mut self,
+            requests: &[GenerateRequest],
+        ) -> Result<Vec<GenerateOutput>> {
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            self.call("generate_batch", serde_json::to_value(requests)?)
+        }
     }
 
     impl EngineBackend for TrtLlmBackend {
