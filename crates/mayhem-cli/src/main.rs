@@ -4800,6 +4800,7 @@ fn catalog_artifact_stage_preflight_command(
 ) -> CatalogCanaryPlanCommand {
     let mut checks = vec![
         hf_cli_path_assignment(),
+        llama_cpp_venv_path_assignment(),
         "python3 -c 'import huggingface_hub' || { echo \"missing Python huggingface_hub module: install with python3 -m pip install --user huggingface_hub[hf_xet]\" >&2; exit 1; }".to_owned(),
     ];
     if let Some(hf_token_file) = hf_token_file {
@@ -4880,7 +4881,8 @@ fn catalog_artifact_stage_gguf_command(
         .join(safe_path_component(artifact_name));
     let f16_path = build_dir.join("model.f16.gguf");
     let script = format!(
-        "test -n \"${{MAYHEM_LLAMA_CPP_DIR:-}}\" || {{ echo \"set MAYHEM_LLAMA_CPP_DIR to a llama.cpp checkout\" >&2; exit 1; }} && LLAMA_QUANTIZE=\"${{MAYHEM_LLAMA_QUANTIZE_BIN:-$MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize}}\" && if [ ! -x \"$LLAMA_QUANTIZE\" ]; then LLAMA_QUANTIZE=\"$(find \"$MAYHEM_LLAMA_CPP_DIR\" -path '*/bin/llama-quantize' -type f -perm -111 | sort | head -n 1)\"; fi && test -x \"$LLAMA_QUANTIZE\" || {{ echo \"missing llama-quantize; set MAYHEM_LLAMA_QUANTIZE_BIN\" >&2; exit 1; }} && mkdir -p {} {} && python3 \"$MAYHEM_LLAMA_CPP_DIR/convert_hf_to_gguf.py\" {} --outfile {} --outtype f16 && \"$LLAMA_QUANTIZE\" {} {} Q4_K_M && test -s {}",
+        "{} && export PATH && test -n \"${{MAYHEM_LLAMA_CPP_DIR:-}}\" || {{ echo \"set MAYHEM_LLAMA_CPP_DIR to a llama.cpp checkout\" >&2; exit 1; }} && LLAMA_QUANTIZE=\"${{MAYHEM_LLAMA_QUANTIZE_BIN:-$MAYHEM_LLAMA_CPP_DIR/build/bin/llama-quantize}}\" && if [ ! -x \"$LLAMA_QUANTIZE\" ]; then LLAMA_QUANTIZE=\"$(find \"$MAYHEM_LLAMA_CPP_DIR\" -path '*/bin/llama-quantize' -type f -perm -111 | sort | head -n 1)\"; fi && test -x \"$LLAMA_QUANTIZE\" || {{ echo \"missing llama-quantize; set MAYHEM_LLAMA_QUANTIZE_BIN\" >&2; exit 1; }} && mkdir -p {} {} && python3 \"$MAYHEM_LLAMA_CPP_DIR/convert_hf_to_gguf.py\" {} --outfile {} --outtype f16 && \"$LLAMA_QUANTIZE\" {} {} Q4_K_M && test -s {}",
+        llama_cpp_venv_path_assignment(),
         shell_single_quote(&artifact_path.parent().unwrap_or_else(|| Path::new(".")).display().to_string()),
         shell_single_quote(&build_dir.display().to_string()),
         shell_single_quote(&source_dir.display().to_string()),
@@ -5147,6 +5149,10 @@ fn with_hf_shell_prefix(
 
 fn hf_cli_path_assignment() -> String {
     "PATH=\"${MAYHEM_HF_VENV:+$MAYHEM_HF_VENV/bin:}$HOME/.local/bin:$PATH\"".to_owned()
+}
+
+fn llama_cpp_venv_path_assignment() -> String {
+    "PATH=\"${MAYHEM_LLAMA_CPP_VENV:+$MAYHEM_LLAMA_CPP_VENV/bin:}$PATH\"".to_owned()
 }
 
 fn catalog_artifact_plan_apply_command(
@@ -18902,6 +18908,10 @@ mod tests {
             .preflight_command
             .shell
             .contains("MAYHEM_LLAMA_CPP_DIR"));
+        assert!(report
+            .preflight_command
+            .shell
+            .contains("MAYHEM_LLAMA_CPP_VENV"));
         assert!(report.preflight_command.shell.contains("hf-token.txt"));
 
         let source = &report.source_commands[0];
@@ -18931,6 +18941,7 @@ mod tests {
             .stage_command
             .shell
             .contains("MAYHEM_LLAMA_QUANTIZE_BIN"));
+        assert!(entry.stage_command.shell.contains("MAYHEM_LLAMA_CPP_VENV"));
         assert!(entry.stage_command.shell.contains("Q4_K_M"));
         assert!(entry
             .follow_up_publish_plan
