@@ -238,6 +238,8 @@ enum CatalogCommands {
     ApplyArtifactMetadata(CatalogApplyArtifactMetadataArgs),
     /// Print copy/paste artifact metadata/apply/sign/verify commands for the launch matrix.
     ArtifactPlan(CatalogArtifactPlanArgs),
+    /// Print copy/paste Hugging Face upload plus artifact finalization commands.
+    ArtifactPublishPlan(CatalogArtifactPublishPlanArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
     CalibrateCanary(CatalogCalibrateCanaryArgs),
     /// Verify calibration report files cover the catalog canary matrix.
@@ -1125,6 +1127,61 @@ struct CatalogArtifactPlanArgs {
     include_dev: bool,
 
     /// Print a machine-readable command plan.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogArtifactPublishPlanArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Base directory containing admin catalog artifacts at their catalog paths.
+    #[arg(long, value_name = "PATH")]
+    artifact_base: PathBuf,
+
+    /// Directory where artifact-metadata reports should be written by the printed commands.
+    #[arg(long, value_name = "PATH")]
+    report_dir: PathBuf,
+
+    /// Unsigned catalog draft path for the printed apply-artifact-metadata command.
+    #[arg(long, value_name = "PATH")]
+    catalog_output: Option<PathBuf>,
+
+    /// Detached signature path for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_signature_output: Option<PathBuf>,
+
+    /// Catalog maintainer key id for an optional printed catalog sign command.
+    #[arg(long)]
+    catalog_key_id: Option<String>,
+
+    /// Ignored 32-byte Ed25519 seed file for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_seed_file: Option<PathBuf>,
+
+    /// Catalog public key directory for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_keys_dir: Option<PathBuf>,
+
+    /// Include --write-key in the optional printed catalog sign command.
+    #[arg(long)]
+    catalog_write_key: bool,
+
+    /// Include --created-at in the optional printed catalog sign command.
+    #[arg(long)]
+    catalog_created_at: Option<String>,
+
+    /// Hugging Face token file for printed upload/revision/verification commands.
+    #[arg(long, value_name = "PATH")]
+    hf_token_file: Option<PathBuf>,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable publish command plan.
     #[arg(long)]
     json: bool,
 }
@@ -2319,6 +2376,7 @@ async fn main() -> Result<()> {
             CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
             CatalogCommands::ApplyArtifactMetadata(args) => catalog_apply_artifact_metadata(args),
             CatalogCommands::ArtifactPlan(args) => catalog_artifact_plan(args),
+            CatalogCommands::ArtifactPublishPlan(args) => catalog_artifact_publish_plan(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
             CatalogCommands::ApplyCanaryReports(args) => catalog_apply_canary_reports(args),
@@ -3318,6 +3376,45 @@ struct CatalogArtifactPlanEntry {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactPublishPlanReport {
+    catalog_path: PathBuf,
+    artifact_base: PathBuf,
+    report_dir: PathBuf,
+    catalog_output: PathBuf,
+    launch_only: bool,
+    hf_token_file: Option<PathBuf>,
+    model_count: usize,
+    artifact_count: usize,
+    ok: bool,
+    publish_commands: Vec<CatalogArtifactPublishPlanEntry>,
+    apply_command: CatalogCanaryPlanCommand,
+    signature_command: Option<CatalogCanaryPlanCommand>,
+    verify_command: Option<CatalogCanaryPlanCommand>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactPublishPlanEntry {
+    model_id: String,
+    tier: String,
+    artifact: String,
+    engine: String,
+    source_kind: String,
+    source_repo: String,
+    current_source_revision: String,
+    source_path: String,
+    current_artifact_path: PathBuf,
+    published_artifact_path_template: PathBuf,
+    report_path: PathBuf,
+    upload_command: CatalogCanaryPlanCommand,
+    revision_command: CatalogCanaryPlanCommand,
+    metadata_command_template: CatalogCanaryPlanCommand,
+    metadata_after_publish_shell: String,
+    ok: bool,
+    errors: Vec<String>,
+}
+
 fn catalog_artifact_metadata_apply_report(
     catalog_doc: &catalog::CatalogDocument,
     catalog_path: PathBuf,
@@ -3658,8 +3755,157 @@ fn catalog_artifact_plan(args: CatalogArtifactPlanArgs) -> Result<()> {
     Ok(())
 }
 
+fn catalog_artifact_publish_plan(args: CatalogArtifactPublishPlanArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let artifact_base = absolutize(args.artifact_base.clone())?;
+    let report_dir = absolutize(args.report_dir.clone())?;
+    let catalog_output = args
+        .catalog_output
+        .clone()
+        .unwrap_or_else(|| report_dir.join("catalog.with-artifacts.json"));
+    let catalog_output = absolutize(catalog_output)?;
+    let hf_token_file = args.hf_token_file.clone().map(absolutize).transpose()?;
+    let catalog_sign = catalog_artifact_publish_plan_sign_options(&args)?;
+    let report = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
+        catalog_doc: &catalog_doc,
+        catalog_path,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        catalog_sign,
+        hf_token_file,
+        launch_only: !args.include_dev,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Catalog artifact publish command plan.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Artifact base: {}", report.artifact_base.display());
+        println!("Report dir: {}", report.report_dir.display());
+        println!(
+            "Scope: {}",
+            if report.launch_only {
+                "launch models"
+            } else {
+                "launch + dev models"
+            }
+        );
+        println!(
+            "Coverage: {} models, {} artifacts, ok={}",
+            report.model_count, report.artifact_count, report.ok
+        );
+        for entry in &report.publish_commands {
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id,
+                entry.artifact,
+                entry.engine,
+                entry.source_repo,
+                if entry.ok { "ready" } else { "error" }
+            );
+            println!(
+                "  local artifact: {}",
+                entry.current_artifact_path.display()
+            );
+            println!(
+                "  published artifact: {}",
+                entry.published_artifact_path_template.display()
+            );
+            println!("  upload: {}", entry.upload_command.shell);
+            println!("  revision: {}", entry.revision_command.shell);
+            println!(
+                "  metadata template: {}",
+                entry.metadata_command_template.shell
+            );
+            println!(
+                "  metadata after publish: {}",
+                entry.metadata_after_publish_shell
+            );
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+        println!("Apply artifact metadata:");
+        println!("{}", report.apply_command.shell);
+        if let Some(signature_command) = &report.signature_command {
+            println!("Sign catalog draft:");
+            println!("{}", signature_command.shell);
+        }
+        if let Some(verify_command) = &report.verify_command {
+            println!("Verify signed launch sources:");
+            println!("{}", verify_command.shell);
+        } else {
+            println!(
+                "Verify signed launch sources: pass catalog signing args to emit this command."
+            );
+        }
+        for error in &report.errors {
+            println!("Global error: {error}");
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "artifact publish command plan has {} error(s)",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
 fn catalog_artifact_plan_sign_options(
     args: &CatalogArtifactPlanArgs,
+) -> Result<Option<CatalogCanaryPlanSignOptions>> {
+    let requested = args.catalog_signature_output.is_some()
+        || args.catalog_key_id.is_some()
+        || args.catalog_seed_file.is_some()
+        || args.catalog_keys_dir.is_some()
+        || args.catalog_write_key
+        || args.catalog_created_at.is_some();
+    if !requested {
+        return Ok(None);
+    }
+    let signature_output = args
+        .catalog_signature_output
+        .clone()
+        .context("--catalog-signature-output is required when emitting a catalog sign command")?;
+    let signature_output = absolutize(signature_output)?;
+    let key_id = args
+        .catalog_key_id
+        .clone()
+        .context("--catalog-key-id is required when emitting a catalog sign command")?;
+    validate_catalog_key_id(&key_id)?;
+    let seed_file = args
+        .catalog_seed_file
+        .clone()
+        .context("--catalog-seed-file is required when emitting a catalog sign command")?;
+    let seed_file = absolutize(seed_file)?;
+    let keys_dir = args
+        .catalog_keys_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    Ok(Some(CatalogCanaryPlanSignOptions {
+        signature_output,
+        key_id,
+        seed_file,
+        keys_dir,
+        write_key: args.catalog_write_key,
+        created_at: args.catalog_created_at.clone(),
+    }))
+}
+
+fn catalog_artifact_publish_plan_sign_options(
+    args: &CatalogArtifactPublishPlanArgs,
 ) -> Result<Option<CatalogCanaryPlanSignOptions>> {
     let requested = args.catalog_signature_output.is_some()
         || args.catalog_key_id.is_some()
@@ -3758,6 +4004,7 @@ fn catalog_artifact_plan_report(input: CatalogArtifactPlanInput<'_>) -> CatalogA
                 artifact_name,
                 &artifact_path,
                 &report_path,
+                None,
             );
             let ok = entry_errors.is_empty();
             let entry = CatalogArtifactPlanEntry {
@@ -3833,12 +4080,176 @@ fn catalog_artifact_plan_report(input: CatalogArtifactPlanInput<'_>) -> CatalogA
     }
 }
 
+struct CatalogArtifactPublishPlanInput<'a> {
+    catalog_doc: &'a catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    artifact_base: PathBuf,
+    report_dir: PathBuf,
+    catalog_output: PathBuf,
+    catalog_sign: Option<CatalogCanaryPlanSignOptions>,
+    hf_token_file: Option<PathBuf>,
+    launch_only: bool,
+}
+
+fn catalog_artifact_publish_plan_report(
+    input: CatalogArtifactPublishPlanInput<'_>,
+) -> CatalogArtifactPublishPlanReport {
+    let CatalogArtifactPublishPlanInput {
+        catalog_doc,
+        catalog_path,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        catalog_sign,
+        hf_token_file,
+        launch_only,
+    } = input;
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+
+    for model in &catalog_doc.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        for (artifact_name, artifact) in &model.artifacts {
+            let mut entry_errors = Vec::new();
+            let artifact_rel_path = PathBuf::from(&artifact.path);
+            if artifact_rel_path.is_absolute() {
+                entry_errors.push(format!(
+                    "catalog artifact path {} must be relative to --artifact-base",
+                    artifact.path
+                ));
+            }
+            if artifact.source.kind != "huggingface" {
+                entry_errors.push(format!(
+                    "artifact source kind {} cannot be published with Hugging Face upload",
+                    artifact.source.kind
+                ));
+            }
+            let current_artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
+            let published_artifact_path_template =
+                catalog_artifact_published_template_path(&artifact_base, artifact);
+            let report_path = report_dir
+                .join(safe_path_component(&model.model_id))
+                .join(format!(
+                    "{}.artifact-metadata.json",
+                    safe_path_component(artifact_name)
+                ));
+            let upload_command = catalog_artifact_upload_command(
+                model,
+                artifact_name,
+                artifact,
+                &current_artifact_path,
+                hf_token_file.as_deref(),
+            );
+            let revision_command =
+                catalog_artifact_revision_command(&artifact.source.repo, hf_token_file.as_deref());
+            let metadata_command_template = catalog_artifact_metadata_plan_command(
+                &catalog_path,
+                model,
+                artifact_name,
+                &published_artifact_path_template,
+                &report_path,
+                Some("<published-hf-commit-40-hex>"),
+            );
+            let metadata_after_publish_shell = catalog_artifact_metadata_after_publish_shell(
+                CatalogArtifactMetadataAfterPublishInput {
+                    catalog_path: &catalog_path,
+                    model,
+                    artifact_name,
+                    artifact,
+                    current_artifact_path: &current_artifact_path,
+                    artifact_base: &artifact_base,
+                    report_path: &report_path,
+                    revision_command: &revision_command,
+                },
+            );
+            let ok = entry_errors.is_empty();
+            let entry = CatalogArtifactPublishPlanEntry {
+                model_id: model.model_id.clone(),
+                tier: model.tier.clone(),
+                artifact: artifact_name.clone(),
+                engine: artifact.engine.clone(),
+                source_kind: artifact.source.kind.clone(),
+                source_repo: artifact.source.repo.clone(),
+                current_source_revision: artifact.source.revision.clone(),
+                source_path: artifact.path.clone(),
+                current_artifact_path,
+                published_artifact_path_template,
+                report_path,
+                upload_command,
+                revision_command,
+                metadata_command_template,
+                metadata_after_publish_shell,
+                ok,
+                errors: entry_errors,
+            };
+            if !entry.ok {
+                errors.extend(
+                    entry
+                        .errors
+                        .iter()
+                        .map(|error| format!("{} {}: {error}", entry.model_id, entry.artifact)),
+                );
+            }
+            entries.push(entry);
+        }
+    }
+
+    if entries.is_empty() {
+        errors.push(if launch_only {
+            "catalog has no launch model artifacts to publish".to_owned()
+        } else {
+            "catalog has no model artifacts to publish".to_owned()
+        });
+    }
+
+    let report_paths = entries
+        .iter()
+        .map(|entry| entry.report_path.clone())
+        .collect::<Vec<_>>();
+    let apply_command = catalog_artifact_plan_apply_command(
+        &catalog_path,
+        &catalog_output,
+        launch_only,
+        &report_paths,
+    );
+    let signature_command = catalog_sign
+        .as_ref()
+        .map(|sign| catalog_canary_plan_sign_command(&catalog_output, sign));
+    let verify_command = catalog_sign.as_ref().map(|sign| {
+        catalog_artifact_plan_verify_command(&catalog_output, sign, hf_token_file.as_deref())
+    });
+    let model_count = entries
+        .iter()
+        .map(|entry| entry.model_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    CatalogArtifactPublishPlanReport {
+        catalog_path,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        launch_only,
+        hf_token_file,
+        model_count,
+        artifact_count: entries.len(),
+        ok: errors.is_empty(),
+        publish_commands: entries,
+        apply_command,
+        signature_command,
+        verify_command,
+        errors,
+    }
+}
+
 fn catalog_artifact_metadata_plan_command(
     catalog_path: &Path,
     model: &catalog::CatalogModel,
     artifact_name: &str,
     artifact_path: &Path,
     report_path: &Path,
+    source_revision: Option<&str>,
 ) -> CatalogCanaryPlanCommand {
     let mut argv = vec![
         "mayhem".to_owned(),
@@ -3850,8 +4261,143 @@ fn catalog_artifact_metadata_plan_command(
     push_plan_value_arg(&mut argv, "--artifact", artifact_name);
     push_plan_path_arg(&mut argv, "--artifact-path", artifact_path);
     push_plan_path_arg(&mut argv, "--report-output", report_path);
+    if let Some(source_revision) = source_revision {
+        push_plan_value_arg(&mut argv, "--source-revision", source_revision);
+    }
     argv.push("--json".to_owned());
     catalog_canary_plan_command(argv)
+}
+
+fn catalog_artifact_upload_command(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    current_artifact_path: &Path,
+    hf_token_file: Option<&Path>,
+) -> CatalogCanaryPlanCommand {
+    let argv = vec![
+        "hf".to_owned(),
+        "upload".to_owned(),
+        "--repo-type".to_owned(),
+        "model".to_owned(),
+        "--commit-message".to_owned(),
+        format!("Mayhem admin artifact {} {}", model.model_id, artifact_name),
+        artifact.source.repo.clone(),
+        current_artifact_path.display().to_string(),
+        artifact.path.clone(),
+    ];
+    let mut command = catalog_canary_plan_command(argv);
+    command.shell = with_hf_shell_prefix(command.shell, hf_token_file, true);
+    command
+}
+
+fn catalog_artifact_revision_command(
+    source_repo: &str,
+    hf_token_file: Option<&Path>,
+) -> CatalogCanaryPlanCommand {
+    let repo_literal = serde_json::to_string(source_repo).expect("repo string serializes");
+    let script = format!(
+        "from huggingface_hub import HfApi; import os; print(HfApi(token=os.environ.get('HF_TOKEN')).model_info({repo_literal}).sha)"
+    );
+    let mut command =
+        catalog_canary_plan_command(vec!["python3".to_owned(), "-c".to_owned(), script]);
+    command.shell = with_hf_shell_prefix(command.shell, hf_token_file, false);
+    command
+}
+
+struct CatalogArtifactMetadataAfterPublishInput<'a> {
+    catalog_path: &'a Path,
+    model: &'a catalog::CatalogModel,
+    artifact_name: &'a str,
+    artifact: &'a catalog::CatalogArtifact,
+    current_artifact_path: &'a Path,
+    artifact_base: &'a Path,
+    report_path: &'a Path,
+    revision_command: &'a CatalogCanaryPlanCommand,
+}
+
+fn catalog_artifact_metadata_after_publish_shell(
+    input: CatalogArtifactMetadataAfterPublishInput<'_>,
+) -> String {
+    let CatalogArtifactMetadataAfterPublishInput {
+        catalog_path,
+        model,
+        artifact_name,
+        artifact,
+        current_artifact_path,
+        artifact_base,
+        report_path,
+        revision_command,
+    } = input;
+    let published_prefix = artifact_base
+        .join(safe_path_component(&artifact.source.kind))
+        .join(safe_path_component(&artifact.source.repo));
+    let mut metadata_argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "artifact-metadata".to_owned(),
+    ];
+    push_plan_path_arg(&mut metadata_argv, "--catalog-path", catalog_path);
+    push_plan_value_arg(&mut metadata_argv, "--model", &model.model_id);
+    push_plan_value_arg(&mut metadata_argv, "--artifact", artifact_name);
+    metadata_argv.push("--artifact-path".to_owned());
+    metadata_argv.push("$PUBLISHED_ARTIFACT_PATH".to_owned());
+    push_plan_path_arg(&mut metadata_argv, "--report-output", report_path);
+    metadata_argv.push("--source-revision".to_owned());
+    metadata_argv.push("$PUBLISHED_REVISION".to_owned());
+    metadata_argv.push("--json".to_owned());
+    let metadata_shell = metadata_argv
+        .iter()
+        .map(|arg| {
+            if arg == "$PUBLISHED_ARTIFACT_PATH" || arg == "$PUBLISHED_REVISION" {
+                format!("\"{arg}\"")
+            } else {
+                shell_single_quote(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "PUBLISHED_REVISION=$({}) && test -n \"$PUBLISHED_REVISION\" && PUBLISHED_ARTIFACT_PATH={}/\"$PUBLISHED_REVISION\"/{} && mkdir -p \"$(dirname \"$PUBLISHED_ARTIFACT_PATH\")\" && ln -sfn {} \"$PUBLISHED_ARTIFACT_PATH\" && {}",
+        revision_command.shell,
+        shell_single_quote(&published_prefix.display().to_string()),
+        shell_single_quote(&artifact.path),
+        shell_single_quote(&current_artifact_path.display().to_string()),
+        metadata_shell
+    )
+}
+
+fn catalog_artifact_published_template_path(
+    artifact_base: &Path,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    artifact_base
+        .join(safe_path_component(&artifact.source.kind))
+        .join(safe_path_component(&artifact.source.repo))
+        .join("<published-hf-commit-40-hex>")
+        .join(&artifact.path)
+}
+
+fn with_hf_shell_prefix(
+    shell: String,
+    hf_token_file: Option<&Path>,
+    high_performance_upload: bool,
+) -> String {
+    let mut assignments = Vec::new();
+    if let Some(hf_token_file) = hf_token_file {
+        assignments.push(format!(
+            "HF_TOKEN=\"$(tr -d '\\r\\n' < {})\"",
+            shell_single_quote(&hf_token_file.display().to_string())
+        ));
+    }
+    if high_performance_upload {
+        assignments.push("HF_XET_HIGH_PERFORMANCE=1".to_owned());
+    }
+    if assignments.is_empty() {
+        shell
+    } else {
+        format!("{} {}", assignments.join(" "), shell)
+    }
 }
 
 fn catalog_artifact_plan_apply_command(
@@ -17577,6 +18123,79 @@ mod tests {
             .argv
             .iter()
             .any(|arg| arg == "--check-launch-sources"));
+        assert!(verify_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--hf-token-file" && pair[1] == "/tmp/hf-token.txt"));
+    }
+
+    #[test]
+    fn artifact_publish_plan_emits_upload_revision_metadata_and_followups() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let sign = CatalogCanaryPlanSignOptions {
+            signature_output: PathBuf::from("/tmp/reports/models.json.sig"),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file: PathBuf::from("/tmp/catalog-seed.hex"),
+            keys_dir: PathBuf::from("/tmp/catalog-keys"),
+            write_key: true,
+            created_at: Some("2026-07-04T00:00:00Z".to_owned()),
+        };
+
+        let report = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/artifacts"),
+            report_dir: PathBuf::from("/tmp/reports"),
+            catalog_output: PathBuf::from("/tmp/reports/catalog.with-artifacts.json"),
+            catalog_sign: Some(sign),
+            hf_token_file: Some(PathBuf::from("/tmp/hf-token.txt")),
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.model_count, 1);
+        assert_eq!(report.artifact_count, 1);
+        let entry = &report.publish_commands[0];
+        assert_eq!(
+            entry.current_artifact_path,
+            PathBuf::from(format!(
+                "/tmp/artifacts/huggingface/test_model/{}/model.gguf",
+                "1".repeat(40)
+            ))
+        );
+        assert_eq!(
+            entry.published_artifact_path_template,
+            PathBuf::from(
+                "/tmp/artifacts/huggingface/test_model/<published-hf-commit-40-hex>/model.gguf"
+            )
+        );
+        assert_eq!(entry.upload_command.argv[0], "hf");
+        assert!(entry
+            .upload_command
+            .argv
+            .windows(2)
+            .any(|pair| { pair[0] == "--repo-type" && pair[1] == "model" }));
+        assert!(entry
+            .upload_command
+            .shell
+            .contains("HF_XET_HIGH_PERFORMANCE=1"));
+        assert!(entry.upload_command.shell.contains("/tmp/hf-token.txt"));
+        assert!(entry.revision_command.shell.contains("HfApi"));
+        assert!(entry.revision_command.shell.contains("/tmp/hf-token.txt"));
+        assert!(entry.metadata_command_template.argv.windows(2).any(|pair| {
+            pair[0] == "--source-revision" && pair[1] == "<published-hf-commit-40-hex>"
+        }));
+        assert!(entry
+            .metadata_after_publish_shell
+            .contains("PUBLISHED_REVISION=$("));
+        assert!(entry.metadata_after_publish_shell.contains("ln -sfn"));
+        assert!(entry
+            .metadata_after_publish_shell
+            .contains("\"$PUBLISHED_ARTIFACT_PATH\""));
+        let signature_command = report.signature_command.as_ref().unwrap();
+        assert!(signature_command.shell.contains("'catalog' 'sign'"));
+        let verify_command = report.verify_command.as_ref().unwrap();
         assert!(verify_command
             .argv
             .windows(2)
