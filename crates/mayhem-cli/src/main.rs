@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use mayhem_bridge::{
     BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL,
     DEFAULT_SC_BRIDGE_URL,
@@ -230,6 +230,8 @@ enum AuditorCommands {
 enum CatalogCommands {
     /// Verify catalog structure, maintainer signature, canary refs, and optional dev downloads.
     Verify(CatalogVerifyArgs),
+    /// Sign an admin-reviewed catalog draft with an operator-held Ed25519 seed file.
+    Sign(CatalogSignArgs),
     /// Compute launch catalog metadata for a local admin artifact without loading model weights.
     ArtifactMetadata(CatalogArtifactMetadataArgs),
     /// Apply bound artifact metadata reports into a catalog draft.
@@ -969,6 +971,45 @@ struct CatalogVerifyArgs {
     hf_token_file: Option<PathBuf>,
 
     /// Print a machine-readable verification report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogSignArgs {
+    /// Path to the admin-reviewed catalog draft. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Write the detached catalog signature JSON here.
+    #[arg(long, value_name = "PATH")]
+    signature_output: PathBuf,
+
+    /// Directory containing catalog maintainer public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Catalog maintainer key id to embed in the detached signature.
+    #[arg(long)]
+    key_id: String,
+
+    /// File containing the 32-byte Ed25519 signing seed as hex. Do not pass secrets on the CLI.
+    #[arg(long, value_name = "PATH")]
+    seed_file: PathBuf,
+
+    /// Create the public key record under --keys-dir when it does not already exist.
+    #[arg(long)]
+    write_key: bool,
+
+    /// ISO timestamp for a newly written public key record. Required with --write-key on first use.
+    #[arg(long)]
+    created_at: Option<String>,
+
+    /// Overwrite an existing detached signature output file.
+    #[arg(long)]
+    force: bool,
+
+    /// Print a machine-readable signing report.
     #[arg(long)]
     json: bool,
 }
@@ -2185,6 +2226,7 @@ async fn main() -> Result<()> {
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
             CatalogCommands::Verify(args) => catalog_verify(args),
+            CatalogCommands::Sign(args) => catalog_sign(args),
             CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
             CatalogCommands::ApplyArtifactMetadata(args) => catalog_apply_artifact_metadata(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
@@ -2568,6 +2610,218 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
             );
         }
         bail!("catalog verification failed");
+    }
+    Ok(())
+}
+
+fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let signature_output = absolutize(args.signature_output.clone())?;
+    if signature_output.exists() && !args.force {
+        bail!(
+            "refusing to overwrite {}; pass --force after reviewing the catalog draft",
+            signature_output.display()
+        );
+    }
+    let keys_dir = args
+        .keys_dir
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    let seed_file = absolutize(args.seed_file.clone())?;
+
+    let report = catalog_sign_report(CatalogSignRequest {
+        catalog_path,
+        signature_output,
+        keys_dir,
+        key_id: args.key_id,
+        seed_file,
+        write_key: args.write_key,
+        created_at: args.created_at,
+    })?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Catalog signature written.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Signature: {}", report.signature_output.display());
+        println!("Signed path: {}", report.signed_path);
+        println!("Catalog blake3: {}", report.blake3);
+        println!("Key id: {}", report.key_id);
+        println!("Public key: {}", report.public_key);
+        if let Some(key_path) = &report.key_path {
+            println!(
+                "Key record: {} ({})",
+                key_path.display(),
+                if report.key_written {
+                    "written"
+                } else {
+                    "already matched"
+                }
+            );
+        }
+        println!();
+        println!("Verify with:");
+        println!(
+            "mayhem catalog verify --catalog-path {} --signature-path {} --keys-dir {}",
+            shell_single_quote(&report.catalog_path.display().to_string()),
+            shell_single_quote(&report.signature_output.display().to_string()),
+            shell_single_quote(&report.keys_dir.display().to_string())
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CatalogSignRequest {
+    catalog_path: PathBuf,
+    signature_output: PathBuf,
+    keys_dir: PathBuf,
+    key_id: String,
+    seed_file: PathBuf,
+    write_key: bool,
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogSignReport {
+    ok: bool,
+    catalog_path: PathBuf,
+    signature_output: PathBuf,
+    keys_dir: PathBuf,
+    key_path: Option<PathBuf>,
+    key_written: bool,
+    key_id: String,
+    public_key: String,
+    signed_path: String,
+    blake3: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogDetachedSignature {
+    schema_version: u32,
+    alg: String,
+    signed_path: String,
+    key_id: String,
+    public_key: String,
+    blake3: String,
+    sig: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogPublicKeyRecord {
+    key_id: String,
+    alg: String,
+    public_key: String,
+    status: String,
+    created_at: String,
+}
+
+fn catalog_sign_report(request: CatalogSignRequest) -> Result<CatalogSignReport> {
+    let catalog_bytes = fs::read(&request.catalog_path)
+        .with_context(|| format!("reading {}", request.catalog_path.display()))?;
+    let file_name = request
+        .catalog_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("catalog path must have a UTF-8 file name")?;
+    let seed = read_catalog_signing_seed(&request.seed_file)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = hex_encode(&signing_key.verifying_key().to_bytes());
+    let blake3 = blake3::hash(&catalog_bytes).to_hex().to_string();
+    let signature = signing_key.sign(&catalog_bytes);
+    let signed_path = format!("catalog/{file_name}");
+    let detached = CatalogDetachedSignature {
+        schema_version: 1,
+        alg: "ed25519".to_owned(),
+        signed_path: signed_path.clone(),
+        key_id: request.key_id.clone(),
+        public_key: public_key.clone(),
+        blake3: blake3.clone(),
+        sig: hex_encode(&signature.to_bytes()),
+    };
+
+    let mut key_path = None;
+    let mut key_written = false;
+    if request.write_key {
+        validate_catalog_key_id(&request.key_id)?;
+        fs::create_dir_all(&request.keys_dir)
+            .with_context(|| format!("creating {}", request.keys_dir.display()))?;
+        let path = request.keys_dir.join(format!("{}.json", request.key_id));
+        if path.exists() {
+            let existing: CatalogPublicKeyRecord =
+                serde_json::from_value(read_json_file(&path)?)
+                    .with_context(|| format!("parsing catalog key record {}", path.display()))?;
+            if existing.key_id != request.key_id
+                || existing.alg != "ed25519"
+                || !existing.public_key.eq_ignore_ascii_case(&public_key)
+                || existing.status != "active"
+            {
+                bail!(
+                    "existing catalog key record {} does not match the signing seed/key id",
+                    path.display()
+                );
+            }
+        } else {
+            let created_at = request
+                .created_at
+                .clone()
+                .context("--created-at is required when --write-key creates a new key record")?;
+            write_json_file(
+                &path,
+                &CatalogPublicKeyRecord {
+                    key_id: request.key_id.clone(),
+                    alg: "ed25519".to_owned(),
+                    public_key: public_key.clone(),
+                    status: "active".to_owned(),
+                    created_at,
+                },
+            )?;
+            key_written = true;
+        }
+        key_path = Some(path);
+    }
+
+    write_json_file(&request.signature_output, &detached)?;
+    Ok(CatalogSignReport {
+        ok: true,
+        catalog_path: request.catalog_path,
+        signature_output: request.signature_output,
+        keys_dir: request.keys_dir,
+        key_path,
+        key_written,
+        key_id: request.key_id,
+        public_key,
+        signed_path,
+        blake3,
+    })
+}
+
+fn read_catalog_signing_seed(path: &Path) -> Result<[u8; 32]> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading catalog signing seed {}", path.display()))?;
+    let seed_hex = text.trim().strip_prefix("0x").unwrap_or(text.trim());
+    if seed_hex.lines().count() != 1 {
+        bail!("catalog signing seed file must contain only one 32-byte hex seed");
+    }
+    hex_decode_array::<32>(seed_hex, "catalog signing seed")
+}
+
+fn validate_catalog_key_id(key_id: &str) -> Result<()> {
+    if key_id.trim().is_empty() {
+        bail!("--key-id must be non-empty");
+    }
+    if !key_id
+        .as_bytes()
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("--key-id may contain only ASCII letters, digits, dash, underscore, and dot");
     }
     Ok(())
 }
@@ -16749,6 +17003,94 @@ mod tests {
             .any(|error| error.contains("current catalog fields are stale")));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn catalog_sign_report_writes_signature_that_verifier_accepts() {
+        let temp = env::temp_dir().join(format!(
+            "mayhem-catalog-sign-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let catalog_path = temp.join("models.json");
+        fs::copy(repo_path("catalog/models.json").unwrap(), &catalog_path).unwrap();
+        let seed_file = temp.join("catalog-seed.hex");
+        fs::write(&seed_file, "08".repeat(32)).unwrap();
+        let signature_output = temp.join("models.json.sig");
+        let keys_dir = temp.join("keys");
+
+        let report = catalog_sign_report(CatalogSignRequest {
+            catalog_path: catalog_path.clone(),
+            signature_output: signature_output.clone(),
+            keys_dir: keys_dir.clone(),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file,
+            write_key: true,
+            created_at: Some("2026-07-04T00:00:00Z".to_owned()),
+        })
+        .unwrap();
+
+        assert!(report.ok);
+        assert!(report.signature_output.exists());
+        assert_eq!(report.signed_path, "catalog/models.json");
+        assert!(report.key_written);
+        assert!(report.key_path.as_ref().unwrap().exists());
+
+        let verified = catalog::verify(catalog::VerifyOptions {
+            catalog_path,
+            signature_path: signature_output,
+            keys_dir,
+            canaries_dir: repo_path("catalog/canaries").unwrap(),
+            check_dev_downloads: false,
+            check_launch_sources: false,
+            hf_token_file: None,
+        })
+        .unwrap();
+        assert!(verified.ok, "{:?}", verified.errors);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn catalog_sign_refuses_to_overwrite_signature_without_force() {
+        let temp = env::temp_dir().join(format!(
+            "mayhem-catalog-sign-overwrite-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let catalog_path = temp.join("models.json");
+        fs::copy(repo_path("catalog/models.json").unwrap(), &catalog_path).unwrap();
+        let seed_file = temp.join("catalog-seed.hex");
+        fs::write(&seed_file, "09".repeat(32)).unwrap();
+        let signature_output = temp.join("models.json.sig");
+        fs::write(&signature_output, "{}").unwrap();
+
+        let err = catalog_sign(CatalogSignArgs {
+            catalog_path: Some(catalog_path),
+            signature_output,
+            keys_dir: Some(temp.join("keys")),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file,
+            write_key: true,
+            created_at: Some("2026-07-04T00:00:00Z".to_owned()),
+            force: false,
+            json: true,
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("refusing to overwrite"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn catalog_sign_key_ids_cannot_escape_keys_dir() {
+        validate_catalog_key_id("mayhem-dev-catalog-v1").unwrap();
+        let err = validate_catalog_key_id("../catalog-key").unwrap_err();
+
+        assert!(err.to_string().contains("may contain only ASCII"));
     }
 
     #[test]
