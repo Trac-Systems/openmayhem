@@ -55,6 +55,20 @@ const matchesFilter = (filter, text) => {
   return filter.some((group) => group.every((word) => haystack.includes(word)));
 };
 
+const keyHex = (value) => {
+  if (!value) return null;
+  if (b4a.isBuffer(value)) return b4a.toString(value, 'hex');
+  if (typeof value === 'string') return value.trim().toLowerCase();
+  if (typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data)) {
+    try {
+      return b4a.toString(b4a.from(value.data), 'hex');
+    } catch (_e) {
+      return null;
+    }
+  }
+  return String(value).trim().toLowerCase();
+};
+
 class ScBridge extends Feature {
   constructor(peer, config = {}) {
     super(peer, config);
@@ -80,6 +94,7 @@ class ScBridge extends Feature {
       ? new Set(config.filterChannels.map((c) => String(c)))
       : null;
     this.info = config.info && typeof config.info === 'object' ? config.info : null;
+    this.nextClientId = 1;
   }
 
   attachSidechannel(sidechannel) {
@@ -94,10 +109,17 @@ class ScBridge extends Feature {
     try {
       const data = JSON.stringify(payload);
       client.socket.write(data);
-    } catch (_e) {}
+    } catch (err) {
+      if (this.debug) {
+        console.log(
+          `[sc-bridge] client ${client?.id ?? '?'} write failed: ${err?.message ?? err}`
+        );
+      }
+    }
   }
 
   _shouldEmit(client, channel, messageText) {
+    if (client.sidechannelMuted === true) return false;
     if (client.channels && client.channels.size > 0 && !client.channels.has(channel)) {
       return false;
     }
@@ -150,6 +172,12 @@ class ScBridge extends Feature {
       frame: event?.frame ?? null,
       ts: Date.now(),
     };
+    if (this.debug) {
+      console.log(
+        `[sc-bridge] session_frame ${payload.frame?.t || 'frame'} ` +
+          `${payload.session_id || ''} from ${payload.remote || ''}; clients ${this.clients.size}`
+      );
+    }
     for (const client of this.clients) {
       if (!client.ready) continue;
       if (
@@ -158,7 +186,15 @@ class ScBridge extends Feature {
         client.sessionIds.size > 0 &&
         !client.sessionIds.has(payload.session_id)
       ) {
+        if (this.debug) {
+          console.log(
+            `[sc-bridge] skip client ${client.id} for session ${payload.session_id || ''}`
+          );
+        }
         continue;
+      }
+      if (this.debug) {
+        console.log(`[sc-bridge] emit session_frame to client ${client.id}`);
       }
       this._broadcastToClient(client, payload);
     }
@@ -258,6 +294,7 @@ class ScBridge extends Feature {
             : [];
         if (!client.channels) client.channels = new Set();
         for (const ch of channels) client.channels.add(String(ch));
+        client.sidechannelMuted = false;
         reply({ type: 'subscribed', channels: Array.from(client.channels) });
         return;
       }
@@ -283,6 +320,18 @@ class ScBridge extends Feature {
           client.sessionAll = true;
         }
         for (const sessionId of sessionIds) client.sessionIds.add(String(sessionId));
+        if (message.sidechannel === false) {
+          client.sidechannelMuted = true;
+        } else if (message.sidechannel === true) {
+          client.sidechannelMuted = false;
+        }
+        if (this.debug) {
+          console.log(
+            `[sc-bridge] client ${client.id} session_subscribe ` +
+              `${Array.from(client.sessionIds).join(',') || '(none)'} ` +
+              `all=${client.sessionAll === true}`
+          );
+        }
         reply({
           type: 'session_subscribed',
           session_ids: Array.from(client.sessionIds),
@@ -315,6 +364,9 @@ class ScBridge extends Feature {
         }
         const remote = String(message.remote || '').trim();
         const sessionId = String(message.session_id || '').trim();
+        if (this.debug) {
+          console.log(`[sc-bridge] client ${client.id} session_open ${sessionId} -> ${remote}`);
+        }
         this.directSession
           .open(remote, sessionId)
           .then((session) => reply({ type: 'session_opened', ...session }))
@@ -330,6 +382,12 @@ class ScBridge extends Feature {
         }
         const remote = String(message.remote || '').trim();
         const sessionId = String(message.session_id || '').trim();
+        if (this.debug) {
+          console.log(
+            `[sc-bridge] client ${client.id} session_send ` +
+              `${message.frame?.t || 'frame'} ${sessionId} -> ${remote}`
+          );
+        }
         this.directSession
           .send(remote, sessionId, message.frame)
           .then((session) => reply({ type: 'session_sent', ...session }))
@@ -493,11 +551,19 @@ class ScBridge extends Feature {
           return;
         }
         const channels = Array.from(this.sidechannel.channels.keys());
+        const peers = Array.from(this.sidechannel.connections.keys())
+          .map((connection) => keyHex(connection?.remotePublicKey))
+          .filter(Boolean);
+        const swarmPeers = Array.from(this.peer?.swarm?.connections || [])
+          .map((connection) => keyHex(connection?.remotePublicKey))
+          .filter(Boolean);
         const connectionCount = this.sidechannel.connections.size;
         reply({
           type: 'stats',
           channels,
           connectionCount,
+          peers,
+          swarmPeers,
           sidechannelStarted: this.sidechannel.started === true,
         });
         return;
@@ -663,6 +729,7 @@ class ScBridge extends Feature {
     this.started = true;
     this.server = new ws.Server({ host: this.host, port: this.port }, (socket) => {
       const client = {
+        id: this.nextClientId++,
         socket,
         ready: !this.requireAuth,
         authed: !this.requireAuth,
@@ -672,6 +739,9 @@ class ScBridge extends Feature {
         sessionAll: false,
       };
       this.clients.add(client);
+      if (this.debug) {
+        console.log(`[sc-bridge] client ${client.id} connected`);
+      }
 
       const hello = {
         type: 'hello',
@@ -684,7 +754,12 @@ class ScBridge extends Feature {
       this._broadcastToClient(client, hello);
 
       socket.on('data', (data) => this._handleSocketData(client, data));
-      const cleanup = () => this.clients.delete(client);
+      const cleanup = () => {
+        if (this.debug && this.clients.has(client)) {
+          console.log(`[sc-bridge] client ${client.id} disconnected`);
+        }
+        this.clients.delete(client);
+      };
       socket.on('close', cleanup);
       socket.on('end', cleanup);
       socket.on('error', cleanup);

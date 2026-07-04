@@ -646,7 +646,10 @@ class MayhemContract extends Contract {
   async mayhemFeature() {
     const adminError = await this.requireAdmin(this.address);
     if (adminError) return;
-    const key = this.op?.key;
+    const rawKey = this.op?.key;
+    const key = typeof rawKey === 'string' && rawKey.startsWith('mayhem_')
+      ? rawKey.slice('mayhem_'.length)
+      : rawKey;
     const value = this.value;
     if (typeof key !== 'string' || !value || typeof value !== 'object' || Array.isArray(value)) {
       return;

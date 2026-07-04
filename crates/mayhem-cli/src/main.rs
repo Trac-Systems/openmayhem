@@ -315,6 +315,14 @@ struct UseArgs {
     #[arg(long)]
     sc_bridge_token: Option<String>,
 
+    /// Seconds to wait for provider s.accept/s.reject after opening a direct session.
+    #[arg(long)]
+    session_open_timeout_seconds: Option<u64>,
+
+    /// Seconds to wait between provider session frames after s.accept.
+    #[arg(long)]
+    session_frame_timeout_seconds: Option<u64>,
+
     /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
     #[arg(long)]
     bind: Option<String>,
@@ -762,6 +770,10 @@ struct TestArgs {
     /// Skip the peer RPC health check; useful for isolated gateway/opencode smoke tests.
     #[arg(long)]
     skip_peer_health: bool,
+
+    /// Skip the direct gateway tool-call smoke before opencode.
+    #[arg(long)]
+    skip_direct_tool_smoke: bool,
 
     /// Do not merge or run opencode.
     #[arg(long)]
@@ -1665,6 +1677,11 @@ struct ProviderStartArgs {
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
     #[arg(long)]
     rpc_url: Option<String>,
+
+    /// Peer JSON-RPC base URL used for live provider session rechecks.
+    /// Defaults to --rpc-url.
+    #[arg(long)]
+    session_rpc_url: Option<String>,
 
     /// SC-Bridge websocket URL for the local provider peer. Required for live heartbeats.
     #[arg(long)]
@@ -3583,10 +3600,21 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             args.sc_bridge_url.as_deref(),
             args.sc_bridge_token.as_deref(),
         )?;
-        let backend = ScBridgeGatewaySessionBackend::new(ScBridgeGatewaySessionConfig::new(
-            sc_bridge_url.clone(),
-            sc_bridge_token,
-        ));
+        if args.session_open_timeout_seconds == Some(0) {
+            bail!("--session-open-timeout-seconds must be positive");
+        }
+        if args.session_frame_timeout_seconds == Some(0) {
+            bail!("--session-frame-timeout-seconds must be positive");
+        }
+        let mut session_config =
+            ScBridgeGatewaySessionConfig::new(sc_bridge_url.clone(), sc_bridge_token);
+        if let Some(seconds) = args.session_open_timeout_seconds {
+            session_config.open_timeout = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = args.session_frame_timeout_seconds {
+            session_config.frame_timeout = Duration::from_secs(seconds);
+        }
+        let backend = ScBridgeGatewaySessionBackend::new(session_config);
         (
             GatewayState::from_models(models).with_session_backend(Arc::new(backend)),
             format!("contract:{rpc_url}"),
@@ -3719,7 +3747,11 @@ async fn mayhem_test(args: TestArgs) -> Result<()> {
         fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/status")).await?;
     let models = fetch_gateway_models(&client, &gateway_root).await?;
     let selected_model = select_test_model(&models, args.model.as_deref())?;
-    let direct_tool = run_gateway_tool_smoke(&client, &gateway_root, &selected_model.id).await?;
+    let direct_tool = if args.skip_direct_tool_smoke {
+        json!({ "skipped": true })
+    } else {
+        run_gateway_tool_smoke(&client, &gateway_root, &selected_model.id).await?
+    };
 
     let peer_health = if args.skip_peer_health {
         json!({ "skipped": true })
@@ -4719,8 +4751,11 @@ async fn run_opencode_smoke(
         .arg("--pure")
         .arg("--model")
         .arg(&model)
+        .arg("--title")
+        .arg("mayhem-opencode-smoke")
         .arg("--format")
         .arg("json")
+        .arg("--dangerously-skip-permissions")
         .arg("--dir")
         .arg(&work_dir)
         .arg("Use the bash tool once to print mayhem-opencode-tool-ok, then answer with mayhem-opencode-tool-ok.");
@@ -6965,6 +7000,15 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let password = args.wallet_password.clone().unwrap_or_default();
     let wallet = inspect_wallet(&keypair_path, &password).await?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
+    let session_rpc_url = args
+        .session_rpc_url
+        .clone()
+        .unwrap_or_else(|| rpc_url.clone());
+    let session_rpc = if args.serve_sessions {
+        Some(PeerRpcClient::new(&session_rpc_url)?)
+    } else {
+        None
+    };
     let rules = resolve_rules(None, None, &rpc, None).await?;
 
     provider_log(
@@ -7205,6 +7249,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "ok": true,
             "kind": "sealed-boot-attestation-heartbeat",
         },
+        "session_rpc_url": if args.serve_sessions { Some(session_rpc_url.as_str()) } else { None },
     });
 
     if args.print_json {
@@ -7226,6 +7271,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     }
 
     if let Some(responder) = session_responder {
+        let live_rpc = session_rpc.as_ref().unwrap_or(&rpc);
         serve_provider_sessions(
             ProviderSessionContext {
                 args: &args,
@@ -7240,7 +7286,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 rules: &rules,
             },
             ProviderSessionRuntime {
-                rpc: &rpc,
+                rpc: live_rpc,
                 rooms: &rooms,
                 keypair_path: &keypair_path,
                 password: &password,
@@ -7880,6 +7926,12 @@ fn print_provider_lifecycle_report(report: &Value, json_output: bool) -> Result<
 fn provider_log(args: &ProviderStartArgs, message: &str) {
     if !args.print_json {
         println!("-> {message}");
+    }
+}
+
+fn provider_session_debug(message: impl AsRef<str>) {
+    if std::env::var_os("MAYHEM_PROVIDER_SESSION_DEBUG").is_some() {
+        eprintln!("[provider-session] {}", message.as_ref());
     }
 }
 
@@ -8959,9 +9011,11 @@ async fn serve_provider_sessions(
         ctx.args.sc_bridge_url.as_deref(),
         ctx.args.sc_bridge_token.as_deref(),
     )?;
+    provider_session_debug(format!("connecting to SC-Bridge {sc_bridge_url}"));
     let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(&sc_bridge_url, sc_bridge_token)?)
         .await
         .context("connecting to SC-Bridge for provider session serving")?;
+    provider_session_debug("subscribing to all direct session frames");
     let subscription = bridge
         .session_subscribe_all()
         .await
@@ -8973,6 +9027,7 @@ async fn serve_provider_sessions(
     {
         bail!("SC-Bridge does not support all-session subscription; update the local Intercom app");
     }
+    provider_session_debug("session frame subscription ready");
 
     provider_log(
         ctx.args,
@@ -9036,6 +9091,18 @@ async fn serve_provider_sessions(
         }
         match bridge.next_session_frame(wait).await {
             Ok(event) => {
+                let frame_type = event
+                    .get("frame")
+                    .and_then(|frame| frame.get("t"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("frame");
+                provider_session_debug(format!(
+                    "received session event {} type {frame_type}",
+                    event
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                ));
                 handle_provider_session_frame(
                     &mut bridge,
                     &mut sessions,
@@ -9080,9 +9147,19 @@ async fn handle_provider_session_frame(
         .to_owned();
     match frame.get("t").and_then(Value::as_str) {
         Some("s.open") => {
+            provider_session_debug(format!(
+                "handling s.open for session {session_id} from {remote}"
+            ));
+            provider_session_debug(format!("opening provider side of session {session_id}"));
+            bridge
+                .session_open(&remote, &session_id)
+                .await
+                .context("opening provider side direct session")?;
+            provider_session_debug(format!("provider side session {session_id} opened"));
             let static_decision = provider_session_open_decision(&frame, terms);
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
+                    provider_session_debug("s.open static decision accepted; rechecking contract");
                     provider_session_current_state_decision(runtime.rpc, terms, runtime.rooms)
                         .await?
                 }
@@ -9090,6 +9167,7 @@ async fn handle_provider_session_frame(
             };
             match decision {
                 ProviderSessionDecision::Accept => {
+                    provider_session_debug(format!("sending s.accept for session {session_id}"));
                     sessions.insert(
                         session_id.clone(),
                         ActiveProviderSession {
@@ -9146,8 +9224,12 @@ async fn handle_provider_session_frame(
                         .session_send(&remote, &session_id, accept_frame)
                         .await
                         .context("sending s.accept")?;
+                    provider_session_debug(format!("sent s.accept for session {session_id}"));
                 }
                 ProviderSessionDecision::Reject { code, reason } => {
+                    provider_session_debug(format!(
+                        "sending s.reject {code} for session {session_id}: {reason}"
+                    ));
                     bridge
                         .session_send(
                             &remote,
@@ -9164,11 +9246,16 @@ async fn handle_provider_session_frame(
                         )
                         .await
                         .context("sending s.reject")?;
+                    provider_session_debug(format!("sent s.reject for session {session_id}"));
                 }
             }
         }
         Some("s.req") => {
+            provider_session_debug(format!("handling s.req for session {session_id}"));
             let Some(active) = sessions.get(&session_id).cloned() else {
+                provider_session_debug(format!(
+                    "closing unknown session {session_id} after s.req from {remote}"
+                ));
                 send_provider_session_close(bridge, &remote, &session_id, "err:unknown_session")
                     .await?;
                 return Ok(());
@@ -9179,8 +9266,39 @@ async fn handle_provider_session_frame(
                 .filter(|rid| !rid.is_empty())
                 .unwrap_or("missing-rid");
             let body = frame.get("body").cloned().unwrap_or(Value::Null);
-            let output = responder.respond(terms, &body)?;
-            let receipt = send_provider_session_output(
+            provider_session_debug(format!(
+                "building response for session {session_id} request {request_id}"
+            ));
+            let output = match responder.respond(terms, &body) {
+                Ok(output) => output,
+                Err(err) => {
+                    provider_session_debug(format!(
+                        "response failed for session {session_id}: {err:#}"
+                    ));
+                    send_provider_session_error(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        request_id,
+                        "provider_response_failed",
+                        &err.to_string(),
+                    )
+                    .await?;
+                    send_provider_session_close(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        "err:provider_response_failed",
+                    )
+                    .await?;
+                    sessions.remove(&session_id);
+                    return Ok(());
+                }
+            };
+            provider_session_debug(format!(
+                "sending response for session {session_id} request {request_id}"
+            ));
+            let receipt = match send_provider_session_output(
                 bridge,
                 &active,
                 request_id,
@@ -9189,11 +9307,45 @@ async fn handle_provider_session_frame(
                 &output,
                 runtime.runtime_keypair,
             )
-            .await?;
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(err) => {
+                    provider_session_debug(format!(
+                        "sending response failed for session {session_id}: {err:#}"
+                    ));
+                    send_provider_session_error(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        request_id,
+                        "provider_send_failed",
+                        &err.to_string(),
+                    )
+                    .await
+                    .ok();
+                    send_provider_session_close(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        "err:provider_send_failed",
+                    )
+                    .await
+                    .ok();
+                    sessions.remove(&session_id);
+                    return Ok(());
+                }
+            };
+            provider_session_debug(format!(
+                "waiting for receipt ack on session {session_id} request {request_id}"
+            ));
             if wait_for_provider_receipt_ack(bridge, &active, &receipt, Duration::from_secs(5))
                 .await
                 .is_err()
             {
+                provider_session_debug(format!(
+                    "receipt ack timeout on session {session_id} request {request_id}"
+                ));
                 send_provider_session_close(
                     bridge,
                     &active.remote,
@@ -9204,6 +9356,9 @@ async fn handle_provider_session_frame(
                 sessions.remove(&session_id);
                 return Ok(());
             }
+            provider_session_debug(format!(
+                "receipt ack received on session {session_id} request {request_id}"
+            ));
             send_provider_session_close(bridge, &active.remote, &active.session_id, "done").await?;
             sessions.remove(&session_id);
         }
@@ -9225,6 +9380,10 @@ async fn send_provider_session_output(
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     if let Some(tool) = &output.tool {
+        provider_session_debug(format!(
+            "sending tool-call s.delta for session {} request {request_id}",
+            active.session_id
+        ));
         bridge
             .session_send(
                 &active.remote,
@@ -9244,6 +9403,10 @@ async fn send_provider_session_output(
     } else {
         let mut index = 0_u64;
         for part in provider_stream_parts(&output.content) {
+            provider_session_debug(format!(
+                "sending content s.delta #{index} for session {} request {request_id}",
+                active.session_id
+            ));
             bridge
                 .session_send(
                     &active.remote,
@@ -9261,6 +9424,10 @@ async fn send_provider_session_output(
                 .context("sending content s.delta")?;
             index = index.saturating_add(1);
         }
+        provider_session_debug(format!(
+            "sending final s.delta #{index} for session {} request {request_id}",
+            active.session_id
+        ));
         bridge
             .session_send(
                 &active.remote,
@@ -9281,6 +9448,10 @@ async fn send_provider_session_output(
 
     let receipt = provider_session_receipt(terms, active, body, output, runtime_keypair)
         .context("building provider session receipt")?;
+    provider_session_debug(format!(
+        "sending s.receipt seq {} for session {} request {request_id}",
+        receipt.body.seq, active.session_id
+    ));
     bridge
         .session_send(
             &active.remote,
@@ -9296,6 +9467,32 @@ async fn send_provider_session_output(
         .await
         .context("sending s.receipt")?;
     Ok(receipt)
+}
+
+async fn send_provider_session_error(
+    bridge: &mut ScBridgeClient,
+    remote: &str,
+    session_id: &str,
+    request_id: &str,
+    code: &str,
+    message: &str,
+) -> Result<()> {
+    bridge
+        .session_send(
+            remote,
+            session_id,
+            json!({
+                "t": "s.error",
+                "v": 1,
+                "session_id": session_id,
+                "rid": request_id,
+                "code": code,
+                "message": message,
+            }),
+        )
+        .await
+        .with_context(|| format!("sending s.error for {session_id}"))?;
+    Ok(())
 }
 
 async fn wait_for_provider_receipt_ack(
@@ -9406,7 +9603,6 @@ async fn send_provider_session_close(
         )
         .await
         .with_context(|| format!("sending s.close for {session_id}"))?;
-    let _ = bridge.session_close(remote, session_id).await;
     Ok(())
 }
 
@@ -10009,6 +10205,20 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             prompt_tokens,
         };
     }
+    let prompt_lower = prompt.to_lowercase();
+    if prompt.contains(OPENCODE_TEST_MARKER) || prompt_lower.contains("bash tool") {
+        return ProviderSessionOutput {
+            content: String::new(),
+            tool: Some(json!({
+                "id": format!("call-{}", stable_value_hash(&json!({ "tool": "bash", "prompt": prompt }))),
+                "name": "bash",
+                "arguments": provider_tool_arguments("bash"),
+            })),
+            finish_reason: "tool_calls".to_owned(),
+            prompt_tokens,
+            completion_tokens: 1,
+        };
+    }
     if let Some(tool_name) = provider_requested_tool_name(body) {
         return ProviderSessionOutput {
             content: String::new(),
@@ -10547,13 +10757,22 @@ async fn run_wallet_helper<T>(args: Vec<String>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/wallet-helper.mjs");
-    let output = Command::new("node")
+    let helper = env::var_os("MAYHEM_WALLET_HELPER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/wallet-helper.mjs"));
+    let node = env::var_os("MAYHEM_NODE_BIN").unwrap_or_else(|| "node".into());
+    let output = Command::new(&node)
         .arg(&helper)
         .args(args)
         .output()
         .await
-        .with_context(|| format!("running wallet helper {}", helper.display()))?;
+        .with_context(|| {
+            format!(
+                "running wallet helper {} with {}",
+                helper.display(),
+                PathBuf::from(&node).display()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

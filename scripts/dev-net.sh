@@ -14,6 +14,8 @@ Options:
 Environment:
   MAYHEM_DEVNET_JOINERS=1 starts only joiner-a. The default is 2.
   MAYHEM_DEVNET_NETWORK passes an explicit app network flag, for example development.
+  MAYHEM_DEVNET_SUBNET_CHANNEL overrides the default local subnet channel.
+  MAYHEM_DEVNET_PEER_DHT_BOOTSTRAP passes --peer-dht-bootstrap to every peer.
 USAGE
 }
 
@@ -68,7 +70,7 @@ fi
 mkdir -p "$log_dir"
 
 token="${MAYHEM_DEVNET_TOKEN:-mayhem-devnet-token-$(date +%s)-$$}"
-subnet_channel="mayhem-devnet-local"
+subnet_channel="${MAYHEM_DEVNET_SUBNET_CHANNEL:-mayhem-devnet-local}"
 startup_timeout_sec="${MAYHEM_DEVNET_STARTUP_TIMEOUT:-120}"
 connection_timeout_sec="${MAYHEM_DEVNET_CONNECTION_TIMEOUT:-120}"
 joiner_count="${MAYHEM_DEVNET_JOINERS:-2}"
@@ -77,6 +79,7 @@ if [[ "$joiner_count" != "1" && "$joiner_count" != "2" ]]; then
   exit 2
 fi
 network_env="${MAYHEM_DEVNET_NETWORK:-local}"
+peer_dht_bootstrap="${MAYHEM_DEVNET_PEER_DHT_BOOTSTRAP:-}"
 
 pids=()
 cleanup_processes() {
@@ -119,6 +122,9 @@ start_peer() {
     .
   )
   args+=(--network "$network_env")
+  if [[ -n "$peer_dht_bootstrap" ]]; then
+    args+=(--peer-dht-bootstrap "$peer_dht_bootstrap")
+  fi
   args+=(
     --peer-store-name "$store"
     --msb-store-name "$msb_store"
@@ -139,6 +145,12 @@ start_peer() {
     --api-tx-exposed 1
     --api-tx-local-apply 1
   )
+  if [[ "${SC_BRIDGE_DEBUG:-}" == "1" || "${SC_BRIDGE_DEBUG:-}" == "true" ]]; then
+    args+=(--sc-bridge-debug 1)
+  fi
+  if [[ "${SESSION_DEBUG:-}" == "1" || "${SESSION_DEBUG:-}" == "true" ]]; then
+    args+=(--session-debug 1)
+  fi
   if [[ -n "$bootstrap" ]]; then
     args+=(--subnet-bootstrap "$bootstrap")
   fi

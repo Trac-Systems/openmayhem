@@ -892,7 +892,6 @@ impl ScBridgeGatewaySessionBackend {
                 }),
             )
             .await;
-        let _ = bridge.session_close(provider, &invocation.session_id).await;
 
         Ok(GatewaySessionResult {
             output: collected.output,
@@ -1145,7 +1144,7 @@ async fn collect_direct_session_output(
             bridge,
             session_id,
             remaining,
-            &["s.delta", "s.receipt", "s.close"],
+            &["s.delta", "s.receipt", "s.error", "s.close"],
         )
         .await?;
         match frame.get("t").and_then(Value::as_str) {
@@ -1167,6 +1166,19 @@ async fn collect_direct_session_output(
                     session_id,
                     enclave_pubkey,
                 )?);
+            }
+            Some("s.error") => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_error");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider returned s.error");
+                return Err(GatewaySessionError::new(format!(
+                    "provider returned {code} on session {session_id}: {message}"
+                )));
             }
             Some("s.close") => {
                 let reason = frame

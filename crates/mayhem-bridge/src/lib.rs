@@ -149,7 +149,11 @@ impl ScBridgeClient {
             .map(|session_id| session_id.as_ref().to_owned())
             .collect::<Vec<_>>();
         self.request(
-            json!({ "type": "session_subscribe", "session_ids": session_ids }),
+            json!({
+                "type": "session_subscribe",
+                "session_ids": session_ids,
+                "sidechannel": false,
+            }),
             "session_subscribed",
         )
         .await
@@ -157,7 +161,11 @@ impl ScBridgeClient {
 
     pub async fn session_subscribe_all(&mut self) -> Result<Value> {
         self.request(
-            json!({ "type": "session_subscribe", "session_ids": ["*"] }),
+            json!({
+                "type": "session_subscribe",
+                "session_ids": ["*"],
+                "sidechannel": false,
+            }),
             "session_subscribed",
         )
         .await

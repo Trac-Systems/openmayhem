@@ -92,8 +92,10 @@ class DirectSession extends Feature {
     const connection = this._findConnection(normalizedRemote);
     if (!connection) throw new Error(`No direct connection to ${normalizedRemote}.`);
     const session = this._ensureSession(connection, normalizedSession);
-    const opened = await session.channel.fullyOpened();
-    if (!opened) throw new Error(`Session ${normalizedSession} was not opened.`);
+    if (session.channel?.opened !== true) {
+      const opened = await session.channel.fullyOpened();
+      if (!opened) throw new Error(`Session ${normalizedSession} was not opened.`);
+    }
     return this._sessionInfo(session);
   }
 
@@ -107,8 +109,15 @@ class DirectSession extends Feature {
     if (!this._checkRate(record.sendLimiter, frameBytes)) {
       throw new Error(`Session ${session.session_id} send rate limit exceeded.`);
     }
+    if (this.debug) {
+      console.log(
+        `[direct-session:${session.session_id}] send ${frame?.t || 'frame'} to ${session.remote}`
+      );
+    }
     const ok = record.message.send(frame);
-    if (!ok) throw new Error(`Session ${session.session_id} send failed.`);
+    if (!ok && this.debug) {
+      console.log(`[direct-session:${session.session_id}] send accepted with backpressure`);
+    }
     return this._sessionInfo(record);
   }
 
@@ -216,6 +225,11 @@ class DirectSession extends Feature {
     if (!this._checkRate(session.receiveLimiter, frameBytes)) {
       if (this.debug) console.log(`[direct-session:${session.sessionId}] drop (rate limit)`);
       return;
+    }
+    if (this.debug) {
+      console.log(
+        `[direct-session:${session.sessionId}] recv ${frame?.t || 'frame'} from ${session.remote}`
+      );
     }
     if (this.onFrame) {
       this.onFrame({
