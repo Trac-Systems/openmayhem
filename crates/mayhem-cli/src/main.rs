@@ -238,6 +238,8 @@ enum CatalogCommands {
     ApplyCanaryReports(CatalogApplyCanaryReportsArgs),
     /// Audit per-backend canary fingerprint coverage for launch artifacts.
     CanaryMatrix(CatalogCanaryMatrixArgs),
+    /// Print copy/paste calibration commands for the catalog canary matrix.
+    CanaryPlan(CatalogCanaryPlanArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -1061,6 +1063,73 @@ struct CatalogCanaryMatrixArgs {
     include_dev: bool,
 
     /// Print a machine-readable coverage report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogCanaryPlanArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Base directory containing admin catalog artifacts at their catalog paths.
+    #[arg(long, value_name = "PATH")]
+    artifact_base: PathBuf,
+
+    /// Directory where calibrate-canary reports should be written by the printed commands.
+    #[arg(long, value_name = "PATH")]
+    report_dir: PathBuf,
+
+    /// Unsigned catalog draft path for the printed apply-canary-reports command.
+    #[arg(long, value_name = "PATH")]
+    catalog_output: Option<PathBuf>,
+
+    /// Base directory containing TensorRT-LLM prebuilt engine directories.
+    #[arg(long, value_name = "PATH")]
+    trt_engine_base: Option<PathBuf>,
+
+    /// Engine context size for the printed calibration commands.
+    #[arg(long, default_value_t = 1024)]
+    ctx_size: u32,
+
+    /// Seed for deterministic calibration requests.
+    #[arg(long, default_value_t = 0)]
+    seed: u32,
+
+    /// Optional llama.cpp thread count for the printed calibration commands.
+    #[arg(long)]
+    threads: Option<i32>,
+
+    /// Optional GPU layer count for llama.cpp calibration commands.
+    #[arg(long)]
+    gpu_layers: Option<u32>,
+
+    /// TensorRT-LLM tensor-parallel degree for calibration commands.
+    #[arg(long)]
+    trt_tensor_parallel: Option<u32>,
+
+    /// TensorRT-LLM KV cache dtype override for calibration commands.
+    #[arg(long)]
+    trt_kv_cache_dtype: Option<String>,
+
+    /// TensorRT-LLM runtime max batch size for calibration commands.
+    #[arg(long)]
+    trt_max_batch_size: Option<u32>,
+
+    /// TensorRT-LLM runtime max token capacity for calibration commands.
+    #[arg(long)]
+    trt_max_num_tokens: Option<u32>,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable command plan.
     #[arg(long)]
     json: bool,
 }
@@ -2062,6 +2131,7 @@ async fn main() -> Result<()> {
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
             CatalogCommands::ApplyCanaryReports(args) => catalog_apply_canary_reports(args),
             CatalogCommands::CanaryMatrix(args) => catalog_canary_matrix(args),
+            CatalogCommands::CanaryPlan(args) => catalog_canary_plan(args),
         },
         Commands::Provider { command } => match *command {
             ProviderCommands::Start(args) => provider_start(*args).await,
@@ -2701,6 +2771,102 @@ fn catalog_canary_matrix(args: CatalogCanaryMatrixArgs) -> Result<()> {
     Ok(())
 }
 
+fn catalog_canary_plan(args: CatalogCanaryPlanArgs) -> Result<()> {
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+    let artifact_base = absolutize(args.artifact_base.clone())?;
+    let report_dir = absolutize(args.report_dir.clone())?;
+    let catalog_output = args
+        .catalog_output
+        .clone()
+        .unwrap_or_else(|| report_dir.join("catalog.with-canaries.json"));
+    let catalog_output = absolutize(catalog_output)?;
+    let trt_engine_base = args
+        .trt_engine_base
+        .clone()
+        .unwrap_or_else(|| artifact_base.join(".trtllm-engines"));
+    let trt_engine_base = absolutize(trt_engine_base)?;
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+
+    let report = catalog_canary_plan_report(CatalogCanaryPlanInput {
+        catalog_doc: &catalog_doc,
+        catalog_path,
+        canaries_dir,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        trt_engine_base,
+        launch_only: !args.include_dev,
+        args: &args,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Canary calibration command plan.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Canaries: {}", report.canaries_dir.display());
+        println!("Artifact base: {}", report.artifact_base.display());
+        println!("Report dir: {}", report.report_dir.display());
+        println!(
+            "Scope: {}",
+            if report.launch_only {
+                "launch models"
+            } else {
+                "launch + dev models"
+            }
+        );
+        println!(
+            "Coverage: {} models, {} artifacts, ok={}",
+            report.model_count, report.artifact_count, report.ok
+        );
+        for entry in &report.calibration_commands {
+            println!(
+                "- {} / {} ({}) [{}]: {}",
+                entry.model_id,
+                entry.artifact,
+                entry.engine,
+                entry.canary_set,
+                entry.calibration_status
+            );
+            println!("  artifact: {}", entry.artifact_path.display());
+            println!("  report: {}", entry.report_path.display());
+            if let Some(trt_engine_dir) = &entry.trt_engine_dir {
+                println!("  trt engine: {}", trt_engine_dir.display());
+            }
+            println!("  command: {}", entry.command.shell);
+            for error in &entry.errors {
+                println!("  error: {error}");
+            }
+        }
+        println!("Apply reports:");
+        println!("{}", report.apply_command.shell);
+        println!("Verify unsigned catalog draft:");
+        println!("{}", report.evidence_command.shell);
+        for error in &report.errors {
+            println!("Global error: {error}");
+        }
+    }
+
+    if !report.ok {
+        bail!(
+            "canary calibration command plan has {} error(s)",
+            report.errors.len()
+        );
+    }
+    Ok(())
+}
+
 fn catalog_canary_evidence(args: CatalogCanaryEvidenceArgs) -> Result<()> {
     let catalog_path = args
         .catalog_path
@@ -3179,6 +3345,303 @@ fn apply_canary_report_fingerprints(
         applied += 1;
     }
     Ok(applied)
+}
+
+struct CatalogCanaryPlanInput<'a> {
+    catalog_doc: &'a catalog::CatalogDocument,
+    catalog_path: PathBuf,
+    canaries_dir: PathBuf,
+    artifact_base: PathBuf,
+    report_dir: PathBuf,
+    catalog_output: PathBuf,
+    trt_engine_base: PathBuf,
+    launch_only: bool,
+    args: &'a CatalogCanaryPlanArgs,
+}
+
+struct CatalogCanaryCalibrationPlanInput<'a> {
+    catalog_path: &'a Path,
+    canaries_dir: &'a Path,
+    model: &'a catalog::CatalogModel,
+    artifact_name: &'a str,
+    artifact: &'a catalog::CatalogArtifact,
+    artifact_path: &'a Path,
+    report_path: &'a Path,
+    trt_engine_dir: Option<&'a Path>,
+    args: &'a CatalogCanaryPlanArgs,
+}
+
+fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanaryPlanReport {
+    let CatalogCanaryPlanInput {
+        catalog_doc,
+        catalog_path,
+        canaries_dir,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        trt_engine_base,
+        launch_only,
+        args,
+    } = input;
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+
+    for model in &catalog_doc.models {
+        if launch_only && model.tier != "launch" {
+            continue;
+        }
+        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id);
+        for (artifact_name, artifact) in &model.artifacts {
+            let mut entry_errors = Vec::new();
+            if let Err(err) = &canary_check {
+                entry_errors.push(err.clone());
+            }
+            let artifact_rel_path = PathBuf::from(&artifact.path);
+            if artifact_rel_path.is_absolute() {
+                entry_errors.push(format!(
+                    "catalog artifact path {} must be relative to --artifact-base",
+                    artifact.path
+                ));
+            }
+            let artifact_path = artifact_base.join(&artifact.path);
+            let report_path = report_dir
+                .join(safe_path_component(&model.model_id))
+                .join(format!(
+                    "{}.canary.json",
+                    safe_path_component(artifact_name)
+                ));
+            let trt_engine_dir = (artifact.engine == "trt-llm").then(|| {
+                trt_engine_base
+                    .join(safe_path_component(&model.model_id))
+                    .join(safe_path_component(artifact_name))
+            });
+            let calibration_status = match artifact.engine.as_str() {
+                "llama.cpp" | "mlx" => "ready",
+                "trt-llm" => "requires-prebuilt-trt-engine",
+                other => {
+                    entry_errors.push(format!("unsupported calibration engine {other}"));
+                    "unsupported-calibration-engine"
+                }
+            }
+            .to_owned();
+            let command =
+                catalog_canary_calibration_plan_command(CatalogCanaryCalibrationPlanInput {
+                    catalog_path: &catalog_path,
+                    canaries_dir: &canaries_dir,
+                    model,
+                    artifact_name,
+                    artifact,
+                    artifact_path: &artifact_path,
+                    report_path: &report_path,
+                    trt_engine_dir: trt_engine_dir.as_deref(),
+                    args,
+                });
+            let ok = entry_errors.is_empty();
+            let entry = CatalogCanaryPlanEntry {
+                model_id: model.model_id.clone(),
+                tier: model.tier.clone(),
+                artifact: artifact_name.clone(),
+                engine: artifact.engine.clone(),
+                canary_set: model.canary.set_id.clone(),
+                prompt_count: canary_check.as_ref().ok().copied(),
+                artifact_path,
+                report_path,
+                trt_engine_dir,
+                calibration_status,
+                command,
+                ok,
+                errors: entry_errors,
+            };
+            if !entry.ok {
+                errors.extend(
+                    entry
+                        .errors
+                        .iter()
+                        .map(|error| format!("{} {}: {error}", entry.model_id, entry.artifact)),
+                );
+            }
+            entries.push(entry);
+        }
+    }
+
+    if entries.is_empty() {
+        errors.push(if launch_only {
+            "catalog has no launch model artifacts to plan".to_owned()
+        } else {
+            "catalog has no model artifacts to plan".to_owned()
+        });
+    }
+
+    let report_paths = entries
+        .iter()
+        .map(|entry| entry.report_path.clone())
+        .collect::<Vec<_>>();
+    let apply_command = catalog_canary_plan_apply_command(
+        &catalog_path,
+        &canaries_dir,
+        &catalog_output,
+        launch_only,
+        &report_paths,
+    );
+    let evidence_command = catalog_canary_plan_evidence_command(
+        &catalog_output,
+        &canaries_dir,
+        launch_only,
+        &report_paths,
+    );
+    let model_count = entries
+        .iter()
+        .map(|entry| entry.model_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    CatalogCanaryPlanReport {
+        catalog_path,
+        canaries_dir,
+        artifact_base,
+        report_dir,
+        catalog_output,
+        trt_engine_base,
+        launch_only,
+        model_count,
+        artifact_count: entries.len(),
+        ok: errors.is_empty(),
+        calibration_commands: entries,
+        apply_command,
+        evidence_command,
+        errors,
+    }
+}
+
+fn catalog_canary_calibration_plan_command(
+    input: CatalogCanaryCalibrationPlanInput<'_>,
+) -> CatalogCanaryPlanCommand {
+    let CatalogCanaryCalibrationPlanInput {
+        catalog_path,
+        canaries_dir,
+        model,
+        artifact_name,
+        artifact,
+        artifact_path,
+        report_path,
+        trt_engine_dir,
+        args,
+    } = input;
+    let mut argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "calibrate-canary".to_owned(),
+    ];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
+    push_plan_path_arg(&mut argv, "--canaries-dir", canaries_dir);
+    push_plan_value_arg(&mut argv, "--model", &model.model_id);
+    push_plan_value_arg(&mut argv, "--artifact", artifact_name);
+    push_plan_path_arg(&mut argv, "--artifact-path", artifact_path);
+    push_plan_value_arg(&mut argv, "--ctx-size", args.ctx_size.max(1).to_string());
+    push_plan_value_arg(&mut argv, "--seed", args.seed.to_string());
+    if let Some(threads) = args.threads {
+        push_plan_value_arg(&mut argv, "--threads", threads.to_string());
+    }
+    if let Some(gpu_layers) = args.gpu_layers {
+        push_plan_value_arg(&mut argv, "--gpu-layers", gpu_layers.to_string());
+    }
+    if artifact.engine == "trt-llm" {
+        if let Some(trt_engine_dir) = trt_engine_dir {
+            push_plan_path_arg(&mut argv, "--trt-engine-dir", trt_engine_dir);
+        }
+        argv.push("--trt-require-engine-dir".to_owned());
+        push_plan_value_arg(
+            &mut argv,
+            "--trt-tensor-parallel",
+            args.trt_tensor_parallel.unwrap_or(1).max(1).to_string(),
+        );
+        if let Some(kv_cache_dtype) = &args.trt_kv_cache_dtype {
+            push_plan_value_arg(&mut argv, "--trt-kv-cache-dtype", kv_cache_dtype);
+        }
+        if let Some(max_batch_size) = args.trt_max_batch_size {
+            push_plan_value_arg(
+                &mut argv,
+                "--trt-max-batch-size",
+                max_batch_size.max(1).to_string(),
+            );
+        }
+        if let Some(max_num_tokens) = args.trt_max_num_tokens {
+            push_plan_value_arg(
+                &mut argv,
+                "--trt-max-num-tokens",
+                max_num_tokens.max(args.ctx_size.max(1)).max(1).to_string(),
+            );
+        }
+    }
+    push_plan_path_arg(&mut argv, "--report-output", report_path);
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
+}
+
+fn catalog_canary_plan_apply_command(
+    catalog_path: &Path,
+    canaries_dir: &Path,
+    catalog_output: &Path,
+    launch_only: bool,
+    report_paths: &[PathBuf],
+) -> CatalogCanaryPlanCommand {
+    let mut argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "apply-canary-reports".to_owned(),
+    ];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
+    push_plan_path_arg(&mut argv, "--canaries-dir", canaries_dir);
+    push_plan_path_arg(&mut argv, "--output", catalog_output);
+    if !launch_only {
+        argv.push("--include-dev".to_owned());
+    }
+    for report_path in report_paths {
+        push_plan_path_arg(&mut argv, "--report", report_path);
+    }
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
+}
+
+fn catalog_canary_plan_evidence_command(
+    catalog_path: &Path,
+    canaries_dir: &Path,
+    launch_only: bool,
+    report_paths: &[PathBuf],
+) -> CatalogCanaryPlanCommand {
+    let mut argv = vec![
+        "mayhem".to_owned(),
+        "catalog".to_owned(),
+        "canary-evidence".to_owned(),
+    ];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_path);
+    push_plan_path_arg(&mut argv, "--canaries-dir", canaries_dir);
+    if !launch_only {
+        argv.push("--include-dev".to_owned());
+    }
+    for report_path in report_paths {
+        push_plan_path_arg(&mut argv, "--report", report_path);
+    }
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
+}
+
+fn push_plan_path_arg(argv: &mut Vec<String>, flag: &str, path: &Path) {
+    argv.push(flag.to_owned());
+    argv.push(path.display().to_string());
+}
+
+fn push_plan_value_arg(argv: &mut Vec<String>, flag: &str, value: impl ToString) {
+    argv.push(flag.to_owned());
+    argv.push(value.to_string());
+}
+
+fn catalog_canary_plan_command(argv: Vec<String>) -> CatalogCanaryPlanCommand {
+    let shell = argv
+        .iter()
+        .map(|arg| shell_single_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    CatalogCanaryPlanCommand { argv, shell }
 }
 
 fn catalog_canary_matrix_report(
@@ -4911,6 +5374,47 @@ struct CatalogCanaryMatrixEntry {
     calibration_status: String,
     ok: bool,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryPlanReport {
+    catalog_path: PathBuf,
+    canaries_dir: PathBuf,
+    artifact_base: PathBuf,
+    report_dir: PathBuf,
+    catalog_output: PathBuf,
+    trt_engine_base: PathBuf,
+    launch_only: bool,
+    model_count: usize,
+    artifact_count: usize,
+    ok: bool,
+    calibration_commands: Vec<CatalogCanaryPlanEntry>,
+    apply_command: CatalogCanaryPlanCommand,
+    evidence_command: CatalogCanaryPlanCommand,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryPlanEntry {
+    model_id: String,
+    tier: String,
+    artifact: String,
+    engine: String,
+    canary_set: String,
+    prompt_count: Option<usize>,
+    artifact_path: PathBuf,
+    report_path: PathBuf,
+    trt_engine_dir: Option<PathBuf>,
+    calibration_status: String,
+    command: CatalogCanaryPlanCommand,
+    ok: bool,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogCanaryPlanCommand {
+    argv: Vec<String>,
+    shell: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -15045,6 +15549,119 @@ mod tests {
     }
 
     #[test]
+    fn canary_plan_emits_launch_calibration_and_followup_commands() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].canary.set_id = "test-canary-zero".to_owned();
+        let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        trt_artifact.engine = "trt-llm".to_owned();
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), trt_artifact);
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("nvfp4".to_owned(), "bb".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary-zero", 0.0);
+        let mut args = test_canary_plan_args();
+        args.trt_tensor_parallel = Some(2);
+        args.trt_max_batch_size = Some(4);
+        args.trt_max_num_tokens = Some(4096);
+
+        let report = catalog_canary_plan_report(CatalogCanaryPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            canaries_dir,
+            artifact_base: PathBuf::from("/tmp/artifacts"),
+            report_dir: PathBuf::from("/tmp/reports"),
+            catalog_output: PathBuf::from("/tmp/reports/catalog.with-canaries.json"),
+            trt_engine_base: PathBuf::from("/tmp/trt-engines"),
+            launch_only: true,
+            args: &args,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.model_count, 1);
+        assert_eq!(report.artifact_count, 2);
+        let gguf = report
+            .calibration_commands
+            .iter()
+            .find(|entry| entry.artifact == "gguf-q4_k_m")
+            .unwrap();
+        assert!(gguf.command.shell.contains("'calibrate-canary'"));
+        assert!(!gguf
+            .command
+            .argv
+            .iter()
+            .any(|arg| arg == "--trt-engine-dir"));
+        let trt = report
+            .calibration_commands
+            .iter()
+            .find(|entry| entry.artifact == "nvfp4")
+            .unwrap();
+        assert_eq!(trt.calibration_status, "requires-prebuilt-trt-engine");
+        assert!(trt.command.argv.iter().any(|arg| arg == "--trt-engine-dir"));
+        assert!(trt
+            .command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--trt-tensor-parallel" && pair[1] == "2"));
+        assert!(trt
+            .command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--trt-max-batch-size" && pair[1] == "4"));
+        assert!(report
+            .apply_command
+            .shell
+            .contains("'apply-canary-reports'"));
+        assert_eq!(
+            report
+                .apply_command
+                .argv
+                .iter()
+                .filter(|arg| arg.as_str() == "--report")
+                .count(),
+            2
+        );
+        assert!(report.evidence_command.shell.contains("'canary-evidence'"));
+        assert!(report
+            .evidence_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--catalog-path"
+                && pair[1] == "/tmp/reports/catalog.with-canaries.json"));
+    }
+
+    #[test]
+    fn canary_plan_allows_missing_existing_fingerprint_before_apply() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].canary.set_id = "test-canary-zero".to_owned();
+        let canaries_dir = test_canary_dir("test-canary-zero", 0.0);
+        let args = test_canary_plan_args();
+
+        let report = catalog_canary_plan_report(CatalogCanaryPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            canaries_dir,
+            artifact_base: PathBuf::from("/tmp/artifacts"),
+            report_dir: PathBuf::from("/tmp/reports"),
+            catalog_output: PathBuf::from("/tmp/reports/catalog.with-canaries.json"),
+            trt_engine_base: PathBuf::from("/tmp/trt-engines"),
+            launch_only: true,
+            args: &args,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.artifact_count, 1);
+    }
+
+    #[test]
     fn canary_evidence_accepts_full_launch_report_set() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -15694,6 +16311,27 @@ mod tests {
             trt_kv_cache_dtype: None,
             trt_max_batch_size: None,
             trt_max_num_tokens: None,
+            json: false,
+        }
+    }
+
+    fn test_canary_plan_args() -> CatalogCanaryPlanArgs {
+        CatalogCanaryPlanArgs {
+            catalog_path: None,
+            canaries_dir: None,
+            artifact_base: PathBuf::from("/tmp/artifacts"),
+            report_dir: PathBuf::from("/tmp/reports"),
+            catalog_output: None,
+            trt_engine_base: None,
+            ctx_size: 1024,
+            seed: 0,
+            threads: None,
+            gpu_layers: None,
+            trt_tensor_parallel: None,
+            trt_kv_cache_dtype: None,
+            trt_max_batch_size: None,
+            trt_max_num_tokens: None,
+            include_dev: false,
             json: false,
         }
     }
