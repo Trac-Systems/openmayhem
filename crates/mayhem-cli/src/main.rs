@@ -1188,6 +1188,30 @@ struct CatalogCanaryPlanArgs {
     #[arg(long, value_name = "PATH")]
     catalog_output: Option<PathBuf>,
 
+    /// Detached signature path for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_signature_output: Option<PathBuf>,
+
+    /// Catalog maintainer key id for an optional printed catalog sign command.
+    #[arg(long)]
+    catalog_key_id: Option<String>,
+
+    /// Ignored 32-byte Ed25519 seed file for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_seed_file: Option<PathBuf>,
+
+    /// Catalog public key directory for an optional printed catalog sign command.
+    #[arg(long, value_name = "PATH")]
+    catalog_keys_dir: Option<PathBuf>,
+
+    /// Include --write-key in the optional printed catalog sign command.
+    #[arg(long)]
+    catalog_write_key: bool,
+
+    /// Include --created-at in the optional printed catalog sign command.
+    #[arg(long)]
+    catalog_created_at: Option<String>,
+
     /// Base directory containing TensorRT-LLM prebuilt engine directories.
     #[arg(long, value_name = "PATH")]
     trt_engine_base: Option<PathBuf>,
@@ -2723,6 +2747,7 @@ struct CatalogPublicKeyRecord {
 }
 
 fn catalog_sign_report(request: CatalogSignRequest) -> Result<CatalogSignReport> {
+    validate_catalog_key_id(&request.key_id)?;
     let catalog_bytes = fs::read(&request.catalog_path)
         .with_context(|| format!("reading {}", request.catalog_path.display()))?;
     let file_name = request
@@ -2749,7 +2774,6 @@ fn catalog_sign_report(request: CatalogSignRequest) -> Result<CatalogSignReport>
     let mut key_path = None;
     let mut key_written = false;
     if request.write_key {
-        validate_catalog_key_id(&request.key_id)?;
         fs::create_dir_all(&request.keys_dir)
             .with_context(|| format!("creating {}", request.keys_dir.display()))?;
         let path = request.keys_dir.join(format!("{}.json", request.key_id));
@@ -3688,6 +3712,7 @@ fn catalog_canary_plan(args: CatalogCanaryPlanArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| artifact_base.join(".trtllm-engines"));
     let trt_engine_base = absolutize(trt_engine_base)?;
+    let catalog_sign = catalog_canary_plan_sign_options(&args)?;
     let catalog_doc = catalog::load_document(&catalog_path)?;
 
     let report = catalog_canary_plan_report(CatalogCanaryPlanInput {
@@ -3698,6 +3723,7 @@ fn catalog_canary_plan(args: CatalogCanaryPlanArgs) -> Result<()> {
         report_dir,
         catalog_output,
         trt_engine_base,
+        catalog_sign,
         launch_only: !args.include_dev,
         args: &args,
     });
@@ -3743,6 +3769,10 @@ fn catalog_canary_plan(args: CatalogCanaryPlanArgs) -> Result<()> {
         }
         println!("Apply reports:");
         println!("{}", report.apply_command.shell);
+        if let Some(signature_command) = &report.signature_command {
+            println!("Sign catalog draft:");
+            println!("{}", signature_command.shell);
+        }
         println!("Verify unsigned catalog draft:");
         println!("{}", report.evidence_command.shell);
         for error in &report.errors {
@@ -3757,6 +3787,49 @@ fn catalog_canary_plan(args: CatalogCanaryPlanArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn catalog_canary_plan_sign_options(
+    args: &CatalogCanaryPlanArgs,
+) -> Result<Option<CatalogCanaryPlanSignOptions>> {
+    let requested = args.catalog_signature_output.is_some()
+        || args.catalog_key_id.is_some()
+        || args.catalog_seed_file.is_some()
+        || args.catalog_keys_dir.is_some()
+        || args.catalog_write_key
+        || args.catalog_created_at.is_some();
+    if !requested {
+        return Ok(None);
+    }
+    let signature_output = args
+        .catalog_signature_output
+        .clone()
+        .context("--catalog-signature-output is required when emitting a catalog sign command")?;
+    let signature_output = absolutize(signature_output)?;
+    let key_id = args
+        .catalog_key_id
+        .clone()
+        .context("--catalog-key-id is required when emitting a catalog sign command")?;
+    validate_catalog_key_id(&key_id)?;
+    let seed_file = args
+        .catalog_seed_file
+        .clone()
+        .context("--catalog-seed-file is required when emitting a catalog sign command")?;
+    let seed_file = absolutize(seed_file)?;
+    let keys_dir = args
+        .catalog_keys_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    Ok(Some(CatalogCanaryPlanSignOptions {
+        signature_output,
+        key_id,
+        seed_file,
+        keys_dir,
+        write_key: args.catalog_write_key,
+        created_at: args.catalog_created_at.clone(),
+    }))
 }
 
 fn catalog_canary_evidence(args: CatalogCanaryEvidenceArgs) -> Result<()> {
@@ -4247,8 +4320,19 @@ struct CatalogCanaryPlanInput<'a> {
     report_dir: PathBuf,
     catalog_output: PathBuf,
     trt_engine_base: PathBuf,
+    catalog_sign: Option<CatalogCanaryPlanSignOptions>,
     launch_only: bool,
     args: &'a CatalogCanaryPlanArgs,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogCanaryPlanSignOptions {
+    signature_output: PathBuf,
+    key_id: String,
+    seed_file: PathBuf,
+    keys_dir: PathBuf,
+    write_key: bool,
+    created_at: Option<String>,
 }
 
 struct CatalogCanaryCalibrationPlanInput<'a> {
@@ -4272,6 +4356,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
         report_dir,
         catalog_output,
         trt_engine_base,
+        catalog_sign,
         launch_only,
         args,
     } = input;
@@ -4381,6 +4466,9 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
         launch_only,
         &report_paths,
     );
+    let signature_command = catalog_sign
+        .as_ref()
+        .map(|sign| catalog_canary_plan_sign_command(&catalog_output, sign));
     let model_count = entries
         .iter()
         .map(|entry| entry.model_id.as_str())
@@ -4399,6 +4487,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
         ok: errors.is_empty(),
         calibration_commands: entries,
         apply_command,
+        signature_command,
         evidence_command,
         errors,
     }
@@ -4500,6 +4589,26 @@ fn catalog_canary_plan_apply_command(
     }
     for report_path in report_paths {
         push_plan_path_arg(&mut argv, "--report", report_path);
+    }
+    argv.push("--json".to_owned());
+    catalog_canary_plan_command(argv)
+}
+
+fn catalog_canary_plan_sign_command(
+    catalog_output: &Path,
+    sign: &CatalogCanaryPlanSignOptions,
+) -> CatalogCanaryPlanCommand {
+    let mut argv = vec!["mayhem".to_owned(), "catalog".to_owned(), "sign".to_owned()];
+    push_plan_path_arg(&mut argv, "--catalog-path", catalog_output);
+    push_plan_path_arg(&mut argv, "--signature-output", &sign.signature_output);
+    push_plan_value_arg(&mut argv, "--key-id", &sign.key_id);
+    push_plan_path_arg(&mut argv, "--seed-file", &sign.seed_file);
+    push_plan_path_arg(&mut argv, "--keys-dir", &sign.keys_dir);
+    if sign.write_key {
+        argv.push("--write-key".to_owned());
+    }
+    if let Some(created_at) = &sign.created_at {
+        push_plan_value_arg(&mut argv, "--created-at", created_at);
     }
     argv.push("--json".to_owned());
     catalog_canary_plan_command(argv)
@@ -6294,6 +6403,7 @@ struct CatalogCanaryPlanReport {
     ok: bool,
     calibration_commands: Vec<CatalogCanaryPlanEntry>,
     apply_command: CatalogCanaryPlanCommand,
+    signature_command: Option<CatalogCanaryPlanCommand>,
     evidence_command: CatalogCanaryPlanCommand,
     errors: Vec<String>,
 }
@@ -16479,6 +16589,14 @@ mod tests {
         args.trt_tensor_parallel = Some(2);
         args.trt_max_batch_size = Some(4);
         args.trt_max_num_tokens = Some(4096);
+        let catalog_sign = CatalogCanaryPlanSignOptions {
+            signature_output: PathBuf::from("/tmp/reports/models.json.sig"),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file: PathBuf::from("/tmp/catalog-seed.hex"),
+            keys_dir: PathBuf::from("/tmp/catalog-keys"),
+            write_key: true,
+            created_at: Some("2026-07-04T00:00:00Z".to_owned()),
+        };
 
         let report = catalog_canary_plan_report(CatalogCanaryPlanInput {
             catalog_doc: &catalog,
@@ -16488,6 +16606,7 @@ mod tests {
             report_dir: PathBuf::from("/tmp/reports"),
             catalog_output: PathBuf::from("/tmp/reports/catalog.with-canaries.json"),
             trt_engine_base: PathBuf::from("/tmp/trt-engines"),
+            catalog_sign: Some(catalog_sign),
             launch_only: true,
             args: &args,
         });
@@ -16550,6 +16669,21 @@ mod tests {
             .windows(2)
             .any(|pair| pair[0] == "--catalog-path"
                 && pair[1] == "/tmp/reports/catalog.with-canaries.json"));
+        let signature_command = report.signature_command.as_ref().unwrap();
+        assert!(signature_command.shell.contains("'catalog' 'sign'"));
+        assert!(signature_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--catalog-path"
+                && pair[1] == "/tmp/reports/catalog.with-canaries.json"));
+        assert!(signature_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--key-id" && pair[1] == "test-catalog-key"));
+        assert!(signature_command
+            .argv
+            .iter()
+            .any(|arg| arg == "--write-key"));
     }
 
     #[test]
@@ -16568,6 +16702,7 @@ mod tests {
             report_dir: PathBuf::from("/tmp/reports"),
             catalog_output: PathBuf::from("/tmp/reports/catalog.with-canaries.json"),
             trt_engine_base: PathBuf::from("/tmp/trt-engines"),
+            catalog_sign: None,
             launch_only: true,
             args: &args,
         });
@@ -17508,6 +17643,12 @@ mod tests {
             artifact_base: PathBuf::from("/tmp/artifacts"),
             report_dir: PathBuf::from("/tmp/reports"),
             catalog_output: None,
+            catalog_signature_output: None,
+            catalog_key_id: None,
+            catalog_seed_file: None,
+            catalog_keys_dir: None,
+            catalog_write_key: false,
+            catalog_created_at: None,
             trt_engine_base: None,
             ctx_size: 1024,
             seed: 0,
