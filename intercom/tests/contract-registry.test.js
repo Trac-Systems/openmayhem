@@ -216,6 +216,10 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.deepEqual(providerEntry.value, {
     provider: provider.publicKey,
     payout: null,
+    accepted_rails: ['fiat'],
+    accepted_rails_schema_version: 1,
+    accepted_rails_set_by: provider.publicKey,
+    accepted_rails_set_at: makeTxKey(3),
     status: 'active',
     enclaves: [],
     probation: {
@@ -1227,6 +1231,22 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
   );
   assert.match(unsupported.message, /unsupported payout method/i);
 
+  const retiredCoinbase = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'admin-approved-target',
+      payout_method: 'coinbase',
+      payout_currency: 'usd',
+    },
+    admin.publicKey,
+    7
+  );
+  assert.match(retiredCoinbase.message, /unsupported payout method/i);
+
   const adminPayout = await execute(
     contract,
     storage,
@@ -1238,7 +1258,7 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
       payout_method: 'tnk',
     },
     admin.publicKey,
-    7
+    8
   );
   assert.deepEqual(adminPayout, {
     ok: true,
@@ -1252,9 +1272,115 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
     method: 'tnk',
     set_by: admin.publicKey,
     set_by_role: 'admin',
-    set_at: makeTxKey(7),
+    set_at: makeTxKey(8),
   });
-  assert.equal(updated.value.updated_at, makeTxKey(7));
+  assert.equal(updated.value.updated_at, makeTxKey(8));
+});
+
+test('MayhemContract lets providers declare accepted payment rails without legacy migration', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: { op: 'register_provider' },
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+
+  const registered = (await storage.get(`prov/${provider.publicKey}`)).value;
+  assert.deepEqual(registered.accepted_rails, ['fiat']);
+  assert.equal(registered.accepted_rails_schema_version, 1);
+  assert.equal(registered.accepted_rails_set_by, provider.publicKey);
+
+  const rejectedCoinbase = await execute(
+    contract,
+    storage,
+    'setProviderRails',
+    {
+      op: 'set_provider_rails',
+      rails: ['coinbase'],
+    },
+    provider.publicKey,
+    4
+  );
+  assert.match(rejectedCoinbase.message, /unsupported provider payment rail/i);
+
+  const rejectedEmpty = await execute(
+    contract,
+    storage,
+    'setProviderRails',
+    {
+      op: 'set_provider_rails',
+      rails: [],
+    },
+    provider.publicKey,
+    5
+  );
+  assert.notEqual(rejectedEmpty.ok, true);
+  assert.match(rejectedEmpty.message, /invalid schema|cannot be empty/i);
+
+  const rejectedDuplicate = await execute(
+    contract,
+    storage,
+    'setProviderRails',
+    {
+      op: 'set_provider_rails',
+      rails: ['fiat', 'fiat'],
+    },
+    provider.publicKey,
+    6
+  );
+  assert.match(rejectedDuplicate.message, /duplicate provider payment rail/i);
+
+  const accepted = await execute(
+    contract,
+    storage,
+    'setProviderRails',
+    {
+      op: 'set_provider_rails',
+      rails: ['fiat', 'tap', 'tnk'],
+    },
+    provider.publicKey,
+    7
+  );
+  assert.deepEqual(accepted, {
+    ok: true,
+    op: 'setProviderRails',
+    provider: provider.publicKey,
+    rails: ['fiat', 'tap', 'tnk'],
+  });
+  const updated = (await storage.get(`prov/${provider.publicKey}`)).value;
+  assert.deepEqual(updated.accepted_rails, ['fiat', 'tap', 'tnk']);
+  assert.equal(updated.accepted_rails_schema_version, 1);
+  assert.equal(updated.accepted_rails_set_by, provider.publicKey);
+  assert.equal(updated.accepted_rails_set_at, makeTxKey(7));
+  assert.equal(updated.updated_at, makeTxKey(7));
 });
 
 test('MayhemContract admin verifies and revokes provider KYB without raw documents', async () => {

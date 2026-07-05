@@ -162,6 +162,29 @@ test('MayhemContract setProviderPayout stamps admin authority evidence', async (
     set_by_role: 'admin',
     set_at: makeTxKey(6),
   });
+
+  const tapTarget = await execute(
+    contract,
+    storage,
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: '0x' + '3'.repeat(40),
+      payout_method: 'tap',
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(tapTarget.ok, true, tapTarget.message);
+  const tapUpdated = (await storage.get(`prov/${provider.publicKey}`)).value;
+  assert.deepEqual(tapUpdated.payout, {
+    addr: '0x' + '3'.repeat(40),
+    method: 'tap',
+    set_by: admin.publicKey,
+    set_by_role: 'admin',
+    set_at: makeTxKey(7),
+  });
 });
 
 test('MayhemContract epoch roots commit provider entitlements without ev/pay evidence', async () => {

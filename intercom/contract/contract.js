@@ -2,11 +2,14 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
-export const CONTRACT_VERSION = 1;
+export const CONTRACT_VERSION = 2;
 const SIGNING_MESSAGE_VERSION = 2;
 const SUPPORTED_SIGNING_MESSAGE_VERSIONS = Object.freeze([2, 1]);
 const CURRENT_RULES_KEY = 'rules/current';
-const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
+const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
+const PROVIDER_ACCEPTED_RAIL_ORDER = Object.freeze(['fiat', 'tap', 'tnk']);
+const PROVIDER_RAIL_SCHEMA_VERSION = 1;
+const PAYOUT_TARGET_METHODS = new Set(['tnk', 'stripe', 'tap']);
 const FIAT_DEPOSIT_RAILS = new Set(['stripe', 'coinbase']);
 const FIAT_CURRENCIES = new Set(['usd', 'eur']);
 const PRICE_DENOMINATION = 'mu_usd';
@@ -362,6 +365,20 @@ class MayhemContract extends Contract {
         payout_addr: { type: 'string', min: 1, max: 256 },
         payout_method: { type: 'string', min: 1, max: 32 },
         payout_currency: { type: 'string', min: 3, max: 3, optional: true },
+      },
+    });
+
+    this.addSchema('setProviderRails', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        rails: {
+          type: 'array',
+          min: 1,
+          max: 3,
+          items: { type: 'string', min: 1, max: 16 },
+        },
       },
     });
 
@@ -1069,6 +1086,10 @@ class MayhemContract extends Contract {
     const record = {
       provider: providerId,
       payout: null,
+      accepted_rails: ['fiat'],
+      accepted_rails_schema_version: PROVIDER_RAIL_SCHEMA_VERSION,
+      accepted_rails_set_by: providerId,
+      accepted_rails_set_at: stamp,
       status: 'active',
       enclaves: [],
       probation: {
@@ -1084,17 +1105,62 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'registerProvider', provider: providerId };
   }
 
+  normalizeProviderAcceptedRails(rails) {
+    if (!Array.isArray(rails) || rails.length === 0) {
+      return new Error('Provider accepted rails cannot be empty.');
+    }
+    const accepted = [];
+    for (const rawRail of rails) {
+      if (typeof rawRail !== 'string') return new Error('Invalid provider rail.');
+      const rail = rawRail.toLowerCase();
+      if (!PROVIDER_ACCEPTED_RAILS.has(rail)) {
+        return new Error('Unsupported provider payment rail.');
+      }
+      if (accepted.includes(rail)) return new Error('Duplicate provider payment rail.');
+      accepted.push(rail);
+    }
+    if (accepted.length === 0) return new Error('Provider accepted rails cannot be empty.');
+    accepted.sort(
+      (left, right) =>
+        PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
+    );
+    return accepted;
+  }
+
+  async setProviderRails() {
+    const shapeError = this.validateExactCommandValue(['op', 'rails'], 'set_provider_rails');
+    if (shapeError) return shapeError;
+    const consentError = await this.requireConsent(this.address);
+    if (consentError) return consentError;
+    const provider = await this.get(`prov/${this.address}`);
+    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    const rails = this.normalizeProviderAcceptedRails(this.value.rails);
+    if (rails instanceof Error) return rails;
+
+    const updated = {
+      ...provider,
+      accepted_rails: rails,
+      accepted_rails_schema_version: PROVIDER_RAIL_SCHEMA_VERSION,
+      accepted_rails_set_by: this.address,
+      accepted_rails_set_at: this.tx,
+      updated_at: this.tx,
+    };
+    await this.put(`prov/${this.address}`, updated);
+    console.log('mayhem setProviderRails', updated);
+    return { ok: true, op: 'setProviderRails', provider: this.address, rails };
+  }
+
   async setProviderPayout() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     if (!this.isSafeKeyPart(this.value.provider)) return new Error('Invalid provider id.');
-    if (!PAYOUT_METHODS.has(this.value.payout_method)) {
+    if (!PAYOUT_TARGET_METHODS.has(this.value.payout_method)) {
       return new Error('Unsupported payout method.');
     }
     let payoutCurrency = null;
-    if (this.value.payout_method === 'tnk') {
+    if (this.value.payout_method === 'tnk' || this.value.payout_method === 'tap') {
       if (this.value.payout_currency !== undefined) {
-        return new Error('TNK payout target must not include fiat currency.');
+        return new Error('Crypto payout target must not include fiat currency.');
       }
     } else {
       if (this.value.payout_currency === undefined) {

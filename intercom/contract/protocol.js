@@ -67,6 +67,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'set_provider_rails') {
+      return {
+        type: 'setProviderRails',
+        value: json,
+      };
+    }
     if (json?.op === 'set_provider_kyb') {
       return {
         type: 'setProviderKyb',
@@ -228,7 +234,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "set_params", "submitted_at": 0, "effective_at": 86400, "values": { "fee_bps": 1500 } }\' --sim 1 | schedules parameter changes.');
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
     console.log('- Consent, provider lifecycle, and epoch apply are free Mayhem Feature records submitted by the Mayhem CLI/RPC feature path, not /tx commands.');
-    console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|coinbase" }\' --sim 1 | admin sets a provider payout target.');
+    console.log('- /tx --command \'{ "op": "set_provider_rails", "rails": ["fiat","tap","tnk"] }\' --sim 1 | provider declares the payment rails they accept for serving.');
+    console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|tap" }\' --sim 1 | admin sets a provider payout target.');
     console.log('- /tx --command \'{ "op": "set_provider_kyb", "provider": "<pubkey>", "legal_name": "Acme AI GmbH", "jurisdiction": "DE", "proof_hash": "<blake3>", "kyb_ref": "<off-ledger-ref>", "verified_at": 3600, "admin_sig": "<sig>" }\' --sim 1 | admin verifies provider business identity for Tier 4 accountability.');
     console.log('- /tx --command \'{ "op": "revoke_provider_kyb", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | admin revokes provider KYB and drops them back to their hardware tier.');
     console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
