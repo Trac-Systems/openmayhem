@@ -841,6 +841,16 @@ impl GatewayState {
         self
     }
 
+    pub fn with_receipt_user_seed(mut self, seed: [u8; 32]) -> Self {
+        self.receipt_config.user_seed = seed;
+        self
+    }
+
+    pub fn with_receipt_balance_mu(mut self, balance_mu: u64) -> Self {
+        self.receipt_config.balance_mu = balance_mu;
+        self
+    }
+
     pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
         self.session_backend = backend;
         self
@@ -7290,6 +7300,42 @@ mod tests {
         assert_eq!(invocation.failover.ttft_timeout_ms, 7_000);
         assert_eq!(invocation.failover.stall_timeout_ms, 9_000);
         assert_eq!(invocation.failover.min_tok_s, Some(30.0));
+    }
+
+    #[test]
+    fn receipt_wallet_balance_and_rail_are_configurable() {
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let user_seed = [12_u8; 32];
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_receipt_user_seed(user_seed)
+            .with_receipt_balance_mu(2_000_000)
+            .with_receipt_rail("tnk");
+        let invocation = state
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                None,
+                GatewayRequestOptions::default(),
+            )
+            .expect("configured wallet has enough balance");
+
+        assert_eq!(invocation.rail, "tnk");
+        assert_eq!(invocation.user_pubkey, verifying_key_hex(&user_seed));
+        assert_eq!(invocation.receipt_user_seed, user_seed);
+
+        let low_balance = GatewayState::from_models(vec![model.clone()])
+            .with_receipt_user_seed(user_seed)
+            .with_receipt_balance_mu(1);
+        let err = low_balance
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                None,
+                GatewayRequestOptions::default(),
+            )
+            .expect_err("gateway rejects spend vouchers above the startup balance snapshot");
+        assert!(err.message.contains("insufficient local balance"));
     }
 
     #[test]

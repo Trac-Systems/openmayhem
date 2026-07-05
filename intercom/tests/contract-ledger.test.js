@@ -1,16 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import MayhemContract from '../contract/contract.js';
+import MayhemContract, { CONTRACT_VERSION } from '../contract/contract.js';
 import MayhemProtocol from '../contract/protocol.js';
 import {
   MemoryStorage,
   execute,
   executeEpochApplyFeature,
   executeFeature,
+  executeSpendReservationFeature,
   epochApplyFeatureKey,
   makeIdentity,
+  makeTxKey,
   makeVerifier,
+  seedCurrentAdminPrice,
   signConsent,
+  signSpendReservation,
+  signSpendVoucher,
 } from './helpers/contract.js';
 
 const rulesHash = '7'.repeat(64);
@@ -51,6 +56,7 @@ const mapPaidOps = (commands) => {
 async function setupLedgerContract(identities = null) {
   const admin = identities?.admin ?? await makeIdentity();
   const provider = identities?.provider ?? await makeIdentity();
+  const provider2 = identities?.provider2 ?? await makeIdentity();
   const user = identities?.user ?? await makeIdentity();
   const outsider = identities?.outsider ?? await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });
@@ -81,13 +87,108 @@ async function setupLedgerContract(identities = null) {
       sender: provider.publicKey,
       txNo: 3,
     },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider2.wallet, 1, rulesHash),
+      },
+      sender: provider2.publicKey,
+      txNo: 4,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider2.publicKey,
+      txNo: 5,
+    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
   }
 
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 1_000_000));
-  return { admin, provider, user, outsider, storage, contract };
+  return { admin, provider, provider2, user, outsider, storage, contract };
+}
+
+async function seedReservationServing(ctx, provider = ctx.provider) {
+  const enclaveId = 'e1'.repeat(32);
+  const modelId = 'test/model@4bit';
+  await ctx.storage.put(`enclave/${enclaveId}`, {
+    enclave_id: enclaveId,
+    model_id: modelId,
+    model_class: 'text-generation',
+    backend: 'llama.cpp',
+    artifact_root: 'a1'.repeat(32),
+    artifact_root_kind: 'blake3_merkle_v1',
+    artifact_source: 'huggingface://trac-network/test/model.gguf',
+    manifest_hash: 'b1'.repeat(32),
+    binary_hash: 'c1'.repeat(32),
+    att_tier: 1,
+    caps: { chat: true, tools: true, json: true, ctx: 8192, ctx_max: 8192 },
+    status: 'active',
+    created_by: ctx.admin.publicKey,
+    created_by_role: 'admin',
+    created_at: makeTxKey(10),
+    updated_at: makeTxKey(10),
+  });
+  await ctx.storage.put(`serve/${provider.publicKey}/${enclaveId}`, {
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    model_id: modelId,
+    status: 'active',
+    joined_at: makeTxKey(11),
+    updated_at: makeTxKey(11),
+    via: 'feature',
+  });
+  await seedCurrentAdminPrice(ctx.storage, {
+    enclaveId,
+    modelId,
+    admin: ctx.admin.publicKey,
+    txNo: 12,
+    ver: 1,
+    inPer1kMu: 20,
+    outPer1kMu: 60,
+    minSessionMu: 100,
+    effectiveAt: 0,
+  });
+  return { enclaveId, modelId };
+}
+
+function signedSpendReservation(ctx, { provider = ctx.provider, enclaveId, sessionId, maxSpendMu, epoch = 1 } = {}) {
+  const voucherBody = {
+    session_id: sessionId,
+    rail: 'fiat',
+    enclave_id: enclaveId,
+    price_ver: 1,
+    max_spend_mu: maxSpendMu,
+    checkpoint_every: { tokens: 8192, ms: 30_000 },
+  };
+  const unsigned = {
+    op: 'spend_reserve',
+    contract_version: CONTRACT_VERSION,
+    session_id: sessionId,
+    epoch,
+    at: epoch * 3_600,
+    rail: 'fiat',
+    user: ctx.user.publicKey,
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    price_ver: 1,
+    rules_ver: 1,
+    max_spend_mu: maxSpendMu,
+    voucher: {
+      ...voucherBody,
+      user_sig: signSpendVoucher(ctx.user.wallet, voucherBody),
+    },
+    provider_sig: '',
+  };
+  return {
+    ...unsigned,
+    provider_sig: signSpendReservation(provider.wallet, unsigned),
+  };
 }
 
 test('MayhemProtocol keeps epochApply off the paid tx route', () => {
@@ -138,6 +239,33 @@ test('MayhemProtocol keeps deposit evidence off the paid tx route', () => {
       fiat_amount_minor: 100,
       epoch: 1,
       at: 3_600,
+    },
+  ]
+    .map((command) => protocol.mapTxCommand(JSON.stringify(command)))
+    .filter(Boolean);
+
+  assert.deepEqual(paidOps.map((op) => op.type), ['epochCommit']);
+});
+
+test('MayhemProtocol keeps spend reservations off the paid tx route', () => {
+  const protocol = new MayhemProtocol({}, {});
+  const paidOps = [
+    { op: 'epoch_commit', epoch: 1, at: 3_600, roots: {}, totals: {} },
+    {
+      op: 'spend_reserve',
+      contract_version: CONTRACT_VERSION,
+      session_id: 'a'.repeat(64),
+      epoch: 1,
+      at: 3_600,
+      rail: 'fiat',
+      user: 'b'.repeat(64),
+      provider: 'c'.repeat(64),
+      enclave_id: 'd'.repeat(64),
+      price_ver: 1,
+      rules_ver: 1,
+      max_spend_mu: 1000,
+      voucher: {},
+      provider_sig: 'e'.repeat(128),
     },
   ]
     .map((command) => protocol.mapTxCommand(JSON.stringify(command)))
@@ -288,6 +416,106 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
   for (let epoch = 1; epoch <= activeEpochs; epoch += 1) {
     assert.equal(paidByEpoch.get(epoch), 1, `epoch ${epoch} must have exactly one paid anchor`);
   }
+});
+
+test('MayhemContract spend reservation enforces active-epoch unreserved user balance', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
+  await seedReservationServing(ctx, ctx.provider2);
+
+  const first = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'a1'.repeat(32),
+    maxSpendMu: 700_000,
+  });
+  const firstKey = await ctx.contract.spendReservationFeatureKey(first);
+  const firstResult = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    first,
+    ctx.provider.publicKey
+  );
+  assert.equal(firstResult.ok, true, firstResult.message);
+  assert.equal(firstResult.idempotent, false);
+  assert.equal(firstResult.available_mu, 300_000);
+
+  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
+  assert.equal(hold.user, ctx.user.publicKey);
+  assert.equal(hold.rail, 'fiat');
+  assert.equal(hold.epoch, 1);
+  assert.equal(hold.reserved_mu, 700_000);
+  assert.equal(hold.balance_mu_at_last_reserve, 1_000_000);
+  assert.equal(hold.sessions.length, 1);
+  assert.equal(hold.sessions[0].session_id, 'a1'.repeat(32));
+  assert.equal(hold.sessions[0].provider, ctx.provider.publicKey);
+  assert.equal(hold.sessions[0].feature_key, firstKey);
+  assert.match(hold.sessions[0].voucher_hash, /^[0-9a-f]{64}$/);
+
+  const replay = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    first,
+    ctx.provider.publicKey
+  );
+  assert.equal(replay.ok, true, replay.message);
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.reserved_mu, 700_000);
+
+  const second = signedSpendReservation(ctx, {
+    provider: ctx.provider2,
+    enclaveId,
+    sessionId: 'a2'.repeat(32),
+    maxSpendMu: 400_000,
+  });
+  const secondResult = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    second,
+    ctx.provider2.publicKey
+  );
+  assert.match(secondResult.message, /Insufficient unreserved credit balance/);
+  assert.equal((await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value.reserved_mu, 700_000);
+});
+
+test('MayhemContract spend reservation moves to next epoch after epochApply', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
+
+  const first = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'b1'.repeat(32),
+    maxSpendMu: 900_000,
+  });
+  const firstResult = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    first,
+    ctx.provider.publicKey
+  );
+  assert.equal(firstResult.ok, true, firstResult.message);
+
+  const applyValue = makeEpochApply(1, ctx.user.publicKey, ctx.provider.publicKey, 100_000);
+  const applied = await executeEpochApplyFeature(ctx.contract, ctx.storage, applyValue, ctx.admin.publicKey);
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.mu, 900_000);
+
+  const nextEpoch = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'b2'.repeat(32),
+    maxSpendMu: 900_000,
+    epoch: 2,
+  });
+  const nextResult = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    nextEpoch,
+    ctx.provider.publicKey
+  );
+  assert.equal(nextResult.ok, true, nextResult.message);
+  assert.equal(nextResult.available_mu, 0);
 });
 
 test('MayhemContract epochApply mutates credit, earning, and fee state in place', async () => {
@@ -446,6 +674,7 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   const identities = {
     admin: await makeIdentity(),
     provider: await makeIdentity(),
+    provider2: await makeIdentity(),
     user: await makeIdentity(),
     outsider: await makeIdentity(),
   };

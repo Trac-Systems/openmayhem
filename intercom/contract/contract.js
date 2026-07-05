@@ -225,6 +225,38 @@ export const receiptMessage = (body, signingVersion = SIGNING_MESSAGE_VERSION) =
   }
   throw new Error(`Unsupported signing message version: ${signingVersion}`);
 };
+export const spendVoucherMessage = (body, signingVersion = SIGNING_MESSAGE_VERSION) => {
+  if (signingVersion === 1) {
+    return JSON.stringify({
+      domain: 'mayhem-spend-voucher-v1',
+      body,
+    });
+  }
+  if (signingVersion === 2) {
+    return JSON.stringify({
+      domain: 'mayhem-spend-voucher',
+      signing_version: 2,
+      body,
+    });
+  }
+  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+};
+export const spendReservationEvidence = (value) => ({
+  contract_version: value.contract_version,
+  session_id: value.session_id,
+  epoch: value.epoch,
+  at: value.at,
+  rail: value.rail,
+  user: value.user,
+  provider: value.provider,
+  enclave_id: value.enclave_id,
+  price_ver: value.price_ver,
+  rules_ver: value.rules_ver,
+  max_spend_mu: value.max_spend_mu,
+  voucher: stableValue(value.voucher),
+});
+export const spendReservationMessage = (value) =>
+  `mayhem-spend-reservation-v1${stableJson(spendReservationEvidence(value))}`;
 export const probeResultEvidence = (value, auditor) => ({
   auditor,
   probe_id: value.probe_id,
@@ -802,6 +834,11 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'spend_reserve') {
+      const result = await this.applySpendReserveFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
     const adminError = await this.requireAdmin(this.address);
     if (adminError) {
       this._mayhemLastFeatureResult = adminError;
@@ -887,6 +924,131 @@ class MayhemContract extends Contract {
       default:
         return;
     }
+  }
+
+  async applySpendReserveFeature(key, value) {
+    const normalized = this.normalizeSpendReserveValue(value);
+    if (normalized instanceof Error) return normalized;
+    normalized.voucher_hash = await this.opaqueHash('mayhem-spend-voucher-record-v1', normalized.voucher_body);
+    const expectedKey = await this.spendReservationFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+    if (!this.verifySpendVoucherSignature(normalized.user, normalized.voucher_body, normalized.voucher.user_sig)) {
+      return new Error('Invalid spend voucher signature.');
+    }
+    if (!this.verifySpendReservationSignature(normalized.provider, normalized)) {
+      return new Error('Invalid spend reservation provider signature.');
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    const activeEpoch = applyState.updated_epoch + 1;
+    if (normalized.epoch !== activeEpoch) {
+      return new Error('Spend reservation epoch is not the active billing epoch.');
+    }
+
+    const provider = await this.get(`prov/${normalized.provider}`);
+    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    if (!Array.isArray(provider.accepted_rails) || !provider.accepted_rails.includes(normalized.rail)) {
+      return new Error('Provider does not accept payment rail.');
+    }
+    const enclave = await this.get(`enclave/${normalized.enclave_id}`);
+    if (!enclave || enclave.status !== 'active') return new Error('Admin enclave is not active.');
+    const enclaveError = this.requireAdminCreatedEnclave(enclave);
+    if (enclaveError) return enclaveError;
+    const serve = await this.get(`serve/${normalized.provider}/${normalized.enclave_id}`);
+    if (!serve || serve.status !== 'active') {
+      return new Error('Provider is not actively serving this admin enclave.');
+    }
+    const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id);
+    if (priceError) return priceError;
+    const schedule = await this.get(`price/${normalized.enclave_id}`);
+    const price = this.priceActiveEntry(schedule, normalized.at);
+    if (!price || price.ver !== normalized.price_ver) {
+      return new Error('Spend reservation price version is not current.');
+    }
+    if (price.set_by_role !== 'admin') {
+      return new Error('Spend reservation price is not admin-set.');
+    }
+    const rules = await this.currentRules();
+    if (!rules || rules.ver !== normalized.rules_ver) {
+      return new Error('Spend reservation rules version is not current.');
+    }
+
+    const balance = await this.balanceRecord(normalized.user, normalized.rail);
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, normalized.user, normalized.rail);
+    if (balanceError) return balanceError;
+
+    const holdKey = this.spendHoldKey(normalized.user, normalized.rail, normalized.epoch);
+    const hold = this.normalizeSpendHoldRecord(
+      (await this.get(holdKey)) ?? null,
+      normalized.user,
+      normalized.rail,
+      normalized.epoch
+    );
+    if (hold instanceof Error) return hold;
+    const existing = hold.sessions.find((session) => session.session_id === normalized.session_id);
+    if (existing) {
+      if (
+        existing.provider !== normalized.provider ||
+        existing.enclave_id !== normalized.enclave_id ||
+        existing.price_ver !== normalized.price_ver ||
+        existing.max_spend_mu !== normalized.max_spend_mu ||
+        existing.voucher_hash !== normalized.voucher_hash
+      ) {
+        return new Error('Spend reservation session already exists with different terms.');
+      }
+      return {
+        ok: true,
+        op: 'spendReserve',
+        session_id: normalized.session_id,
+        epoch: normalized.epoch,
+        rail: normalized.rail,
+        user: normalized.user,
+        provider: normalized.provider,
+        reserved_mu: hold.reserved_mu,
+        available_mu: Math.max(0, balance.mu - hold.reserved_mu),
+        idempotent: true,
+      };
+    }
+
+    const nextReservedMu = this.safeAddMu(hold.reserved_mu, normalized.max_spend_mu);
+    if (nextReservedMu instanceof Error) return nextReservedMu;
+    if (nextReservedMu > balance.mu) {
+      return new Error('Insufficient unreserved credit balance.');
+    }
+    const session = {
+      session_id: normalized.session_id,
+      provider: normalized.provider,
+      enclave_id: normalized.enclave_id,
+      price_ver: normalized.price_ver,
+      rules_ver: normalized.rules_ver,
+      max_spend_mu: normalized.max_spend_mu,
+      voucher_hash: normalized.voucher_hash,
+      feature_key: key,
+      reserved_at: normalized.at,
+      recorded_at: this.tx,
+    };
+    const nextHold = {
+      ...hold,
+      balance_mu_at_last_reserve: balance.mu,
+      reserved_mu: nextReservedMu,
+      sessions: [...hold.sessions, session].sort((a, b) => a.session_id.localeCompare(b.session_id)),
+      updated_at: this.tx,
+    };
+    await this.put(holdKey, nextHold);
+    return {
+      ok: true,
+      op: 'spendReserve',
+      session_id: normalized.session_id,
+      epoch: normalized.epoch,
+      rail: normalized.rail,
+      user: normalized.user,
+      provider: normalized.provider,
+      reserved_mu: nextHold.reserved_mu,
+      available_mu: balance.mu - nextHold.reserved_mu,
+      idempotent: false,
+    };
   }
 
   async applyEpochApplyFeature(key, value) {
@@ -1174,6 +1336,10 @@ class MayhemContract extends Contract {
 
   balanceKey(user, rail) {
     return `bal/${user}/${rail}`;
+  }
+
+  spendHoldKey(user, rail, epoch) {
+    return `hold/${rail}/${user}/${epoch}`;
   }
 
   earningKey(provider, rail) {
@@ -4057,6 +4223,19 @@ class MayhemContract extends Contract {
     return keys;
   }
 
+  async spendReservationFeatureKey(value) {
+    const normalized = value.voucher_body ? value : this.normalizeSpendReserveValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-spend-reservation-feature-v1',
+        value: spendReservationEvidence(normalized),
+      }))),
+      'hex'
+    );
+    return `hold/reserve/${normalized.rail}/${normalized.user}/${normalized.epoch}/${normalized.session_id}/${digest}`;
+  }
+
   async activeParamsAt(at, keys = Object.keys(PARAM_DEFINITIONS)) {
     const params = {};
     for (const key of keys) {
@@ -4527,6 +4706,193 @@ class MayhemContract extends Contract {
       if (!this.isHexBytes(value.auditor_sig, 64)) return new Error('Invalid canary auditor signature.');
     }
     return null;
+  }
+
+  normalizeSpendVoucherForReserve(voucher) {
+    const shapeError = this.validateExactObjectKeys(
+      voucher,
+      [
+        'session_id',
+        'rail',
+        'enclave_id',
+        'price_ver',
+        'max_spend_mu',
+        'checkpoint_every',
+        'user_sig',
+      ],
+      'spend voucher'
+    );
+    if (shapeError) return shapeError;
+    const checkpointError = this.validateExactObjectKeys(
+      voucher.checkpoint_every,
+      ['tokens', 'ms'],
+      'spend voucher checkpoint policy'
+    );
+    if (checkpointError) return checkpointError;
+    const rail = this.normalizeLedgerRail(voucher.rail, 'spend voucher rail');
+    if (rail instanceof Error) return rail;
+    if (!this.isHexBytes(voucher.session_id, 32)) return new Error('Invalid spend voucher session id.');
+    if (!this.isHexBytes(voucher.enclave_id, 32)) return new Error('Invalid spend voucher enclave id.');
+    if (!Number.isSafeInteger(voucher.price_ver) || voucher.price_ver < 1) {
+      return new Error('Invalid spend voucher price version.');
+    }
+    if (!Number.isSafeInteger(voucher.max_spend_mu) || voucher.max_spend_mu < 1) {
+      return new Error('Invalid spend voucher max spend.');
+    }
+    if (!Number.isSafeInteger(voucher.checkpoint_every.tokens) || voucher.checkpoint_every.tokens < 1) {
+      return new Error('Invalid spend voucher checkpoint tokens.');
+    }
+    if (!Number.isSafeInteger(voucher.checkpoint_every.ms) || voucher.checkpoint_every.ms < 1) {
+      return new Error('Invalid spend voucher checkpoint milliseconds.');
+    }
+    if (!this.isHexBytes(voucher.user_sig, 64)) return new Error('Invalid spend voucher user signature.');
+    const body = {
+      session_id: voucher.session_id.toLowerCase(),
+      rail,
+      enclave_id: voucher.enclave_id.toLowerCase(),
+      price_ver: voucher.price_ver,
+      max_spend_mu: voucher.max_spend_mu,
+      checkpoint_every: {
+        tokens: voucher.checkpoint_every.tokens,
+        ms: voucher.checkpoint_every.ms,
+      },
+    };
+    return {
+      ...body,
+      user_sig: voucher.user_sig.toLowerCase(),
+      body,
+    };
+  }
+
+  normalizeSpendReserveValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'session_id',
+        'epoch',
+        'at',
+        'rail',
+        'user',
+        'provider',
+        'enclave_id',
+        'price_ver',
+        'rules_ver',
+        'max_spend_mu',
+        'voucher',
+        'provider_sig',
+      ],
+      'spend reservation feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'spend_reserve') return new Error('Invalid spend reservation op.');
+    if (value.contract_version !== CONTRACT_VERSION) return new Error('Invalid spend reservation contract version.');
+    if (!this.isHexBytes(value.session_id, 32)) return new Error('Invalid spend reservation session id.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid spend reservation epoch.');
+    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid spend reservation timestamp.');
+    const rail = this.normalizeLedgerRail(value.rail, 'spend reservation rail');
+    if (rail instanceof Error) return rail;
+    if (!this.isHexBytes(value.user, 32)) return new Error('Invalid spend reservation user.');
+    if (!this.isHexBytes(value.provider, 32)) return new Error('Invalid spend reservation provider.');
+    if (!this.isHexBytes(value.enclave_id, 32)) return new Error('Invalid spend reservation enclave.');
+    if (!Number.isSafeInteger(value.price_ver) || value.price_ver < 1) {
+      return new Error('Invalid spend reservation price version.');
+    }
+    if (!Number.isSafeInteger(value.rules_ver) || value.rules_ver < 1) {
+      return new Error('Invalid spend reservation rules version.');
+    }
+    if (!Number.isSafeInteger(value.max_spend_mu) || value.max_spend_mu < 1) {
+      return new Error('Invalid spend reservation max spend.');
+    }
+    if (!this.isHexBytes(value.provider_sig, 64)) {
+      return new Error('Invalid spend reservation provider signature.');
+    }
+    const voucher = this.normalizeSpendVoucherForReserve(value.voucher);
+    if (voucher instanceof Error) return voucher;
+    if (voucher.session_id !== value.session_id.toLowerCase()) {
+      return new Error('Spend reservation voucher session mismatch.');
+    }
+    if (voucher.rail !== rail) return new Error('Spend reservation voucher rail mismatch.');
+    if (voucher.enclave_id !== value.enclave_id.toLowerCase()) {
+      return new Error('Spend reservation voucher enclave mismatch.');
+    }
+    if (voucher.price_ver !== value.price_ver) {
+      return new Error('Spend reservation voucher price mismatch.');
+    }
+    if (voucher.max_spend_mu !== value.max_spend_mu) {
+      return new Error('Spend reservation voucher max spend mismatch.');
+    }
+    return {
+      op: 'spend_reserve',
+      contract_version: CONTRACT_VERSION,
+      session_id: value.session_id.toLowerCase(),
+      epoch: value.epoch,
+      at: value.at,
+      rail,
+      user: value.user.toLowerCase(),
+      provider: value.provider.toLowerCase(),
+      enclave_id: value.enclave_id.toLowerCase(),
+      price_ver: value.price_ver,
+      rules_ver: value.rules_ver,
+      max_spend_mu: value.max_spend_mu,
+      voucher: {
+        session_id: voucher.body.session_id,
+        rail: voucher.body.rail,
+        enclave_id: voucher.body.enclave_id,
+        price_ver: voucher.body.price_ver,
+        max_spend_mu: voucher.body.max_spend_mu,
+        checkpoint_every: voucher.body.checkpoint_every,
+        user_sig: voucher.user_sig,
+      },
+      voucher_body: voucher.body,
+      provider_sig: value.provider_sig.toLowerCase(),
+    };
+  }
+
+  normalizeSpendHoldRecord(record, user, rail, epoch) {
+    if (!record) {
+      return {
+        user,
+        rail,
+        denom: PRICE_DENOMINATION,
+        epoch,
+        reserved_mu: 0,
+        balance_mu_at_last_reserve: null,
+        sessions: [],
+        updated_at: null,
+      };
+    }
+    if (typeof record !== 'object' || Array.isArray(record)) {
+      return new Error('Spend hold record must be an object.');
+    }
+    if (record.user !== user || record.rail !== rail || record.epoch !== epoch) {
+      return new Error('Spend hold record key mismatch.');
+    }
+    if (record.denom !== PRICE_DENOMINATION) return new Error('Spend hold denomination mismatch.');
+    if (!Number.isSafeInteger(record.reserved_mu) || record.reserved_mu < 0) {
+      return new Error('Invalid spend hold reserved amount.');
+    }
+    if (!Array.isArray(record.sessions)) return new Error('Spend hold sessions must be an array.');
+    for (const session of record.sessions) {
+      if (!session || typeof session !== 'object' || Array.isArray(session)) {
+        return new Error('Invalid spend hold session.');
+      }
+      if (!this.isHexBytes(session.session_id, 32)) return new Error('Invalid spend hold session id.');
+      if (!this.isHexBytes(session.provider, 32)) return new Error('Invalid spend hold provider.');
+      if (!this.isHexBytes(session.enclave_id, 32)) return new Error('Invalid spend hold enclave.');
+      if (!Number.isSafeInteger(session.price_ver) || session.price_ver < 1) {
+        return new Error('Invalid spend hold price version.');
+      }
+      if (!Number.isSafeInteger(session.max_spend_mu) || session.max_spend_mu < 1) {
+        return new Error('Invalid spend hold max spend.');
+      }
+      if (!this.isHexBytes(session.voucher_hash, 32)) return new Error('Invalid spend hold voucher hash.');
+    }
+    return {
+      ...record,
+      sessions: record.sessions.map((session) => ({ ...session })),
+    };
   }
 
   async requireBoundCanaryProbe(value, auditor) {
@@ -6457,6 +6823,20 @@ class MayhemContract extends Contract {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
     return verify.call(this.protocol.peer.wallet, sig, depositTnkIntentMessage(intent), sender) === true;
+  }
+
+  verifySpendVoucherSignature(user, body, sig) {
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function') return false;
+    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) =>
+      verify.call(this.protocol.peer.wallet, sig, spendVoucherMessage(body, signingVersion), user) === true
+    );
+  }
+
+  verifySpendReservationSignature(provider, value) {
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function') return false;
+    return verify.call(this.protocol.peer.wallet, value.provider_sig, spendReservationMessage(value), provider) === true;
   }
 
   verifyProbeResultSignature(auditor, value) {

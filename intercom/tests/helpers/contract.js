@@ -7,6 +7,8 @@ import {
   probeResultMessage,
   providerKybMessage,
   providerLifecycleIntentMessage,
+  spendReservationMessage,
+  spendVoucherMessage,
 } from '../../contract/contract.js';
 
 export const ZERO_HEX = '0'.repeat(64);
@@ -148,6 +150,25 @@ export async function executeTnkSettlementFeature(contract, storage, value, send
   return result ?? contract._mayhemLastFeatureResult;
 }
 
+export async function spendReservationFeatureKey(contract, value) {
+  const key = await contract.spendReservationFeatureKey(value);
+  if (key instanceof Error) throw key;
+  return key;
+}
+
+export async function executeSpendReservationFeature(contract, storage, value, sender) {
+  contract._mayhemLastFeatureResult = undefined;
+  const result = await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await spendReservationFeatureKey(contract, value),
+    value,
+    sender
+  );
+  return result ?? contract._mayhemLastFeatureResult;
+}
+
 export async function seedCurrentAdminPrice(
   storage,
   {
@@ -213,6 +234,12 @@ export const signConsent = (wallet, ver, hash, signingVersion) =>
 
 export const signDepositTnkIntent = (wallet, intent) =>
   b4a.toString(wallet.sign(b4a.from(depositTnkIntentMessage(intent))), 'hex');
+
+export const signSpendVoucher = (wallet, body, signingVersion) =>
+  b4a.toString(wallet.sign(b4a.from(spendVoucherMessage(body, signingVersion))), 'hex');
+
+export const signSpendReservation = (wallet, value) =>
+  b4a.toString(wallet.sign(b4a.from(spendReservationMessage(value))), 'hex');
 
 export const signProviderLifecycleIntent = (wallet, intent, signingVersion) =>
   b4a.toString(wallet.sign(b4a.from(providerLifecycleIntentMessage(intent, signingVersion))), 'hex');

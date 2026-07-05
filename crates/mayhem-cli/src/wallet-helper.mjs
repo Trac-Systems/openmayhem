@@ -23,6 +23,7 @@ const usage = () => {
   wallet-helper.mjs inspect --keypair <path> [--password <value>]
   wallet-helper.mjs backup --keypair <path> [--password <value>]
   wallet-helper.mjs passwd --keypair <path> [--password <old>] --new-password <new>
+  wallet-helper.mjs seed --keypair <path> [--password <value>]
   wallet-helper.mjs sign --keypair <path> [--password <value>] (--message <text> | --message-hex <hex>)`);
 };
 
@@ -136,6 +137,15 @@ if (command === 'passwd') {
     throw err;
   }
   console.log(JSON.stringify(walletJson(wallet, false, false)));
+  process.exit(0);
+}
+
+if (command === 'seed') {
+  const wallet = await loadWallet();
+  console.log(JSON.stringify({
+    public_key: b4a.toString(wallet.publicKey, 'hex'),
+    signing_seed_hex: b4a.toString(wallet.secretKey.subarray(0, 32), 'hex')
+  }));
   process.exit(0);
 }
 

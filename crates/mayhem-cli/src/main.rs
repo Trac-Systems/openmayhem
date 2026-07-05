@@ -725,6 +725,18 @@ struct UseArgs {
     #[arg(long)]
     rpc_url: Option<String>,
 
+    /// Exact wallet keypair.json path used to sign spend vouchers.
+    #[arg(long, value_name = "PATH")]
+    keypair: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
     /// SC-Bridge websocket URL for direct provider sessions.
     #[arg(long)]
     sc_bridge_url: Option<String>,
@@ -3507,6 +3519,12 @@ struct WalletInfo {
     address: Option<String>,
     derivation_path: Option<String>,
     mnemonic: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletSeedOutput {
+    public_key: String,
+    signing_seed_hex: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -12201,17 +12219,40 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         None => None,
     };
-    let (state, source, model_count, backend) = if args.dev_embedded_catalog {
+    let (state, source, model_count, backend, wallet_public_key, balance_mu) = if args
+        .dev_embedded_catalog
+    {
         let state = GatewayState::from_embedded_catalog();
         (
             state,
             "dev-embedded-catalog".to_owned(),
             None,
             "local-openai-shape".to_owned(),
+            None,
+            None,
         )
     } else {
         let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
         let rpc = PeerRpcClient::new(&rpc_url)?;
+        let wallet_password = args.wallet_password.clone().unwrap_or_default();
+        let wallet = resolve_cli_wallet_with_keypair(
+            &home,
+            config.as_ref(),
+            args.keypair.as_deref(),
+            &args.peer_store_name,
+            &wallet_password,
+        )
+        .await?;
+        let keypair_path = PathBuf::from(&wallet.keypair_path);
+        let user_seed = wallet_signing_seed(&keypair_path, &wallet_password, &wallet.public_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "loading spend-voucher signing seed for wallet {}",
+                    wallet.public_key
+                )
+            })?;
+        let balance_mu = read_user_balance_mu(&rpc, &wallet.public_key, args.rail.as_str()).await?;
         let contract = read_contract_catalog(&rpc).await?;
         let models = gateway_models_from_contract(&contract)?;
         let model_count = models.len();
@@ -12268,10 +12309,14 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             GatewayState::from_models(models)
                 .with_provider_earnings(provider_earnings)
                 .with_failover_policy(failover_policy)
+                .with_receipt_user_seed(user_seed)
+                .with_receipt_balance_mu(balance_mu)
                 .with_session_backend(Arc::new(backend)),
             format!("contract:{rpc_url}"),
             Some(model_count),
             format!("sc-bridge-direct-session:{sc_bridge_url}"),
+            Some(wallet.public_key),
+            Some(balance_mu),
         )
     };
     let state = match apple_app_attest_jwks {
@@ -12304,6 +12349,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "source": source,
         "backend": backend,
         "rail": args.rail.as_str(),
+        "wallet": wallet_public_key.as_ref().map(|public_key| json!({
+            "public_key": public_key,
+            "balance_mu": balance_mu.unwrap_or(0),
+            "balance_source": format!("bal/{}/{}", public_key, args.rail.as_str()),
+        })),
         "models": model_count,
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
         "nvidia_gb10_device_jwks": args.nvidia_gb10_device_jwks_file.is_some(),
@@ -12329,6 +12379,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 model_count.unwrap_or(0)
             );
             println!("Backend: {backend}");
+            if let Some(public_key) = wallet_public_key.as_deref() {
+                println!("Wallet: {public_key}");
+                println!(
+                    "Balance snapshot: {} mu_usd from bal/{}/{}",
+                    balance_mu.unwrap_or(0),
+                    public_key,
+                    args.rail.as_str()
+                );
+            }
             if args.apple_app_attest_jwks_file.is_some() {
                 println!("Tier 2 Apple App Attest verification: trusted JWKS loaded.");
             }
@@ -15552,20 +15611,33 @@ async fn resolve_cli_wallet(
     peer_store_name: &str,
     password: &str,
 ) -> Result<WalletInfo> {
+    resolve_cli_wallet_with_keypair(home, config, None, peer_store_name, password).await
+}
+
+async fn resolve_cli_wallet_with_keypair(
+    home: &Path,
+    config: Option<&MayhemConfig>,
+    keypair: Option<&Path>,
+    peer_store_name: &str,
+    password: &str,
+) -> Result<WalletInfo> {
     let store_name = config
         .and_then(|config| config.identity.as_ref())
         .and_then(|identity| identity.store_name.as_deref())
         .unwrap_or(peer_store_name);
-    let keypair_path = config
-        .and_then(|config| config.identity.as_ref())
-        .and_then(|identity| identity.keypair_path.as_deref())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home.join("stores")
-                .join(store_name)
-                .join("db")
-                .join("keypair.json")
-        });
+    let keypair_path = match keypair {
+        Some(path) => absolutize(path.to_path_buf())?,
+        None => config
+            .and_then(|config| config.identity.as_ref())
+            .and_then(|identity| identity.keypair_path.as_deref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.join("stores")
+                    .join(store_name)
+                    .join("db")
+                    .join("keypair.json")
+            }),
+    };
     inspect_wallet(&keypair_path, password)
         .await
         .with_context(|| format!("reading wallet {}", keypair_path.display()))
@@ -20694,13 +20766,27 @@ async fn handle_provider_session_frame(
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
                     provider_session_debug("s.open static decision accepted; rechecking contract");
-                    provider_session_current_state_decision(
+                    let live_decision = provider_session_current_state_decision(
                         runtime.rpc,
                         terms,
                         runtime.rooms,
                         &session_rail,
                     )
-                    .await?
+                    .await?;
+                    match live_decision {
+                        ProviderSessionDecision::Accept => {
+                            provider_session_spend_reservation_decision(
+                                runtime.rpc,
+                                runtime.keypair_path,
+                                runtime.password,
+                                terms,
+                                &frame,
+                                &session_rail,
+                            )
+                            .await?
+                        }
+                        reject => reject,
+                    }
                 }
                 reject => reject,
             };
@@ -21714,6 +21800,166 @@ fn provider_session_contract_decision(
         );
     }
     ProviderSessionDecision::Accept
+}
+
+async fn provider_session_spend_reservation_decision(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    terms: &ProviderSessionTerms,
+    frame: &Value,
+    rail: &str,
+) -> Result<ProviderSessionDecision> {
+    let reject = |reason: String| ProviderSessionDecision::Reject {
+        code: "BALANCE",
+        reason,
+    };
+    let epoch = active_billing_epoch(rpc).await?;
+    let at = unix_epoch_seconds()?;
+    let mut value = match provider_session_spend_reservation_value(terms, frame, rail, epoch, at) {
+        Ok(value) => value,
+        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+    };
+    let message = spend_reservation_message(&value);
+    let provider_sig = sign_message(keypair_path, password, &message)
+        .await
+        .context("signing provider spend reservation")?;
+    value["provider_sig"] = json!(provider_sig);
+    let key = spend_reservation_feature_key(&value)?;
+    let submitted = match rpc
+        .submit_feature(json!({
+            "feature": "mayhem",
+            "key": key,
+            "value": value,
+        }))
+        .await
+    {
+        Ok(submitted) => submitted,
+        Err(err) => {
+            return Ok(reject(format!(
+                "could not reserve user balance on contract before serving: {err}"
+            )));
+        }
+    };
+    if submitted.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(ProviderSessionDecision::Accept);
+    }
+    let reason = submitted
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            submitted
+                .get("result")
+                .and_then(|result| result.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| submitted.to_string());
+    Ok(reject(format!(
+        "contract spend reservation rejected before serving: {reason}"
+    )))
+}
+
+async fn active_billing_epoch(rpc: &PeerRpcClient) -> Result<u64> {
+    let updated_epoch = read_state_value(rpc, "epoch/apply/state")
+        .await?
+        .and_then(|value| value.get("updated_epoch").and_then(Value::as_u64))
+        .unwrap_or(0);
+    updated_epoch
+        .checked_add(1)
+        .context("active billing epoch overflowed")
+}
+
+fn provider_session_spend_reservation_value(
+    terms: &ProviderSessionTerms,
+    frame: &Value,
+    rail: &str,
+    epoch: u64,
+    at: u64,
+) -> Result<Value> {
+    let session_id = frame
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("s.open missing session_id")?;
+    let user = frame
+        .get("user")
+        .and_then(Value::as_str)
+        .context("s.open missing user")?;
+    let voucher = frame
+        .get("voucher")
+        .cloned()
+        .context("s.open missing spend voucher")?;
+    let max_spend_mu = voucher
+        .get("max_spend_mu")
+        .and_then(Value::as_u64)
+        .context("spend voucher missing max_spend_mu")?;
+    Ok(json!({
+        "op": "spend_reserve",
+        "contract_version": CONTRACT_VERSION,
+        "session_id": session_id,
+        "epoch": epoch,
+        "at": at,
+        "rail": rail,
+        "user": user,
+        "provider": terms.provider,
+        "enclave_id": terms.enclave_id,
+        "price_ver": terms.price_ver,
+        "rules_ver": terms.rules_ver,
+        "max_spend_mu": max_spend_mu,
+        "voucher": voucher,
+        "provider_sig": "",
+    }))
+}
+
+fn spend_reservation_evidence(value: &Value) -> Value {
+    json!({
+        "contract_version": value.get("contract_version").cloned().unwrap_or(Value::Null),
+        "session_id": value.get("session_id").cloned().unwrap_or(Value::Null),
+        "epoch": value.get("epoch").cloned().unwrap_or(Value::Null),
+        "at": value.get("at").cloned().unwrap_or(Value::Null),
+        "rail": value.get("rail").cloned().unwrap_or(Value::Null),
+        "user": value.get("user").cloned().unwrap_or(Value::Null),
+        "provider": value.get("provider").cloned().unwrap_or(Value::Null),
+        "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
+        "price_ver": value.get("price_ver").cloned().unwrap_or(Value::Null),
+        "rules_ver": value.get("rules_ver").cloned().unwrap_or(Value::Null),
+        "max_spend_mu": value.get("max_spend_mu").cloned().unwrap_or(Value::Null),
+        "voucher": stable_json_value(value.get("voucher").unwrap_or(&Value::Null)),
+    })
+}
+
+fn spend_reservation_message(value: &Value) -> String {
+    format!(
+        "mayhem-spend-reservation-v1{}",
+        stable_json_value(&spend_reservation_evidence(value))
+    )
+}
+
+fn spend_reservation_feature_key(value: &Value) -> Result<String> {
+    let rail = value
+        .get("rail")
+        .and_then(Value::as_str)
+        .context("spend reservation missing rail")?;
+    let user = value
+        .get("user")
+        .and_then(Value::as_str)
+        .context("spend reservation missing user")?;
+    let epoch = value
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .context("spend reservation missing epoch")?;
+    let session_id = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("spend reservation missing session_id")?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-spend-reservation-feature-v1",
+        "value": spend_reservation_evidence(value),
+    }));
+    Ok(format!(
+        "hold/reserve/{rail}/{user}/{epoch}/{session_id}/{digest}"
+    ))
 }
 
 fn provider_session_open_decision(
@@ -23083,6 +23329,39 @@ async fn sign_hex(keypair_path: &Path, password: &str, message_hex: &str) -> Res
     Ok(output.signature)
 }
 
+async fn wallet_signing_seed(
+    keypair_path: &Path,
+    password: &str,
+    expected_public_key: &str,
+) -> Result<[u8; 32]> {
+    let mut args = vec![
+        "seed".to_owned(),
+        "--keypair".to_owned(),
+        keypair_path.display().to_string(),
+    ];
+    if !password.is_empty() {
+        args.extend(["--password".to_owned(), password.to_owned()]);
+    }
+    let output: WalletSeedOutput = run_wallet_helper(args).await?;
+    if !output.public_key.eq_ignore_ascii_case(expected_public_key) {
+        bail!(
+            "wallet helper returned public key {}, expected {}",
+            output.public_key,
+            expected_public_key
+        );
+    }
+    let seed = hex_decode_array::<32>(&output.signing_seed_hex, "wallet signing seed")?;
+    let derived_public_key = hex_encode(&SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+    if !derived_public_key.eq_ignore_ascii_case(expected_public_key) {
+        bail!(
+            "wallet signing seed derives public key {}, expected {}",
+            derived_public_key,
+            expected_public_key
+        );
+    }
+    Ok(seed)
+}
+
 async fn run_wallet_helper<T>(args: Vec<String>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -24026,6 +24305,26 @@ mod tests {
         assert_eq!(created.public_key, inspected.public_key);
         assert_eq!(created.address, restored.address);
         assert_eq!(created.address, inspected.address);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn wallet_signing_seed_derives_wallet_public_key() {
+        let temp = test_temp_dir("mayhem-wallet-seed");
+        let keypair_path = temp.join("main").join("db").join("keypair.json");
+        fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
+
+        let created = create_wallet(&keypair_path, "seed-pass", None, false)
+            .await
+            .unwrap();
+        let seed = wallet_signing_seed(&keypair_path, "seed-pass", &created.public_key)
+            .await
+            .unwrap();
+        let derived_public_key =
+            hex_encode(&SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+
+        assert_eq!(created.public_key, derived_public_key);
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -25828,6 +26127,46 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_spend_reservation_feature_is_contract_shaped() {
+        let terms = test_provider_session_terms();
+        let frame = test_session_open_frame(&terms);
+        let value =
+            provider_session_spend_reservation_value(&terms, &frame, "fiat", 7, 25_200).unwrap();
+
+        assert_eq!(value["op"], "spend_reserve");
+        assert_eq!(value["contract_version"], CONTRACT_VERSION);
+        assert_eq!(value["epoch"], 7);
+        assert_eq!(value["at"], 25_200);
+        assert_eq!(value["provider"], terms.provider);
+        assert_eq!(value["enclave_id"], terms.enclave_id);
+        assert_eq!(value["price_ver"], terms.price_ver);
+        assert_eq!(value["rules_ver"], terms.rules_ver);
+        assert_eq!(value["max_spend_mu"], 1000);
+        assert_eq!(value["provider_sig"], "");
+
+        let message = spend_reservation_message(&value);
+        assert!(message.starts_with("mayhem-spend-reservation-v1"));
+        assert!(message.contains("\"max_spend_mu\":1000"));
+        assert!(!message.contains("provider_sig"));
+
+        let key = spend_reservation_feature_key(&value).unwrap();
+        assert!(key.starts_with(&format!(
+            "hold/reserve/fiat/{}/7/{}/",
+            value["user"].as_str().unwrap(),
+            value["session_id"].as_str().unwrap()
+        )));
+        assert_eq!(key.split('/').last().unwrap().len(), 64);
+
+        let mut signed = value.clone();
+        signed["provider_sig"] = json!("11".repeat(64));
+        assert_eq!(
+            spend_reservation_feature_key(&signed).unwrap(),
+            key,
+            "provider signature is not part of the reservation feature key"
+        );
+    }
+
+    #[test]
     fn provider_session_open_rechecks_current_admin_contract_state() {
         let terms = test_provider_session_terms();
         let contract = test_contract(&"aa".repeat(32));
@@ -27425,6 +27764,35 @@ mod tests {
 
         assert!(gateway_bind_addr(Some(&config), Some("0.0.0.0:5252"), 11_435).is_err());
         assert!(gateway_bind_addr(Some(&config), Some("192.168.1.5:5252"), 11_435).is_err());
+    }
+
+    #[test]
+    fn use_gateway_accepts_wallet_and_rail_flags() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "use",
+            "--keypair",
+            "/tmp/mayhem/stores/main/db/keypair.json",
+            "--peer-store-name",
+            "terminal",
+            "--wallet-password",
+            "secret",
+            "--rail",
+            "tnk",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Use(args) => {
+                assert_eq!(
+                    args.keypair.as_deref(),
+                    Some(Path::new("/tmp/mayhem/stores/main/db/keypair.json"))
+                );
+                assert_eq!(args.peer_store_name, "terminal");
+                assert_eq!(args.wallet_password.as_deref(), Some("secret"));
+                assert_eq!(args.rail, GatewayLedgerRail::Tnk);
+            }
+            other => panic!("expected use command, got {other:?}"),
+        }
     }
 
     #[test]
