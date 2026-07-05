@@ -63,12 +63,17 @@ function makeNode(op, { fromKeyHex = null } = {}) {
   };
 }
 
-function makeProtocolStub({ msgMaxBytes = 1_000_000, txMaxBytes = 1_000_000, featMaxBytes = 1_000_000 } = {}) {
+function makeProtocolStub({
+  msgMaxBytes = 1_000_000,
+  txMaxBytes = 1_000_000,
+  featMaxBytes = 1_000_000,
+  getError = () => null,
+} = {}) {
   return {
     msgMaxBytes: () => msgMaxBytes,
     txMaxBytes: () => txMaxBytes,
     featMaxBytes: () => featMaxBytes,
-    getError: () => null,
+    getError,
   };
 }
 
@@ -556,5 +561,51 @@ test("operations: feature executes contract when admin-signed", async (t) => {
   await op.handle(opObj, batch, base, node);
 
   t.is((await batch.get("feature_called"))?.value ?? null, true);
+  t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
+});
+
+test("operations: feature does not burn replay hash when contract returns an error", async (t) => {
+  const adminWallet = new Wallet();
+  await adminWallet.generateKeyPair();
+  const nonce = makeHex32(33);
+  const dispatchValue = { a: 1 };
+  const strDispatchValue = JSON.stringify(dispatchValue);
+  const signature = adminWallet.sign(`${strDispatchValue}${nonce}`);
+
+  const batch = makeBatch({ admin: adminWallet.publicKey });
+  const base = makeBase();
+  let attempts = 0;
+
+  const contractInstance = {
+    execute: async (_op, b) => {
+      attempts += 1;
+      if (attempts === 1) return new Error("commit required");
+      await b.put("feature_called_after_retry", true);
+      return null;
+    },
+  };
+
+  const opObj = {
+    type: "feature",
+    key: "my_feature",
+    value: { dispatch: { value: dispatchValue, nonce, hash: signature } },
+  };
+  const node = makeNode(opObj);
+
+  const op = new FeatureOperation(new FeatureCheck(), {
+    wallet: adminWallet,
+    protocolInstance: makeProtocolStub({
+      featMaxBytes: 4096,
+      getError: (value) => (value instanceof Error ? value : null),
+    }),
+    contractInstance,
+  });
+
+  await op.handle(opObj, batch, base, node);
+  t.is((await batch.get(`sh/${signature}`))?.value ?? null, null);
+  t.is((await batch.get("feature_called_after_retry"))?.value ?? null, null);
+
+  await op.handle(opObj, batch, base, node);
+  t.is((await batch.get("feature_called_after_retry"))?.value ?? null, true);
   t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
 });

@@ -10990,6 +10990,20 @@ async fn run_admin_command(args: &AdminTxArgs, tx_type: &'static str, value: Val
             "keypair_path": wallet.keypair_path,
         });
         report["tx"] = submitted;
+        if tx_type == "epochCommit" && !args.sim {
+            let epoch = report["command"]
+                .get("epoch")
+                .and_then(Value::as_u64)
+                .context("epochCommit command missing epoch")?;
+            let key = format!("epoch/commit/{epoch}");
+            report["commit_state"] = wait_for_state(&rpc, &key, |value| {
+                value
+                    .get("epoch")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|updated| updated == epoch)
+            })
+            .await?;
+        }
     }
 
     if args.json {
