@@ -2252,6 +2252,7 @@ async fn build_chat_completion(
             Some("messages"),
         ));
     }
+    validate_chat_modalities(&model, &request)?;
     if request
         .tools
         .as_ref()
@@ -2760,6 +2761,49 @@ fn model_supports_tts(model: &GatewayModel) -> bool {
 
 fn model_supports_stt(model: &GatewayModel) -> bool {
     model.mayhem.model_class == "stt"
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChatInputModalities {
+    image: bool,
+    audio: bool,
+}
+
+fn validate_chat_modalities(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+) -> Result<(), ApiError> {
+    let modalities = chat_input_modalities(&request.messages);
+    if modalities.image && !model.mayhem.caps.vision {
+        return Err(ApiError::bad_request(
+            "model does not support image_url chat content",
+            Some("messages"),
+        ));
+    }
+    if modalities.audio && !model.mayhem.caps.audio {
+        return Err(ApiError::bad_request(
+            "model does not support input_audio chat content",
+            Some("messages"),
+        ));
+    }
+    Ok(())
+}
+
+fn chat_input_modalities(messages: &[ChatMessage]) -> ChatInputModalities {
+    let mut modalities = ChatInputModalities::default();
+    for message in messages {
+        let Value::Array(parts) = &message.content else {
+            continue;
+        };
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("image_url") => modalities.image = true,
+                Some("input_audio") => modalities.audio = true,
+                _ => {}
+            }
+        }
+    }
+    modalities
 }
 
 fn image_count(value: Option<u32>) -> Result<u32, ApiError> {
@@ -3848,6 +3892,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
             usage: usage_for(&prompt_text, "{}"),
         }
     } else {
+        let modalities = chat_input_modalities(&request.messages);
         let content = if wants_json(&request.response_format) {
             json!({
                 "ok": true,
@@ -3855,6 +3900,18 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
                 "mayhem": { "response_format": request.response_format },
             })
             .to_string()
+        } else if modalities.image {
+            format!(
+                "Mayhem response from {}: received image input with {}",
+                model.id,
+                last_user_text(&request.messages)
+            )
+        } else if modalities.audio {
+            format!(
+                "Mayhem response from {}: received audio input with {}",
+                model.id,
+                last_user_text(&request.messages)
+            )
         } else {
             format!(
                 "Mayhem response from {}: {}",
@@ -4443,15 +4500,46 @@ fn content_to_text(value: &Value) -> String {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
-            .map(|part| {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| content_to_text(part))
-            })
+            .map(content_part_to_text)
             .collect::<Vec<_>>()
             .join(""),
         other => other.to_string(),
+    }
+}
+
+fn content_part_to_text(part: &Value) -> String {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some("image_url") => {
+            let url = part
+                .get("image_url")
+                .and_then(|image| image.get("url"))
+                .or_else(|| part.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("[image:{}]", blake3_hex(url.as_bytes()))
+        }
+        Some("input_audio") => {
+            let audio = part.get("input_audio").unwrap_or(&Value::Null);
+            let format = audio
+                .get("format")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let data = audio
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("[audio:{format}:{}]", blake3_hex(data.as_bytes()))
+        }
+        _ => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| content_to_text(part)),
     }
 }
 
@@ -4936,6 +5024,29 @@ mod tests {
             stop: None,
             max_tokens: None,
         }
+    }
+
+    #[test]
+    fn direct_session_request_body_preserves_multimodal_content_parts() {
+        let mut request = test_chat_request("mayhem/vision");
+        request.messages[0].content = json!([
+            { "type": "text", "text": "what is shown?" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } },
+            { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } }
+        ]);
+
+        let body = direct_session_request_body(&request);
+
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        assert_eq!(
+            body["messages"][0]["content"][2]["input_audio"]["data"],
+            "UklGRg=="
+        );
+        assert!(chat_prompt_text(&request).contains("[image:"));
+        assert!(chat_prompt_text(&request).contains("[audio:wav:"));
     }
 
     fn test_chat_output() -> ChatOutput {

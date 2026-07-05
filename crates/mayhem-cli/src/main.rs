@@ -30,7 +30,8 @@ use mayhem_enclave::{
     Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
-    ArtifactChunk, EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, ModelArtifact, ToolSpec,
+    ArtifactChunk, EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, MediaInput,
+    ModelArtifact, ToolSpec,
 };
 use mayhem_gateway::{
     heartbeat_signing_payload, normalize_rate_map,
@@ -18054,6 +18055,7 @@ fn provider_engine_request_from_body(
         .unwrap_or(&[]);
     let prompt = provider_engine_prompt(messages, adapter)?;
     let mut request = GenerateRequest::new(prompt);
+    request.media = provider_engine_media_inputs(messages);
     if let Some(max_tokens) = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
@@ -18090,6 +18092,66 @@ fn provider_engine_request_from_body(
         });
     }
     Ok(request)
+}
+
+fn provider_engine_media_inputs(messages: &[Value]) -> Vec<MediaInput> {
+    messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flat_map(|parts| parts.iter())
+        .filter_map(provider_content_part_media_input)
+        .collect()
+}
+
+fn provider_content_part_media_input(part: &Value) -> Option<MediaInput> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("image_url") => {
+            let url = part
+                .get("image_url")
+                .and_then(|image| image.get("url"))
+                .or_else(|| part.get("url"))
+                .and_then(Value::as_str)?
+                .to_owned();
+            Some(MediaInput {
+                kind: "image".to_owned(),
+                content_type: data_url_content_type(&url),
+                url: Some(url),
+                data: None,
+            })
+        }
+        Some("input_audio") => {
+            let audio = part.get("input_audio")?;
+            let data = audio.get("data").and_then(Value::as_str)?.to_owned();
+            if data.is_empty() {
+                return None;
+            }
+            let format = audio.get("format").and_then(Value::as_str).unwrap_or("wav");
+            Some(MediaInput {
+                kind: "audio".to_owned(),
+                content_type: Some(audio_content_type(format).to_owned()),
+                url: None,
+                data: Some(data),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn data_url_content_type(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("data:")?;
+    let (content_type, _) = rest.split_once(';')?;
+    (!content_type.trim().is_empty()).then(|| content_type.to_owned())
+}
+
+fn audio_content_type(format: &str) -> &'static str {
+    match format {
+        "mp3" => "audio/mpeg",
+        "opus" => "audio/ogg",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "pcm" => "audio/L16",
+        _ => "audio/wav",
+    }
 }
 
 fn provider_engine_prompt(messages: &[Value], adapter: &catalog::CatalogAdapter) -> Result<String> {
@@ -18475,15 +18537,49 @@ fn provider_content_to_text(value: &Value) -> String {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
-            .map(|part| {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| provider_content_to_text(part))
-            })
+            .map(provider_content_part_to_text)
             .collect::<Vec<_>>()
             .join(""),
         other => other.to_string(),
+    }
+}
+
+fn provider_content_part_to_text(part: &Value) -> String {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some("image_url") => {
+            let url = part
+                .get("image_url")
+                .and_then(|image| image.get("url"))
+                .or_else(|| part.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("[image:{}]", blake3::hash(url.as_bytes()).to_hex())
+        }
+        Some("input_audio") => {
+            let audio = part.get("input_audio").unwrap_or(&Value::Null);
+            let format = audio
+                .get("format")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let data = audio
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!(
+                "[audio:{format}:{}]",
+                blake3::hash(data.as_bytes()).to_hex()
+            )
+        }
+        _ => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| provider_content_to_text(part)),
     }
 }
 
@@ -21251,6 +21347,37 @@ mod tests {
             .prompt
             .contains("scratchpad stays only for preserve adapters"));
         assert!(stripped_request.prompt.contains("user: final user content"));
+    }
+
+    #[test]
+    fn provider_engine_request_preserves_multimodal_content_as_media() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe this" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } },
+                    { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } }
+                ]
+            }]
+        });
+
+        let request =
+            provider_engine_request_from_body(&body, &catalog::CatalogAdapter::default()).unwrap();
+
+        assert_eq!(request.media.len(), 2);
+        assert_eq!(request.media[0].kind, "image");
+        assert_eq!(request.media[0].content_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            request.media[0].url.as_deref(),
+            Some("data:image/png;base64,aW1hZ2U=")
+        );
+        assert_eq!(request.media[1].kind, "audio");
+        assert_eq!(request.media[1].content_type.as_deref(), Some("audio/wav"));
+        assert_eq!(request.media[1].data.as_deref(), Some("UklGRg=="));
+        assert!(request.prompt.contains("describe this"));
+        assert!(request.prompt.contains("[image:"));
+        assert!(request.prompt.contains("[audio:wav:"));
     }
 
     #[test]

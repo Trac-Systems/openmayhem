@@ -238,6 +238,8 @@ impl Tokenization {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GenerateRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<MediaInput>,
     #[serde(default = "default_max_new_tokens")]
     pub max_new_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,10 +254,22 @@ pub struct GenerateRequest {
     pub ignore_eos: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaInput {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
 impl GenerateRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            media: Vec::new(),
             max_new_tokens: default_max_new_tokens(),
             grammar: None,
             temperature: None,

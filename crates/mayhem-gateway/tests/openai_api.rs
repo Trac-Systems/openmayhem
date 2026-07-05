@@ -149,6 +149,49 @@ impl GatewaySessionBackend for ArtifactDirectSessionBackend {
 }
 
 #[derive(Debug)]
+struct VisionInspectBackend {
+    seen_content: Arc<Mutex<Vec<Value>>>,
+}
+
+impl GatewaySessionBackend for VisionInspectBackend {
+    fn name(&self) -> &str {
+        "test-vision-inspect"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            self.seen_content
+                .lock()
+                .expect("seen content lock")
+                .push(request.messages[0].content.clone());
+            let prompt_tokens = request.messages.len() as u64;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some("vision ok".to_owned()),
+                    tool_call: None,
+                    artifacts: Vec::new(),
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens: 2,
+                        total_tokens: prompt_tokens + 2,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids: vec![70, 71],
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
 struct RetryThenDirectSessionBackend {
     retry_provider: String,
     calls: Arc<Mutex<Vec<String>>>,
@@ -923,6 +966,64 @@ async fn chat_completion_can_use_direct_session_backend() {
     let (status, body) = json_request(app, Method::GET, "/mayhem/status", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["backend"], "test-direct-session");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_image_content_for_non_vision_model() {
+    let state = GatewayState::from_models(vec![routed_test_model()])
+        .with_session_backend(Arc::new(TestDirectSessionBackend));
+    let app = openai_router(state);
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe this" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } }
+            ]
+        }]
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "messages");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("does not support image_url"));
+}
+
+#[tokio::test]
+async fn chat_completion_preserves_image_content_for_vision_direct_session() {
+    let mut model = routed_test_model();
+    model.mayhem.caps.vision = true;
+    let seen_content = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![model]).with_session_backend(Arc::new(
+        VisionInspectBackend {
+            seen_content: seen_content.clone(),
+        },
+    ));
+    let app = openai_router(state);
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe this" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } }
+            ]
+        }]
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "vision ok");
+    assert_eq!(
+        seen_content.lock().expect("seen content")[0][1]["image_url"]["url"],
+        "data:image/png;base64,aW1hZ2U="
+    );
 }
 
 #[tokio::test]
