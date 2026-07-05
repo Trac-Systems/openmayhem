@@ -6,6 +6,8 @@ pub const CRATE_NAME: &str = "mayhem-proto";
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const SIGNING_MESSAGE_VERSION: u32 = 2;
+pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
 
@@ -173,14 +175,28 @@ pub struct ReceiptAck {
 }
 
 #[derive(Serialize)]
-struct SpendVoucherSigningEnvelope<'a> {
+struct SpendVoucherSigningEnvelopeV1<'a> {
     domain: &'static str,
     body: &'a SpendVoucherBody,
 }
 
 #[derive(Serialize)]
-struct ReceiptSigningEnvelope<'a> {
+struct SpendVoucherSigningEnvelopeV2<'a> {
     domain: &'static str,
+    signing_version: u32,
+    body: &'a SpendVoucherBody,
+}
+
+#[derive(Serialize)]
+struct ReceiptSigningEnvelopeV1<'a> {
+    domain: &'static str,
+    body: &'a ReceiptBody,
+}
+
+#[derive(Serialize)]
+struct ReceiptSigningEnvelopeV2<'a> {
+    domain: &'static str,
+    signing_version: u32,
     body: &'a ReceiptBody,
 }
 
@@ -263,17 +279,73 @@ struct AttestationHardwareQuoteBinding<'a> {
 }
 
 pub fn spend_voucher_signing_bytes(body: &SpendVoucherBody) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&SpendVoucherSigningEnvelope {
-        domain: "mayhem-spend-voucher-v1",
-        body,
-    })
+    spend_voucher_signing_bytes_for_version(body, SIGNING_MESSAGE_VERSION)
+}
+
+pub fn spend_voucher_signing_bytes_for_version(
+    body: &SpendVoucherBody,
+    signing_version: u32,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match signing_version {
+        1 => serde_json::to_vec(&SpendVoucherSigningEnvelopeV1 {
+            domain: "mayhem-spend-voucher-v1",
+            body,
+        }),
+        2 => serde_json::to_vec(&SpendVoucherSigningEnvelopeV2 {
+            domain: "mayhem-spend-voucher",
+            signing_version: 2,
+            body,
+        }),
+        _ => serde_json::to_vec(&SpendVoucherSigningEnvelopeV2 {
+            domain: "mayhem-spend-voucher-unsupported",
+            signing_version,
+            body,
+        }),
+    }
+}
+
+pub fn supported_spend_voucher_signing_bytes(
+    body: &SpendVoucherBody,
+) -> Result<Vec<Vec<u8>>, serde_json::Error> {
+    SUPPORTED_SIGNING_MESSAGE_VERSIONS
+        .iter()
+        .map(|version| spend_voucher_signing_bytes_for_version(body, *version))
+        .collect()
 }
 
 pub fn receipt_signing_bytes(body: &ReceiptBody) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&ReceiptSigningEnvelope {
-        domain: "mayhem-session-receipt-v1",
-        body,
-    })
+    receipt_signing_bytes_for_version(body, SIGNING_MESSAGE_VERSION)
+}
+
+pub fn receipt_signing_bytes_for_version(
+    body: &ReceiptBody,
+    signing_version: u32,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match signing_version {
+        1 => serde_json::to_vec(&ReceiptSigningEnvelopeV1 {
+            domain: "mayhem-session-receipt-v1",
+            body,
+        }),
+        2 => serde_json::to_vec(&ReceiptSigningEnvelopeV2 {
+            domain: "mayhem-session-receipt",
+            signing_version: 2,
+            body,
+        }),
+        _ => serde_json::to_vec(&ReceiptSigningEnvelopeV2 {
+            domain: "mayhem-session-receipt-unsupported",
+            signing_version,
+            body,
+        }),
+    }
+}
+
+pub fn supported_receipt_signing_bytes(
+    body: &ReceiptBody,
+) -> Result<Vec<Vec<u8>>, serde_json::Error> {
+    SUPPORTED_SIGNING_MESSAGE_VERSIONS
+        .iter()
+        .map(|version| receipt_signing_bytes_for_version(body, *version))
+        .collect()
 }
 
 pub fn session_accept_signing_bytes(
@@ -416,6 +488,66 @@ mod tests {
         assert_ne!(
             receipt_signing_bytes(&receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn signing_payloads_are_versioned_and_keep_legacy_payloads_supported() {
+        let voucher = SpendVoucherBody {
+            session_id: "sess".to_owned(),
+            enclave_id: "enclave".to_owned(),
+            price_ver: 1,
+            max_spend_mu: 5000,
+            checkpoint_every: CheckpointPolicy {
+                tokens: 8192,
+                ms: 30000,
+            },
+        };
+        let current_voucher = spend_voucher_signing_bytes(&voucher).unwrap();
+        let legacy_voucher = spend_voucher_signing_bytes_for_version(&voucher, 1).unwrap();
+        assert_ne!(current_voucher, legacy_voucher);
+        assert!(String::from_utf8(current_voucher.clone())
+            .unwrap()
+            .contains("\"signing_version\":2"));
+        assert!(String::from_utf8(legacy_voucher.clone())
+            .unwrap()
+            .contains("mayhem-spend-voucher-v1"));
+        assert_eq!(
+            supported_spend_voucher_signing_bytes(&voucher).unwrap(),
+            vec![current_voucher, legacy_voucher]
+        );
+
+        let receipt = ReceiptBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            session_id: "sess".to_owned(),
+            seq: 1,
+            final_receipt: false,
+            user: "user".to_owned(),
+            provider: "provider".to_owned(),
+            enclave_id: "enclave".to_owned(),
+            model_id: "model".to_owned(),
+            price_ver: 1,
+            rules_ver: 1,
+            usage: ReceiptUsage {
+                in_tokens: 3,
+                out_tokens: 5,
+            },
+            mu_owed_cum: 1,
+            prompt_hash: "hash".to_owned(),
+            ts: 10,
+        };
+        let current_receipt = receipt_signing_bytes(&receipt).unwrap();
+        let legacy_receipt = receipt_signing_bytes_for_version(&receipt, 1).unwrap();
+        assert_ne!(current_receipt, legacy_receipt);
+        assert!(String::from_utf8(current_receipt.clone())
+            .unwrap()
+            .contains("\"signing_version\":2"));
+        assert!(String::from_utf8(legacy_receipt.clone())
+            .unwrap()
+            .contains("mayhem-session-receipt-v1"));
+        assert_eq!(
+            supported_receipt_signing_bytes(&receipt).unwrap(),
+            vec![current_receipt, legacy_receipt]
         );
     }
 

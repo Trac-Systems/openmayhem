@@ -36,9 +36,9 @@ use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
+    spend_voucher_signing_bytes, supported_receipt_signing_bytes, AttestationReport,
+    CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1350,16 +1350,18 @@ fn verify_provider_receipt_signature(
     let verifying_key = VerifyingKey::from_bytes(&enclave_key)
         .map_err(|err| GatewaySessionError::new(format!("invalid enclave pubkey: {err}")))?;
     let signature = Signature::from_bytes(&signature);
-    verifying_key
-        .verify(
-            &receipt_signing_bytes(&receipt.body).map_err(|err| {
-                GatewaySessionError::new(format!("provider receipt signing payload failed: {err}"))
-            })?,
-            &signature,
-        )
-        .map_err(|err| {
-            GatewaySessionError::new(format!("provider receipt enclave signature failed: {err}"))
-        })
+    let payloads = supported_receipt_signing_bytes(&receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!("provider receipt signing payload failed: {err}"))
+    })?;
+    if payloads
+        .iter()
+        .any(|payload| verifying_key.verify(payload, &signature).is_ok())
+    {
+        return Ok(());
+    }
+    Err(GatewaySessionError::new(
+        "provider receipt enclave signature failed",
+    ))
 }
 
 fn decode_hex_array<const N: usize>(
@@ -3248,7 +3250,9 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mayhem_proto::{attestation_signing_bytes, AttestationSigner};
+    use mayhem_proto::{
+        attestation_signing_bytes, receipt_signing_bytes_for_version, AttestationSigner,
+    };
 
     #[test]
     fn sc_bridge_direct_session_defaults_match_p4_3_failover_timeouts() {
@@ -3343,6 +3347,14 @@ mod tests {
         assert_eq!(stored.receipt.enclave_sig, provider_receipt.enclave_sig);
         assert_eq!(stored.receipt.body, provider_receipt.body);
         assert_eq!(stored.receipt_ack.user_sig, stored.receipt.user_sig);
+
+        let mut legacy_signed = provider_receipt.clone();
+        legacy_signed.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes_for_version(&legacy_signed.body, 1).unwrap(),
+        );
+        verify_provider_receipt_signature(&legacy_signed)
+            .expect("legacy v1 provider receipt signature remains accepted");
 
         let live_ack = direct_session_receipt_ack(
             &request,

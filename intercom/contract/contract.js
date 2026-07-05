@@ -3,6 +3,8 @@ import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
 const CONTRACT_VERSION = 1;
+const SIGNING_MESSAGE_VERSION = 2;
+const SUPPORTED_SIGNING_MESSAGE_VERSIONS = Object.freeze([2, 1]);
 const CURRENT_RULES_KEY = 'rules/current';
 const PAYOUT_METHODS = new Set(['tnk', 'stripe', 'coinbase']);
 const PAYOUT_CONFIRM_KINDS = new Set(['provider', 'fee_sweep']);
@@ -117,13 +119,46 @@ const ROOM_POLICY_FIELDS = new Set([
   'max_price_mult',
 ]);
 
-export const consentMessage = (ver, hash) => `mayhem-consent${ver}${hash}`;
-export const providerLifecycleIntentMessage = (intent) =>
-  `mayhem-provider-lifecycle-v1${stableJson(intent)}`;
-export const receiptMessage = (body) => JSON.stringify({
-  domain: 'mayhem-session-receipt-v1',
-  body,
-});
+export const signingMessageVersions = () => [...SUPPORTED_SIGNING_MESSAGE_VERSIONS];
+export const consentMessage = (ver, hash, signingVersion = SIGNING_MESSAGE_VERSION) => {
+  if (signingVersion === 1) return `mayhem-consent${ver}${hash}`;
+  if (signingVersion === 2) {
+    return JSON.stringify({
+      domain: 'mayhem-consent',
+      signing_version: 2,
+      rules_ver: ver,
+      rules_hash: hash,
+    });
+  }
+  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+};
+export const providerLifecycleIntentMessage = (intent, signingVersion = SIGNING_MESSAGE_VERSION) => {
+  if (signingVersion === 1) return `mayhem-provider-lifecycle-v1${stableJson(intent)}`;
+  if (signingVersion === 2) {
+    return JSON.stringify({
+      domain: 'mayhem-provider-lifecycle',
+      signing_version: 2,
+      intent: stableValue(intent),
+    });
+  }
+  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+};
+export const receiptMessage = (body, signingVersion = SIGNING_MESSAGE_VERSION) => {
+  if (signingVersion === 1) {
+    return JSON.stringify({
+      domain: 'mayhem-session-receipt-v1',
+      body,
+    });
+  }
+  if (signingVersion === 2) {
+    return JSON.stringify({
+      domain: 'mayhem-session-receipt',
+      signing_version: 2,
+      body,
+    });
+  }
+  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+};
 export const probeResultEvidence = (value, auditor) => ({
   auditor,
   probe_id: value.probe_id,
@@ -754,7 +789,7 @@ class MayhemContract extends Contract {
     const intentError = this.validateProviderLifecycleIntent(intent);
     if (intentError) return;
     if (!this.isHexBytes(value.sig, 64)) return;
-    if (key !== await this.providerLifecycleFeatureKey(intent)) return;
+    if (!(await this.providerLifecycleFeatureKeys(intent)).includes(key)) return;
     if (!this.verifyProviderLifecycleSignature(intent.provider, intent, value.sig)) return;
 
     switch (intent.op) {
@@ -3140,6 +3175,15 @@ class MayhemContract extends Contract {
     return `intent/provider/${intent.provider}/${intent.op}/${b4a.toString(digest, 'hex')}`;
   }
 
+  async providerLifecycleFeatureKeys(intent) {
+    const keys = [];
+    for (const signingVersion of SUPPORTED_SIGNING_MESSAGE_VERSIONS) {
+      const digest = await blake3(b4a.from(providerLifecycleIntentMessage(intent, signingVersion)));
+      keys.push(`intent/provider/${intent.provider}/${intent.op}/${b4a.toString(digest, 'hex')}`);
+    }
+    return keys;
+  }
+
   async activeParamsAt(at, keys = Object.keys(PARAM_DEFINITIONS)) {
     const params = {};
     for (const key of keys) {
@@ -4382,15 +4426,17 @@ class MayhemContract extends Contract {
   verifyReceiptEnvelope(envelope) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
-    const message = receiptMessage(envelope.body);
     const enclaveKey = envelope.enclave_pubkey ?? (
       this.isHexBytes(envelope.body.enclave_id, 32) ? envelope.body.enclave_id : null
     );
     if (!enclaveKey) return false;
-    return (
-      verify.call(this.protocol.peer.wallet, envelope.enclave_sig, message, enclaveKey) === true &&
-      verify.call(this.protocol.peer.wallet, envelope.user_sig, message, envelope.body.user) === true
-    );
+    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) => {
+      const message = receiptMessage(envelope.body, signingVersion);
+      return (
+        verify.call(this.protocol.peer.wallet, envelope.enclave_sig, message, enclaveKey) === true &&
+        verify.call(this.protocol.peer.wallet, envelope.user_sig, message, envelope.body.user) === true
+      );
+    });
   }
 
   receiptLeafEnvelope(envelope) {
@@ -4991,13 +5037,17 @@ class MayhemContract extends Contract {
   verifyConsentSignature(sender, ver, hash, sig) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
-    return verify.call(this.protocol.peer.wallet, sig, consentMessage(ver, hash), sender) === true;
+    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) =>
+      verify.call(this.protocol.peer.wallet, sig, consentMessage(ver, hash, signingVersion), sender) === true
+    );
   }
 
   verifyProviderLifecycleSignature(provider, intent, sig) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
-    return verify.call(this.protocol.peer.wallet, sig, providerLifecycleIntentMessage(intent), provider) === true;
+    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) =>
+      verify.call(this.protocol.peer.wallet, sig, providerLifecycleIntentMessage(intent, signingVersion), provider) === true
+    );
   }
 
   verifyProbeResultSignature(auditor, value) {

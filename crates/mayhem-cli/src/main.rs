@@ -45,8 +45,9 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck,
-    ReceiptBody, ReceiptUsage, SpendVoucher, SESSION_RECEIPT_SCHEMA_VERSION,
+    spend_voucher_signing_bytes, supported_receipt_signing_bytes,
+    supported_spend_voucher_signing_bytes, AttestationRuntimeConfig, CatalogEnclaveIdentity,
+    ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,7 @@ const DEFAULT_RELEASE_FEED_URL: &str =
     "https://api.github.com/repos/Trac-Systems/operationmayhem/releases/latest";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
 const RELEASE_SIGNATURE_FILE_SUFFIX: &str = ".sig";
+const CONTRACT_SIGNING_MESSAGE_VERSION: u32 = 2;
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
@@ -14065,11 +14067,49 @@ async fn provider_room_leave(args: ProviderRoomLeaveArgs) -> Result<()> {
     print_provider_lifecycle_report(&report, args.tx.json)
 }
 
+#[derive(Serialize)]
+struct ProviderLifecycleIntentSigningEnvelope<'a> {
+    domain: &'static str,
+    signing_version: u32,
+    intent: &'a Value,
+}
+
 fn provider_lifecycle_intent_message(intent: &Value) -> String {
-    format!("mayhem-provider-lifecycle-v1{}", stable_json_value(intent))
+    provider_lifecycle_intent_message_for_version(intent, CONTRACT_SIGNING_MESSAGE_VERSION)
+}
+
+fn provider_lifecycle_intent_message_for_version(intent: &Value, signing_version: u32) -> String {
+    match signing_version {
+        1 => format!("mayhem-provider-lifecycle-v1{}", stable_json_value(intent)),
+        2 => {
+            let stable_intent = stable_json_value(intent);
+            serde_json::to_string(&ProviderLifecycleIntentSigningEnvelope {
+                domain: "mayhem-provider-lifecycle",
+                signing_version: 2,
+                intent: &stable_intent,
+            })
+            .expect("provider lifecycle signing message serializes")
+        }
+        _ => {
+            let stable_intent = stable_json_value(intent);
+            serde_json::to_string(&ProviderLifecycleIntentSigningEnvelope {
+                domain: "mayhem-provider-lifecycle-unsupported",
+                signing_version,
+                intent: &stable_intent,
+            })
+            .expect("provider lifecycle signing message serializes")
+        }
+    }
 }
 
 fn provider_lifecycle_feature_key(intent: &Value) -> Result<String> {
+    provider_lifecycle_feature_key_for_version(intent, CONTRACT_SIGNING_MESSAGE_VERSION)
+}
+
+fn provider_lifecycle_feature_key_for_version(
+    intent: &Value,
+    signing_version: u32,
+) -> Result<String> {
     let provider = intent
         .get("provider")
         .and_then(Value::as_str)
@@ -14078,9 +14118,11 @@ fn provider_lifecycle_feature_key(intent: &Value) -> Result<String> {
         .get("op")
         .and_then(Value::as_str)
         .context("provider lifecycle intent missing op")?;
-    let digest = blake3::hash(provider_lifecycle_intent_message(intent).as_bytes())
-        .to_hex()
-        .to_string();
+    let digest = blake3::hash(
+        provider_lifecycle_intent_message_for_version(intent, signing_version).as_bytes(),
+    )
+    .to_hex()
+    .to_string();
     Ok(format!("intent/provider/{provider}/{op}/{digest}"))
 }
 
@@ -16265,9 +16307,14 @@ fn verify_provider_session_receipt_ack(
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).context("invalid receipt ack user pubkey")?;
     let signature = Signature::from_bytes(&sig_bytes);
-    verifying_key
-        .verify(&receipt_signing_bytes(body)?, &signature)
-        .context("receipt ack user signature failed")
+    let payloads = supported_receipt_signing_bytes(body)?;
+    if payloads
+        .iter()
+        .any(|payload| verifying_key.verify(payload, &signature).is_ok())
+    {
+        return Ok(());
+    }
+    bail!("receipt ack user signature failed")
 }
 
 async fn send_provider_session_close(
@@ -16810,9 +16857,14 @@ fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &s
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).context("invalid spend voucher user pubkey")?;
     let signature = Signature::from_bytes(&sig_bytes);
-    verifying_key
-        .verify(&spend_voucher_signing_bytes(&voucher.body)?, &signature)
-        .context("spend voucher user signature failed")
+    let payloads = supported_spend_voucher_signing_bytes(&voucher.body)?;
+    if payloads
+        .iter()
+        .any(|payload| verifying_key.verify(payload, &signature).is_ok())
+    {
+        return Ok(());
+    }
+    bail!("spend voucher user signature failed")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -18630,8 +18682,9 @@ mod tests {
             "room_id": "room-a",
             "nonce": "22".repeat(32),
         });
+        assert!(provider_lifecycle_intent_message(&intent).contains("\"signing_version\":2"));
         assert_eq!(
-            provider_lifecycle_intent_message(&intent),
+            provider_lifecycle_intent_message_for_version(&intent, 1),
             format!("mayhem-provider-lifecycle-v1{}", stable_json_value(&intent))
         );
         assert_eq!(
@@ -18640,6 +18693,15 @@ mod tests {
                 "intent/provider/{}/join_room/{}",
                 provider,
                 blake3::hash(provider_lifecycle_intent_message(&intent).as_bytes()).to_hex()
+            )
+        );
+        assert_eq!(
+            provider_lifecycle_feature_key_for_version(&intent, 1).unwrap(),
+            format!(
+                "intent/provider/{}/join_room/{}",
+                provider,
+                blake3::hash(provider_lifecycle_intent_message_for_version(&intent, 1).as_bytes())
+                    .to_hex()
             )
         );
 
@@ -19186,6 +19248,24 @@ mod tests {
         let frame = test_session_open_frame(&terms);
         assert_eq!(
             provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Accept
+        );
+        let mut legacy_voucher = frame.clone();
+        let user_key = SigningKey::from_bytes(&[6_u8; 32]);
+        let voucher_body: mayhem_proto::SpendVoucherBody =
+            serde_json::from_value(legacy_voucher["voucher"].clone()).unwrap();
+        let legacy_sig = hex_encode(
+            &user_key
+                .sign(
+                    &mayhem_proto::spend_voucher_signing_bytes_for_version(&voucher_body, 1)
+                        .unwrap(),
+                )
+                .to_bytes(),
+        );
+        legacy_voucher["voucher"]["user_sig"] = json!(legacy_sig.clone());
+        legacy_voucher["sig"] = json!(legacy_sig);
+        assert_eq!(
+            provider_session_open_decision(&legacy_voucher, &terms),
             ProviderSessionDecision::Accept
         );
 

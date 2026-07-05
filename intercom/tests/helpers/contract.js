@@ -127,16 +127,16 @@ export const makeVerifier = (wallet) => ({
   },
 });
 
-export const signConsent = (wallet, ver, hash) =>
-  b4a.toString(wallet.sign(b4a.from(consentMessage(ver, hash))), 'hex');
+export const signConsent = (wallet, ver, hash, signingVersion) =>
+  b4a.toString(wallet.sign(b4a.from(consentMessage(ver, hash, signingVersion))), 'hex');
 
-export const signProviderLifecycleIntent = (wallet, intent) =>
-  b4a.toString(wallet.sign(b4a.from(providerLifecycleIntentMessage(intent))), 'hex');
+export const signProviderLifecycleIntent = (wallet, intent, signingVersion) =>
+  b4a.toString(wallet.sign(b4a.from(providerLifecycleIntentMessage(intent, signingVersion))), 'hex');
 
 export const signProbeResult = (wallet, value, auditor) =>
   b4a.toString(wallet.sign(b4a.from(probeResultMessage(value, auditor))), 'hex');
 
-export const providerLifecycleFeatureKey = async (intent) => {
-  const digest = await blake3(b4a.from(providerLifecycleIntentMessage(intent)));
+export const providerLifecycleFeatureKey = async (intent, signingVersion) => {
+  const digest = await blake3(b4a.from(providerLifecycleIntentMessage(intent, signingVersion)));
   return `intent/provider/${intent.provider}/${intent.op}/${b4a.toString(digest, 'hex')}`;
 };
