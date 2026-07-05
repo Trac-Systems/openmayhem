@@ -63,12 +63,18 @@ const EMBEDDED_CATALOG: &str = include_str!("../../../catalog/models.json");
 const EMBEDDED_CANARY_DEV_V1: &str = include_str!("../../../catalog/canaries/canary-dev-v1.json");
 const EMBEDDED_CANARY_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-launch-v1.json");
+const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
 const DEFAULT_CANARY_SEED: i64 = 7;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
 const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
+const DASHBOARD_CSS: &str = r#"
+@font-face{font-family:Exo;src:url('/mayhem/dashboard/assets/exo-latin.woff2') format('woff2');font-style:normal;font-weight:400 700;font-display:swap}
+:root{color-scheme:dark;--bg:rgb(11,11,12);--surface:rgb(22,22,26);--surface-card:rgb(24,24,27);--surface-raised:rgb(42,42,46);--border:rgb(42,42,46);--border-strong:rgb(41,41,41);--text-primary:rgb(229,231,235);--text-inverse:rgb(255,255,255);--text-muted:rgb(136,138,140);--accent-primary:rgb(197,68,89);--accent-primary-light:rgb(214,120,102);--accent-secondary:rgb(66,187,147);--radius-sm:6px;--radius-md:8px;--radius-pill:999px;--space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-5:20px;--space-6:24px}
+*{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
+"#;
 
 #[derive(Clone, Debug)]
 pub struct GatewayState {
@@ -820,6 +826,10 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/balance", get(mayhem_balance))
         .route("/mayhem/dashboard", get(mayhem_dashboard))
         .route("/mayhem/dashboard/session", get(mayhem_dashboard_session))
+        .route(
+            "/mayhem/dashboard/assets/exo-latin.woff2",
+            get(mayhem_dashboard_exo_font),
+        )
         .with_state(Arc::new(state))
 }
 
@@ -982,6 +992,24 @@ async fn mayhem_dashboard_session(
     )
 }
 
+async fn mayhem_dashboard_exo_font(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+        return with_dashboard_security_headers(StatusCode::UNAUTHORIZED.into_response());
+    }
+    let mut response = Response::new(Body::from(DASHBOARD_EXO_LATIN_WOFF2.to_vec()));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("font/woff2"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    with_dashboard_security_headers(response)
+}
+
 async fn mayhem_status(State(state): State<SharedState>) -> Response {
     Json(json!({
         "ok": true,
@@ -1112,7 +1140,7 @@ fn dashboard_locked_html(expires_in_seconds: u64) -> String {
     dashboard_html_document(
         "Locked",
         &format!(
-            r#"<section class="panel"><p class="eyebrow">LOCAL SESSION</p><h1>MAY<span>HEM</span></h1><p class="muted">Dashboard token required.</p><p class="mono">expires in {expires_in_seconds}s</p></section>"#
+            r#"<main class="dashboard"><section class="card strong"><span class="label">Local session</span><h1 class="wordmark compact">MAY<span class="hem">HEM</span></h1><p class="muted">Dashboard token required.</p><p class="mono">expires in {expires_in_seconds}s</p></section></main>"#
         ),
     )
 }
@@ -1121,14 +1149,14 @@ fn dashboard_shell_html(expires_in_seconds: u64) -> String {
     dashboard_html_document(
         "Local Dashboard",
         &format!(
-            r#"<nav><strong>MAY<span>HEM</span></strong><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard">Provider</a><b>LOCAL</b></nav><main><section class="panel"><p class="eyebrow">LOCAL SESSION</p><h1>MAY<span>HEM</span></h1><div class="grid"><div><label>Gateway</label><p class="mono">127.0.0.1</p></div><div><label>Session</label><p class="mono">{expires_in_seconds}s</p></div></div></section></main><footer>Runs entirely on this machine. No external network calls.</footer>"#
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">127.0.0.1 local gateway</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Local dashboard surface</p></section><section class="component-grid"><article class="card strong"><div class="card-header"><h2>Account</h2><a class="link" href="/mayhem/dashboard">View all</a></div><div class="detail-grid"><div><span class="label">Balance</span><p class="value mono">1,240.00 TAP</p></div><div><span class="label">Sessions</span><p class="value"><span class="count-chip">12</span></p></div><div><span class="label">Provider</span><div class="copy-row"><span class="mono">testtrac1n57xm5de...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Gateway</span><p class="value mono">127.0.0.1</p></div></div><div class="card-footer"><span>Local session {expires_in_seconds}s</span><span class="status-dot">Online</span></div></article><article class="card"><div class="card-header"><h2>Throughput</h2><div class="toggle-row"><span class="count-chip">42 tok/s</span><span class="icon-toggle active">L</span><span class="icon-toggle">B</span></div></div><div class="chart-shell"><div class="chart-grid"></div><div class="chart-line"></div><span class="chart-point">42</span></div><div class="card-footer"><span>Synced locally</span><span class="status-dot muted">Idle</span></div></article><article class="card"><div class="card-header"><h2>Components</h2><span class="count-chip">06</span></div><div class="detail-grid"><div><span class="label">Status</span><p class="status-dot">Online</p></div><div><span class="label">Copy</span><button class="copy-chip" type="button">Copy</button></div><div><span class="label">Count</span><span class="count-chip">128</span></div><div><span class="label">Mono</span><p class="mono">mx/s/session</p></div></div></article><article class="card"><div class="card-header"><h2>Queue</h2><a class="link" href="/mayhem/dashboard">View all</a></div><div class="empty-state"><div><div class="empty-icon"></div><p>No sessions yet</p></div></div></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#
         ),
     )
 }
 
 fn dashboard_html_document(title: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>:root{{color-scheme:dark;--bg:rgb(11,11,12);--surface:rgb(22,22,26);--card:rgb(24,24,27);--border:rgb(42,42,46);--text:rgb(229,231,235);--muted:rgb(136,138,140);--accent:rgb(197,68,89);--live:rgb(66,187,147)}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:Exo,system-ui,sans-serif}}nav{{height:64px;display:flex;align-items:center;gap:20px;padding:0 24px;background:var(--surface);border-bottom:1px solid var(--border)}}nav strong,nav b{{letter-spacing:0}}nav strong span,h1 span{{background:linear-gradient(90deg,var(--accent),rgb(214,120,102));-webkit-background-clip:text;background-clip:text;color:transparent}}nav a{{color:var(--text);text-decoration:none}}nav b{{margin-left:auto;background:var(--live);color:rgb(4,24,19);border-radius:999px;padding:6px 10px;font-size:12px}}main{{max-width:960px;margin:0 auto;padding:56px 24px}}.panel{{border:1px solid var(--border);border-radius:8px;background:var(--card);padding:24px}}.eyebrow,label{{color:var(--muted);font-size:12px;letter-spacing:0;text-transform:uppercase}}h1{{margin:8px 0 24px;font-size:48px;line-height:1;letter-spacing:0}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}.muted,footer{{color:var(--muted)}}footer{{border-top:1px solid var(--border);padding:18px 24px;font-size:13px}}@media(max-width:640px){{.grid{{grid-template-columns:1fr}}h1{{font-size:40px}}nav{{gap:12px;padding:0 16px}}}}</style></head><body>{body}</body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>{DASHBOARD_CSS}</style></head><body>{body}</body></html>"#
     )
 }
 

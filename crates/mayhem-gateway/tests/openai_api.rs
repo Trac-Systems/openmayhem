@@ -1836,6 +1836,57 @@ async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
     assert!(expires <= 900);
 }
 
+#[tokio::test]
+async fn dashboard_component_gallery_uses_local_design_system_and_font_asset() {
+    let state = GatewayState::from_embedded_catalog();
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let app = openai_router(state);
+
+    let (status, headers, bytes) =
+        raw_request(app.clone(), Method::GET, dashboard_path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("dashboard html");
+    for expected in [
+        "@font-face",
+        "/mayhem/dashboard/assets/exo-latin.woff2",
+        "--surface-card",
+        "class=\"wordmark\"",
+        "class=\"status-dot\"",
+        "class=\"copy-chip\"",
+        "class=\"count-chip\"",
+        "class=\"empty-state\"",
+        "class=\"chart-shell\"",
+    ] {
+        assert!(body.contains(expected), "missing {expected}");
+    }
+    assert_no_external_urls(&body);
+
+    let cookie = headers
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .expect("dashboard session cookie")
+        .to_owned();
+    let (status, headers, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        "/mayhem/dashboard/assets/exo-latin.woff2",
+        None,
+        &[("cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("font/woff2")
+    );
+    assert!(bytes.len() > 10_000);
+}
+
 #[test]
 fn dashboard_bind_refuses_unspecified_and_lan_addresses() {
     assert!(
