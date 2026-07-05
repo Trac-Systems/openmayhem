@@ -3388,7 +3388,7 @@ struct ProviderStartArgs {
     #[arg(long)]
     rpc_url: Option<String>,
 
-    /// Peer JSON-RPC base URL used for live provider session rechecks.
+    /// Provider peer JSON-RPC URL reported for diagnostics. Contract rechecks/reservations use --rpc-url.
     /// Defaults to --rpc-url.
     #[arg(long)]
     session_rpc_url: Option<String>,
@@ -11044,6 +11044,13 @@ async fn run_admin_feature_command(
         report["submitted"] = json!(true);
         report["rpc_url"] = json!(rpc_url);
         report["result"] = submitted;
+        if feature_type == "epochApply" {
+            let epoch = value
+                .get("epoch")
+                .and_then(Value::as_u64)
+                .context("epochApply feature value missing epoch")?;
+            report["apply_state"] = wait_for_epoch_apply_state(&rpc, epoch).await?;
+        }
     } else if args.submit && args.sim {
         report["sim"] = json!(true);
     }
@@ -11054,6 +11061,24 @@ async fn run_admin_feature_command(
         print_admin_feature_report(&report)?;
     }
     Ok(())
+}
+
+async fn wait_for_epoch_apply_state(rpc: &PeerRpcClient, epoch: u64) -> Result<Value> {
+    let mut last = Value::Null;
+    for _ in 0..120 {
+        last = read_state_value(rpc, "epoch/apply/state")
+            .await?
+            .unwrap_or(Value::Null);
+        if last
+            .get("updated_epoch")
+            .and_then(Value::as_u64)
+            .is_some_and(|updated| updated >= epoch)
+        {
+            return Ok(last);
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    bail!("timed out waiting for epoch/apply/state to reach epoch {epoch}; last value: {last}")
 }
 
 fn print_admin_report(report: &Value) -> Result<()> {
@@ -18291,11 +18316,6 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .session_rpc_url
         .clone()
         .unwrap_or_else(|| rpc_url.clone());
-    let session_rpc = if args.serve_sessions {
-        Some(PeerRpcClient::new(&session_rpc_url)?)
-    } else {
-        None
-    };
     let rules = resolve_rules(None, None, &rpc, None).await?;
 
     provider_log(
@@ -18568,7 +18588,6 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     }
 
     if let Some(responder) = session_responder {
-        let live_rpc = session_rpc.as_ref().unwrap_or(&rpc);
         serve_provider_sessions(
             ProviderSessionContext {
                 args: &args,
@@ -18583,7 +18602,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 rules: &rules,
             },
             ProviderSessionRuntime {
-                rpc: live_rpc,
+                rpc: &rpc,
                 rooms: &rooms,
                 keypair_path: &keypair_path,
                 password: &password,
@@ -19878,6 +19897,10 @@ fn print_provider_lifecycle_report(report: &Value, json_output: bool) -> Result<
 fn provider_log(args: &ProviderStartArgs, message: &str) {
     if !args.print_json {
         println!("-> {message}");
+    } else if env::var_os("MAYHEM_PROVIDER_START_PROGRESS").is_some()
+        || env::var_os("MAYHEM_PROVIDER_SESSION_DEBUG").is_some()
+    {
+        eprintln!("[provider-start] {message}");
     }
 }
 
@@ -19975,12 +19998,12 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         .map(|entry| serde_json::from_value(entry.value).context("parsing price schedule"))
         .collect::<Result<Vec<LedgerPriceSchedule>>>()?;
     Ok(ContractCatalog {
-        enclaves: read_prefix_values(rpc, "enclave/").await?,
-        rooms: read_prefix_values(rpc, "room/").await?,
+        enclaves: read_prefix_values_filtered(rpc, "enclave/", |tail| !tail.contains('/')).await?,
+        rooms: read_prefix_values_filtered(rpc, "room/", |tail| !tail.contains('/')).await?,
         roomserve: read_prefix_values(rpc, "roomserve/").await?,
         serves: read_prefix_values(rpc, "serve/").await?,
-        providers: read_prefix_values(rpc, "prov/").await?,
-        kyb: read_prefix_values(rpc, "kyb/").await?,
+        providers: read_prefix_values_filtered(rpc, "prov/", |tail| !tail.contains('/')).await?,
+        kyb: read_prefix_values_filtered(rpc, "kyb/", |tail| !tail.contains('/')).await?,
         prices,
         rules: read_state_value(rpc, "rules/current")
             .await?
@@ -19994,10 +20017,27 @@ async fn read_prefix_values<T>(rpc: &PeerRpcClient, prefix: &str) -> Result<Vec<
 where
     T: DeserializeOwned,
 {
+    read_prefix_values_filtered(rpc, prefix, |_| true).await
+}
+
+async fn read_prefix_values_filtered<T, F>(
+    rpc: &PeerRpcClient,
+    prefix: &str,
+    include_tail: F,
+) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+    F: Fn(&str) -> bool,
+{
     read_prefix_entries(rpc, prefix)
         .await?
         .into_iter()
-        .map(|entry| serde_json::from_value(entry.value).context("parsing contract state record"))
+        .filter(|entry| entry.key.strip_prefix(prefix).is_some_and(&include_tail))
+        .map(|entry| {
+            let key = entry.key;
+            serde_json::from_value(entry.value)
+                .with_context(|| format!("parsing contract state record {key}"))
+        })
         .collect()
 }
 
@@ -20650,6 +20690,25 @@ async fn download_provider_artifact(
     selected: &ProviderCandidate,
 ) -> Result<PathBuf> {
     require_provider_merkle_artifact(selected)?;
+    if let Some(path) = &args.artifact {
+        let source = absolutize(path.clone())?;
+        let merkle = build_merkle_manifest(&source, args.chunk_size).with_context(|| {
+            format!(
+                "verifying local admin-approved artifact {}",
+                source.display()
+            )
+        })?;
+        if merkle.root != selected.enclave.artifact_root {
+            bail!(
+                "local artifact root mismatch for {}; expected admin enclave artifact_root {}, got {}",
+                source.display(),
+                selected.enclave.artifact_root,
+                merkle.root
+            );
+        }
+        verify_artifact_sha256(&source, &selected.artifact)?;
+        return Ok(source);
+    }
     let artifact_file = format!(
         "{}-{}",
         safe_path_component(&selected.enclave.enclave_id),
@@ -20665,9 +20724,7 @@ async fn download_provider_artifact(
         }
     }
 
-    let source = if let Some(path) = &args.artifact {
-        DownloadSource::File(absolutize(path.clone())?)
-    } else if selected.artifact.source.kind == "huggingface" {
+    let source = if selected.artifact.source.kind == "huggingface" {
         DownloadSource::Http {
             url: catalog::huggingface_resolve_url(
                 &selected.artifact.source,

@@ -29,7 +29,7 @@ const SSH_OPTS = [
   '-o', 'PubkeyAuthentication=no',
   '-o', 'PasswordAuthentication=yes',
   '-o', 'KbdInteractiveAuthentication=yes',
-  '-o', 'NumberOfPasswordPrompts=3',
+  '-o', 'NumberOfPasswordPrompts=1',
   '-o', 'StrictHostKeyChecking=no',
   '-o', `UserKnownHostsFile=${path.join(ROOT, '.mayhem-local/macmini-known-hosts')}`,
 ];
@@ -62,6 +62,16 @@ Environment:
   MAYHEM_PHASE3_MODEL          Catalog model id (default: ${DEFAULT_MODEL})
   MAYHEM_PHASE3_ARTIFACT       Local artifact path (default: cached Qwen GGUF)
   MAYHEM_PHASE3_PROVIDER_MODE  real or shim (default: real)
+  MAYHEM_PHASE3_RUN_OPENCODE   Also run the opencode tool-call smoke after curl chat (default: 0)
+  MAYHEM_PHASE3_CARGO_OPT_LEVEL Cargo dev opt-level for real provider smoke (default: 3 in real mode)
+  MAYHEM_PHASE3_PROVIDER_START_TIMEOUT_SECONDS Remote provider startup timeout (default: 1800 real, 300 shim)
+  MAYHEM_PHASE3_SESSION_OPEN_TIMEOUT_SECONDS Gateway direct-session open timeout (default: 90 real, 45 shim)
+  MAYHEM_PHASE3_SESSION_TTFT_TIMEOUT_SECONDS Gateway first-token timeout (default: 300 real, 60 shim)
+  MAYHEM_PHASE3_SESSION_FRAME_TIMEOUT_SECONDS Gateway frame idle timeout (default: 300 real, 60 shim)
+  MAYHEM_PHASE3_CHAT_TIMEOUT_SECONDS Curl-compatible chat timeout (default: 420 real, 120 shim)
+  MAYHEM_PHASE3_CHAT_MAX_TOKENS Curl-compatible chat max_tokens (default: 32)
+  MAYHEM_PHASE3_CHAT_ATTEMPTS Curl-compatible chat attempts after provider is ready (default: 3)
+  MAYHEM_PHASE3_LOCAL_JOINERS Local dev-net joiners to start, 1 or 2 (default: 2)
   MAYHEM_PHASE3_OPENCODE_BIN   opencode binary path/name (default: opencode)
   MAYHEM_PHASE3_LOCAL_DHT_HOST  Local LAN IP advertised to the Mac mini DHT peer
   MAYHEM_PHASE3_USE_REMOTE_DHT Start/use a temporary Mac mini HyperDHT bootstrap (default: 1)
@@ -87,6 +97,13 @@ function sh(value) {
 
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function textRateMapJson(inPer1kMu, outPer1kMu) {
+  return JSON.stringify([
+    { unit: 'input_token', per_unit_mu: Number(inPer1kMu), granularity: 1000 },
+    { unit: 'output_token', per_unit_mu: Number(outPer1kMu), granularity: 1000 },
+  ]);
 }
 
 function parseFirstJsonObject(text) {
@@ -121,6 +138,314 @@ function parseFirstJsonObject(text) {
 
 function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function envPositiveInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    fail(`${name} must be a positive integer, got ${raw}`);
+  }
+  return value;
+}
+
+async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 240_000, maxTokens = 32 } = {}) {
+  const rawPath = path.join(runDir, 'gateway-chat-stream.sse');
+  const summaryPath = path.join(runDir, 'gateway-chat-stream.json');
+  const prompt = [
+    'Write one short sentence proving this is a live model response.',
+    'Include the word mayhem and name a color that is not blue.',
+  ].join(' ');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('streaming chat timed out')), timeoutMs);
+  let raw = '';
+  let content = '';
+  let dataEvents = 0;
+  let jsonEvents = 0;
+  let doneSeen = false;
+  try {
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: modelId,
+        stream: true,
+        temperature: 0.7,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      fail(`streaming chat returned HTTP ${response.status}: ${text}`);
+    }
+    if (!response.body) fail('streaming chat response had no body');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const handleLine = (line) => {
+      if (!line.startsWith('data:')) return;
+      const data = line.slice(5).trim();
+      if (!data) return;
+      dataEvents += 1;
+      if (data === '[DONE]') {
+        doneSeen = true;
+        return;
+      }
+      let value;
+      try {
+        value = JSON.parse(data);
+      } catch {
+        return;
+      }
+      jsonEvents += 1;
+      const choice = Array.isArray(value.choices) ? value.choices[0] : null;
+      const delta = choice?.delta?.content;
+      const message = choice?.message?.content;
+      if (typeof delta === 'string') content += delta;
+      else if (typeof message === 'string') content += message;
+    };
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      raw += chunk;
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) handleLine(line);
+    }
+    const tail = decoder.decode();
+    if (tail) {
+      raw += tail;
+      buffer += tail;
+    }
+    if (buffer) handleLine(buffer);
+  } finally {
+    clearTimeout(timer);
+  }
+  fs.writeFileSync(rawPath, raw);
+  if (dataEvents === 0) fail('streaming chat produced no SSE data events');
+  if (!content.trim()) fail(`streaming chat produced no model content; raw saved at ${rawPath}`);
+  const summary = {
+    ok: true,
+    model: modelId,
+    prompt,
+    max_tokens: maxTokens,
+    content: content.trim(),
+    content_chars: content.trim().length,
+    data_events: dataEvents,
+    json_events: jsonEvents,
+    done_seen: doneSeen,
+    raw_path: path.relative(ROOT, rawPath),
+  };
+  writeJson(summaryPath, summary);
+  return { ...summary, summary_path: path.relative(ROOT, summaryPath) };
+}
+
+async function runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, options) {
+  const attempts = envPositiveInt('MAYHEM_PHASE3_CHAT_ATTEMPTS', 3);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await runStreamingChatSmoke(gatewayUrl, modelId, runDir, options);
+    } catch (err) {
+      lastError = err;
+      if (attempt >= attempts) break;
+      log(`streaming chat attempt ${attempt}/${attempts} failed before final accept: ${err?.message || err}`);
+      await sleep(5_000);
+    }
+  }
+  throw lastError;
+}
+
+async function readStateValue(rpcUrl, key) {
+  const response = await fetch(`${rpcUrl.replace(/\/$/, '')}/state?key=${encodeURI(key)}`);
+  if (!response.ok) {
+    const text = await response.text();
+    fail(`state read ${key} returned HTTP ${response.status}: ${text}`);
+  }
+  const body = await response.json();
+  if (Object.prototype.hasOwnProperty.call(body, 'value')) return body.value;
+  if (body.result && Object.prototype.hasOwnProperty.call(body.result, 'value')) return body.result.value;
+  return body.result ?? body;
+}
+
+async function waitForLedgerMovement(rpcUrl, user, provider, before, expected, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = null;
+  while (Date.now() < deadline) {
+    latest = await readLedgerSnapshot(rpcUrl, user, provider);
+    const actual = {
+      debit_mu: before.balance_mu - latest.balance_mu,
+      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
+      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+    };
+    if (
+      actual.debit_mu === expected.debit_mu &&
+      actual.provider_net_mu === expected.provider_net_mu &&
+      actual.fee_mu === expected.fee_mu
+    ) {
+      return { after: latest, actual };
+    }
+    await sleep(500);
+  }
+  latest = latest || await readLedgerSnapshot(rpcUrl, user, provider);
+  return {
+    after: latest,
+    actual: {
+      debit_mu: before.balance_mu - latest.balance_mu,
+      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
+      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+    },
+  };
+}
+
+function safeMu(value, label) {
+  const number = Number(value ?? 0);
+  if (!Number.isSafeInteger(number) || number < 0) fail(`${label} is not a non-negative safe integer: ${value}`);
+  return number;
+}
+
+async function readLedgerSnapshot(rpcUrl, user, provider) {
+  const [balance, earning, fee] = await Promise.all([
+    readStateValue(rpcUrl, `bal/${user}/fiat`),
+    readStateValue(rpcUrl, `earn/fiat/${provider}`),
+    readStateValue(rpcUrl, 'fee/fiat/cum'),
+  ]);
+  return {
+    user,
+    provider,
+    rail: 'fiat',
+    balance,
+    earning,
+    fee,
+    balance_mu: safeMu(balance?.mu, 'fiat balance mu'),
+    provider_total_mu: safeMu(earning?.total_mu, 'fiat provider total_mu'),
+    fee_cum_mu: safeMu(fee?.cum_mu, 'fiat fee cum_mu'),
+  };
+}
+
+function runJsonCommandToFile(command, args, outPath, options = {}) {
+  const stdout = runSync(command, args, options);
+  fs.writeFileSync(outPath, stdout);
+  return readJson(outPath);
+}
+
+async function settleGatewayReceiptEpoch({
+  mayhemBin,
+  adminHome,
+  adminRpcUrl,
+  receiptsPath,
+  runDir,
+  user,
+  provider,
+  epoch = 1,
+  feeBps = 1500,
+}) {
+  const before = await readLedgerSnapshot(adminRpcUrl, user, provider);
+  const bundlePath = path.join(runDir, 'epoch-bundle.json');
+  const exportPath = path.join(runDir, 'epoch-export.json');
+  const recomputedPath = path.join(runDir, 'epoch-recomputed.json');
+  const commitSimPath = path.join(runDir, 'epoch-commit-sim.json');
+  const commitPath = path.join(runDir, 'epoch-commit.json');
+  const applySimPath = path.join(runDir, 'epoch-apply-sim.json');
+  const applyPath = path.join(runDir, 'epoch-apply.json');
+
+  const exportReport = runJsonCommandToFile(mayhemBin, [
+    'receipts', 'export',
+    '--epoch', String(epoch),
+    '--fee-bps', String(feeBps),
+    '--receipts-file', receiptsPath,
+    '--output', bundlePath,
+    '--no-verify',
+    '--json',
+  ], exportPath);
+
+  const recomputedStdout = runSync('node', [path.join(ROOT, 'intercom/scripts/recompute-epoch-roots.mjs'), bundlePath]);
+  fs.writeFileSync(recomputedPath, recomputedStdout);
+  const recomputed = readJson(recomputedPath);
+  if (safeMu(recomputed?.totals?.use_mu, 'recomputed use_mu') <= 0) {
+    fail('epoch recompute produced zero usage; refusing to mark billing moved');
+  }
+  const providerEarning = (recomputed.earnings || []).find(
+    (entry) => entry.rail === 'fiat' && entry.provider === provider
+  );
+  if (!providerEarning) fail(`epoch recompute did not include fiat earnings for provider ${provider}`);
+  const expectedDebitMu = safeMu(recomputed.totals.use_mu, 'expected debit mu');
+  const expectedProviderNetMu =
+    safeMu(providerEarning.gross_mu, 'provider gross_mu') -
+    Math.floor((safeMu(providerEarning.gross_mu, 'provider gross_mu') * feeBps) / 10_000);
+  const expectedFeeMu = safeMu(recomputed.totals.fee_mu, 'expected fee_mu');
+
+  const adminEpochCommon = [
+    '--home', adminHome,
+    '--peer-store-name', 'admin',
+    '--rpc-url', adminRpcUrl,
+    '--recomputed-file', recomputedPath,
+    '--at', String(epoch),
+    '--submit',
+    '--json',
+  ];
+  const commitSim = runJsonCommandToFile(
+    mayhemBin,
+    ['admin', 'epoch-commit', ...adminEpochCommon, '--sim'],
+    commitSimPath
+  );
+  const commit = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-commit', ...adminEpochCommon], commitPath);
+  const applySim = runJsonCommandToFile(
+    mayhemBin,
+    ['admin', 'epoch-apply', ...adminEpochCommon, '--sim'],
+    applySimPath
+  );
+  const apply = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-apply', ...adminEpochCommon], applyPath);
+
+  const expected = {
+    debit_mu: expectedDebitMu,
+    provider_net_mu: expectedProviderNetMu,
+    fee_mu: expectedFeeMu,
+  };
+  const { after, actual } = await waitForLedgerMovement(adminRpcUrl, user, provider, before, expected);
+  const actualDebitMu = actual.debit_mu;
+  const actualProviderNetMu = actual.provider_net_mu;
+  const actualFeeMu = actual.fee_mu;
+  if (actualDebitMu !== expectedDebitMu) {
+    fail(`fiat balance debit mismatch; expected ${expectedDebitMu}, got ${actualDebitMu}`);
+  }
+  if (actualProviderNetMu !== expectedProviderNetMu) {
+    fail(`fiat provider earning mismatch; expected ${expectedProviderNetMu}, got ${actualProviderNetMu}`);
+  }
+  if (actualFeeMu !== expectedFeeMu) {
+    fail(`fiat fee movement mismatch; expected ${expectedFeeMu}, got ${actualFeeMu}`);
+  }
+
+  return {
+    ok: true,
+    epoch,
+    fee_bps: feeBps,
+    before,
+    after,
+    expected,
+    actual,
+    files: {
+      bundle: path.relative(ROOT, bundlePath),
+      export_report: path.relative(ROOT, exportPath),
+      recomputed: path.relative(ROOT, recomputedPath),
+      commit_sim: path.relative(ROOT, commitSimPath),
+      commit: path.relative(ROOT, commitPath),
+      apply_sim: path.relative(ROOT, applySimPath),
+      apply: path.relative(ROOT, applyPath),
+    },
+    reports: {
+      export: exportReport,
+      commit_sim: commitSim,
+      commit,
+      apply_sim: applySim,
+      apply,
+    },
+  };
 }
 
 async function preauthorizeLocalApps(apps, logFile) {
@@ -431,11 +756,17 @@ async function waitBridgeSessionOpen(url, token, provider, timeoutMs, label = 'b
     const sessionId = crypto.randomBytes(32).toString('hex');
     const attemptTimeout = Math.max(1_000, deadline - Date.now());
     try {
+      await bridgeRequest(
+        url,
+        token,
+        { type: 'peer_connect', remote: provider, wait_ms: Math.min(attemptTimeout, 15_000) },
+        Math.min(attemptTimeout, 20_000)
+      );
       const opened = await bridgeRequest(
         url,
         token,
         { type: 'session_open', remote: provider, session_id: sessionId },
-        attemptTimeout
+        Math.min(attemptTimeout, 10_000)
       );
       await bridgeRequest(
         url,
@@ -694,7 +1025,18 @@ async function main() {
   log(`run dir: ${path.relative(ROOT, runDir)}`);
   log(`provider mode: ${mode}`);
   log('building mayhem CLI/gateway/enclave crates');
-  runSync('cargo', ['build', '-q', '-p', 'mayhem-cli', '-p', 'mayhem-gateway', '-p', 'mayhem-enclave']);
+  const cargoEnv = { ...process.env };
+  if (mode === 'real') {
+    cargoEnv.CARGO_PROFILE_DEV_OPT_LEVEL =
+      cargoEnv.MAYHEM_PHASE3_CARGO_OPT_LEVEL ||
+      cargoEnv.CARGO_PROFILE_DEV_OPT_LEVEL ||
+      '3';
+    cargoEnv.CARGO_PROFILE_DEV_DEBUG = cargoEnv.CARGO_PROFILE_DEV_DEBUG || '0';
+    log(`using Cargo dev opt-level ${cargoEnv.CARGO_PROFILE_DEV_OPT_LEVEL} for real-provider hashing/generation`);
+  }
+  runSync('cargo', ['build', '-q', '-p', 'mayhem-cli', '-p', 'mayhem-gateway', '-p', 'mayhem-enclave'], {
+    env: cargoEnv,
+  });
   if (!fs.existsSync(mayhemBin)) fail(`missing ${mayhemBin} after cargo build`);
   if (!fs.existsSync(mayhemEnclaveBin)) fail(`missing ${mayhemEnclaveBin} after cargo build`);
 
@@ -708,6 +1050,9 @@ async function main() {
   const catalog = readJson(path.join(ROOT, 'catalog/models.json'));
   const model = catalog.models.find((entry) => entry.model_id === modelId);
   if (!model) fail(`catalog model not found: ${modelId}`);
+  const inPer1kMu = model.price_ref_mu?.in_per_1k || 18;
+  const outPer1kMu = model.price_ref_mu?.out_per_1k || 55;
+  const rateMapJson = textRateMapJson(inPer1kMu, outPer1kMu);
   const artifactEntry = Object.entries(model.artifacts).find(([, artifact]) => artifact.engine === 'llama.cpp');
   if (!artifactEntry) fail(`model ${modelId} has no llama.cpp artifact`);
   const [artifactName, artifact] = artifactEntry;
@@ -742,6 +1087,7 @@ async function main() {
   const remoteLogs = path.posix.join(remoteRun, 'logs');
   cleanupState.remoteRun = remoteRun;
   const remoteCatalog = path.posix.join(remoteRun, 'catalog/models.json');
+  const remoteRules = path.posix.join(remoteRun, 'RULES.md');
   const remoteArtifact = path.posix.join(remoteRoot, '.mayhem-cache/artifacts', path.basename(artifactPath));
   const remoteMayhem = path.posix.join(remoteRoot, 'target/debug/mayhem');
   const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
@@ -803,6 +1149,10 @@ async function main() {
     logFile: path.join(logsDir, 'scp-catalog.log'),
     timeoutMs: 60_000,
   });
+  await scpTo(remote, passFile, path.join(ROOT, 'RULES.md'), remoteRules, {
+    logFile: path.join(logsDir, 'scp-rules.log'),
+    timeoutMs: 60_000,
+  });
   await scpTo(remote, passFile, path.join(ROOT, 'crates/mayhem-cli/src/wallet-helper.mjs'), remoteWalletHelper, {
     logFile: path.join(logsDir, 'scp-wallet-helper.log'),
     timeoutMs: 60_000,
@@ -842,6 +1192,7 @@ async function main() {
   const usePublicDht = /^(1|true|yes)$/i.test(process.env.MAYHEM_PHASE3_USE_PUBLIC_DHT || '');
   const useRemoteDht = !usePublicDht && /^(1|true|yes)?$/i.test(process.env.MAYHEM_PHASE3_USE_REMOTE_DHT || '1');
   let localPeerDht = null;
+  let remotePeerDhtPid = null;
   let peerDhtBootstrap = explicitPeerDhtBootstrap;
   if (!peerDhtBootstrap && useLocalDht) {
     const peerDhtPort = await freePort();
@@ -876,7 +1227,7 @@ async function main() {
       `cd ${sh(path.posix.join(remoteRoot, 'intercom'))}`,
       `nohup ${sh(remoteNode)} ${sh(path.posix.join(remoteRoot, 'intercom/node_modules/hyperdht/bin.js'))} --bootstrap --host ${sh(remote.host)} --port ${remotePeerDhtPort} > ${sh(remotePeerDhtLog)} 2>&1 & echo $!`,
     ].join(' && ');
-    const remotePeerDhtPid = (await ssh(remote, passFile, remotePeerDhtCmd)).stdout.trim();
+    remotePeerDhtPid = (await ssh(remote, passFile, remotePeerDhtCmd)).stdout.trim();
     cleanupState.remotePids.push(remotePeerDhtPid);
     const remotePeerDhtWait = `for i in $(seq 1 120); do grep -q 'Fully started Hyperswarm DHT bootstrap node' ${sh(remotePeerDhtLog)} && exit 0; kill -0 ${remotePeerDhtPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
     await ssh(remote, passFile, remotePeerDhtWait, { timeoutMs: 75_000 });
@@ -895,7 +1246,7 @@ async function main() {
     {
       env: {
         ...process.env,
-        MAYHEM_DEVNET_JOINERS: '1',
+        MAYHEM_DEVNET_JOINERS: process.env.MAYHEM_PHASE3_LOCAL_JOINERS || '2',
         MAYHEM_DEVNET_SUBNET_CHANNEL: subnetChannel,
         ...(peerDhtBootstrap ? { MAYHEM_DEVNET_PEER_DHT_BOOTSTRAP: peerDhtBootstrap } : {}),
         MAYHEM_DEVNET_REPLICATE_FLUSH_TIMEOUT_MS: '5000',
@@ -916,6 +1267,7 @@ async function main() {
   const devnetText = fs.readFileSync(devnetLog, 'utf8');
   const adminWs = devnetText.match(/admin:\s+(ws:\/\/[^\s]+).*rpc=(http:\/\/[^\s]+)/);
   const joinerWs = devnetText.match(/joiner-a:\s+(ws:\/\/[^\s]+).*rpc=(http:\/\/[^\s]+)/);
+  const joinerBWs = devnetText.match(/joiner-b:\s+(ws:\/\/[^\s]+).*rpc=(http:\/\/[^\s]+)/);
   const bootstrap = devnetText.match(/subnet bootstrap:\s+(\S+)/);
   const channel = devnetText.match(/subnet channel:\s+(\S+)/);
   const token = devnetText.match(/sc bridge token:\s+(\S+)/);
@@ -924,13 +1276,17 @@ async function main() {
     fail(`could not parse dev-net output in ${devnetLog}`);
   }
   const adminPeerLog = path.join(devnetLogs[1], 'admin.log');
+  const joinerPeerLog = path.join(devnetLogs[1], 'joiner-a.log');
   const adminPubkey = fs.readFileSync(adminPeerLog, 'utf8').match(/Peer pubkey \(hex\):\s+([0-9a-f]{64})/);
   if (!adminPubkey) fail(`could not parse admin pubkey from ${adminPeerLog}`);
+  const userPubkey = fs.readFileSync(joinerPeerLog, 'utf8').match(/Peer pubkey \(hex\):\s+([0-9a-f]{64})/);
+  if (!userPubkey) fail(`could not parse user pubkey from ${joinerPeerLog}`);
   const adminScBridgeUrl = adminWs[1];
   const adminRpcUrl = adminWs[2];
   const adminRpcPort = new URL(adminRpcUrl).port;
   const userBridgeCandidates = [
     { label: 'joiner-a', url: joinerWs[1] },
+    ...(joinerBWs ? [{ label: 'joiner-b', url: joinerBWs[1] }] : []),
     { label: 'admin', url: adminScBridgeUrl },
   ];
   let userScBridge = { label: 'joiner-a', url: joinerWs[1], ready: null };
@@ -973,8 +1329,7 @@ async function main() {
   adminRun('admin-set-model-ref', [
     'set-model-ref',
     '--model', modelId,
-    '--in-per-1k-mu', String(model.price_ref_mu?.in_per_1k || 18),
-    '--out-per-1k-mu', String(model.price_ref_mu?.out_per_1k || 55),
+    '--rate-map-json', rateMapJson,
   ]);
   adminRun('admin-register-enclave', [
     'register-enclave',
@@ -996,8 +1351,7 @@ async function main() {
   adminRun('admin-set-price', [
     'set-price',
     '--enclave-id', enclaveId,
-    '--in-per-1k-mu', String(model.price_ref_mu?.in_per_1k || 18),
-    '--out-per-1k-mu', String(model.price_ref_mu?.out_per_1k || 55),
+    '--rate-map-json', rateMapJson,
     '--effective-at', '0',
   ]);
   adminRun('admin-open-room', [
@@ -1006,6 +1360,19 @@ async function main() {
     '--model', modelId,
     '--nonce', roomNonce,
     '--label', 'phase3-opencode-p2p',
+  ]);
+  const gatewayCreditMu = 10_000_000;
+  const fiatDepositRef = (await b3(Buffer.from(`phase3-fiat-credit:${tag}:${userPubkey[1]}`, 'utf8'))).toString('hex');
+  adminRun('admin-fiat-deposit', [
+    'fiat-deposit',
+    '--rail', 'stripe',
+    '--who', userPubkey[1],
+    '--mu', String(gatewayCreditMu),
+    '--ext-ref-hash', fiatDepositRef,
+    '--fiat-currency', 'usd',
+    '--fiat-amount-minor', '1000',
+    '--epoch', '1',
+    '--at', '0',
   ]);
 
   log('starting remote Pear provider peer');
@@ -1054,6 +1421,12 @@ async function main() {
   const remotePeerReady = async () => remotePidAlive(remote, passFile, remotePeerPid);
   const remoteWaitCmd = `for i in $(seq 1 900); do grep -q 'Sidechannel: ready' ${sh(remotePeerLog)} && exit 0; kill -0 ${remotePeerPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
   await ssh(remote, passFile, remoteWaitCmd, { timeoutMs: 480_000 });
+  if (localPeerDht && localPeerDht.exitCode !== null) {
+    fail(`local peer DHT bootstrap exited before provider discovery; see ${path.join(logsDir, 'local-peer-dht.log')}`);
+  }
+  if (remotePeerDhtPid && !(await remotePidAlive(remote, passFile, remotePeerDhtPid))) {
+    fail(`Mac mini peer DHT bootstrap exited before provider discovery; see ${path.posix.join(remoteLogs, 'peer-dht.log')}`);
+  }
 
   log('opening SSH reverse tunnel for remote provider contract RPC');
   const tunnelLog = path.join(logsDir, 'ssh-reverse-tunnel.log');
@@ -1088,7 +1461,7 @@ async function main() {
     [
       prepareProviderHome,
       `cd ${sh(remoteRoot)}`,
-      `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} ${sh(remoteMayhem)} setup --home ${sh(remoteProviderHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${remoteAdminRpcTunnelPort}/v1`)} --rules-ver 1 --rules-hash ${sh(rulesHash)} --yes --print-json > ${sh(remoteProviderSetupLog)} 2>&1`,
+      `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} ${sh(remoteMayhem)} setup --home ${sh(remoteProviderHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${remoteAdminRpcTunnelPort}/v1`)} --rules-ver 1 --rules-hash ${sh(rulesHash)} --rules-path ${sh(remoteRules)} --yes --print-json > ${sh(remoteProviderSetupLog)} 2>&1`,
     ].join(' && '),
     { timeoutMs: 180_000 }
   );
@@ -1096,7 +1469,6 @@ async function main() {
     `--home ${sh(remoteProviderHome)}`,
     `--enclave ${sh(enclaveId)}`,
     `--rpc-url ${sh(`http://127.0.0.1:${remoteAdminRpcTunnelPort}/v1`)}`,
-    `--session-rpc-url ${sh(`http://127.0.0.1:${remoteRpcPort}/v1`)}`,
     `--sc-bridge-url ${sh(`ws://127.0.0.1:${remoteScPort}`)}`,
     `--sc-bridge-token ${sh(scToken)}`,
     `--catalog-path ${sh(remoteCatalog)}`,
@@ -1117,9 +1489,14 @@ async function main() {
   ].join(' && ');
   const remoteProviderPid = (await ssh(remote, passFile, providerCmd)).stdout.trim();
   cleanupState.remotePids.push(remoteProviderPid);
-  const providerWaitCmd = `for i in $(seq 1 1200); do grep -q '"self_test"' ${sh(remoteProviderLog)} && exit 0; kill -0 ${remoteProviderPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
-  await ssh(remote, passFile, providerWaitCmd, { timeoutMs: 610_000 });
-  const providerStartupText = (await ssh(remote, passFile, `sed -n '1,260p' ${sh(remoteProviderLog)}`)).stdout;
+  const providerStartTimeoutSeconds = envPositiveInt(
+    'MAYHEM_PHASE3_PROVIDER_START_TIMEOUT_SECONDS',
+    mode === 'real' ? 1800 : 300
+  );
+  const providerWaitIterations = Math.ceil(providerStartTimeoutSeconds * 2);
+  const providerWaitCmd = `for i in $(seq 1 ${providerWaitIterations}); do grep -q '"self_test"' ${sh(remoteProviderLog)} && exit 0; kill -0 ${remoteProviderPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
+  await ssh(remote, passFile, providerWaitCmd, { timeoutMs: providerStartTimeoutSeconds * 1_000 + 10_000 });
+  const providerStartupText = (await ssh(remote, passFile, `cat ${sh(remoteProviderLog)}`)).stdout;
   const providerStartupReport = parseFirstJsonObject(providerStartupText);
   const providerPubkey = providerStartupReport?.provider;
   if (!providerPubkey) fail(`provider startup report did not include provider pubkey; see ${remoteProviderLog}`);
@@ -1133,7 +1510,28 @@ async function main() {
   const gatewayUrl = `http://127.0.0.1:${gatewayPort}`;
   const gatewayLog = path.join(logsDir, 'gateway.log');
   const gatewayHome = path.join(runDir, 'gateway-home');
-  await fsp.mkdir(gatewayHome, { recursive: true });
+  await fsp.mkdir(path.join(gatewayHome, 'stores'), { recursive: true });
+  const gatewayStore = path.join(ROOT, 'intercom/stores/mayhem-devnet-joiner-a');
+  const gatewayStoreLink = path.join(gatewayHome, 'stores/main');
+  await fsp.rm(gatewayStoreLink, { recursive: true, force: true });
+  await fsp.symlink(gatewayStore, gatewayStoreLink);
+  const sessionOpenTimeoutSeconds = envPositiveInt(
+    'MAYHEM_PHASE3_SESSION_OPEN_TIMEOUT_SECONDS',
+    mode === 'real' ? 90 : 45
+  );
+  const sessionTtftTimeoutSeconds = envPositiveInt(
+    'MAYHEM_PHASE3_SESSION_TTFT_TIMEOUT_SECONDS',
+    mode === 'real' ? 300 : 60
+  );
+  const sessionFrameTimeoutSeconds = envPositiveInt(
+    'MAYHEM_PHASE3_SESSION_FRAME_TIMEOUT_SECONDS',
+    mode === 'real' ? 300 : 60
+  );
+  const chatTimeoutSeconds = envPositiveInt(
+    'MAYHEM_PHASE3_CHAT_TIMEOUT_SECONDS',
+    mode === 'real' ? 420 : 120
+  );
+  const chatMaxTokens = envPositiveInt('MAYHEM_PHASE3_CHAT_MAX_TOKENS', 32);
   const gateway = spawnLogged(
     mayhemBin,
     [
@@ -1142,7 +1540,9 @@ async function main() {
       '--rpc-url', adminRpcUrl,
       '--sc-bridge-url', userScBridge.url,
       '--sc-bridge-token', scToken,
-      '--session-open-timeout-seconds', '90',
+      '--session-open-timeout-seconds', String(sessionOpenTimeoutSeconds),
+      '--session-ttft-timeout-seconds', String(sessionTtftTimeoutSeconds),
+      '--session-frame-timeout-seconds', String(sessionFrameTimeoutSeconds),
       '--bind', `127.0.0.1:${gatewayPort}`,
       '--json',
     ],
@@ -1151,34 +1551,59 @@ async function main() {
   cleanupState.localChildren.push(gateway);
   await waitHttp(`${gatewayUrl}/mayhem/status`, 120_000, 'local gateway', async () => gateway.exitCode === null);
 
-  log('running mayhem test with opencode through the gateway');
+  log('running streaming curl-compatible chat through the gateway');
+  const chatStream = await runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, {
+    timeoutMs: chatTimeoutSeconds * 1_000,
+    maxTokens: chatMaxTokens,
+  });
+
+  const runOpencode = /^(1|true|yes)$/i.test(process.env.MAYHEM_PHASE3_RUN_OPENCODE || '');
   const configHome = path.join(runDir, 'xdg-config');
   const opencodeConfig = path.join(configHome, 'opencode/opencode.json');
   await fsp.mkdir(path.dirname(opencodeConfig), { recursive: true });
   writeJson(opencodeConfig, { $schema: 'https://opencode.ai/config.json' });
   const testJsonPath = path.join(runDir, 'mayhem-test.json');
-  const test = await run(
-    mayhemBin,
-    [
-      'test',
-      '--home', gatewayHome,
-      '--gateway-url', gatewayUrl,
-      '--rpc-url', adminRpcUrl,
-      '--model', modelId,
-      '--skip-direct-tool-smoke',
-      '--sync-models',
-      '--opencode-config', opencodeConfig,
-      '--opencode-bin', opencodeBin,
-      '--timeout-seconds', mode === 'real' ? '240' : '120',
-      '--json',
-    ],
-    {
-      logFile: path.join(logsDir, 'mayhem-test.log'),
-      timeoutMs: mode === 'real' ? 300_000 : 180_000,
-    }
-  );
-  fs.writeFileSync(testJsonPath, test.stdout);
-  const testJson = JSON.parse(test.stdout);
+  let testJson;
+  if (runOpencode) {
+    log('running optional mayhem test with opencode through the gateway');
+    const test = await run(
+      mayhemBin,
+      [
+        'test',
+        '--home', gatewayHome,
+        '--gateway-url', gatewayUrl,
+        '--rpc-url', adminRpcUrl,
+        '--model', modelId,
+        '--skip-direct-tool-smoke',
+        '--sync-models',
+        '--opencode-config', opencodeConfig,
+        '--opencode-bin', opencodeBin,
+        '--timeout-seconds', mode === 'real' ? '240' : '120',
+        '--json',
+      ],
+      {
+        logFile: path.join(logsDir, 'mayhem-test.log'),
+        timeoutMs: mode === 'real' ? 300_000 : 180_000,
+      }
+    );
+    fs.writeFileSync(testJsonPath, test.stdout);
+    testJson = JSON.parse(test.stdout);
+  } else {
+    testJson = {
+      ok: true,
+      opencode: {
+        run: {
+          skipped: true,
+          reason: 'MAYHEM_PHASE3_RUN_OPENCODE is not set; E1 uses curl-compatible streaming chat',
+        },
+      },
+    };
+    writeJson(testJsonPath, testJson);
+    fs.writeFileSync(
+      path.join(logsDir, 'mayhem-test.log'),
+      'opencode skipped; set MAYHEM_PHASE3_RUN_OPENCODE=1 to run the tool-call smoke\n'
+    );
+  }
   const receipts = await (await fetch(`${gatewayUrl}/mayhem/receipts`)).json();
   const receiptsPath = path.join(runDir, 'gateway-receipts.json');
   writeJson(receiptsPath, receipts);
@@ -1186,11 +1611,24 @@ async function main() {
   const modelsPath = path.join(runDir, 'gateway-models.json');
   writeJson(modelsPath, modelsJson);
 
-  const providerLogText = (await ssh(remote, passFile, `sed -n '1,240p' ${sh(remoteProviderLog)}`)).stdout;
+  const providerLogText = (await ssh(remote, passFile, `cat ${sh(remoteProviderLog)}`)).stdout;
   const providerReport = parseFirstJsonObject(providerLogText);
   const selectedModel = modelsJson.data?.find((entry) => entry.id === modelId) || null;
   const latestReceipt = Array.isArray(receipts.data) ? receipts.data.at(-1) : null;
   const receiptBody = latestReceipt?.receipt?.body || latestReceipt?.receipt || latestReceipt || null;
+  if (!latestReceipt) fail('streaming chat completed but no gateway receipt was recorded');
+  log('settling the streamed receipt through epoch commit/apply');
+  const epochSettlement = await settleGatewayReceiptEpoch({
+    mayhemBin,
+    adminHome,
+    adminRpcUrl,
+    receiptsPath,
+    runDir,
+    user: userPubkey[1],
+    provider: providerPubkey,
+    epoch: 1,
+    feeBps: 1500,
+  });
 
   const report = {
     ok: true,
@@ -1217,6 +1655,8 @@ async function main() {
     },
     admin: {
       pubkey: adminPubkey[1],
+      credited_user: userPubkey[1],
+      gateway_credit_mu: gatewayCreditMu,
       room_nonce: roomNonce,
       room_id: roomId,
       rules_hash: rulesHash,
@@ -1249,10 +1689,12 @@ async function main() {
       direct_ready: directReady,
     },
     gateway: {
+      chat_stream: chatStream,
       models: modelsPath,
       selected_model: selectedModel,
       receipts: receiptsPath,
       latest_receipt: receiptBody,
+      epoch_settlement: epochSettlement,
     },
     opencode: {
       binary: opencodeBin,
