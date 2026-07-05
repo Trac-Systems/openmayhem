@@ -9,11 +9,16 @@ use std::{
 };
 
 use crate::{
+    audit::{
+        aggregate_canary_fingerprints, evaluate_catalog_canary_probe, token_fingerprint,
+        CanaryProbeSpec, DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
+    },
     failover::{
         x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState, SessionPriceMu,
         DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, ProviderKey,
+    ReputationEventKind,
 };
 use axum::{
     extract::State,
@@ -41,16 +46,24 @@ use tokio::net::TcpListener;
 type SharedState = Arc<GatewayState>;
 
 const EMBEDDED_CATALOG: &str = include_str!("../../../catalog/models.json");
+const EMBEDDED_CANARY_DEV_V1: &str = include_str!("../../../catalog/canaries/canary-dev-v1.json");
+const EMBEDDED_CANARY_LAUNCH_V1: &str =
+    include_str!("../../../catalog/canaries/canary-launch-v1.json");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
+const DEFAULT_CANARY_SEED: i64 = 7;
 
 #[derive(Clone, Debug)]
 pub struct GatewayState {
     models: Arc<Vec<GatewayModel>>,
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
+    probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     paused_sessions: Arc<Mutex<Vec<PausedSession>>>,
     receipt_config: ReceiptConfig,
     session_backend: Arc<dyn GatewaySessionBackend>,
     hardware_quote_trust: Arc<HardwareQuoteTrust>,
+    canaries: Arc<GatewayCanaryRegistry>,
+    canary_policy: GatewayCanaryProbePolicy,
+    canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,6 +130,62 @@ pub struct PausedSession {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct StoredProbeEvent {
+    pub probe_id: String,
+    pub model_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub canary_set: String,
+    pub expected_fingerprint: String,
+    pub observed_fingerprint: String,
+    pub match_bps: u32,
+    pub pass: bool,
+    pub reputation_event_kind: ReputationEventKind,
+    pub session_receipt_hash: String,
+    pub evidence_hash: String,
+    pub evidence: Value,
+    pub probe_command: Value,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GatewayCanaryRegistry {
+    pub models: BTreeMap<String, GatewayCanaryModelConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayCanaryModelConfig {
+    pub canary_set: String,
+    pub match_min_bps: u32,
+    pub prompts: Vec<GatewayCanaryPrompt>,
+    pub fingerprints_by_artifact_root: BTreeMap<String, String>,
+    pub default_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayCanaryPrompt {
+    pub id: String,
+    pub messages: Vec<ChatMessage>,
+    pub tools: Option<Vec<Value>>,
+    pub max_tokens: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GatewayCanaryProbePolicy {
+    pub enabled: bool,
+    pub min_interval_sessions: u64,
+    pub max_interval_sessions: u64,
+    pub seed: i64,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Default)]
+struct GatewayCanaryScheduler {
+    counters: BTreeMap<String, u64>,
+    next_after: BTreeMap<String, u64>,
+    sequence: u64,
+}
+
 #[derive(Clone, Debug)]
 struct ReceiptConfig {
     cosign_enabled: bool,
@@ -133,7 +202,7 @@ struct HardwareQuoteTrust {
     nvidia_nras_jwks: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     #[serde(default)]
@@ -171,7 +240,7 @@ pub struct ChatMessage {
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
@@ -222,6 +291,7 @@ pub struct GatewaySessionResult {
     pub backend: String,
     pub direct_session: bool,
     pub provider_receipt: Option<ProviderSignedReceipt>,
+    pub token_ids: Vec<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,10 +388,11 @@ impl GatewayState {
             .flatten()
             .filter_map(|model| model_from_catalog_value(model, created))
             .collect::<Vec<_>>();
+        let canaries = canary_registry_from_catalog_root(&root);
         if models.is_empty() {
             Ok(Self::fixture())
         } else {
-            Ok(Self::with_models(models))
+            Ok(Self::with_models_and_canaries(models, canaries))
         }
     }
 
@@ -359,14 +430,25 @@ impl GatewayState {
     }
 
     fn with_models(models: Vec<GatewayModel>) -> Self {
+        Self::with_models_and_canaries(models, GatewayCanaryRegistry::default())
+    }
+
+    fn with_models_and_canaries(
+        models: Vec<GatewayModel>,
+        canaries: GatewayCanaryRegistry,
+    ) -> Self {
         let models = sanitize_gateway_models(models);
         Self {
             models: Arc::new(models),
             receipts: Arc::new(Mutex::new(Vec::new())),
+            probes: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(Vec::new())),
             receipt_config: ReceiptConfig::default(),
             session_backend: Arc::new(LocalOpenAiShapeBackend),
             hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
+            canaries: Arc::new(canaries),
+            canary_policy: GatewayCanaryProbePolicy::default(),
+            canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
         }
     }
 
@@ -377,6 +459,18 @@ impl GatewayState {
 
     pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
         self.session_backend = backend;
+        self
+    }
+
+    pub fn with_canary_registry(mut self, registry: GatewayCanaryRegistry) -> Self {
+        self.canaries = Arc::new(registry);
+        self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
+        self
+    }
+
+    pub fn with_canary_probe_policy(mut self, policy: GatewayCanaryProbePolicy) -> Self {
+        self.canary_policy = policy;
+        self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
         self
     }
 
@@ -392,6 +486,10 @@ impl GatewayState {
             .lock()
             .expect("receipt store poisoned")
             .clone()
+    }
+
+    pub fn probes(&self) -> Vec<StoredProbeEvent> {
+        self.probes.lock().expect("probe store poisoned").clone()
     }
 
     pub fn paused_sessions(&self) -> Vec<PausedSession> {
@@ -417,6 +515,13 @@ impl GatewayState {
             .lock()
             .expect("receipt store poisoned")
             .push(receipt);
+    }
+
+    fn record_probe(&self, probe: StoredProbeEvent) {
+        self.probes
+            .lock()
+            .expect("probe store poisoned")
+            .push(probe);
     }
 
     fn pause_session(&self, paused: PausedSession) {
@@ -452,6 +557,30 @@ impl Default for ReceiptConfig {
     }
 }
 
+impl Default for GatewayCanaryProbePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_interval_sessions: 23,
+            max_interval_sessions: 89,
+            seed: DEFAULT_CANARY_SEED,
+            epoch: 0,
+        }
+    }
+}
+
+impl GatewayCanaryProbePolicy {
+    pub fn every_session_for_tests() -> Self {
+        Self {
+            enabled: true,
+            min_interval_sessions: 1,
+            max_interval_sessions: 1,
+            seed: DEFAULT_CANARY_SEED,
+            epoch: 0,
+        }
+    }
+}
+
 pub fn openai_router(state: GatewayState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
@@ -459,6 +588,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/completions", post(create_completion))
         .route("/mayhem/status", get(mayhem_status))
         .route("/mayhem/receipts", get(mayhem_receipts))
+        .route("/mayhem/probes", get(mayhem_probes))
         .route("/mayhem/balance", get(mayhem_balance))
         .with_state(Arc::new(state))
 }
@@ -521,6 +651,7 @@ async fn mayhem_status(State(state): State<SharedState>) -> Response {
         "sessions_active": 0,
         "sessions_paused": state.paused_session_count(),
         "receipts": state.receipt_count(),
+        "probes": state.probes.lock().expect("probe store poisoned").len(),
     }))
     .into_response()
 }
@@ -530,6 +661,14 @@ async fn mayhem_receipts(State(state): State<SharedState>) -> Response {
         "object": "list",
         "data": state.receipts(),
         "paused": state.paused_sessions(),
+    }))
+    .into_response()
+}
+
+async fn mayhem_probes(State(state): State<SharedState>) -> Response {
+    Json(json!({
+        "object": "list",
+        "data": state.probes(),
     }))
     .into_response()
 }
@@ -569,6 +708,7 @@ struct ValidatedDirectSessionAccept {
 struct DirectSessionCollected {
     output: ChatOutput,
     provider_receipt: ProviderSignedReceipt,
+    token_ids: Vec<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,11 +718,114 @@ struct ProviderReceiptWire {
     enclave_sig: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CanarySetDocument {
+    set_id: String,
+    #[serde(default)]
+    prompts: Vec<CanaryPromptDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanaryPromptDocument {
+    id: String,
+    #[serde(default)]
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
 struct ExpectedProviderReceipt<'a> {
     provider: &'a str,
     usage: ReceiptUsage,
     mu_owed_cum: u64,
     prompt_hash: String,
+}
+
+fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
+    let canary_sets = embedded_canary_sets();
+    let mut models = BTreeMap::new();
+    let Some(model_values) = root.get("models").and_then(Value::as_array) else {
+        return GatewayCanaryRegistry { models };
+    };
+    for model in model_values {
+        let Some(model_id) = model.get("model_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(canary) = model.get("canary") else {
+            continue;
+        };
+        let Some(canary_set) = canary.get("set_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(prompts) = canary_sets.get(canary_set).cloned() else {
+            continue;
+        };
+        let match_min_bps = canary
+            .get("match_min")
+            .and_then(Value::as_f64)
+            .map(|value| (value * 10_000.0).round().clamp(0.0, 10_000.0) as u32)
+            .unwrap_or(DEFAULT_CANARY_MATCH_MIN_BPS);
+        let fingerprints = canary
+            .get("fingerprints")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|object| object.iter())
+            .filter_map(|(artifact_name, value)| {
+                value
+                    .as_str()
+                    .map(|fingerprint| (artifact_name.as_str(), fingerprint.to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if fingerprints.is_empty() {
+            continue;
+        }
+        let mut fingerprints_by_artifact_root = BTreeMap::new();
+        if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
+            for (artifact_name, artifact) in artifacts {
+                let Some(fingerprint) = fingerprints.get(artifact_name.as_str()) else {
+                    continue;
+                };
+                if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
+                    fingerprints_by_artifact_root
+                        .insert(artifact_root.to_owned(), fingerprint.clone());
+                }
+            }
+        }
+        let default_fingerprint = fingerprints.values().next().cloned();
+        models.insert(
+            model_id.to_owned(),
+            GatewayCanaryModelConfig {
+                canary_set: canary_set.to_owned(),
+                match_min_bps,
+                prompts,
+                fingerprints_by_artifact_root,
+                default_fingerprint,
+            },
+        );
+    }
+    GatewayCanaryRegistry { models }
+}
+
+fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
+    [EMBEDDED_CANARY_DEV_V1, EMBEDDED_CANARY_LAUNCH_V1]
+        .into_iter()
+        .filter_map(|raw| serde_json::from_str::<CanarySetDocument>(raw).ok())
+        .map(|doc| {
+            let prompts = doc
+                .prompts
+                .into_iter()
+                .map(|prompt| GatewayCanaryPrompt {
+                    id: prompt.id,
+                    messages: prompt.messages,
+                    tools: prompt.tools,
+                    max_tokens: prompt.max_tokens.unwrap_or(64).max(1),
+                })
+                .collect::<Vec<_>>();
+            (doc.set_id, prompts)
+        })
+        .collect()
 }
 
 fn sanitize_gateway_models(models: Vec<GatewayModel>) -> Vec<GatewayModel> {
@@ -691,6 +934,7 @@ impl GatewaySessionResult {
             backend: "local-openai-shape".to_owned(),
             direct_session: false,
             provider_receipt: None,
+            token_ids: Vec::new(),
         }
     }
 }
@@ -924,6 +1168,7 @@ impl ScBridgeGatewaySessionBackend {
             backend: self.name().to_owned(),
             direct_session: true,
             provider_receipt: Some(collected.provider_receipt),
+            token_ids: collected.token_ids,
         })
     }
 }
@@ -1158,6 +1403,7 @@ async fn collect_direct_session_output(
     let mut finish_reason = None;
     let mut usage = None;
     let mut provider_receipt = None;
+    let mut token_ids = Vec::new();
     let deadline = Instant::now() + wait;
 
     while finish_reason.is_none() || provider_receipt.is_none() {
@@ -1178,6 +1424,11 @@ async fn collect_direct_session_output(
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 if let Some(delta) = frame.get("d").and_then(Value::as_str) {
                     content.push_str(delta);
+                }
+                if let Some(ids) = token_ids_from_session_delta(&frame) {
+                    token_ids = ids;
+                } else if let Some(token_id) = token_id_from_session_delta(&frame) {
+                    token_ids.push(token_id);
                 }
                 if tool_call.is_none() {
                     tool_call = tool_call_from_session_delta(&frame);
@@ -1235,7 +1486,25 @@ async fn collect_direct_session_output(
             usage,
         },
         provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        token_ids,
     })
+}
+
+fn token_ids_from_session_delta(frame: &Value) -> Option<Vec<i32>> {
+    let ids = frame.get("token_ids")?.as_array()?;
+    Some(
+        ids.iter()
+            .filter_map(|value| value.as_i64().and_then(|id| i32::try_from(id).ok()))
+            .collect(),
+    )
+}
+
+fn token_id_from_session_delta(frame: &Value) -> Option<i32> {
+    frame
+        .get("token_id")
+        .or_else(|| frame.get("chunk").and_then(|chunk| chunk.get("token_id")))
+        .and_then(Value::as_i64)
+        .and_then(|id| i32::try_from(id).ok())
 }
 
 fn provider_signed_receipt_from_frame(
@@ -1470,6 +1739,7 @@ async fn build_chat_completion(
             backend,
             direct_session,
             provider_receipt,
+            token_ids: _,
         },
         invocation,
     ) = run_chat_with_route_retry(state, &model, &request, options).await?;
@@ -1485,6 +1755,9 @@ async fn build_chat_completion(
         &invocation,
         provider_receipt.as_ref(),
     )?;
+    state
+        .maybe_run_canary_probe_after_session(&model, &invocation)
+        .await;
     if request.stream {
         Ok(ChatResponse::Sse(chat_stream_chunks(
             &id,
@@ -1598,7 +1871,241 @@ fn build_completion(
     }
 }
 
+impl GatewayCanaryScheduler {
+    fn should_probe(&mut self, key: &str, policy: GatewayCanaryProbePolicy) -> bool {
+        if !policy.enabled {
+            return false;
+        }
+        let interval = self
+            .next_after
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| self.next_interval(key, policy));
+        self.next_after.entry(key.to_owned()).or_insert(interval);
+        let counter = self.counters.entry(key.to_owned()).or_insert(0);
+        *counter = counter.saturating_add(1);
+        if *counter < interval {
+            return false;
+        }
+        *counter = 0;
+        let next = self.next_interval(key, policy);
+        self.next_after.insert(key.to_owned(), next);
+        true
+    }
+
+    fn next_interval(&mut self, key: &str, policy: GatewayCanaryProbePolicy) -> u64 {
+        let min = policy.min_interval_sessions.max(1);
+        let max = policy.max_interval_sessions.max(min);
+        if min == max {
+            return min;
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        let digest = blake3::hash(
+            format!(
+                "mayhem-canary-schedule:{key}:{}:{}",
+                policy.seed, self.sequence
+            )
+            .as_bytes(),
+        );
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest.as_bytes()[..8]);
+        min + (u64::from_be_bytes(bytes) % (max - min + 1))
+    }
+}
+
 impl GatewayState {
+    async fn maybe_run_canary_probe_after_session(
+        &self,
+        model: &GatewayModel,
+        invocation: &GatewaySessionInvocation,
+    ) {
+        let Some(config) = self.canaries.models.get(&model.id).cloned() else {
+            return;
+        };
+        if config.prompts.is_empty() {
+            return;
+        }
+        let route_key = canary_route_key(model, invocation);
+        let should_probe = self
+            .canary_scheduler
+            .lock()
+            .expect("canary scheduler poisoned")
+            .should_probe(&route_key, self.canary_policy);
+        if !should_probe {
+            return;
+        }
+        match self
+            .run_canary_probe_for_route(model, invocation, &config)
+            .await
+        {
+            Ok(probe) => self.record_probe(probe),
+            Err(err) => {
+                self.record_probe(failed_canary_runtime_probe(
+                    model,
+                    invocation,
+                    &config,
+                    err.message,
+                    self.canary_policy.epoch,
+                ));
+            }
+        }
+    }
+
+    async fn run_canary_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let expected_fingerprint = canary_expected_fingerprint(config, served_invocation)
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "no catalog canary fingerprint for served artifact",
+                    Some("model"),
+                )
+            })?;
+        let route = canary_served_route(model, served_invocation);
+        let mut prompt_reports = Vec::with_capacity(config.prompts.len());
+        let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
+        let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+
+        for prompt in &config.prompts {
+            let request = canary_chat_request(&model.id, config, prompt, self.canary_policy.seed);
+            let invocation = self.prepare_chat_invocation_for_route(
+                model,
+                &request,
+                route.as_ref(),
+                GatewayRequestOptions::default(),
+            )?;
+            let result = self
+                .session_backend
+                .run_chat(model, &request, &invocation)
+                .await
+                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            let token_fingerprint = token_fingerprint(result.token_ids.iter().copied()).digest;
+            let receipt = self.meter_chat_session(
+                model,
+                &request,
+                &result.output,
+                &invocation,
+                result.provider_receipt.as_ref(),
+            )?;
+            let receipt_hash = stable_value_hash(&json!(receipt));
+            receipt_hashes.push(receipt_hash.clone());
+            stored_receipts.push(receipt);
+            prompt_reports.push(json!({
+                "prompt_id": prompt.id,
+                "request": request,
+                "token_count": result.token_ids.len(),
+                "token_fingerprint": token_fingerprint,
+                "session_id": invocation.session_id,
+                "receipt_hash": receipt_hash,
+            }));
+        }
+
+        let prompt_fingerprints = prompt_reports
+            .iter()
+            .filter_map(|report| {
+                Some((
+                    report.get("prompt_id")?.as_str()?,
+                    report.get("token_fingerprint")?.as_str()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let observed_fingerprint = aggregate_canary_fingerprints(prompt_fingerprints);
+        let spec = CanaryProbeSpec {
+            model: model.id.clone(),
+            canary_set: config.canary_set.clone(),
+            prompt_id: format!("aggregate:{}", config.prompts.len()),
+            prompt: config
+                .prompts
+                .iter()
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            seed: self.canary_policy.seed,
+            max_tokens: config
+                .prompts
+                .iter()
+                .map(|prompt| prompt.max_tokens)
+                .max()
+                .unwrap_or(1),
+        };
+        let evaluation = evaluate_catalog_canary_probe(
+            &spec,
+            &expected_fingerprint,
+            &observed_fingerprint,
+            config.match_min_bps,
+        );
+        let provider = served_invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-canary-probe-evidence",
+            "model": model.id,
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "canary_set": config.canary_set,
+            "catalog_expected_fingerprint": expected_fingerprint,
+            "observed_fingerprint": observed_fingerprint,
+            "evaluation": evaluation,
+            "prompts": prompt_reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        let evidence_hash = stable_value_hash(&evidence);
+        let session_receipt_hash = stable_value_hash(&json!({
+            "domain": "mayhem-canary-receipt-bundle-v1",
+            "receipt_hashes": receipt_hashes,
+        }));
+        let at = now_secs();
+        let probe_id = stable_value_hash(&json!({
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "canary_set": config.canary_set,
+            "epoch": self.canary_policy.epoch,
+            "evidence_hash": evidence_hash,
+        }));
+        let probe_command = json!({
+            "op": "probe_result",
+            "probe_id": probe_id,
+            "probe_kind": "canary",
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "epoch": self.canary_policy.epoch,
+            "at": at,
+            "canary_set": config.canary_set,
+            "match_bps": evaluation.match_bps,
+            "pass": evaluation.pass,
+            "session_receipt_hash": session_receipt_hash,
+            "evidence_hash": evidence_hash,
+        });
+        let event = StoredProbeEvent {
+            probe_id: probe_command["probe_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            model_id: model.id.clone(),
+            provider,
+            enclave_id: served_invocation.enclave_id.clone(),
+            canary_set: config.canary_set.clone(),
+            expected_fingerprint: evaluation.expected_fingerprint.clone(),
+            observed_fingerprint: evaluation.observed_fingerprint.clone(),
+            match_bps: evaluation.match_bps,
+            pass: evaluation.pass,
+            reputation_event_kind: evaluation.reputation_event_kind(),
+            session_receipt_hash,
+            evidence_hash,
+            evidence: json!({
+                "evidence": evidence,
+                "receipts": stored_receipts,
+            }),
+            probe_command,
+        };
+        Ok(event)
+    }
+
     fn prepare_chat_invocation_for_route(
         &self,
         model: &GatewayModel,
@@ -1846,6 +2353,140 @@ impl GatewayState {
         };
         self.record_receipt(stored.clone());
         Ok(stored)
+    }
+}
+
+fn canary_route_key(model: &GatewayModel, invocation: &GatewaySessionInvocation) -> String {
+    format!(
+        "{}:{}:{}",
+        model.id,
+        invocation
+            .provider_pubkey
+            .as_deref()
+            .unwrap_or("local-provider"),
+        invocation.enclave_id
+    )
+}
+
+fn canary_served_route(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+) -> Option<GatewayRouteCandidate> {
+    let provider = invocation.provider_pubkey.as_deref()?;
+    model
+        .mayhem
+        .route_candidates
+        .iter()
+        .find(|candidate| {
+            candidate.provider == provider && candidate.enclave_id == invocation.enclave_id
+        })
+        .cloned()
+}
+
+fn canary_expected_fingerprint(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<String> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .fingerprints_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| config.default_fingerprint.clone())
+}
+
+fn canary_chat_request(
+    model_id: &str,
+    _config: &GatewayCanaryModelConfig,
+    prompt: &GatewayCanaryPrompt,
+    seed: i64,
+) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model_id.to_owned(),
+        messages: prompt.messages.clone(),
+        stream: true,
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        tools: prompt.tools.clone(),
+        tool_choice: None,
+        response_format: None,
+        temperature: Some(DEFAULT_CANARY_TEMPERATURE),
+        top_p: None,
+        seed: Some(seed),
+        stop: None,
+        max_tokens: Some(prompt.max_tokens.max(1)),
+    }
+}
+
+fn failed_canary_runtime_probe(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    config: &GatewayCanaryModelConfig,
+    reason: String,
+    epoch: u64,
+) -> StoredProbeEvent {
+    let provider = invocation
+        .provider_pubkey
+        .clone()
+        .unwrap_or_else(|| "local-provider".to_owned());
+    let evidence = json!({
+        "schema_version": 1,
+        "kind": "mayhem-automatic-canary-probe-runtime-failure",
+        "model": model.id,
+        "provider": provider,
+        "enclave_id": invocation.enclave_id,
+        "canary_set": config.canary_set,
+        "reason": reason,
+    });
+    let evidence_hash = stable_value_hash(&evidence);
+    let at = now_secs();
+    let probe_id = stable_value_hash(&json!({
+        "provider": provider,
+        "enclave_id": invocation.enclave_id,
+        "canary_set": config.canary_set,
+        "epoch": epoch,
+        "runtime_failure": evidence_hash,
+    }));
+    let probe_command = json!({
+        "op": "probe_result",
+        "probe_id": probe_id,
+        "probe_kind": "canary",
+        "provider": provider,
+        "enclave_id": invocation.enclave_id,
+        "epoch": epoch,
+        "at": at,
+        "canary_set": config.canary_set,
+        "match_bps": 0,
+        "pass": false,
+        "session_receipt_hash": stable_value_hash(&json!({
+            "domain": "mayhem-canary-runtime-failure-v1",
+            "evidence_hash": evidence_hash,
+        })),
+        "evidence_hash": evidence_hash,
+    });
+    StoredProbeEvent {
+        probe_id,
+        model_id: model.id.clone(),
+        provider,
+        enclave_id: invocation.enclave_id.clone(),
+        canary_set: config.canary_set.clone(),
+        expected_fingerprint: canary_expected_fingerprint(config, invocation).unwrap_or_default(),
+        observed_fingerprint: String::new(),
+        match_bps: 0,
+        pass: false,
+        reputation_event_kind: ReputationEventKind::ProbeFail,
+        session_receipt_hash: probe_command["session_receipt_hash"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        evidence_hash,
+        evidence,
+        probe_command,
     }
 }
 
@@ -2203,6 +2844,28 @@ fn enclave_id_for_model(model_id: &str) -> String {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn stable_value_hash(value: &Value) -> String {
+    blake3::hash(stable_json_value(value).to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn stable_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(stable_json_value).collect()),
+        Value::Object(map) => {
+            let mut stable = serde_json::Map::new();
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                stable.insert(key.clone(), stable_json_value(value));
+            }
+            Value::Object(stable)
+        }
+        other => other.clone(),
+    }
 }
 
 fn is_hex_len(value: &str, len: usize) -> bool {

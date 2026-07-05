@@ -4,10 +4,13 @@ use axum::{
     Router,
 };
 use mayhem_gateway::openai::{
-    openai_router, ChatCompletionRequest, ChatOutput, GatewayModel, GatewayRouteCandidate,
-    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
-    GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, Usage,
+    openai_router, ChatCompletionRequest, ChatMessage, ChatOutput, GatewayCanaryModelConfig,
+    GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayModel,
+    GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture,
+    GatewaySessionInvocation, GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps,
+    PriceRefMu, Usage,
 };
+use mayhem_gateway::{aggregate_canary_fingerprints, token_fingerprint, ReputationEventKind};
 use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity};
 use serde_json::{json, Value};
 use std::{
@@ -50,6 +53,7 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                 backend: self.name().to_owned(),
                 direct_session: true,
                 provider_receipt: None,
+                token_ids: vec![1, 2, 3, 4],
             })
         })
     }
@@ -105,6 +109,7 @@ impl GatewaySessionBackend for RetryThenDirectSessionBackend {
                 backend: self.name().to_owned(),
                 direct_session: true,
                 provider_receipt: None,
+                token_ids: vec![2, 3, 4],
             })
         })
     }
@@ -181,6 +186,67 @@ impl GatewaySessionBackend for HedgeInspectBackend {
                 backend: self.name().to_owned(),
                 direct_session: true,
                 provider_receipt: None,
+                token_ids: vec![5, 6],
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CanarySubstitutionBackend {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl GatewaySessionBackend for CanarySubstitutionBackend {
+    fn name(&self) -> &str {
+        "test-canary-substitution"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let prompt = request
+                .messages
+                .iter()
+                .map(|message| message.content.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.calls.lock().expect("calls lock").push(prompt.clone());
+            let is_canary = prompt.contains("fixed canary");
+            let token_ids = if is_canary {
+                vec![9, 9, 9]
+            } else {
+                vec![1, 2, 3]
+            };
+            let content = if is_canary {
+                "substituted canary output".to_owned()
+            } else {
+                format!(
+                    "normal direct session response from {} via {}",
+                    model.id, invocation.session_id
+                )
+            };
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = token_ids.len() as u64;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(content),
+                    tool_call: None,
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids,
             })
         })
     }
@@ -396,6 +462,60 @@ async fn chat_completion_can_use_direct_session_backend() {
 }
 
 #[tokio::test]
+async fn automatic_canary_probe_catches_substituted_served_enclave() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![routed_test_model()])
+        .with_canary_registry(test_canary_registry(&[1, 2, 3]))
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(CanarySubstitutionBackend {
+            calls: calls.clone(),
+        }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Use a direct session." }]
+    });
+
+    let (status, body) =
+        json_request(app.clone(), Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mayhem"]["backend"], "test-canary-substitution");
+    assert_eq!(state.receipts().len(), 2);
+    assert_eq!(calls.lock().expect("calls lock").len(), 2);
+
+    let probes = state.probes();
+    assert_eq!(probes.len(), 1);
+    let probe = &probes[0];
+    assert!(!probe.pass);
+    assert_eq!(probe.match_bps, 0);
+    assert_eq!(probe.reputation_event_kind, ReputationEventKind::ProbeFail);
+    assert_eq!(probe.probe_command["op"], "probe_result");
+    assert_eq!(probe.probe_command["probe_kind"], "canary");
+    assert_eq!(probe.probe_command["pass"], false);
+    assert_eq!(probe.probe_command["provider"], "55".repeat(32));
+    assert_eq!(
+        probe.probe_command["enclave_id"],
+        catalog_enclave_id(&routed_test_identity())
+    );
+    assert!(
+        probe.evidence["evidence"]["prompts"][0]["token_count"]
+            .as_u64()
+            .expect("token count")
+            > 0
+    );
+
+    let (status, body) = json_request(app, Method::GET, "/mayhem/probes", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().expect("probe list").len(), 1);
+    assert_eq!(body["data"][0]["pass"], false);
+    assert_eq!(
+        body["data"][0]["reputation_event_kind"]["kind"],
+        "probe_fail"
+    );
+}
+
+#[tokio::test]
 async fn contract_model_with_noncanonical_route_is_unavailable() {
     let mut model = routed_test_model();
     model.mayhem.route_candidates[0].room_id = "provider-local-only".to_owned();
@@ -557,6 +677,37 @@ async fn invalid_x_mayhem_hedge_header_is_rejected_before_session_start() {
 
 fn routed_test_model() -> GatewayModel {
     routed_test_model_with_providers(&["55".repeat(32)])
+}
+
+fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
+    let prompt_fingerprint = token_fingerprint(expected_tokens.iter().copied()).digest;
+    let expected_fingerprint =
+        aggregate_canary_fingerprints([("fixed-probe", prompt_fingerprint.as_str())]);
+    GatewayCanaryRegistry {
+        models: BTreeMap::from([(
+            "mayhem/routed-test".to_owned(),
+            GatewayCanaryModelConfig {
+                canary_set: "canary-test-v1".to_owned(),
+                match_min_bps: 9_000,
+                prompts: vec![GatewayCanaryPrompt {
+                    id: "fixed-probe".to_owned(),
+                    messages: vec![ChatMessage {
+                        role: "user".to_owned(),
+                        content: json!("fixed canary prompt"),
+                        name: None,
+                        extra: BTreeMap::new(),
+                    }],
+                    tools: None,
+                    max_tokens: 8,
+                }],
+                fingerprints_by_artifact_root: BTreeMap::from([(
+                    "aa".repeat(32),
+                    expected_fingerprint,
+                )]),
+                default_fingerprint: None,
+            },
+        )]),
+    }
 }
 
 fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {

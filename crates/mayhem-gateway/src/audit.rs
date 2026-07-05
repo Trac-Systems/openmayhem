@@ -79,6 +79,19 @@ pub fn token_fingerprint(token_ids: impl IntoIterator<Item = i32>) -> CanaryToke
     }
 }
 
+pub fn aggregate_canary_fingerprints<'a>(
+    prompts: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (prompt_id, fingerprint) in prompts {
+        let prompt_id = prompt_id.as_bytes();
+        hasher.update(&(prompt_id.len() as u32).to_be_bytes());
+        hasher.update(prompt_id);
+        hasher.update(fingerprint.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 pub fn evaluate_canary_probe(
     spec: &CanaryProbeSpec,
     expected: &[i32],
@@ -103,6 +116,29 @@ pub fn evaluate_canary_probe(
         observed_fingerprint: token_fingerprint(observed.iter().copied()).digest,
         matched_positions,
         total_positions,
+        match_bps,
+        pass: match_bps >= min_match_bps,
+    }
+}
+
+pub fn evaluate_catalog_canary_probe(
+    spec: &CanaryProbeSpec,
+    expected_fingerprint: &str,
+    observed_fingerprint: &str,
+    min_match_bps: u32,
+) -> CanaryProbeEvaluation {
+    let match_bps = if expected_fingerprint.eq_ignore_ascii_case(observed_fingerprint) {
+        10_000
+    } else {
+        0
+    };
+    CanaryProbeEvaluation {
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint: expected_fingerprint.to_owned(),
+        observed_fingerprint: observed_fingerprint.to_owned(),
+        matched_positions: u32::from(match_bps == 10_000),
+        total_positions: 1,
         match_bps,
         pass: match_bps >= min_match_bps,
     }
@@ -171,5 +207,38 @@ mod tests {
             evaluation.reputation_event_kind(),
             ReputationEventKind::ProbeOk
         );
+    }
+
+    #[test]
+    fn aggregate_canary_fingerprint_matches_catalog_format() {
+        let first = token_fingerprint([1, 2, 3]).digest;
+        let second = token_fingerprint([4, 5]).digest;
+        let aggregate =
+            aggregate_canary_fingerprints([("a", first.as_str()), ("b", second.as_str())]);
+
+        assert_eq!(
+            aggregate,
+            aggregate_canary_fingerprints([("a", first.as_str()), ("b", second.as_str())])
+        );
+        assert_ne!(
+            aggregate,
+            aggregate_canary_fingerprints([("b", second.as_str()), ("a", first.as_str())])
+        );
+    }
+
+    #[test]
+    fn catalog_fingerprint_evaluation_emits_probe_fail_on_mismatch() {
+        let evaluation = evaluate_catalog_canary_probe(&spec(), "aa", "bb", 9_000);
+
+        assert_eq!(evaluation.match_bps, 0);
+        assert!(!evaluation.pass);
+        assert_eq!(
+            evaluation.reputation_event_kind(),
+            ReputationEventKind::ProbeFail
+        );
+
+        let ok = evaluate_catalog_canary_probe(&spec(), "AA", "aa", 9_000);
+        assert_eq!(ok.match_bps, 10_000);
+        assert!(ok.pass);
     }
 }

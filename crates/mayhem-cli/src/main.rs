@@ -14669,6 +14669,7 @@ async fn send_provider_session_output(
                     "tool": tool,
                     "fin": output.finish_reason,
                     "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
+                    "token_ids": &output.token_ids,
                 }),
             )
             .await
@@ -14714,6 +14715,7 @@ async fn send_provider_session_output(
                     "tool": null,
                     "fin": output.finish_reason,
                     "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
+                    "token_ids": &output.token_ids,
                 }),
             )
             .await
@@ -15439,6 +15441,7 @@ struct ProviderSessionOutput {
     finish_reason: String,
     prompt_tokens: u64,
     completion_tokens: u64,
+    token_ids: Vec<i32>,
 }
 
 fn provider_engine_session_response(
@@ -15450,9 +15453,12 @@ fn provider_engine_session_response(
         .grammar
         .as_ref()
         .is_some_and(|grammar| matches!(grammar, GrammarSpec::ToolCall { .. }));
-    let mut sink = mayhem_engine::NoopTokenSink;
+    let mut token_ids = Vec::new();
     let output = backend
-        .generate(request, &mut sink)
+        .generate(request, &mut |chunk: mayhem_engine::TokenChunk| {
+            token_ids.push(chunk.token_id);
+            Ok(())
+        })
         .context("generating provider session response with mayhem-engine")?;
     let tool = if wants_tool {
         Some(
@@ -15480,6 +15486,7 @@ fn provider_engine_session_response(
         },
         prompt_tokens: u64::from(output.usage.prompt_tokens),
         completion_tokens: u64::from(output.usage.completion_tokens),
+        token_ids,
     })
 }
 
@@ -15621,6 +15628,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         let content = format!("Tool result received: {tool_result}");
         return ProviderSessionOutput {
             completion_tokens: rough_text_tokens(&content),
+            token_ids: content.bytes().map(i32::from).collect(),
             content,
             tool: None,
             finish_reason: "stop".to_owned(),
@@ -15639,6 +15647,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             finish_reason: "tool_calls".to_owned(),
             prompt_tokens,
             completion_tokens: 1,
+            token_ids: Vec::new(),
         };
     }
     if let Some(tool_name) = provider_requested_tool_name(body) {
@@ -15652,6 +15661,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             finish_reason: "tool_calls".to_owned(),
             prompt_tokens,
             completion_tokens: 1,
+            token_ids: Vec::new(),
         };
     }
     let content = if provider_wants_json(body) {
@@ -15670,6 +15680,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
     };
     ProviderSessionOutput {
         completion_tokens: rough_text_tokens(&content),
+        token_ids: content.bytes().map(i32::from).collect(),
         content,
         tool: None,
         finish_reason: "stop".to_owned(),
@@ -18095,6 +18106,7 @@ mod tests {
             finish_reason: "stop".to_owned(),
             prompt_tokens: 3,
             completion_tokens: 4,
+            token_ids: vec![1, 2, 3, 4],
         };
         let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
         let receipt =
@@ -18146,6 +18158,7 @@ mod tests {
             finish_reason: "stop".to_owned(),
             prompt_tokens: 2,
             completion_tokens: 3,
+            token_ids: vec![1, 2, 3],
         };
         let receipt = provider_session_receipt(
             &terms,
