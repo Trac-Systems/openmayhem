@@ -18,7 +18,7 @@ use mayhem_gateway::{
 use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity, DEFAULT_MODEL_CLASS};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
@@ -60,6 +60,7 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![1, 2, 3, 4],
+                quality: None,
             })
         })
     }
@@ -102,6 +103,7 @@ impl GatewaySessionBackend for ToolCallDirectSessionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![1],
+                quality: None,
             })
         })
     }
@@ -145,6 +147,7 @@ impl GatewaySessionBackend for ArtifactDirectSessionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: Vec::new(),
+                quality: None,
             })
         })
     }
@@ -188,6 +191,7 @@ impl GatewaySessionBackend for VisionInspectBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![70, 71],
+                quality: None,
             })
         })
     }
@@ -245,6 +249,65 @@ impl GatewaySessionBackend for RetryThenDirectSessionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![2, 3, 4],
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RetryFirstDirectSessionBackend {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl GatewaySessionBackend for RetryFirstDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-retry-first-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let provider = invocation
+                .provider_pubkey
+                .clone()
+                .unwrap_or_else(|| "<none>".to_owned());
+            let attempt = {
+                let mut calls = self.calls.lock().expect("calls lock");
+                calls.push(provider.clone());
+                calls.len()
+            };
+            if attempt == 1 {
+                return Err(GatewaySessionError::retryable(
+                    "simulated first direct open timeout before spend",
+                ));
+            }
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = 3;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(format!(
+                        "direct retry response from {} via {}",
+                        model.id, provider
+                    )),
+                    tool_call: None,
+                    artifacts: Vec::new(),
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids: vec![2, 3, 4],
+                quality: None,
             })
         })
     }
@@ -323,6 +386,7 @@ impl GatewaySessionBackend for HedgeInspectBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![5, 6],
+                quality: None,
             })
         })
     }
@@ -384,6 +448,7 @@ impl GatewaySessionBackend for CanarySubstitutionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids,
+                quality: None,
             })
         })
     }
@@ -1174,8 +1239,7 @@ async fn chat_completion_retries_retryable_direct_session_route_before_metering(
         first_provider.clone(),
         second_provider.clone(),
     ])])
-    .with_session_backend(Arc::new(RetryThenDirectSessionBackend {
-        retry_provider: first_provider.clone(),
+    .with_session_backend(Arc::new(RetryFirstDirectSessionBackend {
         calls: calls.clone(),
     }));
     let app = openai_router(state.clone());
@@ -1187,17 +1251,19 @@ async fn chat_completion_retries_retryable_direct_session_route_before_metering(
     let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["mayhem"]["backend"], "test-retry-direct-session");
+    assert_eq!(body["mayhem"]["backend"], "test-retry-first-direct-session");
+    let calls = calls.lock().expect("calls lock").clone();
+    assert_eq!(calls.len(), 2);
     assert!(body["choices"][0]["message"]["content"]
         .as_str()
         .expect("assistant content")
-        .contains(&second_provider));
-    assert_eq!(
-        calls.lock().expect("calls lock").clone(),
-        vec![first_provider, second_provider.clone()]
-    );
+        .contains(calls[1].as_str()));
+    assert_ne!(calls[0], calls[1]);
+    assert!(calls.iter().all(
+        |provider| [first_provider.as_str(), second_provider.as_str()].contains(&provider.as_str())
+    ));
     assert_eq!(state.receipts().len(), 1);
-    assert_eq!(state.receipts()[0].receipt.body.provider, second_provider);
+    assert_eq!(state.receipts()[0].receipt.body.provider, calls[1]);
 }
 
 #[tokio::test]
@@ -1223,10 +1289,11 @@ async fn chat_completion_caps_retryable_direct_session_routes_at_four_without_re
         .as_str()
         .expect("error message")
         .contains("all 4 route attempt(s) failed before spend"));
-    assert_eq!(
-        calls.lock().expect("calls lock").clone(),
-        providers[0..4].to_vec()
-    );
+    let calls = calls.lock().expect("calls lock").clone();
+    assert_eq!(calls.len(), 4);
+    let unique_calls = calls.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(unique_calls.len(), 4);
+    assert!(calls.iter().all(|provider| providers.contains(provider)));
     assert!(state.receipts().is_empty());
 }
 
@@ -1237,7 +1304,7 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
         first_provider.clone(),
-        second_provider,
+        second_provider.clone(),
     ])])
     .with_session_backend(Arc::new(HedgeInspectBackend {
         invocations: invocations.clone(),
@@ -1261,12 +1328,15 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
     assert_eq!(body["mayhem"]["backend"], "test-hedge-inspect");
     assert_eq!(body["mayhem"]["hedge"]["requested"], true);
     assert_eq!(body["mayhem"]["hedge"]["planned_probe_count"], 2);
-    assert_eq!(
-        invocations.lock().expect("invocations lock").clone(),
-        vec![(first_provider.clone(), true, 2)]
-    );
+    let invocations = invocations.lock().expect("invocations lock").clone();
+    assert_eq!(invocations.len(), 1);
+    assert!(matches!(
+        invocations[0],
+        (ref provider, true, 2)
+            if provider == &first_provider || provider == &second_provider
+    ));
     assert_eq!(state.receipts().len(), 1);
-    assert_eq!(state.receipts()[0].receipt.body.provider, first_provider);
+    assert_eq!(state.receipts()[0].receipt.body.provider, invocations[0].0);
 }
 
 #[tokio::test]

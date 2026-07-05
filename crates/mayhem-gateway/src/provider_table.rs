@@ -507,10 +507,12 @@ pub fn eligible_candidates(
             let available = (1.0 - heartbeat.sat).clamp(0.0, 1.0);
             let price_norm = ((estimated_price_mu.max(1) as f64) / median_price).max(f64::EPSILON);
             let latency_factor = (median_ttft / effective_ttft_ms).clamp(0.25, 4.0);
+            let error_factor = (1.0 - entry.observed.ewma_error_rate).clamp(0.05, 1.0);
             let weight = reputation.powf(weights.reputation_alpha)
                 * available.powf(weights.saturation_beta)
                 * (1.0 / price_norm).powf(weights.price_gamma)
                 * latency_factor
+                * error_factor
                 * probation_weight_multiplier(&entry);
             SelectionCandidate {
                 entry,

@@ -23,8 +23,13 @@ use crate::{
         DEFAULT_STALL_TIMEOUT_MILLIS,
     },
     pricing::{normalize_rate_map, text_generation_rate_map, text_usage_mu, RateMapEntry},
-    verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, ProviderKey,
-    ReputationEventKind,
+    provider_table::{
+        ContractProviderSnapshot, LcgBalancerRng, ProviderObservationSample, ProviderTable,
+        RequestRequirements, SelectionWeights,
+    },
+    verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
+    HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
+    ProviderHeartbeat, ProviderKey, ReputationEventKind,
 };
 use axum::{
     body::Body,
@@ -94,6 +99,7 @@ pub struct GatewayState {
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
     provider_earnings: Arc<Vec<Value>>,
+    provider_table: Arc<Mutex<ProviderTable>>,
 }
 
 #[derive(Clone)]
@@ -469,6 +475,13 @@ pub struct GatewaySessionResult {
     pub direct_session: bool,
     pub provider_receipt: Option<ProviderSignedReceipt>,
     pub token_ids: Vec<i32>,
+    pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GatewaySessionQuality {
+    pub ttft_ms: u64,
+    pub tok_s: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -639,12 +652,14 @@ impl GatewayState {
         canaries: GatewayCanaryRegistry,
     ) -> Self {
         let models = sanitize_gateway_models(models);
+        let receipt_config = ReceiptConfig::default();
+        let provider_table = provider_table_from_models(&models, receipt_config.rules_ver);
         Self {
             models: Arc::new(models),
             receipts: Arc::new(Mutex::new(Vec::new())),
             probes: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(Vec::new())),
-            receipt_config: ReceiptConfig::default(),
+            receipt_config,
             session_backend: Arc::new(LocalOpenAiShapeBackend),
             hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
             canaries: Arc::new(canaries),
@@ -652,6 +667,7 @@ impl GatewayState {
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
             provider_earnings: Arc::new(Vec::new()),
+            provider_table: Arc::new(Mutex::new(provider_table)),
         }
     }
 
@@ -1999,6 +2015,7 @@ struct DirectSessionCollected {
     output: ChatOutput,
     provider_receipt: ProviderSignedReceipt,
     token_ids: Vec<i32>,
+    quality: Option<GatewaySessionQuality>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2230,6 +2247,90 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
         .collect()
 }
 
+fn provider_table_from_models(models: &[GatewayModel], rules_ver: u64) -> ProviderTable {
+    let mut table = ProviderTable::new();
+    let now = now_millis_u64();
+    for model in models {
+        for candidate in &model.mayhem.route_candidates {
+            table.upsert_contract(contract_snapshot_for_route(model, candidate, rules_ver));
+            table.upsert_heartbeat(heartbeat_for_route(model, candidate, now), now);
+        }
+    }
+    table
+}
+
+fn contract_snapshot_for_route(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    rules_ver: u64,
+) -> ContractProviderSnapshot {
+    ContractProviderSnapshot {
+        provider: candidate.provider.clone(),
+        provider_status: Some("active".to_owned()),
+        enclave_id: candidate.enclave_id.clone(),
+        model_id: model.id.clone(),
+        room_id: candidate.room_id.clone(),
+        consent_ver: rules_ver,
+        reputation: 1.0,
+        price_ver: candidate.price_ver,
+        rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
+        ref_rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
+        probation: None,
+        caps: heartbeat_caps_from_model(&model.mayhem.caps),
+        attestation_head: Some(candidate.binary_hash.clone()),
+    }
+}
+
+fn heartbeat_for_route(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    now_millis: u64,
+) -> ProviderHeartbeat {
+    ProviderHeartbeat {
+        t: "hb".to_owned(),
+        v: crate::HEARTBEAT_SCHEMA_VERSION,
+        contract_version: CONTRACT_VERSION,
+        provider: candidate.provider.clone(),
+        enclave_id: candidate.enclave_id.clone(),
+        model_id: model.id.clone(),
+        room_id: candidate.room_id.clone(),
+        sat: 0.0,
+        slots: HeartbeatSlots { active: 0, max: 1 },
+        q: HeartbeatQueue {
+            depth: 0,
+            est_wait_ms: 0,
+        },
+        perf: HeartbeatPerf {
+            tok_s: Some(50.0),
+            ttft_ms: 150,
+        },
+        price_ver: candidate.price_ver,
+        caps: heartbeat_caps_from_model(&model.mayhem.caps),
+        att: HeartbeatAttestation {
+            epoch: 0,
+            head: candidate.binary_hash.clone(),
+        },
+        ts: now_millis / 1000,
+        nonce: blake3_hex(
+            format!(
+                "route:{}:{}:{}:{now_millis}",
+                candidate.provider, candidate.enclave_id, candidate.room_id
+            )
+            .as_bytes(),
+        ),
+        sig: String::new(),
+    }
+}
+
+fn heartbeat_caps_from_model(caps: &ModelCaps) -> HeartbeatCaps {
+    HeartbeatCaps {
+        tools: caps.tools,
+        json: caps.json,
+        ctx: caps.ctx,
+        vision: caps.vision,
+    }
+}
+
 fn sanitize_gateway_models(models: Vec<GatewayModel>) -> Vec<GatewayModel> {
     models
         .into_iter()
@@ -2366,6 +2467,7 @@ impl GatewaySessionResult {
             direct_session: false,
             provider_receipt: None,
             token_ids: Vec::new(),
+            quality: None,
         }
     }
 }
@@ -2605,6 +2707,7 @@ impl ScBridgeGatewaySessionBackend {
             direct_session: true,
             provider_receipt: Some(collected.provider_receipt),
             token_ids: collected.token_ids,
+            quality: collected.quality,
         })
     }
 }
@@ -2974,7 +3077,8 @@ async fn collect_direct_session_output(
     let mut provider_receipt = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
-    let mut watchdog = DirectSessionWatchdog::new(now_millis_u64(), wait, wait, None);
+    let started_at_millis = now_millis_u64();
+    let mut watchdog = DirectSessionWatchdog::new(started_at_millis, wait, wait, None);
 
     while finish_reason.is_none() || provider_receipt.is_none() {
         let remaining_millis = watchdog
@@ -3054,6 +3158,14 @@ async fn collect_direct_session_output(
 
     let prompt_text = chat_prompt_text(request);
     let usage = usage.unwrap_or_else(|| usage_for(&prompt_text, &content));
+    let completed_at_millis = now_millis_u64();
+    let quality = watchdog.first_delta_at_millis.map(|first_delta_at_millis| {
+        let elapsed_millis = completed_at_millis.saturating_sub(started_at_millis).max(1);
+        GatewaySessionQuality {
+            ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+            tok_s: Some((usage.completion_tokens as f64) * 1000.0 / (elapsed_millis as f64)),
+        }
+    });
     let artifacts = finish_session_artifacts(artifact_builders)?;
     Ok(DirectSessionCollected {
         output: ChatOutput {
@@ -3065,6 +3177,7 @@ async fn collect_direct_session_output(
         },
         provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
         token_ids,
+        quality,
     })
 }
 
@@ -3480,6 +3593,7 @@ async fn build_chat_completion(
             direct_session,
             provider_receipt,
             token_ids: _,
+            quality: _,
         },
         invocation,
     ) = run_chat_with_route_retry(state, &model, &request, options).await?;
@@ -3529,7 +3643,8 @@ async fn run_chat_with_route_retry(
     request: &ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<(GatewaySessionResult, GatewaySessionInvocation), ApiError> {
-    let eligible_routes = eligible_route_candidates(model, options.min_att_tier);
+    let eligible_routes =
+        ordered_route_candidates_for_request(state, model, request, options.min_att_tier);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         return Err(ApiError::bad_request(
             "no provider route satisfies X-Mayhem-Min-Att-Tier",
@@ -3548,16 +3663,36 @@ async fn run_chat_with_route_retry(
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
         let invocation = state.prepare_chat_invocation_for_route(model, request, route, options)?;
+        let attempt_started = Instant::now();
         match state
             .session_backend
             .run_chat(model, request, &invocation)
             .await
         {
-            Ok(result) => return Ok((result, invocation)),
+            Ok(result) => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_success(&result, attempt_started.elapsed()),
+                );
+                return Ok((result, invocation));
+            }
             Err(err) if err.retryable => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
                 last_retryable_error = Some(err.message);
             }
-            Err(err) => return Err(ApiError::bad_gateway(err.message, Some("model"))),
+            Err(err) => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                return Err(ApiError::bad_gateway(err.message, Some("model")));
+            }
         }
     }
 
@@ -3568,6 +3703,189 @@ async fn run_chat_with_route_retry(
         ),
         Some("model"),
     ))
+}
+
+fn ordered_route_candidates_for_request<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &ChatCompletionRequest,
+    min_att_tier: Option<u8>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = route_selection_seed(model, request, now_millis_u64());
+    ordered_route_candidates_for_request_with_seed(state, model, request, min_att_tier, seed)
+}
+
+fn ordered_route_candidates_for_request_with_seed<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &ChatCompletionRequest,
+    min_att_tier: Option<u8>,
+    seed: u64,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let eligible_routes = eligible_route_candidates(model, min_att_tier);
+    if eligible_routes.len() <= 1 {
+        return eligible_routes;
+    }
+
+    state.refresh_provider_table_routes(model);
+    let now_millis = now_millis_u64();
+    let requirements = request_requirements_for_chat(state, model, request, now_millis);
+    let route_by_key = eligible_routes
+        .iter()
+        .map(|candidate| (route_key(candidate), *candidate))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining_entries = {
+        let table = state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned");
+        table
+            .entries(now_millis)
+            .into_iter()
+            .filter(|entry| route_by_key.contains_key(&entry.key))
+            .collect::<Vec<_>>()
+    };
+    let weights = SelectionWeights::default();
+    let mut rng = LcgBalancerRng::seeded(seed);
+    let mut ordered = Vec::new();
+    let mut selected_keys = BTreeSet::new();
+
+    while !remaining_entries.is_empty() {
+        let Some(selection) = crate::provider_table::select_weighted_p2c(
+            &remaining_entries,
+            &requirements,
+            &weights,
+            &mut rng,
+        ) else {
+            break;
+        };
+        let key = selection.selected.entry.key;
+        if let Some(candidate) = route_by_key.get(&key).copied() {
+            ordered.push(candidate);
+            selected_keys.insert(key.clone());
+        }
+        remaining_entries.retain(|entry| entry.key != key);
+    }
+
+    for candidate in eligible_routes {
+        let key = route_key(candidate);
+        if selected_keys.insert(key) {
+            ordered.push(candidate);
+        }
+    }
+    ordered
+}
+
+impl GatewayState {
+    fn refresh_provider_table_routes(&self, model: &GatewayModel) {
+        let now = now_millis_u64();
+        let mut table = self.provider_table.lock().expect("provider table poisoned");
+        for candidate in &model.mayhem.route_candidates {
+            table.upsert_contract(contract_snapshot_for_route(
+                model,
+                candidate,
+                self.receipt_config.rules_ver,
+            ));
+            table.upsert_heartbeat(heartbeat_for_route(model, candidate, now), now);
+        }
+    }
+}
+
+fn route_key(candidate: &GatewayRouteCandidate) -> ProviderKey {
+    ProviderKey::new(
+        candidate.provider.clone(),
+        candidate.enclave_id.clone(),
+        candidate.room_id.clone(),
+    )
+}
+
+fn request_requirements_for_chat(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    now_millis: u64,
+) -> RequestRequirements {
+    let prompt_text = chat_prompt_text(request);
+    let input_tokens = rough_tokens(&prompt_text);
+    let output_tokens = u64::from(request.max_tokens.unwrap_or(1024).max(1));
+    RequestRequirements {
+        current_rules_ver: state.receipt_config.rules_ver,
+        requires_tools: request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty()),
+        requires_json: request.response_format.is_some(),
+        requires_vision: chat_input_modalities(&request.messages).image,
+        min_ctx: input_tokens
+            .saturating_add(output_tokens)
+            .min(u64::from(u32::MAX)) as u32,
+        input_tokens,
+        output_tokens,
+        now_millis,
+        max_price_mu: Some(estimate_max_spend_mu(model, request, &prompt_text)),
+        ..RequestRequirements::default()
+    }
+}
+
+fn route_selection_seed(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    now_millis: u64,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.id.as_bytes());
+    hasher.update(chat_prompt_text(request).as_bytes());
+    hasher.update(&request.seed.unwrap_or_default().to_le_bytes());
+    hasher.update(&now_millis.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn record_route_observation(
+    state: &GatewayState,
+    route: Option<&GatewayRouteCandidate>,
+    sample: ProviderObservationSample,
+) {
+    let Some(route) = route else {
+        return;
+    };
+    state
+        .provider_table
+        .lock()
+        .expect("provider table poisoned")
+        .record_observation(&route_key(route), sample);
+}
+
+fn observation_sample_from_success(
+    result: &GatewaySessionResult,
+    elapsed: Duration,
+) -> ProviderObservationSample {
+    let elapsed_millis = duration_millis_u64(elapsed).max(1);
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
+    ProviderObservationSample {
+        ttft_ms: result
+            .quality
+            .map(|quality| quality.ttft_ms)
+            .unwrap_or(elapsed_millis),
+        tok_s: result
+            .quality
+            .and_then(|quality| quality.tok_s)
+            .or_else(|| {
+                Some(result.output.usage.completion_tokens as f64 / elapsed_seconds)
+                    .filter(|tok_s| tok_s.is_finite() && *tok_s >= 0.0)
+            }),
+        error: false,
+    }
+}
+
+fn observation_sample_from_error(elapsed: Duration) -> ProviderObservationSample {
+    ProviderObservationSample {
+        ttft_ms: duration_millis_u64(elapsed).max(1),
+        tok_s: None,
+        error: true,
+    }
 }
 
 fn eligible_route_candidates(
@@ -6276,6 +6594,119 @@ mod tests {
             stop: None,
             max_tokens: None,
         }
+    }
+
+    fn test_routed_model(provider_count: u8) -> GatewayModel {
+        let mut model = test_model();
+        model.id = "mayhem/routing-test".to_owned();
+        model.mayhem.source = "contract".to_owned();
+        model.mayhem.providers_online = u32::from(provider_count);
+        model.mayhem.rooms = u32::from(provider_count);
+        model.mayhem.route_candidates = (0..provider_count)
+            .map(test_route_candidate)
+            .collect::<Vec<_>>();
+        model
+    }
+
+    fn test_route_candidate(idx: u8) -> GatewayRouteCandidate {
+        GatewayRouteCandidate {
+            provider: format!("{:02x}", idx.wrapping_add(1)).repeat(32),
+            enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
+            room_id: format!("{:02x}", idx.wrapping_add(160)).repeat(16),
+            price_ver: 7,
+            att_tier: 1,
+            admin_pubkey: "33".repeat(32),
+            artifact_root: format!("{:02x}", idx.wrapping_add(180)).repeat(32),
+            manifest_hash: format!("{:02x}", idx.wrapping_add(190)).repeat(32),
+            binary_hash: format!("{:02x}", idx.wrapping_add(200)).repeat(32),
+            kyb: None,
+            caps: json!({}),
+        }
+    }
+
+    #[test]
+    fn route_selection_uses_weighted_p2c_not_array_order() {
+        let model = test_routed_model(4);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let request = test_chat_request(&model.id);
+        let mut counts = BTreeMap::new();
+
+        for seed in 0..256 {
+            let selected = ordered_route_candidates_for_request_with_seed(
+                &state, &model, &request, None, seed,
+            )
+            .into_iter()
+            .next()
+            .expect("route selected")
+            .provider
+            .clone();
+            *counts.entry(selected).or_insert(0_u32) += 1;
+        }
+
+        assert!(
+            counts.len() > 1,
+            "P2C should distribute first picks instead of always using catalog array order"
+        );
+        assert!(
+            counts[&model.mayhem.route_candidates[0].provider] < 256,
+            "catalog array first provider must not win every live selection"
+        );
+    }
+
+    #[test]
+    fn route_selection_penalizes_observed_slow_error_provider() {
+        let model = test_routed_model(4);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let request = test_chat_request(&model.id);
+        let penalized_provider = model.mayhem.route_candidates[0].provider.clone();
+        let before = (0..256)
+            .filter(|seed| {
+                ordered_route_candidates_for_request_with_seed(
+                    &state, &model, &request, None, *seed,
+                )
+                .into_iter()
+                .next()
+                .map(|candidate| candidate.provider == penalized_provider)
+                .unwrap_or(false)
+            })
+            .count();
+
+        let penalized_key = route_key(&model.mayhem.route_candidates[0]);
+        {
+            let mut table = state
+                .provider_table
+                .lock()
+                .expect("provider table poisoned");
+            for _ in 0..5 {
+                table.record_observation(
+                    &penalized_key,
+                    ProviderObservationSample {
+                        ttft_ms: 5_000,
+                        tok_s: None,
+                        error: true,
+                    },
+                );
+            }
+        }
+
+        let after = (0..256)
+            .filter(|seed| {
+                ordered_route_candidates_for_request_with_seed(
+                    &state, &model, &request, None, *seed,
+                )
+                .into_iter()
+                .next()
+                .map(|candidate| candidate.provider == penalized_provider)
+                .unwrap_or(false)
+            })
+            .count();
+
+        assert!(before > 0, "baseline should pick the provider sometimes");
+        assert!(
+            after < before,
+            "slow/error observations should lower future P2C selection weight"
+        );
+        assert_eq!(after, 0);
     }
 
     #[test]
