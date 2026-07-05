@@ -58,6 +58,8 @@ use tokio::time::sleep;
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
+const COINBASE_RETIRED_MESSAGE: &str =
+    "Coinbase Commerce is retired for Mayhem; use Stripe fiat checkout or TAP.";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
 const OPENCODE_PROVIDER_ID: &str = "mayhem";
 const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
@@ -217,7 +219,7 @@ enum PayCommands {
     Tnk(PayTnkArgs),
     /// Buy credits via Stripe hosted checkout.
     Stripe(PayRailArgs),
-    /// Buy credits via Coinbase hosted checkout.
+    /// Retired: Coinbase Commerce is not an active Mayhem rail.
     Coinbase(PayRailArgs),
 }
 
@@ -2599,14 +2601,12 @@ enum WalletMode {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PayRail {
     Stripe,
-    Coinbase,
 }
 
 impl PayRail {
     fn as_str(self) -> &'static str {
         match self {
             Self::Stripe => "stripe",
-            Self::Coinbase => "coinbase",
         }
     }
 }
@@ -2735,7 +2735,7 @@ async fn main() -> Result<()> {
         Commands::Pay { command } => match command {
             PayCommands::Tnk(args) => pay_tnk(args).await,
             PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
-            PayCommands::Coinbase(args) => pay(PayRail::Coinbase, args).await,
+            PayCommands::Coinbase(_) => bail!(COINBASE_RETIRED_MESSAGE),
         },
         Commands::Balance(args) => balance(args).await,
         Commands::Payouts(args) => payouts(args).await,
@@ -4668,11 +4668,7 @@ fn validate_release_key_id(key_id: &str) -> Result<()> {
 }
 
 fn release_host_target() -> String {
-    let arch = match env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        other => other,
-    };
+    let arch = env::consts::ARCH;
     let os = match env::consts::OS {
         "macos" => "apple-darwin",
         "linux" => "unknown-linux-gnu",
@@ -12440,10 +12436,7 @@ fn emit_checkout_handoff(
 
 async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheckout> {
     let client = reqwest::Client::new();
-    let endpoint = match request.rail {
-        PayRail::Stripe => "v1/stripe/checkout-sessions",
-        PayRail::Coinbase => "v1/coinbase/charges",
-    };
+    let endpoint = "v1/stripe/checkout-sessions";
     let success_url = request
         .success_url
         .filter(|value| !value.trim().is_empty())
@@ -12458,21 +12451,12 @@ async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheck
         "who": request.who,
         "mu": request.amount_mu,
     });
-    match request.rail {
-        PayRail::Stripe => {
-            body["success_url"] = Value::String(success_url);
-            body["cancel_url"] = Value::String(cancel_url);
-            body["currency"] = Value::String(request.currency.to_ascii_lowercase());
-            body["locale"] = Value::String(request.locale.to_ascii_lowercase());
-            if let Some(idempotency_key) = request.idempotency_key.filter(|value| !value.is_empty())
-            {
-                body["idempotency_key"] = Value::String(idempotency_key.to_owned());
-            }
-        }
-        PayRail::Coinbase => {
-            body["redirect_url"] = Value::String(success_url);
-            body["cancel_url"] = Value::String(cancel_url);
-        }
+    body["success_url"] = Value::String(success_url);
+    body["cancel_url"] = Value::String(cancel_url);
+    body["currency"] = Value::String(request.currency.to_ascii_lowercase());
+    body["locale"] = Value::String(request.locale.to_ascii_lowercase());
+    if let Some(idempotency_key) = request.idempotency_key.filter(|value| !value.is_empty()) {
+        body["idempotency_key"] = Value::String(idempotency_key.to_owned());
     }
 
     let response = client
@@ -12508,27 +12492,6 @@ fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayChe
                 },
                 reference: session
                     .get("payment_intent")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
-        }
-        PayRail::Coinbase => {
-            let charge = value
-                .get("charge")
-                .ok_or_else(|| anyhow::anyhow!("paygate response missing charge"))?;
-            Ok(PayCheckout {
-                id: required_json_string(charge, "id")?,
-                url: {
-                    let url = required_hosted_checkout_url(
-                        charge,
-                        "hosted_url",
-                        "commerce.coinbase.com",
-                    )?;
-                    validate_response_copy_paste_url(value, &url)?;
-                    url
-                },
-                reference: charge
-                    .get("code")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             })
@@ -12574,7 +12537,6 @@ fn default_checkout_success_url(paygate_url: &str, rail: PayRail) -> String {
         PayRail::Stripe => {
             format!("{base}/v1/stripe/return?session_id={{CHECKOUT_SESSION_ID}}")
         }
-        PayRail::Coinbase => format!("{base}/v1/coinbase/return"),
     }
 }
 
@@ -12582,7 +12544,6 @@ fn default_checkout_cancel_url(paygate_url: &str, rail: PayRail) -> String {
     let base = paygate_url.trim_end_matches('/');
     match rail {
         PayRail::Stripe => format!("{base}/v1/stripe/cancel"),
-        PayRail::Coinbase => format!("{base}/v1/coinbase/cancel"),
     }
 }
 
@@ -20534,44 +20495,12 @@ mod tests {
         assert_eq!(stripe.id, "cs_test");
         assert_eq!(stripe.reference.as_deref(), Some("pi_test"));
 
-        let coinbase = checkout_from_paygate_response(
-            PayRail::Coinbase,
-            &json!({
-                "copy_paste": {
-                    "checkout_url": "https://commerce.coinbase.com/charges/CBTEST"
-                },
-                "charge": {
-                    "id": "charge_test",
-                    "code": "CBTEST",
-                    "hosted_url": "https://commerce.coinbase.com/charges/CBTEST"
-                }
-            }),
-        )
-        .unwrap();
-        assert_eq!(coinbase.id, "charge_test");
-        assert_eq!(coinbase.reference.as_deref(), Some("CBTEST"));
-
-        assert!(checkout_from_paygate_response(
-            PayRail::Coinbase,
-            &json!({ "charge": { "id": "charge_test" } })
-        )
-        .is_err());
         assert!(checkout_from_paygate_response(
             PayRail::Stripe,
             &json!({
                 "checkout_session": {
                     "id": "cs_test",
                     "url": "javascript:alert(1)"
-                }
-            }),
-        )
-        .is_err());
-        assert!(checkout_from_paygate_response(
-            PayRail::Coinbase,
-            &json!({
-                "charge": {
-                    "id": "charge_test",
-                    "hosted_url": "file:///tmp/mayhem-checkout.html"
                 }
             }),
         )
@@ -20587,14 +20516,14 @@ mod tests {
         )
         .is_err());
         assert!(checkout_from_paygate_response(
-            PayRail::Coinbase,
+            PayRail::Stripe,
             &json!({
                 "copy_paste": {
-                    "checkout_url": "https://commerce.coinbase.com/charges/OTHER"
+                    "checkout_url": "https://checkout.stripe.com/c/pay/other"
                 },
-                "charge": {
-                    "id": "charge_test",
-                    "hosted_url": "https://commerce.coinbase.com/charges/CBTEST"
+                "checkout_session": {
+                    "id": "cs_test",
+                    "url": "https://checkout.stripe.com/c/pay/cs_test"
                 }
             }),
         )
