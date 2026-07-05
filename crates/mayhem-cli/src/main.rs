@@ -236,6 +236,8 @@ enum ProviderRailsCommands {
 enum FraudProofCommands {
     /// Submit an over-credit fraud proof against an epoch commit.
     Submit(FraudProofSubmitArgs),
+    /// Scan receipts and provisional epoch commits, then challenge inflated commits.
+    Challenge(FraudProofChallengeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1469,6 +1471,48 @@ struct FraudProofSubmitArgs {
     /// Previous cumulative owed amount for the session, if any.
     #[arg(long)]
     previous_mu_owed_cum: Option<u64>,
+}
+
+#[derive(Debug, Parser)]
+struct FraudProofChallengeArgs {
+    #[command(flatten)]
+    tx: ParticipantTxArgs,
+
+    /// Only scan one epoch commit. Defaults to every provisional epoch/commit record.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    /// Epoch number to stamp on proofs. Defaults to the highest scanned commit epoch.
+    #[arg(long)]
+    proof_epoch: Option<u64>,
+
+    /// Contract timestamp/slot. Defaults to current Unix seconds.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// Gateway base URL used to read /mayhem/receipts when --receipts-file is omitted.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Read receipt entries from a JSON file instead of the gateway.
+    #[arg(long, value_name = "PATH")]
+    receipts_file: Option<PathBuf>,
+
+    /// HTTP timeout in seconds for gateway calls.
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+
+    /// Keep polling for receipts/commits.
+    #[arg(long)]
+    watch: bool,
+
+    /// Poll interval while --watch is active.
+    #[arg(long, default_value_t = 15)]
+    poll_interval_seconds: u64,
+
+    /// Stop after this many matching challenges in one scan.
+    #[arg(long)]
+    max_challenges: Option<usize>,
 }
 
 #[derive(Debug, Parser)]
@@ -3632,6 +3676,7 @@ async fn main() -> Result<()> {
         Commands::Dispute(args) => dispute(args).await,
         Commands::FraudProof { command } => match command {
             FraudProofCommands::Submit(args) => fraud_proof_submit(args).await,
+            FraudProofCommands::Challenge(args) => fraud_proof_challenge(args).await,
         },
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
@@ -11402,6 +11447,106 @@ async fn fraud_proof_submit(args: FraudProofSubmitArgs) -> Result<()> {
     run_participant_command(&args.tx, "fraudProof", value).await
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct FraudProofChallengeCandidate {
+    epoch: u64,
+    proof_epoch: u64,
+    commit_hash: Option<String>,
+    submitted_by: Option<String>,
+    receipt_id: String,
+    session_id: Option<String>,
+    provider: Option<String>,
+    actual_mu: u64,
+    claimed_mu: u64,
+    claimed_mu_owed_cum: u64,
+    previous_mu_owed_cum: u64,
+    committed_use_root: String,
+    proof_hash: String,
+    proof_bytes: usize,
+    command: Value,
+    copy_paste: String,
+}
+
+async fn fraud_proof_challenge(args: FraudProofChallengeArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    if args.watch && args.poll_interval_seconds == 0 {
+        bail!("--poll-interval-seconds must be positive when --watch is set");
+    }
+    if args.max_challenges == Some(0) {
+        bail!("--max-challenges must be positive when set");
+    }
+
+    let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(args.timeout_seconds))
+        .build()?;
+    let mut seen_submitted = BTreeSet::new();
+    let mut scans = Vec::new();
+
+    loop {
+        let at = args.at.unwrap_or(unix_epoch_seconds()?);
+        let commits = read_epoch_commits_for_challenger(&rpc, args.epoch).await?;
+        let receipts = read_receipts_for_challenger(&args, &client, &gateway_root).await?;
+        let mut candidates = fraud_proof_candidates_from_values(
+            &commits,
+            &receipts,
+            args.proof_epoch,
+            at,
+            args.max_challenges,
+        )?;
+        if args.tx.submit {
+            candidates.retain(|candidate| seen_submitted.insert(candidate.proof_hash.clone()));
+        }
+        let submissions = submit_fraud_proof_candidates(&args.tx, &rpc_url, &candidates).await?;
+        let scan = json!({
+            "rpc_url": rpc_url.clone(),
+            "gateway_url": if args.receipts_file.is_none() { Some(gateway_root.clone()) } else { None },
+            "receipts_file": args
+                .receipts_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "epoch": args.epoch,
+            "proof_epoch": args.proof_epoch,
+            "commits_scanned": commits.len(),
+            "receipts_scanned": receipts.len(),
+            "candidates": candidates,
+            "submitted": submissions,
+        });
+        let should_stop = !args.watch
+            || scan
+                .get("candidates")
+                .and_then(Value::as_array)
+                .is_some_and(|candidates| {
+                    args.max_challenges
+                        .is_some_and(|max| candidates.len() >= max)
+                });
+        scans.push(scan);
+        if should_stop {
+            break;
+        }
+        sleep(Duration::from_secs(args.poll_interval_seconds)).await;
+    }
+
+    let report = json!({
+        "ok": true,
+        "watch": args.watch,
+        "scans": scans,
+    });
+    if args.tx.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_fraud_proof_challenge_report(&report)?;
+    }
+    Ok(())
+}
+
 fn dispute_payload(args: &DisputeArgs) -> Result<Value> {
     let evidence = optional_json_arg_or_file(
         args.evidence_json.as_deref(),
@@ -11473,6 +11618,431 @@ fn fraud_proof_payload(args: &FraudProofSubmitArgs) -> Result<Value> {
         payload["previous_mu_owed_cum"] = json!(previous);
     }
     Ok(payload)
+}
+
+async fn read_epoch_commits_for_challenger(
+    rpc: &PeerRpcClient,
+    epoch: Option<u64>,
+) -> Result<Vec<Value>> {
+    if let Some(epoch) = epoch {
+        let key = format!("epoch/commit/{epoch}");
+        return Ok(read_state_value(rpc, &key)
+            .await?
+            .into_iter()
+            .collect::<Vec<_>>());
+    }
+    Ok(read_prefix_entries(rpc, "epoch/commit/")
+        .await?
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect())
+}
+
+async fn read_receipts_for_challenger(
+    args: &FraudProofChallengeArgs,
+    client: &reqwest::Client,
+    gateway_root: &str,
+) -> Result<Vec<Value>> {
+    if let Some(path) = args.receipts_file.as_deref() {
+        return read_json_array(path, "receipts");
+    }
+    let value = fetch_gateway_json(
+        client,
+        &format!("{}/mayhem/receipts", gateway_root.trim_end_matches('/')),
+    )
+    .await?;
+    Ok(value
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("gateway /mayhem/receipts response did not include data[]")?)
+}
+
+fn fraud_proof_candidates_from_values(
+    commits: &[Value],
+    receipts: &[Value],
+    proof_epoch: Option<u64>,
+    at: u64,
+    max_challenges: Option<usize>,
+) -> Result<Vec<FraudProofChallengeCandidate>> {
+    let default_proof_epoch = proof_epoch
+        .or_else(|| commits.iter().filter_map(commit_epoch).max())
+        .unwrap_or(1);
+    let mut candidates = Vec::new();
+
+    for commit in commits {
+        let Some(epoch) = commit_epoch(commit) else {
+            continue;
+        };
+        let effective_proof_epoch = proof_epoch.unwrap_or(default_proof_epoch);
+        if !commit_is_challengeable_over_credit(commit, effective_proof_epoch) {
+            continue;
+        }
+        let Some(claimed_mu) = commit
+            .get("totals")
+            .and_then(|totals| totals.get("use_mu"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let Some(committed_use_root) = commit
+            .get("roots")
+            .and_then(|roots| roots.get("use"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+
+        for receipt in receipts {
+            let Some(envelope) = normalized_receipt_envelope(receipt) else {
+                continue;
+            };
+            let Some(body) = envelope.get("body").and_then(Value::as_object) else {
+                continue;
+            };
+            let actual_cum = body.get("mu_owed_cum").and_then(Value::as_u64).unwrap_or(0);
+            for previous_mu in previous_receipt_amounts(receipts, receipt) {
+                if previous_mu > actual_cum {
+                    continue;
+                }
+                let claimed_mu_owed_cum = previous_mu.saturating_add(claimed_mu);
+                if claimed_mu_owed_cum <= actual_cum {
+                    continue;
+                }
+                let claimed_envelope =
+                    receipt_envelope_with_mu_owed_cum(&envelope, claimed_mu_owed_cum);
+                if usage_leaf_hash_from_envelope(&claimed_envelope)? != committed_use_root {
+                    continue;
+                }
+                let command = json!({
+                    "op": "fraud_proof",
+                    "epoch": epoch,
+                    "proof_epoch": effective_proof_epoch,
+                    "at": at,
+                    "reason": "over_credit",
+                    "receipt": envelope.clone(),
+                    "claimed_mu_owed_cum": claimed_mu_owed_cum,
+                    "previous_mu_owed_cum": previous_mu,
+                });
+                let proof_hash = fraud_proof_hash_from_command(&command)?;
+                let proof_bytes = stable_json_len(&command)?;
+                let compact_command = serde_json::to_string(&command)?;
+                candidates.push(FraudProofChallengeCandidate {
+                    epoch,
+                    proof_epoch: effective_proof_epoch,
+                    commit_hash: commit
+                        .get("commit_hash")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    submitted_by: commit
+                        .get("submitted_by")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    receipt_id: receipt_id(receipt),
+                    session_id: body
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    provider: body
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    actual_mu: actual_cum - previous_mu,
+                    claimed_mu,
+                    claimed_mu_owed_cum,
+                    previous_mu_owed_cum: previous_mu,
+                    committed_use_root: committed_use_root.clone(),
+                    proof_hash,
+                    proof_bytes,
+                    command,
+                    copy_paste: format!(
+                        "/tx --command {} --sim 1",
+                        shell_single_quote(&compact_command)
+                    ),
+                });
+                if max_challenges.is_some_and(|max| candidates.len() >= max) {
+                    return Ok(candidates);
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn commit_epoch(commit: &Value) -> Option<u64> {
+    commit.get("epoch").and_then(Value::as_u64)
+}
+
+fn commit_is_challengeable_over_credit(commit: &Value, proof_epoch: u64) -> bool {
+    commit.get("status").and_then(Value::as_str) == Some("provisional")
+        && commit
+            .get("totals")
+            .and_then(|totals| totals.get("use_count"))
+            .and_then(Value::as_u64)
+            == Some(1)
+        && commit
+            .get("totals")
+            .and_then(|totals| totals.get("use_mu"))
+            .and_then(Value::as_u64)
+            .is_some_and(|mu| mu > 0)
+        && commit
+            .get("provisional_until_epoch")
+            .and_then(Value::as_u64)
+            .is_some_and(|until| proof_epoch <= until)
+}
+
+fn normalized_receipt_envelope(value: &Value) -> Option<Value> {
+    let receipt = value.get("receipt").unwrap_or(value);
+    let body_source = receipt.get("body").unwrap_or(receipt);
+    let final_receipt = body_source
+        .get("final")
+        .or_else(|| body_source.get("final_receipt"))?;
+    let mut body = Map::new();
+    for field in [
+        "schema_version",
+        "session_id",
+        "seq",
+        "rail",
+        "user",
+        "provider",
+        "enclave_id",
+        "model_id",
+        "price_ver",
+        "rules_ver",
+        "usage",
+        "mu_owed_cum",
+        "prompt_hash",
+        "ts",
+    ] {
+        body.insert(field.to_owned(), body_source.get(field)?.clone());
+    }
+    body.insert("final".to_owned(), final_receipt.clone());
+    Some(json!({
+        "body": Value::Object(body),
+        "enclave_sig": receipt.get("enclave_sig").or_else(|| value.get("enclave_sig"))?.clone(),
+        "user_sig": receipt.get("user_sig").or_else(|| value.get("user_sig"))?.clone(),
+    }))
+}
+
+fn previous_receipt_amounts(receipts: &[Value], receipt: &Value) -> BTreeSet<u64> {
+    let mut amounts = BTreeSet::from([0]);
+    let Some(body) = receipt_body(receipt) else {
+        return amounts;
+    };
+    let Some(session_id) = body.get("session_id").and_then(Value::as_str) else {
+        return amounts;
+    };
+    let actual_cum = body.get("mu_owed_cum").and_then(Value::as_u64).unwrap_or(0);
+    for other in receipts {
+        let Some(other_body) = receipt_body(other) else {
+            continue;
+        };
+        if other_body.get("session_id").and_then(Value::as_str) != Some(session_id) {
+            continue;
+        }
+        if let Some(mu) = other_body.get("mu_owed_cum").and_then(Value::as_u64) {
+            if mu < actual_cum {
+                amounts.insert(mu);
+            }
+        }
+    }
+    amounts
+}
+
+fn receipt_envelope_with_mu_owed_cum(envelope: &Value, mu_owed_cum: u64) -> Value {
+    let mut claimed = envelope.clone();
+    if let Some(body) = claimed.get_mut("body").and_then(Value::as_object_mut) {
+        body.insert("mu_owed_cum".to_owned(), json!(mu_owed_cum));
+    }
+    claimed
+}
+
+fn usage_leaf_hash_from_envelope(envelope: &Value) -> Result<String> {
+    let leaf = json!({
+        "body": envelope.get("body").cloned().context("receipt envelope missing body")?,
+        "enclave_sig": envelope
+            .get("enclave_sig")
+            .cloned()
+            .context("receipt envelope missing enclave_sig")?,
+        "user_sig": envelope
+            .get("user_sig")
+            .cloned()
+            .context("receipt envelope missing user_sig")?,
+    });
+    Ok(opaque_hash("mayhem-usage-leaf-v1", &leaf))
+}
+
+fn fraud_proof_hash_from_command(command: &Value) -> Result<String> {
+    let value = json!({
+        "epoch": command.get("epoch").cloned().context("fraud command missing epoch")?,
+        "proof_epoch": command
+            .get("proof_epoch")
+            .cloned()
+            .context("fraud command missing proof_epoch")?,
+        "reason": command
+            .get("reason")
+            .cloned()
+            .context("fraud command missing reason")?,
+        "receipt": command
+            .get("receipt")
+            .cloned()
+            .context("fraud command missing receipt")?,
+        "claimed_mu_owed_cum": command
+            .get("claimed_mu_owed_cum")
+            .cloned()
+            .context("fraud command missing claimed_mu_owed_cum")?,
+        "previous_mu_owed_cum": command
+            .get("previous_mu_owed_cum")
+            .cloned()
+            .unwrap_or_else(|| json!(0)),
+    });
+    Ok(opaque_hash("mayhem-fraud-proof-v1", &value))
+}
+
+fn opaque_hash(domain: &str, value: &Value) -> String {
+    stable_value_hash(&json!({
+        "domain": domain,
+        "value": value,
+    }))
+}
+
+fn stable_json_len(value: &Value) -> Result<usize> {
+    Ok(serde_json::to_vec(&stable_json_value(value))?.len())
+}
+
+async fn submit_fraud_proof_candidates(
+    args: &ParticipantTxArgs,
+    rpc_url: &str,
+    candidates: &[FraudProofChallengeCandidate],
+) -> Result<Vec<Value>> {
+    if !args.submit || candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let wallet_password = args.wallet_password.as_deref().unwrap_or("");
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        wallet_password,
+    )
+    .await?;
+    let keypair_path = PathBuf::from(&wallet.keypair_path);
+    let rpc = PeerRpcClient::new(rpc_url)?;
+    let mut submitted = Vec::new();
+    for candidate in candidates {
+        let preflight = submit_contract_command(
+            &rpc,
+            &keypair_path,
+            wallet_password,
+            &wallet,
+            "fraudProof",
+            candidate.command.clone(),
+            true,
+        )
+        .await
+        .with_context(|| format!("simulating fraud proof {}", candidate.proof_hash))?;
+        let real = if args.sim {
+            None
+        } else {
+            Some(
+                submit_contract_command(
+                    &rpc,
+                    &keypair_path,
+                    wallet_password,
+                    &wallet,
+                    "fraudProof",
+                    candidate.command.clone(),
+                    false,
+                )
+                .await
+                .with_context(|| format!("submitting fraud proof {}", candidate.proof_hash))?,
+            )
+        };
+        submitted.push(json!({
+            "proof_hash": candidate.proof_hash,
+            "wallet": {
+                "public_key": wallet.public_key,
+                "keypair_path": wallet.keypair_path,
+            },
+            "preflight_sim": preflight,
+            "real_tx": real,
+        }));
+    }
+    Ok(submitted)
+}
+
+fn print_fraud_proof_challenge_report(report: &Value) -> Result<()> {
+    println!("Fraud-proof challenger scan complete.");
+    for (index, scan) in report
+        .get("scans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        println!("Scan: {}", index + 1);
+        println!(
+            "RPC: {}",
+            scan.get("rpc_url").and_then(Value::as_str).unwrap_or("")
+        );
+        if let Some(gateway_url) = scan.get("gateway_url").and_then(Value::as_str) {
+            println!("Gateway receipts: {gateway_url}/mayhem/receipts");
+        }
+        if let Some(path) = scan.get("receipts_file").and_then(Value::as_str) {
+            println!("Receipts file: {path}");
+        }
+        println!(
+            "Commits scanned: {}",
+            scan.get("commits_scanned")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        );
+        println!(
+            "Receipts scanned: {}",
+            scan.get("receipts_scanned")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        );
+        let candidates = scan
+            .get("candidates")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        println!("Challenges found: {}", candidates.len());
+        for candidate in candidates {
+            println!(
+                "Candidate epoch {} receipt {} proof {}",
+                candidate.get("epoch").and_then(Value::as_u64).unwrap_or(0),
+                candidate
+                    .get("receipt_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                candidate
+                    .get("proof_hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+            println!("Copy/paste Intercom sim command:");
+            println!(
+                "{}",
+                candidate
+                    .get("copy_paste")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+        }
+        let submissions = scan
+            .get("submitted")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        println!("Submitted proofs: {submissions}");
+    }
+    Ok(())
 }
 
 async fn run_participant_command(
@@ -24204,11 +24774,39 @@ mod tests {
         let Commands::FraudProof { command } = fraud.command else {
             panic!("expected fraud-proof command");
         };
-        let FraudProofCommands::Submit(args) = command;
+        let FraudProofCommands::Submit(args) = command else {
+            panic!("expected fraud-proof submit command");
+        };
         assert_eq!(args.epoch, 1);
         assert_eq!(args.proof_epoch, 2);
         assert_eq!(args.claimed_mu_owed_cum, 2000);
         assert_eq!(args.previous_mu_owed_cum, Some(1000));
+        assert!(args.tx.json);
+
+        let challenge = Cli::try_parse_from([
+            "mayhem",
+            "fraud-proof",
+            "challenge",
+            "--epoch",
+            "1",
+            "--proof-epoch",
+            "2",
+            "--receipts-file",
+            "/tmp/mayhem-receipts.json",
+            "--max-challenges",
+            "1",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::FraudProof { command } = challenge.command else {
+            panic!("expected fraud-proof command");
+        };
+        let FraudProofCommands::Challenge(args) = command else {
+            panic!("expected fraud-proof challenge command");
+        };
+        assert_eq!(args.epoch, Some(1));
+        assert_eq!(args.proof_epoch, Some(2));
+        assert_eq!(args.max_challenges, Some(1));
         assert!(args.tx.json);
     }
 
@@ -24279,6 +24877,109 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("over_credit"));
+    }
+
+    #[test]
+    fn fraud_proof_challenger_builds_root_matched_over_credit_candidate() {
+        let sig = "aa".repeat(64);
+        let receipt = json!({
+            "receipt": {
+                "body": {
+                    "schema_version": SESSION_RECEIPT_SCHEMA_VERSION,
+                    "session_id": "s1",
+                    "seq": 1,
+                    "final": true,
+                    "rail": "fiat",
+                    "user": "11".repeat(32),
+                    "provider": "22".repeat(32),
+                    "enclave_id": "33".repeat(32),
+                    "model_id": "mayhem/test",
+                    "price_ver": 1,
+                    "rules_ver": 1,
+                    "usage": { "input_token": 1, "output_token": 1 },
+                    "mu_owed_cum": 100,
+                    "prompt_hash": "44".repeat(32),
+                    "ts": 1_000,
+                },
+                "enclave_sig": sig.clone(),
+                "user_sig": sig,
+            }
+        });
+        let envelope = normalized_receipt_envelope(&receipt).unwrap();
+        let inflated = receipt_envelope_with_mu_owed_cum(&envelope, 200);
+        let committed_use_root = usage_leaf_hash_from_envelope(&inflated).unwrap();
+        let commit = json!({
+            "type": "epoch_commit",
+            "epoch": 1,
+            "status": "provisional",
+            "provisional_until_epoch": 3,
+            "commit_hash": "cc".repeat(32),
+            "submitted_by": "55".repeat(32),
+            "roots": { "use": committed_use_root },
+            "totals": {
+                "use_count": 1,
+                "use_mu": 200
+            }
+        });
+
+        let candidates =
+            fraud_proof_candidates_from_values(&[commit], &[receipt], Some(2), 42, None).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.epoch, 1);
+        assert_eq!(candidate.proof_epoch, 2);
+        assert_eq!(candidate.actual_mu, 100);
+        assert_eq!(candidate.claimed_mu, 200);
+        assert_eq!(candidate.claimed_mu_owed_cum, 200);
+        assert_eq!(candidate.previous_mu_owed_cum, 0);
+        assert_eq!(candidate.command["op"], "fraud_proof");
+        assert_eq!(candidate.command["receipt"]["body"]["mu_owed_cum"], 100);
+        assert!(candidate.copy_paste.contains("/tx --command"));
+        assert_eq!(candidate.proof_hash.len(), 64);
+    }
+
+    #[test]
+    fn fraud_proof_challenger_skips_closed_or_unmatched_commits() {
+        let sig = "aa".repeat(64);
+        let receipt = json!({
+            "receipt": {
+                "body": {
+                    "schema_version": SESSION_RECEIPT_SCHEMA_VERSION,
+                    "session_id": "s1",
+                    "seq": 1,
+                    "final": true,
+                    "rail": "fiat",
+                    "user": "11".repeat(32),
+                    "provider": "22".repeat(32),
+                    "enclave_id": "33".repeat(32),
+                    "model_id": "mayhem/test",
+                    "price_ver": 1,
+                    "rules_ver": 1,
+                    "usage": { "input_token": 1 },
+                    "mu_owed_cum": 100,
+                    "prompt_hash": "44".repeat(32),
+                    "ts": 1_000,
+                },
+                "enclave_sig": sig.clone(),
+                "user_sig": sig,
+            }
+        });
+        let commit = json!({
+            "epoch": 1,
+            "status": "provisional",
+            "provisional_until_epoch": 1,
+            "roots": { "use": "00".repeat(32) },
+            "totals": {
+                "use_count": 1,
+                "use_mu": 200
+            }
+        });
+
+        let candidates =
+            fraud_proof_candidates_from_values(&[commit], &[receipt], Some(2), 42, None).unwrap();
+
+        assert!(candidates.is_empty());
     }
 
     #[tokio::test]
