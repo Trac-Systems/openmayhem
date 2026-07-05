@@ -21,6 +21,8 @@ const usage = () => {
   console.error(`Usage:
   wallet-helper.mjs create --keypair <path> [--password <value>] [--mnemonic <phrase>] [--force]
   wallet-helper.mjs inspect --keypair <path> [--password <value>]
+  wallet-helper.mjs backup --keypair <path> [--password <value>]
+  wallet-helper.mjs passwd --keypair <path> [--password <old>] --new-password <new>
   wallet-helper.mjs sign --keypair <path> [--password <value>] (--message <text> | --message-hex <hex>)`);
 };
 
@@ -53,6 +55,7 @@ if (!command) {
 
 const keypairPath = takeOption('--keypair');
 const password = takeOption('--password') ?? '';
+const newPassword = takeOption('--new-password');
 const mnemonic = takeOption('--mnemonic');
 const force = takeFlag('--force');
 const message = takeOption('--message');
@@ -107,6 +110,31 @@ if (command === 'create') {
 
 if (command === 'inspect') {
   const wallet = await loadWallet();
+  console.log(JSON.stringify(walletJson(wallet, false, false)));
+  process.exit(0);
+}
+
+if (command === 'backup') {
+  const wallet = await loadWallet();
+  console.log(JSON.stringify(walletJson(wallet, false, true)));
+  process.exit(0);
+}
+
+if (command === 'passwd') {
+  if (newPassword === null) fail('Missing --new-password.');
+
+  const wallet = await loadWallet();
+  const nextPasswordBuffer = b4a.from(newPassword, 'utf8');
+  const tmpPath = `${keypairPath}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    await quietConsoleLog(async () => wallet.exportToFile(tmpPath, nextPasswordBuffer));
+    fs.renameSync(tmpPath, keypairPath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {}
+    throw err;
+  }
   console.log(JSON.stringify(walletJson(wallet, false, false)));
   process.exit(0);
 }

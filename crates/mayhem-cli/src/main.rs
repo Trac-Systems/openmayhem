@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
 use mayhem_bridge::{
@@ -91,6 +91,11 @@ struct Cli {
 enum Commands {
     /// Choose a role, create or import a wallet, and sign current router rules.
     Setup(SetupArgs),
+    /// Inspect, back up, import, and re-encrypt the local Mayhem wallet.
+    Wallet {
+        #[command(subcommand)]
+        command: WalletCommands,
+    },
     /// Probe local hardware and print enclave backend feasibility.
     Doctor(DoctorArgs),
     /// Inspect and verify the admin-signed model catalog.
@@ -230,6 +235,96 @@ enum PayCommands {
     Stripe(PayRailArgs),
     /// Retired: Coinbase Commerce is not an active Mayhem rail.
     Coinbase(PayRailArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum WalletCommands {
+    /// Show the local wallet public key, Trac address, and keypair path.
+    Show(WalletShowArgs),
+    /// Reveal the restorable mnemonic after explicit confirmation.
+    Backup(WalletBackupArgs),
+    /// Reveal the restorable mnemonic after explicit confirmation.
+    #[command(name = "export-mnemonic", alias = "export")]
+    ExportMnemonic(WalletBackupArgs),
+    /// Import a wallet from a BIP-39 mnemonic.
+    Import(WalletImportArgs),
+    /// Re-encrypt the wallet with a new password.
+    Passwd(WalletPasswdArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct WalletLocatorArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Exact keypair.json path. Overrides config.toml and --peer-store-name.
+    #[arg(long, value_name = "PATH")]
+    keypair: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml is absent.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct WalletShowArgs {
+    #[command(flatten)]
+    wallet: WalletLocatorArgs,
+
+    /// Print a machine-readable wallet report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct WalletBackupArgs {
+    #[command(flatten)]
+    wallet: WalletLocatorArgs,
+
+    /// Confirm that the mnemonic should be printed to this terminal.
+    #[arg(long)]
+    yes: bool,
+
+    /// Print a machine-readable wallet backup report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct WalletImportArgs {
+    #[command(flatten)]
+    wallet: WalletLocatorArgs,
+
+    /// BIP-39 mnemonic to import.
+    #[arg(long)]
+    mnemonic: String,
+
+    /// Overwrite an existing keypair.json.
+    #[arg(long)]
+    force: bool,
+
+    /// Print a machine-readable wallet import report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct WalletPasswdArgs {
+    #[command(flatten)]
+    wallet: WalletLocatorArgs,
+
+    /// New password for the encrypted keypair.json. Empty string removes the password.
+    #[arg(long)]
+    new_wallet_password: Option<String>,
+
+    /// Print a machine-readable password-rotation report.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2777,6 +2872,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Setup(args) => setup(args).await,
+        Commands::Wallet { command } => wallet_command(command).await,
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
             CatalogCommands::List(args) => catalog_list(args),
@@ -2924,6 +3020,169 @@ async fn setup(args: SetupArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn wallet_command(command: WalletCommands) -> Result<()> {
+    match command {
+        WalletCommands::Show(args) => wallet_show(args).await,
+        WalletCommands::Backup(args) | WalletCommands::ExportMnemonic(args) => {
+            wallet_backup(args).await
+        }
+        WalletCommands::Import(args) => wallet_import(args).await,
+        WalletCommands::Passwd(args) => wallet_passwd(args).await,
+    }
+}
+
+async fn wallet_show(args: WalletShowArgs) -> Result<()> {
+    let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
+    let password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let wallet = inspect_wallet(&keypair_path, &password)
+        .await
+        .with_context(|| format!("reading wallet {}", keypair_path.display()))?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&wallet)?);
+    } else {
+        print_wallet_show(&wallet);
+    }
+    Ok(())
+}
+
+async fn wallet_backup(args: WalletBackupArgs) -> Result<()> {
+    confirm_wallet_backup_reveal(args.yes)?;
+    let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
+    let password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let wallet = backup_wallet(&keypair_path, &password)
+        .await
+        .with_context(|| format!("backing up wallet {}", keypair_path.display()))?;
+    if wallet.mnemonic.as_deref().unwrap_or_default().is_empty() {
+        bail!(
+            "wallet {} did not contain a restorable mnemonic",
+            keypair_path.display()
+        );
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&wallet)?);
+    } else {
+        print_wallet_backup(&wallet);
+    }
+    Ok(())
+}
+
+async fn wallet_import(args: WalletImportArgs) -> Result<()> {
+    let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
+    if keypair_path.exists() && !args.force {
+        bail!(
+            "{} already exists; pass --force to overwrite it.",
+            keypair_path.display()
+        );
+    }
+    if let Some(parent) = keypair_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let wallet = create_wallet(&keypair_path, &password, Some(&args.mnemonic), true)
+        .await
+        .with_context(|| format!("importing wallet {}", keypair_path.display()))?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&wallet)?);
+    } else {
+        println!("Wallet imported.");
+        print_wallet_show(&wallet);
+    }
+    Ok(())
+}
+
+async fn wallet_passwd(args: WalletPasswdArgs) -> Result<()> {
+    let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
+    let old_password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let new_password = args
+        .new_wallet_password
+        .clone()
+        .or_else(|| env::var("MAYHEM_NEW_WALLET_PASSWORD").ok())
+        .context(
+            "missing --new-wallet-password (or MAYHEM_NEW_WALLET_PASSWORD); pass an empty string to remove the password",
+        )?;
+    let wallet = rotate_wallet_password(&keypair_path, &old_password, &new_password)
+        .await
+        .with_context(|| format!("re-encrypting wallet {}", keypair_path.display()))?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&wallet)?);
+    } else {
+        println!("Wallet password updated.");
+        print_wallet_show(&wallet);
+    }
+    Ok(())
+}
+
+fn resolve_wallet_keypair_path(args: &WalletLocatorArgs) -> Result<PathBuf> {
+    if let Some(keypair) = &args.keypair {
+        return Ok(keypair.clone());
+    }
+
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let store_name = config
+        .as_ref()
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.store_name.as_deref())
+        .unwrap_or(&args.peer_store_name);
+    Ok(config
+        .as_ref()
+        .and_then(|config| config.identity.as_ref())
+        .and_then(|identity| identity.keypair_path.as_deref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.join("stores")
+                .join(store_name)
+                .join("db")
+                .join("keypair.json")
+        }))
+}
+
+fn confirm_wallet_backup_reveal(yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("refusing to reveal a mnemonic without --yes in a non-interactive shell");
+    }
+
+    println!("This will print the wallet mnemonic. Anyone who sees it can restore this wallet.");
+    print!("Type REVEAL to continue: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "REVEAL" {
+        bail!("wallet backup cancelled");
+    }
+    Ok(())
+}
+
+fn print_wallet_show(wallet: &WalletInfo) {
+    println!("Public key: {}", wallet.public_key);
+    if let Some(address) = wallet.address.as_deref() {
+        println!("Address: {address}");
+    }
+    if let Some(derivation_path) = wallet.derivation_path.as_deref() {
+        println!("Derivation path: {derivation_path}");
+    }
+    println!("Keypair: {}", wallet.keypair_path);
+}
+
+fn print_wallet_backup(wallet: &WalletInfo) {
+    print_wallet_show(wallet);
+    if let Some(mnemonic) = wallet.mnemonic.as_deref() {
+        println!("Mnemonic: {mnemonic}");
+        println!(
+            "Restore command: mayhem wallet import --keypair {} --mnemonic '<mnemonic>'",
+            wallet.keypair_path
+        );
+    }
 }
 
 fn rules_hash(args: RulesHashArgs) -> Result<()> {
@@ -18980,6 +19239,36 @@ async fn inspect_wallet(keypair_path: &Path, password: &str) -> Result<WalletInf
     run_wallet_helper(args).await
 }
 
+async fn backup_wallet(keypair_path: &Path, password: &str) -> Result<WalletInfo> {
+    let mut args = vec![
+        "backup".to_owned(),
+        "--keypair".to_owned(),
+        keypair_path.display().to_string(),
+    ];
+    if !password.is_empty() {
+        args.extend(["--password".to_owned(), password.to_owned()]);
+    }
+    run_wallet_helper(args).await
+}
+
+async fn rotate_wallet_password(
+    keypair_path: &Path,
+    old_password: &str,
+    new_password: &str,
+) -> Result<WalletInfo> {
+    let mut args = vec![
+        "passwd".to_owned(),
+        "--keypair".to_owned(),
+        keypair_path.display().to_string(),
+        "--new-password".to_owned(),
+        new_password.to_owned(),
+    ];
+    if !old_password.is_empty() {
+        args.extend(["--password".to_owned(), old_password.to_owned()]);
+    }
+    run_wallet_helper(args).await
+}
+
 async fn sign_message(keypair_path: &Path, password: &str, message: &str) -> Result<String> {
     let mut args = vec![
         "sign".to_owned(),
@@ -19383,6 +19672,82 @@ mod tests {
     #[test]
     fn toml_string_escapes_quotes_and_backslashes() {
         assert_eq!(toml_string(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn wallet_cli_parses_export_mnemonic_alias() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "wallet",
+            "export-mnemonic",
+            "--keypair",
+            "/tmp/mayhem-wallet/db/keypair.json",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+
+        let Commands::Wallet { command } = cli.command else {
+            panic!("expected wallet command");
+        };
+        let WalletCommands::ExportMnemonic(args) = command else {
+            panic!("expected export-mnemonic command");
+        };
+        assert_eq!(
+            args.wallet.keypair.as_deref(),
+            Some(Path::new("/tmp/mayhem-wallet/db/keypair.json"))
+        );
+        assert!(args.yes);
+        assert!(args.json);
+    }
+
+    #[tokio::test]
+    async fn wallet_backup_import_round_trips_mnemonic() {
+        let temp = test_temp_dir("mayhem-wallet-roundtrip");
+        let keypair_path = temp.join("main").join("db").join("keypair.json");
+        let restored_path = temp.join("restored").join("db").join("keypair.json");
+        fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(restored_path.parent().unwrap()).unwrap();
+
+        let created = create_wallet(&keypair_path, "old-pass", None, false)
+            .await
+            .unwrap();
+        let backup = backup_wallet(&keypair_path, "old-pass").await.unwrap();
+        let mnemonic = backup.mnemonic.as_deref().unwrap();
+        assert!(!mnemonic.is_empty());
+
+        let restored = create_wallet(&restored_path, "new-pass", Some(mnemonic), true)
+            .await
+            .unwrap();
+        let inspected = inspect_wallet(&restored_path, "new-pass").await.unwrap();
+
+        assert_eq!(created.public_key, restored.public_key);
+        assert_eq!(created.public_key, inspected.public_key);
+        assert_eq!(created.address, restored.address);
+        assert_eq!(created.address, inspected.address);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn wallet_passwd_reencrypts_existing_keypair() {
+        let temp = test_temp_dir("mayhem-wallet-passwd");
+        let keypair_path = temp.join("main").join("db").join("keypair.json");
+        fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
+
+        let created = create_wallet(&keypair_path, "old-pass", None, false)
+            .await
+            .unwrap();
+        let rotated = rotate_wallet_password(&keypair_path, "old-pass", "new-pass")
+            .await
+            .unwrap();
+        assert_eq!(created.public_key, rotated.public_key);
+
+        assert!(inspect_wallet(&keypair_path, "old-pass").await.is_err());
+        let inspected = inspect_wallet(&keypair_path, "new-pass").await.unwrap();
+        assert_eq!(created.public_key, inspected.public_key);
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
