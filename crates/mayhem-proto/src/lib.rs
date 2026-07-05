@@ -73,8 +73,10 @@ impl Default for AttestationRuntimeConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareQuoteKind {
+    AppleAppAttestJwt,
     AmdSevSnpVcek,
     IntelTdxDcap,
+    NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
     MockTier2,
 }

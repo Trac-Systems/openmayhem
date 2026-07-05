@@ -365,6 +365,10 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
     assert_eq!(body["data"][0]["id"], "mayhem/tier2-model");
     assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T1"], 1);
     assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T2"], 2);
+    assert!(body["data"][0]["mayhem"]["attestation_tier_labels"]["T2"]
+        .as_str()
+        .expect("tier 2 label")
+        .contains("Apple App Attest strong / NVIDIA GB10 device medium"));
 }
 
 #[tokio::test]
@@ -767,6 +771,10 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 out_per_1k: 60,
             },
             attestation_tiers: tiers,
+            attestation_tier_labels: BTreeMap::from([(
+                "T1".to_owned(),
+                "Tier 1 - software self-attestation; economic/trust only".to_owned(),
+            )]),
             caps: ModelCaps {
                 tools: true,
                 json: true,

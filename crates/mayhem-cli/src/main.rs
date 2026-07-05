@@ -375,7 +375,15 @@ struct UseArgs {
     #[arg(long)]
     session_frame_timeout_seconds: Option<u64>,
 
-    /// Trusted NVIDIA NRAS JWKS JSON file for verifying Tier-2 NVIDIA hardware quotes.
+    /// Trusted Apple App Attest JWKS JSON file for verifying Tier-2 Apple hardware-identity quotes.
+    #[arg(long, value_name = "PATH")]
+    apple_app_attest_jwks_file: Option<PathBuf>,
+
+    /// Trusted NVIDIA GB10 device JWKS JSON file for verifying Tier-2 GPU hardware-identity quotes.
+    #[arg(long, value_name = "PATH")]
+    nvidia_gb10_device_jwks_file: Option<PathBuf>,
+
+    /// Trusted NVIDIA NRAS JWKS JSON file for verifying NVIDIA confidential-compute quotes.
     #[arg(long, value_name = "PATH")]
     nvidia_nras_jwks_file: Option<PathBuf>,
 
@@ -9650,6 +9658,27 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
+    let apple_app_attest_jwks = match &args.apple_app_attest_jwks_file {
+        Some(path) => {
+            let path = absolutize(path.clone())?;
+            Some(read_json_file(&path).with_context(|| {
+                format!("loading Apple App Attest JWKS from {}", path.display())
+            })?)
+        }
+        None => None,
+    };
+    let nvidia_gb10_device_jwks = match &args.nvidia_gb10_device_jwks_file {
+        Some(path) => {
+            let path = absolutize(path.clone())?;
+            Some(read_json_file(&path).with_context(|| {
+                format!(
+                    "loading NVIDIA GB10 device-attestation JWKS from {}",
+                    path.display()
+                )
+            })?)
+        }
+        None => None,
+    };
     let nvidia_nras_jwks = match &args.nvidia_nras_jwks_file {
         Some(path) => {
             let path = absolutize(path.clone())?;
@@ -9701,10 +9730,17 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             format!("sc-bridge-direct-session:{sc_bridge_url}"),
         )
     };
-    let state = if let Some(jwks) = nvidia_nras_jwks {
-        state.with_nvidia_nras_jwks(jwks)
-    } else {
-        state
+    let state = match apple_app_attest_jwks {
+        Some(jwks) => state.with_apple_app_attest_jwks(jwks),
+        None => state,
+    };
+    let state = match nvidia_gb10_device_jwks {
+        Some(jwks) => state.with_nvidia_gb10_device_jwks(jwks),
+        None => state,
+    };
+    let state = match nvidia_nras_jwks {
+        Some(jwks) => state.with_nvidia_nras_jwks(jwks),
+        None => state,
     };
     let report = json!({
         "ok": true,
@@ -9715,6 +9751,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "source": source,
         "backend": backend,
         "models": model_count,
+        "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
+        "nvidia_gb10_device_jwks": args.nvidia_gb10_device_jwks_file.is_some(),
         "nvidia_nras_jwks": args.nvidia_nras_jwks_file.is_some(),
     });
 
@@ -9733,8 +9771,14 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 model_count.unwrap_or(0)
             );
             println!("Backend: {backend}");
+            if args.apple_app_attest_jwks_file.is_some() {
+                println!("Tier-2 Apple App Attest verification: trusted JWKS loaded.");
+            }
+            if args.nvidia_gb10_device_jwks_file.is_some() {
+                println!("Tier-2 NVIDIA GB10 device verification: trusted JWKS loaded.");
+            }
             if args.nvidia_nras_jwks_file.is_some() {
-                println!("Tier-2 NVIDIA NRAS verification: trusted JWKS loaded.");
+                println!("NVIDIA NRAS verification: trusted JWKS loaded.");
             }
         }
         println!("Use Ctrl-C to stop.");
@@ -9991,6 +10035,7 @@ struct ModelSummary {
     json: bool,
     context: u64,
     attestation_tiers: BTreeMap<String, u64>,
+    attestation_tier_labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -10894,6 +10939,18 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let attestation_tier_labels = mayhem
+        .get("attestation_tier_labels")
+        .and_then(Value::as_object)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|(tier, value)| {
+                    value.as_str().map(|label| (tier.clone(), label.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_else(|| attestation_tier_labels_for_counts(&attestation_tiers));
     Ok(ModelSummary {
         id: id.to_owned(),
         providers_online: mayhem
@@ -10912,7 +10969,36 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         json: caps.get("json").and_then(Value::as_bool).unwrap_or(false),
         context: caps.get("ctx").and_then(Value::as_u64).unwrap_or(0),
         attestation_tiers,
+        attestation_tier_labels,
     })
+}
+
+fn attestation_tier_labels_for_counts(tiers: &BTreeMap<String, u64>) -> BTreeMap<String, String> {
+    tiers
+        .keys()
+        .map(|tier| (tier.clone(), attestation_tier_label(tier).to_owned()))
+        .collect()
+}
+
+fn gateway_attestation_tier_labels_for_counts(
+    tiers: &BTreeMap<String, u32>,
+) -> BTreeMap<String, String> {
+    tiers
+        .keys()
+        .map(|tier| (tier.clone(), attestation_tier_label(tier).to_owned()))
+        .collect()
+}
+
+fn attestation_tier_label(tier: &str) -> &'static str {
+    match tier {
+        "T1" => "Tier 1 - software self-attestation; economic/trust only",
+        "T2" => {
+            "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
+        }
+        "T3" => "Tier 3 - hardware confidential compute; prompt-confidential when supported",
+        "T4" => "Tier 4 - admin KYB verified identity; not prompt-confidential",
+        _ => "Unknown attestation tier",
+    }
 }
 
 fn model_tool_capable(model: &Value) -> bool {
@@ -11482,8 +11568,8 @@ fn print_test_report(report: &Value) {
 fn print_models_report(report: &Value) -> Result<()> {
     println!("Gateway: {}", report["gateway_url"].as_str().unwrap_or(""));
     println!(
-        "{:<52} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}",
-        "MODEL", "PROVIDERS", "ROOMS", "MU/1K IN/OUT", "CTX", "TOOLS", "JSON"
+        "{:<44} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}  {:<44}",
+        "MODEL", "PROVIDERS", "ROOMS", "MU/1K IN/OUT", "CTX", "TOOLS", "JSON", "ATTESTATION"
     );
     for model in report["models"]
         .as_array()
@@ -11500,18 +11586,50 @@ fn print_models_report(report: &Value) -> Result<()> {
         let context = model["context"].as_u64().unwrap_or(0);
         let tools = bool_mark(model["tools"].as_bool().unwrap_or(false));
         let json = bool_mark(model["json"].as_bool().unwrap_or(false));
+        let attestation = attestation_summary_for_model(model);
         println!(
-            "{:<52} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}",
-            truncate_for_table(id, 52),
+            "{:<44} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}  {:<44}",
+            truncate_for_table(id, 44),
             providers,
             rooms,
             price,
             context,
             tools,
-            json
+            json,
+            truncate_for_table(&attestation, 44)
         );
     }
     Ok(())
+}
+
+fn attestation_summary_for_model(model: &Value) -> String {
+    let tiers = model
+        .get("attestation_tiers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let labels = model
+        .get("attestation_tier_labels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut parts = tiers
+        .iter()
+        .filter_map(|(tier, count)| {
+            let count = count.as_u64()?;
+            let label = labels
+                .get(tier)
+                .and_then(Value::as_str)
+                .unwrap_or("attestation tier");
+            Some(format!("{tier}={count} {label}"))
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "T1=0 Tier 1 - software self-attestation; economic/trust only".to_owned()
+    } else {
+        parts.sort();
+        parts.join("; ")
+    }
 }
 
 fn print_balance_report(report: &Value) {
@@ -14850,6 +14968,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if rooms == 0 || providers_online == 0 {
             continue;
         }
+        let attestation_tiers = tiers_by_model
+            .remove(&model_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(tier, providers)| (tier, usize_to_u32(providers.len())))
+            .collect::<BTreeMap<_, _>>();
         models.push(GatewayModel {
             id: model_id.clone(),
             created: 1_782_950_400,
@@ -14863,12 +14987,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     in_per_1k: price.in_per_1k_mu,
                     out_per_1k: price.out_per_1k_mu,
                 },
-                attestation_tiers: tiers_by_model
-                    .remove(&model_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(tier, providers)| (tier, usize_to_u32(providers.len())))
-                    .collect(),
+                attestation_tier_labels: gateway_attestation_tier_labels_for_counts(
+                    &attestation_tiers,
+                ),
+                attestation_tiers,
                 caps: caps_by_model
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
@@ -20716,6 +20838,9 @@ mod tests {
                     "out_per_1k": 60
                 },
                 "attestation_tiers": { "T1": 2, "T2": 1 },
+                "attestation_tier_labels": {
+                    "T2": "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
+                },
                 "caps": { "tools": true, "json": false, "ctx": 8192 }
             }
         })])
@@ -20732,6 +20857,7 @@ mod tests {
         assert!(!summaries[0].json);
         assert_eq!(summaries[0].context, 8192);
         assert_eq!(summaries[0].attestation_tiers["T2"], 1);
+        assert!(summaries[0].attestation_tier_labels["T2"].contains("GB10"));
     }
 
     #[test]

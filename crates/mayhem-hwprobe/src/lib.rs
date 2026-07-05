@@ -894,7 +894,22 @@ fn probe_tee(gpus: &[GpuInfo]) -> TeeInfo {
             .to_ascii_lowercase()
             .contains("enabled")
     });
-    let tier = if sev_snp || tdx || gpu_confidential_compute {
+    let apple_device_identity = cfg!(target_os = "macos")
+        && gpus
+            .iter()
+            .any(|gpu| gpu.vendor == GpuVendor::Apple && gpu.backend == GpuBackend::Metal);
+    let gb10_device_identity = gpus.iter().any(|gpu| {
+        gpu.vendor == GpuVendor::Nvidia && {
+            let name = gpu.name.to_ascii_lowercase();
+            name.contains("gb10") || name.contains("dgx spark")
+        }
+    });
+    let tier = if sev_snp
+        || tdx
+        || gpu_confidential_compute
+        || apple_device_identity
+        || gb10_device_identity
+    {
         2
     } else {
         1
@@ -908,6 +923,12 @@ fn probe_tee(gpus: &[GpuInfo]) -> TeeInfo {
     }
     if gpu_confidential_compute {
         notes.push("NVIDIA confidential compute enabled".to_owned());
+    }
+    if apple_device_identity {
+        notes.push("Apple Metal device identity can supply Tier 2 App Attest evidence".to_owned());
+    }
+    if gb10_device_identity {
+        notes.push("NVIDIA GB10 device identity can supply Tier 2 evidence".to_owned());
     }
     if notes.is_empty() {
         notes.push("hardware TEE not detected; Tier 1 software-rooted attestation".to_owned());
@@ -983,7 +1004,7 @@ fn fixture_profile(fixture: FixtureProfile, disk_path: &Path) -> HardwareProfile
                 supports_fp8: false,
                 supports_tensor_parallel: false,
             }],
-            tee: fixture_tee(1),
+            tee: fixture_tee(2),
             warnings: Vec::new(),
         },
         FixtureProfile::LinuxNvidia => HardwareProfile {
@@ -1264,6 +1285,7 @@ mod tests {
         assert_eq!(mlx.status, VerdictStatus::FullOffload);
         assert!(report.memory.unified_memory);
         assert_eq!(report.gpus[0].backend, GpuBackend::Metal);
+        assert_eq!(report.tee.tier, 2);
     }
 
     #[test]

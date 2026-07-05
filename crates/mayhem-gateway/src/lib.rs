@@ -34,6 +34,7 @@ pub const HEARTBEAT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = 30_000;
 pub const DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS: u64 = 5_000;
 pub const DEFAULT_HEARTBEAT_REPLAY_CACHE_CAPACITY: usize = 5_000;
+const APPLE_APP_ATTEST_ISSUER: &str = "https://appattest.apple.com";
 const NVIDIA_NRAS_ISSUER: &str = "https://nras.attestation.nvidia.com";
 
 type Result<T> = std::result::Result<T, GatewayError>;
@@ -140,6 +141,8 @@ pub struct AttestationVerificationRequest<'a> {
     pub max_report_age_secs: u64,
     pub max_report_clock_skew_secs: u64,
     pub allow_mock_hardware_quote: bool,
+    pub trusted_apple_app_attest_jwks: Option<&'a Value>,
+    pub trusted_nvidia_gb10_device_jwks: Option<&'a Value>,
     pub trusted_nvidia_nras_jwks: Option<&'a Value>,
 }
 
@@ -269,6 +272,8 @@ impl<'a> AttestationVerificationRequest<'a> {
             max_report_age_secs: DEFAULT_MAX_REPORT_AGE_SECS,
             max_report_clock_skew_secs: DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS,
             allow_mock_hardware_quote: false,
+            trusted_apple_app_attest_jwks: None,
+            trusted_nvidia_gb10_device_jwks: None,
             trusted_nvidia_nras_jwks: None,
         }
     }
@@ -512,6 +517,12 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
         });
     }
     match quote.kind {
+        HardwareQuoteKind::AppleAppAttestJwt => verify_apple_app_attest_quote(
+            &quote.evidence,
+            request.trusted_apple_app_attest_jwks,
+            &expected,
+            request.report,
+        ),
         HardwareQuoteKind::MockTier2 if request.allow_mock_hardware_quote => Ok(()),
         HardwareQuoteKind::MockTier2 => Err(GatewayError::MockHardwareQuoteDisabled),
         HardwareQuoteKind::AmdSevSnpVcek => Err(GatewayError::HardwareQuoteUnsupported {
@@ -520,9 +531,226 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
         HardwareQuoteKind::IntelTdxDcap => Err(GatewayError::HardwareQuoteUnsupported {
             kind: "intel_tdx_dcap".to_owned(),
         }),
+        HardwareQuoteKind::NvidiaGb10DeviceJwt => verify_nvidia_gb10_device_quote(
+            &quote.evidence,
+            request.trusted_nvidia_gb10_device_jwks,
+            &expected,
+            request.report,
+        ),
         HardwareQuoteKind::NvidiaNrasJwt => {
             verify_nvidia_nras_quote(&quote.evidence, request.trusted_nvidia_nras_jwks, &expected)
         }
+    }
+}
+
+fn verify_apple_app_attest_quote(
+    evidence: &str,
+    trusted_jwks: Option<&Value>,
+    expected_binding: &str,
+    report: &AttestationReport,
+) -> Result<()> {
+    const KIND: &str = "apple_app_attest_jwt";
+    let claims =
+        decode_vendor_identity_jwt(evidence, trusted_jwks, KIND, &[APPLE_APP_ATTEST_ISSUER])?;
+    require_string_claim_ci_for_kind(&claims, "sub", "APPLE-APP-ATTEST", KIND)?;
+    require_string_claim_ci_for_kind(
+        &claims,
+        "x-mayhem-attestation-mechanism",
+        "apple_app_attest",
+        KIND,
+    )?;
+    require_claim_matches_for_kind(&claims, "eat_nonce", expected_binding, KIND)?;
+    require_claim_matches_for_kind(&claims, "x-mayhem-enclave-id", &report.enclave_id, KIND)?;
+    require_claim_matches_for_kind(&claims, "x-mayhem-binary-hash", &report.binary_hash, KIND)?;
+    for field in [
+        "x-apple-app-attest-root-verified",
+        "x-apple-app-attest-app-id-bound",
+        "x-apple-app-attest-client-hash-bound",
+        "x-apple-app-attest-signature-verified",
+        "x-apple-app-attest-counter-valid",
+    ] {
+        require_bool_claim_for_kind(&claims, field, KIND)?;
+    }
+    require_bool_claim_value_for_kind(&claims, "x-mayhem-prompt-confidentiality", false, KIND)?;
+    Ok(())
+}
+
+fn verify_nvidia_gb10_device_quote(
+    evidence: &str,
+    trusted_jwks: Option<&Value>,
+    expected_binding: &str,
+    report: &AttestationReport,
+) -> Result<()> {
+    const KIND: &str = "nvidia_gb10_device_jwt";
+    let claims = decode_vendor_identity_jwt(evidence, trusted_jwks, KIND, &[NVIDIA_NRAS_ISSUER])?;
+    require_string_claim_ci_for_kind(&claims, "sub", "NVIDIA-GB10-DEVICE-ATTESTATION", KIND)?;
+    require_string_claim_ci_for_kind(&claims, "x-nvidia-device-type", "gpu", KIND)?;
+    require_claim_matches_for_kind(&claims, "eat_nonce", expected_binding, KIND)?;
+    require_claim_matches_for_kind(&claims, "x-mayhem-enclave-id", &report.enclave_id, KIND)?;
+    require_claim_matches_for_kind(&claims, "x-mayhem-binary-hash", &report.binary_hash, KIND)?;
+    for field in [
+        "x-nvidia-gpu-attestation-report-cert-chain-validated",
+        "x-nvidia-gpu-attestation-report-parsed",
+        "x-nvidia-gpu-attestation-report-signature-verified",
+        "x-nvidia-gpu-driver-rim-signature-verified",
+        "x-nvidia-gpu-vbios-rim-signature-verified",
+        "x-nvidia-gpu-driver-rim-measurements-available",
+        "x-nvidia-gpu-vbios-rim-measurements-available",
+        "x-nvidia-gpu-nonce-match",
+        "x-nvidia-gpu-arch-check",
+    ] {
+        require_bool_claim_for_kind(&claims, field, KIND)?;
+    }
+    require_gb10_device_model_claim(&claims)?;
+    Ok(())
+}
+
+fn decode_vendor_identity_jwt(
+    evidence: &str,
+    trusted_jwks: Option<&Value>,
+    kind: &'static str,
+    issuers: &[&str],
+) -> Result<Value> {
+    let trusted_jwks = trusted_jwks.ok_or_else(|| GatewayError::HardwareQuoteTrustRootMissing {
+        kind: kind.to_owned(),
+    })?;
+    let token = evidence.trim();
+    if !looks_like_jwt(token) {
+        return Err(hardware_quote_invalid(
+            kind,
+            "vendor identity evidence must be a compact JWT",
+        ));
+    }
+    let jwks = parse_vendor_jwks(trusted_jwks, kind)?;
+    let header = decode_header(token)
+        .map_err(|err| hardware_quote_invalid(kind, format!("JWT header decode failed: {err}")))?;
+    if header.alg != Algorithm::ES384 {
+        return Err(hardware_quote_invalid(
+            kind,
+            "vendor identity JWT must use ES384",
+        ));
+    }
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| hardware_quote_invalid(kind, "vendor identity JWT is missing kid"))?;
+    let jwk = jwks.find(kid).ok_or_else(|| {
+        hardware_quote_invalid(kind, "vendor identity JWT kid is not in trusted JWKS")
+    })?;
+    if jwk
+        .common
+        .key_algorithm
+        .as_ref()
+        .is_some_and(|alg| *alg != KeyAlgorithm::ES384)
+    {
+        return Err(hardware_quote_invalid(
+            kind,
+            "trusted vendor JWK declares a non-ES384 alg",
+        ));
+    }
+    let decoding_key = DecodingKey::from_jwk(jwk).map_err(|err| {
+        hardware_quote_invalid(kind, format!("trusted vendor JWK is invalid: {err}"))
+    })?;
+    let mut validation = Validation::new(Algorithm::ES384);
+    validation.validate_aud = false;
+    validation.set_issuer(issuers);
+    validation.set_required_spec_claims(&["exp", "iss"]);
+    decode::<Value>(token, &decoding_key, &validation)
+        .map(|token| token.claims)
+        .map_err(|err| {
+            hardware_quote_invalid(
+                kind,
+                format!("vendor identity JWT verification failed: {err}"),
+            )
+        })
+}
+
+fn parse_vendor_jwks(value: &Value, kind: &'static str) -> Result<JwkSet> {
+    let jwks_value = value.get("jwks").unwrap_or(value).clone();
+    serde_json::from_value(jwks_value).map_err(|err| GatewayError::HardwareQuoteInvalid {
+        kind: kind.to_owned(),
+        reason: format!("trusted JWKS is invalid: {err}"),
+    })
+}
+
+fn require_claim_matches_for_kind(
+    claims: &Value,
+    field: &'static str,
+    expected: &str,
+    kind: &'static str,
+) -> Result<()> {
+    if claims
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+    {
+        Ok(())
+    } else {
+        Err(hardware_quote_invalid(
+            kind,
+            format!("{field} does not match the Mayhem quote binding"),
+        ))
+    }
+}
+
+fn require_bool_claim_for_kind(
+    claims: &Value,
+    field: &'static str,
+    kind: &'static str,
+) -> Result<()> {
+    require_bool_claim_value_for_kind(claims, field, true, kind)
+}
+
+fn require_bool_claim_value_for_kind(
+    claims: &Value,
+    field: &'static str,
+    expected: bool,
+    kind: &'static str,
+) -> Result<()> {
+    if claims.get(field).and_then(Value::as_bool) == Some(expected) {
+        Ok(())
+    } else {
+        Err(hardware_quote_invalid(
+            kind,
+            format!("{field} is not {expected}"),
+        ))
+    }
+}
+
+fn require_string_claim_ci_for_kind(
+    claims: &Value,
+    field: &'static str,
+    expected: &'static str,
+    kind: &'static str,
+) -> Result<()> {
+    if claims
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+    {
+        Ok(())
+    } else {
+        Err(hardware_quote_invalid(
+            kind,
+            format!("{field} is not {expected}"),
+        ))
+    }
+}
+
+fn require_gb10_device_model_claim(claims: &Value) -> Result<()> {
+    const KIND: &str = "nvidia_gb10_device_jwt";
+    let model = ["hwmodel", "x-nvidia-gpu-model", "x-nvidia-gpu-product"]
+        .iter()
+        .find_map(|field| claims.get(*field).and_then(Value::as_str))
+        .unwrap_or("");
+    let model_lc = model.to_ascii_lowercase();
+    if model_lc.contains("gb10") || model_lc.contains("dgx spark") {
+        Ok(())
+    } else {
+        Err(hardware_quote_invalid(
+            KIND,
+            "NVIDIA device evidence is not for GB10/DGX Spark hardware",
+        ))
     }
 }
 
@@ -786,8 +1014,12 @@ fn require_string_claim_ci(
 }
 
 fn nvidia_quote_invalid(reason: impl Into<String>) -> GatewayError {
+    hardware_quote_invalid("nvidia_nras_jwt", reason)
+}
+
+fn hardware_quote_invalid(kind: &'static str, reason: impl Into<String>) -> GatewayError {
     GatewayError::HardwareQuoteInvalid {
-        kind: "nvidia_nras_jwt".to_owned(),
+        kind: kind.to_owned(),
         reason: reason.into(),
     }
 }

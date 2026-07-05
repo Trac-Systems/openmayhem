@@ -82,6 +82,8 @@ pub struct MayhemModelInfo {
     pub rooms: u32,
     pub price_ref_mu: PriceRefMu,
     pub attestation_tiers: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attestation_tier_labels: BTreeMap<String, String>,
     pub caps: ModelCaps,
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -204,6 +206,8 @@ struct ReceiptConfig {
 
 #[derive(Clone, Debug, Default)]
 struct HardwareQuoteTrust {
+    apple_app_attest_jwks: Option<Value>,
+    nvidia_gb10_device_jwks: Option<Value>,
     nvidia_nras_jwks: Option<Value>,
 }
 
@@ -332,6 +336,8 @@ pub struct GatewayHedgeInvocation {
 pub struct GatewaySessionAttestation {
     pub contract: EnclaveContractRecord,
     pub trusted_binary_hashes: BTreeSet<String>,
+    pub trusted_apple_app_attest_jwks: Option<Value>,
+    pub trusted_nvidia_gb10_device_jwks: Option<Value>,
     pub trusted_nvidia_nras_jwks: Option<Value>,
 }
 
@@ -419,6 +425,10 @@ impl GatewayState {
                     out_per_1k: 60,
                 },
                 attestation_tiers: tiers,
+                attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
+                    "T1".to_owned(),
+                    1,
+                )])),
                 caps: ModelCaps {
                     tools: true,
                     json: true,
@@ -480,10 +490,24 @@ impl GatewayState {
         self
     }
 
+    pub fn with_apple_app_attest_jwks(mut self, jwks: Value) -> Self {
+        let mut trust = (*self.hardware_quote_trust).clone();
+        trust.apple_app_attest_jwks = Some(jwks);
+        self.hardware_quote_trust = Arc::new(trust);
+        self
+    }
+
+    pub fn with_nvidia_gb10_device_jwks(mut self, jwks: Value) -> Self {
+        let mut trust = (*self.hardware_quote_trust).clone();
+        trust.nvidia_gb10_device_jwks = Some(jwks);
+        self.hardware_quote_trust = Arc::new(trust);
+        self
+    }
+
     pub fn with_nvidia_nras_jwks(mut self, jwks: Value) -> Self {
-        self.hardware_quote_trust = Arc::new(HardwareQuoteTrust {
-            nvidia_nras_jwks: Some(jwks),
-        });
+        let mut trust = (*self.hardware_quote_trust).clone();
+        trust.nvidia_nras_jwks = Some(jwks);
+        self.hardware_quote_trust = Arc::new(trust);
         self
     }
 
@@ -1324,6 +1348,9 @@ fn validate_direct_session_accept(
             provider,
             now_ts,
         );
+        request.trusted_apple_app_attest_jwks = attestation.trusted_apple_app_attest_jwks.as_ref();
+        request.trusted_nvidia_gb10_device_jwks =
+            attestation.trusted_nvidia_gb10_device_jwks.as_ref();
         request.trusted_nvidia_nras_jwks = attestation.trusted_nvidia_nras_jwks.as_ref();
         verify_tier1_attestation(&request).map_err(|err| {
             fail(format!(
@@ -2228,6 +2255,11 @@ impl GatewayState {
                 caps: candidate.caps.clone(),
             },
             trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
+            trusted_nvidia_gb10_device_jwks: self
+                .hardware_quote_trust
+                .nvidia_gb10_device_jwks
+                .clone(),
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
         });
         let max_spend_mu = estimate_max_spend_mu(model, request, &prompt_text);
@@ -2921,6 +2953,8 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 in_per_1k: price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
                 out_per_1k: price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
             },
+            attestation_tier_labels: attestation_tier_labels_from_catalog_value(model)
+                .unwrap_or_else(|| attestation_tier_labels_for_counts(&tiers)),
             attestation_tiers: tiers,
             caps: ModelCaps {
                 tools: caps.get("tools").and_then(Value::as_bool).unwrap_or(false),
@@ -2951,6 +2985,46 @@ fn attestation_tiers_from_catalog_value(model: &Value) -> BTreeMap<String, u32> 
         tiers.insert("T1".to_owned(), 0);
     }
     tiers
+}
+
+fn attestation_tier_labels_from_catalog_value(model: &Value) -> Option<BTreeMap<String, String>> {
+    let object = model
+        .get("attestation_tier_labels")
+        .and_then(Value::as_object)?;
+    let labels = object
+        .iter()
+        .filter_map(|(tier, label)| {
+            label
+                .as_str()
+                .filter(|label| !label.trim().is_empty())
+                .map(|label| (tier.clone(), label.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels)
+    }
+}
+
+fn attestation_tier_labels_for_counts(tiers: &BTreeMap<String, u32>) -> BTreeMap<String, String> {
+    tiers
+        .keys()
+        .map(|tier| {
+            let label = match tier.as_str() {
+                "T1" => "Tier 1 - software self-attestation; economic/trust only",
+                "T2" => {
+                    "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
+                }
+                "T3" => {
+                    "Tier 3 - hardware confidential compute; prompt-confidential when supported"
+                }
+                "T4" => "Tier 4 - admin KYB verified identity; not prompt-confidential",
+                _ => "Unknown attestation tier",
+            };
+            (tier.clone(), label.to_owned())
+        })
+        .collect()
 }
 
 fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiError> {
@@ -3485,6 +3559,8 @@ mod tests {
             attestation: Some(GatewaySessionAttestation {
                 contract,
                 trusted_binary_hashes: BTreeSet::from([identity.binary_hash]),
+                trusted_apple_app_attest_jwks: None,
+                trusted_nvidia_gb10_device_jwks: None,
                 trusted_nvidia_nras_jwks: None,
             }),
             hedge: GatewayHedgeInvocation::default(),
@@ -3508,6 +3584,10 @@ mod tests {
                     out_per_1k: 60,
                 },
                 attestation_tiers: BTreeMap::from([("T1".to_owned(), 1)]),
+                attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
+                    "T1".to_owned(),
+                    1,
+                )])),
                 caps: ModelCaps {
                     tools: true,
                     json: true,

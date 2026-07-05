@@ -246,8 +246,10 @@ struct AttestArgs {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum HardwareQuoteKindArg {
+    AppleAppAttestJwt,
     AmdSevSnpVcek,
     IntelTdxDcap,
+    NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
     MockTier2,
 }
@@ -255,8 +257,10 @@ enum HardwareQuoteKindArg {
 impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
     fn from(value: HardwareQuoteKindArg) -> Self {
         match value {
+            HardwareQuoteKindArg::AppleAppAttestJwt => HardwareQuoteKind::AppleAppAttestJwt,
             HardwareQuoteKindArg::AmdSevSnpVcek => HardwareQuoteKind::AmdSevSnpVcek,
             HardwareQuoteKindArg::IntelTdxDcap => HardwareQuoteKind::IntelTdxDcap,
+            HardwareQuoteKindArg::NvidiaGb10DeviceJwt => HardwareQuoteKind::NvidiaGb10DeviceJwt,
             HardwareQuoteKindArg::NvidiaNrasJwt => HardwareQuoteKind::NvidiaNrasJwt,
             HardwareQuoteKindArg::MockTier2 => HardwareQuoteKind::MockTier2,
         }
@@ -266,8 +270,10 @@ impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
 impl HardwareQuoteKindArg {
     fn as_str(self) -> &'static str {
         match self {
+            HardwareQuoteKindArg::AppleAppAttestJwt => "apple_app_attest_jwt",
             HardwareQuoteKindArg::AmdSevSnpVcek => "amd_sev_snp_vcek",
             HardwareQuoteKindArg::IntelTdxDcap => "intel_tdx_dcap",
+            HardwareQuoteKindArg::NvidiaGb10DeviceJwt => "nvidia_gb10_device_jwt",
             HardwareQuoteKindArg::NvidiaNrasJwt => "nvidia_nras_jwt",
             HardwareQuoteKindArg::MockTier2 => "mock_tier2",
         }

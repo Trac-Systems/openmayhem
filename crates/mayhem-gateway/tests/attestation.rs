@@ -71,12 +71,12 @@ fn test_tier2_report(
     EnclaveContractRecord,
     BTreeSet<String>,
 ) {
-    test_tier2_report_with_evidence(quote_kind, |_| "mock-hardware-quote".to_owned())
+    test_tier2_report_with_evidence(quote_kind, |_, _| "mock-hardware-quote".to_owned())
 }
 
 fn test_tier2_report_with_evidence(
     quote_kind: HardwareQuoteKind,
-    evidence_for_binding: impl FnOnce(&str) -> String,
+    evidence_for_binding: impl FnOnce(&AttestationBody, &str) -> String,
 ) -> (
     tempfile::TempDir,
     mayhem_proto::AttestationReport,
@@ -114,7 +114,7 @@ fn test_tier2_report_with_evidence(
     let binding = hardware_quote_binding(&body).expect("binding");
     let quote = HardwareQuote {
         kind: quote_kind,
-        evidence: evidence_for_binding(&binding),
+        evidence: evidence_for_binding(&body, &binding),
         binding,
         endorsements: vec!["mock-root".to_owned()],
     };
@@ -226,6 +226,46 @@ fn test_nvidia_evidence(binding: &str, gpu_measurement_success: bool) -> String 
     .to_string()
 }
 
+fn test_apple_app_attest_evidence(body: &AttestationBody, binding: &str) -> String {
+    test_nvidia_signed_eat(serde_json::json!({
+        "iss": "https://appattest.apple.com",
+        "sub": "APPLE-APP-ATTEST",
+        "exp": 4_102_444_800_u64,
+        "eat_nonce": binding,
+        "x-mayhem-attestation-mechanism": "apple_app_attest",
+        "x-mayhem-enclave-id": body.enclave_id.clone(),
+        "x-mayhem-binary-hash": body.binary_hash.clone(),
+        "x-mayhem-prompt-confidentiality": false,
+        "x-apple-app-attest-root-verified": true,
+        "x-apple-app-attest-app-id-bound": true,
+        "x-apple-app-attest-client-hash-bound": true,
+        "x-apple-app-attest-signature-verified": true,
+        "x-apple-app-attest-counter-valid": true
+    }))
+}
+
+fn test_nvidia_gb10_device_evidence(body: &AttestationBody, binding: &str, model: &str) -> String {
+    test_nvidia_signed_eat(serde_json::json!({
+        "iss": "https://nras.attestation.nvidia.com",
+        "sub": "NVIDIA-GB10-DEVICE-ATTESTATION",
+        "exp": 4_102_444_800_u64,
+        "eat_nonce": binding,
+        "x-mayhem-enclave-id": body.enclave_id.clone(),
+        "x-mayhem-binary-hash": body.binary_hash.clone(),
+        "x-nvidia-device-type": "gpu",
+        "hwmodel": model,
+        "x-nvidia-gpu-attestation-report-cert-chain-validated": true,
+        "x-nvidia-gpu-attestation-report-parsed": true,
+        "x-nvidia-gpu-attestation-report-signature-verified": true,
+        "x-nvidia-gpu-driver-rim-signature-verified": true,
+        "x-nvidia-gpu-vbios-rim-signature-verified": true,
+        "x-nvidia-gpu-driver-rim-measurements-available": true,
+        "x-nvidia-gpu-vbios-rim-measurements-available": true,
+        "x-nvidia-gpu-nonce-match": true,
+        "x-nvidia-gpu-arch-check": true
+    }))
+}
+
 #[test]
 fn verifies_signed_tier1_report() {
     let (_temp, report, contract, trusted) = test_report();
@@ -331,9 +371,108 @@ fn tier2_report_requires_hardware_quote_verification() {
 }
 
 #[test]
+fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
+    let (_temp, report, contract, trusted) =
+        test_tier2_report_with_evidence(HardwareQuoteKind::AppleAppAttestJwt, |body, binding| {
+            test_apple_app_attest_evidence(body, binding)
+        });
+    let jwks = test_nvidia_jwks();
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.trusted_apple_app_attest_jwks = Some(&jwks);
+
+    let verified =
+        verify_tier1_attestation(&request).expect("Apple App Attest tier2 identity verifies");
+
+    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.enclave_id, contract.enclave_id);
+}
+
+#[test]
+fn apple_app_attest_tier2_identity_requires_trusted_jwks() {
+    let (_temp, report, contract, trusted) =
+        test_tier2_report_with_evidence(HardwareQuoteKind::AppleAppAttestJwt, |body, binding| {
+            test_apple_app_attest_evidence(body, binding)
+        });
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+
+    let err = verify_tier1_attestation(&request).expect_err("Apple App Attest needs trusted JWKS");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteTrustRootMissing { kind }
+            if kind == "apple_app_attest_jwt"
+    ));
+}
+
+#[test]
+fn verifies_nvidia_gb10_tier2_device_identity_with_trusted_jwks() {
+    let (_temp, report, contract, trusted) =
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaGb10DeviceJwt, |body, binding| {
+            test_nvidia_gb10_device_evidence(body, binding, "NVIDIA GB10 DGX Spark")
+        });
+    let jwks = test_nvidia_jwks();
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.trusted_nvidia_gb10_device_jwks = Some(&jwks);
+
+    let verified =
+        verify_tier1_attestation(&request).expect("NVIDIA GB10 device identity verifies");
+
+    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.enclave_id, contract.enclave_id);
+}
+
+#[test]
+fn nvidia_gb10_tier2_device_identity_rejects_non_gb10_hardware() {
+    let (_temp, report, contract, trusted) =
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaGb10DeviceJwt, |body, binding| {
+            test_nvidia_gb10_device_evidence(body, binding, "NVIDIA H100")
+        });
+    let jwks = test_nvidia_jwks();
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.trusted_nvidia_gb10_device_jwks = Some(&jwks);
+
+    let err =
+        verify_tier1_attestation(&request).expect_err("non-GB10 device identity must be rejected");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { kind, reason }
+            if kind == "nvidia_gb10_device_jwt" && reason.contains("GB10")
+    ));
+}
+
+#[test]
 fn verifies_nvidia_nras_tier2_report_with_trusted_jwks() {
     let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |binding| {
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
         });
     let jwks = test_nvidia_jwks();
@@ -357,7 +496,7 @@ fn verifies_nvidia_nras_tier2_report_with_trusted_jwks() {
 #[test]
 fn nvidia_nras_tier2_report_requires_trusted_jwks() {
     let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |binding| {
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
         });
     let request = AttestationVerificationRequest::new(
@@ -380,7 +519,7 @@ fn nvidia_nras_tier2_report_requires_trusted_jwks() {
 #[test]
 fn nvidia_nras_tier2_report_rejects_signed_failed_appraisal() {
     let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |binding| {
+        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, false)
         });
     let jwks = test_nvidia_jwks();
