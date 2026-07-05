@@ -131,10 +131,18 @@ enum Commands {
     },
     /// Show a canonical contract credit balance.
     Balance(BalanceArgs),
+    /// Show one-shot node, gateway, peer, session, and wallet health.
+    Status(StatusArgs),
+    /// Show recent local gateway receipts without needing an epoch number.
+    History(SessionHistoryArgs),
+    /// Show recent local gateway sessions without needing an epoch number.
+    Sessions(SessionHistoryArgs),
     /// Show provider payout evidence and treasury fee sweeps.
     Payouts(PayoutsArgs),
     /// Show provider earnings, holdback, paid, released, and claimable balances.
     Earnings(EarningsArgs),
+    /// Show provider reputation plus earning/holdback state.
+    Reputation(ReputationArgs),
     /// Auditor probe commands.
     Auditor {
         #[command(subcommand)]
@@ -468,6 +476,95 @@ struct BalanceArgs {
     who: Option<String>,
 
     /// Print a machine-readable balance report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct StatusArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Maximum seconds for gateway HTTP checks.
+    #[arg(long, default_value_t = 5)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable status report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct SessionHistoryArgs {
+    /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Restrict to one session id.
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Restrict to one provider public key.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Restrict to one model id.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Maximum rows to print.
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+
+    /// Print machine-readable history.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ReputationArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Provider public key. Defaults to the local wallet public key.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Print machine-readable reputation.
     #[arg(long)]
     json: bool,
 }
@@ -3070,8 +3167,12 @@ async fn main() -> Result<()> {
             PayCommands::Coinbase(_) => bail!(COINBASE_RETIRED_MESSAGE),
         },
         Commands::Balance(args) => balance(args).await,
+        Commands::Status(args) => status(args).await,
+        Commands::History(args) => session_history(args, false).await,
+        Commands::Sessions(args) => session_history(args, true).await,
         Commands::Payouts(args) => payouts(args).await,
         Commands::Earnings(args) => earnings(args).await,
+        Commands::Reputation(args) => reputation(args).await,
         Commands::Auditor { command } => match command {
             AuditorCommands::Canary(args) => auditor_canary(args).await,
         },
@@ -11296,6 +11397,399 @@ async fn balance(args: BalanceArgs) -> Result<()> {
         print_balance_report(&report);
     }
     Ok(())
+}
+
+async fn status(args: StatusArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(args.timeout_seconds))
+        .build()?;
+
+    let wallet = match resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        args.wallet_password.as_deref().unwrap_or(""),
+    )
+    .await
+    {
+        Ok(wallet) => json!({
+            "ok": true,
+            "public_key": wallet.public_key,
+            "address": wallet.address,
+            "keypair_path": wallet.keypair_path,
+        }),
+        Err(err) => component_error(err),
+    };
+
+    let peer = match PeerRpcClient::new(&rpc_url) {
+        Ok(rpc) => {
+            let rules = read_state_value(&rpc, "rules/current").await;
+            let catalog = read_state_value(&rpc, "catalog/current").await;
+            let rules_ok = rules.is_ok();
+            let catalog_ok = catalog.is_ok();
+            let rules_current = match rules {
+                Ok(Some(value)) => value,
+                Ok(None) => Value::Null,
+                Err(err) => component_error(err),
+            };
+            let catalog_current = match catalog {
+                Ok(Some(value)) => value,
+                Ok(None) => Value::Null,
+                Err(err) => component_error(err),
+            };
+            let balance = if let Some(who) = wallet.get("public_key").and_then(Value::as_str) {
+                match read_balance_record(&rpc, who).await {
+                    Ok(value) => value,
+                    Err(err) => component_error(err),
+                }
+            } else {
+                Value::Null
+            };
+            json!({
+                "ok": rules_ok && catalog_ok,
+                "rpc_url": rpc_url,
+                "rules_current": rules_current,
+                "catalog_current": catalog_current,
+                "wallet_balance": balance,
+            })
+        }
+        Err(err) => component_error(err),
+    };
+
+    let gateway_status =
+        fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/status")).await;
+    let gateway_receipts =
+        fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/receipts")).await;
+    let gateway = json!({
+        "ok": gateway_status.is_ok() && gateway_receipts.is_ok(),
+        "url": gateway_root,
+        "status": gateway_status.unwrap_or_else(component_error),
+        "receipts": gateway_receipts.unwrap_or_else(component_error),
+    });
+
+    let report = json!({
+        "ok": wallet.get("ok").and_then(Value::as_bool) == Some(true)
+            && peer.get("ok").and_then(Value::as_bool) == Some(true)
+            && gateway.get("ok").and_then(Value::as_bool) == Some(true),
+        "node": {
+            "home": home,
+            "config_present": config.is_some(),
+            "role": config
+                .as_ref()
+                .and_then(|config| config.role.as_ref())
+                .and_then(|role| role.mode.as_deref())
+                .unwrap_or("unknown"),
+        },
+        "wallet": wallet,
+        "peer": peer,
+        "gateway": gateway,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_status_report(&report);
+    }
+    Ok(())
+}
+
+async fn session_history(args: SessionHistoryArgs, group_sessions: bool) -> Result<()> {
+    if args.limit == 0 {
+        bail!("--limit must be positive");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let client = reqwest::Client::new();
+    let receipts_response =
+        fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/receipts")).await?;
+    let data = receipts_response
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut rows = data
+        .iter()
+        .map(receipt_history_summary)
+        .filter(|entry| receipt_history_matches(entry, &args))
+        .collect::<Vec<_>>();
+    rows.reverse();
+    let (receipts, sessions) = if group_sessions {
+        let mut sessions = group_session_summaries(&rows);
+        sessions.truncate(args.limit);
+        (Value::Null, Value::Array(sessions))
+    } else {
+        rows.truncate(args.limit);
+        (Value::Array(rows), Value::Null)
+    };
+    let report = json!({
+        "ok": true,
+        "mode": if group_sessions { "sessions" } else { "history" },
+        "gateway_url": gateway_root,
+        "filters": {
+            "session_id": args.session_id,
+            "provider": args.provider,
+            "model": args.model,
+        },
+        "receipts": receipts,
+        "sessions": sessions,
+        "paused": receipts_response.get("paused").cloned().unwrap_or_else(|| json!([])),
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_session_history_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn reputation(args: ReputationArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let provider = if let Some(provider) = args.provider.clone() {
+        provider
+    } else {
+        resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            args.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await?
+        .public_key
+    };
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let reputation = read_state_value(&rpc, &format!("rep/{provider}")).await?;
+    let events_head = read_state_value(&rpc, &format!("ev/rep/head/{provider}")).await?;
+    let provider_record = read_state_value(&rpc, &format!("prov/{provider}")).await?;
+    let earning = match read_state_value(&rpc, &format!("earn/{provider}")).await? {
+        Some(value) => serde_json::from_value(value).context("parsing earning record")?,
+        None => LedgerEarningRecord {
+            provider: provider.clone(),
+            denom: "mu_usd".to_owned(),
+            total_mu: 0,
+            held_mu: 0,
+            paid_cum_mu: 0,
+            holdbacks: Vec::new(),
+            updated_epoch: 0,
+            updated_at: None,
+            last_holdback_release_epoch: None,
+            last_payout_rate_ts: None,
+            last_payout_msb_tx_hash: None,
+        },
+    };
+    let earning = earning_view(earning)?;
+    let report = json!({
+        "ok": true,
+        "rpc_url": rpc_url,
+        "provider": provider,
+        "provider_record": provider_record,
+        "reputation": reputation,
+        "events_head": events_head,
+        "earnings": earning,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_reputation_report(&report);
+    }
+    Ok(())
+}
+
+fn component_error(error: impl std::fmt::Display) -> Value {
+    json!({
+        "ok": false,
+        "error": error.to_string(),
+    })
+}
+
+fn receipt_history_summary(entry: &Value) -> Value {
+    let null = Value::Null;
+    let body = receipt_body(entry).unwrap_or(&null);
+    json!({
+        "session_id": body.get("session_id").and_then(Value::as_str).unwrap_or(""),
+        "seq": body.get("seq").and_then(Value::as_u64),
+        "model_id": body.get("model_id").and_then(Value::as_str),
+        "provider": body.get("provider").and_then(Value::as_str),
+        "user": body.get("user").and_then(Value::as_str),
+        "enclave_id": body.get("enclave_id").and_then(Value::as_str),
+        "mu_owed_cum": body.get("mu_owed_cum").and_then(Value::as_u64),
+        "usage": body.get("usage").cloned().unwrap_or(Value::Null),
+        "ts": body.get("ts").and_then(Value::as_u64),
+        "final_receipt": body.get("final_receipt").and_then(Value::as_bool),
+        "receipt_hash": stable_value_hash(entry),
+    })
+}
+
+fn receipt_history_matches(entry: &Value, args: &SessionHistoryArgs) -> bool {
+    if let Some(session_id) = args.session_id.as_deref() {
+        if entry.get("session_id").and_then(Value::as_str) != Some(session_id) {
+            return false;
+        }
+    }
+    if let Some(provider) = args.provider.as_deref() {
+        if entry.get("provider").and_then(Value::as_str) != Some(provider) {
+            return false;
+        }
+    }
+    if let Some(model) = args.model.as_deref() {
+        if entry.get("model_id").and_then(Value::as_str) != Some(model) {
+            return false;
+        }
+    }
+    true
+}
+
+fn group_session_summaries(entries_latest_first: &[Value]) -> Vec<Value> {
+    let mut positions = BTreeMap::<String, usize>::new();
+    let mut groups = Vec::<Value>::new();
+    for entry in entries_latest_first {
+        let session_id = entry
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let index = if let Some(index) = positions.get(&session_id) {
+            *index
+        } else {
+            let index = groups.len();
+            positions.insert(session_id.clone(), index);
+            groups.push(json!({
+                "session_id": session_id,
+                "receipts": 0_u64,
+                "latest": entry.clone(),
+            }));
+            index
+        };
+        if let Some(object) = groups[index].as_object_mut() {
+            let receipts = object.get("receipts").and_then(Value::as_u64).unwrap_or(0) + 1;
+            object.insert("receipts".to_owned(), Value::Number(receipts.into()));
+        }
+    }
+    groups
+}
+
+fn print_status_report(report: &Value) {
+    println!(
+        "Mayhem status: {}",
+        if report["ok"].as_bool() == Some(true) {
+            "ok"
+        } else {
+            "degraded"
+        }
+    );
+    println!("Home: {}", report["node"]["home"].as_str().unwrap_or(""));
+    println!(
+        "Wallet: {}",
+        if report["wallet"]["ok"].as_bool() == Some(true) {
+            report["wallet"]["public_key"].as_str().unwrap_or("")
+        } else {
+            report["wallet"]["error"].as_str().unwrap_or("unavailable")
+        }
+    );
+    println!(
+        "Peer RPC: {}",
+        if report["peer"]["ok"].as_bool() == Some(true) {
+            "ok"
+        } else {
+            report["peer"]["error"].as_str().unwrap_or("degraded")
+        }
+    );
+    println!(
+        "Gateway: {}",
+        if report["gateway"]["ok"].as_bool() == Some(true) {
+            "ok"
+        } else {
+            report["gateway"]["status"]["error"]
+                .as_str()
+                .unwrap_or("degraded")
+        }
+    );
+    let status = &report["gateway"]["status"];
+    if status["ok"].as_bool() == Some(true) {
+        println!(
+            "Sessions: active={} paused={} receipts={}",
+            status["sessions_active"].as_u64().unwrap_or(0),
+            status["sessions_paused"].as_u64().unwrap_or(0),
+            status["receipts"].as_u64().unwrap_or(0)
+        );
+    }
+}
+
+fn print_session_history_report(report: &Value) -> Result<()> {
+    if report["mode"].as_str() == Some("sessions") {
+        println!("Recent sessions");
+        for entry in report["sessions"].as_array().into_iter().flatten() {
+            let latest = &entry["latest"];
+            println!(
+                "{} receipts={} provider={} model={} mu={}",
+                entry["session_id"].as_str().unwrap_or(""),
+                entry["receipts"].as_u64().unwrap_or(0),
+                latest["provider"].as_str().unwrap_or(""),
+                latest["model_id"].as_str().unwrap_or(""),
+                latest["mu_owed_cum"].as_u64().unwrap_or(0),
+            );
+        }
+    } else {
+        println!("Recent receipts");
+        for entry in report["receipts"].as_array().into_iter().flatten() {
+            println!(
+                "{} seq={} provider={} model={} mu={}",
+                entry["session_id"].as_str().unwrap_or(""),
+                entry["seq"].as_u64().unwrap_or(0),
+                entry["provider"].as_str().unwrap_or(""),
+                entry["model_id"].as_str().unwrap_or(""),
+                entry["mu_owed_cum"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    if let Some(paused) = report["paused"]
+        .as_array()
+        .filter(|paused| !paused.is_empty())
+    {
+        println!("Paused sessions:");
+        println!("{}", serde_json::to_string(paused)?);
+    }
+    Ok(())
+}
+
+fn print_reputation_report(report: &Value) {
+    println!("Provider: {}", report["provider"].as_str().unwrap_or(""));
+    if report["reputation"].is_null() {
+        println!("Reputation: not anchored yet");
+    } else {
+        println!(
+            "Reputation: {} bps (raw {} milli)",
+            report["reputation"]["r_bps"].as_u64().unwrap_or(0),
+            report["reputation"]["raw_milli"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "Probation active: {}",
+            report["reputation"]["probation"]["active"]
+                .as_bool()
+                .unwrap_or(false)
+        );
+    }
+    println!(
+        "Earnings: total={} held={} paid={} claimable={} mu_usd",
+        report["earnings"]["total_mu"].as_u64().unwrap_or(0),
+        report["earnings"]["held_mu"].as_u64().unwrap_or(0),
+        report["earnings"]["paid_cum_mu"].as_u64().unwrap_or(0),
+        report["earnings"]["claimable_mu"].as_u64().unwrap_or(0),
+    );
 }
 
 async fn mayhem_test(args: TestArgs) -> Result<()> {
@@ -20372,6 +20866,140 @@ mod tests {
         assert_eq!(args.cumulative_wei.as_deref(), Some("100"));
         assert_eq!(args.proof.as_deref(), Some("[]"));
         assert!(args.json);
+    }
+
+    #[test]
+    fn observability_cli_parses_status_history_sessions_and_reputation() {
+        let status = Cli::try_parse_from([
+            "mayhem",
+            "status",
+            "--rpc-url",
+            "http://127.0.0.1:4000/v1",
+            "--gateway-url",
+            "http://127.0.0.1:11435",
+            "--timeout-seconds",
+            "2",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Status(args) = status.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(args.rpc_url.as_deref(), Some("http://127.0.0.1:4000/v1"));
+        assert_eq!(args.timeout_seconds, 2);
+        assert!(args.json);
+
+        let history = Cli::try_parse_from([
+            "mayhem",
+            "history",
+            "--session-id",
+            "s1",
+            "--provider",
+            "provider-a",
+            "--model",
+            "model-a",
+            "--limit",
+            "7",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::History(args) = history.command else {
+            panic!("expected history command");
+        };
+        assert_eq!(args.session_id.as_deref(), Some("s1"));
+        assert_eq!(args.provider.as_deref(), Some("provider-a"));
+        assert_eq!(args.model.as_deref(), Some("model-a"));
+        assert_eq!(args.limit, 7);
+        assert!(args.json);
+
+        let sessions = Cli::try_parse_from([
+            "mayhem",
+            "sessions",
+            "--gateway-url",
+            "http://127.0.0.1:11435",
+            "--limit",
+            "3",
+        ])
+        .unwrap();
+        let Commands::Sessions(args) = sessions.command else {
+            panic!("expected sessions command");
+        };
+        assert_eq!(args.gateway_url.as_deref(), Some("http://127.0.0.1:11435"));
+        assert_eq!(args.limit, 3);
+
+        let reputation =
+            Cli::try_parse_from(["mayhem", "reputation", "--provider", "provider-a", "--json"])
+                .unwrap();
+        let Commands::Reputation(args) = reputation.command else {
+            panic!("expected reputation command");
+        };
+        assert_eq!(args.provider.as_deref(), Some("provider-a"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn receipt_history_summarizes_filters_and_groups_sessions() {
+        let latest = receipt_history_summary(&json!({
+            "receipt": {
+                "body": {
+                    "session_id": "s1",
+                    "seq": 2,
+                    "model_id": "model-a",
+                    "provider": "provider-a",
+                    "user": "user-a",
+                    "enclave_id": "enclave-a",
+                    "mu_owed_cum": 42,
+                    "usage": {"output_token": 3},
+                    "ts": 7200000,
+                    "final_receipt": true
+                }
+            }
+        }));
+        assert_eq!(latest["session_id"].as_str(), Some("s1"));
+        assert_eq!(latest["seq"].as_u64(), Some(2));
+        assert_eq!(latest["provider"].as_str(), Some("provider-a"));
+        assert_eq!(latest["model_id"].as_str(), Some("model-a"));
+        assert_eq!(latest["mu_owed_cum"].as_u64(), Some(42));
+
+        let previous = receipt_history_summary(&json!({
+            "body": {
+                "session_id": "s1",
+                "seq": 1,
+                "model_id": "model-a",
+                "provider": "provider-a",
+                "mu_owed_cum": 12
+            }
+        }));
+        let other = receipt_history_summary(&json!({
+            "receipt": {
+                "body": {
+                    "session_id": "s2",
+                    "seq": 1,
+                    "model_id": "model-b",
+                    "provider": "provider-b",
+                    "mu_owed_cum": 9
+                }
+            }
+        }));
+
+        let matching_args = SessionHistoryArgs {
+            gateway_url: None,
+            home: None,
+            session_id: Some("s1".to_owned()),
+            provider: Some("provider-a".to_owned()),
+            model: Some("model-a".to_owned()),
+            limit: 20,
+            json: false,
+        };
+        assert!(receipt_history_matches(&latest, &matching_args));
+        assert!(!receipt_history_matches(&other, &matching_args));
+
+        let groups = group_session_summaries(&[latest.clone(), other, previous]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["session_id"].as_str(), Some("s1"));
+        assert_eq!(groups[0]["receipts"].as_u64(), Some(2));
+        assert_eq!(groups[0]["latest"]["seq"].as_u64(), Some(2));
+        assert_eq!(groups[1]["session_id"].as_str(), Some("s2"));
     }
 
     #[test]
