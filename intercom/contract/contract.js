@@ -625,28 +625,6 @@ class MayhemContract extends Contract {
       },
     });
 
-    this.addSchema('rateOracle', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        tnk_usd_e6: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        source: { type: 'string', min: 1, max: 64 },
-        ts: { type: 'number', integer: true, min: 0 },
-      },
-    });
-
-    this.addSchema('tapRateOracle', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        tap_usd_e6: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        source: { type: 'string', min: 1, max: 64 },
-        ts: { type: 'number', integer: true, min: 0 },
-      },
-    });
-
     this.addSchema('fiatChargeback', {
       value: {
         $$strict: true,
@@ -737,6 +715,11 @@ class MayhemContract extends Contract {
     }
     if (['tnk_deposit', 'tap_deposit', 'fiat_deposit'].includes(value.op)) {
       const result = await this.applyDepositCreditFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'rate_oracle' || value.op === 'tap_rate_oracle') {
+      const result = await this.applyRateOracleFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -861,6 +844,22 @@ class MayhemContract extends Contract {
       if (value.op === 'tnk_deposit') return await this.tnkDeposit();
       if (value.op === 'tap_deposit') return await this.tapDeposit();
       if (value.op === 'fiat_deposit') return await this.fiatDeposit();
+      return;
+    } finally {
+      this.tx = previousTx;
+    }
+  }
+
+  async applyRateOracleFeature(key, value) {
+    const expectedKey = await this.rateFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      if (value.op === 'rate_oracle') return await this.rateOracle();
+      if (value.op === 'tap_rate_oracle') return await this.tapRateOracle();
       return;
     } finally {
       this.tx = previousTx;
@@ -2685,6 +2684,8 @@ class MayhemContract extends Contract {
   async rateOracle() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    const shapeError = this.validateRateOracleValue(this.value);
+    if (shapeError) return shapeError;
     if (!RATE_SOURCES.has(this.value.source)) return new Error('Unsupported rate source.');
 
     const current = await this.get('rate/latest');
@@ -2709,6 +2710,8 @@ class MayhemContract extends Contract {
   async tapRateOracle() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+    const shapeError = this.validateTapRateOracleValue(this.value);
+    if (shapeError) return shapeError;
     if (!TAP_RATE_SOURCES.has(this.value.source)) return new Error('Unsupported TAP rate source.');
 
     const current = await this.get('tap/rate/latest');
@@ -2728,6 +2731,46 @@ class MayhemContract extends Contract {
     await this.put('tap/rate/latest', record);
     console.log('mayhem tapRateOracle', record);
     return { ok: true, op: 'tapRateOracle', ts: record.ts, source: record.source };
+  }
+
+  validateRateOracleValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'tnk_usd_e6', 'source', 'ts'],
+      'rate oracle'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'rate_oracle') return new Error('Invalid rate oracle op.');
+    if (!Number.isSafeInteger(value.tnk_usd_e6) || value.tnk_usd_e6 < 1) {
+      return new Error('Invalid TNK/USD rate.');
+    }
+    if (typeof value.source !== 'string' || value.source.length < 1 || value.source.length > 64) {
+      return new Error('Invalid rate source.');
+    }
+    if (!Number.isSafeInteger(value.ts) || value.ts < 0) {
+      return new Error('Invalid rate timestamp.');
+    }
+    return null;
+  }
+
+  validateTapRateOracleValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'tap_usd_e6', 'source', 'ts'],
+      'TAP rate oracle'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'tap_rate_oracle') return new Error('Invalid TAP rate oracle op.');
+    if (!Number.isSafeInteger(value.tap_usd_e6) || value.tap_usd_e6 < 1) {
+      return new Error('Invalid TAP/USD rate.');
+    }
+    if (typeof value.source !== 'string' || value.source.length < 1 || value.source.length > 64) {
+      return new Error('Invalid TAP rate source.');
+    }
+    if (!Number.isSafeInteger(value.ts) || value.ts < 0) {
+      return new Error('Invalid TAP rate timestamp.');
+    }
+    return null;
   }
 
   async depositTnk() {
@@ -5085,6 +5128,32 @@ class MayhemContract extends Contract {
       return `dep/fiat/${value.rail}/${value.ext_ref_hash}/${digest}`;
     }
     return new Error('Unsupported deposit feature op.');
+  }
+
+  async rateFeatureKey(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Rate feature value must be an object.');
+    }
+    let kind;
+    if (value.op === 'rate_oracle') {
+      const shapeError = this.validateRateOracleValue(value);
+      if (shapeError) return shapeError;
+      kind = 'tnk';
+    } else if (value.op === 'tap_rate_oracle') {
+      const shapeError = this.validateTapRateOracleValue(value);
+      if (shapeError) return shapeError;
+      kind = 'tap';
+    } else {
+      return new Error('Unsupported rate feature op.');
+    }
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-rate-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    return `rate/${kind}/${value.ts}/${digest}`;
   }
 
   async epochCommitHash(value) {

@@ -6,6 +6,7 @@ import {
   execute,
   executeDepositFeature,
   executeEpochApplyFeature,
+  executeRateFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
@@ -242,15 +243,6 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     },
   ],
   [
-    'rateOracle',
-    {
-      op: 'rate_oracle',
-      tnk_usd_e6: 2_000_000,
-      source: 'gate-spot',
-      ts: 3_600,
-    },
-  ],
-  [
     'fiatChargeback',
     {
       op: 'fiat_chargeback',
@@ -313,6 +305,21 @@ const buildAdminOnlyFeatureAttempts = (provider) => [
   },
 ];
 
+const buildAdminOnlyRateFeatureAttempts = () => [
+  {
+    op: 'rate_oracle',
+    tnk_usd_e6: 2_000_000,
+    source: 'gate-spot',
+    ts: 3_600,
+  },
+  {
+    op: 'tap_rate_oracle',
+    tap_usd_e6: 2_000_000,
+    source: 'uniswap-v2',
+    ts: 3_600,
+  },
+];
+
 test('MayhemContract rejects admin ops before genesis admin is present', async () => {
   const outsider = await makeIdentity();
   const storage = new MemoryStorage();
@@ -346,6 +353,13 @@ test('MayhemContract rejects admin ops before genesis admin is present', async (
   for (const value of buildAdminOnlyFeatureAttempts(outsider)) {
     const before = storage.snapshotBytes();
     const result = await executeDepositFeature(contract, storage, value, outsider.publicKey);
+    assert.match(result.message, /admin required/i, `${value.op} feature should require genesis admin`);
+    assert.equal(storage.snapshotBytes(), before, `${value.op} feature must not mutate before genesis admin`);
+  }
+
+  for (const value of buildAdminOnlyRateFeatureAttempts()) {
+    const before = storage.snapshotBytes();
+    const result = await executeRateFeature(contract, storage, value, outsider.publicKey);
     assert.match(result.message, /admin required/i, `${value.op} feature should require genesis admin`);
     assert.equal(storage.snapshotBytes(), before, `${value.op} feature must not mutate before genesis admin`);
   }
@@ -384,6 +398,13 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
   for (const value of buildAdminOnlyFeatureAttempts(provider)) {
     const before = storage.snapshotBytes();
     const result = await executeDepositFeature(contract, storage, value, providerSender);
+    assert.match(result.message, /admin required/i, `${value.op} feature should be admin-only`);
+    assert.equal(storage.snapshotBytes(), before, `${value.op} feature must not mutate state`);
+  }
+
+  for (const value of buildAdminOnlyRateFeatureAttempts()) {
+    const before = storage.snapshotBytes();
+    const result = await executeRateFeature(contract, storage, value, providerSender);
     assert.match(result.message, /admin required/i, `${value.op} feature should be admin-only`);
     assert.equal(storage.snapshotBytes(), before, `${value.op} feature must not mutate state`);
   }

@@ -106,6 +106,25 @@ export async function executeDepositFeature(contract, storage, value, sender) {
   return result ?? contract._mayhemLastFeatureResult;
 }
 
+export async function rateFeatureKey(contract, value) {
+  const key = await contract.rateFeatureKey(value);
+  if (key instanceof Error) throw key;
+  return key;
+}
+
+export async function executeRateFeature(contract, storage, value, sender) {
+  contract._mayhemLastFeatureResult = undefined;
+  const result = await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await rateFeatureKey(contract, value),
+    value,
+    sender
+  );
+  return result ?? contract._mayhemLastFeatureResult;
+}
+
 export async function seedCurrentAdminPrice(
   storage,
   {

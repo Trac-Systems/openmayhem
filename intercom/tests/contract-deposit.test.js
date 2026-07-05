@@ -6,6 +6,7 @@ import {
   depositFeatureKey,
   execute,
   executeDepositFeature,
+  executeRateFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
@@ -55,11 +56,10 @@ async function consentUser(ctx, txNo = 2) {
   assert.equal(result.ok, true, result.message);
 }
 
-async function setRate(ctx, txNo = 3) {
-  const result = await execute(
+async function setRate(ctx) {
+  const result = await executeRateFeature(
     ctx.contract,
     ctx.storage,
-    'rateOracle',
     {
       op: 'rate_oracle',
       tnk_usd_e6: 2_000_000,
@@ -67,7 +67,6 @@ async function setRate(ctx, txNo = 3) {
       ts: 1_000,
     },
     ctx.admin.publicKey,
-    txNo
   );
   assert.equal(result.ok, true, result.message);
 }
@@ -286,10 +285,9 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   const nonAdmin = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.outsider.publicKey);
   assert.match(nonAdmin.message, /admin required/i);
 
-  const rate = await execute(
+  const rate = await executeRateFeature(
     ctx.contract,
     ctx.storage,
-    'tapRateOracle',
     {
       op: 'tap_rate_oracle',
       tap_usd_e6: 2_000_000,
@@ -297,7 +295,6 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
       ts: 1_000,
     },
     ctx.admin.publicKey,
-    3
   );
   assert.equal(rate.ok, true, rate.message);
 

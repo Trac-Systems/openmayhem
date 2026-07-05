@@ -196,18 +196,7 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'rate_oracle') {
-      return {
-        type: 'rateOracle',
-        value: json,
-      };
-    }
-    if (json?.op === 'tap_rate_oracle') {
-      return {
-        type: 'tapRateOracle',
-        value: json,
-      };
-    }
+    if (json?.op === 'rate_oracle' || json?.op === 'tap_rate_oracle') return null;
     if (
       json?.op === 'deposit_tnk' ||
       json?.op === 'tnk_deposit' ||
@@ -259,8 +248,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "dispute", "session_id": "<id>", "reason": "service_failure", "provider": "<pk>", "at": 7200, "evidence_hash": "<hash>" }\' --sim 1 | opens a dispute with a refundable 5000 mu deposit.');
     console.log('- /tx --command \'{ "op": "dispute_resolve", "dispute_id": 1, "outcome": "provider_fault", "deposit_action": "refund", "rationale_hash": "<hash>", "slash": true, "at": 10800 }\' --sim 1 | admin resolves a dispute.');
     console.log('- Feature { "feature": "mayhem", "key": "epoch/apply/<epoch>/<payload_hash>", "value": { "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] } } | admin/oracle applies bounded credit, earning, and fee deltas for free after epochCommit.');
-    console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "gate-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
-    console.log('- /tx --command \'{ "op": "tap_rate_oracle", "tap_usd_e6": 50000, "source": "uniswap-v2", "ts": 3600 }\' --sim 1 | admin/oracle updates the TAP/USD policy rate for TAP deposits.');
+    console.log('- Feature { "feature": "mayhem", "key": "rate/tnk/<ts>/<payload_hash>", "value": { "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "gate-spot", "ts": 3600 } } | admin/oracle updates the TNK/USD rate for free.');
+    console.log('- Feature { "feature": "mayhem", "key": "rate/tap/<ts>/<payload_hash>", "value": { "op": "tap_rate_oracle", "tap_usd_e6": 50000, "source": "uniswap-v2", "ts": 3600 } } | admin/oracle updates the TAP/USD policy rate for free.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk-intent/<memo>/<payload_hash>", "value": { "op": "deposit_tnk", "sender": "<pk>", "intent": { ... }, "sig": "<sig>" } } | user-signed TNK deposit intent for free.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk|tap|fiat/...", "value": { "op": "tnk_deposit|tap_deposit|fiat_deposit", ... } } | admin/oracle credits deposit evidence for free; deposits fold into ev/dep roots.');
     console.log('- Provider payouts are non-custodial TAP claims from epoch earning roots; use the TAP claim-proof/calldata tools, not payout_confirm /tx commands.');

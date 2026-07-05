@@ -8552,6 +8552,18 @@ async fn admin(command: AdminCommands) -> Result<()> {
             )
             .await;
         }
+        AdminCommands::RateOracle(args) => {
+            return run_admin_rate_feature(&args.tx, "rateOracle", admin_rate_oracle_payload(args))
+                .await;
+        }
+        AdminCommands::TapRateOracle(args) => {
+            return run_admin_rate_feature(
+                &args.tx,
+                "tapRateOracle",
+                admin_tap_rate_oracle_payload(args),
+            )
+            .await;
+        }
         AdminCommands::PayoutConfirm(_) => {
             bail!(
                 "payout-confirm is retired; provider payouts are non-custodial TAP claims from epoch earning roots"
@@ -8577,6 +8589,15 @@ async fn run_admin_deposit_feature(
     value: Value,
 ) -> Result<()> {
     let key = deposit_feature_key(&value)?;
+    run_admin_feature_command(args, feature_type, key, value).await
+}
+
+async fn run_admin_rate_feature(
+    args: &AdminTxArgs,
+    feature_type: &'static str,
+    value: Value,
+) -> Result<()> {
+    let key = rate_feature_key(&value)?;
     run_admin_feature_command(args, feature_type, key, value).await
 }
 
@@ -8650,9 +8671,8 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::AuditorRegister(args) => {
             Ok(("auditorRegister", admin_auditor_register_payload(args)))
         }
-        AdminCommands::RateOracle(args) => Ok(("rateOracle", admin_rate_oracle_payload(args))),
-        AdminCommands::TapRateOracle(args) => {
-            Ok(("tapRateOracle", admin_tap_rate_oracle_payload(args)))
+        AdminCommands::RateOracle(_) | AdminCommands::TapRateOracle(_) => {
+            bail!("rate oracle updates are free features, not paid admin txs")
         }
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
         AdminCommands::TapDeposit(args) => Ok(("tapDeposit", admin_tap_deposit_payload(args))),
@@ -9360,6 +9380,27 @@ fn deposit_feature_key(value: &Value) -> Result<String> {
         }
         _ => bail!("unsupported deposit feature op {op}"),
     }
+}
+
+fn rate_feature_key(value: &Value) -> Result<String> {
+    let op = value
+        .get("op")
+        .and_then(Value::as_str)
+        .context("rate feature payload missing op")?;
+    let ts = value
+        .get("ts")
+        .and_then(Value::as_u64)
+        .context("rate feature payload missing ts")?;
+    let kind = match op {
+        "rate_oracle" => "tnk",
+        "tap_rate_oracle" => "tap",
+        _ => bail!("unsupported rate feature op {op}"),
+    };
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-rate-feature-v1",
+        "value": value,
+    }));
+    Ok(format!("rate/{kind}/{ts}/{digest}"))
 }
 
 fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option<Value>> {
@@ -19138,13 +19179,14 @@ mod tests {
 
     #[test]
     fn admin_oracle_payment_payloads_match_contract_schemas() {
+        let rate_payload = admin_rate_oracle_payload(&AdminRateOracleArgs {
+            tx: test_admin_tx_args(),
+            tnk_usd_e6: 50_000,
+            source: AdminRateSource::GateSpot,
+            ts: 3_600,
+        });
         assert_eq!(
-            admin_rate_oracle_payload(&AdminRateOracleArgs {
-                tx: test_admin_tx_args(),
-                tnk_usd_e6: 50_000,
-                source: AdminRateSource::GateSpot,
-                ts: 3_600,
-            }),
+            rate_payload,
             json!({
                 "op": "rate_oracle",
                 "tnk_usd_e6": 50_000,
@@ -19152,20 +19194,57 @@ mod tests {
                 "ts": 3_600,
             })
         );
-
+        assert!(rate_feature_key(&rate_payload)
+            .unwrap()
+            .starts_with("rate/tnk/3600/"));
         assert_eq!(
-            admin_tap_rate_oracle_payload(&AdminTapRateOracleArgs {
+            rate_feature_key(&rate_payload).unwrap().len(),
+            "rate/tnk/3600/".len() + 64
+        );
+        assert_eq!(
+            admin_command_payload(&AdminCommands::RateOracle(AdminRateOracleArgs {
                 tx: test_admin_tx_args(),
-                tap_usd_e6: 50_000,
-                source: AdminTapRateSource::UniswapV2,
+                tnk_usd_e6: 50_000,
+                source: AdminRateSource::GateSpot,
                 ts: 3_600,
-            }),
+            }))
+            .unwrap_err()
+            .to_string(),
+            "rate oracle updates are free features, not paid admin txs"
+        );
+
+        let tap_rate_payload = admin_tap_rate_oracle_payload(&AdminTapRateOracleArgs {
+            tx: test_admin_tx_args(),
+            tap_usd_e6: 50_000,
+            source: AdminTapRateSource::UniswapV2,
+            ts: 3_600,
+        });
+        assert_eq!(
+            tap_rate_payload,
             json!({
                 "op": "tap_rate_oracle",
                 "tap_usd_e6": 50_000,
                 "source": "uniswap-v2",
                 "ts": 3_600,
             })
+        );
+        assert!(rate_feature_key(&tap_rate_payload)
+            .unwrap()
+            .starts_with("rate/tap/3600/"));
+        assert_eq!(
+            rate_feature_key(&tap_rate_payload).unwrap().len(),
+            "rate/tap/3600/".len() + 64
+        );
+        assert_eq!(
+            admin_command_payload(&AdminCommands::TapRateOracle(AdminTapRateOracleArgs {
+                tx: test_admin_tx_args(),
+                tap_usd_e6: 50_000,
+                source: AdminTapRateSource::UniswapV2,
+                ts: 3_600,
+            }))
+            .unwrap_err()
+            .to_string(),
+            "rate oracle updates are free features, not paid admin txs"
         );
 
         assert_eq!(

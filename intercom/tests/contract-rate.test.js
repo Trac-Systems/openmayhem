@@ -6,9 +6,10 @@ import {
   depositFeatureKey,
   execute,
   executeDepositFeature,
+  executeRateFeature,
   makeIdentity,
-  makeTxKey,
   makeVerifier,
+  rateFeatureKey,
   signConsent,
   signDepositTnkIntent,
 } from './helpers/contract.js';
@@ -111,37 +112,38 @@ const tnkDepositConfirm = (memoHash, overrides = {}) => ({
   ...overrides,
 });
 
-test('MayhemContract rateOracle is admin controlled and monotonic', async () => {
+test('MayhemContract rateOracle feature is admin controlled and monotonic', async () => {
   const { admin, outsider, storage, contract } = await setupRateContract();
 
-  const nonAdmin = await execute(
+  const paidTxRoute = await execute(
     contract,
     storage,
     'rateOracle',
     rateOracle(),
-    outsider.publicKey,
+    admin.publicKey,
     4
+  );
+  assert.match(paidTxRoute.message, /unknown contract operation type|function not registered/i);
+
+  const nonAdmin = await executeRateFeature(
+    contract,
+    storage,
+    rateOracle(),
+    outsider.publicKey,
   );
   assert.match(nonAdmin.message, /admin required/i);
 
-  const badSource = await execute(
+  const badSource = await executeRateFeature(
     contract,
     storage,
-    'rateOracle',
     rateOracle({ source: 'provider-quote' }),
     admin.publicKey,
-    5
   );
   assert.match(badSource.message, /unsupported rate source/i);
 
-  const first = await execute(
-    contract,
-    storage,
-    'rateOracle',
-    rateOracle(),
-    admin.publicKey,
-    6
-  );
+  const firstValue = rateOracle();
+  const firstKey = await rateFeatureKey(contract, firstValue);
+  const first = await executeRateFeature(contract, storage, firstValue, admin.publicKey);
   assert.deepEqual(first, {
     ok: true,
     op: 'rateOracle',
@@ -153,18 +155,16 @@ test('MayhemContract rateOracle is admin controlled and monotonic', async () => 
     tnk_usd_e6: 2_000_000,
     source: 'gate-spot',
     ts: 1_000,
-    updated_at: makeTxKey(6),
+    updated_at: firstKey,
     posted_by: admin.publicKey,
     posted_by_role: 'admin',
   });
 
-  const older = await execute(
+  const older = await executeRateFeature(
     contract,
     storage,
-    'rateOracle',
     rateOracle({ source: 'mexc-spot', ts: 999 }),
     admin.publicKey,
-    7
   );
   assert.match(older.message, /timestamp must not decrease/i);
 });
@@ -186,34 +186,35 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     at: 3_701,
   };
 
-  const nonAdmin = await execute(
+  const paidTxRoute = await execute(
     contract,
     storage,
     'tapRateOracle',
     tapRateOracle(),
-    outsider.publicKey,
+    admin.publicKey,
     4
+  );
+  assert.match(paidTxRoute.message, /unknown contract operation type|function not registered/i);
+
+  const nonAdmin = await executeRateFeature(
+    contract,
+    storage,
+    tapRateOracle(),
+    outsider.publicKey,
   );
   assert.match(nonAdmin.message, /admin required/i);
 
-  const badSource = await execute(
+  const badSource = await executeRateFeature(
     contract,
     storage,
-    'tapRateOracle',
     tapRateOracle({ source: 'provider-quote' }),
     admin.publicKey,
-    5
   );
   assert.match(badSource.message, /unsupported TAP rate source/i);
 
-  const first = await execute(
-    contract,
-    storage,
-    'tapRateOracle',
-    tapRateOracle(),
-    admin.publicKey,
-    6
-  );
+  const firstValue = tapRateOracle();
+  const firstKey = await rateFeatureKey(contract, firstValue);
+  const first = await executeRateFeature(contract, storage, firstValue, admin.publicKey);
   assert.deepEqual(first, {
     ok: true,
     op: 'tapRateOracle',
@@ -225,18 +226,16 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     tap_usd_e6: 2_000_000,
     source: 'uniswap-v2',
     ts: 1_000,
-    updated_at: makeTxKey(6),
+    updated_at: firstKey,
     posted_by: admin.publicKey,
     posted_by_role: 'admin',
   });
 
-  const older = await execute(
+  const older = await executeRateFeature(
     contract,
     storage,
-    'tapRateOracle',
     tapRateOracle({ source: 'config', ts: 999 }),
     admin.publicKey,
-    7
   );
   assert.match(older.message, /timestamp must not decrease/i);
 
@@ -275,14 +274,7 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
 
 test('MayhemContract refuses TNK deposit credits when the rate is stale', async () => {
   const { admin, user, storage, contract } = await setupRateContract();
-  const rate = await execute(
-    contract,
-    storage,
-    'rateOracle',
-    rateOracle(),
-    admin.publicKey,
-    4
-  );
+  const rate = await executeRateFeature(contract, storage, rateOracle(), admin.publicKey);
   assert.equal(rate.ok, true, rate.message);
 
   const staleDeposit = await executeDepositFeature(
@@ -359,13 +351,11 @@ test('MayhemContract rate staleness follows scheduled params', async () => {
   );
   assert.equal(params.ok, true, params.message);
 
-  const rate = await execute(
+  const rate = await executeRateFeature(
     contract,
     storage,
-    'rateOracle',
     rateOracle({ ts: 86_400 }),
-    admin.publicKey,
-    5
+    admin.publicKey
   );
   assert.equal(rate.ok, true, rate.message);
 
