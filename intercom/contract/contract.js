@@ -2,7 +2,7 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
-const CONTRACT_VERSION = 1;
+export const CONTRACT_VERSION = 1;
 const SIGNING_MESSAGE_VERSION = 2;
 const SUPPORTED_SIGNING_MESSAGE_VERSIONS = Object.freeze([2, 1]);
 const CURRENT_RULES_KEY = 'rules/current';

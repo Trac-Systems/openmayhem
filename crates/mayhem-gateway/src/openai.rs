@@ -38,7 +38,8 @@ use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
     spend_voucher_signing_bytes, supported_receipt_signing_bytes, AttestationReport,
     CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
-    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
+    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -307,6 +308,7 @@ pub struct ProviderSignedReceipt {
 
 #[derive(Clone, Debug)]
 pub struct GatewaySessionInvocation {
+    pub contract_version: u32,
     pub session_id: String,
     pub user_pubkey: String,
     pub provider_pubkey: Option<String>,
@@ -650,6 +652,7 @@ async fn mayhem_status(State(state): State<SharedState>) -> Response {
     Json(json!({
         "ok": true,
         "version": 1,
+        "contract_version": CONTRACT_VERSION,
         "backend": state.session_backend.name(),
         "models": state.models.len(),
         "sessions_active": 0,
@@ -1105,6 +1108,7 @@ impl ScBridgeGatewaySessionBackend {
         let open_frame = json!({
             "t": "s.open",
             "v": 1,
+            "contract_version": invocation.contract_version,
             "session_id": invocation.session_id,
             "user": invocation.user_pubkey,
             "enclave_id": invocation.enclave_id,
@@ -1141,8 +1145,12 @@ impl ScBridgeGatewaySessionBackend {
                 .get("code")
                 .and_then(Value::as_str)
                 .unwrap_or("UNKNOWN");
+            let reason = accept
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason provided");
             return Err(GatewaySessionError::retryable(format!(
-                "provider rejected session {} with {code}",
+                "provider rejected session {} with {code}: {reason}",
                 invocation.session_id
             )));
         }
@@ -1252,6 +1260,13 @@ fn validate_direct_session_accept(
         return Err(fail(format!(
             "provider accept session_id did not match {}",
             invocation.session_id
+        )));
+    }
+    let actual_contract_version = frame_contract_version(frame);
+    if actual_contract_version != Some(invocation.contract_version) {
+        return Err(fail(contract_upgrade_required_reason(
+            invocation.contract_version,
+            actual_contract_version,
         )));
     }
     if frame.get("open_head").and_then(Value::as_str) != Some(expected_open_head) {
@@ -2232,6 +2247,7 @@ impl GatewayState {
         let voucher_payload =
             spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
         Ok(GatewaySessionInvocation {
+            contract_version: CONTRACT_VERSION,
             session_id,
             user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
@@ -2434,6 +2450,22 @@ impl GatewayState {
         self.record_receipt(stored.clone());
         Ok(stored)
     }
+}
+
+fn frame_contract_version(frame: &Value) -> Option<u32> {
+    frame
+        .get("contract_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+}
+
+fn contract_upgrade_required_reason(expected: u32, actual: Option<u32>) -> String {
+    let actual = actual
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "missing/legacy".to_owned());
+    format!(
+        "contract upgrade required: expected CONTRACT_VERSION {expected}, got {actual}; update Mayhem on the out-of-sync node before opening sessions"
+    )
 }
 
 fn canary_route_key(model: &GatewayModel, invocation: &GatewaySessionInvocation) -> String {
@@ -3286,6 +3318,18 @@ mod tests {
         wrong_session["session_id"] = json!("bb".repeat(32));
         assert_accept_err(&wrong_session, &invocation, "session_id");
 
+        let mut legacy_contract = frame.clone();
+        legacy_contract
+            .as_object_mut()
+            .expect("s.accept object")
+            .remove("contract_version");
+        legacy_contract["sig"] = json!("ee".repeat(64));
+        assert_accept_err(&legacy_contract, &invocation, "contract upgrade required");
+
+        let mut future_contract = frame.clone();
+        future_contract["contract_version"] = json!(invocation.contract_version + 1);
+        assert_accept_err(&future_contract, &invocation, "contract upgrade required");
+
         let mut wrong_open_head = frame.clone();
         wrong_open_head["open_head"] = json!("99".repeat(32));
         assert_accept_err(&wrong_open_head, &invocation, "open_head");
@@ -3427,6 +3471,7 @@ mod tests {
             },
         };
         GatewaySessionInvocation {
+            contract_version: CONTRACT_VERSION,
             session_id,
             user_pubkey: verifying_key_hex(&test_user_seed()),
             provider_pubkey: Some(verifying_key_hex(&test_provider_seed())),
@@ -3557,6 +3602,7 @@ mod tests {
         let mut frame = json!({
             "t": "s.accept",
             "v": 1,
+            "contract_version": invocation.contract_version,
             "session_id": invocation.session_id,
             "open_head": test_open_head(),
             "att_nonce": test_att_nonce(),

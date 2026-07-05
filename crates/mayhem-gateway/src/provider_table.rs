@@ -779,6 +779,7 @@ mod tests {
         ProviderHeartbeat {
             t: "hb".to_owned(),
             v: crate::HEARTBEAT_SCHEMA_VERSION,
+            contract_version: mayhem_proto::CONTRACT_VERSION,
             provider: key.provider,
             enclave_id: key.enclave_id,
             model_id: "model/test@4bit".to_owned(),
@@ -810,6 +811,7 @@ mod tests {
         ProviderHeartbeat {
             t: "hb".to_owned(),
             v: crate::HEARTBEAT_SCHEMA_VERSION,
+            contract_version: mayhem_proto::CONTRACT_VERSION,
             provider: key.provider,
             enclave_id: key.enclave_id,
             model_id: "model/test@4bit".to_owned(),

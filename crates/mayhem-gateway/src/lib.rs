@@ -21,7 +21,7 @@ use jsonwebtoken::{
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
     AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind,
-    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,6 +97,8 @@ pub enum GatewayError {
     HeartbeatJson(String),
     #[error("heartbeat must have t=\"hb\" and v={expected_version}")]
     BadHeartbeatSchema { expected_version: u32 },
+    #[error("contract upgrade required: expected CONTRACT_VERSION {expected}, got {actual}")]
+    ContractUpgradeRequired { expected: u32, actual: u32 },
     #[error("heartbeat field {field} is invalid: {reason}")]
     BadHeartbeatField { field: &'static str, reason: String },
     #[error("heartbeat signature is invalid: {reason}")]
@@ -156,6 +158,8 @@ pub struct VerifiedAttestation {
 pub struct ProviderHeartbeat {
     pub t: String,
     pub v: u32,
+    #[serde(default)]
+    pub contract_version: u32,
     pub provider: String,
     pub enclave_id: String,
     pub model_id: String,
@@ -355,6 +359,12 @@ pub fn validate_provider_heartbeat(
     if heartbeat.t != "hb" || heartbeat.v != HEARTBEAT_SCHEMA_VERSION {
         return Err(GatewayError::BadHeartbeatSchema {
             expected_version: HEARTBEAT_SCHEMA_VERSION,
+        });
+    }
+    if heartbeat.contract_version != CONTRACT_VERSION {
+        return Err(GatewayError::ContractUpgradeRequired {
+            expected: CONTRACT_VERSION,
+            actual: heartbeat.contract_version,
         });
     }
 
@@ -1194,6 +1204,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_heartbeat_without_contract_version_requires_upgrade_before_signature_check() {
+        let signing_key = SigningKey::from_bytes(&[10_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&signing_key, &provider, now, "ad");
+        heartbeat
+            .as_object_mut()
+            .expect("heartbeat object")
+            .remove("contract_version");
+        heartbeat["sig"] = json!("00".repeat(64));
+
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("legacy heartbeat must require upgrade");
+        assert!(matches!(err, GatewayError::ContractUpgradeRequired { .. }));
+    }
+
+    #[test]
     fn heartbeat_receiver_logs_bad_signature_and_replay_drops() {
         let signing_key = SigningKey::from_bytes(&[8_u8; 32]);
         let provider = hex::encode(signing_key.verifying_key().to_bytes());
@@ -1222,6 +1255,7 @@ mod tests {
         let mut heartbeat = json!({
             "t": "hb",
             "v": HEARTBEAT_SCHEMA_VERSION,
+            "contract_version": CONTRACT_VERSION,
             "provider": provider,
             "enclave_id": "11".repeat(32),
             "model_id": "model/test@4bit",

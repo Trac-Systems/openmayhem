@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
 import MayhemContract, {
+  CONTRACT_VERSION,
   consentMessage,
   providerLifecycleIntentMessage,
   receiptMessage,
@@ -18,6 +19,16 @@ import {
 } from './helpers/contract.js';
 
 const rulesHash = '6'.repeat(64);
+
+test('contract reports the exported contract version', async () => {
+  const user = await makeIdentity();
+  const storage = new MemoryStorage({ admin: user.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(user.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  const result = await contract.noop(storage);
+  assert.equal(result.version, CONTRACT_VERSION);
+});
 
 test('contract accepts legacy v1 and current v2 consent signatures', async () => {
   assert.notEqual(consentMessage(1, rulesHash, 1), consentMessage(1, rulesHash));

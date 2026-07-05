@@ -45,9 +45,9 @@ use mayhem_hwprobe::{
 };
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, supported_receipt_signing_bytes,
-    supported_spend_voucher_signing_bytes, AttestationRuntimeConfig, CatalogEnclaveIdentity,
-    ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher, SESSION_RECEIPT_SCHEMA_VERSION,
+    supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
+    AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SpendVoucher, CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13386,6 +13386,7 @@ struct ActiveProviderSession {
 
 #[derive(Clone, Debug)]
 struct ProviderSessionTerms {
+    contract_version: u32,
     provider: String,
     enclave_id: String,
     model_id: String,
@@ -15643,6 +15644,7 @@ async fn send_provider_heartbeat_round(
         let mut heartbeat = json!({
             "t": "hb",
             "v": 1,
+            "contract_version": CONTRACT_VERSION,
             "provider": ctx.wallet.public_key,
             "enclave_id": ctx.selected.enclave.enclave_id,
             "model_id": ctx.selected.enclave.model_id,
@@ -15890,6 +15892,7 @@ async fn handle_provider_session_frame(
                     let mut accept_frame = json!({
                         "t": "s.accept",
                         "v": 1,
+                        "contract_version": terms.contract_version,
                         "session_id": session_id,
                         "open_head": open_head,
                         "att_nonce": att_nonce,
@@ -15933,6 +15936,7 @@ async fn handle_provider_session_frame(
                             json!({
                                 "t": "s.reject",
                                 "v": 1,
+                                "expected_contract_version": terms.contract_version,
                                 "session_id": session_id,
                                 "code": code,
                                 "reason": reason,
@@ -16625,6 +16629,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         .and_then(current_mu_usd_price)
         .context("selected provider enclave has no current admin price")?;
     Ok(ProviderSessionTerms {
+        contract_version: CONTRACT_VERSION,
         provider: ctx.wallet.public_key.clone(),
         enclave_id: ctx.selected.enclave.enclave_id.clone(),
         model_id: ctx.selected.enclave.model_id.clone(),
@@ -16778,6 +16783,13 @@ fn provider_session_open_decision(
     if frame.get("t").and_then(Value::as_str) != Some("s.open") {
         return reject("SCHEMA", "session open frame must have t=s.open".to_owned());
     }
+    let actual_contract_version = frame_contract_version(frame);
+    if actual_contract_version != Some(terms.contract_version) {
+        return reject(
+            "UPGRADE_REQUIRED",
+            contract_upgrade_required_reason(terms.contract_version, actual_contract_version),
+        );
+    }
     let session_id = frame
         .get("session_id")
         .and_then(Value::as_str)
@@ -16849,6 +16861,22 @@ fn provider_session_open_decision(
         return reject("SIGNATURE", format!("{err:#}"));
     }
     ProviderSessionDecision::Accept
+}
+
+fn frame_contract_version(frame: &Value) -> Option<u32> {
+    frame
+        .get("contract_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+}
+
+fn contract_upgrade_required_reason(expected: u32, actual: Option<u32>) -> String {
+    let actual = actual
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "missing/legacy".to_owned());
+    format!(
+        "contract upgrade required: expected CONTRACT_VERSION {expected}, got {actual}; update Mayhem on the out-of-sync node before opening sessions"
+    )
 }
 
 fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &str) -> Result<()> {
@@ -19268,6 +19296,33 @@ mod tests {
             provider_session_open_decision(&legacy_voucher, &terms),
             ProviderSessionDecision::Accept
         );
+
+        let mut legacy_open = frame.clone();
+        legacy_open
+            .as_object_mut()
+            .expect("s.open object")
+            .remove("contract_version");
+        legacy_open["voucher"]["user_sig"] = json!("11".repeat(64));
+        legacy_open["sig"] = json!("11".repeat(64));
+        match provider_session_open_decision(&legacy_open, &terms) {
+            ProviderSessionDecision::Reject { code, reason } => {
+                assert_eq!(code, "UPGRADE_REQUIRED");
+                assert!(reason.contains("contract upgrade required"));
+                assert!(reason.contains("missing/legacy"));
+            }
+            other => panic!("legacy contract version should reject before signatures: {other:?}"),
+        }
+
+        let mut future_open = frame.clone();
+        future_open["contract_version"] = json!(terms.contract_version + 1);
+        match provider_session_open_decision(&future_open, &terms) {
+            ProviderSessionDecision::Reject { code, reason } => {
+                assert_eq!(code, "UPGRADE_REQUIRED");
+                assert!(reason.contains("contract upgrade required"));
+                assert!(reason.contains(&(terms.contract_version + 1).to_string()));
+            }
+            other => panic!("future contract version should reject before signatures: {other:?}"),
+        }
 
         let mut wrong_enclave = frame.clone();
         wrong_enclave["enclave_id"] = json!("22".repeat(32));
@@ -22444,6 +22499,7 @@ mod tests {
 
     fn test_provider_session_terms() -> ProviderSessionTerms {
         ProviderSessionTerms {
+            contract_version: CONTRACT_VERSION,
             provider: "55".repeat(32),
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
@@ -22472,12 +22528,13 @@ mod tests {
         };
         let voucher_sig = hex_encode(
             &user_key
-                .sign(&spend_voucher_signing_bytes(&voucher_body).unwrap())
+                .sign(&mayhem_proto::spend_voucher_signing_bytes(&voucher_body).unwrap())
                 .to_bytes(),
         );
         json!({
             "t": "s.open",
             "v": 1,
+            "contract_version": terms.contract_version,
             "session_id": session_id,
             "user": user,
             "enclave_id": &terms.enclave_id,
