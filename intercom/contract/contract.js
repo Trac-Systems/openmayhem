@@ -39,6 +39,8 @@ const PARAM_DEFINITIONS = Object.freeze({
   auditor_min_reputation_bps: { default: 8_000, min: 0, max: 10_000 },
   auditor_min_age_seconds: { default: 30 * DAY_SECONDS, min: 0, max: 10 * 365 * DAY_SECONDS },
   canary_match_min_bps: { default: 9_000, min: 0, max: 10_000 },
+  canary_probe_holdback_bps: { default: 0, min: 0, max: 10_000 },
+  canary_probe_release_min_passes: { default: 1, min: 0, max: 1_000_000 },
   probe_reward_mu: { default: 5_000, min: 0, max: Number.MAX_SAFE_INTEGER },
   uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
   holdback_epochs: { default: 168, min: 0, max: 1_000_000 },
@@ -1781,6 +1783,9 @@ class MayhemContract extends Contract {
 
     const validationError = this.validateProbeResult(this.value);
     if (validationError) return validationError;
+    if ((await this.get(`ev/probe/${this.value.probe_id}`)) !== null) {
+      return new Error('Probe result already recorded.');
+    }
 
     const providerKey = `prov/${this.value.provider}`;
     const provider = await this.get(providerKey);
@@ -1872,6 +1877,11 @@ class MayhemContract extends Contract {
       recorded_at: this.tx,
     };
     await this.put(`ev/probe/${this.value.probe_id}`, record);
+    let probePassRecord = null;
+    if (this.value.probe_kind === 'canary' && pass) {
+      probePassRecord = await this.recordCanaryProbePass(this.value);
+      if (probePassRecord instanceof Error) return probePassRecord;
+    }
     await this.put(`auditor/${this.address}`, {
       ...auditor,
       submitted_probes: (auditor.submitted_probes ?? 0) + 1,
@@ -1885,6 +1895,7 @@ class MayhemContract extends Contract {
       probe_id: this.value.probe_id,
       provider: this.value.provider,
       pass,
+      ...(probePassRecord ? { probe_pass_record: probePassRecord } : {}),
       provenance_violation: provenanceViolation,
     };
   }
@@ -1908,6 +1919,8 @@ class MayhemContract extends Contract {
       'max_apply_batch',
       'holdback_epochs',
       'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
     ]);
     if (this.value.debits.length + this.value.earnings.length > params.max_apply_batch) {
       return new Error('Epoch apply batch exceeds max_apply_batch.');
@@ -1996,10 +2009,13 @@ class MayhemContract extends Contract {
       const current = await this.earningRecord(provider);
       const currentError = this.guardianValidateEarningRecord(current, provider);
       if (currentError) return currentError;
+      const probeGate = await this.probeGateForEarning(provider, current, params);
+      if (probeGate instanceof Error) return probeGate;
       const refreshed = this.refreshEarningHoldback(
         current,
         this.value.epoch,
-        this.lockedEarningEpochs(params)
+        this.lockedEarningEpochs(params),
+        probeGate
       );
       if (refreshed instanceof Error) return refreshed;
       const totalMu = this.safeAddMu(refreshed.total_mu, deltaMu);
@@ -2766,11 +2782,16 @@ class MayhemContract extends Contract {
       'holdback_epochs',
       'challenge_epochs',
       'payout_min_mu',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
     ]);
+    const probeGate = await this.probeGateForEarning(this.value.who, earning, params);
+    if (probeGate instanceof Error) return probeGate;
     const refreshed = this.refreshEarningHoldback(
       earning,
       this.value.epoch,
-      this.lockedEarningEpochs(params)
+      this.lockedEarningEpochs(params),
+      probeGate
     );
     if (refreshed instanceof Error) return refreshed;
     const payoutGuardian = this.guardianCheckPayoutConfirm(refreshed, this.value.mu);
@@ -3656,6 +3677,49 @@ class MayhemContract extends Contract {
     return Math.max(params.holdback_epochs ?? 0, params.challenge_epochs ?? 0);
   }
 
+  async recordCanaryProbePass(value) {
+    const key = `probe/pass/${value.provider}/${value.epoch}`;
+    const current = await this.get(key);
+    const passCount = this.safeAddMu(current?.pass_count ?? 0, 1);
+    if (passCount instanceof Error) return passCount;
+    const record = {
+      provider: value.provider,
+      epoch: value.epoch,
+      pass_count: passCount,
+      last_probe_id: value.probe_id,
+      last_evidence_hash: value.evidence_hash ?? null,
+      updated_at: this.tx,
+    };
+    await this.put(key, record);
+    return record;
+  }
+
+  async probeGateForEarning(provider, earning, params) {
+    const holdbackBps = params.canary_probe_holdback_bps ?? 0;
+    const requiredPasses = params.canary_probe_release_min_passes ?? 0;
+    if (holdbackBps <= 0 || requiredPasses <= 0) return null;
+    if (!Number.isSafeInteger(holdbackBps) || holdbackBps < 0 || holdbackBps > 10_000) {
+      return new Error('Invalid canary probe holdback bps.');
+    }
+    if (!Number.isSafeInteger(requiredPasses) || requiredPasses < 0) {
+      return new Error('Invalid canary probe release threshold.');
+    }
+    const holdbacks = this.normalizeHoldbackBuckets(earning);
+    if (holdbacks instanceof Error) return holdbacks;
+    const passedEpochs = new Set();
+    for (const epoch of [...new Set(holdbacks.map((bucket) => bucket.epoch))]) {
+      const passRecord = await this.get(`probe/pass/${provider}/${epoch}`);
+      if ((passRecord?.pass_count ?? 0) >= requiredPasses) {
+        passedEpochs.add(epoch);
+      }
+    }
+    return {
+      holdback_bps: holdbackBps,
+      required_passes: requiredPasses,
+      passed_epochs: passedEpochs,
+    };
+  }
+
   normalizeHoldbackBuckets(record) {
     if (!Array.isArray(record.holdbacks)) {
       if (!Number.isSafeInteger(record.held_mu) || record.held_mu < 0) {
@@ -3679,13 +3743,22 @@ class MayhemContract extends Contract {
       if (!Number.isSafeInteger(bucket.mu) || bucket.mu <= 0) {
         return new Error('Guardian non-negative earnings invariant failed.');
       }
-      const next = this.safeAddMu(byEpoch.get(bucket.epoch) ?? 0, bucket.mu);
+      const key = `${bucket.epoch}:${bucket.probe_gate === true ? 'probe' : 'time'}`;
+      const next = this.safeAddMu(byEpoch.get(key)?.mu ?? 0, bucket.mu);
       if (next instanceof Error) return next;
-      byEpoch.set(bucket.epoch, next);
+      byEpoch.set(key, {
+        epoch: bucket.epoch,
+        mu: next,
+        probe_gate: bucket.probe_gate === true,
+      });
     }
-    return Array.from(byEpoch.entries())
-      .sort(([a], [b]) => a - b)
-      .map(([epoch, mu]) => ({ epoch, mu }));
+    return Array.from(byEpoch.values())
+      .sort((a, b) => a.epoch - b.epoch || Number(a.probe_gate) - Number(b.probe_gate))
+      .map((bucket) => (
+        bucket.probe_gate
+          ? { epoch: bucket.epoch, mu: bucket.mu, probe_gate: true }
+          : { epoch: bucket.epoch, mu: bucket.mu }
+      ));
   }
 
   holdbackBucketTotal(holdbacks) {
@@ -3698,7 +3771,7 @@ class MayhemContract extends Contract {
     return total;
   }
 
-  refreshEarningHoldback(record, currentEpoch, lockedEpochs) {
+  refreshEarningHoldback(record, currentEpoch, lockedEpochs, probeGate = null) {
     if (!Number.isSafeInteger(currentEpoch) || currentEpoch < 0) {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
@@ -3707,7 +3780,23 @@ class MayhemContract extends Contract {
     }
     const holdbacks = this.normalizeHoldbackBuckets(record);
     if (holdbacks instanceof Error) return holdbacks;
-    const kept = holdbacks.filter((bucket) => bucket.epoch + lockedEpochs > currentEpoch);
+    const kept = [];
+    for (const bucket of holdbacks) {
+      if (bucket.epoch + lockedEpochs > currentEpoch) {
+        kept.push(bucket);
+        continue;
+      }
+      if (!probeGate) continue;
+      if (probeGate.passed_epochs.has(bucket.epoch)) continue;
+      if (bucket.probe_gate === true) {
+        kept.push(bucket);
+        continue;
+      }
+      const gatedMu = Math.floor((bucket.mu * probeGate.holdback_bps) / 10_000);
+      if (gatedMu > 0) {
+        kept.push({ epoch: bucket.epoch, mu: gatedMu, probe_gate: true });
+      }
+    }
     const heldMu = this.holdbackBucketTotal(kept);
     if (heldMu instanceof Error) return heldMu;
     return {
@@ -3737,6 +3826,7 @@ class MayhemContract extends Contract {
         continue;
       }
       kept.push({
+        ...bucket,
         epoch: bucket.epoch,
         mu: bucket.mu - remaining,
       });
@@ -4139,13 +4229,23 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(mu) || mu <= 0) {
       return new Error('Guardian non-negative earnings invariant failed.');
     }
-    const byEpoch = new Map(holdbacks.map((bucket) => [bucket.epoch, bucket.mu]));
+    const normalized = this.normalizeHoldbackBuckets({ holdbacks });
+    if (normalized instanceof Error) return normalized;
+    const gated = normalized.filter((bucket) => bucket.probe_gate === true);
+    const byEpoch = new Map(
+      normalized
+        .filter((bucket) => bucket.probe_gate !== true)
+        .map((bucket) => [bucket.epoch, bucket.mu])
+    );
     const next = this.safeAddMu(byEpoch.get(epoch) ?? 0, mu);
     if (next instanceof Error) return next;
     byEpoch.set(epoch, next);
-    return Array.from(byEpoch.entries())
-      .sort(([a], [b]) => a - b)
-      .map(([bucketEpoch, bucketMu]) => ({ epoch: bucketEpoch, mu: bucketMu }));
+    return [
+      ...Array.from(byEpoch.entries())
+        .map(([bucketEpoch, bucketMu]) => ({ epoch: bucketEpoch, mu: bucketMu })),
+      ...gated,
+    ]
+      .sort((a, b) => a.epoch - b.epoch || Number(a.probe_gate === true) - Number(b.probe_gate === true));
   }
 
   normalizeEpochRoots(value) {

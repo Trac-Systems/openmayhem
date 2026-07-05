@@ -8,10 +8,14 @@ import {
   makeTxKey,
   makeVerifier,
   signConsent,
+  signProbeResult,
 } from './helpers/contract.js';
 
 const rulesHash = '9'.repeat(64);
 const oneUsdAtTwoUsdPerTnk = '500000000000000000';
+const DAY_SECONDS = 24 * 60 * 60;
+const probeEnclaveId = '7'.repeat(64);
+const probeBinaryHash = '8'.repeat(64);
 
 async function setupPayoutContract() {
   const admin = await makeIdentity();
@@ -82,12 +86,13 @@ async function setupPayoutContract() {
   return { admin, provider, user, storage, contract };
 }
 
-const epochApply = (epoch, user, provider, grossMu) => ({
+const epochApply = (epoch, user, provider, grossMu, overrides = {}) => ({
   op: 'epoch_apply',
   epoch,
   at: epoch * 3_600,
   debits: [{ user, mu: grossMu }],
   earnings: [{ provider, gross_mu: grossMu }],
+  ...overrides,
 });
 
 const payoutConfirm = (provider, overrides = {}) => ({
@@ -113,6 +118,27 @@ const fiatPayoutConfirm = (provider, rail, externalRef, overrides = {}) => ({
   at: 1_900,
   ...overrides,
 });
+
+const signedCanaryProbe = (provider, auditor, overrides = {}) => {
+  const value = {
+    op: 'probe_result',
+    probe_id: 'probe-pass-1',
+    probe_kind: 'canary',
+    provider: provider.publicKey,
+    enclave_id: probeEnclaveId,
+    binary_hash: probeBinaryHash,
+    epoch: 1,
+    at: DAY_SECONDS + 7_200,
+    canary_set: 'canary-dev-v1',
+    match_bps: 10_000,
+    pass: true,
+    session_receipt_hash: 'a'.repeat(64),
+    evidence_hash: 'b'.repeat(64),
+    ...overrides,
+  };
+  value.auditor_sig = signProbeResult(auditor.wallet, value, auditor.publicKey);
+  return value;
+};
 
 test('MayhemContract setProviderPayout stamps admin authority evidence', async () => {
   const { admin, provider, storage, contract } = await setupPayoutContract();
@@ -220,6 +246,152 @@ test('MayhemContract payoutConfirm releases earnings only after challenge plus h
   assert.equal(payRoot.count, 1);
   assert.equal(payRoot.mu_total, 1_000_000);
   assert.equal(payRoot.merkle_root, paid.payout_root);
+});
+
+test('MayhemContract payoutConfirm keeps configured probe-gated earnings held until canary passes', async () => {
+  const { admin, provider, user, storage, contract } = await setupPayoutContract();
+  const auditor = await makeIdentity();
+
+  const params = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: {
+        holdback_epochs: 1,
+        challenge_epochs: 1,
+        canary_probe_holdback_bps: 5_000,
+        canary_probe_release_min_passes: 1,
+        payout_min_mu: 0,
+        rate_staleness_seconds: 86_400,
+      },
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(params.ok, true, params.message);
+
+  const freshRate = await execute(
+    contract,
+    storage,
+    'rateOracle',
+    {
+      op: 'rate_oracle',
+      tnk_usd_e6: 2_000_000,
+      source: 'gate-spot',
+      ts: DAY_SECONDS,
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(freshRate.ok, true, freshRate.message);
+
+  await storage.put(`auditor/${auditor.publicKey}`, {
+    auditor: auditor.publicKey,
+    status: 'active',
+    registered_at: makeTxKey(8),
+    registered_at_seconds: 0,
+    accredited_by: admin.publicKey,
+    successful_probes: 0,
+    submitted_probes: 0,
+    false_reports: 0,
+    updated_at: makeTxKey(8),
+  });
+  await storage.put(`enclave/${probeEnclaveId}`, {
+    enclave_id: probeEnclaveId,
+    binary_hash: probeBinaryHash,
+    status: 'active',
+  });
+  await storage.put('catalog/current', {
+    status: 'active',
+    canaries: [{ set_id: 'canary-dev-v1' }],
+  });
+
+  const applied = await execute(
+    contract,
+    storage,
+    'epochApply',
+    epochApply(1, user.publicKey, provider.publicKey, 2_000_000, { at: DAY_SECONDS }),
+    admin.publicKey,
+    9
+  );
+  assert.equal(applied.ok, true, applied.message);
+
+  const overGated = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey, {
+      epoch: 2,
+      at: DAY_SECONDS + 3_600,
+      mu: 1_000_000,
+      msb_tx_hash: 'b'.repeat(64),
+    }),
+    admin.publicKey,
+    10
+  );
+  assert.match(overGated.message, /insufficient released earnings/i);
+
+  const ungated = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey, {
+      epoch: 2,
+      at: DAY_SECONDS + 3_600,
+      mu: 850_000,
+      msb_tx_hash: 'c'.repeat(64),
+    }),
+    admin.publicKey,
+    11
+  );
+  assert.equal(ungated.ok, true, ungated.message);
+  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value.holdbacks, [
+    { epoch: 1, mu: 850_000, probe_gate: true },
+  ]);
+
+  const probe = await execute(
+    contract,
+    storage,
+    'probeResult',
+    signedCanaryProbe(provider, auditor),
+    auditor.publicKey,
+    12
+  );
+  assert.equal(probe.ok, true, probe.message);
+  assert.equal(probe.probe_pass_record.pass_count, 1);
+
+  const gated = await execute(
+    contract,
+    storage,
+    'payoutConfirm',
+    payoutConfirm(provider.publicKey, {
+      epoch: 3,
+      at: DAY_SECONDS + 7_200,
+      mu: 850_000,
+      msb_tx_hash: 'd'.repeat(64),
+    }),
+    admin.publicKey,
+    13
+  );
+  assert.equal(gated.ok, true, gated.message);
+  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+    provider: provider.publicKey,
+    denom: 'mu_usd',
+    total_mu: 1_700_000,
+    held_mu: 0,
+    paid_cum_mu: 1_700_000,
+    holdbacks: [],
+    updated_epoch: 1,
+    updated_at: makeTxKey(13),
+    last_holdback_release_epoch: 3,
+    last_payout_rail: 'tnk',
+    last_payout_rate_ts: DAY_SECONDS,
+    last_payout_msb_tx_hash: 'd'.repeat(64),
+  });
 });
 
 test('MayhemContract payoutConfirm rejects non-admin payout target provenance', async () => {

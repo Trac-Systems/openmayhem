@@ -318,6 +318,14 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
     probe_id: 'canary-good',
     provider: provider.publicKey,
     pass: true,
+    probe_pass_record: {
+      provider: provider.publicKey,
+      epoch: 1,
+      pass_count: 1,
+      last_probe_id: 'canary-good',
+      last_evidence_hash: 'd'.repeat(64),
+      updated_at: makeTxKey(9),
+    },
     provenance_violation: false,
   });
 
