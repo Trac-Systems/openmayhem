@@ -6,8 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 
 import { distribution } from './merkle.mjs';
+import {
+  TAP_ROLLER_SIGNER_ENV,
+  walletFromEnv,
+} from './signer-env.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
+let cliEthProvider = null;
 export const TAP_WEI = 1_000_000_000_000_000_000n;
 export const BPS = 10_000n;
 export const PROVIDER_BPS = 7_500n;
@@ -24,6 +29,31 @@ export const POOL_SETTLEMENT_ABI = [
   'function merkleRoot() view returns (bytes32)',
   'function claimed(address account) view returns (uint256)',
 ];
+const POOL_SETTLEMENT_INTERFACE = new ethers.Interface(POOL_SETTLEMENT_ABI);
+export const TAP_ROLLER_SIGNER_ENVS = [TAP_ROLLER_SIGNER_ENV];
+
+export function tapRollerWallet(provider, env = process.env) {
+  return walletFromEnv(provider, {
+    env,
+    names: TAP_ROLLER_SIGNER_ENVS,
+    label: 'TAP settlement roller private key',
+  });
+}
+
+function errorMessage(error) {
+  return error?.shortMessage || error?.reason || error?.message || String(error);
+}
+
+export function encodeSetRootCalldata({
+  root,
+  epoch,
+  cumulativeSpentWei,
+} = {}) {
+  if (!root) throw new Error('Missing setRoot root');
+  const safeEpoch = parseNonNegativeInt(epoch, 'setRoot epoch');
+  const spent = parseBigIntString(cumulativeSpentWei, 'setRoot cumulative spent wei');
+  return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('setRoot', [root, BigInt(safeEpoch), spent]);
+}
 
 function shellQuote(value) {
   const raw = String(value ?? '');
@@ -413,6 +443,31 @@ export async function guardianScreenSettlement({
   return guardianPreSignReport({ settlement, pool, epoch, previous });
 }
 
+export async function dryRunSetRoot({
+  writablePool,
+  root,
+  epoch,
+  cumulativeSpentWei,
+} = {}) {
+  if (!writablePool?.setRoot) throw new Error('Missing writable pool contract');
+  const safeEpoch = parseNonNegativeInt(epoch, 'setRoot epoch');
+  const spent = parseBigIntString(cumulativeSpentWei, 'setRoot cumulative spent wei');
+  const out = { ok: false, static_call_ok: false, gas_estimate: null };
+  try {
+    if (writablePool.setRoot.staticCall) {
+      await writablePool.setRoot.staticCall(root, safeEpoch, spent);
+      out.static_call_ok = true;
+    }
+    if (writablePool.setRoot.estimateGas) {
+      out.gas_estimate = (await writablePool.setRoot.estimateGas(root, safeEpoch, spent)).toString();
+    }
+    out.ok = true;
+    return out;
+  } catch (error) {
+    return { ...out, error: errorMessage(error) };
+  }
+}
+
 function bpsOf(value, bps) {
   return (value * BigInt(bps)) / BPS;
 }
@@ -553,9 +608,43 @@ export async function rollTapSettlement({
   if (!screen.ok) {
     return { ...settlement, posted: false, blocked: true, reasons: screen.reasons, screen };
   }
+  const setRootCalldata = encodeSetRootCalldata({
+    root: settlement.root,
+    epoch: screen.epoch,
+    cumulativeSpentWei: settlement.cumulative_spent_wei,
+  });
+  let signingAddress = null;
+  if (ownerSigner?.getAddress) {
+    signingAddress = normalizeAddress(await ownerSigner.getAddress(), 'signing address');
+  }
+  let writable = null;
+  let setRootDryRun = null;
+  if (pool && ownerSigner) {
+    writable = pool.connect ? pool.connect(ownerSigner) : pool;
+    setRootDryRun = await dryRunSetRoot({
+      writablePool: writable,
+      root: settlement.root,
+      epoch: screen.epoch,
+      cumulativeSpentWei: settlement.cumulative_spent_wei,
+    });
+    if (!setRootDryRun.ok) {
+      return {
+        ...settlement,
+        posted: false,
+        blocked: true,
+        reasons: [`setRoot dry-run failed: ${setRootDryRun.error}`],
+        epoch: screen.epoch,
+        signing_address: signingAddress,
+        set_root_calldata: setRootCalldata,
+        set_root_dry_run: setRootDryRun,
+        screen,
+      };
+    }
+  }
   let tx = null;
   if (post && pool) {
-    const writable = ownerSigner && pool.connect ? pool.connect(ownerSigner) : pool;
+    if (!ownerSigner) throw new Error('Missing TAP settlement owner signer for broadcast');
+    if (!writable) writable = pool.connect ? pool.connect(ownerSigner) : pool;
     const sent = await writable.setRoot(settlement.root, screen.epoch, BigInt(settlement.cumulative_spent_wei));
     await sent.wait();
     tx = sent.hash;
@@ -565,6 +654,9 @@ export async function rollTapSettlement({
     posted: Boolean(tx),
     epoch: screen.epoch,
     tx,
+    signing_address: signingAddress,
+    set_root_calldata: setRootCalldata,
+    set_root_dry_run: setRootDryRun,
     screen,
   };
 }
@@ -614,7 +706,7 @@ function buildReplayCommand({
   ethRpc,
   poolAddress,
   epoch,
-  post,
+  confirm,
   json,
 } = {}) {
   const args = ['node', 'contracts/scripts/tap-settlement-roller.mjs'];
@@ -634,13 +726,19 @@ function buildReplayCommand({
   if (ethRpc) args.push('--eth-rpc', ethRpc);
   if (poolAddress) args.push('--pool', poolAddress);
   if (epoch) args.push('--epoch', String(epoch));
-  if (post) args.push('--post');
+  if (confirm) args.push('--confirm');
   if (json) args.push('--json');
   return args.map(shellQuote).join(' ');
 }
 
 async function main() {
   const args = parseArgs();
+  if (args.post !== undefined) {
+    throw new Error('--post has been retired. Run the dry-run without it, inspect the signer/calldata, then add --confirm to broadcast.');
+  }
+  if (args['owner-index'] !== undefined) {
+    throw new Error(`--owner-index has been retired. Set ${TAP_ROLLER_SIGNER_ENV} in the environment instead.`);
+  }
   const bundlePath = args.bundle || args['receipts-file'];
   if (!bundlePath) throw new Error('Missing --bundle/--receipts-file.');
   const bundle = readJson(path.resolve(bundlePath), 'receipt bundle');
@@ -658,16 +756,19 @@ async function main() {
 
   const ethRpc = args['eth-rpc'] || args.rpc || process.env.MAYHEM_TAP_ETH_RPC;
   const poolAddress = args.pool || process.env.MAYHEM_TAP_POOL_ADDRESS;
-  const post = boolArg(args.post, false);
+  const confirm = boolArg(args.confirm, false);
   const json = boolArg(args.json, false);
   let pool = null;
   let ownerSigner = null;
-  if (post || ethRpc || poolAddress) {
+  let signerEnvName = null;
+  if (confirm || ethRpc || poolAddress) {
     if (!ethRpc) throw new Error('Missing --eth-rpc or MAYHEM_TAP_ETH_RPC.');
     if (!poolAddress) throw new Error('Missing --pool or MAYHEM_TAP_POOL_ADDRESS.');
-    const provider = new ethers.JsonRpcProvider(ethRpc);
-    ownerSigner = await provider.getSigner(parseNonNegativeInt(args['owner-index'] ?? 0, '--owner-index'));
-    pool = new ethers.Contract(poolAddress, POOL_SETTLEMENT_ABI, provider);
+    cliEthProvider = new ethers.JsonRpcProvider(ethRpc);
+    const signer = tapRollerWallet(cliEthProvider);
+    ownerSigner = signer.wallet;
+    signerEnvName = signer.envName;
+    pool = new ethers.Contract(poolAddress, POOL_SETTLEMENT_ABI, cliEthProvider);
   }
 
   const report = await rollTapSettlement({
@@ -681,8 +782,9 @@ async function main() {
     pool,
     ownerSigner,
     epoch: args.epoch ? parsePositiveInt(args.epoch, '--epoch') : undefined,
-    post,
+    post: confirm,
   });
+  if (signerEnvName) report.signer_env = signerEnvName;
   report.copy_paste_replay_command = buildReplayCommand({
     bundlePath,
     providerAccountsPath,
@@ -694,9 +796,25 @@ async function main() {
     ethRpc,
     poolAddress,
     epoch: report.epoch,
-    post,
+    confirm,
     json: true,
   });
+  if (!confirm && report.root && ethRpc && poolAddress) {
+    report.copy_paste_confirm_command = buildReplayCommand({
+      bundlePath,
+      providerAccountsPath,
+      tapUsdE6,
+      priorPath,
+      settleThroughEpoch: args['settle-through-epoch'],
+      challengeEpochs: args['challenge-epochs'],
+      holdbackEpochs: args['holdback-epochs'],
+      ethRpc,
+      poolAddress,
+      epoch: report.epoch,
+      confirm: true,
+      json: true,
+    });
+  }
   delete report.dist;
 
   if (json) {
@@ -705,16 +823,30 @@ async function main() {
     console.log('[tap:settlement] root:', report.root ?? 'none');
     console.log('[tap:settlement] epoch:', report.epoch ?? 'none');
     console.log('[tap:settlement] cumulative_spent_wei:', report.cumulative_spent_wei);
+    if (report.signing_address) console.log('[tap:settlement] signing_address:', report.signing_address);
+    if (report.set_root_calldata) console.log('[tap:settlement] setRoot calldata:', report.set_root_calldata);
+    if (report.set_root_dry_run) {
+      console.log('[tap:settlement] setRoot dry-run:', JSON.stringify(report.set_root_dry_run));
+    }
     console.log('[tap:settlement] posted:', report.posted);
     if (report.blocked) console.log('[tap:settlement] blocked:', report.reasons.join('; '));
     console.log('Copy/paste TAP settlement replay command:');
     console.log(report.copy_paste_replay_command);
+    if (report.copy_paste_confirm_command) {
+      console.log('Copy/paste TAP settlement broadcast command after inspecting the dry-run:');
+      console.log(report.copy_paste_confirm_command);
+    }
   }
   if (report.blocked) process.exitCode = 2;
+  if (cliEthProvider?.destroy) {
+    cliEthProvider.destroy();
+    cliEthProvider = null;
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
   main().catch((error) => {
+    if (cliEthProvider?.destroy) cliEthProvider.destroy();
     console.error(error?.stack || error?.message || String(error));
     process.exit(1);
   });

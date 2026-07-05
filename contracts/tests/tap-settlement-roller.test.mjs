@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import Ganache from 'ganache';
 import { ethers } from 'ethers';
@@ -8,6 +13,7 @@ import { deployPool } from '../scripts/deploy-local.mjs';
 import { distribution } from '../scripts/merkle.mjs';
 import {
   buildTapSettlement,
+  encodeSetRootCalldata,
   guardianPreSignReport,
   muToTapWei,
   providerShareWei,
@@ -16,6 +22,38 @@ import {
 
 const TAP_USD_E6 = 1_000_000;
 const U = (n) => ethers.parseUnits(String(n), 18);
+const SCRIPT_PATH = fileURLToPath(new URL('../scripts/tap-settlement-roller.mjs', import.meta.url));
+const OPERATOR_KEY = `0x${'11'.repeat(32)}`;
+const BUYER_KEY = `0x${'22'.repeat(32)}`;
+const PROVIDER_KEY = `0x${'33'.repeat(32)}`;
+const GANACHE_BALANCE = ethers.toBeHex(ethers.parseEther('100'));
+
+function runNode(args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, {
+      ...options,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`child process timed out: ${args.join(' ')}`));
+    }, 20_000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on('close', (status, signal) => {
+      clearTimeout(timeout);
+      resolve({ status, signal, stdout, stderr });
+    });
+  });
+}
 
 function receipt({
   session,
@@ -245,4 +283,103 @@ test('guardian pre-sign screen halts invariant violations', async () => {
   });
   assert.equal(decreasedProvider.ok, false);
   assert.match(decreasedProvider.reasons.join('; '), /cumulative for .* decreased/);
+});
+
+test('TAP settlement CLI dry-runs and broadcasts with env key against a locked JSON-RPC node', async (t) => {
+  const server = Ganache.server({
+    logging: { quiet: true },
+    chain: { chainId: 61_001 },
+    wallet: {
+      lock: true,
+      accounts: [
+        { secretKey: OPERATOR_KEY, balance: GANACHE_BALANCE },
+        { secretKey: BUYER_KEY, balance: GANACHE_BALANCE },
+        { secretKey: PROVIDER_KEY, balance: GANACHE_BALANCE },
+      ],
+    },
+  });
+  await new Promise((resolve, reject) => {
+    server.listen(0, '127.0.0.1', (error) => (error ? reject(error) : resolve()));
+  });
+  let provider = null;
+  t.after(() => {
+    if (provider?.destroy) provider.destroy();
+    try {
+      const closing = server.close();
+      if (closing?.catch) closing.catch(() => {});
+    } catch (_error) {
+      // Best-effort cleanup for Ganache's mixed callback/promise close API in node:test.
+    }
+  });
+  const rpc = `http://127.0.0.1:${server.address().port}`;
+  provider = new ethers.JsonRpcProvider(rpc);
+  const operator = new ethers.NonceManager(new ethers.Wallet(OPERATOR_KEY, provider));
+  const buyer = new ethers.Wallet(BUYER_KEY, provider);
+  const providerSigner = new ethers.Wallet(PROVIDER_KEY, provider);
+  const { token, pool, poolAddr } = await deployPool(operator);
+
+  await (await token.mint(await buyer.getAddress(), U(10))).wait();
+  await (await token.connect(buyer).approve(poolAddr, U(10))).wait();
+  await (await pool.connect(buyer).deposit(U(10))).wait();
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-tap-roller-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const bundlePath = path.join(tmp, 'bundle.json');
+  const providerAccountsPath = path.join(tmp, 'providers.json');
+  fs.writeFileSync(bundlePath, JSON.stringify({
+    receipts: [receipt({ session: 'cli-s1', provider: 'provider_cli', mu: 1_000_000 })],
+  }, null, 2));
+  fs.writeFileSync(providerAccountsPath, JSON.stringify({
+    provider_cli: await providerSigner.getAddress(),
+  }, null, 2));
+
+  const baseArgs = [
+    SCRIPT_PATH,
+    '--bundle', bundlePath,
+    '--provider-accounts', providerAccountsPath,
+    '--tap-usd-e6', String(TAP_USD_E6),
+    '--eth-rpc', rpc,
+    '--pool', poolAddr,
+    '--json',
+  ];
+  const baseEnv = { ...process.env };
+  delete baseEnv.MAYHEM_TAP_ROLLER_PRIVATE_KEY;
+  const missingKey = await runNode(baseArgs, {
+    cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
+    env: baseEnv,
+  });
+  assert.notEqual(missingKey.status, 0);
+  assert.match(missingKey.stderr, /MAYHEM_TAP_ROLLER_PRIVATE_KEY/);
+
+  const dryRun = await runNode(baseArgs, {
+    cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
+    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+  });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const report = JSON.parse(dryRun.stdout);
+  assert.equal(report.posted, false);
+  assert.equal(report.signer_env, 'MAYHEM_TAP_ROLLER_PRIVATE_KEY');
+  assert.equal(report.signing_address, (await operator.getAddress()).toLowerCase());
+  assert.equal(report.set_root_dry_run.ok, true);
+  assert.equal(report.set_root_dry_run.static_call_ok, true);
+  assert.match(report.set_root_dry_run.gas_estimate, /^[0-9]+$/);
+  assert.equal(report.set_root_calldata, encodeSetRootCalldata({
+    root: report.root,
+    epoch: report.epoch,
+    cumulativeSpentWei: report.cumulative_spent_wei,
+  }));
+  assert.match(report.copy_paste_confirm_command, /--confirm/);
+  assert.doesNotMatch(JSON.stringify(report), new RegExp(OPERATOR_KEY.slice(2), 'i'));
+  assert.equal(await pool.epoch(), 0n);
+
+  const confirmed = await runNode([...baseArgs, '--confirm'], {
+    cwd: path.join(path.dirname(SCRIPT_PATH), '..'),
+    env: { ...baseEnv, MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY },
+  });
+  assert.equal(confirmed.status, 0, confirmed.stderr);
+  const posted = JSON.parse(confirmed.stdout);
+  assert.equal(posted.posted, true);
+  assert.match(posted.tx, /^0x[0-9a-f]{64}$/i);
+  assert.equal(posted.signing_address, (await operator.getAddress()).toLowerCase());
+  assert.equal(await pool.epoch(), 1n);
 });

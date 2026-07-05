@@ -7,6 +7,10 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { compileAll } from './compile.mjs';
+import {
+  TAP_DEPLOYER_SIGNER_ENV,
+  walletFromEnv,
+} from './signer-env.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const ADDRESSES_FILE = join(REPO, '.mayhem-local', 'contracts', 'eth-addresses.json');
@@ -35,13 +39,21 @@ export async function deployPool(signer, ownerAddr, maxEpochDelta = 0n) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const rpc = process.env.MAYHEM_TAP_ETH_RPC || 'http://127.0.0.1:61000';
   const provider = new ethers.JsonRpcProvider(rpc);
-  const signer = await provider.getSigner(0);
-  // C1: a real per-epoch spend cap can be set via MAYHEM_TAP_MAX_EPOCH_DELTA (wei); 0 locally.
-  const maxEpochDelta = process.env.MAYHEM_TAP_MAX_EPOCH_DELTA ? BigInt(process.env.MAYHEM_TAP_MAX_EPOCH_DELTA) : 0n;
-  const { tokenAddr, poolAddr } = await deployPool(signer, undefined, maxEpochDelta);
-  const net = await provider.getNetwork();
-  const out = { pool: poolAddr, token: tokenAddr, deployer: await signer.getAddress(), chainId: Number(net.chainId), rpc, maxEpochDelta: maxEpochDelta.toString() };
-  mkdirSync(dirname(ADDRESSES_FILE), { recursive: true });
-  writeFileSync(ADDRESSES_FILE, JSON.stringify(out, null, 2) + '\n');
-  console.log('deployed ->', ADDRESSES_FILE, '\n', out);
+  try {
+    const { envName, wallet } = walletFromEnv(provider, {
+      names: [TAP_DEPLOYER_SIGNER_ENV],
+      label: 'TAP deployer private key',
+    });
+    const signer = new ethers.NonceManager(wallet);
+    // C1: a real per-epoch spend cap can be set via MAYHEM_TAP_MAX_EPOCH_DELTA (wei); 0 locally.
+    const maxEpochDelta = process.env.MAYHEM_TAP_MAX_EPOCH_DELTA ? BigInt(process.env.MAYHEM_TAP_MAX_EPOCH_DELTA) : 0n;
+    const { tokenAddr, poolAddr } = await deployPool(signer, undefined, maxEpochDelta);
+    const net = await provider.getNetwork();
+    const out = { pool: poolAddr, token: tokenAddr, deployer: await signer.getAddress(), signerEnv: envName, chainId: Number(net.chainId), rpc, maxEpochDelta: maxEpochDelta.toString() };
+    mkdirSync(dirname(ADDRESSES_FILE), { recursive: true });
+    writeFileSync(ADDRESSES_FILE, JSON.stringify(out, null, 2) + '\n');
+    console.log('deployed ->', ADDRESSES_FILE, '\n', out);
+  } finally {
+    if (provider.destroy) provider.destroy();
+  }
 }
