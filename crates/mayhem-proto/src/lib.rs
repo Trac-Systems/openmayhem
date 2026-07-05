@@ -14,6 +14,7 @@ pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
+pub const DEFAULT_MODEL_CLASS: &str = "text-generation";
 pub const TIER1_SOFTWARE_ATTESTATION_TIER: u8 = 1;
 pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
 pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
@@ -53,6 +54,8 @@ pub struct AttestationBody {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AttestationRuntimeConfig {
+    #[serde(default = "default_model_class")]
+    pub model_class: String,
     pub backend: String,
     pub ctx: u32,
     pub tp_degree: u32,
@@ -65,6 +68,7 @@ pub struct AttestationRuntimeConfig {
 impl Default for AttestationRuntimeConfig {
     fn default() -> Self {
         Self {
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "unknown".to_owned(),
             ctx: 0,
             tp_degree: 1,
@@ -72,6 +76,10 @@ impl Default for AttestationRuntimeConfig {
             max_num_tokens: None,
         }
     }
+}
+
+pub fn default_model_class() -> String {
+    DEFAULT_MODEL_CLASS.to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -471,6 +479,18 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-proto");
+    }
+
+    #[test]
+    fn runtime_config_defaults_model_class_for_legacy_text_reports() {
+        let config: AttestationRuntimeConfig = serde_json::from_value(json!({
+            "backend": "llama.cpp",
+            "ctx": 8192,
+            "tp_degree": 1
+        }))
+        .unwrap();
+
+        assert_eq!(config.model_class, DEFAULT_MODEL_CLASS);
     }
 
     #[test]

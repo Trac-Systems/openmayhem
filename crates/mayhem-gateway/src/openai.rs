@@ -35,11 +35,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    migrate_receipt_body, receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, supported_receipt_signing_bytes, AttestationReport,
-    CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
-    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    SESSION_RECEIPT_SCHEMA_VERSION,
+    default_model_class, migrate_receipt_body, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
+    AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
+    SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -79,6 +79,8 @@ pub struct GatewayModel {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MayhemModelInfo {
+    #[serde(default = "default_model_class")]
+    pub model_class: String,
     pub providers_online: u32,
     pub rooms: u32,
     pub price_ref_mu: PriceRefMu,
@@ -432,6 +434,7 @@ impl GatewayState {
             created: 1_782_950_400,
             owned_by: "mayhem".to_owned(),
             mayhem: MayhemModelInfo {
+                model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 providers_online: 1,
                 rooms: 1,
                 price_ref_mu: PriceRefMu {
@@ -2320,6 +2323,7 @@ impl GatewayState {
                 enclave_id: candidate.enclave_id.clone(),
                 admin_pubkey: candidate.admin_pubkey.clone(),
                 model_id: model.id.clone(),
+                model_class: model.mayhem.model_class.clone(),
                 artifact_root: candidate.artifact_root.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
@@ -3010,6 +3014,11 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
         created,
         owned_by: "mayhem".to_owned(),
         mayhem: MayhemModelInfo {
+            model_class: model
+                .get("model_class")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_MODEL_CLASS)
+                .to_owned(),
             providers_online: 0,
             rooms: 0,
             price_ref_mu: PriceRefMu {
@@ -3602,6 +3611,7 @@ mod tests {
             enclave_id: enclave_id.clone(),
             admin_pubkey: identity.admin_pubkey.clone(),
             model_id: identity.model_id.clone(),
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             artifact_root: identity.artifact_root.clone(),
             manifest_hash: identity.manifest_hash.clone(),
             binary_hash: identity.binary_hash.clone(),
@@ -3650,6 +3660,7 @@ mod tests {
             created: 1,
             owned_by: "mayhem".to_owned(),
             mayhem: MayhemModelInfo {
+                model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 providers_online: 1,
                 rooms: 1,
                 price_ref_mu: PriceRefMu {

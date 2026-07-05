@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use mayhem_proto::{default_model_class, DEFAULT_MODEL_CLASS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -74,6 +75,8 @@ pub(crate) struct CatalogDocument {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CatalogModel {
     pub(crate) model_id: String,
+    #[serde(default = "default_model_class")]
+    pub(crate) model_class: String,
     pub(crate) family: String,
     pub(crate) params_b: f64,
     pub(crate) tier: String,
@@ -415,6 +418,12 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
     if model.model_id.trim().is_empty() {
         errors.push("model_id is required".to_owned());
     }
+    if !valid_model_class(&model.model_class) {
+        errors.push(format!(
+            "{} has unsupported model_class {}",
+            model.model_id, model.model_class
+        ));
+    }
     if model.family.trim().is_empty() {
         errors.push(format!("{} has empty family", model.model_id));
     }
@@ -589,6 +598,13 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             model.model_id
         ));
     }
+}
+
+fn valid_model_class(model_class: &str) -> bool {
+    matches!(
+        model_class,
+        DEFAULT_MODEL_CLASS | "embedding" | "image-generation" | "video-generation" | "tts" | "stt"
+    )
 }
 
 fn validate_artifact(
@@ -1122,6 +1138,7 @@ mod tests {
     fn launch_source_metadata_requires_merkle_root_and_source_sha() {
         let mut model = CatalogModel {
             model_id: "admin/model@4bit".to_owned(),
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             family: "admin".to_owned(),
             params_b: 4.0,
             tier: "launch".to_owned(),

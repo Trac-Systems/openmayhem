@@ -21,7 +21,7 @@ use jsonwebtoken::{
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
     AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind,
-    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -124,6 +124,7 @@ pub struct EnclaveContractRecord {
     pub enclave_id: String,
     pub admin_pubkey: String,
     pub model_id: String,
+    pub model_class: String,
     pub artifact_root: String,
     pub manifest_hash: String,
     pub binary_hash: String,
@@ -439,6 +440,16 @@ pub fn verify_tier1_attestation(
         "att_tier",
         &request.contract.att_tier.to_string(),
         &report.att_tier.to_string(),
+    )?;
+    let expected_model_class = if request.contract.model_class.trim().is_empty() {
+        DEFAULT_MODEL_CLASS
+    } else {
+        request.contract.model_class.as_str()
+    };
+    compare_field(
+        "runtime_config.model_class",
+        expected_model_class,
+        &report.runtime_config.model_class,
     )?;
     compare_field(
         "runtime_config.tp_degree",

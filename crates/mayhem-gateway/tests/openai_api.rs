@@ -11,7 +11,7 @@ use mayhem_gateway::openai::{
     PriceRefMu, Usage,
 };
 use mayhem_gateway::{aggregate_canary_fingerprints, token_fingerprint, ReputationEventKind};
-use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity};
+use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity, DEFAULT_MODEL_CLASS};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -351,6 +351,7 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
     let catalog = json!({
         "models": [{
             "model_id": "mayhem/tier2-model",
+            "model_class": "embedding",
             "caps": { "tools": true, "json": true, "ctx_max": 4096, "vision": false },
             "price_ref_mu": { "denom": "mu_usd", "ver": 1, "in_per_1k": 10, "out_per_1k": 30 },
             "attestation_tiers": { "T1": 1, "T2": 2 }
@@ -363,6 +364,7 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["id"], "mayhem/tier2-model");
+    assert_eq!(body["data"][0]["mayhem"]["model_class"], "embedding");
     assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T1"], 1);
     assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T2"], 2);
     assert!(body["data"][0]["mayhem"]["attestation_tier_labels"]["T2"]
@@ -877,6 +879,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
         created: 1_782_950_400,
         owned_by: "mayhem".to_owned(),
         mayhem: MayhemModelInfo {
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             providers_online: 1,
             rooms: 1,
             price_ref_mu: PriceRefMu {

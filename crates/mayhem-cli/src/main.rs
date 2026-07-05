@@ -48,7 +48,7 @@ use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
     supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
     AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
+    SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -3105,6 +3105,7 @@ struct CatalogListReport {
 #[derive(Debug, Serialize)]
 struct CatalogListModel {
     model_id: String,
+    model_class: String,
     family: String,
     params_b: f64,
     tier: String,
@@ -3284,6 +3285,7 @@ fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
         .collect();
     CatalogListModel {
         model_id: model.model_id.clone(),
+        model_class: model.model_class.clone(),
         family: model.family.clone(),
         params_b: model.params_b,
         tier: model.tier.clone(),
@@ -8834,7 +8836,7 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
 }
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
-    validate_admin_enclave_catalog_binding(args)?;
+    let model_class = validate_admin_enclave_catalog_binding(args)?;
     let caps = json_arg_or_file_object(
         args.caps_json.as_deref(),
         args.caps_file.as_ref(),
@@ -8845,6 +8847,7 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "op": "register_enclave",
         "enclave_id": &args.enclave_id,
         "model_id": &args.model,
+        "model_class": model_class,
         "backend": &args.backend,
         "artifact_root": &args.artifact_root,
         "artifact_root_kind": &args.artifact_root_kind,
@@ -8865,7 +8868,7 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
     Ok(payload)
 }
 
-fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Result<()> {
+fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Result<String> {
     let catalog_path = args
         .catalog_path
         .clone()
@@ -8957,7 +8960,7 @@ fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Re
         args.source_sha256.as_deref(),
         artifact.source_sha256.as_deref(),
     )?;
-    Ok(())
+    Ok(model.model_class.clone())
 }
 
 fn ensure_catalog_text_match(label: &str, requested: &str, catalog: &str) -> Result<()> {
@@ -13780,6 +13783,8 @@ fn push_evidence_check(
 struct LedgerEnclave {
     enclave_id: String,
     model_id: String,
+    #[serde(default = "mayhem_proto::default_model_class")]
+    model_class: String,
     backend: String,
     artifact_root: String,
     artifact_root_kind: String,
@@ -15377,6 +15382,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
     }
 
     let mut caps_by_model: BTreeMap<String, ModelCaps> = BTreeMap::new();
+    let mut class_by_model: BTreeMap<String, String> = BTreeMap::new();
     for enclave in active_enclaves.values() {
         if rooms_by_model.get(&enclave.model_id).copied().unwrap_or(0) == 0 {
             continue;
@@ -15384,6 +15390,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if !prices_by_enclave.contains_key(&enclave.enclave_id) {
             continue;
         };
+        class_by_model
+            .entry(enclave.model_id.clone())
+            .or_insert_with(|| enclave.model_class.clone());
         caps_by_model
             .entry(enclave.model_id.clone())
             .and_modify(|caps| merge_model_caps(caps, &gateway_caps_from_contract(&enclave.caps)))
@@ -15531,6 +15540,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             created: 1_782_950_400,
             owned_by: "mayhem".to_owned(),
             mayhem: MayhemModelInfo {
+                model_class: class_by_model
+                    .remove(&model_id)
+                    .unwrap_or_else(|| DEFAULT_MODEL_CLASS.to_owned()),
                 providers_online,
                 rooms,
                 price_ref_mu: PriceRefMu {
@@ -15691,6 +15703,9 @@ fn build_provider_candidates(
         else {
             continue;
         };
+        if enclave.model_class != model.model_class {
+            continue;
+        }
         let Some(verdict) = hardware
             .backend_verdicts
             .iter()
@@ -17323,6 +17338,7 @@ fn provider_attestation_runtime_config(
     let max_num_tokens =
         enclave_max_num_tokens(&selected.enclave.caps)?.map(|tokens| tokens.max(ctx));
     Ok(AttestationRuntimeConfig {
+        model_class: selected.enclave.model_class.clone(),
         backend: selected.artifact.engine.clone(),
         ctx,
         tp_degree,
@@ -19062,6 +19078,7 @@ mod tests {
         let payload = admin_register_enclave_payload(&args).unwrap();
         assert_eq!(payload["artifact_source"]["repo"], "admin/model");
         assert_eq!(payload["artifact_root"], artifact_root);
+        assert_eq!(payload["model_class"], DEFAULT_MODEL_CLASS);
 
         let mut fake_repo = args;
         fake_repo.artifact_repo = "provider/fake-model".to_owned();
@@ -19561,6 +19578,7 @@ mod tests {
         contract.enclaves.push(LedgerEnclave {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "llama.cpp".to_owned(),
             artifact_root: root.clone(),
             artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -19639,6 +19657,7 @@ mod tests {
         contract.enclaves.push(LedgerEnclave {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "llama.cpp".to_owned(),
             artifact_root: root.clone(),
             artifact_root_kind: "blake3_merkle_v1".to_owned(),
@@ -20406,6 +20425,7 @@ mod tests {
         };
         let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
         let runtime_config = AttestationRuntimeConfig {
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "trt-llm".to_owned(),
             ctx: 8192,
             tp_degree: 2,
@@ -20754,6 +20774,7 @@ mod tests {
         assert_eq!(
             provider_attestation_runtime_config(&selected).unwrap(),
             AttestationRuntimeConfig {
+                model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 backend: "trt-llm".to_owned(),
                 ctx: 8192,
                 tp_degree: 2,
@@ -23845,6 +23866,7 @@ mod tests {
             generated_at: "2026-07-02T00:00:00Z".to_owned(),
             models: vec![catalog::CatalogModel {
                 model_id: "test/model@4bit".to_owned(),
+                model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 family: "test".to_owned(),
                 params_b: 1.0,
                 tier: "dev".to_owned(),
@@ -23894,6 +23916,7 @@ mod tests {
         let enclave = LedgerEnclave {
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "llama.cpp".to_owned(),
             artifact_root: root.to_owned(),
             artifact_root_kind: "blake3_merkle_v1".to_owned(),

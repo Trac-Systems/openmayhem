@@ -16,7 +16,8 @@ use mayhem_gateway::{
 use mayhem_proto::{
     catalog_enclave_id, hardware_quote_binding, AttestationBody, AttestationRuntimeConfig,
     CatalogEnclaveIdentity, HardwareQuote, HardwareQuoteKind, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, TIER2_DEVICE_IDENTITY_TIER, TIER3_CONFIDENTIAL_COMPUTE_TIER,
+    ATTESTATION_SCHEMA_VERSION, DEFAULT_MODEL_CLASS, TIER2_DEVICE_IDENTITY_TIER,
+    TIER3_CONFIDENTIAL_COMPUTE_TIER,
 };
 
 fn test_report() -> (
@@ -52,6 +53,7 @@ fn test_report() -> (
         enclave_id,
         admin_pubkey: identity.admin_pubkey,
         model_id: identity.model_id,
+        model_class: DEFAULT_MODEL_CLASS.to_owned(),
         artifact_root: identity.artifact_root,
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
@@ -135,6 +137,7 @@ fn test_hardware_report_with_evidence(
         enclave_id: body.enclave_id,
         admin_pubkey: identity.admin_pubkey,
         model_id: identity.model_id,
+        model_class: DEFAULT_MODEL_CLASS.to_owned(),
         artifact_root: identity.artifact_root,
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
@@ -382,6 +385,30 @@ fn verification_rejects_runtime_tp_degree_mismatch() {
         err,
         GatewayError::ContractMismatch {
             field: "runtime_config.tp_degree",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn verification_rejects_runtime_model_class_mismatch() {
+    let (_temp, report, mut contract, trusted) = test_report();
+    contract.model_class = "embedding".to_owned();
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+
+    let err = verify_tier1_attestation(&request).expect_err("model_class must match admin record");
+
+    assert!(matches!(
+        err,
+        GatewayError::ContractMismatch {
+            field: "runtime_config.model_class",
             ..
         }
     ));

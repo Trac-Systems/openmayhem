@@ -84,6 +84,7 @@ const EPOCH_TOTAL_KEYS = [
   'fee_cum_mu',
 ];
 const ENCLAVE_UPDATE_FIELDS = [
+  'model_class',
   'backend',
   'artifact_root',
   'artifact_root_kind',
@@ -95,6 +96,15 @@ const ENCLAVE_UPDATE_FIELDS = [
   'caps',
 ];
 const ENCLAVE_BACKENDS = new Set(['llama.cpp', 'mlx', 'trt-llm']);
+const DEFAULT_MODEL_CLASS = 'text-generation';
+const MODEL_CLASSES = new Set([
+  DEFAULT_MODEL_CLASS,
+  'embedding',
+  'image-generation',
+  'video-generation',
+  'tts',
+  'stt',
+]);
 const ENCLAVE_ARTIFACT_ROOT_KIND = 'blake3_merkle_v1';
 const ENCLAVE_CAP_BOOLEAN_FIELDS = [
   'chat',
@@ -347,6 +357,7 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         model_id: { type: 'string', min: 1, max: 256 },
+        model_class: { type: 'string', min: 1, max: 64, optional: true },
         price_ref_mu: { type: 'any' },
         source_hash: { type: 'string', min: 1, max: 128, optional: true },
       },
@@ -378,6 +389,7 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
         model_id: { type: 'string', min: 1, max: 256 },
+        model_class: { type: 'string', min: 1, max: 64, optional: true },
         backend: { type: 'string', min: 1, max: 64 },
         artifact_root: { type: 'string', min: 1, max: 256 },
         artifact_root_kind: { type: 'string', min: 1, max: 64 },
@@ -396,6 +408,7 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
+        model_class: { type: 'string', min: 1, max: 64, optional: true },
         backend: { type: 'string', min: 1, max: 64, optional: true },
         artifact_root: { type: 'string', min: 1, max: 256, optional: true },
         artifact_root_kind: { type: 'string', min: 1, max: 64, optional: true },
@@ -1238,6 +1251,7 @@ class MayhemContract extends Contract {
     const current = await this.get(key);
     const record = {
       model_id: this.value.model_id,
+      model_class: this.modelClassFor(this.value),
       denom: PRICE_DENOMINATION,
       price_ref_mu: {
         in_per_1k: this.value.price_ref_mu.in_per_1k,
@@ -1305,10 +1319,12 @@ class MayhemContract extends Contract {
 
     const key = `enclave/${this.value.enclave_id}`;
     if ((await this.get(key)) !== null) return new Error('Enclave already registered.');
+    const modelClass = this.modelClassFor(this.value);
 
     const record = {
       enclave_id: this.value.enclave_id,
       model_id: this.value.model_id,
+      model_class: modelClass,
       backend: this.value.backend,
       artifact_root: this.value.artifact_root,
       artifact_root_kind: this.value.artifact_root_kind,
@@ -1749,6 +1765,9 @@ class MayhemContract extends Contract {
 
     const modelRef = await this.get(`modelref/${enclave.model_id}`);
     if (!modelRef) return new Error('Model reference not found.');
+    if (this.modelClassFor(modelRef) !== this.modelClassFor(enclave)) {
+      return new Error('Model reference model_class must match enclave model_class.');
+    }
 
     const inRef = this.modelRefPrice(modelRef, 'in_per_1k_mu', 'in_per_1k');
     const outRef = this.modelRefPrice(modelRef, 'out_per_1k_mu', 'out_per_1k');
@@ -3381,6 +3400,8 @@ class MayhemContract extends Contract {
 
   validateModelRef(value) {
     if (!this.isSafeModelId(value.model_id)) return new Error('Invalid model id.');
+    const classError = this.validateModelClass(this.modelClassFor(value), 'Model reference model_class');
+    if (classError) return classError;
     const ref = value.price_ref_mu;
     if (!ref || typeof ref !== 'object' || Array.isArray(ref)) {
       return new Error('Model reference price must be an object.');
@@ -3498,6 +3519,8 @@ class MayhemContract extends Contract {
   }
 
   validateEnclaveArtifactBinding(value) {
+    const classError = this.validateModelClass(this.modelClassFor(value), 'Enclave model_class');
+    if (classError) return classError;
     if (!ENCLAVE_BACKENDS.has(value.backend)) return new Error('Unsupported enclave backend.');
     if (!this.isHexBytes(value.artifact_root, 32)) {
       return new Error('Enclave artifact_root must be a 32-byte hex Merkle root.');
@@ -3611,6 +3634,21 @@ class MayhemContract extends Contract {
   modelRefPrice(modelRef, directKey, nestedKey) {
     if (Number.isInteger(modelRef?.[directKey])) return modelRef[directKey];
     if (Number.isInteger(modelRef?.price_ref_mu?.[nestedKey])) return modelRef.price_ref_mu[nestedKey];
+    return null;
+  }
+
+  modelClassFor(value) {
+    if (!value || !hasOwn(value, 'model_class') || value.model_class === null || value.model_class === undefined) {
+      return DEFAULT_MODEL_CLASS;
+    }
+    return value.model_class;
+  }
+
+  validateModelClass(modelClass, label) {
+    if (typeof modelClass !== 'string' || modelClass.length === 0 || modelClass.length > 64) {
+      return new Error(`${label} must be a non-empty string.`);
+    }
+    if (!MODEL_CLASSES.has(modelClass)) return new Error(`Unsupported ${label}.`);
     return null;
   }
 

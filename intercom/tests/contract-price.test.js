@@ -302,6 +302,7 @@ test('MayhemContract setModelRef is admin-only and forward-facing', async () => 
 
   assert.deepEqual((await storage.get(`modelref/${modelId}`)).value, {
     model_id: modelId,
+    model_class: 'text-generation',
     denom: 'mu_usd',
     price_ref_mu: {
       in_per_1k: 21,

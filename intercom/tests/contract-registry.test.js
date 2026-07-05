@@ -244,6 +244,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.equal(enclaveEntry.value.status, 'retired');
   assert.equal(enclaveEntry.value.created_by, admin.publicKey);
   assert.equal(enclaveEntry.value.created_by_role, 'admin');
+  assert.equal(enclaveEntry.value.model_class, 'text-generation');
   assert.equal(enclaveEntry.value.artifact_root, updatedArtifactRoot);
   assert.equal(enclaveEntry.value.artifact_root_kind, 'blake3_merkle_v1');
   assert.deepEqual(enclaveEntry.value.artifact_source, enclaveUpdate.artifact_source);
@@ -271,6 +272,170 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
     tombstone_reason_hash: null,
     rooms: [],
   });
+});
+
+test('MayhemContract model_class defaults old text records and allows new admin classes', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const legacyEnclaveId = 'b'.repeat(64);
+
+  await storage.put(`enclave/${legacyEnclaveId}`, {
+    enclave_id: legacyEnclaveId,
+    model_id: enclaveRegistration.model_id,
+    backend: 'llama.cpp',
+    artifact_root: artifactRoot,
+    artifact_root_kind: 'blake3_merkle_v1',
+    artifact_source: artifactSource,
+    manifest_hash: manifestHash,
+    att_tier: 1,
+    binary_hash: binaryHash,
+    caps: {
+      chat: true,
+      tools: false,
+      ctx: 32768,
+    },
+    status: 'active',
+    providers: [],
+    created_by: admin.publicKey,
+    created_by_role: 'admin',
+    registered_at: makeTxKey(1),
+    updated_at: makeTxKey(1),
+    retired_at: null,
+  });
+  await storage.put(`modelref/${enclaveRegistration.model_id}`, {
+    model_id: enclaveRegistration.model_id,
+    price_ref_mu: {
+      in_per_1k: 20,
+      out_per_1k: 60,
+    },
+  });
+
+  const legacyPrice = await execute(
+    contract,
+    storage,
+    'setPrice',
+    {
+      ...priceSchedule,
+      enclave_id: legacyEnclaveId,
+    },
+    admin.publicKey,
+    2
+  );
+  assert.equal(legacyPrice.ok, true, legacyPrice.message);
+
+  const embeddingRegistration = {
+    ...enclaveRegistration,
+    enclave_id: 'c'.repeat(64),
+    model_id: 'admin/embed-small@fp16',
+    model_class: 'embedding',
+    artifact_root: 'd'.repeat(64),
+    manifest_hash: 'e'.repeat(64),
+    binary_hash: 'f'.repeat(64),
+    caps: {
+      embeddings: true,
+      ctx: 8192,
+    },
+  };
+  const registered = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    embeddingRegistration,
+    admin.publicKey,
+    3
+  );
+  assert.equal(registered.ok, true, registered.message);
+  assert.equal((await storage.get(`enclave/${embeddingRegistration.enclave_id}`)).value.model_class, 'embedding');
+
+  const modelRefResult = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      op: 'set_model_ref',
+      model_id: embeddingRegistration.model_id,
+      model_class: 'embedding',
+      price_ref_mu: {
+        in_per_1k: 2,
+        out_per_1k: 2,
+      },
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(modelRefResult.ok, true, modelRefResult.message);
+  assert.equal((await storage.get(`modelref/${embeddingRegistration.model_id}`)).value.model_class, 'embedding');
+});
+
+test('MayhemContract rejects unsupported model classes and mismatched model references', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  const unsupportedEnclave = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'b'.repeat(64),
+      model_class: 'provider-defined-magic',
+    },
+    admin.publicKey,
+    1
+  );
+  assert.match(unsupportedEnclave.message, /unsupported enclave model_class/i);
+
+  const unsupportedModelRef = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      ...modelRef,
+      model_class: 'provider-defined-magic',
+    },
+    admin.publicKey,
+    2
+  );
+  assert.match(unsupportedModelRef.message, /unsupported model reference model_class/i);
+
+  const registered = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'c'.repeat(64),
+      model_class: 'embedding',
+    },
+    admin.publicKey,
+    3
+  );
+  assert.equal(registered.ok, true, registered.message);
+  await storage.put(`modelref/${enclaveRegistration.model_id}`, {
+    model_id: enclaveRegistration.model_id,
+    model_class: 'text-generation',
+    price_ref_mu: {
+      in_per_1k: 20,
+      out_per_1k: 60,
+    },
+  });
+
+  const mismatchedPrice = await execute(
+    contract,
+    storage,
+    'setPrice',
+    {
+      ...priceSchedule,
+      enclave_id: 'c'.repeat(64),
+    },
+    admin.publicKey,
+    4
+  );
+  assert.match(mismatchedPrice.message, /model_class must match/i);
 });
 
 test('MayhemContract requires Hugging Face catalog anchors to use pinned revisions', async () => {
