@@ -1548,6 +1548,29 @@ pub fn apply_current_process_sandbox(config: &SandboxConfig) -> Result<()> {
     apply_platform_sandbox(config)
 }
 
+pub fn exec_sandboxed_child(config: &SandboxConfig, command: &[String]) -> Result<()> {
+    validate_sandbox_config(config)?;
+    if command.is_empty() {
+        return Err(EnclaveError::SandboxCommandEmpty);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        apply_current_process_sandbox(config)?;
+        Err(Command::new(&command[0]).args(&command[1..]).exec().into())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+        Err(EnclaveError::SandboxUnsupported(
+            "sandbox child exec is only implemented for Linux".to_owned(),
+        ))
+    }
+}
+
 pub fn probe_outbound_tcp(addr: &str, timeout: Duration) -> TcpProbeReport {
     let socket_addr = match addr
         .to_socket_addrs()
@@ -1855,10 +1878,20 @@ fn linux_seccomp_policy_document() -> String {
         "default_action": "allow",
         "match_action": "errno(EPERM)",
         "blocked_syscalls": [
-            { "syscall": "socket", "arg": "domain", "values": ["AF_INET", "AF_INET6", "AF_PACKET", "AF_NETLINK"] }
+            { "syscall": "socket", "arg": "domain", "values": ["AF_INET", "AF_INET6", "AF_PACKET", "AF_NETLINK"] },
+            { "syscall": "mount", "reason": "sealed store is remounted read-only before child exec" },
+            { "syscall": "umount2", "reason": "sealed store read-only mount must not be removed" },
+            { "syscall": "open_tree", "reason": "mount graph must not be rearranged after sandbox entry" },
+            { "syscall": "move_mount", "reason": "mount graph must not be rearranged after sandbox entry" },
+            { "syscall": "fsopen", "reason": "new mounts must not be created after sandbox entry" },
+            { "syscall": "fsconfig", "reason": "new mounts must not be configured after sandbox entry" },
+            { "syscall": "fsmount", "reason": "new mounts must not be created after sandbox entry" },
+            { "syscall": "fspick", "reason": "mount graph must not be rearranged after sandbox entry" },
+            { "syscall": "mount_setattr", "reason": "sealed store read-only mount attributes must remain stable" },
+            { "syscall": "pivot_root", "reason": "sealed store mount namespace must remain stable" }
         ],
         "fs": {
-            "sealed_store": "read-only enforced by sandbox-run permission guard; direct apply requires pre-existing read-only permissions",
+            "sealed_store": "read-only enforced by sandbox-run private mount namespace and bind remount; direct apply requires pre-existing read-only mount",
             "ipc_socket": "AF_UNIX only"
         }
     })
@@ -1910,13 +1943,7 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
 
     #[cfg(target_os = "linux")]
     {
-        let _sealed_store_guard =
-            linux_sandbox_fs::SealedStoreReadOnlyGuard::apply(&config.sealed_store_dir)?;
-        apply_current_process_sandbox(config)?;
-        Command::new(&command[0])
-            .args(&command[1..])
-            .status()
-            .map_err(EnclaveError::Io)
+        run_linux_mount_namespace_sandbox(config, command)
     }
 
     #[cfg(target_os = "windows")]
@@ -1934,6 +1961,66 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
             std::env::consts::OS.to_owned(),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_mount_namespace_sandbox(
+    config: &SandboxConfig,
+    command: &[String],
+) -> Result<ExitStatus> {
+    let sealed_store = linux_sandbox_fs::canonical_sealed_store_dir(&config.sealed_store_dir)?;
+    let current_exe = std::env::current_exe().map_err(EnclaveError::Io)?;
+    let mut helper = vec![
+        current_exe.to_string_lossy().to_string(),
+        "sandbox-exec-child".to_owned(),
+        "--sealed-store".to_owned(),
+        sealed_store.to_string_lossy().to_string(),
+        "--ipc-socket".to_owned(),
+        config.ipc_socket_path.to_string_lossy().to_string(),
+        "--".to_owned(),
+    ];
+    helper.extend_from_slice(command);
+
+    let status = run_linux_mount_namespace_attempt(&sealed_store, &helper, false)?;
+    if status.code() == Some(125) {
+        run_linux_mount_namespace_attempt(&sealed_store, &helper, true)
+    } else {
+        Ok(status)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_mount_namespace_attempt(
+    sealed_store: &Path,
+    command: &[String],
+    use_user_namespace: bool,
+) -> Result<ExitStatus> {
+    let mut process = Command::new("unshare");
+    if use_user_namespace {
+        process.arg("--user").arg("--map-root-user");
+    }
+    process
+        .arg("--mount")
+        .arg("--fork")
+        .arg("--propagation")
+        .arg("private")
+        .arg("--")
+        .arg("sh")
+        .arg("-eu")
+        .arg("-c")
+        .arg(
+            r#"store=$1
+shift
+mount --bind "$store" "$store" || exit 125
+mount -o remount,bind,ro "$store" || exit 125
+exec "$@"
+"#,
+        )
+        .arg("mayhem-sandbox-mount")
+        .arg(sealed_store)
+        .args(command)
+        .status()
+        .map_err(EnclaveError::Io)
 }
 
 fn apply_platform_sandbox(config: &SandboxConfig) -> Result<()> {
@@ -1978,52 +2065,44 @@ fn is_tcp_denied_error(err: &std::io::Error) -> bool {
 #[cfg(target_os = "linux")]
 mod linux_sandbox_fs {
     use super::{EnclaveError, Result};
-    use std::fs::{self, Permissions};
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
     use std::path::{Path, PathBuf};
 
-    pub struct SealedStoreReadOnlyGuard {
-        entries: Vec<(PathBuf, Permissions)>,
-    }
-
-    impl SealedStoreReadOnlyGuard {
-        pub fn apply(path: &Path) -> Result<Self> {
-            ensure_not_effective_root()?;
-            let mut entries = Vec::new();
-            collect_entries(path, &mut entries)?;
-            for (path, permissions) in &entries {
-                let mut read_only = permissions.clone();
-                read_only.set_mode(permissions.mode() & !0o222);
-                fs::set_permissions(path, read_only).map_err(EnclaveError::Io)?;
-            }
-            Ok(Self { entries })
-        }
-    }
-
-    impl Drop for SealedStoreReadOnlyGuard {
-        fn drop(&mut self) {
-            for (path, permissions) in self.entries.iter().rev() {
-                let _ = fs::set_permissions(path, permissions.clone());
-            }
-        }
-    }
-
     pub fn ensure_sealed_store_read_only(path: &Path) -> Result<()> {
-        ensure_not_effective_root()?;
-        let mut entries = Vec::new();
-        collect_entries(path, &mut entries)?;
-        for (path, permissions) in entries {
-            if permissions.mode() & 0o222 != 0 {
+        let canonical = canonical_sealed_store_dir(path)?;
+        let mounts = read_mountinfo()?;
+        let covering_mount = mounts
+            .iter()
+            .filter(|mount| canonical.starts_with(&mount.mount_point))
+            .max_by_key(|mount| mount.mount_point.as_os_str().len())
+            .ok_or_else(|| {
+                EnclaveError::InvalidInput(format!(
+                    "sealed store path {} is not covered by a Linux mount",
+                    canonical.display()
+                ))
+            })?;
+        if !covering_mount.read_only {
+            return Err(EnclaveError::InvalidInput(format!(
+                "sealed store path {} is covered by writable Linux mount {}",
+                canonical.display(),
+                covering_mount.mount_point.display()
+            )));
+        }
+        for mount in mounts.iter().filter(|mount| {
+            mount.mount_point != canonical && mount.mount_point.starts_with(&canonical)
+        }) {
+            if !mount.read_only {
                 return Err(EnclaveError::InvalidInput(format!(
-                    "sealed store path {} is writable before Linux seccomp apply",
-                    path.display()
+                    "sealed store path {} contains writable nested mount {}",
+                    canonical.display(),
+                    mount.mount_point.display()
                 )));
             }
         }
         Ok(())
     }
 
-    fn collect_entries(path: &Path, entries: &mut Vec<(PathBuf, Permissions)>) -> Result<()> {
+    pub fn canonical_sealed_store_dir(path: &Path) -> Result<PathBuf> {
         let metadata = fs::symlink_metadata(path).map_err(EnclaveError::Io)?;
         if metadata.file_type().is_symlink() {
             return Err(EnclaveError::InvalidInput(format!(
@@ -2031,43 +2110,103 @@ mod linux_sandbox_fs {
                 path.display()
             )));
         }
-        entries.push((path.to_path_buf(), metadata.permissions()));
+        if !metadata.is_dir() {
+            return Err(EnclaveError::InvalidInput(format!(
+                "sealed store path {} must be a directory",
+                path.display()
+            )));
+        }
+        reject_nested_symlinks(path)?;
+        fs::canonicalize(path).map_err(EnclaveError::Io)
+    }
+
+    fn reject_nested_symlinks(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path).map_err(EnclaveError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(EnclaveError::InvalidInput(format!(
+                "sealed store path {} must not contain symlinks",
+                path.display()
+            )));
+        }
         if metadata.is_dir() {
             for entry in fs::read_dir(path).map_err(EnclaveError::Io)? {
                 let entry = entry.map_err(EnclaveError::Io)?;
-                collect_entries(&entry.path(), entries)?;
+                reject_nested_symlinks(&entry.path())?;
             }
         }
         Ok(())
     }
 
-    fn ensure_not_effective_root() -> Result<()> {
-        if linux_effective_uid()? == 0 {
-            return Err(EnclaveError::InvalidInput(
-                "Linux sealed-store read-only sandbox enforcement requires a non-root provider process"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
+    #[derive(Debug)]
+    struct MountInfo {
+        mount_point: PathBuf,
+        read_only: bool,
     }
 
-    fn linux_effective_uid() -> Result<u32> {
-        let status = fs::read_to_string("/proc/self/status").map_err(EnclaveError::Io)?;
-        let uid_line = status
+    fn read_mountinfo() -> Result<Vec<MountInfo>> {
+        fs::read_to_string("/proc/self/mountinfo")
+            .map_err(EnclaveError::Io)?
             .lines()
-            .find(|line| line.starts_with("Uid:"))
-            .ok_or_else(|| {
-                EnclaveError::InvalidInput("missing Uid in /proc/self/status".to_owned())
-            })?;
-        let effective = uid_line
-            .split_whitespace()
-            .nth(2)
-            .ok_or_else(|| EnclaveError::InvalidInput("missing effective uid".to_owned()))?;
-        effective
-            .parse::<u32>()
-            .map_err(|err| EnclaveError::InvalidInput(format!("invalid effective uid: {err}")))
+            .map(parse_mountinfo_line)
+            .collect()
+    }
+
+    fn parse_mountinfo_line(line: &str) -> Result<MountInfo> {
+        let mut parts = line.split_whitespace();
+        let mount_point = parts.nth(4).ok_or_else(|| {
+            EnclaveError::InvalidInput("malformed /proc/self/mountinfo line".to_owned())
+        })?;
+        let options = parts.next().ok_or_else(|| {
+            EnclaveError::InvalidInput("malformed /proc/self/mountinfo options".to_owned())
+        })?;
+        Ok(MountInfo {
+            mount_point: decode_mountinfo_path(mount_point)?,
+            read_only: options.split(',').any(|option| option == "ro"),
+        })
+    }
+
+    fn decode_mountinfo_path(value: &str) -> Result<PathBuf> {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'\\' && index + 3 < bytes.len() {
+                let octal = &value[index + 1..index + 4];
+                if octal.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+                    let byte = u8::from_str_radix(octal, 8).map_err(|err| {
+                        EnclaveError::InvalidInput(format!("invalid mountinfo escape: {err}"))
+                    })?;
+                    decoded.push(byte);
+                    index += 4;
+                    continue;
+                }
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&decoded).into_owned(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn mountinfo_read_only_for_test(line: &str) -> Result<bool> {
+        Ok(parse_mountinfo_line(line)?.read_only)
+    }
+
+    #[cfg(test)]
+    pub(super) fn mountinfo_path_for_test(line: &str) -> Result<PathBuf> {
+        Ok(parse_mountinfo_line(line)?.mount_point)
+    }
+
+    #[cfg(test)]
+    pub(super) fn decode_mountinfo_path_for_test(value: &str) -> Result<PathBuf> {
+        decode_mountinfo_path(value)
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+mod linux_sandbox_fs {}
 
 fn validate_manifest_context(expected: &KeyContext, actual: &KeyContext) -> Result<()> {
     compare_context_field("provider_id", &expected.provider_id, &actual.provider_id)?;
@@ -2294,7 +2433,21 @@ mod linux {
             );
         }
 
-        let rules = BTreeMap::from([(libc::SYS_socket, socket_rules)]);
+        let mut rules = BTreeMap::from([(libc::SYS_socket, socket_rules)]);
+        for syscall in [
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_open_tree,
+            libc::SYS_move_mount,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_fspick,
+            libc::SYS_mount_setattr,
+            libc::SYS_pivot_root,
+        ] {
+            rules.insert(syscall, vec![always_deny_rule()?]);
+        }
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::Allow,
@@ -2304,6 +2457,17 @@ mod linux {
         .map_err(seccomp_error)?;
         let bpf: BpfProgram = filter.try_into().map_err(seccomp_error)?;
         seccompiler::apply_filter(&bpf).map_err(seccomp_error)
+    }
+
+    fn always_deny_rule() -> Result<SeccompRule> {
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::Ge,
+            0,
+        )
+        .map_err(seccomp_error)?])
+        .map_err(seccomp_error)
     }
 
     fn seccomp_error<E: std::fmt::Display>(err: E) -> EnclaveError {

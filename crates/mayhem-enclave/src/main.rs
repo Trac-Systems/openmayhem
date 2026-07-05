@@ -8,13 +8,13 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use mayhem_enclave::{
     boot_sealed_store, build_merkle_manifest, build_sandbox_profile,
-    build_tier1_attestation_report, build_tier2_attestation_report, expect_outbound_tcp_denied,
-    hex_secret, load_or_create_runtime_keypair_store, measure_binary, measure_current_binary,
-    prepare_tier2_hardware_quote_binding, probe_outbound_tcp, provider_signing_seed_from_hex,
-    run_sandboxed_command, seal_artifact, unix_timestamp_now, BootOptions, KeyContext,
-    RuntimeKeyContext, RuntimeKeypairStoreOptions, SandboxConfig, SandboxPlatform, SealOptions,
-    Tier1AttestationOptions, Tier2AttestationOptions, Tier2HardwareQuoteBindingOptions,
-    DEFAULT_CHUNK_SIZE, DEFAULT_TCP_PROBE_TIMEOUT_MS,
+    build_tier1_attestation_report, build_tier2_attestation_report, exec_sandboxed_child,
+    expect_outbound_tcp_denied, hex_secret, load_or_create_runtime_keypair_store, measure_binary,
+    measure_current_binary, prepare_tier2_hardware_quote_binding, probe_outbound_tcp,
+    provider_signing_seed_from_hex, run_sandboxed_command, seal_artifact, unix_timestamp_now,
+    BootOptions, KeyContext, RuntimeKeyContext, RuntimeKeypairStoreOptions, SandboxConfig,
+    SandboxPlatform, SealOptions, Tier1AttestationOptions, Tier2AttestationOptions,
+    Tier2HardwareQuoteBindingOptions, DEFAULT_CHUNK_SIZE, DEFAULT_TCP_PROBE_TIMEOUT_MS,
 };
 use mayhem_proto::{
     catalog_enclave_id, AttestationRuntimeConfig, CatalogEnclaveIdentity, HardwareQuote,
@@ -45,6 +45,8 @@ enum Commands {
     SandboxProfile(SandboxProfileArgs),
     /// Run a command under the current platform sandbox.
     SandboxRun(SandboxRunArgs),
+    #[command(hide = true, name = "sandbox-exec-child")]
+    SandboxExecChild(SandboxExecChildArgs),
     /// Probe whether outbound TCP is denied from this process.
     SandboxProbeTcp(SandboxProbeTcpArgs),
     /// Probe whether sealed-store writes are denied from this process.
@@ -315,6 +317,21 @@ struct SandboxRunArgs {
 }
 
 #[derive(Debug, Parser)]
+struct SandboxExecChildArgs {
+    /// Read-only sealed store directory.
+    #[arg(long, value_name = "PATH")]
+    sealed_store: PathBuf,
+
+    /// Local IPC socket/named-pipe path allowed through the sandbox.
+    #[arg(long, value_name = "PATH")]
+    ipc_socket: PathBuf,
+
+    /// Command and arguments to exec after applying child-only sandbox rules.
+    #[arg(required = true, trailing_var_arg = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
 struct SandboxProbeTcpArgs {
     /// TCP address to connect to, e.g. 127.0.0.1:12345.
     #[arg(long)]
@@ -343,6 +360,10 @@ struct SandboxProbeStoreWriteArgs {
     #[arg(long)]
     expect_denied: bool,
 
+    /// Try to restore owner write bits before probing the write path.
+    #[arg(long)]
+    attempt_restore_permissions: bool,
+
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
@@ -367,6 +388,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         Commands::Attest(args) => attest(*args)?,
         Commands::SandboxProfile(args) => sandbox_profile(args)?,
         Commands::SandboxRun(args) => return sandbox_run(args),
+        Commands::SandboxExecChild(args) => return sandbox_exec_child(args),
         Commands::SandboxProbeTcp(args) => sandbox_probe_tcp(args)?,
         Commands::SandboxProbeStoreWrite(args) => sandbox_probe_store_write(args)?,
     }
@@ -618,6 +640,12 @@ fn sandbox_run(args: SandboxRunArgs) -> Result<i32, Box<dyn std::error::Error>> 
         .unwrap_or(if report.success { 0 } else { 1 }))
 }
 
+fn sandbox_exec_child(args: SandboxExecChildArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let config = SandboxConfig::new(args.sealed_store, args.ipc_socket);
+    exec_sandboxed_child(&config, &args.command)?;
+    Ok(1)
+}
+
 fn sandbox_probe_tcp(args: SandboxProbeTcpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_millis(args.timeout_ms);
     let report = if args.expect_denied {
@@ -655,6 +683,23 @@ fn sandbox_probe_store_write(
     let mut denied = false;
     let mut error_kind = None;
     let mut raw_os_error = None;
+    let mut restore_succeeded = false;
+    let mut restore_denied = false;
+    let mut restore_error_kind = None;
+    let mut restore_raw_os_error = None;
+
+    if args.attempt_restore_permissions {
+        match try_restore_sealed_store_permissions(&args.sealed_store) {
+            Ok(()) => {
+                restore_succeeded = true;
+            }
+            Err(err) => {
+                restore_denied = fs_denied_error(&err);
+                restore_error_kind = Some(format!("{:?}", err.kind()));
+                restore_raw_os_error = err.raw_os_error();
+            }
+        }
+    }
 
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
@@ -663,8 +708,7 @@ fn sandbox_probe_store_write(
             let _ = fs::remove_file(&path);
         }
         Err(err) => {
-            denied = err.kind() == std::io::ErrorKind::PermissionDenied
-                || matches!(err.raw_os_error(), Some(1 | 13 | 30));
+            denied = fs_denied_error(&err);
             error_kind = Some(format!("{:?}", err.kind()));
             raw_os_error = err.raw_os_error();
         }
@@ -683,6 +727,11 @@ fn sandbox_probe_store_write(
         "denied": denied,
         "error_kind": error_kind,
         "raw_os_error": raw_os_error,
+        "restore_attempted": args.attempt_restore_permissions,
+        "restore_succeeded": restore_succeeded,
+        "restore_denied": restore_denied,
+        "restore_error_kind": restore_error_kind,
+        "restore_raw_os_error": restore_raw_os_error,
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -700,6 +749,29 @@ fn sandbox_probe_store_write(
         );
     }
     Ok(())
+}
+
+fn fs_denied_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(1 | 13 | 30))
+}
+
+fn try_restore_sealed_store_permissions(path: &PathBuf) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o700);
+        fs::set_permissions(path, permissions)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)
+    }
 }
 
 fn boot_check(args: BootCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
