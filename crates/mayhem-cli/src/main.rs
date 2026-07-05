@@ -41,7 +41,7 @@ use mayhem_gateway::{
         ScBridgeGatewaySessionConfig,
     },
     rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
-    RateMapEntry, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
+    RateMapEntry, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
@@ -169,6 +169,10 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ProviderCommands {
+    /// List this provider wallet's active canonical enclaves and rooms.
+    List(ProviderListArgs),
+    /// Show provider serving state and local gateway route visibility.
+    Health(ProviderHealthArgs),
     /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
     Start(Box<ProviderStartArgs>),
     /// Register if needed, then join an existing admin-created enclave and canonical rooms.
@@ -2813,6 +2817,53 @@ struct ProviderTxArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderReadArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Gateway base URL for route/health visibility. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted provider keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Provider public key to inspect. Defaults to the local provider wallet public key.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderListArgs {
+    #[command(flatten)]
+    read: ProviderReadArgs,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderHealthArgs {
+    #[command(flatten)]
+    read: ProviderReadArgs,
+
+    /// Maximum seconds for gateway HTTP checks.
+    #[arg(long, default_value_t = 5)]
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderJoinArgs {
     #[command(flatten)]
     tx: ProviderTxArgs,
@@ -3149,6 +3200,8 @@ async fn main() -> Result<()> {
             CatalogCommands::CanaryPlan(args) => catalog_canary_plan(args),
         },
         Commands::Provider { command } => match *command {
+            ProviderCommands::List(args) => provider_list(args).await,
+            ProviderCommands::Health(args) => provider_health(args).await,
             ProviderCommands::Start(args) => provider_start(*args).await,
             ProviderCommands::Join(args) => provider_join(args).await,
             ProviderCommands::Leave(args) => provider_leave(args).await,
@@ -15905,6 +15958,12 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     } else {
         "heartbeats_flowing"
     };
+    let heartbeat_cache = write_provider_heartbeat_cache(
+        &home,
+        &wallet.public_key,
+        &selected.enclave.enclave_id,
+        &heartbeats,
+    )?;
     let report = json!({
         "status": heartbeat_status,
         "home": home,
@@ -15938,6 +15997,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         },
         "rules": &rules,
         "rooms": rooms.clone(),
+        "local_heartbeat_cache": heartbeat_cache,
         "features": {
             "provider": provider_feature,
             "serve": serve_feature,
@@ -16001,6 +16061,125 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+struct ProviderReadContext {
+    home: PathBuf,
+    rpc_url: String,
+    gateway_url: String,
+    rpc: PeerRpcClient,
+    provider: String,
+    wallet: Value,
+    config_present: bool,
+}
+
+async fn provider_read_context(args: &ProviderReadArgs) -> Result<ProviderReadContext> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let gateway_url = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let (provider, wallet) = if let Some(provider) = args.provider.clone() {
+        (provider, Value::Null)
+    } else {
+        let wallet = resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            args.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await
+        .context("resolving provider wallet")?;
+        (
+            wallet.public_key.clone(),
+            json!({
+                "public_key": wallet.public_key,
+                "address": wallet.address,
+                "keypair_path": wallet.keypair_path,
+            }),
+        )
+    };
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    Ok(ProviderReadContext {
+        home,
+        rpc_url,
+        gateway_url,
+        rpc,
+        provider,
+        wallet,
+        config_present: config.is_some(),
+    })
+}
+
+async fn provider_list(args: ProviderListArgs) -> Result<()> {
+    let ctx = provider_read_context(&args.read).await?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let report = json!({
+        "ok": true,
+        "action": "provider.list",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "config_present": ctx.config_present,
+        "provider": &ctx.provider,
+        "wallet": ctx.wallet,
+        "ledger": provider_list_summary(&contract, &ctx.provider),
+    });
+    print_provider_list_report(&report, args.read.json)
+}
+
+async fn provider_health(args: ProviderHealthArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    let ctx = provider_read_context(&args.read).await?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let ledger = provider_list_summary(&contract, &ctx.provider);
+    let heartbeat = read_provider_heartbeat_cache(&ctx.home, &ctx.provider);
+    let heartbeat_live = heartbeat.get("live").and_then(Value::as_bool) == Some(true);
+    let active_serves = ledger["active_serves"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(args.timeout_seconds))
+        .build()?;
+    let gateway_status =
+        fetch_gateway_json(&client, &format!("{}/mayhem/status", ctx.gateway_url)).await;
+    let gateway_status_ok = gateway_status.is_ok();
+    let gateway_status = gateway_status.unwrap_or_else(component_error);
+    let gateway_models = fetch_gateway_models(&client, &ctx.gateway_url).await;
+    let (gateway_models_ok, gateway_routes) = match gateway_models {
+        Ok(models) => (
+            true,
+            Value::Array(provider_gateway_route_summaries(&models, &ctx.provider)),
+        ),
+        Err(err) => (false, component_error(err)),
+    };
+    let gateway_route_count = gateway_routes.as_array().map(Vec::len).unwrap_or(0);
+    let gateway_ok = gateway_status_ok && gateway_models_ok;
+    let report = json!({
+        "ok": active_serves > 0 && heartbeat_live && gateway_ok && gateway_route_count > 0,
+        "action": "provider.health",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "config_present": ctx.config_present,
+        "provider": &ctx.provider,
+        "wallet": ctx.wallet,
+        "ledger": ledger,
+        "serving": {
+            "status": if active_serves > 0 { "active" } else { "not_serving" },
+            "active_enclaves": active_serves,
+        },
+        "heartbeat": heartbeat,
+        "gateway": {
+            "ok": gateway_ok,
+            "url": ctx.gateway_url,
+            "status": gateway_status,
+            "routes": gateway_routes,
+            "route_count": gateway_route_count,
+        },
+    });
+    print_provider_health_report(&report, args.read.json)
 }
 
 struct ProviderTxContext {
@@ -16670,6 +16849,318 @@ async fn read_active_provider_serves(
         .collect::<Vec<_>>();
     serves.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
     Ok(serves)
+}
+
+fn provider_heartbeat_cache_path(home: &Path, provider: &str) -> PathBuf {
+    home.join("provider")
+        .join("heartbeats")
+        .join(format!("{provider}.json"))
+}
+
+fn write_provider_heartbeat_cache(
+    home: &Path,
+    provider: &str,
+    enclave_id: &str,
+    heartbeats: &[Value],
+) -> Result<Value> {
+    if heartbeats.is_empty() {
+        return Ok(Value::Null);
+    }
+    let path = provider_heartbeat_cache_path(home, provider);
+    let updated_at_ms = unix_epoch_millis()?;
+    let cache = json!({
+        "provider": provider,
+        "enclave_id": enclave_id,
+        "updated_at_ms": updated_at_ms,
+        "heartbeat_count": heartbeats.len(),
+        "heartbeats": heartbeats,
+    });
+    write_json_file(&path, &cache)?;
+    Ok(json!({
+        "ok": true,
+        "path": path,
+        "updated_at_ms": updated_at_ms,
+        "heartbeat_count": heartbeats.len(),
+    }))
+}
+
+fn read_provider_heartbeat_cache(home: &Path, provider: &str) -> Value {
+    let path = provider_heartbeat_cache_path(home, provider);
+    match read_json_file(&path) {
+        Ok(cache) => {
+            let updated_at_ms = cache
+                .get("updated_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let age_ms = unix_epoch_millis()
+                .ok()
+                .map(|now| now.saturating_sub(updated_at_ms));
+            let live = age_ms
+                .map(|age| age <= DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS)
+                .unwrap_or(false);
+            json!({
+                "ok": true,
+                "path": path,
+                "live": live,
+                "updated_at_ms": updated_at_ms,
+                "age_ms": age_ms,
+                "ttl_ms": DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+                "cache": cache,
+            })
+        }
+        Err(err) => json!({
+            "ok": false,
+            "path": path,
+            "live": false,
+            "ttl_ms": DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+            "error": err.to_string(),
+        }),
+    }
+}
+
+fn active_provider_serves_from_contract(
+    contract: &ContractCatalog,
+    provider: &str,
+) -> Vec<LedgerServe> {
+    let mut serves = contract
+        .serves
+        .iter()
+        .filter(|serve| serve.provider == provider && serve.status == "active")
+        .cloned()
+        .collect::<Vec<_>>();
+    serves.sort_by(|a, b| {
+        a.enclave_id
+            .cmp(&b.enclave_id)
+            .then_with(|| a.model_id.cmp(&b.model_id))
+    });
+    serves
+}
+
+fn active_provider_roomserves_from_contract(
+    contract: &ContractCatalog,
+    provider: &str,
+) -> Vec<LedgerRoomServe> {
+    let mut rows = contract
+        .roomserve
+        .iter()
+        .filter(|row| row.provider == provider && row.status == "active")
+        .cloned()
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        a.enclave_id
+            .cmp(&b.enclave_id)
+            .then_with(|| a.room_id.cmp(&b.room_id))
+    });
+    rows
+}
+
+fn provider_list_summary(contract: &ContractCatalog, provider: &str) -> Value {
+    let active_serves = active_provider_serves_from_contract(contract, provider);
+    let active_rooms = active_provider_roomserves_from_contract(contract, provider);
+    let provider_record = contract
+        .providers
+        .iter()
+        .find(|record| record.provider == provider)
+        .cloned();
+    let kyb = contract
+        .kyb
+        .iter()
+        .find(|record| record.provider == provider)
+        .cloned();
+    let serves = active_serves
+        .iter()
+        .map(|serve| provider_serve_summary(contract, serve, &active_rooms))
+        .collect::<Vec<_>>();
+    let rooms = active_rooms
+        .iter()
+        .map(|row| provider_roomserve_summary(contract, row))
+        .collect::<Vec<_>>();
+    json!({
+        "provider": provider,
+        "provider_record": provider_record,
+        "kyb": kyb,
+        "active_serves": serves,
+        "active_rooms": rooms,
+        "stop_plan": {
+            "rooms": active_rooms,
+            "enclaves": active_serves,
+        },
+    })
+}
+
+fn provider_serve_summary(
+    contract: &ContractCatalog,
+    serve: &LedgerServe,
+    active_rooms: &[LedgerRoomServe],
+) -> Value {
+    let enclave = contract
+        .enclaves
+        .iter()
+        .find(|enclave| enclave.enclave_id == serve.enclave_id)
+        .cloned();
+    let price = contract
+        .prices
+        .iter()
+        .find(|price| price.enclave_id == serve.enclave_id)
+        .cloned();
+    let rooms = active_rooms
+        .iter()
+        .filter(|row| row.enclave_id == serve.enclave_id && row.provider == serve.provider)
+        .map(|row| provider_roomserve_summary(contract, row))
+        .collect::<Vec<_>>();
+    let room_count = rooms.len();
+    json!({
+        "provider": &serve.provider,
+        "enclave_id": &serve.enclave_id,
+        "model_id": &serve.model_id,
+        "status": &serve.status,
+        "rooms": rooms,
+        "room_count": room_count,
+        "enclave": enclave,
+        "price": price,
+    })
+}
+
+fn provider_roomserve_summary(contract: &ContractCatalog, row: &LedgerRoomServe) -> Value {
+    let room = contract
+        .rooms
+        .iter()
+        .find(|room| room.room_id == row.room_id)
+        .cloned();
+    json!({
+        "room_id": &row.room_id,
+        "provider": &row.provider,
+        "enclave_id": &row.enclave_id,
+        "model_id": &row.model_id,
+        "status": &row.status,
+        "room": room,
+    })
+}
+
+fn provider_gateway_route_summaries(models: &[Value], provider: &str) -> Vec<Value> {
+    let mut routes = Vec::new();
+    for model in models {
+        let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
+        let mayhem = model.get("mayhem").unwrap_or(&Value::Null);
+        let providers_online = mayhem
+            .get("providers_online")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let rooms = mayhem.get("rooms").and_then(Value::as_u64).unwrap_or(0);
+        for candidate in mayhem
+            .get("route_candidates")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if candidate.get("provider").and_then(Value::as_str) == Some(provider) {
+                routes.push(json!({
+                    "model_id": model_id,
+                    "providers_online": providers_online,
+                    "rooms": rooms,
+                    "provider": candidate.get("provider").cloned().unwrap_or(Value::Null),
+                    "enclave_id": candidate.get("enclave_id").cloned().unwrap_or(Value::Null),
+                    "room_id": candidate.get("room_id").cloned().unwrap_or(Value::Null),
+                    "price_ver": candidate.get("price_ver").cloned().unwrap_or(Value::Null),
+                    "att_tier": candidate.get("att_tier").cloned().unwrap_or(Value::Null),
+                    "kyb": candidate.get("kyb").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+    }
+    routes.sort_by(|a, b| {
+        let left = (
+            a.get("model_id").and_then(Value::as_str).unwrap_or(""),
+            a.get("enclave_id").and_then(Value::as_str).unwrap_or(""),
+            a.get("room_id").and_then(Value::as_str).unwrap_or(""),
+        );
+        let right = (
+            b.get("model_id").and_then(Value::as_str).unwrap_or(""),
+            b.get("enclave_id").and_then(Value::as_str).unwrap_or(""),
+            b.get("room_id").and_then(Value::as_str).unwrap_or(""),
+        );
+        left.cmp(&right)
+    });
+    routes
+}
+
+fn print_provider_list_report(report: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Provider: {}", report["provider"].as_str().unwrap_or(""));
+    print_provider_list_rows(&report["ledger"]);
+    Ok(())
+}
+
+fn print_provider_health_report(report: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Provider health: {}",
+        if report["ok"].as_bool() == Some(true) {
+            "healthy"
+        } else {
+            "degraded"
+        }
+    );
+    println!("Provider: {}", report["provider"].as_str().unwrap_or(""));
+    print_provider_list_rows(&report["ledger"]);
+    println!(
+        "Heartbeat: {}",
+        if report["heartbeat"]["live"].as_bool() == Some(true) {
+            "live"
+        } else {
+            report["heartbeat"]["error"].as_str().unwrap_or("stale")
+        }
+    );
+    println!(
+        "Gateway: {}",
+        if report["gateway"]["ok"].as_bool() == Some(true) {
+            "ok"
+        } else {
+            report["gateway"]["status"]["error"]
+                .as_str()
+                .or_else(|| report["gateway"]["routes"]["error"].as_str())
+                .unwrap_or("degraded")
+        }
+    );
+    println!(
+        "Gateway routes visible: {}",
+        report["gateway"]["route_count"].as_u64().unwrap_or(0)
+    );
+    Ok(())
+}
+
+fn print_provider_list_rows(ledger: &Value) {
+    let serves = ledger["active_serves"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let rooms = ledger["active_rooms"].as_array().map(Vec::len).unwrap_or(0);
+    println!("Active enclaves: {serves}");
+    for serve in ledger["active_serves"].as_array().into_iter().flatten() {
+        println!(
+            "- {} model={} rooms={} status={}",
+            serve["enclave_id"].as_str().unwrap_or(""),
+            serve["model_id"].as_str().unwrap_or(""),
+            serve["room_count"].as_u64().unwrap_or(0),
+            serve["status"].as_str().unwrap_or("")
+        );
+    }
+    println!("Active rooms: {rooms}");
+    for room in ledger["active_rooms"].as_array().into_iter().flatten() {
+        println!(
+            "- {} model={} enclave={} status={}",
+            room["room_id"].as_str().unwrap_or(""),
+            room["model_id"].as_str().unwrap_or(""),
+            room["enclave_id"].as_str().unwrap_or(""),
+            room["status"].as_str().unwrap_or("")
+        );
+    }
 }
 
 fn print_provider_lifecycle_report(report: &Value, json_output: bool) -> Result<()> {
@@ -22084,6 +22575,98 @@ mod tests {
     }
 
     #[test]
+    fn provider_list_summary_matches_stop_plan_and_gateway_routes() {
+        let root = "aa".repeat(32);
+        let contract = test_contract(&root);
+        let provider = "55".repeat(32);
+        let summary = provider_list_summary(&contract, &provider);
+
+        assert_eq!(summary["provider"].as_str(), Some(provider.as_str()));
+        assert_eq!(summary["active_serves"].as_array().map(Vec::len), Some(1));
+        assert_eq!(summary["active_rooms"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            summary["stop_plan"]["enclaves"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            summary["stop_plan"]["rooms"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            summary["active_serves"][0]["enclave_id"].as_str(),
+            Some("11".repeat(32).as_str())
+        );
+        assert_eq!(summary["active_serves"][0]["room_count"].as_u64(), Some(1));
+        assert_eq!(
+            summary["active_rooms"][0]["room_id"].as_str(),
+            Some("aa".repeat(16).as_str())
+        );
+
+        let models = gateway_models_from_contract(&contract)
+            .unwrap()
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let routes = provider_gateway_route_summaries(&models, &provider);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["provider"].as_str(), Some(provider.as_str()));
+        assert_eq!(routes[0]["model_id"].as_str(), Some("test/model@4bit"));
+
+        let inactive = provider_list_summary(&contract, &"66".repeat(32));
+        assert_eq!(inactive["active_serves"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            inactive["stop_plan"]["rooms"].as_array().map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn provider_heartbeat_cache_reports_live_and_stale() {
+        let temp = test_temp_dir("mayhem-provider-heartbeat-cache");
+        let provider = "55".repeat(32);
+        let enclave = "11".repeat(32);
+        let written = write_provider_heartbeat_cache(
+            &temp,
+            &provider,
+            &enclave,
+            &[json!({
+                "t": "hb",
+                "provider": &provider,
+                "enclave_id": &enclave,
+                "room_id": "aa".repeat(16),
+            })],
+        )
+        .unwrap();
+        assert_eq!(written["ok"].as_bool(), Some(true));
+
+        let live = read_provider_heartbeat_cache(&temp, &provider);
+        assert_eq!(live["ok"].as_bool(), Some(true));
+        assert_eq!(live["live"].as_bool(), Some(true));
+        assert_eq!(
+            live["ttl_ms"].as_u64(),
+            Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS)
+        );
+
+        let path = provider_heartbeat_cache_path(&temp, &provider);
+        write_json_file(
+            &path,
+            &json!({
+                "provider": &provider,
+                "enclave_id": &enclave,
+                "updated_at_ms": 1,
+                "heartbeat_count": 1,
+                "heartbeats": [],
+            }),
+        )
+        .unwrap();
+        let stale = read_provider_heartbeat_cache(&temp, &provider);
+        assert_eq!(stale["live"].as_bool(), Some(false));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_lifecycle_cli_parses_join_leave_and_room_commands() {
         let join = Cli::try_parse_from([
             "mayhem",
@@ -22130,6 +22713,43 @@ mod tests {
         };
         assert_eq!(args.room, "room-a");
         assert_eq!(args.enclave, "enclave-a");
+
+        let list =
+            Cli::try_parse_from(["mayhem", "provider", "list", "--provider", "55", "--json"])
+                .unwrap();
+        let Commands::Provider { command } = list.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::List(args) = *command else {
+            panic!("expected provider list command");
+        };
+        assert_eq!(args.read.provider.as_deref(), Some("55"));
+        assert!(args.read.json);
+
+        let health = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "health",
+            "--provider",
+            "55",
+            "--gateway-url",
+            "http://127.0.0.1:11435",
+            "--timeout-seconds",
+            "2",
+        ])
+        .unwrap();
+        let Commands::Provider { command } = health.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Health(args) = *command else {
+            panic!("expected provider health command");
+        };
+        assert_eq!(args.read.provider.as_deref(), Some("55"));
+        assert_eq!(
+            args.read.gateway_url.as_deref(),
+            Some("http://127.0.0.1:11435")
+        );
+        assert_eq!(args.timeout_seconds, 2);
     }
 
     #[test]
