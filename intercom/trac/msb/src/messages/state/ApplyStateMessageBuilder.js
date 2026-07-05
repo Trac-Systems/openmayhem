@@ -28,6 +28,8 @@ import { isHexString } from '../../utils/helpers.js';
 class ApplyStateMessageBuilder {
     #address;
     #amount;
+    #batchAmount;
+    #batchOutputs;
     #channel;
     #config
     #contentHash;
@@ -159,6 +161,19 @@ class ApplyStateMessageBuilder {
         return this;
     }
 
+    setBatchOutputs(outputs) {
+        this.#batchOutputs = this.#normalizeVariableBuffer(outputs, 'Batch outputs');
+        if (this.#batchOutputs.length === 0) {
+            throw new Error('Batch outputs must be non-empty.');
+        }
+        return this;
+    }
+
+    setBatchAmount(amount) {
+        this.#batchAmount = this.#normalizeHexBuffer(amount, 16, 'Batch amount');
+        return this;
+    }
+
     #requireFields(fields) {
         for (const [value, name] of fields) {
             if (!value) {
@@ -240,6 +255,17 @@ class ApplyStateMessageBuilder {
         throw new Error(`${fieldName} must be a ${expectedBytes}-byte buffer or ${expectedBytes * 2}-length hexstring.`);
     }
 
+    #normalizeVariableBuffer(value, fieldName) {
+        if (b4a.isBuffer(value)) return value;
+        if (typeof value === 'string') {
+            if (!isHexString(value) || value.length === 0 || value.length % 2 !== 0) {
+                throw new Error(`${fieldName} must be a non-empty even-length hexstring.`);
+            }
+            return b4a.from(value, 'hex');
+        }
+        throw new Error(`${fieldName} must be a Buffer or hexstring.`);
+    }
+
     #normalizeAddress(address) {
         if (b4a.isBuffer(address)) {
             const addr = bufferToAddress(address, this.#config.addressPrefix);
@@ -311,19 +337,35 @@ class ApplyStateMessageBuilder {
                 );
                 break;
             case OperationType.TRANSFER:
-                this.#requireFields([
-                    [this.#txValidity, 'Transaction validity'],
-                    [this.#incomingAddress, 'Incoming address'],
-                    [this.#amount, 'Amount']
-                ]);
-                msg = createMessage(
-                    this.#config.networkId,
-                    this.#txValidity,
-                    this.#incomingAddress,
-                    this.#amount,
-                    nonce,
-                    OperationType.TRANSFER
-                );
+                if (this.#batchOutputs || this.#batchAmount) {
+                    this.#requireFields([
+                        [this.#txValidity, 'Transaction validity'],
+                        [this.#batchOutputs, 'Batch outputs'],
+                        [this.#batchAmount, 'Batch amount']
+                    ]);
+                    msg = createMessage(
+                        this.#config.networkId,
+                        this.#txValidity,
+                        this.#batchOutputs,
+                        this.#batchAmount,
+                        nonce,
+                        OperationType.TRANSFER
+                    );
+                } else {
+                    this.#requireFields([
+                        [this.#txValidity, 'Transaction validity'],
+                        [this.#incomingAddress, 'Incoming address'],
+                        [this.#amount, 'Amount']
+                    ]);
+                    msg = createMessage(
+                        this.#config.networkId,
+                        this.#txValidity,
+                        this.#incomingAddress,
+                        this.#amount,
+                        nonce,
+                        OperationType.TRANSFER
+                    );
+                }
                 break;
             default:
                 throw new Error(`Unsupported operation type: ${this.#operationType}`);
@@ -364,6 +406,16 @@ class ApplyStateMessageBuilder {
             };
         }
         if (isTransfer(this.#operationType)) {
+            if (this.#batchOutputs || this.#batchAmount) {
+                return {
+                    tx,
+                    txv: this.#txValidity,
+                    bo: this.#batchOutputs,
+                    ba: this.#batchAmount,
+                    in: nonce,
+                    is: signature
+                };
+            }
             return {
                 tx,
                 txv: this.#txValidity,
@@ -484,14 +536,25 @@ class ApplyStateMessageBuilder {
                 );
                 break;
             case OperationType.TRANSFER:
-                this.#requireFields([
-                    [this.#txHash, 'Transaction hash'],
-                    [this.#txValidity, 'Transaction validity'],
-                    [this.#incomingAddress, 'Incoming address'],
-                    [this.#amount, 'Amount'],
-                    [this.#incomingNonce, 'Incoming nonce'],
-                    [this.#incomingSignature, 'Incoming signature']
-                ]);
+                if (this.#batchOutputs || this.#batchAmount) {
+                    this.#requireFields([
+                        [this.#txHash, 'Transaction hash'],
+                        [this.#txValidity, 'Transaction validity'],
+                        [this.#batchOutputs, 'Batch outputs'],
+                        [this.#batchAmount, 'Batch amount'],
+                        [this.#incomingNonce, 'Incoming nonce'],
+                        [this.#incomingSignature, 'Incoming signature']
+                    ]);
+                } else {
+                    this.#requireFields([
+                        [this.#txHash, 'Transaction hash'],
+                        [this.#txValidity, 'Transaction validity'],
+                        [this.#incomingAddress, 'Incoming address'],
+                        [this.#amount, 'Amount'],
+                        [this.#incomingNonce, 'Incoming nonce'],
+                        [this.#incomingSignature, 'Incoming signature']
+                    ]);
+                }
                 msg = createMessage(
                     this.#config.networkId,
                     this.#txHash,
@@ -566,6 +629,19 @@ class ApplyStateMessageBuilder {
             };
         }
         if (isTransfer(this.#operationType)) {
+            if (this.#batchOutputs || this.#batchAmount) {
+                return {
+                    tx: this.#txHash,
+                    txv: this.#txValidity,
+                    bo: this.#batchOutputs,
+                    ba: this.#batchAmount,
+                    in: this.#incomingNonce,
+                    is: this.#incomingSignature,
+                    va: validatorAddress,
+                    vn: nonce,
+                    vs: signature
+                };
+            }
             return {
                 tx: this.#txHash,
                 txv: this.#txValidity,
@@ -641,6 +717,19 @@ class ApplyStateMessageBuilder {
                     }
                 };
             case 'tro':
+                if (body.bo || body.ba) {
+                    return {
+                        ...base,
+                        tro: {
+                            tx: toHex(body.tx),
+                            txv: toHex(body.txv),
+                            bo: toHex(body.bo),
+                            ba: toHex(body.ba),
+                            in: toHex(body.in),
+                            is: toHex(body.is)
+                        }
+                    };
+                }
                 return {
                     ...base,
                     tro: {

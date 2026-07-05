@@ -15316,18 +15316,33 @@ async fn run_msb_transfer_helper<T>(args: Vec<String>) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/msb-transfer-helper.mjs");
-    let output = Command::new("node")
-        .arg(&helper)
-        .args(args)
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .context("resolving repository root for MSB transfer helper")?;
+    let msb_app = repo_root.join("intercom/trac/msb");
+    let pear = env::var_os("MAYHEM_PEAR_BIN").unwrap_or_else(|| "pear".into());
+    let mut helper_args = vec!["--transfer-helper".to_owned()];
+    helper_args.extend(args);
+    let output = Command::new(&pear)
+        .arg("run")
+        .arg("--no-ask")
+        .arg(&msb_app)
+        .args(helper_args)
         .output()
         .await
-        .with_context(|| format!("running MSB transfer helper {}", helper.display()))?;
+        .with_context(|| {
+            format!(
+                "running MSB transfer helper via Pear app {}",
+                msb_app.display()
+            )
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "MSB transfer helper failed: {}{}{}",
+            "MSB transfer helper failed via Pear: {}{}{}",
             stderr.trim(),
             if stderr.trim().is_empty() || stdout.trim().is_empty() {
                 ""
@@ -15337,7 +15352,7 @@ where
             stdout.trim()
         );
     }
-    serde_json::from_slice(&output.stdout).context("parsing MSB transfer helper JSON output")
+    serde_json::from_slice(&output.stdout).context("parsing Pear MSB transfer helper JSON output")
 }
 
 #[derive(Debug)]

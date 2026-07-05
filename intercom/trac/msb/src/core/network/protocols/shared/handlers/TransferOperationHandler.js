@@ -39,8 +39,18 @@ class TransferOperationHandler extends BaseOperationHandler {
             throw new Error("TransferHandler: Transfer validation failed.");
         }
 
-        const completeTransferOperation = await applyStateMessageFactory(this.#wallet, this.#config)
-            .buildCompleteTransferOperationMessage(
+        const factory = applyStateMessageFactory(this.#wallet, this.#config);
+        const completeTransferOperation = normalizedPayload.tro.bo
+            ? await factory.buildCompleteBatchTransferOperationMessage(
+                normalizedPayload.address,
+                normalizedPayload.tro.tx,
+                normalizedPayload.tro.txv,
+                normalizedPayload.tro.in,
+                normalizedPayload.tro.bo,
+                normalizedPayload.tro.ba,
+                normalizedPayload.tro.is
+            )
+            : await factory.buildCompleteTransferOperationMessage(
                 normalizedPayload.address,
                 normalizedPayload.tro.tx,
                 normalizedPayload.tro.txv,
@@ -48,7 +58,7 @@ class TransferOperationHandler extends BaseOperationHandler {
                 normalizedPayload.tro.to,
                 normalizedPayload.tro.am,
                 normalizedPayload.tro.is
-            )
+            );
 
         this.#txPoolService.addTransaction(safeEncodeApplyOperation(completeTransferOperation));
     }

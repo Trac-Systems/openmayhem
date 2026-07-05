@@ -10,6 +10,7 @@ import transferSelfTransferZeroAmountScenario from './transferSelfTransferZeroAm
 import transferDoubleSpendAcrossValidatorsScenario from './transferDoubleSpendAcrossValidatorsScenario.js';
 import transferDoubleSpendSameBatchScenario from './transferDoubleSpendSameBatchScenario.js';
 import transferDoubleSpendSingleValidatorScenario from './transferDoubleSpendSingleValidatorScenario.js';
+import transferBatchAmountScenario from './transferBatchAmountScenario.js';
 import transferContractSchemaValidationScenario from './transferContractSchemaValidationScenario.js';
 import transferHandlerGuardScenarios from './transferHandlerGuardScenarios.js';
 import transferInvalidIncomingDataScenario from './transferInvalidIncomingDataScenario.js';
@@ -137,6 +138,12 @@ transferDoubleSpendSingleValidatorScenario();
  * First applies (sender -(am+fee), recipient2 +am, validator +75% fee). Second skipped (recipient3 untouched, no extra reward, hash absent).
  */
 transferDoubleSpendSameBatchScenario();
+
+/*
+ * Batch transfer
+ * Sender pays the sum of all batch outputs plus one fee, multiple recipients are credited, validator receives one 75% fee reward, tx hash recorded once.
+ */
+transferBatchAmountScenario();
 
 // Handler validation order (transfer)
 transferContractSchemaValidationScenario();

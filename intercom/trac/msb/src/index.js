@@ -22,6 +22,7 @@ import {
 } from "./utils/constants.js";
 import { randomBytes } from "hypercore-crypto";
 import { decimalStringToBigInt, bigIntTo16ByteBuffer, bufferToBigInt, bigIntToDecimalString } from "./utils/amountSerialization.js"
+import { encodeTransferBatchOutputs } from "./utils/transferBatch.js";
 import fileUtils from './utils/fileUtils.js';
 import migrationUtils from './utils/migrationUtils.js';
 import {
@@ -768,6 +769,69 @@ export class MainSettlementBus extends ReadyResource {
 
     }
 
+    async #handleBatchTransferOperation(outputsJson) {
+        if (!this.#config.enableWallet) {
+            throw new Error(
+                "Can not perform batch transfer - wallet is not enabled."
+            );
+        }
+
+        if (!this.#wallet) {
+            throw new Error(
+                "Can not perform batch transfer - wallet is not initialized."
+            );
+        }
+
+        let outputs;
+        try {
+            outputs = JSON.parse(outputsJson);
+        } catch (error) {
+            throw new Error(`Invalid batch transfer JSON: ${error.message}`);
+        }
+        const batch = encodeTransferBatchOutputs(outputs, this.#config);
+
+        const senderEntry = await this.#state.getNodeEntry(this.#wallet.address);
+        if (!senderEntry) {
+            throw new Error("Sender account not found");
+        }
+
+        const fee = this.#state.getFee();
+        const feeBigInt = bufferToBigInt(fee);
+        const senderBalance = bufferToBigInt(senderEntry.balance);
+        const totalAmount = bufferToBigInt(batch.totalAmount);
+        const totalDeductedAmount = totalAmount + feeBigInt;
+
+        if (!(senderBalance >= totalDeductedAmount)) {
+            throw new Error("Insufficient balance for batch transfer + fee");
+        }
+
+        const txValidity = await this.#state.getIndexerSequenceState();
+        const payload = await applyStateMessageFactory(this.#wallet, this.#config)
+            .buildPartialBatchTransferOperationMessage(
+                this.#wallet.address,
+                batch.buffer,
+                batch.totalAmount,
+                txValidity,
+                "json"
+            )
+
+        const expectedNewBalance = senderBalance - totalDeductedAmount;
+        console.info('Batch Transfer Details:');
+        console.info(`Transaction hash ${payload.tro.tx}`)
+        console.info(`Outputs: ${batch.outputs.length}`);
+        console.info(`Amount: ${bigIntToDecimalString(totalAmount)}`);
+        console.info(`Fee: ${bigIntToDecimalString(feeBigInt)}`);
+        console.info(`Total: ${bigIntToDecimalString(totalDeductedAmount)}`);
+        console.log(`Expected Balance After Batch Transfer: ${bigIntToDecimalString(expectedNewBalance)}`);
+        const success = await this.broadcastPartialTransaction(payload);
+        if (!success) {
+            throw new Error("Failed to broadcast batch transfer transaction after multiple attempts.");
+        } else {
+            console.log(`Batch transfer transaction broadcasted successfully. Tx hash: ${payload.tro.tx}`);
+        }
+
+    }
+
     async #balanceMigrationOperation() {
 
         const isInitDisabled = await this.#state.isInitalizationDisabled()
@@ -991,6 +1055,9 @@ export class MainSettlementBus extends ReadyResource {
         } else if (input.startsWith("/get_tx_info")) {
             const txHash = parts[0];
             await getTxInfoCommand(this.#state, txHash);
+        } else if (input.startsWith("/transfer_batch")) {
+            const outputsJson = parts.join(" ");
+            await this.#handleBatchTransferOperation(outputsJson);
         } else if (input.startsWith("/transfer")) {
             const address = parts[0];
             const amount = parts[1];

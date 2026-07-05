@@ -2,6 +2,11 @@ import b4a from 'b4a';
 import { OperationType } from '../../src/utils/constants.js';
 import { addressToBuffer } from '../../src/core/state/utils/address.js';
 import { config } from '../helpers/config.js';
+import { encodeTransferBatchOutputs } from '../../src/utils/transferBatch.js';
+
+const batchTransferFixture = encodeTransferBatchOutputs([
+    { to: 'trac1mqktwme8fvklrds4hlhfy6lhmsu9qgfn3c3kuhz7c5zwjt8rc3dqj9tx7h', amount: '1.25' }
+], config);
 
 const validTransferOperation = {
     type: OperationType.TRANSFER,
@@ -15,7 +20,9 @@ const validTransferOperation = {
         is: b4a.from('06acd7faecd5159221259ebb1d7e98eccd7c6e2884de9de45097e6d9d8c37192602901c74dde6bb2f48f6f665edc84140627f6e9c42f774a0e9f55ef3b348e06', 'hex'),
         va: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
         vn: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
-        vs: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex')
+        vs: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
+        bo: null,
+        ba: null
     }
 }
 
@@ -31,7 +38,45 @@ const validPartialTransferOperation = {
         is: b4a.from('06acd7faecd5159221259ebb1d7e98eccd7c6e2884de9de45097e6d9d8c37192602901c74dde6bb2f48f6f665edc84140627f6e9c42f774a0e9f55ef3b348e06', 'hex'),
         va: null,
         vn: null,
-        vs: null
+        vs: null,
+        bo: null,
+        ba: null
+    }
+}
+
+const validBatchTransferOperation = {
+    type: OperationType.TRANSFER,
+    address: addressToBuffer('trac123z3gfpr2epjwww7ntm3m6ud2fhmq0tvts27p2f5mx3qkecsutlqfys769', config.addressPrefix),
+    tro: {
+        tx: b4a.from('d59f70942febb1de32fcb59febe84560416265d39f39b48fae676592910a98f4', 'hex'),
+        txv: b4a.from('fb59a3e756d1c9597e46b33bcea91e262f8f73e94c238bdf70854aa2e8c42608', 'hex'),
+        to: null,
+        am: null,
+        in: b4a.from('963fef21f5146553b0396b2ee1a93a8dbfce240411b71ccdcfc504504a6b9b50', 'hex'),
+        is: b4a.from('16acd7faecd5159221259ebb1d7e98eccd7c6e2884de9de45097e6d9d8c37192602901c74dde6bb2f48f6f665edc84140627f6e9c42f774a0e9f55ef3b348e06', 'hex'),
+        va: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        vn: b4a.from('1ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
+        vs: b4a.from('6b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
+        bo: batchTransferFixture.buffer,
+        ba: batchTransferFixture.totalAmount
+    }
+}
+
+const validPartialBatchTransferOperation = {
+    type: OperationType.TRANSFER,
+    address: addressToBuffer('trac123z3gfpr2epjwww7ntm3m6ud2fhmq0tvts27p2f5mx3qkecsutlqfys769'),
+    tro: {
+        tx: b4a.from('d59f70942febb1de32fcb59febe84560416265d39f39b48fae676592910a98f4', 'hex'),
+        txv: b4a.from('fb59a3e756d1c9597e46b33bcea91e262f8f73e94c238bdf70854aa2e8c42608', 'hex'),
+        to: null,
+        am: null,
+        in: b4a.from('963fef21f5146553b0396b2ee1a93a8dbfce240411b71ccdcfc504504a6b9b50', 'hex'),
+        is: b4a.from('16acd7faecd5159221259ebb1d7e98eccd7c6e2884de9de45097e6d9d8c37192602901c74dde6bb2f48f6f665edc84140627f6e9c42f774a0e9f55ef3b348e06', 'hex'),
+        va: null,
+        vn: null,
+        vs: null,
+        bo: batchTransferFixture.buffer,
+        ba: batchTransferFixture.totalAmount
     }
 }
 
@@ -373,6 +418,8 @@ export default {
     validDisableInitialization,
     validTransferOperation,
     validPartialTransferOperation,
+    validBatchTransferOperation,
+    validPartialBatchTransferOperation,
     validBalanceInitOperation,
     validPartialAddWriter,
     validCompleteAddWriter,

@@ -72,6 +72,7 @@ export function printHelp(isAdminMode = false) {
     console.log('- /deployment <subnetwork_bootstrap> <channel>: Deploy a subnetwork with the given bootstrap. If channel is not provided, a random one will be generated. Requires a fee.');
     console.log('- /get_deployment <subnetwork_bootstrap>: Get information about a subnetwork deployment with the given bootstrap.');
     console.log('- /transfer <to_address> <amount>: Transfer the specified amount to the given address. Requires a fee.');
+    console.log('- /transfer_batch <json_outputs>: Transfer one fee-paid batch, e.g. [{"to":"<address>","amount":"1.25"}]. Requires one fee.');
     console.log('- /get_tx_info <tx_hash>: Get information about a transaction with the given hash.');
     console.log('- /get_validator_addr <writing_key>: Get the validator address mapped to the given writing key.');
     console.log('- /get_balance <address> <confirmed>: Get the balance of the node with specified address (confirmed = true is default)');

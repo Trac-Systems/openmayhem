@@ -8,6 +8,7 @@ import { isHexString } from '../../../../src/utils/helpers.js';
 import { config } from '../../../helpers/config.js';
 import { testKeyPair1, testKeyPair2 } from '../../../fixtures/apply.fixtures.js';
 import { isAddressValid } from '../../../../src/core/state/utils/address.js';
+import { encodeTransferBatchOutputs } from '../../../../src/utils/transferBatch.js';
 
 const hex = (value, bytes) => value.repeat(bytes);
 
@@ -230,4 +231,37 @@ test('ApplyStateMessageBuilder partial transfer operation (tro)', async t => {
     t.is(payload.tro.txv, txValidity);
     t.is(payload.tro.to, otherWallet.address);
     t.is(payload.tro.am, amount);
+});
+
+test('ApplyStateMessageBuilder partial batch transfer operation (tro)', async t => {
+    const wallet = await createWallet(testKeyPair1.mnemonic);
+    const otherWallet = await createWallet(testKeyPair2.mnemonic);
+    const txValidity = hex('be', 32);
+    const batch = encodeTransferBatchOutputs([{ to: otherWallet.address, amount: '1.25' }], config);
+
+    const builder = new ApplyStateMessageBuilder(wallet, config);
+    await builder
+        .setPhase('partial')
+        .setOutput('json')
+        .setOperationType(OperationType.TRANSFER)
+        .setAddress(wallet.address)
+        .setTxValidity(txValidity)
+        .setBatchOutputs(batch.buffer)
+        .setBatchAmount(batch.totalAmount)
+        .build();
+
+    const payload = builder.getPayload();
+    t.is(payload.type, OperationType.TRANSFER);
+    t.is(payload.address, wallet.address);
+    expectPayloadKeys(t, payload, 'tro');
+    expectKeys(t, payload.tro, ['tx', 'txv', 'bo', 'ba', 'in', 'is'], 'tro');
+    expectHexField(t, payload.tro.tx, 32, 'tro.tx');
+    expectHexField(t, payload.tro.txv, 32, 'tro.txv');
+    expectHexField(t, payload.tro.bo, batch.buffer.length, 'tro.bo');
+    expectHexField(t, payload.tro.ba, 16, 'tro.ba');
+    expectHexField(t, payload.tro.in, 32, 'tro.in');
+    expectHexField(t, payload.tro.is, 64, 'tro.is');
+    t.is(payload.tro.txv, txValidity);
+    t.is(payload.tro.bo, b4a.toString(batch.buffer, 'hex'));
+    t.is(payload.tro.ba, b4a.toString(batch.totalAmount, 'hex'));
 });

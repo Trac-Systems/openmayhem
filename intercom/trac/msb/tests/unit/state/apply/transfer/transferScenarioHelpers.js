@@ -13,7 +13,9 @@ import addressUtils from '../../../../../src/core/state/utils/address.js';
 import transactionUtils from '../../../../../src/core/state/utils/transaction.js';
 import { toBalance, PERCENT_75, BALANCE_ZERO } from '../../../../../src/core/state/utils/balance.js';
 import { decimalStringToBigInt, bigIntTo16ByteBuffer } from '../../../../../src/utils/amountSerialization.js';
+import { bufferToBigInt } from '../../../../../src/utils/amountSerialization.js';
 import { safeDecodeApplyOperation, safeEncodeApplyOperation } from '../../../../../src/utils/protobuf/operationHelpers.js';
+import { encodeTransferBatchOutputs } from '../../../../../src/utils/transferBatch.js';
 import { ZERO_WK } from '../../../../../src/utils/buffer.js';
 import { EntryType, OperationType } from '../../../../../src/utils/constants.js';
 import { createMessage } from '../../../../../src/utils/buffer.js';
@@ -142,6 +144,54 @@ export async function buildTransferPayload(
             b4a.from(partial.tro.is, 'hex')
         );
     return safeEncodeApplyOperation(payload);
+}
+
+export async function buildBatchTransferPayload(
+	context,
+	{
+		senderPeer = context.transferScenario?.senderPeer ?? selectSenderPeer(context, 1),
+		validatorPeer = context.transferScenario?.validatorPeer ?? selectValidatorPeer(context, 0),
+		outputs,
+		txValidity = null
+	} = {}
+) {
+	if (!Array.isArray(outputs) || outputs.length === 0) {
+		throw new Error('buildBatchTransferPayload requires outputs.');
+	}
+
+	const batch = encodeTransferBatchOutputs(outputs, config);
+	const resolvedTxValidity =
+		txValidity ?? (await deriveIndexerSequenceState(validatorPeer.base));
+
+	const partial = await applyStateMessageFactory(senderPeer.wallet, config)
+		.buildPartialBatchTransferOperationMessage(
+			senderPeer.wallet.address,
+			batch.buffer,
+			batch.totalAmount,
+			b4a.toString(resolvedTxValidity, 'hex'),
+			'json'
+		);
+
+	const payload = await applyStateMessageFactory(validatorPeer.wallet, config)
+		.buildCompleteBatchTransferOperationMessage(
+			partial.address,
+			b4a.from(partial.tro.tx, 'hex'),
+			b4a.from(partial.tro.txv, 'hex'),
+			b4a.from(partial.tro.in, 'hex'),
+			b4a.from(partial.tro.bo, 'hex'),
+			b4a.from(partial.tro.ba, 'hex'),
+			b4a.from(partial.tro.is, 'hex')
+		);
+
+	return {
+		payload: safeEncodeApplyOperation(payload),
+		batch,
+	};
+}
+
+export function decodeEntryBalance(entryBuffer) {
+	const decoded = nodeEntryUtils.decode(entryBuffer);
+	return decoded ? bufferToBigInt(decoded.balance) : null;
 }
 
 export async function buildTransferPayloadWithTxValidity(

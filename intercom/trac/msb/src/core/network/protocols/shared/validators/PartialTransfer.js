@@ -2,6 +2,7 @@ import PeerWallet from 'trac-wallet';
 
 import {bufferToAddress} from "../../../../state/utils/address.js";
 import {bufferToBigInt} from "../../../../../utils/amountSerialization.js";
+import {decodeTransferBatchOutputs} from "../../../../../utils/transferBatch.js";
 import PartialOperation from './base/PartialOperation.js';
 
 class PartialTransfer extends PartialOperation {
@@ -22,10 +23,63 @@ class PartialTransfer extends PartialOperation {
         this.isOperationNotCompleted(payload);
 
         // uncommon validations below
-        this.#validateRecipientAddress(payload)
-        await this.#validateStateBalances(payload)
+        if (payload.tro.bo) {
+            this.#validateBatchRecipients(payload)
+            await this.#validateBatchStateBalances(payload)
+        } else {
+            this.#validateRecipientAddress(payload)
+            await this.#validateStateBalances(payload)
+        }
 
         return true;
+    }
+
+    #decodeBatch(payload) {
+        return decodeTransferBatchOutputs(payload.tro.bo, this.#config);
+    }
+
+    #validateBatchRecipients(payload) {
+        const senderAddress = bufferToAddress(payload.address, this.#config.addressPrefix);
+        const batch = this.#decodeBatch(payload);
+        for (const output of batch.outputs) {
+            if (output.to === senderAddress) {
+                throw new Error('Batch transfer must not include a self-recipient.');
+            }
+            const incomingPublicKey = PeerWallet.decodeBech32mSafe(output.to);
+            if (incomingPublicKey === null) {
+                throw new Error('Invalid recipient public key in batch transfer payload.');
+            }
+        }
+        if (bufferToBigInt(payload.tro.ba) !== batch.total) {
+            throw new Error('Batch transfer total does not match outputs.');
+        }
+    }
+
+    async #validateBatchStateBalances(payload) {
+        const senderAddress = bufferToAddress(payload.address, this.#config.addressPrefix);
+        const batch = this.#decodeBatch(payload);
+        const totalDeductedAmount = batch.total + this.fee;
+
+        const senderEntry = await this.state.getNodeEntryUnsigned(senderAddress);
+        if (!senderEntry) {
+            throw new Error('Sender account not found');
+        }
+
+        const senderBalance = bufferToBigInt(senderEntry.balance);
+        if (!(senderBalance >= totalDeductedAmount)) {
+            throw new Error('Insufficient balance for batch transfer + fee');
+        }
+
+        for (const output of batch.outputs) {
+            const recipientEntry = await this.state.getNodeEntryUnsigned(output.to);
+            if (recipientEntry) {
+                const recipientBalance = bufferToBigInt(recipientEntry.balance);
+                const newRecipientBalance = recipientBalance + output.amount;
+                if (newRecipientBalance > this.max_amount) {
+                    throw new Error('Batch transfer would cause recipient balance to exceed maximum allowed value');
+                }
+            }
+        }
     }
 
     #validateRecipientAddress(payload) {
