@@ -12,6 +12,10 @@ pub const DEFAULT_SATURATION_CUTOFF: f64 = 0.85;
 pub const DEFAULT_REPUTATION_ALPHA: f64 = 1.5;
 pub const DEFAULT_SATURATION_BETA: f64 = 1.0;
 pub const DEFAULT_PRICE_GAMMA: f64 = 0.7;
+pub const DEFAULT_ERROR_CIRCUIT_BREAKER_MIN_SAMPLES: u64 = 3;
+pub const DEFAULT_ERROR_CIRCUIT_BREAKER_EWMA_THRESHOLD: f64 = 0.8;
+pub const DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES: u32 = 3;
+pub const DEFAULT_ERROR_CIRCUIT_BREAKER_COOLOFF_MILLIS: u64 = 30_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ProviderKey {
@@ -50,6 +54,10 @@ pub struct ProviderObservation {
     pub ewma_ttft_ms: Option<f64>,
     pub ewma_tok_s: Option<f64>,
     pub ewma_error_rate: f64,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_open_until_millis: Option<u64>,
     pub samples: u64,
 }
 
@@ -103,6 +111,7 @@ pub enum IneligibilityReason {
     ProbationPriceCap,
     AttestationMissing,
     AttestationStale,
+    CircuitOpen,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -299,6 +308,15 @@ impl ProviderTable {
     }
 
     pub fn record_observation(&mut self, key: &ProviderKey, sample: ProviderObservationSample) {
+        self.record_observation_at(key, sample, 0);
+    }
+
+    pub fn record_observation_at(
+        &mut self,
+        key: &ProviderKey,
+        sample: ProviderObservationSample,
+        now_millis: u64,
+    ) {
         let alpha = self.observation_alpha;
         let observed = self.observations.entry(key.clone()).or_default();
         observed.ewma_ttft_ms = Some(update_ewma(
@@ -321,6 +339,19 @@ impl ProviderTable {
             if sample.error { 1.0 } else { 0.0 },
             alpha,
         );
+        if sample.error {
+            observed.consecutive_failures = observed.consecutive_failures.saturating_add(1);
+            if observed.consecutive_failures >= DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES
+                || (observed.samples + 1 >= DEFAULT_ERROR_CIRCUIT_BREAKER_MIN_SAMPLES
+                    && observed.ewma_error_rate >= DEFAULT_ERROR_CIRCUIT_BREAKER_EWMA_THRESHOLD)
+            {
+                observed.circuit_open_until_millis =
+                    Some(now_millis.saturating_add(DEFAULT_ERROR_CIRCUIT_BREAKER_COOLOFF_MILLIS));
+            }
+        } else {
+            observed.consecutive_failures = 0;
+            observed.circuit_open_until_millis = None;
+        }
         observed.samples += 1;
     }
 
@@ -405,6 +436,13 @@ pub fn evaluate_eligibility(
     }
     if entry.contract.reputation < request.min_reputation {
         return Err(IneligibilityReason::Reputation);
+    }
+    if entry
+        .observed
+        .circuit_open_until_millis
+        .is_some_and(|until| until > request.now_millis)
+    {
+        return Err(IneligibilityReason::CircuitOpen);
     }
     let heartbeat = entry
         .heartbeat
@@ -927,6 +965,80 @@ mod tests {
         assert_eq!(entry.observed.ewma_ttft_ms, Some(180.0));
         assert_eq!(entry.observed.ewma_tok_s, Some(48.0));
         assert!((entry.observed.ewma_error_rate - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn error_circuit_breaker_drops_provider_then_readmits_after_cooloff() {
+        let now = 1_000_000;
+        let mut table = ProviderTable::new();
+        let record = contract_record_for(1);
+        let key = ProviderKey::from_contract(&record);
+        table.upsert_contract(record);
+        table.upsert_heartbeat(heartbeat_for(1, now, 0.2, 100, 9, "44"), now);
+        let request = eligible_request(now + 1);
+        assert_eq!(
+            eligible_candidates(
+                &table.entries(now + 1),
+                &request,
+                &SelectionWeights::default()
+            )
+            .len(),
+            1
+        );
+
+        for offset in 0..DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES {
+            table.record_observation_at(
+                &key,
+                ProviderObservationSample {
+                    ttft_ms: 5_000,
+                    tok_s: None,
+                    error: true,
+                },
+                now + u64::from(offset),
+            );
+        }
+
+        let open_entries = table.entries(now + 3);
+        let open_entry = open_entries.first().expect("provider entry");
+        assert_eq!(
+            evaluate_eligibility(open_entry, &eligible_request(now + 3)),
+            Err(IneligibilityReason::CircuitOpen)
+        );
+        assert_eq!(
+            eligible_candidates(
+                &open_entries,
+                &eligible_request(now + 3),
+                &SelectionWeights::default()
+            )
+            .len(),
+            0
+        );
+
+        let readmit_at = open_entry
+            .observed
+            .circuit_open_until_millis
+            .expect("open circuit")
+            + 1;
+        table.upsert_heartbeat(heartbeat_for(1, readmit_at, 0.2, 100, 9, "44"), readmit_at);
+        let readmitted_entries = table.entries(readmit_at + 1);
+        let readmitted = readmitted_entries.first().expect("provider entry");
+        assert_eq!(
+            evaluate_eligibility(readmitted, &eligible_request(readmit_at + 1)),
+            Ok(80)
+        );
+
+        table.record_observation_at(
+            &key,
+            ProviderObservationSample {
+                ttft_ms: 100,
+                tok_s: Some(50.0),
+                error: false,
+            },
+            readmit_at + 1,
+        );
+        let recovered = table.entries(readmit_at + 2).pop().expect("provider entry");
+        assert_eq!(recovered.observed.consecutive_failures, 0);
+        assert_eq!(recovered.observed.circuit_open_until_millis, None);
     }
 
     #[test]

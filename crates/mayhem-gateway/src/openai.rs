@@ -4411,6 +4411,15 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
             .collect::<Vec<_>>()
     };
     let weights = SelectionWeights::default();
+    let table_entry_keys = remaining_entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
+    let table_eligible_keys =
+        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
+            .into_iter()
+            .map(|candidate| candidate.entry.key)
+            .collect::<BTreeSet<_>>();
     let mut rng = LcgBalancerRng::seeded(seed);
     let mut ordered = Vec::new();
     let mut selected_keys = BTreeSet::new();
@@ -4434,6 +4443,9 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
 
     for candidate in eligible_routes {
         let key = route_key(candidate);
+        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
+            continue;
+        }
         if selected_keys.insert(key) {
             ordered.push(candidate);
         }
@@ -4537,7 +4549,7 @@ fn record_route_observation(
         .provider_table
         .lock()
         .expect("provider table poisoned")
-        .record_observation(&route_key(route), sample);
+        .record_observation_at(&route_key(route), sample, now_millis_u64());
 }
 
 fn observation_sample_from_success(
@@ -7871,6 +7883,61 @@ mod tests {
         assert!(readmitted_order
             .iter()
             .any(|candidate| candidate.provider == cooled_provider));
+    }
+
+    #[test]
+    fn route_selection_excludes_circuit_open_provider_and_readmits_after_expiry() {
+        let model = test_routed_model(3);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let request = test_chat_request(&model.id);
+        let circuit_route = &model.mayhem.route_candidates[0];
+        let circuit_provider = circuit_route.provider.clone();
+        let key = route_key(circuit_route);
+        let now = now_millis_u64();
+        {
+            let mut table = state
+                .provider_table
+                .lock()
+                .expect("provider table poisoned");
+            for offset in
+                0..crate::provider_table::DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES
+            {
+                table.record_observation_at(
+                    &key,
+                    ProviderObservationSample {
+                        ttft_ms: 5_000,
+                        tok_s: None,
+                        error: true,
+                    },
+                    now + u64::from(offset),
+                );
+            }
+        }
+
+        let circuit_order =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert!(!circuit_order
+            .iter()
+            .any(|candidate| candidate.provider == circuit_provider));
+
+        state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .record_observation_at(
+                &key,
+                ProviderObservationSample {
+                    ttft_ms: 100,
+                    tok_s: Some(50.0),
+                    error: false,
+                },
+                now + crate::provider_table::DEFAULT_ERROR_CIRCUIT_BREAKER_COOLOFF_MILLIS + 10,
+            );
+        let readmitted_order =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert!(readmitted_order
+            .iter()
+            .any(|candidate| candidate.provider == circuit_provider));
     }
 
     #[tokio::test]
