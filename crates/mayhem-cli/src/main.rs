@@ -103,6 +103,13 @@ enum Commands {
     },
     /// Cash out claimable TAP distribution entries without giving Mayhem custody.
     Withdraw(WithdrawArgs),
+    /// Open a paid participant dispute over a session.
+    Dispute(DisputeArgs),
+    /// Submit fraud evidence against an epoch commit.
+    FraudProof {
+        #[command(subcommand)]
+        command: FraudProofCommands,
+    },
     /// Probe local hardware and print enclave backend feasibility.
     Doctor(DoctorArgs),
     /// Inspect and verify the admin-signed model catalog.
@@ -194,6 +201,12 @@ enum ProviderRoomsCommands {
     Join(ProviderRoomJoinArgs),
     /// Leave one canonical room.
     Leave(ProviderRoomLeaveArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum FraudProofCommands {
+    /// Submit an over-credit fraud proof against an epoch commit.
+    Submit(FraudProofSubmitArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1184,6 +1197,121 @@ struct WithdrawArgs {
     /// Print machine-readable withdrawal calldata.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ParticipantTxArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted participant keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
+    #[arg(long)]
+    submit: bool,
+
+    /// Submit with peer RPC sim mode when --submit is used.
+    #[arg(long)]
+    sim: bool,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct DisputeArgs {
+    #[command(flatten)]
+    tx: ParticipantTxArgs,
+
+    /// Session id being disputed.
+    #[arg(long)]
+    session_id: String,
+
+    /// Compact dispute reason, e.g. service_failure.
+    #[arg(long)]
+    reason: String,
+
+    /// Provider public key, when this dispute names a provider.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Counterparty public key, when provider is not the right label.
+    #[arg(long)]
+    counterparty: Option<String>,
+
+    /// Admin-created enclave id involved in the dispute.
+    #[arg(long)]
+    enclave_id: Option<String>,
+
+    /// Epoch associated with the disputed session.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    /// Contract timestamp/slot. Defaults to current Unix seconds.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// BLAKE3 evidence hash. Defaults to the hash of --evidence-json/--evidence-file.
+    #[arg(long)]
+    evidence_hash: Option<String>,
+
+    /// JSON evidence bundle to store on-ledger. Keep it compact.
+    #[arg(long)]
+    evidence_json: Option<String>,
+
+    /// JSON evidence bundle file to store on-ledger. Keep it compact.
+    #[arg(long, value_name = "PATH")]
+    evidence_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct FraudProofSubmitArgs {
+    #[command(flatten)]
+    tx: ParticipantTxArgs,
+
+    /// Epoch commit being challenged.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Epoch when this proof is being submitted.
+    #[arg(long)]
+    proof_epoch: u64,
+
+    /// Contract timestamp/slot. Defaults to current Unix seconds.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// Fraud reason supported by the contract.
+    #[arg(long, default_value = "over_credit")]
+    reason: String,
+
+    /// Receipt envelope JSON proving the claimed commit over-credited usage.
+    #[arg(long)]
+    receipt_json: Option<String>,
+
+    /// Receipt envelope JSON file.
+    #[arg(long, value_name = "PATH")]
+    receipt_file: Option<PathBuf>,
+
+    /// Amount claimed in the epoch commit for this receipt.
+    #[arg(long)]
+    claimed_mu_owed_cum: u64,
+
+    /// Previous cumulative owed amount for the session, if any.
+    #[arg(long)]
+    previous_mu_owed_cum: Option<u64>,
 }
 
 #[derive(Debug, Parser)]
@@ -3183,6 +3311,10 @@ async fn main() -> Result<()> {
         Commands::Wallet { command } => wallet_command(command).await,
         Commands::Deposit { command } => deposit_command(command).await,
         Commands::Withdraw(args) => withdraw(args).await,
+        Commands::Dispute(args) => dispute(args).await,
+        Commands::FraudProof { command } => match command {
+            FraudProofCommands::Submit(args) => fraud_proof_submit(args).await,
+        },
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
             CatalogCommands::List(args) => catalog_list(args),
@@ -10103,6 +10235,23 @@ fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option
     .transpose()
 }
 
+fn optional_json_arg_or_file(
+    inline: Option<&str>,
+    file: Option<&PathBuf>,
+    label: &str,
+) -> Result<Option<Value>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => bail!("pass only one inline {label} JSON value or {label} JSON file"),
+        (Some(inline), None) => serde_json::from_str::<Value>(inline)
+            .with_context(|| format!("parsing {label} JSON"))
+            .map(Some),
+        (None, Some(path)) => read_json_file(path)
+            .with_context(|| format!("reading {label} JSON from {}", path.display()))
+            .map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
 fn recomputed_field(recomputed: Option<&Value>, field: &str) -> Option<Value> {
     recomputed.and_then(|value| value.get(field).cloned())
 }
@@ -10559,6 +10708,176 @@ async fn withdraw(args: WithdrawArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_withdraw_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn dispute(args: DisputeArgs) -> Result<()> {
+    let value = dispute_payload(&args)?;
+    run_participant_command(&args.tx, "dispute", value).await
+}
+
+async fn fraud_proof_submit(args: FraudProofSubmitArgs) -> Result<()> {
+    let value = fraud_proof_payload(&args)?;
+    run_participant_command(&args.tx, "fraudProof", value).await
+}
+
+fn dispute_payload(args: &DisputeArgs) -> Result<Value> {
+    let evidence = optional_json_arg_or_file(
+        args.evidence_json.as_deref(),
+        args.evidence_file.as_ref(),
+        "dispute evidence",
+    )?;
+    let evidence_hash = args
+        .evidence_hash
+        .clone()
+        .or_else(|| evidence.as_ref().map(stable_value_hash));
+    if let Some(hash) = evidence_hash.as_deref() {
+        if !is_hex_len(hash, 64) {
+            bail!("--evidence-hash must be a 32-byte BLAKE3 hex digest");
+        }
+    }
+    let mut payload = json!({
+        "op": "dispute",
+        "session_id": &args.session_id,
+        "reason": &args.reason,
+        "at": args.at.unwrap_or(unix_epoch_seconds()?),
+    });
+    if let Some(provider) = &args.provider {
+        payload["provider"] = json!(provider);
+    }
+    if let Some(counterparty) = &args.counterparty {
+        payload["counterparty"] = json!(counterparty);
+    }
+    if let Some(enclave_id) = &args.enclave_id {
+        payload["enclave_id"] = json!(enclave_id);
+    }
+    if let Some(epoch) = args.epoch {
+        payload["epoch"] = json!(epoch);
+    }
+    if let Some(evidence_hash) = evidence_hash {
+        payload["evidence_hash"] = json!(evidence_hash.to_ascii_lowercase());
+    }
+    if let Some(evidence) = evidence {
+        payload["evidence"] = evidence;
+    }
+    Ok(payload)
+}
+
+fn fraud_proof_payload(args: &FraudProofSubmitArgs) -> Result<Value> {
+    if args.epoch == 0 {
+        bail!("--epoch must be positive");
+    }
+    if args.proof_epoch == 0 {
+        bail!("--proof-epoch must be positive");
+    }
+    if args.reason != "over_credit" {
+        bail!("contract currently supports only --reason over_credit");
+    }
+    let receipt = json_arg_or_file_object(
+        args.receipt_json.as_deref(),
+        args.receipt_file.as_ref(),
+        None,
+        "fraud proof receipt",
+    )?;
+    let mut payload = json!({
+        "op": "fraud_proof",
+        "epoch": args.epoch,
+        "proof_epoch": args.proof_epoch,
+        "at": args.at.unwrap_or(unix_epoch_seconds()?),
+        "reason": &args.reason,
+        "receipt": receipt,
+        "claimed_mu_owed_cum": args.claimed_mu_owed_cum,
+    });
+    if let Some(previous) = args.previous_mu_owed_cum {
+        payload["previous_mu_owed_cum"] = json!(previous);
+    }
+    Ok(payload)
+}
+
+async fn run_participant_command(
+    args: &ParticipantTxArgs,
+    tx_type: &'static str,
+    value: Value,
+) -> Result<()> {
+    let compact_command = serde_json::to_string(&value)?;
+    let copy_paste = format!(
+        "/tx --command {} --sim 1",
+        shell_single_quote(&compact_command)
+    );
+    let mut report = json!({
+        "ok": true,
+        "submitted": false,
+        "tx_type": tx_type,
+        "command": value,
+        "copy_paste": {
+            "intercom_sim": copy_paste,
+        },
+    });
+
+    if args.submit {
+        let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        let config = read_mayhem_config(&home)?;
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let wallet_password = args.wallet_password.as_deref().unwrap_or("");
+        let wallet = resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            wallet_password,
+        )
+        .await?;
+        let keypair_path = PathBuf::from(&wallet.keypair_path);
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let submitted = submit_contract_command(
+            &rpc,
+            &keypair_path,
+            wallet_password,
+            &wallet,
+            tx_type,
+            report["command"].clone(),
+            args.sim,
+        )
+        .await?;
+        report["submitted"] = json!(true);
+        report["sim"] = json!(args.sim);
+        report["rpc_url"] = json!(rpc_url);
+        report["wallet"] = json!({
+            "public_key": wallet.public_key,
+            "keypair_path": wallet.keypair_path,
+        });
+        report["tx"] = submitted;
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_participant_report(&report)?;
+    }
+    Ok(())
+}
+
+fn print_participant_report(report: &Value) -> Result<()> {
+    println!("Participant contract command ready.");
+    println!("Tx type: {}", report["tx_type"].as_str().unwrap_or(""));
+    println!("Command JSON:");
+    println!("{}", serde_json::to_string_pretty(&report["command"])?);
+    println!("Copy/paste Intercom sim command:");
+    println!(
+        "{}",
+        report["copy_paste"]["intercom_sim"].as_str().unwrap_or("")
+    );
+    if report["submitted"].as_bool() == Some(true) {
+        println!("Submitted: true");
+        if let Some(tx) = report["tx"]["tx"].as_str() {
+            println!("Tx: {tx}");
+        }
+        if let Some(command_hash) = report["tx"]["command_hash"].as_str() {
+            println!("Command hash: {command_hash}");
+        }
+    } else {
+        println!("Submitted: false (pass --submit to sign and send through peer RPC)");
     }
     Ok(())
 }
@@ -21528,6 +21847,126 @@ mod tests {
         assert!(proof_to_script_arg(&json!({"bad": true})).is_err());
     }
 
+    #[test]
+    fn participant_dispute_and_fraud_proof_cli_parse() {
+        let dispute = Cli::try_parse_from([
+            "mayhem",
+            "dispute",
+            "--session-id",
+            "session-1",
+            "--reason",
+            "service_failure",
+            "--provider",
+            "55",
+            "--evidence-json",
+            r#"{"kind":"timeout"}"#,
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Dispute(args) = dispute.command else {
+            panic!("expected dispute command");
+        };
+        assert_eq!(args.session_id, "session-1");
+        assert_eq!(args.provider.as_deref(), Some("55"));
+        assert!(args.tx.json);
+
+        let fraud = Cli::try_parse_from([
+            "mayhem",
+            "fraud-proof",
+            "submit",
+            "--epoch",
+            "1",
+            "--proof-epoch",
+            "2",
+            "--receipt-json",
+            r#"{"receipt":{"body":{"session_id":"s1"}}}"#,
+            "--claimed-mu-owed-cum",
+            "2000",
+            "--previous-mu-owed-cum",
+            "1000",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::FraudProof { command } = fraud.command else {
+            panic!("expected fraud-proof command");
+        };
+        let FraudProofCommands::Submit(args) = command;
+        assert_eq!(args.epoch, 1);
+        assert_eq!(args.proof_epoch, 2);
+        assert_eq!(args.claimed_mu_owed_cum, 2000);
+        assert_eq!(args.previous_mu_owed_cum, Some(1000));
+        assert!(args.tx.json);
+    }
+
+    #[test]
+    fn participant_dispute_and_fraud_proof_payloads_match_contract_schema() {
+        let dispute = dispute_payload(&DisputeArgs {
+            tx: test_participant_tx_args(),
+            session_id: "session-1".to_owned(),
+            reason: "service_failure".to_owned(),
+            provider: Some("55".repeat(32)),
+            counterparty: None,
+            enclave_id: Some("11".repeat(32)),
+            epoch: Some(7),
+            at: Some(42),
+            evidence_hash: None,
+            evidence_json: Some(r#"{"kind":"timeout","detail":"no final receipt"}"#.to_owned()),
+            evidence_file: None,
+        })
+        .unwrap();
+        assert_eq!(dispute["op"], "dispute");
+        assert_eq!(dispute["session_id"], "session-1");
+        assert_eq!(dispute["provider"].as_str(), Some("55".repeat(32).as_str()));
+        assert_eq!(
+            dispute["enclave_id"].as_str(),
+            Some("11".repeat(32).as_str())
+        );
+        assert_eq!(dispute["epoch"].as_u64(), Some(7));
+        assert_eq!(dispute["at"].as_u64(), Some(42));
+        assert_eq!(dispute["evidence_hash"].as_str().map(str::len), Some(64));
+        assert_eq!(dispute["evidence"]["kind"].as_str(), Some("timeout"));
+
+        let fraud = fraud_proof_payload(&FraudProofSubmitArgs {
+            tx: test_participant_tx_args(),
+            epoch: 1,
+            proof_epoch: 2,
+            at: Some(43),
+            reason: "over_credit".to_owned(),
+            receipt_json: Some(
+                r#"{"receipt":{"body":{"session_id":"s1","mu_owed_cum":1000}}}"#.to_owned(),
+            ),
+            receipt_file: None,
+            claimed_mu_owed_cum: 2000,
+            previous_mu_owed_cum: Some(1000),
+        })
+        .unwrap();
+        assert_eq!(fraud["op"], "fraud_proof");
+        assert_eq!(fraud["epoch"].as_u64(), Some(1));
+        assert_eq!(fraud["proof_epoch"].as_u64(), Some(2));
+        assert_eq!(fraud["at"].as_u64(), Some(43));
+        assert_eq!(fraud["reason"], "over_credit");
+        assert_eq!(fraud["claimed_mu_owed_cum"].as_u64(), Some(2000));
+        assert_eq!(fraud["previous_mu_owed_cum"].as_u64(), Some(1000));
+        assert_eq!(fraud["receipt"]["receipt"]["body"]["session_id"], "s1");
+
+        let err = fraud_proof_payload(&FraudProofSubmitArgs {
+            reason: "other".to_owned(),
+            ..FraudProofSubmitArgs {
+                tx: test_participant_tx_args(),
+                epoch: 1,
+                proof_epoch: 2,
+                at: Some(43),
+                reason: "over_credit".to_owned(),
+                receipt_json: Some(r#"{"receipt":{"body":{"session_id":"s1"}}}"#.to_owned()),
+                receipt_file: None,
+                claimed_mu_owed_cum: 2000,
+                previous_mu_owed_cum: None,
+            }
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("over_credit"));
+    }
+
     #[tokio::test]
     async fn wallet_backup_import_round_trips_mnemonic() {
         let temp = test_temp_dir("mayhem-wallet-roundtrip");
@@ -26548,6 +26987,18 @@ mod tests {
 
     fn test_admin_tx_args() -> AdminTxArgs {
         AdminTxArgs {
+            home: None,
+            rpc_url: None,
+            peer_store_name: "main".to_owned(),
+            wallet_password: None,
+            submit: false,
+            sim: false,
+            json: true,
+        }
+    }
+
+    fn test_participant_tx_args() -> ParticipantTxArgs {
+        ParticipantTxArgs {
             home: None,
             rpc_url: None,
             peer_store_name: "main".to_owned(),
