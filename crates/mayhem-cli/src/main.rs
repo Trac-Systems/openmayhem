@@ -6242,6 +6242,18 @@ fn catalog_canary_evidence_report(
                     "canary fingerprint missing artifact {artifact_name}"
                 )),
             }
+            let expected_token_prefixes = model.canary.token_prefixes.get(artifact_name).cloned();
+            if mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
+                match expected_token_prefixes.as_ref() {
+                    Some(prefixes) if !prefixes.is_empty() => {}
+                    Some(_) => entry_errors.push(format!(
+                        "canary token_prefixes for {artifact_name} must not be empty"
+                    )),
+                    None => entry_errors.push(format!(
+                        "canary token_prefixes missing artifact {artifact_name}"
+                    )),
+                }
+            }
             let prompt_count = canary_check.as_ref().ok().copied();
             let key = (model.model_id.clone(), artifact_name.clone());
             entry_index.insert(key, entries.len());
@@ -6254,12 +6266,15 @@ fn catalog_canary_evidence_report(
                 canary_set_sha256: canary_set_sha256.clone(),
                 prompt_count,
                 expected_fingerprint,
+                expected_token_prefixes,
                 expected_artifact_binding: catalog_canary_artifact_binding(artifact),
                 report_path: None,
                 report_fingerprint: None,
+                report_token_prefixes: None,
                 report_canary_set_sha256: None,
                 report_artifact_binding: None,
                 matches_catalog: None,
+                token_prefixes_match_catalog: None,
                 ok: entry_errors.is_empty(),
                 errors: entry_errors,
             });
@@ -6317,6 +6332,12 @@ fn catalog_canary_evidence_report(
 
         entry.report_path = Some(path.clone());
         entry.report_fingerprint = Some(calibration.catalog_fingerprint.clone());
+        let report_token_prefixes = calibration
+            .prompts
+            .iter()
+            .map(|prompt| (prompt.prompt_id.clone(), prompt.token_ids.clone()))
+            .collect::<BTreeMap<_, _>>();
+        entry.report_token_prefixes = Some(report_token_prefixes.clone());
         entry.report_canary_set_sha256 = Some(calibration.canary_set_sha256.clone());
         entry.report_artifact_binding = Some(calibration.artifact_binding.clone());
         let matches_catalog = entry
@@ -6324,6 +6345,11 @@ fn catalog_canary_evidence_report(
             .as_ref()
             .map(|expected| expected == &calibration.catalog_fingerprint);
         entry.matches_catalog = matches_catalog;
+        let token_prefixes_match_catalog = entry
+            .expected_token_prefixes
+            .as_ref()
+            .map(|expected| expected == &report_token_prefixes);
+        entry.token_prefixes_match_catalog = token_prefixes_match_catalog;
 
         if calibration.engine != entry.engine {
             entry.errors.push(format!(
@@ -6430,6 +6456,27 @@ fn catalog_canary_evidence_report(
                     prompt.prompt_id, prompt.token_count, prompt.completion_tokens
                 ));
             }
+            if prompt.token_count != prompt.token_ids.len() {
+                entry.errors.push(format!(
+                    "prompt {} token_count {} does not match token_ids length {}",
+                    prompt.prompt_id,
+                    prompt.token_count,
+                    prompt.token_ids.len()
+                ));
+            }
+            if prompt.token_ids.is_empty() {
+                entry.errors.push(format!(
+                    "prompt {} token_ids must not be empty",
+                    prompt.prompt_id
+                ));
+            }
+        }
+        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
+            && token_prefixes_match_catalog != Some(true)
+        {
+            entry
+                .errors
+                .push("report token_ids do not match catalog token_prefixes".to_owned());
         }
         entry.ok = entry.errors.is_empty();
     }
@@ -6505,6 +6552,19 @@ fn apply_canary_report_fingerprints(
                 )
             })?;
         fingerprints.insert(entry.artifact.clone(), json!(fingerprint));
+        let token_prefixes = canary
+            .entry("token_prefixes")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .with_context(|| {
+                format!(
+                    "model {} canary.token_prefixes is not an object",
+                    entry.model_id
+                )
+            })?;
+        if let Some(prefixes) = &entry.report_token_prefixes {
+            token_prefixes.insert(entry.artifact.clone(), json!(prefixes));
+        }
         applied += 1;
     }
     Ok(applied)
@@ -7061,6 +7121,7 @@ fn calibrate_canary_prompt(
         prompt_tokens: output.usage.prompt_tokens,
         completion_tokens: output.usage.completion_tokens,
         token_count: token_ids.len(),
+        token_ids,
         fingerprint,
         output_text: include_output.then_some(output.text),
     })
@@ -8681,6 +8742,7 @@ struct CanaryCalibrationPromptReport {
     prompt_tokens: u32,
     completion_tokens: u32,
     token_count: usize,
+    token_ids: Vec<i32>,
     fingerprint: String,
     output_text: Option<String>,
 }
@@ -8795,12 +8857,15 @@ struct CatalogCanaryEvidenceEntry {
     canary_set_sha256: Option<String>,
     prompt_count: Option<usize>,
     expected_fingerprint: Option<String>,
+    expected_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     expected_artifact_binding: CatalogCanaryArtifactBinding,
     report_path: Option<PathBuf>,
     report_fingerprint: Option<String>,
+    report_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     report_canary_set_sha256: Option<String>,
     report_artifact_binding: Option<CatalogCanaryArtifactBinding>,
     matches_catalog: Option<bool>,
+    token_prefixes_match_catalog: Option<bool>,
     ok: bool,
     errors: Vec<String>,
 }
@@ -19562,10 +19627,7 @@ mod tests {
     fn canary_evidence_accepts_full_launch_report_set() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
@@ -19592,10 +19654,7 @@ mod tests {
     fn canary_evidence_requires_report_for_every_launch_artifact() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
 
         let report = catalog_canary_evidence_report(
@@ -19618,10 +19677,7 @@ mod tests {
     fn canary_evidence_rejects_report_catalog_mismatch() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("bb".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
@@ -19648,10 +19704,7 @@ mod tests {
     fn canary_evidence_rejects_stale_artifact_binding() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
@@ -19679,10 +19732,7 @@ mod tests {
     fn canary_evidence_rejects_stale_canary_set_hash() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
@@ -19707,6 +19757,34 @@ mod tests {
     }
 
     #[test]
+    fn canary_evidence_rejects_catalog_token_prefix_mismatch() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        calibration.prompts[0].token_ids = vec![2];
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("token_ids do not match catalog token_prefixes")));
+    }
+
+    #[test]
     fn canary_evidence_rejects_cross_backend_fingerprint_swap() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -19716,14 +19794,8 @@ mod tests {
         catalog.models[0]
             .artifacts
             .insert("mlx-4bit".to_owned(), mlx_artifact);
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
-        catalog.models[0]
-            .canary
-            .fingerprints
-            .insert("mlx-4bit".to_owned(), "bb".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "mlx-4bit", "bb".repeat(32));
         let canaries_dir = test_canary_dir("test-canary", 0.0);
         let mut calibration = test_calibration_report("aa".repeat(32), Some("bb".repeat(32)));
         calibration.model_id = "test/model@4bit".to_owned();
@@ -19801,6 +19873,10 @@ mod tests {
         assert_eq!(
             catalog_value["models"][0]["canary"]["fingerprints"]["gguf-q4_k_m"],
             json!("aa".repeat(32))
+        );
+        assert_eq!(
+            catalog_value["models"][0]["canary"]["token_prefixes"]["gguf-q4_k_m"]["p1"],
+            json!([1])
         );
     }
 
@@ -20970,9 +21046,25 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 1,
             token_count: 1,
+            token_ids: vec![1],
             fingerprint,
             output_text: None,
         }
+    }
+
+    fn insert_test_canary_expectation(
+        model: &mut catalog::CatalogModel,
+        artifact: &str,
+        fingerprint: String,
+    ) {
+        model
+            .canary
+            .fingerprints
+            .insert(artifact.to_owned(), fingerprint);
+        model.canary.token_prefixes.insert(
+            artifact.to_owned(),
+            BTreeMap::from([("p1".to_owned(), vec![1])]),
+        );
     }
 
     fn test_calibration_report(
@@ -21197,6 +21289,7 @@ mod tests {
                     set_id: "test-canary".to_owned(),
                     match_min: 0.9,
                     fingerprints: BTreeMap::new(),
+                    token_prefixes: BTreeMap::new(),
                 },
                 price_ref_mu: catalog::PriceRef {
                     denom: "mu_usd".to_owned(),

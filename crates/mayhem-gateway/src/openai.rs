@@ -10,8 +10,9 @@ use std::{
 
 use crate::{
     audit::{
-        aggregate_canary_fingerprints, evaluate_catalog_canary_probe, token_fingerprint,
-        CanaryProbeSpec, DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
+        aggregate_canary_fingerprints, evaluate_catalog_canary_token_prefix_probe,
+        token_fingerprint, CanaryProbeSpec, DEFAULT_CANARY_MATCH_MIN_BPS,
+        DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
         x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState, SessionPriceMu,
@@ -160,7 +161,9 @@ pub struct GatewayCanaryModelConfig {
     pub match_min_bps: u32,
     pub prompts: Vec<GatewayCanaryPrompt>,
     pub fingerprints_by_artifact_root: BTreeMap<String, String>,
+    pub token_prefixes_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
     pub default_fingerprint: Option<String>,
+    pub default_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -782,19 +785,34 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
         if fingerprints.is_empty() {
             continue;
         }
+        let token_prefixes = canary_token_prefixes_by_artifact(canary);
+        if token_prefixes.is_empty() {
+            continue;
+        }
         let mut fingerprints_by_artifact_root = BTreeMap::new();
+        let mut token_prefixes_by_artifact_root = BTreeMap::new();
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
             for (artifact_name, artifact) in artifacts {
                 let Some(fingerprint) = fingerprints.get(artifact_name.as_str()) else {
                     continue;
                 };
+                let Some(prefixes) = token_prefixes.get(artifact_name.as_str()) else {
+                    continue;
+                };
+                let expected_fingerprint = aggregate_token_prefixes_for_prompts(&prompts, prefixes);
+                if expected_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                    continue;
+                }
                 if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
                     fingerprints_by_artifact_root
                         .insert(artifact_root.to_owned(), fingerprint.clone());
+                    token_prefixes_by_artifact_root
+                        .insert(artifact_root.to_owned(), prefixes.clone());
                 }
             }
         }
         let default_fingerprint = fingerprints.values().next().cloned();
+        let default_token_prefixes = token_prefixes.values().next().cloned();
         models.insert(
             model_id.to_owned(),
             GatewayCanaryModelConfig {
@@ -802,11 +820,56 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
                 match_min_bps,
                 prompts,
                 fingerprints_by_artifact_root,
+                token_prefixes_by_artifact_root,
                 default_fingerprint,
+                default_token_prefixes,
             },
         );
     }
     GatewayCanaryRegistry { models }
+}
+
+fn canary_token_prefixes_by_artifact(
+    canary: &Value,
+) -> BTreeMap<String, BTreeMap<String, Vec<i32>>> {
+    canary
+        .get("token_prefixes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(artifact_name, value)| {
+            let prompts = value.as_object()?;
+            let prefixes = prompts
+                .iter()
+                .filter_map(|(prompt_id, raw_tokens)| {
+                    let tokens = raw_tokens
+                        .as_array()?
+                        .iter()
+                        .map(|token| token.as_i64().and_then(|token| i32::try_from(token).ok()))
+                        .collect::<Option<Vec<_>>>()?;
+                    (!tokens.is_empty()).then_some((prompt_id.clone(), tokens))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!prefixes.is_empty()).then_some((artifact_name.clone(), prefixes))
+        })
+        .collect()
+}
+
+fn aggregate_token_prefixes_for_prompts(
+    prompts: &[GatewayCanaryPrompt],
+    prefixes: &BTreeMap<String, Vec<i32>>,
+) -> Option<String> {
+    let mut prompt_fingerprints = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        let tokens = prefixes.get(&prompt.id)?;
+        let fingerprint = token_fingerprint(tokens.iter().copied()).digest;
+        prompt_fingerprints.push((prompt.id.as_str(), fingerprint));
+    }
+    Some(aggregate_canary_fingerprints(
+        prompt_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    ))
 }
 
 fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
@@ -1966,10 +2029,18 @@ impl GatewayState {
                     Some("model"),
                 )
             })?;
+        let expected_token_prefixes = canary_expected_token_prefixes(config, served_invocation)
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "no catalog canary token prefixes for served artifact",
+                    Some("model"),
+                )
+            })?;
         let route = canary_served_route(model, served_invocation);
         let mut prompt_reports = Vec::with_capacity(config.prompts.len());
         let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
         let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+        let mut observed_tokens = BTreeMap::new();
 
         for prompt in &config.prompts {
             let request = canary_chat_request(&model.id, config, prompt, self.canary_policy.seed);
@@ -1985,6 +2056,7 @@ impl GatewayState {
                 .await
                 .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
             let token_fingerprint = token_fingerprint(result.token_ids.iter().copied()).digest;
+            observed_tokens.insert(prompt.id.clone(), result.token_ids.clone());
             let receipt = self.meter_chat_session(
                 model,
                 &request,
@@ -1999,22 +2071,13 @@ impl GatewayState {
                 "prompt_id": prompt.id,
                 "request": request,
                 "token_count": result.token_ids.len(),
+                "token_ids": result.token_ids,
                 "token_fingerprint": token_fingerprint,
                 "session_id": invocation.session_id,
                 "receipt_hash": receipt_hash,
             }));
         }
 
-        let prompt_fingerprints = prompt_reports
-            .iter()
-            .filter_map(|report| {
-                Some((
-                    report.get("prompt_id")?.as_str()?,
-                    report.get("token_fingerprint")?.as_str()?,
-                ))
-            })
-            .collect::<Vec<_>>();
-        let observed_fingerprint = aggregate_canary_fingerprints(prompt_fingerprints);
         let spec = CanaryProbeSpec {
             model: model.id.clone(),
             canary_set: config.canary_set.clone(),
@@ -2033,11 +2096,10 @@ impl GatewayState {
                 .max()
                 .unwrap_or(1),
         };
-        let evaluation = evaluate_catalog_canary_probe(
+        let evaluation = evaluate_catalog_canary_token_prefix_probe(
             &spec,
-            &expected_fingerprint,
-            &observed_fingerprint,
-            config.match_min_bps,
+            &expected_token_prefixes,
+            &observed_tokens,
         );
         let provider = served_invocation
             .provider_pubkey
@@ -2057,7 +2119,8 @@ impl GatewayState {
             "binary_hash": binary_hash,
             "canary_set": config.canary_set,
             "catalog_expected_fingerprint": expected_fingerprint,
-            "observed_fingerprint": observed_fingerprint,
+            "catalog_expected_token_prefixes": expected_token_prefixes,
+            "observed_fingerprint": evaluation.observed_fingerprint,
             "evaluation": evaluation,
             "prompts": prompt_reports,
             "receipt_hashes": receipt_hashes,
@@ -2412,6 +2475,22 @@ fn canary_expected_fingerprint(
                 .cloned()
         })
         .or_else(|| config.default_fingerprint.clone())
+}
+
+fn canary_expected_token_prefixes(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<BTreeMap<String, Vec<i32>>> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .token_prefixes_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| config.default_token_prefixes.clone())
 }
 
 fn canary_chat_request(

@@ -504,6 +504,14 @@ async fn automatic_canary_probe_catches_substituted_served_enclave() {
             .expect("token count")
             > 0
     );
+    assert_eq!(
+        probe.evidence["evidence"]["catalog_expected_token_prefixes"]["fixed-probe"],
+        json!([1, 2, 3])
+    );
+    assert_eq!(
+        probe.evidence["evidence"]["prompts"][0]["token_ids"],
+        json!([9, 9, 9])
+    );
 
     let (status, body) = json_request(app, Method::GET, "/mayhem/probes", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
@@ -512,6 +520,33 @@ async fn automatic_canary_probe_catches_substituted_served_enclave() {
     assert_eq!(
         body["data"][0]["reputation_event_kind"]["kind"],
         "probe_fail"
+    );
+}
+
+#[tokio::test]
+async fn automatic_canary_probe_accepts_exact_catalog_token_prefix() {
+    let state = GatewayState::from_models(vec![routed_test_model()])
+        .with_canary_registry(test_canary_registry(&[9, 9, 9]))
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(CanarySubstitutionBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Use a direct session." }]
+    });
+
+    let (status, _body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let probes = state.probes();
+    assert_eq!(probes.len(), 1);
+    assert!(probes[0].pass);
+    assert_eq!(probes[0].match_bps, 10_000);
+    assert_eq!(
+        probes[0].reputation_event_kind,
+        ReputationEventKind::ProbeOk
     );
 }
 
@@ -704,7 +739,12 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     "aa".repeat(32),
                     expected_fingerprint,
                 )]),
+                token_prefixes_by_artifact_root: BTreeMap::from([(
+                    "aa".repeat(32),
+                    BTreeMap::from([("fixed-probe".to_owned(), expected_tokens.to_vec())]),
+                )]),
                 default_fingerprint: None,
+                default_token_prefixes: None,
             },
         )]),
     }

@@ -168,6 +168,8 @@ pub(crate) struct CanaryRef {
     pub(crate) match_min: f64,
     #[serde(default)]
     pub(crate) fingerprints: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) token_prefixes: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -545,6 +547,34 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
                 "{} canary fingerprint for {} must be 32-byte hex",
                 model.model_id, artifact
             ));
+        }
+    }
+    for (artifact, prefixes) in &model.canary.token_prefixes {
+        if !model.artifacts.contains_key(artifact) {
+            errors.push(format!(
+                "{} canary token_prefixes references unknown artifact {}",
+                model.model_id, artifact
+            ));
+        }
+        if prefixes.is_empty() {
+            errors.push(format!(
+                "{} canary token_prefixes for {} must not be empty",
+                model.model_id, artifact
+            ));
+        }
+        for (prompt_id, tokens) in prefixes {
+            if prompt_id.trim().is_empty() {
+                errors.push(format!(
+                    "{} canary token_prefixes for {} has empty prompt id",
+                    model.model_id, artifact
+                ));
+            }
+            if tokens.is_empty() {
+                errors.push(format!(
+                    "{} canary token_prefixes for {} prompt {} must not be empty",
+                    model.model_id, artifact, prompt_id
+                ));
+            }
         }
     }
     if model.price_ref_mu.denom != "mu_usd" {
@@ -1123,6 +1153,7 @@ mod tests {
                 set_id: "canary-launch-v1".to_owned(),
                 match_min: 0.9,
                 fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
             },
             price_ref_mu: PriceRef {
                 denom: "mu_usd".to_owned(),

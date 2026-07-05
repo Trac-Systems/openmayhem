@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -144,6 +146,68 @@ pub fn evaluate_catalog_canary_probe(
     }
 }
 
+pub fn evaluate_catalog_canary_token_prefix_probe(
+    spec: &CanaryProbeSpec,
+    expected_prefixes: &BTreeMap<String, Vec<i32>>,
+    observed_tokens: &BTreeMap<String, Vec<i32>>,
+) -> CanaryProbeEvaluation {
+    let mut matched_positions = 0_u32;
+    let mut total_positions = 0_u32;
+    let mut expected_fingerprints = Vec::with_capacity(expected_prefixes.len());
+    let mut observed_fingerprints = Vec::with_capacity(expected_prefixes.len());
+
+    for (prompt_id, expected_prefix) in expected_prefixes {
+        let observed = observed_tokens
+            .get(prompt_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let observed_prefix = observed
+            .iter()
+            .copied()
+            .take(expected_prefix.len())
+            .collect::<Vec<_>>();
+        total_positions = total_positions.saturating_add(expected_prefix.len() as u32);
+        matched_positions = matched_positions.saturating_add(
+            expected_prefix
+                .iter()
+                .zip(observed_prefix.iter())
+                .filter(|(expected, observed)| expected == observed)
+                .count() as u32,
+        );
+        let expected_fingerprint = token_fingerprint(expected_prefix.iter().copied()).digest;
+        let observed_fingerprint = token_fingerprint(observed_prefix.iter().copied()).digest;
+        expected_fingerprints.push((prompt_id.as_str(), expected_fingerprint));
+        observed_fingerprints.push((prompt_id.as_str(), observed_fingerprint));
+    }
+
+    let match_bps = if total_positions == 0 {
+        0
+    } else {
+        ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
+    };
+    let expected_fingerprint = aggregate_canary_fingerprints(
+        expected_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+    let observed_fingerprint = aggregate_canary_fingerprints(
+        observed_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+
+    CanaryProbeEvaluation {
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint,
+        observed_fingerprint,
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: total_positions > 0 && matched_positions == total_positions,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +304,31 @@ mod tests {
         let ok = evaluate_catalog_canary_probe(&spec(), "AA", "aa", 9_000);
         assert_eq!(ok.match_bps, 10_000);
         assert!(ok.pass);
+    }
+
+    #[test]
+    fn catalog_token_prefix_evaluation_requires_exact_prefixes() {
+        let expected = BTreeMap::from([
+            ("first".to_owned(), vec![1, 2, 3]),
+            ("second".to_owned(), vec![4, 5]),
+        ]);
+        let observed_ok = BTreeMap::from([
+            ("first".to_owned(), vec![1, 2, 3, 999]),
+            ("second".to_owned(), vec![4, 5, 999]),
+        ]);
+        let ok = evaluate_catalog_canary_token_prefix_probe(&spec(), &expected, &observed_ok);
+        assert_eq!(ok.match_bps, 10_000);
+        assert!(ok.pass);
+
+        let observed_swap = BTreeMap::from([
+            ("first".to_owned(), vec![1, 2, 99]),
+            ("second".to_owned(), vec![4, 5]),
+        ]);
+        let mismatch =
+            evaluate_catalog_canary_token_prefix_probe(&spec(), &expected, &observed_swap);
+        assert_eq!(mismatch.matched_positions, 4);
+        assert_eq!(mismatch.total_positions, 5);
+        assert_eq!(mismatch.match_bps, 8_000);
+        assert!(!mismatch.pass);
     }
 }
