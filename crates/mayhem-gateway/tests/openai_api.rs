@@ -2047,6 +2047,9 @@ async fn user_dashboard_renders_live_gateway_data() {
     assert!(body.contains("Sessions"));
     assert!(body.contains("Models"));
     assert!(body.contains("Spend"));
+    assert!(body.contains("Only Tier 3 keeps prompts private"));
+    assert!(body.contains("Tier 4 can still read prompts"));
+    assert!(body.contains("not a privacy ladder"));
     assert!(body.contains(&model));
     assert!(!body.contains("1,240.00 TAP"));
     assert_no_external_urls(&body);

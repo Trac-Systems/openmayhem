@@ -1398,6 +1398,10 @@ fn dashboard_locked_html(expires_in_seconds: u64) -> String {
     )
 }
 
+fn dashboard_tier_tooltip() -> &'static str {
+    "Tier 1: runs Mayhem software; trust is economic. Tier 2: proven Apple or NVIDIA hardware running the real app. Tier 3: Only Tier 3 keeps prompts private from the provider's own machine. Tier 4: admin-verified business identity, not prompt privacy; Tier 4 can still read prompts. Higher numbers are not a privacy ladder."
+}
+
 fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &str) -> String {
     let receipts = state.receipts();
     let latest_receipts = dashboard_latest_receipts(&receipts);
@@ -1418,10 +1422,11 @@ fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &s
     let balance_usd = format_mu_usd(state.receipt_config.balance_mu);
     let lifetime_spend = format_mu_usd(lifetime_spend_mu);
     let api_key_masked = "mayhem-local";
+    let tier_tooltip = html_escape(dashboard_tier_tooltip());
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/provider">Provider</a><a href="/mayhem/dashboard/components">Components</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented"><span class="segment active">T1+</span><span class="segment">T2+</span><span class="segment">T3+</span><span class="toggle">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/provider">Provider</a><a href="/mayhem/dashboard/components">Components</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
 OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
@@ -2010,6 +2015,7 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
         return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>No models loaded</p></div></div>"#
             .to_owned();
     }
+    let tier_tooltip = html_escape(dashboard_tier_tooltip());
     models
         .iter()
         .take(6)
@@ -2037,11 +2043,13 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
                         html_escape(&identity.legal_name),
                         html_escape(&identity.jurisdiction)
                     )
-                })
+            })
                 .unwrap_or_default();
             format!(
-                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta">{} · {} · T{}{} · {}</div></div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
+                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta" title="{}" aria-label="{}">{} · {} · T{}{} · {}</div></div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
                 html_escape(&model.id),
+                tier_tooltip,
+                tier_tooltip,
                 html_escape(&model.mayhem.model_class),
                 html_escape(&dashboard_model_price(model)),
                 max_tier,

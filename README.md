@@ -50,6 +50,19 @@ The gateway routes for quality, not just availability. It tracks TTFT, throughpu
 | Admin | Creates and signs enclaves/catalog entries, opens rooms, sets prices/rules, publishes catalog anchors, and bans providers when needed. | Does not hold provider payout funds in the TAP claim path. |
 | Auditor | Runs canary probes and submits signed probe evidence. | Cannot slash without contract-valid, signed, catalog-bound evidence. |
 
+## How Much Can You Trust A Provider?
+
+Attestation tiers tell you what kind of trust evidence a provider has. They do not all mean the same thing, and a higher number is not always "everything below it plus more."
+
+| Tier | Plain Meaning | Can The Provider Read My Prompt? |
+|------|---------------|----------------------------------|
+| Tier 1 | Runs the Mayhem software. Trust is mostly economic: if they cheat, probes, receipts, holdbacks, and slashing can cost them money. | Yes. |
+| Tier 2 | Proven to be genuine Apple or NVIDIA hardware running the real Mayhem app. This helps stop fake hardware or fake-app claims. | Yes. |
+| Tier 3 | Hardware confidential compute. Your prompt is protected even from the provider's own machine. This is the only tier where they should not be able to read what you send, and it is not available yet on our current hardware. | No. |
+| Tier 4 | A real, identity-verified business that the Mayhem admin has KYB'd. You know who they are. | Yes. Tier 4 is identity, not prompt privacy. |
+
+The honest shortcut is simple: **only Tier 3 means the provider cannot read your prompt**. **Tier 4 does not make a prompt private**; it means the admin knows the business behind the provider.
+
 ## User Walkthrough
 
 Install Mayhem from a checkout:
@@ -105,7 +118,7 @@ mayhem models --gateway --min-att-tier 3
 mayhem models --gateway --require-kyb
 ```
 
-You can also send routing preferences through OpenAI-compatible request headers, for example `X-Mayhem-Min-Att-Tier: 3`, `X-Mayhem-Hedge: 1`, or failover thresholds such as `X-Mayhem-Min-Tok-S`.
+`--min-att-tier 3` asks for prompt-private routing. `--require-kyb` asks for Tier 4 identity; it does not make prompts private. You can also send routing preferences through OpenAI-compatible request headers, for example `X-Mayhem-Min-Att-Tier: 3`, `X-Mayhem-Hedge: 1`, or failover thresholds such as `X-Mayhem-Min-Tok-S`.
 
 ## Provider Walkthrough
 
