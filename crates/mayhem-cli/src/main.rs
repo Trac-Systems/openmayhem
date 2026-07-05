@@ -65,6 +65,11 @@ const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
 const COINBASE_RETIRED_MESSAGE: &str =
     "Coinbase Commerce is retired for Mayhem; use Stripe fiat checkout or TAP.";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
+const DEFAULT_HOLDBACK_EPOCHS: u64 = 168;
+const DEFAULT_CHALLENGE_EPOCHS: u64 = 6;
+const DEFAULT_CANARY_PROBE_HOLDBACK_BPS: u64 = 0;
+const DEFAULT_CANARY_PROBE_RELEASE_MIN_PASSES: u64 = 1;
+const DEFAULT_RATE_STALENESS_SECONDS: u64 = 45 * 60;
 const OPENCODE_PROVIDER_ID: &str = "mayhem";
 const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
 const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
@@ -2789,6 +2794,42 @@ struct AdminTnkSettlementArgs {
     /// Path to full tnk_settlement feature JSON produced by the settlement runner.
     #[arg(long, value_name = "PATH")]
     settlement_file: Option<PathBuf>,
+
+    /// Epoch to plan from live contract state when settlement JSON is not supplied.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    /// Settlement timestamp in Unix seconds. Defaults to now when planning from state.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// Treasury MSB address that will author the batch transfer.
+    #[arg(long)]
+    treasury_address: Option<String>,
+
+    /// Operator/admin TNK address receiving the aggregate TNK operator fee.
+    #[arg(long)]
+    operator_tnk_address: Option<String>,
+
+    /// MSB network for the treasury batch. Defaults from the treasury address.
+    #[arg(long)]
+    msb_network: Option<String>,
+
+    /// Broadcast the planned MSB batch through the local Pear MSB app. Requires --submit.
+    #[arg(long)]
+    submit_transfer: bool,
+
+    /// Use an already-broadcast 64-hex MSB batch transaction hash for evidence.
+    #[arg(long)]
+    msb_tx_hash: Option<String>,
+
+    /// Maximum seconds to wait for MSB account sync and validator connection.
+    #[arg(long, default_value_t = 180)]
+    msb_transfer_timeout_seconds: u64,
+
+    /// Refuse transfer retry unless the treasury balance before broadcast matches this decimal TNK value.
+    #[arg(long)]
+    expected_treasury_balance_before: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -3394,6 +3435,23 @@ struct MsbTransferOutput {
     tx_hash: String,
     before_balance: String,
     validator_connections: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MsbBatchTransferOutput {
+    ok: bool,
+    network: String,
+    from: String,
+    outputs: Vec<MsbBatchTransferOutputEntry>,
+    tx_hash: String,
+    before_balance: String,
+    validator_connections: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MsbBatchTransferOutputEntry {
+    to: String,
+    amount: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -9546,9 +9604,12 @@ async fn run_admin_rate_feature(
 }
 
 async fn run_admin_tnk_settlement_feature(args: &AdminTnkSettlementArgs) -> Result<()> {
-    let value = admin_tnk_settlement_payload(args)?;
-    let key = tnk_settlement_feature_key(&value)?;
-    run_admin_feature_command(&args.tx, "tnkSettlement", key, value).await
+    if args.settlement_json.is_some() || args.settlement_file.is_some() {
+        let value = admin_tnk_settlement_payload(args)?;
+        let key = tnk_settlement_feature_key(&value)?;
+        return run_admin_feature_command(&args.tx, "tnkSettlement", key, value).await;
+    }
+    run_admin_tnk_settlement_runner(args).await
 }
 
 fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
@@ -10202,6 +10263,211 @@ fn admin_tnk_settlement_payload(args: &AdminTnkSettlementArgs) -> Result<Value> 
     Ok(value)
 }
 
+async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Result<()> {
+    if args.submit_transfer && args.msb_tx_hash.is_some() {
+        bail!("pass only one of --submit-transfer or --msb-tx-hash");
+    }
+    if args.submit_transfer && args.tx.sim {
+        bail!("--submit-transfer cannot be combined with --sim");
+    }
+    if args.submit_transfer && !args.tx.submit {
+        bail!("--submit-transfer requires --submit so the MSB batch and contract evidence are submitted together");
+    }
+    if args.msb_transfer_timeout_seconds == 0 {
+        bail!("--msb-transfer-timeout-seconds must be positive");
+    }
+    let epoch = args
+        .epoch
+        .context("--epoch is required when planning TNK settlement from contract state")?;
+    if epoch == 0 {
+        bail!("--epoch must be positive");
+    }
+    let at = args.at.unwrap_or(now_unix_seconds()?);
+
+    let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let treasury_address =
+        resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
+    let operator_tnk_address = resolve_tnk_operator_address(args.operator_tnk_address.as_deref())?;
+    let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
+    let provided_msb_tx_hash = args
+        .msb_tx_hash
+        .as_deref()
+        .map(validate_msb_tx_hash)
+        .transpose()?;
+
+    let mut plan = build_tnk_settlement_plan(
+        &rpc,
+        epoch,
+        at,
+        &network,
+        &treasury_address,
+        &operator_tnk_address,
+        provided_msb_tx_hash.as_deref(),
+    )
+    .await?;
+
+    if plan.already_settled.is_none()
+        && plan
+            .payload
+            .get("msb_tx_hash")
+            .and_then(Value::as_str)
+            .is_none()
+        && args.tx.submit
+        && !args.submit_transfer
+    {
+        bail!("--submit requires --msb-tx-hash or --submit-transfer for TNK settlement evidence");
+    }
+
+    let mut msb_transfer = None;
+    if plan.already_settled.is_none() && args.submit_transfer {
+        let wallet = resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.tx.peer_store_name,
+            args.tx.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await?;
+        if wallet.address.as_deref() != Some(&treasury_address) {
+            bail!(
+                "local MSB wallet address {} does not match --treasury-address {treasury_address}",
+                wallet.address.as_deref().unwrap_or("<unknown>")
+            );
+        }
+        let keypair_path = PathBuf::from(wallet.keypair_path.clone());
+        let (stores_directory, store_name) = msb_store_from_keypair_path(&keypair_path)?;
+        let transfer = submit_msb_batch_transfer(
+            &network,
+            &stores_directory,
+            &store_name,
+            &plan.msb_outputs,
+            args.msb_transfer_timeout_seconds,
+            args.expected_treasury_balance_before.as_deref(),
+        )
+        .await?;
+        if transfer.from != treasury_address {
+            bail!(
+                "MSB batch was authored by {}, expected treasury {}",
+                transfer.from,
+                treasury_address
+            );
+        }
+        plan.payload["msb_tx_hash"] = json!(transfer.tx_hash.clone());
+        msb_transfer = Some(transfer);
+    }
+
+    let settlement_report = plan.payload.clone();
+    let feature = if plan.already_settled.is_none()
+        && plan
+            .payload
+            .get("msb_tx_hash")
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        Some(json!({
+            "feature": "mayhem",
+            "key": tnk_settlement_feature_key(&plan.payload)?,
+            "value": plan.payload.clone(),
+        }))
+    } else {
+        None
+    };
+
+    let mut feature_result = None;
+    if let Some(feature) = feature.as_ref().filter(|_| args.tx.submit && !args.tx.sim) {
+        let submitted = rpc
+            .submit_feature(feature)
+            .await
+            .context("submitting free TNK settlement feature")?;
+        if submitted.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!("TNK settlement feature was not accepted: {submitted}");
+        }
+        feature_result = Some(submitted);
+    }
+
+    let copy_paste_submit = format!(
+        "mayhem admin tnk-settlement --epoch {} --at {} --treasury-address {} --operator-tnk-address {} --msb-network {} --submit-transfer --submit{}{}{}{}",
+        epoch,
+        at,
+        shell_single_quote(&treasury_address),
+        shell_single_quote(&operator_tnk_address),
+        shell_single_quote(&network),
+        args.tx
+            .home
+            .as_ref()
+            .map(|home| format!(" --home {}", shell_single_quote(&home.display().to_string())))
+            .unwrap_or_default(),
+        (args.tx.peer_store_name != "main")
+            .then(|| format!(
+                " --peer-store-name {}",
+                shell_single_quote(&args.tx.peer_store_name)
+            ))
+            .unwrap_or_default(),
+        args.tx
+            .rpc_url
+            .as_deref()
+            .map(|url| format!(" --rpc-url {}", shell_single_quote(url)))
+            .unwrap_or_default(),
+        args
+            .expected_treasury_balance_before
+            .as_deref()
+            .map(|balance| format!(" --expected-treasury-balance-before {}", shell_single_quote(balance)))
+            .unwrap_or_default()
+    );
+    let feature_rpc_command = feature.as_ref().map(|feature| {
+        let feature_json = serde_json::to_string(feature).unwrap_or_default();
+        format!(
+            "curl -sS -X POST {} -H 'content-type: application/json' --data {}",
+            shell_single_quote(&format!(
+                "{}/contract/feature",
+                rpc_url.trim_end_matches('/')
+            )),
+            shell_single_quote(&feature_json)
+        )
+    });
+    let msb_outputs_json = serde_json::to_string(&plan.msb_outputs)?;
+    let msb_transfer_command = format!(
+        "pear run --no-ask {} --transfer-helper batch-transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --outputs-json {}",
+        shell_single_quote(&repo_path("intercom/trac/msb")?.display().to_string()),
+        shell_single_quote(&network),
+        shell_single_quote(&msb_outputs_json)
+    );
+
+    let report = json!({
+        "ok": true,
+        "submitted": feature_result.is_some(),
+        "sim": args.tx.submit && args.tx.sim,
+        "already_settled": plan.already_settled,
+        "rpc_url": rpc_url,
+        "epoch": epoch,
+        "at": at,
+        "network": network,
+        "treasury_from": treasury_address,
+        "operator_to": operator_tnk_address,
+        "settlement": settlement_report,
+        "feature": feature,
+        "feature_result": feature_result,
+        "msb_transfer": msb_transfer,
+        "msb_outputs": plan.msb_outputs,
+        "skipped_providers": plan.skipped_providers,
+        "copy_paste": {
+            "submit_settlement": copy_paste_submit,
+            "msb_transfer_helper": msb_transfer_command,
+            "feature_rpc": feature_rpc_command,
+        },
+    });
+
+    if args.tx.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_tnk_settlement_runner_report(&report)?;
+    }
+    Ok(())
+}
+
 fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
     json!({
         "op": "tnk_deposit",
@@ -10677,6 +10943,83 @@ fn print_admin_feature_report(report: &Value) -> Result<()> {
         println!("Submitted: false (--sim dry-run for free feature)");
     } else {
         println!("Submitted: false (pass --submit to append through peer RPC)");
+    }
+    Ok(())
+}
+
+fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
+    println!("TNK settlement runner report.");
+    println!("Epoch: {}", report["epoch"].as_u64().unwrap_or(0));
+    println!("Network: {}", report["network"].as_str().unwrap_or(""));
+    println!(
+        "Treasury: {}",
+        report["treasury_from"].as_str().unwrap_or("")
+    );
+    println!("Operator: {}", report["operator_to"].as_str().unwrap_or(""));
+    if !report["already_settled"].is_null() {
+        println!("Already settled: true");
+        if let Some(hash) = report["already_settled"]["msb_tx_hash"].as_str() {
+            println!("MSB tx: {hash}");
+        }
+        return Ok(());
+    }
+    println!("Already settled: false");
+    if let Some(settlement) = report.get("settlement").filter(|value| !value.is_null()) {
+        println!(
+            "Gross: {} mu_usd",
+            settlement["gross_mu"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "Providers: {} / provider_mu: {} / operator_fee_mu: {}",
+            settlement["provider_count"].as_u64().unwrap_or(0),
+            settlement["provider_mu"].as_u64().unwrap_or(0),
+            settlement["operator_fee_mu"].as_u64().unwrap_or(0)
+        );
+        println!("TNK e18: {}", settlement["tnk_e18"].as_str().unwrap_or(""));
+        println!(
+            "Transfer root: {}",
+            settlement["transfer_root"].as_str().unwrap_or("")
+        );
+        if let Some(hash) = settlement["msb_tx_hash"].as_str() {
+            println!("MSB tx: {hash}");
+        } else {
+            println!("MSB tx: pending (dry plan only)");
+        }
+    }
+    println!(
+        "Skipped providers: {}",
+        report["skipped_providers"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0)
+    );
+    if let Some(feature) = report.get("feature").filter(|value| !value.is_null()) {
+        println!("Feature key: {}", feature["key"].as_str().unwrap_or(""));
+    }
+    if report["submitted"].as_bool() == Some(true) {
+        println!("Submitted: true");
+    } else if report["sim"].as_bool() == Some(true) {
+        println!("Submitted: false (--sim dry-run)");
+    } else {
+        println!("Submitted: false");
+    }
+    println!("Copy/paste full settlement command:");
+    println!(
+        "{}",
+        report["copy_paste"]["submit_settlement"]
+            .as_str()
+            .unwrap_or("")
+    );
+    println!("Copy/paste Pear MSB batch helper command:");
+    println!(
+        "{}",
+        report["copy_paste"]["msb_transfer_helper"]
+            .as_str()
+            .unwrap_or("")
+    );
+    if let Some(command) = report["copy_paste"]["feature_rpc"].as_str() {
+        println!("Copy/paste feature RPC command:");
+        println!("{command}");
     }
     Ok(())
 }
@@ -12205,6 +12548,8 @@ async fn reputation(args: ReputationArgs) -> Result<()> {
             last_holdback_release_epoch: None,
             last_payout_rate_ts: None,
             last_payout_msb_tx_hash: None,
+            last_settlement_epoch: None,
+            last_settlement_msb_tx_hash: None,
         },
     };
     let earning = earning_view(earning)?;
@@ -15167,6 +15512,527 @@ fn parse_tnk_rate(value: &Value) -> Result<PayTnkRate> {
     })
 }
 
+fn now_unix_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs())
+}
+
+fn resolve_tnk_operator_address(operator_tnk_address: Option<&str>) -> Result<String> {
+    let value = operator_tnk_address
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            env::var("MAYHEM_TNK_OPERATOR_ADDRESS")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .context(
+            "operator TNK address required; pass --operator-tnk-address or set MAYHEM_TNK_OPERATOR_ADDRESS",
+        )?;
+    if value.split_whitespace().count() != 1 {
+        bail!("operator TNK address must not contain whitespace");
+    }
+    Ok(value)
+}
+
+fn validate_msb_tx_hash(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if !is_hex_len(&value, 64) {
+        bail!("MSB transaction hash must be 64 hex characters");
+    }
+    Ok(value)
+}
+
+async fn build_tnk_settlement_plan(
+    rpc: &PeerRpcClient,
+    epoch: u64,
+    at: u64,
+    network: &str,
+    treasury_address: &str,
+    operator_tnk_address: &str,
+    msb_tx_hash: Option<&str>,
+) -> Result<TnkSettlementPlan> {
+    for (label, value) in [
+        ("MSB network", network),
+        ("treasury address", treasury_address),
+        ("operator TNK address", operator_tnk_address),
+    ] {
+        if !is_safe_key_part(value) {
+            bail!("{label} is not contract-safe");
+        }
+    }
+    if let Some(existing) = read_state_value(rpc, &format!("settle/tnk/{epoch}")).await? {
+        return Ok(TnkSettlementPlan {
+            payload: existing.clone(),
+            msb_outputs: Vec::new(),
+            skipped_providers: Vec::new(),
+            already_settled: Some(existing),
+        });
+    }
+
+    let apply_state = read_state_value(rpc, "epoch/apply/state")
+        .await?
+        .context("epoch/apply/state not found; apply the epoch before TNK settlement")?;
+    let applied_epoch = apply_state
+        .get("updated_epoch")
+        .and_then(Value::as_u64)
+        .context("epoch/apply/state missing updated_epoch")?;
+    if applied_epoch != epoch {
+        bail!(
+            "epoch/apply/state is at epoch {applied_epoch}, not requested settlement epoch {epoch}"
+        );
+    }
+    let epoch_apply_hash = apply_state
+        .get("last_apply_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| is_hex_len(hash, 64))
+        .context("epoch/apply/state missing 32-byte last_apply_hash")?
+        .to_ascii_lowercase();
+
+    let rate_value = read_state_value(rpc, "rate/latest")
+        .await?
+        .context("rate/latest not found; run the TNK rate watcher before settlement")?;
+    let rate = parse_tnk_rate(&rate_value)?;
+    if !matches!(rate.source.as_str(), "gate-spot" | "mexc-spot") {
+        bail!(
+            "rate/latest source {} is not supported for TNK settlement",
+            rate.source
+        );
+    }
+    let rate_ts = rate.ts.context(
+        "rate/latest missing timestamp; settlement requires a contract oracle timestamp",
+    )?;
+
+    let params = read_tnk_settlement_params(rpc, at).await?;
+    if rate_ts > at {
+        bail!("rate/latest timestamp {rate_ts} is in the future relative to settlement timestamp {at}");
+    }
+    if at.saturating_sub(rate_ts) > params.rate_staleness_seconds {
+        bail!(
+            "rate/latest is stale: age {}s exceeds {}s",
+            at.saturating_sub(rate_ts),
+            params.rate_staleness_seconds
+        );
+    }
+
+    let admin = read_state_value(rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .context("admin key missing; provider payout targets cannot be verified")?;
+    let providers = read_prefix_entries(rpc, "prov/")
+        .await?
+        .into_iter()
+        .filter_map(|entry| {
+            let provider = entry
+                .value
+                .get("provider")
+                .and_then(Value::as_str)?
+                .to_owned();
+            Some((provider, entry.value))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut skipped_providers = Vec::new();
+    let mut outputs = Vec::new();
+    let mut earnings = read_prefix_values::<LedgerEarningRecord>(rpc, "earn/tnk/").await?;
+    earnings.sort_by(|left, right| left.provider.cmp(&right.provider));
+    for earning in earnings {
+        if earning.rail != "tnk" {
+            continue;
+        }
+        let payable_mu = tnk_payable_earning_mu(rpc, &earning, epoch, &params).await?;
+        if payable_mu == 0 {
+            continue;
+        }
+        let Some(provider) = providers.get(&earning.provider) else {
+            skipped_providers.push(json!({
+                "provider": earning.provider,
+                "mu": payable_mu,
+                "reason": "provider record missing",
+            }));
+            continue;
+        };
+        match tnk_provider_payout_target(provider, &earning.provider, &admin) {
+            Ok(to) => outputs.push(json!({
+                "role": "provider",
+                "provider": earning.provider,
+                "to": to,
+                "mu": payable_mu,
+                "tnk_e18": mu_to_tnk_e18_ceil_u128(payable_mu, rate.tnk_usd_e6)?.to_string(),
+            })),
+            Err(error) => skipped_providers.push(json!({
+                "provider": earning.provider,
+                "mu": payable_mu,
+                "reason": error.to_string(),
+            })),
+        }
+    }
+
+    let fee = read_tnk_fee_record(rpc).await?;
+    let operator_fee_mu = fee
+        .cum_mu
+        .checked_sub(fee.swept_cum_mu)
+        .context("fee/tnk/cum swept amount exceeds cumulative fee")?;
+    if operator_fee_mu > 0 {
+        outputs.push(json!({
+            "role": "operator_fee",
+            "to": operator_tnk_address,
+            "mu": operator_fee_mu,
+            "tnk_e18": mu_to_tnk_e18_ceil_u128(operator_fee_mu, rate.tnk_usd_e6)?.to_string(),
+        }));
+    }
+    if outputs.is_empty() {
+        bail!(
+            "TNK settlement has no positive provider or operator fee outputs; nothing to broadcast"
+        );
+    }
+
+    let totals = tnk_settlement_output_totals(&outputs)?;
+    let transfer_root = stable_value_hash(&json!({
+        "domain": "mayhem-tnk-settlement-transfer-root-v1",
+        "value": outputs,
+    }));
+    let payload = json!({
+        "op": "tnk_settlement",
+        "epoch": epoch,
+        "at": at,
+        "rail": "tnk",
+        "network": network,
+        "treasury_from": treasury_address,
+        "operator_to": operator_tnk_address,
+        "epoch_apply_hash": epoch_apply_hash,
+        "rate_tnk_usd_e6": rate.tnk_usd_e6,
+        "rate_source": rate.source,
+        "rate_ts": rate_ts,
+        "msb_tx_hash": msb_tx_hash,
+        "transfer_root": transfer_root,
+        "provider_count": totals.provider_count,
+        "provider_mu": totals.provider_mu,
+        "operator_fee_mu": totals.operator_fee_mu,
+        "gross_mu": totals.gross_mu,
+        "tnk_e18": totals.tnk_e18,
+        "outputs": outputs,
+    });
+    let msb_outputs = payload["outputs"]
+        .as_array()
+        .expect("outputs constructed as array")
+        .iter()
+        .map(|output| {
+            let tnk_e18 = output
+                .get("tnk_e18")
+                .and_then(Value::as_str)
+                .context("settlement output missing tnk_e18")?
+                .parse::<u128>()
+                .context("parsing settlement tnk_e18")?;
+            Ok(MsbBatchTransferOutputEntry {
+                to: output
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .context("settlement output missing recipient")?
+                    .to_owned(),
+                amount: tnk_e18_to_decimal(tnk_e18),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(TnkSettlementPlan {
+        payload,
+        msb_outputs,
+        skipped_providers,
+        already_settled: None,
+    })
+}
+
+#[derive(Debug)]
+struct TnkSettlementTotals {
+    provider_count: u64,
+    provider_mu: u64,
+    operator_fee_mu: u64,
+    gross_mu: u64,
+    tnk_e18: String,
+}
+
+fn tnk_settlement_output_totals(outputs: &[Value]) -> Result<TnkSettlementTotals> {
+    let mut provider_count = 0_u64;
+    let mut provider_mu = 0_u64;
+    let mut operator_fee_mu = 0_u64;
+    let mut tnk_e18 = 0_u128;
+    for output in outputs {
+        let role = output
+            .get("role")
+            .and_then(Value::as_str)
+            .context("TNK settlement output missing role")?;
+        let mu = output
+            .get("mu")
+            .and_then(Value::as_u64)
+            .context("TNK settlement output missing mu")?;
+        let amount = output
+            .get("tnk_e18")
+            .and_then(Value::as_str)
+            .context("TNK settlement output missing tnk_e18")?
+            .parse::<u128>()
+            .context("parsing TNK settlement tnk_e18")?;
+        tnk_e18 = tnk_e18
+            .checked_add(amount)
+            .context("TNK settlement amount overflow")?;
+        match role {
+            "provider" => {
+                provider_count = provider_count
+                    .checked_add(1)
+                    .context("TNK settlement provider count overflow")?;
+                provider_mu = provider_mu
+                    .checked_add(mu)
+                    .context("TNK settlement provider amount overflow")?;
+            }
+            "operator_fee" => {
+                operator_fee_mu = operator_fee_mu
+                    .checked_add(mu)
+                    .context("TNK settlement operator amount overflow")?;
+            }
+            _ => bail!("invalid TNK settlement output role {role}"),
+        }
+    }
+    let gross_mu = provider_mu
+        .checked_add(operator_fee_mu)
+        .context("TNK settlement gross amount overflow")?;
+    Ok(TnkSettlementTotals {
+        provider_count,
+        provider_mu,
+        operator_fee_mu,
+        gross_mu,
+        tnk_e18: tnk_e18.to_string(),
+    })
+}
+
+async fn read_tnk_settlement_params(rpc: &PeerRpcClient, at: u64) -> Result<TnkSettlementParams> {
+    Ok(TnkSettlementParams {
+        holdback_epochs: read_param_u64_at(rpc, "holdback_epochs", DEFAULT_HOLDBACK_EPOCHS, at)
+            .await?,
+        challenge_epochs: read_param_u64_at(rpc, "challenge_epochs", DEFAULT_CHALLENGE_EPOCHS, at)
+            .await?,
+        canary_probe_holdback_bps: read_param_u64_at(
+            rpc,
+            "canary_probe_holdback_bps",
+            DEFAULT_CANARY_PROBE_HOLDBACK_BPS,
+            at,
+        )
+        .await?,
+        canary_probe_release_min_passes: read_param_u64_at(
+            rpc,
+            "canary_probe_release_min_passes",
+            DEFAULT_CANARY_PROBE_RELEASE_MIN_PASSES,
+            at,
+        )
+        .await?,
+        rate_staleness_seconds: read_param_u64_at(
+            rpc,
+            "rate_staleness_seconds",
+            DEFAULT_RATE_STALENESS_SECONDS,
+            at,
+        )
+        .await?,
+    })
+}
+
+async fn read_param_u64_at(rpc: &PeerRpcClient, key: &str, default: u64, at: u64) -> Result<u64> {
+    let Some(record) = read_state_value(rpc, &format!("params/{key}")).await? else {
+        return Ok(default);
+    };
+    let active = match record.get("pending") {
+        Some(pending)
+            if !pending.is_null()
+                && pending
+                    .get("effective_at")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|effective_at| effective_at <= at) =>
+        {
+            pending
+        }
+        _ => record
+            .get("current")
+            .context("parameter record missing current entry")?,
+    };
+    active
+        .get("value")
+        .and_then(Value::as_u64)
+        .with_context(|| format!("params/{key} active value is not a u64"))
+}
+
+async fn read_tnk_fee_record(rpc: &PeerRpcClient) -> Result<LedgerFeeRecord> {
+    match read_state_value(rpc, "fee/tnk/cum").await? {
+        Some(value) => serde_json::from_value(value).context("parsing fee/tnk/cum contract state"),
+        None => Ok(LedgerFeeRecord {
+            rail: "tnk".to_owned(),
+            denom: "mu_usd".to_owned(),
+            cum_mu: 0,
+            swept_cum_mu: 0,
+            updated_epoch: 0,
+            updated_at: None,
+            last_apply_hash: None,
+            last_fee_bps: None,
+            last_settlement_epoch: None,
+            last_settlement_msb_tx_hash: None,
+        }),
+    }
+}
+
+async fn tnk_payable_earning_mu(
+    rpc: &PeerRpcClient,
+    earning: &LedgerEarningRecord,
+    epoch: u64,
+    params: &TnkSettlementParams,
+) -> Result<u64> {
+    let locked_epochs = params.holdback_epochs.max(params.challenge_epochs);
+    let kept = refresh_tnk_holdbacks(rpc, earning, epoch, locked_epochs, params).await?;
+    let held_mu = kept
+        .iter()
+        .try_fold(0_u64, |sum, bucket| sum.checked_add(bucket.mu))
+        .context("TNK held amount overflow")?;
+    let released_mu = earning
+        .total_mu
+        .checked_sub(held_mu)
+        .context("TNK held amount exceeds total earnings")?;
+    released_mu
+        .checked_sub(earning.paid_cum_mu)
+        .context("TNK paid amount exceeds released earnings")
+}
+
+async fn refresh_tnk_holdbacks(
+    rpc: &PeerRpcClient,
+    earning: &LedgerEarningRecord,
+    current_epoch: u64,
+    locked_epochs: u64,
+    params: &TnkSettlementParams,
+) -> Result<Vec<LedgerHoldbackBucket>> {
+    let holdbacks = normalize_tnk_holdbacks(earning)?;
+    let probe_gate_enabled =
+        params.canary_probe_holdback_bps > 0 && params.canary_probe_release_min_passes > 0;
+    let mut kept = Vec::new();
+    for bucket in holdbacks {
+        if bucket.epoch.saturating_add(locked_epochs) > current_epoch {
+            kept.push(bucket);
+            continue;
+        }
+        if !probe_gate_enabled {
+            continue;
+        }
+        if tnk_probe_passed(
+            rpc,
+            &earning.provider,
+            bucket.epoch,
+            params.canary_probe_release_min_passes,
+        )
+        .await?
+        {
+            continue;
+        }
+        if bucket.probe_gate {
+            kept.push(bucket);
+            continue;
+        }
+        let gated_mu =
+            (u128::from(bucket.mu) * u128::from(params.canary_probe_holdback_bps) / 10_000) as u64;
+        if gated_mu > 0 {
+            kept.push(LedgerHoldbackBucket {
+                epoch: bucket.epoch,
+                mu: gated_mu,
+                probe_gate: true,
+            });
+        }
+    }
+    Ok(kept)
+}
+
+async fn tnk_probe_passed(
+    rpc: &PeerRpcClient,
+    provider: &str,
+    epoch: u64,
+    required_passes: u64,
+) -> Result<bool> {
+    let Some(record) = read_state_value(rpc, &format!("probe/pass/{provider}/{epoch}")).await?
+    else {
+        return Ok(false);
+    };
+    Ok(record
+        .get("pass_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        >= required_passes)
+}
+
+fn normalize_tnk_holdbacks(earning: &LedgerEarningRecord) -> Result<Vec<LedgerHoldbackBucket>> {
+    if earning.holdbacks.is_empty() {
+        if earning.held_mu == 0 {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![LedgerHoldbackBucket {
+            epoch: earning.updated_epoch,
+            mu: earning.held_mu,
+            probe_gate: false,
+        }]);
+    }
+    let mut by_bucket = BTreeMap::<(u64, bool), u64>::new();
+    for bucket in &earning.holdbacks {
+        if bucket.mu == 0 {
+            bail!("TNK holdback bucket amount must be positive");
+        }
+        let key = (bucket.epoch, bucket.probe_gate);
+        let next = by_bucket
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(bucket.mu)
+            .context("TNK holdback bucket overflow")?;
+        by_bucket.insert(key, next);
+    }
+    Ok(by_bucket
+        .into_iter()
+        .map(|((epoch, probe_gate), mu)| LedgerHoldbackBucket {
+            epoch,
+            mu,
+            probe_gate,
+        })
+        .collect())
+}
+
+fn tnk_provider_payout_target(provider: &Value, provider_id: &str, admin: &str) -> Result<String> {
+    if provider.get("status").and_then(Value::as_str) != Some("active") {
+        bail!("provider is not active");
+    }
+    let payout = provider
+        .get("payout")
+        .and_then(Value::as_object)
+        .context("provider payout target is not set")?;
+    if payout.get("method").and_then(Value::as_str) != Some("tnk") {
+        bail!("provider payout target is not TNK");
+    }
+    if payout.get("set_by").and_then(Value::as_str) != Some(admin) {
+        bail!("provider payout target was not set by the current admin");
+    }
+    if payout.get("set_by_role").and_then(Value::as_str) != Some("admin") {
+        bail!("provider payout target must be admin-set");
+    }
+    let addr = payout
+        .get("addr")
+        .and_then(Value::as_str)
+        .context("provider payout target missing address")?;
+    if !is_safe_key_part(addr) {
+        bail!("provider payout target address is not contract-safe");
+    }
+    if provider
+        .get("provider")
+        .and_then(Value::as_str)
+        .is_some_and(|actual| actual != provider_id)
+    {
+        bail!("provider payout record owner mismatch");
+    }
+    Ok(addr.to_owned())
+}
+
 fn resolve_tnk_nonce(
     wallet_pubkey: &str,
     amount_mu: u64,
@@ -15310,6 +16176,36 @@ async fn submit_msb_transfer(
         timeout_seconds.to_string(),
     ])
     .await
+}
+
+async fn submit_msb_batch_transfer(
+    network: &str,
+    stores_directory: &Path,
+    store_name: &str,
+    outputs: &[MsbBatchTransferOutputEntry],
+    timeout_seconds: u64,
+    expected_balance_before: Option<&str>,
+) -> Result<MsbBatchTransferOutput> {
+    let mut args = vec![
+        "batch-transfer".to_owned(),
+        "--network".to_owned(),
+        network.to_owned(),
+        "--stores-directory".to_owned(),
+        stores_directory.display().to_string(),
+        "--store-name".to_owned(),
+        store_name.to_owned(),
+        "--outputs-json".to_owned(),
+        serde_json::to_string(outputs)?,
+        "--timeout-seconds".to_owned(),
+        timeout_seconds.to_string(),
+    ];
+    if let Some(balance) = expected_balance_before {
+        args.extend([
+            "--expected-balance-before".to_owned(),
+            balance.trim().to_owned(),
+        ]);
+    }
+    run_msb_transfer_helper(args).await
 }
 
 async fn run_msb_transfer_helper<T>(args: Vec<String>) -> Result<T>
@@ -16312,6 +17208,8 @@ struct ContractCatalog {
 struct LedgerHoldbackBucket {
     epoch: u64,
     mu: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    probe_gate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -16334,6 +17232,47 @@ struct LedgerEarningRecord {
     last_payout_rate_ts: Option<u64>,
     #[serde(default)]
     last_payout_msb_tx_hash: Option<String>,
+    #[serde(default)]
+    last_settlement_epoch: Option<u64>,
+    #[serde(default)]
+    last_settlement_msb_tx_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerFeeRecord {
+    rail: String,
+    denom: String,
+    cum_mu: u64,
+    swept_cum_mu: u64,
+    #[serde(default)]
+    updated_epoch: u64,
+    #[serde(default)]
+    updated_at: Option<Value>,
+    #[serde(default)]
+    last_apply_hash: Option<String>,
+    #[serde(default)]
+    last_fee_bps: Option<u64>,
+    #[serde(default)]
+    last_settlement_epoch: Option<u64>,
+    #[serde(default)]
+    last_settlement_msb_tx_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TnkSettlementParams {
+    holdback_epochs: u64,
+    challenge_epochs: u64,
+    canary_probe_holdback_bps: u64,
+    canary_probe_release_min_passes: u64,
+    rate_staleness_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TnkSettlementPlan {
+    payload: Value,
+    msb_outputs: Vec<MsbBatchTransferOutputEntry>,
+    skipped_providers: Vec<Value>,
+    already_settled: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -21321,6 +22260,19 @@ fn is_hex_len(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn is_safe_key_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -23350,6 +24302,15 @@ mod tests {
                 tx: test_admin_tx_args(),
                 settlement_json: Some(settlement_payload.to_string()),
                 settlement_file: None,
+                epoch: None,
+                at: None,
+                treasury_address: None,
+                operator_tnk_address: None,
+                msb_network: None,
+                submit_transfer: false,
+                msb_tx_hash: None,
+                msb_transfer_timeout_seconds: 180,
+                expected_treasury_balance_before: None,
             })
             .unwrap(),
             settlement_payload
@@ -23368,6 +24329,15 @@ mod tests {
                 tx: test_admin_tx_args(),
                 settlement_json: Some(settlement_payload.to_string()),
                 settlement_file: None,
+                epoch: None,
+                at: None,
+                treasury_address: None,
+                operator_tnk_address: None,
+                msb_network: None,
+                submit_transfer: false,
+                msb_tx_hash: None,
+                msb_transfer_timeout_seconds: 180,
+                expected_treasury_balance_before: None,
             }))
             .unwrap_err()
             .to_string(),
@@ -25615,12 +26585,15 @@ mod tests {
             holdbacks: vec![LedgerHoldbackBucket {
                 epoch: 7,
                 mu: 2_500,
+                probe_gate: false,
             }],
             updated_epoch: 7,
             updated_at: None,
             last_holdback_release_epoch: Some(7),
             last_payout_rate_ts: None,
             last_payout_msb_tx_hash: Some("aa".repeat(32)),
+            last_settlement_epoch: None,
+            last_settlement_msb_tx_hash: None,
         })
         .unwrap();
 
@@ -25642,6 +26615,8 @@ mod tests {
             last_holdback_release_epoch: None,
             last_payout_rate_ts: None,
             last_payout_msb_tx_hash: None,
+            last_settlement_epoch: None,
+            last_settlement_msb_tx_hash: None,
         })
         .is_err());
     }
@@ -25959,6 +26934,113 @@ mod tests {
             "testnet1"
         );
         assert!(resolve_tnk_msb_network(None, "not-an-address").is_err());
+    }
+
+    #[test]
+    fn tnk_settlement_totals_preserve_provider_and_operator_rails() {
+        let outputs = vec![
+            json!({
+                "role": "provider",
+                "provider": "11".repeat(32),
+                "to": "testtrac1provider",
+                "mu": 850_000,
+                "tnk_e18": "17000000000000000000",
+            }),
+            json!({
+                "role": "operator_fee",
+                "to": "testtrac1operator",
+                "mu": 150_000,
+                "tnk_e18": "3000000000000000000",
+            }),
+        ];
+        let totals = tnk_settlement_output_totals(&outputs).unwrap();
+
+        assert_eq!(totals.provider_count, 1);
+        assert_eq!(totals.provider_mu, 850_000);
+        assert_eq!(totals.operator_fee_mu, 150_000);
+        assert_eq!(totals.gross_mu, 1_000_000);
+        assert_eq!(totals.tnk_e18, "20000000000000000000");
+        assert_eq!(
+            stable_value_hash(&json!({
+                "domain": "mayhem-tnk-settlement-transfer-root-v1",
+                "value": outputs,
+            }))
+            .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn tnk_settlement_provider_payout_requires_admin_set_tnk_target() {
+        let admin = "aa".repeat(32);
+        let provider_id = "11".repeat(32);
+        let provider = json!({
+            "provider": provider_id,
+            "status": "active",
+            "payout": {
+                "method": "tnk",
+                "addr": "testtrac1provider",
+                "set_by": admin,
+                "set_by_role": "admin",
+            }
+        });
+
+        assert_eq!(
+            tnk_provider_payout_target(&provider, &provider_id, &admin).unwrap(),
+            "testtrac1provider"
+        );
+
+        let mut wrong_method = provider.clone();
+        wrong_method["payout"]["method"] = json!("stripe");
+        assert!(tnk_provider_payout_target(&wrong_method, &provider_id, &admin).is_err());
+
+        let mut wrong_admin = provider.clone();
+        wrong_admin["payout"]["set_by"] = json!("bb".repeat(32));
+        assert!(tnk_provider_payout_target(&wrong_admin, &provider_id, &admin).is_err());
+    }
+
+    #[test]
+    fn tnk_settlement_holdbacks_normalize_probe_gated_buckets() {
+        let earning = LedgerEarningRecord {
+            provider: "11".repeat(32),
+            rail: "tnk".to_owned(),
+            denom: "mu_usd".to_owned(),
+            total_mu: 10_000,
+            held_mu: 4_000,
+            paid_cum_mu: 1_000,
+            holdbacks: vec![
+                LedgerHoldbackBucket {
+                    epoch: 7,
+                    mu: 1_000,
+                    probe_gate: false,
+                },
+                LedgerHoldbackBucket {
+                    epoch: 7,
+                    mu: 500,
+                    probe_gate: false,
+                },
+                LedgerHoldbackBucket {
+                    epoch: 7,
+                    mu: 250,
+                    probe_gate: true,
+                },
+            ],
+            updated_epoch: 7,
+            updated_at: None,
+            last_holdback_release_epoch: None,
+            last_payout_rate_ts: None,
+            last_payout_msb_tx_hash: None,
+            last_settlement_epoch: None,
+            last_settlement_msb_tx_hash: None,
+        };
+
+        let buckets = normalize_tnk_holdbacks(&earning).unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].epoch, 7);
+        assert_eq!(buckets[0].mu, 1_500);
+        assert!(!buckets[0].probe_gate);
+        assert_eq!(buckets[1].mu, 250);
+        assert!(buckets[1].probe_gate);
     }
 
     #[test]
