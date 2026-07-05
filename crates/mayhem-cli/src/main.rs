@@ -11822,6 +11822,12 @@ fn normalized_receipt_envelope(value: &Value) -> Option<Value> {
         "body": Value::Object(body),
         "enclave_sig": receipt.get("enclave_sig").or_else(|| value.get("enclave_sig"))?.clone(),
         "user_sig": receipt.get("user_sig").or_else(|| value.get("user_sig"))?.clone(),
+        "enclave_pubkey": receipt
+            .get("enclave_pubkey")
+            .or_else(|| value.get("enclave_pubkey"))
+            .or_else(|| body_source.get("enclave_pubkey"))
+            .cloned()
+            .unwrap_or(Value::Null),
     }))
 }
 
@@ -24935,6 +24941,9 @@ mod tests {
         assert_eq!(candidate.previous_mu_owed_cum, 0);
         assert_eq!(candidate.command["op"], "fraud_proof");
         assert_eq!(candidate.command["receipt"]["body"]["mu_owed_cum"], 100);
+        assert!(candidate.command["receipt"]
+            .get("enclave_pubkey")
+            .is_some_and(Value::is_null));
         assert!(candidate.copy_paste.contains("/tx --command"));
         assert_eq!(candidate.proof_hash.len(), 64);
     }
