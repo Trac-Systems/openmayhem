@@ -8,9 +8,12 @@ import { ethers } from 'ethers';
 import { distribution } from './merkle.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
-const TAP_WEI = 1_000_000_000_000_000_000n;
-const BPS = 10_000n;
-const PROVIDER_BPS = 7_500n;
+export const TAP_WEI = 1_000_000_000_000_000_000n;
+export const BPS = 10_000n;
+export const PROVIDER_BPS = 7_500n;
+export const OPERATOR_BPS = 1_500n;
+export const BURN_BPS = 1_000n;
+const PROVIDER_CAP_TOLERANCE_WEI = 0n;
 
 export const POOL_SETTLEMENT_ABI = [
   'function setRoot(bytes32 newRoot, uint256 newEpoch, uint256 newCumulativeSpent)',
@@ -19,6 +22,7 @@ export const POOL_SETTLEMENT_ABI = [
   'function totalDeposited() view returns (uint256)',
   'function maxEpochDelta() view returns (uint256)',
   'function merkleRoot() view returns (bytes32)',
+  'function claimed(address account) view returns (uint256)',
 ];
 
 function shellQuote(value) {
@@ -205,18 +209,35 @@ function normalizedReceipts(bundleOrReceipts) {
   throw new Error('settlement input must be a receipt array or object with receipts[]/data[]');
 }
 
-function priorProviderMap(prior) {
+function parseEntryAmount(entry, label) {
+  if (isObject(entry)) {
+    return parseBigIntString(entry.amount ?? entry.cumulative_wei, label);
+  }
+  return parseBigIntString(entry, label);
+}
+
+export function settlementDistributionEntries(report, label = 'settlement') {
   const out = new Map();
-  const source = prior?.providers ?? prior?.entries ?? {};
+  const source = report?.providers ?? report?.entries ?? report?.proofs ?? {};
   if (Array.isArray(source)) {
     for (const entry of source) {
-      const account = normalizeAddress(entry.account, 'prior account');
-      out.set(account, parseBigIntString(entry.amount ?? entry.cumulative_wei, 'prior cumulative wei'));
+      const account = normalizeAddress(entry.account, `${label} account`);
+      out.set(account, parseEntryAmount(entry, `${label} cumulative wei`));
     }
   } else if (isObject(source)) {
-    for (const [account, amount] of Object.entries(source)) {
-      out.set(normalizeAddress(account, 'prior account'), parseBigIntString(amount, 'prior cumulative wei'));
+    for (const [account, entry] of Object.entries(source)) {
+      out.set(normalizeAddress(account, `${label} account`), parseEntryAmount(entry, `${label} cumulative wei`));
     }
+  }
+  return Array.from(out.entries())
+    .map(([account, amount]) => ({ account, amount }))
+    .sort((a, b) => a.account.localeCompare(b.account));
+}
+
+function priorProviderMap(prior) {
+  const out = new Map();
+  for (const entry of settlementDistributionEntries(prior, 'prior')) {
+    out.set(entry.account, entry.amount);
   }
   return out;
 }
@@ -312,30 +333,119 @@ export async function guardianScreenSettlement({
   settlement,
   pool,
   epoch,
+  previous = null,
+} = {}) {
+  return guardianPreSignReport({ settlement, pool, epoch, previous });
+}
+
+function bpsOf(value, bps) {
+  return (value * BigInt(bps)) / BPS;
+}
+
+async function poolAddressOrNull(pool) {
+  if (!pool?.getAddress) return null;
+  try {
+    return normalizeAddress(await pool.getAddress(), 'pool address');
+  } catch (_error) {
+    return null;
+  }
+}
+
+export async function guardianPreSignReport({
+  settlement,
+  pool,
+  epoch,
+  previous = null,
+  currentEpoch,
+  prevSpentWei,
+  totalDepositedWei,
+  maxEpochDeltaWei,
 } = {}) {
   if (!settlement?.root) return { ok: false, reasons: ['missing settlement root'] };
   const reasons = [];
-  const currentEpoch = pool ? Number(await pool.epoch()) : 0;
-  const newEpoch = epoch ?? currentEpoch + 1;
-  const cumulativeSpentWei = BigInt(settlement.cumulative_spent_wei);
-  const prevSpentWei = pool ? await pool.cumulativeSpent() : 0n;
-  const totalDepositedWei = pool ? await pool.totalDeposited() : cumulativeSpentWei;
-  const maxEpochDeltaWei = pool ? await pool.maxEpochDelta() : 0n;
+  const flags = [];
+  const priorEpoch = currentEpoch !== undefined
+    ? parseNonNegativeInt(currentEpoch, 'current epoch')
+    : pool
+      ? Number(await pool.epoch())
+      : parseNonNegativeInt(previous?.epoch ?? previous?.prev_epoch ?? 0, 'previous epoch', 0);
+  const newEpoch = epoch ?? priorEpoch + 1;
+  const cumulativeSpentWei = parseBigIntString(
+    settlement.cumulative_spent_wei ?? settlement.cumulativeSpentWei,
+    'settlement cumulative spent wei'
+  );
+  const previousSpentWei = prevSpentWei !== undefined
+    ? parseBigIntString(prevSpentWei, 'previous spent wei')
+    : pool
+      ? await pool.cumulativeSpent()
+      : parseBigIntString(previous?.cumulative_spent_wei ?? previous?.cumulativeSpentWei, 'previous spent wei');
+  const depositedWei = totalDepositedWei !== undefined
+    ? parseBigIntString(totalDepositedWei, 'total deposited wei')
+    : pool
+      ? await pool.totalDeposited()
+      : cumulativeSpentWei;
+  const epochDeltaCapWei = maxEpochDeltaWei !== undefined
+    ? parseBigIntString(maxEpochDeltaWei, 'max epoch delta wei')
+    : pool
+      ? await pool.maxEpochDelta()
+      : 0n;
+  const poolAddress = await poolAddressOrNull(pool);
 
-  if (!Number.isSafeInteger(newEpoch) || newEpoch <= currentEpoch) reasons.push('epoch !monotonic');
-  if (cumulativeSpentWei <= prevSpentWei) reasons.push('no new spend since last root');
-  if (cumulativeSpentWei > totalDepositedWei) reasons.push('spent > deposited');
-  if (maxEpochDeltaWei > 0n && cumulativeSpentWei - prevSpentWei > maxEpochDeltaWei) {
+  if (!Number.isSafeInteger(newEpoch) || newEpoch <= priorEpoch) reasons.push('epoch !monotonic');
+  if (cumulativeSpentWei < previousSpentWei) reasons.push('spent !monotonic');
+  if (cumulativeSpentWei === previousSpentWei) reasons.push('no new spend since last root');
+  if (cumulativeSpentWei > depositedWei) reasons.push('spent > deposited');
+  if (epochDeltaCapWei > 0n && cumulativeSpentWei >= previousSpentWei && cumulativeSpentWei - previousSpentWei > epochDeltaCapWei) {
     reasons.push('epoch delta > cap');
   }
+
+  let entries = [];
+  try {
+    entries = settlementDistributionEntries(settlement, 'settlement');
+  } catch (error) {
+    reasons.push(error?.message || 'invalid settlement entries');
+  }
+  const previousByAccount = priorProviderMap(previous);
+  let totalOwedWei = 0n;
+  for (const entry of entries) {
+    if (entry.amount <= 0n) reasons.push(`non-positive amount for ${entry.account}`);
+    if (entry.amount > depositedWei) reasons.push(`amount for ${entry.account} exceeds deposited`);
+    if (entry.account === '0x0000000000000000000000000000000000000000') reasons.push('zero account in settlement');
+    if (poolAddress && entry.account === poolAddress) reasons.push('pool account in settlement');
+    const previousAmount = previousByAccount.get(entry.account);
+    if (previousAmount !== undefined && entry.amount < previousAmount) {
+      reasons.push(`cumulative for ${entry.account} decreased`);
+    }
+    totalOwedWei += entry.amount;
+  }
+
+  const providerCapWei = bpsOf(cumulativeSpentWei, PROVIDER_BPS);
+  const operatorCapWei = bpsOf(cumulativeSpentWei, OPERATOR_BPS);
+  const burnCapWei = bpsOf(cumulativeSpentWei, BURN_BPS);
+  if (totalOwedWei > providerCapWei + PROVIDER_CAP_TOLERANCE_WEI) {
+    reasons.push('provider owed > 75% spent cap');
+  } else if (totalOwedWei > providerCapWei) {
+    flags.push('provider owed exceeds exact 75% cap only by rounding tolerance');
+  }
+  if (totalOwedWei + operatorCapWei + burnCapWei > depositedWei) {
+    reasons.push('owed + operator cap + burn cap > deposited');
+  }
+
   return {
     ok: reasons.length === 0,
     reasons,
+    flags,
     epoch: newEpoch,
-    prev_epoch: currentEpoch,
-    prev_spent_wei: prevSpentWei.toString(),
-    total_deposited_wei: totalDepositedWei.toString(),
-    max_epoch_delta_wei: maxEpochDeltaWei.toString(),
+    prev_epoch: priorEpoch,
+    cumulative_spent_wei: cumulativeSpentWei.toString(),
+    prev_spent_wei: previousSpentWei.toString(),
+    total_deposited_wei: depositedWei.toString(),
+    max_epoch_delta_wei: epochDeltaCapWei.toString(),
+    total_owed_wei: totalOwedWei.toString(),
+    provider_cap_wei: providerCapWei.toString(),
+    operator_cap_wei: operatorCapWei.toString(),
+    burn_cap_wei: burnCapWei.toString(),
+    entries_count: entries.length,
   };
 }
 
@@ -352,7 +462,7 @@ export async function rollTapSettlement({
 } = {}) {
   const settlement = buildTapSettlement({ bundle, receipts, providerAccounts, tapUsdE6, prior });
   if (!settlement.root) return settlement;
-  const screen = await guardianScreenSettlement({ settlement, pool, epoch });
+  const screen = await guardianScreenSettlement({ settlement, pool, epoch, previous: prior });
   if (!screen.ok) {
     return { ...settlement, posted: false, blocked: true, reasons: screen.reasons, screen };
   }

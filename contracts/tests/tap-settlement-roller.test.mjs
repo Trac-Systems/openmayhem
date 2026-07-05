@@ -8,6 +8,7 @@ import { deployPool } from '../scripts/deploy-local.mjs';
 import { distribution } from '../scripts/merkle.mjs';
 import {
   buildTapSettlement,
+  guardianPreSignReport,
   muToTapWei,
   providerShareWei,
   rollTapSettlement,
@@ -173,4 +174,75 @@ test('TAP settlement roller supports weighted multi-provider receipts', () => {
   assert.equal(settlement.cumulative_spent_wei, spent.toString());
   assert.equal(settlement.proofs[a].cumulative_wei, providerShareWei(spent, 2_500).toString());
   assert.equal(settlement.proofs[b].cumulative_wei, providerShareWei(spent, 7_500).toString());
+});
+
+test('guardian pre-sign screen halts invariant violations', async () => {
+  const a = '0x1111111111111111111111111111111111111111';
+  const root = `0x${'11'.repeat(32)}`;
+
+  const overAllocated = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '1000',
+      entries: [{ account: a, cumulative_wei: '751' }],
+    },
+    epoch: 1,
+    currentEpoch: 0,
+    prevSpentWei: '0',
+    totalDepositedWei: '1000',
+    maxEpochDeltaWei: '0',
+  });
+  assert.equal(overAllocated.ok, false);
+  assert.match(overAllocated.reasons.join('; '), /provider owed > 75% spent cap/);
+  assert.match(overAllocated.reasons.join('; '), /owed \+ operator cap \+ burn cap > deposited/);
+
+  const spentPastDeposits = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '1001',
+      entries: [{ account: a, cumulative_wei: '750' }],
+    },
+    epoch: 1,
+    currentEpoch: 0,
+    prevSpentWei: '0',
+    totalDepositedWei: '1000',
+    maxEpochDeltaWei: '0',
+  });
+  assert.equal(spentPastDeposits.ok, false);
+  assert.match(spentPastDeposits.reasons.join('; '), /spent > deposited/);
+
+  const capExceeded = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '2000',
+      entries: [{ account: a, cumulative_wei: '1500' }],
+    },
+    epoch: 1,
+    currentEpoch: 0,
+    prevSpentWei: '0',
+    totalDepositedWei: '2000',
+    maxEpochDeltaWei: '1999',
+  });
+  assert.equal(capExceeded.ok, false);
+  assert.match(capExceeded.reasons.join('; '), /epoch delta > cap/);
+
+  const decreasedProvider = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '1100',
+      entries: [{ account: a, cumulative_wei: '700' }],
+    },
+    previous: {
+      epoch: 1,
+      cumulative_spent_wei: '1000',
+      entries: [{ account: a, cumulative_wei: '800' }],
+    },
+    epoch: 2,
+    currentEpoch: 1,
+    prevSpentWei: '1000',
+    totalDepositedWei: '1100',
+    maxEpochDeltaWei: '0',
+  });
+  assert.equal(decreasedProvider.ok, false);
+  assert.match(decreasedProvider.reasons.join('; '), /cumulative for .* decreased/);
 });
