@@ -179,6 +179,17 @@ export const probeResultEvidence = (value, auditor) => ({
 });
 export const probeResultMessage = (value, auditor) =>
   `mayhem-probe-result-v1${stableJson(probeResultEvidence(value, auditor))}`;
+export const providerKybEvidence = (value) => ({
+  provider: value.provider,
+  legal_name: value.legal_name,
+  jurisdiction: value.jurisdiction,
+  proof_hash: value.proof_hash,
+  kyb_ref: value.kyb_ref,
+  verified_at: value.verified_at,
+  schema_version: value.schema_version,
+});
+export const providerKybMessage = (value) =>
+  `mayhem-provider-kyb-v1${stableJson(providerKybEvidence(value))}`;
 export const roomSidechannelName = (roomId) => `mx/room/${roomId}`;
 export const deriveRoomId = async (modelId, creator, nonce) => {
   const digest = await blake3(b4a.from(`${modelId}${creator}${nonce}`));
@@ -292,6 +303,32 @@ class MayhemContract extends Contract {
         payout_addr: { type: 'string', min: 1, max: 256 },
         payout_method: { type: 'string', min: 1, max: 32 },
         payout_currency: { type: 'string', min: 3, max: 3, optional: true },
+      },
+    });
+
+    this.addSchema('setProviderKyb', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128 },
+        legal_name: { type: 'string', min: 1, max: 160 },
+        jurisdiction: { type: 'string', min: 1, max: 64 },
+        proof_hash: { type: 'string', min: 1, max: 128 },
+        kyb_ref: { type: 'string', min: 1, max: 128 },
+        verified_at: { type: 'number', integer: true, min: 0 },
+        schema_version: { type: 'number', integer: true, min: 1, optional: true },
+        admin_sig: { type: 'string', min: 1, max: 256 },
+      },
+    });
+
+    this.addSchema('revokeProviderKyb', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        provider: { type: 'string', min: 1, max: 128 },
+        reason_hash: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
 
@@ -1038,6 +1075,133 @@ class MayhemContract extends Contract {
     await this.put(key, updated);
     console.log('mayhem setProviderPayout', updated);
     return { ok: true, op: 'setProviderPayout', provider: this.value.provider };
+  }
+
+  async setProviderKyb() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(
+      [
+        'op',
+        'provider',
+        'legal_name',
+        'jurisdiction',
+        'proof_hash',
+        'kyb_ref',
+        'verified_at',
+        'admin_sig',
+      ],
+      'set_provider_kyb',
+      ['schema_version']
+    );
+    if (shapeError) return shapeError;
+
+    const normalized = this.normalizeProviderKybValue(this.value);
+    if (normalized instanceof Error) return normalized;
+    if (!(await this.verifyProviderKybSignature(normalized))) {
+      return new Error('Invalid provider KYB admin signature.');
+    }
+
+    const key = `prov/${normalized.provider}`;
+    const provider = await this.get(key);
+    if (!provider) return new Error('Provider not found.');
+
+    const record = {
+      status: 'verified',
+      provider: normalized.provider,
+      legal_name: normalized.legal_name,
+      jurisdiction: normalized.jurisdiction,
+      proof_hash: normalized.proof_hash,
+      kyb_ref: normalized.kyb_ref,
+      verified_at: normalized.verified_at,
+      verified_by: this.address,
+      verified_by_role: 'admin',
+      admin_sig: normalized.admin_sig,
+      schema_version: normalized.schema_version,
+      updated_at: this.tx,
+    };
+    const providerSummary = {
+      status: 'verified',
+      legal_name: record.legal_name,
+      jurisdiction: record.jurisdiction,
+      proof_hash: record.proof_hash,
+      kyb_ref: record.kyb_ref,
+      verified_at: record.verified_at,
+      verified_by: record.verified_by,
+      verified_by_role: 'admin',
+      schema_version: record.schema_version,
+      set_at: this.tx,
+    };
+    const updatedProvider = {
+      ...provider,
+      kyb: providerSummary,
+      updated_at: this.tx,
+    };
+
+    await this.put(`kyb/${normalized.provider}`, record);
+    await this.put(key, updatedProvider);
+    console.log('mayhem setProviderKyb', record);
+    return {
+      ok: true,
+      op: 'setProviderKyb',
+      provider: normalized.provider,
+      att_tier: 4,
+    };
+  }
+
+  async revokeProviderKyb() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'provider'],
+      'revoke_provider_kyb',
+      ['reason_hash']
+    );
+    if (shapeError) return shapeError;
+    if (!this.isHexBytes(this.value.provider, 32)) return new Error('Invalid provider id.');
+    if (
+      this.value.reason_hash !== undefined &&
+      !this.isHexBytes(this.value.reason_hash, 32)
+    ) {
+      return new Error('Invalid provider KYB revoke reason hash.');
+    }
+
+    const key = `prov/${this.value.provider}`;
+    const provider = await this.get(key);
+    if (!provider) return new Error('Provider not found.');
+    const current = await this.get(`kyb/${this.value.provider}`);
+    if (!current || current.status !== 'verified') return new Error('Active provider KYB not found.');
+
+    const revoked = {
+      ...current,
+      status: 'revoked',
+      revoked_at: this.tx,
+      revoked_by: this.address,
+      revoked_by_role: 'admin',
+      revoke_reason_hash: this.value.reason_hash ?? null,
+      updated_at: this.tx,
+    };
+    const updatedProvider = {
+      ...provider,
+      kyb: {
+        ...(provider.kyb ?? {}),
+        status: 'revoked',
+        revoked_at: this.tx,
+        revoked_by: this.address,
+        revoked_by_role: 'admin',
+        revoke_reason_hash: this.value.reason_hash ?? null,
+      },
+      updated_at: this.tx,
+    };
+
+    await this.put(`kyb/${this.value.provider}`, revoked);
+    await this.put(key, updatedProvider);
+    console.log('mayhem revokeProviderKyb', revoked);
+    return {
+      ok: true,
+      op: 'revokeProviderKyb',
+      provider: this.value.provider,
+    };
   }
 
   async banProvider() {
@@ -3289,11 +3453,11 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  validateExactCommandValue(allowedKeys, opName) {
+  validateExactCommandValue(allowedKeys, opName, optionalKeys = []) {
     if (!this.value || typeof this.value !== 'object' || Array.isArray(this.value)) {
       return new Error(`${opName} value must be an object.`);
     }
-    const allowed = new Set(allowedKeys);
+    const allowed = new Set([...allowedKeys, ...optionalKeys]);
     const unknown = Object.keys(this.value).filter((key) => !allowed.has(key)).sort();
     if (unknown.length > 0) {
       return new Error(`${opName} does not accept provider-authored fields: ${unknown.join(', ')}.`);
@@ -5271,6 +5435,38 @@ class MayhemContract extends Contract {
     return typeof value === 'string' && /^[a-zA-Z0-9._:-]{1,256}$/.test(value);
   }
 
+  normalizeProviderKybValue(value) {
+    if (!this.isHexBytes(value.provider, 32)) return new Error('Invalid provider id.');
+    const legalName = value.legal_name.trim();
+    if (!legalName || /[\x00-\x1f\x7f]/.test(legalName)) {
+      return new Error('Invalid provider KYB legal name.');
+    }
+    const jurisdiction = value.jurisdiction.trim().toUpperCase();
+    if (!/^[A-Z0-9._:-]{1,64}$/.test(jurisdiction)) {
+      return new Error('Invalid provider KYB jurisdiction.');
+    }
+    const proofHash = value.proof_hash.toLowerCase();
+    if (!this.isHexBytes(proofHash, 32)) return new Error('Invalid provider KYB proof hash.');
+    const kybRef = value.kyb_ref.trim();
+    if (!this.isSafeExternalRef(kybRef)) return new Error('Invalid provider KYB reference.');
+    const schemaVersion = value.schema_version ?? 1;
+    if (!Number.isInteger(schemaVersion) || schemaVersion < 1) {
+      return new Error('Invalid provider KYB schema version.');
+    }
+    const adminSig = value.admin_sig.toLowerCase();
+    if (!this.isHexBytes(adminSig, 64)) return new Error('Invalid provider KYB admin signature.');
+    return {
+      provider: value.provider.toLowerCase(),
+      legal_name: legalName,
+      jurisdiction,
+      proof_hash: proofHash,
+      kyb_ref: kybRef,
+      verified_at: value.verified_at,
+      schema_version: schemaVersion,
+      admin_sig: adminSig,
+    };
+  }
+
   isHexBytes(value, bytes) {
     return typeof value === 'string' &&
       value.length === bytes * 2 &&
@@ -5307,6 +5503,13 @@ class MayhemContract extends Contract {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
     return verify.call(this.protocol.peer.wallet, value.auditor_sig, probeResultMessage(value, auditor), auditor) === true;
+  }
+
+  async verifyProviderKybSignature(value) {
+    const admin = await this.get('admin');
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof admin !== 'string' || typeof verify !== 'function') return false;
+    return verify.call(this.protocol.peer.wallet, value.admin_sig, providerKybMessage(value), admin) === true;
   }
 }
 

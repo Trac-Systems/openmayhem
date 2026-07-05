@@ -11,6 +11,7 @@ import {
   providerLifecycleFeatureKey,
   seedCurrentAdminPrice,
   signConsent,
+  signProviderKyb,
   signProviderLifecycleIntent,
 } from './helpers/contract.js';
 
@@ -984,6 +985,174 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
     set_at: makeTxKey(7),
   });
   assert.equal(updated.value.updated_at, makeTxKey(7));
+});
+
+test('MayhemContract admin verifies and revokes provider KYB without raw documents', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+
+  const unsignedKyb = {
+    op: 'set_provider_kyb',
+    provider: provider.publicKey,
+    legal_name: 'Acme AI GmbH',
+    jurisdiction: 'DE',
+    proof_hash: 'a'.repeat(64),
+    kyb_ref: 'KYB-2026-0001',
+    verified_at: 1_788_000_000,
+    schema_version: 1,
+  };
+  const signedKyb = {
+    ...unsignedKyb,
+    admin_sig: signProviderKyb(admin.wallet, unsignedKyb),
+  };
+
+  const nonAdmin = await execute(
+    contract,
+    storage,
+    'setProviderKyb',
+    signedKyb,
+    provider.publicKey,
+    4
+  );
+  assert.match(nonAdmin.message, /admin required/i);
+
+  const badSig = await execute(
+    contract,
+    storage,
+    'setProviderKyb',
+    {
+      ...unsignedKyb,
+      legal_name: 'Acme AI GmbH Tampered',
+      admin_sig: signedKyb.admin_sig,
+    },
+    admin.publicKey,
+    5
+  );
+  assert.match(badSig.message, /kyb admin signature/i);
+
+  const rawDocuments = await execute(
+    contract,
+    storage,
+    'setProviderKyb',
+    {
+      ...signedKyb,
+      documents: [{ kind: 'passport', number: 'raw-pii' }],
+    },
+    admin.publicKey,
+    6
+  );
+  assert.notEqual(rawDocuments.ok, true);
+  assert.equal(await storage.get(`kyb/${provider.publicKey}`), null);
+
+  const verified = await execute(
+    contract,
+    storage,
+    'setProviderKyb',
+    signedKyb,
+    admin.publicKey,
+    7
+  );
+  assert.deepEqual(verified, {
+    ok: true,
+    op: 'setProviderKyb',
+    provider: provider.publicKey,
+    att_tier: 4,
+  });
+
+  const kyb = await storage.get(`kyb/${provider.publicKey}`);
+  assert.deepEqual(kyb.value, {
+    status: 'verified',
+    provider: provider.publicKey,
+    legal_name: 'Acme AI GmbH',
+    jurisdiction: 'DE',
+    proof_hash: 'a'.repeat(64),
+    kyb_ref: 'KYB-2026-0001',
+    verified_at: 1_788_000_000,
+    verified_by: admin.publicKey,
+    verified_by_role: 'admin',
+    admin_sig: signedKyb.admin_sig,
+    schema_version: 1,
+    updated_at: makeTxKey(7),
+  });
+  assert.equal(JSON.stringify(kyb.value).includes('passport'), false);
+  assert.equal(JSON.stringify(kyb.value).includes('raw-pii'), false);
+
+  const providerEntry = await storage.get(`prov/${provider.publicKey}`);
+  assert.equal(providerEntry.value.kyb.status, 'verified');
+  assert.equal(providerEntry.value.kyb.legal_name, 'Acme AI GmbH');
+  assert.equal(providerEntry.value.kyb.verified_by_role, 'admin');
+
+  const providerRevoke = await execute(
+    contract,
+    storage,
+    'revokeProviderKyb',
+    {
+      op: 'revoke_provider_kyb',
+      provider: provider.publicKey,
+      reason_hash: 'b'.repeat(64),
+    },
+    provider.publicKey,
+    8
+  );
+  assert.match(providerRevoke.message, /admin required/i);
+
+  const revoked = await execute(
+    contract,
+    storage,
+    'revokeProviderKyb',
+    {
+      op: 'revoke_provider_kyb',
+      provider: provider.publicKey,
+      reason_hash: 'b'.repeat(64),
+    },
+    admin.publicKey,
+    9
+  );
+  assert.deepEqual(revoked, {
+    ok: true,
+    op: 'revokeProviderKyb',
+    provider: provider.publicKey,
+  });
+
+  const revokedKyb = await storage.get(`kyb/${provider.publicKey}`);
+  assert.equal(revokedKyb.value.status, 'revoked');
+  assert.equal(revokedKyb.value.revoked_by, admin.publicKey);
+  assert.equal(revokedKyb.value.revoked_by_role, 'admin');
+  assert.equal(revokedKyb.value.revoke_reason_hash, 'b'.repeat(64));
+  const revokedProvider = await storage.get(`prov/${provider.publicKey}`);
+  assert.equal(revokedProvider.value.kyb.status, 'revoked');
 });
 
 test('MayhemContract rejects provider-authored serving terms on joins', async () => {

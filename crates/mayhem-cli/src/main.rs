@@ -36,7 +36,8 @@ use mayhem_gateway::{
     heartbeat_signing_payload,
     openai::{
         serve as serve_gateway, GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo,
-        ModelCaps, PriceRefMu, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
+        ModelCaps, PriceRefMu, ProviderKybInfo, ScBridgeGatewaySessionBackend,
+        ScBridgeGatewaySessionConfig,
     },
 };
 use mayhem_hwprobe::{
@@ -189,6 +190,10 @@ enum AdminCommands {
     SetPrice(AdminSetPriceArgs),
     /// Set an admin-approved provider payout target.
     SetProviderPayout(AdminSetProviderPayoutArgs),
+    /// Verify a provider business identity for Tier 4 accountability.
+    SetProviderKyb(AdminSetProviderKybArgs),
+    /// Revoke a provider business identity verification.
+    RevokeProviderKyb(AdminRevokeProviderKybArgs),
     /// Ban a provider and tombstone its active serving rows.
     BanProvider(AdminBanProviderArgs),
     /// Accredit an auditor key for probe submission.
@@ -433,6 +438,10 @@ struct ModelsArgs {
     /// Minimum live provider attestation tier to show; requires --gateway.
     #[arg(long)]
     min_att_tier: Option<u8>,
+
+    /// Show only live models with at least one admin-KYB'd provider; requires --gateway.
+    #[arg(long)]
+    require_kyb: bool,
 
     /// Print a machine-readable model list.
     #[arg(long)]
@@ -2045,6 +2054,60 @@ struct AdminSetProviderPayoutArgs {
     /// Provider payout currency for fiat payout rails.
     #[arg(long)]
     payout_currency: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetProviderKybArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    provider: String,
+
+    /// Business display name to put on ledger. Do not pass raw documents.
+    #[arg(long)]
+    legal_name: String,
+
+    /// Business jurisdiction code, e.g. DE or US-CA.
+    #[arg(long)]
+    jurisdiction: String,
+
+    /// BLAKE3 hash of the off-ledger KYB dossier.
+    #[arg(long)]
+    proof_hash: String,
+
+    /// Off-ledger admin reference for the KYB dossier.
+    #[arg(long)]
+    kyb_ref: String,
+
+    /// Verification timestamp in Unix seconds. Defaults to now.
+    #[arg(long)]
+    verified_at: Option<u64>,
+
+    /// KYB record schema version.
+    #[arg(long, default_value_t = 1)]
+    schema_version: u64,
+
+    /// Admin signature over the KYB record. If omitted, the CLI signs with the admin wallet.
+    #[arg(long)]
+    admin_sig: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminRevokeProviderKybArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    provider: String,
+
+    /// Precomputed reason hash.
+    #[arg(long)]
+    reason_hash: Option<String>,
+
+    /// Plaintext reason to hash locally with BLAKE3.
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -8473,7 +8536,8 @@ fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> St
 
 async fn admin(command: AdminCommands) -> Result<()> {
     let tx_args = admin_tx_args(&command);
-    let (tx_type, value) = admin_command_payload(&command)?;
+    let (tx_type, mut value) = admin_command_payload(&command)?;
+    ensure_admin_command_signatures(tx_args, &mut value).await?;
     run_admin_command(tx_args, tx_type, value).await
 }
 
@@ -8489,6 +8553,8 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::CloseRoom(args) => &args.tx,
         AdminCommands::SetPrice(args) => &args.tx,
         AdminCommands::SetProviderPayout(args) => &args.tx,
+        AdminCommands::SetProviderKyb(args) => &args.tx,
+        AdminCommands::RevokeProviderKyb(args) => &args.tx,
         AdminCommands::BanProvider(args) => &args.tx,
         AdminCommands::AuditorRegister(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
@@ -8534,6 +8600,13 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             "setProviderPayout",
             admin_set_provider_payout_payload(args)?,
         )),
+        AdminCommands::SetProviderKyb(args) => {
+            Ok(("setProviderKyb", admin_set_provider_kyb_payload(args)?))
+        }
+        AdminCommands::RevokeProviderKyb(args) => Ok((
+            "revokeProviderKyb",
+            admin_revoke_provider_kyb_payload(args)?,
+        )),
         AdminCommands::BanProvider(args) => Ok(("banProvider", admin_ban_provider_payload(args)?)),
         AdminCommands::AuditorRegister(args) => {
             Ok(("auditorRegister", admin_auditor_register_payload(args)))
@@ -8554,6 +8627,31 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::EpochCommit(args) => Ok(("epochCommit", admin_epoch_commit_payload(args)?)),
         AdminCommands::EpochApply(args) => Ok(("epochApply", admin_epoch_apply_payload(args)?)),
     }
+}
+
+async fn ensure_admin_command_signatures(args: &AdminTxArgs, value: &mut Value) -> Result<()> {
+    if value.get("op").and_then(Value::as_str) != Some("set_provider_kyb")
+        || value.get("admin_sig").is_some()
+    {
+        return Ok(());
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let wallet_password = args.wallet_password.as_deref().unwrap_or("");
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        wallet_password,
+    )
+    .await?;
+    let keypair_path = PathBuf::from(&wallet.keypair_path);
+    let signature = sign_message(&keypair_path, wallet_password, &provider_kyb_message(value))
+        .await
+        .context("signing provider KYB record with admin wallet")?;
+    value["admin_sig"] = json!(signature);
+    Ok(())
 }
 
 fn admin_set_rules_payload(args: &AdminSetRulesArgs) -> Value {
@@ -8899,6 +8997,90 @@ fn admin_set_provider_payout_payload(args: &AdminSetProviderPayoutArgs) -> Resul
         }
     }
     Ok(payload)
+}
+
+fn admin_set_provider_kyb_payload(args: &AdminSetProviderKybArgs) -> Result<Value> {
+    if !is_hex_len(&args.provider, 64) {
+        bail!("--provider must be a 32-byte hex public key");
+    }
+    if !is_hex_len(&args.proof_hash, 64) {
+        bail!("--proof-hash must be a 32-byte BLAKE3 hex digest");
+    }
+    if args.schema_version == 0 {
+        bail!("--schema-version must be positive");
+    }
+    let legal_name = args.legal_name.trim();
+    if legal_name.is_empty() || legal_name.chars().any(char::is_control) {
+        bail!("--legal-name must be non-empty display text without control characters");
+    }
+    let jurisdiction = args.jurisdiction.trim().to_ascii_uppercase();
+    if jurisdiction.is_empty()
+        || jurisdiction.len() > 64
+        || !jurisdiction
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
+    {
+        bail!("--jurisdiction must be a compact jurisdiction code such as DE or US-CA");
+    }
+    let kyb_ref = args.kyb_ref.trim();
+    if kyb_ref.is_empty()
+        || kyb_ref.len() > 128
+        || !kyb_ref
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
+    {
+        bail!("--kyb-ref must be a compact off-ledger dossier reference");
+    }
+
+    let mut payload = json!({
+        "op": "set_provider_kyb",
+        "provider": args.provider.to_ascii_lowercase(),
+        "legal_name": legal_name,
+        "jurisdiction": jurisdiction,
+        "proof_hash": args.proof_hash.to_ascii_lowercase(),
+        "kyb_ref": kyb_ref,
+        "verified_at": args.verified_at.unwrap_or(unix_epoch_seconds()?),
+        "schema_version": args.schema_version,
+    });
+    if let Some(admin_sig) = &args.admin_sig {
+        if !is_hex_len(admin_sig, 128) {
+            bail!("--admin-sig must be a 64-byte Ed25519 signature hex string");
+        }
+        payload["admin_sig"] = json!(admin_sig.to_ascii_lowercase());
+    }
+    Ok(payload)
+}
+
+fn admin_revoke_provider_kyb_payload(args: &AdminRevokeProviderKybArgs) -> Result<Value> {
+    if args.reason_hash.is_some() && args.reason.is_some() {
+        bail!("pass only one of --reason-hash or --reason");
+    }
+    let reason_hash = args.reason_hash.clone().or_else(|| {
+        args.reason
+            .as_ref()
+            .map(|reason| blake3::hash(reason.as_bytes()).to_hex().to_string())
+    });
+    let mut payload = json!({
+        "op": "revoke_provider_kyb",
+        "provider": &args.provider,
+    });
+    if let Some(reason_hash) = reason_hash {
+        payload["reason_hash"] = json!(reason_hash);
+    }
+    Ok(payload)
+}
+
+fn provider_kyb_message(value: &Value) -> String {
+    let evidence = json!({
+        "provider": value.get("provider").cloned().unwrap_or(Value::Null),
+        "legal_name": value.get("legal_name").cloned().unwrap_or(Value::Null),
+        "jurisdiction": value.get("jurisdiction").cloned().unwrap_or(Value::Null),
+        "proof_hash": value.get("proof_hash").cloned().unwrap_or(Value::Null),
+        "kyb_ref": value.get("kyb_ref").cloned().unwrap_or(Value::Null),
+        "verified_at": value.get("verified_at").cloned().unwrap_or(Value::Null),
+        "schema_version": value.get("schema_version").cloned().unwrap_or(Value::Null),
+    });
+    format!("mayhem-provider-kyb-v1{}", stable_json_value(&evidence))
 }
 
 fn admin_ban_provider_payload(args: &AdminBanProviderArgs) -> Result<Value> {
@@ -9831,6 +10013,9 @@ async fn models(args: ModelsArgs) -> Result<()> {
             bail!("--min-att-tier requires --gateway because attestation tier is live provider capacity");
         }
     }
+    if args.require_kyb && !args.gateway {
+        bail!("--require-kyb requires --gateway because KYB is live provider capacity");
+    }
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
@@ -9840,15 +10025,19 @@ async fn models(args: ModelsArgs) -> Result<()> {
     if args.gateway {
         let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
         let models = fetch_gateway_models(&client, &gateway_root).await?;
-        let summaries = filter_model_summaries_by_min_att_tier(
-            gateway_model_summaries(&models)?,
-            args.min_att_tier,
+        let summaries = filter_model_summaries_by_require_kyb(
+            filter_model_summaries_by_min_att_tier(
+                gateway_model_summaries(&models)?,
+                args.min_att_tier,
+            ),
+            args.require_kyb,
         );
         let report = json!({
             "ok": true,
             "source": "gateway_live",
             "gateway_url": gateway_root,
             "min_att_tier": args.min_att_tier,
+            "require_kyb": args.require_kyb,
             "models": summaries,
         });
 
@@ -10076,6 +10265,7 @@ struct ModelSummary {
     context: u64,
     attestation_tiers: BTreeMap<String, u64>,
     attestation_tier_labels: BTreeMap<String, String>,
+    kyb_identities: Vec<ProviderKybInfo>,
     max_attestation_tier: u8,
     prompt_confidential: bool,
     prompt_confidentiality_note: String,
@@ -10976,6 +11166,19 @@ fn filter_model_summaries_by_min_att_tier(
         .collect()
 }
 
+fn filter_model_summaries_by_require_kyb(
+    summaries: Vec<ModelSummary>,
+    require_kyb: bool,
+) -> Vec<ModelSummary> {
+    if !require_kyb {
+        return summaries;
+    }
+    summaries
+        .into_iter()
+        .filter(|summary| !summary.kyb_identities.is_empty())
+        .collect()
+}
+
 fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
     let id = model
         .get("id")
@@ -11014,6 +11217,13 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         .copied()
         .unwrap_or(0)
         > 0;
+    let kyb_identities = mayhem
+        .get("kyb_identities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|value| serde_json::from_value(value.clone()).context("parsing model KYB identity"))
+        .collect::<Result<Vec<ProviderKybInfo>>>()?;
     Ok(ModelSummary {
         id: id.to_owned(),
         providers_online: mayhem
@@ -11033,6 +11243,7 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         context: caps.get("ctx").and_then(Value::as_u64).unwrap_or(0),
         attestation_tiers,
         attestation_tier_labels,
+        kyb_identities,
         max_attestation_tier,
         prompt_confidential,
         prompt_confidentiality_note: prompt_confidentiality_note(prompt_confidential).to_owned(),
@@ -11661,6 +11872,9 @@ fn print_models_report(report: &Value) -> Result<()> {
     if let Some(min_att_tier) = report["min_att_tier"].as_u64() {
         println!("Filter: minimum attestation tier T{min_att_tier}");
     }
+    if report["require_kyb"].as_bool() == Some(true) {
+        println!("Filter: admin-KYB'd provider required");
+    }
     println!(
         "Prompt privacy: only Tier 3 is prompt-confidential; Tier 1, Tier 2, and Tier 4 providers can read prompts in memory."
     );
@@ -11725,7 +11939,27 @@ fn attestation_summary_for_model(model: &Value) -> String {
         "T1=0 Tier 1 - software self-attestation; economic/trust only".to_owned()
     } else {
         parts.sort();
-        parts.join("; ")
+        let mut summary = parts.join("; ");
+        if let Some(identity) = model
+            .get("kyb_identities")
+            .and_then(Value::as_array)
+            .and_then(|identities| identities.first())
+        {
+            let legal_name = identity
+                .get("legal_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let jurisdiction = identity
+                .get("jurisdiction")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !legal_name.is_empty() && !jurisdiction.is_empty() {
+                summary.push_str(&format!(
+                    "; Tier 4 - verified: {legal_name} ({jurisdiction})"
+                ));
+            }
+        }
+        summary
     }
 }
 
@@ -13450,6 +13684,21 @@ struct LedgerProvider {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerProviderKyb {
+    provider: String,
+    status: String,
+    legal_name: String,
+    jurisdiction: String,
+    proof_hash: String,
+    kyb_ref: String,
+    verified_at: u64,
+    #[serde(default)]
+    verified_by_role: Option<String>,
+    admin_sig: String,
+    schema_version: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LedgerPriceSchedule {
     enclave_id: String,
     model_id: String,
@@ -13518,6 +13767,7 @@ struct ContractCatalog {
     roomserve: Vec<LedgerRoomServe>,
     serves: Vec<LedgerServe>,
     providers: Vec<LedgerProvider>,
+    kyb: Vec<LedgerProviderKyb>,
     prices: Vec<LedgerPriceSchedule>,
     rules: Option<RulesRef>,
 }
@@ -14510,6 +14760,29 @@ fn admin_role_marker_ok(role: Option<&str>) -> bool {
     role == Some("admin")
 }
 
+fn active_provider_kyb_info(record: &LedgerProviderKyb) -> Option<ProviderKybInfo> {
+    if record.status != "verified" || !admin_role_marker_ok(record.verified_by_role.as_deref()) {
+        return None;
+    }
+    if !is_hex_len(&record.provider, 64)
+        || !is_hex_len(&record.proof_hash, 64)
+        || !is_hex_len(&record.admin_sig, 128)
+        || record.legal_name.trim().is_empty()
+        || record.jurisdiction.trim().is_empty()
+        || record.kyb_ref.trim().is_empty()
+        || record.schema_version == 0
+    {
+        return None;
+    }
+    Some(ProviderKybInfo {
+        provider: record.provider.to_ascii_lowercase(),
+        legal_name: record.legal_name.clone(),
+        jurisdiction: record.jurisdiction.clone(),
+        proof_hash: record.proof_hash.to_ascii_lowercase(),
+        kyb_ref: record.kyb_ref.clone(),
+    })
+}
+
 fn require_admin_role_marker(field: &str, role: Option<&str>) -> Result<()> {
     if admin_role_marker_ok(role) {
         return Ok(());
@@ -14862,6 +15135,7 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         roomserve: read_prefix_values(rpc, "roomserve/").await?,
         serves: read_prefix_values(rpc, "serve/").await?,
         providers: read_prefix_values(rpc, "prov/").await?,
+        kyb: read_prefix_values(rpc, "kyb/").await?,
         prices,
         rules: read_state_value(rpc, "rules/current")
             .await?
@@ -14920,6 +15194,13 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         .filter(|provider| provider.status == "active")
         .map(|provider| provider.provider.as_str())
         .collect::<BTreeSet<_>>();
+    let active_kyb_by_provider = contract
+        .kyb
+        .iter()
+        .filter_map(active_provider_kyb_info)
+        .filter(|kyb| active_providers.contains(kyb.provider.as_str()))
+        .map(|kyb| (kyb.provider.clone(), kyb))
+        .collect::<BTreeMap<_, _>>();
     let mut rooms_by_id = BTreeMap::new();
     let mut rooms_by_model: BTreeMap<String, u32> = BTreeMap::new();
     for room in &open_rooms {
@@ -14986,6 +15267,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
 
     let mut providers_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut tiers_by_model: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    let mut kyb_by_model: BTreeMap<String, BTreeMap<String, ProviderKybInfo>> = BTreeMap::new();
     let mut route_candidates_by_model: BTreeMap<String, BTreeMap<String, GatewayRouteCandidate>> =
         BTreeMap::new();
     for serving in contract
@@ -15020,6 +15302,14 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .entry(enclave.model_id.clone())
             .or_default()
             .insert(serving.provider.clone());
+        let kyb = active_kyb_by_provider.get(&serving.provider).cloned();
+        if let Some(kyb) = &kyb {
+            kyb_by_model
+                .entry(enclave.model_id.clone())
+                .or_default()
+                .insert(serving.provider.clone(), kyb.clone());
+        }
+        let effective_att_tier = kyb.as_ref().map(|_| 4).unwrap_or(enclave.att_tier);
         route_candidates_by_model
             .entry(enclave.model_id.clone())
             .or_default()
@@ -15033,15 +15323,16 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
-                    att_tier: enclave.att_tier,
+                    att_tier: effective_att_tier,
                     admin_pubkey: enclave.created_by.clone(),
                     artifact_root: enclave.artifact_root.clone(),
                     manifest_hash: enclave.manifest_hash.clone(),
                     binary_hash: enclave.binary_hash.clone(),
+                    kyb,
                     caps: enclave.caps.clone(),
                 },
             );
-        let tier = format!("T{}", enclave.att_tier);
+        let tier = format!("T{effective_att_tier}");
         tiers_by_model
             .entry(enclave.model_id.clone())
             .or_default()
@@ -15054,6 +15345,11 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
     for (model_id, price) in served_price_by_model {
         let rooms = rooms_by_model.get(&model_id).copied().unwrap_or(0);
         let route_candidates = route_candidates_by_model
+            .remove(&model_id)
+            .unwrap_or_default()
+            .into_values()
+            .collect::<Vec<_>>();
+        let kyb_identities = kyb_by_model
             .remove(&model_id)
             .unwrap_or_default()
             .into_values()
@@ -15092,6 +15388,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
                 source: "contract".to_owned(),
+                kyb_identities,
                 route_candidates,
             },
         });
@@ -18664,6 +18961,64 @@ mod tests {
     }
 
     #[test]
+    fn admin_kyb_payloads_match_contract_schemas() {
+        let (tx_type, payload) =
+            admin_command_payload(&AdminCommands::SetProviderKyb(AdminSetProviderKybArgs {
+                tx: test_admin_tx_args(),
+                provider: "55".repeat(32),
+                legal_name: " Acme AI GmbH ".to_owned(),
+                jurisdiction: "de".to_owned(),
+                proof_hash: "AA".repeat(32),
+                kyb_ref: "KYB-2026-0001".to_owned(),
+                verified_at: Some(1_788_000_000),
+                schema_version: 1,
+                admin_sig: Some("bb".repeat(64)),
+            }))
+            .unwrap();
+
+        assert_eq!(tx_type, "setProviderKyb");
+        assert_eq!(
+            payload,
+            json!({
+                "op": "set_provider_kyb",
+                "provider": "55".repeat(32),
+                "legal_name": "Acme AI GmbH",
+                "jurisdiction": "DE",
+                "proof_hash": "aa".repeat(32),
+                "kyb_ref": "KYB-2026-0001",
+                "verified_at": 1_788_000_000_u64,
+                "schema_version": 1,
+                "admin_sig": "bb".repeat(64),
+            })
+        );
+        assert_eq!(
+            provider_kyb_message(&payload),
+            format!(
+                "mayhem-provider-kyb-v1{{\"jurisdiction\":\"DE\",\"kyb_ref\":\"KYB-2026-0001\",\"legal_name\":\"Acme AI GmbH\",\"proof_hash\":\"{}\",\"provider\":\"{}\",\"schema_version\":1,\"verified_at\":1788000000}}",
+                "aa".repeat(32),
+                "55".repeat(32)
+            )
+        );
+
+        let (tx_type, payload) = admin_command_payload(&AdminCommands::RevokeProviderKyb(
+            AdminRevokeProviderKybArgs {
+                tx: test_admin_tx_args(),
+                provider: "55".repeat(32),
+                reason_hash: None,
+                reason: Some("KYB expired".to_owned()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(tx_type, "revokeProviderKyb");
+        assert_eq!(payload["op"], "revoke_provider_kyb");
+        assert_eq!(payload["provider"], "55".repeat(32));
+        assert_eq!(
+            payload["reason_hash"],
+            blake3::hash("KYB expired".as_bytes()).to_hex().to_string()
+        );
+    }
+
+    #[test]
     fn admin_oracle_payment_payloads_match_contract_schemas() {
         assert_eq!(
             admin_rate_oracle_payload(&AdminRateOracleArgs {
@@ -19497,9 +19852,12 @@ mod tests {
         assert_eq!(models[0].mayhem.price_ref_mu.in_per_1k, 1);
         assert_eq!(models[0].mayhem.price_ref_mu.out_per_1k, 2);
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
+        assert!(models[0].mayhem.kyb_identities.is_empty());
         assert!(models[0].mayhem.caps.tools);
         assert_eq!(models[0].mayhem.caps.ctx, 8192);
         assert_eq!(models[0].mayhem.route_candidates.len(), 1);
+        assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
+        assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
         assert_eq!(
             models[0].mayhem.route_candidates[0].provider,
             "55".repeat(32)
@@ -19602,6 +19960,48 @@ mod tests {
         let err = gateway_models_from_contract(&wrong_same_model_enclave)
             .expect_err("same-model wrong-enclave roomserve should hide model");
         assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+    }
+
+    #[test]
+    fn gateway_models_promote_kyb_providers_to_tier4_and_revoke_back_to_hardware_tier() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        contract.kyb.push(LedgerProviderKyb {
+            provider: "55".repeat(32),
+            status: "verified".to_owned(),
+            legal_name: "Acme AI GmbH".to_owned(),
+            jurisdiction: "DE".to_owned(),
+            proof_hash: "aa".repeat(32),
+            kyb_ref: "KYB-2026-0001".to_owned(),
+            verified_at: 1_788_000_000,
+            verified_by_role: Some("admin".to_owned()),
+            admin_sig: "bb".repeat(64),
+            schema_version: 1,
+        });
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models[0].mayhem.attestation_tiers["T4"], 1);
+        assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 4);
+        assert_eq!(models[0].mayhem.kyb_identities.len(), 1);
+        assert_eq!(
+            models[0].mayhem.kyb_identities[0].legal_name,
+            "Acme AI GmbH"
+        );
+        assert_eq!(
+            models[0].mayhem.route_candidates[0]
+                .kyb
+                .as_ref()
+                .unwrap()
+                .jurisdiction,
+            "DE"
+        );
+
+        contract.kyb[0].status = "revoked".to_owned();
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
+        assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
+        assert!(models[0].mayhem.kyb_identities.is_empty());
+        assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
     }
 
     #[test]
@@ -20997,6 +21397,47 @@ mod tests {
         assert!(filtered[0]
             .prompt_confidentiality_note
             .contains("Tier 3 route available"));
+    }
+
+    #[test]
+    fn model_summaries_filter_by_require_kyb() {
+        let summaries = gateway_model_summaries(&[
+            json!({
+                "id": "mayhem/anonymous",
+                "mayhem": {
+                    "providers_online": 1,
+                    "rooms": 1,
+                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "attestation_tiers": { "T1": 1 },
+                    "caps": { "tools": false, "json": false, "ctx": 4096 }
+                }
+            }),
+            json!({
+                "id": "mayhem/verified",
+                "mayhem": {
+                    "providers_online": 1,
+                    "rooms": 1,
+                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "attestation_tiers": { "T4": 1 },
+                    "kyb_identities": [{
+                        "provider": "55".repeat(32),
+                        "legal_name": "Acme AI GmbH",
+                        "jurisdiction": "DE",
+                        "proof_hash": "aa".repeat(32),
+                        "kyb_ref": "KYB-2026-0001"
+                    }],
+                    "caps": { "tools": false, "json": false, "ctx": 4096 }
+                }
+            }),
+        ])
+        .unwrap();
+
+        let filtered = filter_model_summaries_by_require_kyb(summaries, true);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "mayhem/verified");
+        assert_eq!(filtered[0].kyb_identities[0].legal_name, "Acme AI GmbH");
+        assert_eq!(filtered[0].max_attestation_tier, 4);
     }
 
     #[test]
@@ -23427,6 +23868,7 @@ mod tests {
                 provider: "55".repeat(32),
                 status: "active".to_owned(),
             }],
+            kyb: Vec::new(),
             prices: vec![LedgerPriceSchedule {
                 enclave_id: "11".repeat(32),
                 model_id: "test/model@4bit".to_owned(),

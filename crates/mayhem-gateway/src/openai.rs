@@ -88,7 +88,18 @@ pub struct MayhemModelInfo {
     pub caps: ModelCaps,
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kyb_identities: Vec<ProviderKybInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_candidates: Vec<GatewayRouteCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ProviderKybInfo {
+    pub provider: String,
+    pub legal_name: String,
+    pub jurisdiction: String,
+    pub proof_hash: String,
+    pub kyb_ref: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -102,6 +113,8 @@ pub struct GatewayRouteCandidate {
     pub artifact_root: String,
     pub manifest_hash: String,
     pub binary_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kyb: Option<ProviderKybInfo>,
     #[serde(default)]
     pub caps: Value,
 }
@@ -439,6 +452,7 @@ impl GatewayState {
                     vision: false,
                 },
                 source: "local-fixture".to_owned(),
+                kyb_identities: Vec::new(),
                 route_candidates: Vec::new(),
             },
         }])
@@ -3026,6 +3040,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 vision: caps.get("vision").and_then(Value::as_bool).unwrap_or(false),
             },
             source: "catalog".to_owned(),
+            kyb_identities: Vec::new(),
             route_candidates: Vec::new(),
         },
     })
@@ -3655,6 +3670,7 @@ mod tests {
                     vision: false,
                 },
                 source: "test".to_owned(),
+                kyb_identities: Vec::new(),
                 route_candidates: Vec::new(),
             },
         }

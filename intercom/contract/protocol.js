@@ -67,6 +67,18 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
+    if (json?.op === 'set_provider_kyb') {
+      return {
+        type: 'setProviderKyb',
+        value: json,
+      };
+    }
+    if (json?.op === 'revoke_provider_kyb') {
+      return {
+        type: 'revokeProviderKyb',
+        value: json,
+      };
+    }
     if (json?.op === 'ban_provider') {
       return {
         type: 'banProvider',
@@ -256,6 +268,8 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
     console.log('- Consent and provider lifecycle are free Mayhem Feature records submitted by the Mayhem CLI/RPC feature path, not /tx commands.');
     console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|coinbase" }\' --sim 1 | admin sets a provider payout target.');
+    console.log('- /tx --command \'{ "op": "set_provider_kyb", "provider": "<pubkey>", "legal_name": "Acme AI GmbH", "jurisdiction": "DE", "proof_hash": "<blake3>", "kyb_ref": "<off-ledger-ref>", "verified_at": 3600, "admin_sig": "<sig>" }\' --sim 1 | admin verifies provider business identity for Tier 4 accountability.');
+    console.log('- /tx --command \'{ "op": "revoke_provider_kyb", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | admin revokes provider KYB and drops them back to their hardware tier.');
     console.log('- /tx --command \'{ "op": "ban_provider", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | bans a provider from future serving mutations.');
     console.log('- /tx --command \'{ "op": "set_model_ref", "model_id": "<catalog-model-id>", "price_ref_mu": { "in_per_1k": 18, "out_per_1k": 55 } }\' --sim 1 | admin seeds catalog reference pricing in mu_usd.');
     console.log('- /tx --command \'{ "op": "publish_catalog", "catalog_id": "mayhem-models", "source_kind": "huggingface", "catalog_url": "https://...", "signature_url": "https://...", "catalog_hash": "<blake3>", "signature_hash": "<blake3>", "key_id": "<id>", "public_key": "<hex>", "model_count": 3, "artifact_count": 5, "canaries": [{ "set_id": "canary-launch-v1", "url": "https://...", "hash": "<blake3>" }] }\' --sim 1 | admin anchors the latest signed catalog release for network discovery.');

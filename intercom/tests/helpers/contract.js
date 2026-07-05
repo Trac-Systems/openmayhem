@@ -4,6 +4,7 @@ import PeerWallet from 'trac-wallet';
 import {
   consentMessage,
   probeResultMessage,
+  providerKybMessage,
   providerLifecycleIntentMessage,
 } from '../../contract/contract.js';
 
@@ -135,6 +136,9 @@ export const signProviderLifecycleIntent = (wallet, intent, signingVersion) =>
 
 export const signProbeResult = (wallet, value, auditor) =>
   b4a.toString(wallet.sign(b4a.from(probeResultMessage(value, auditor))), 'hex');
+
+export const signProviderKyb = (wallet, value) =>
+  b4a.toString(wallet.sign(b4a.from(providerKybMessage(value))), 'hex');
 
 export const providerLifecycleFeatureKey = async (intent, signingVersion) => {
   const digest = await blake3(b4a.from(providerLifecycleIntentMessage(intent, signingVersion)));

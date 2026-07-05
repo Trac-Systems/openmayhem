@@ -56,6 +56,7 @@ can route right now. For sensitive prompts, inspect and pin attestation tier:
 
 ```bash
 mayhem models --gateway --min-att-tier 3
+mayhem models --gateway --require-kyb
 ```
 
 Only Tier 3 is prompt-confidential. Tier 1 is economic/self-attestation, Tier 2

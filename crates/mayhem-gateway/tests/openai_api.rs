@@ -897,6 +897,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 vision: false,
             },
             source: "contract".to_owned(),
+            kyb_identities: Vec::new(),
             route_candidates: providers
                 .iter()
                 .enumerate()
@@ -919,6 +920,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         artifact_root: identity.artifact_root,
         manifest_hash: identity.manifest_hash,
         binary_hash: identity.binary_hash,
+        kyb: None,
         caps: serde_json::json!({}),
     }
 }
