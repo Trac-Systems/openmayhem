@@ -7,6 +7,11 @@ VERSION="${MAYHEM_VERSION:-}"
 TARGET=""
 TARGET_SET=0
 SKIP_BUILD=0
+RELEASE_KEY_ID="${MAYHEM_RELEASE_KEY_ID:-}"
+RELEASE_SEED_FILE="${MAYHEM_RELEASE_SEED_FILE:-}"
+RELEASE_KEYS_DIR="${MAYHEM_RELEASE_KEYS_DIR:-$ROOT_DIR/release/keys}"
+RELEASE_CREATED_AT="${MAYHEM_RELEASE_CREATED_AT:-}"
+RELEASE_SIGNER_BIN="${MAYHEM_RELEASE_SIGNER_BIN:-}"
 
 BINS=(
   mayhem
@@ -28,11 +33,29 @@ Options:
   --target <triple>     Rust target triple to package
   --out-dir <dir>       Output directory (default: dist/)
   --skip-build          Package existing release binaries
+  --release-key-id <id> Release signing key id for manifest signature
+  --release-seed-file <path>
+                         32-byte Ed25519 release signing seed as hex
+  --release-keys-dir <dir>
+                         Directory for release public key records
+  --release-created-at <iso>
+                         Created-at timestamp for a newly written release key record
+  --release-signer-bin <path>
+                         Host-runnable mayhem binary used for manifest signing
   -h, --help            Show this help
 
 Environment:
   MAYHEM_VERSION        Default version
   MAYHEM_DIST_DIR       Default output directory
+  MAYHEM_RELEASE_KEY_ID Release signing key id
+  MAYHEM_RELEASE_SEED_FILE
+                         Release signing seed file
+  MAYHEM_RELEASE_KEYS_DIR
+                         Release public key directory
+  MAYHEM_RELEASE_CREATED_AT
+                         Release key created-at timestamp
+  MAYHEM_RELEASE_SIGNER_BIN
+                         Host-runnable mayhem binary used for signing
 USAGE
 }
 
@@ -97,6 +120,31 @@ while [[ $# -gt 0 ]]; do
     --skip-build)
       SKIP_BUILD=1
       shift
+      ;;
+    --release-key-id)
+      [[ $# -ge 2 ]] || die "--release-key-id requires a value"
+      RELEASE_KEY_ID="$2"
+      shift 2
+      ;;
+    --release-seed-file)
+      [[ $# -ge 2 ]] || die "--release-seed-file requires a value"
+      RELEASE_SEED_FILE="$2"
+      shift 2
+      ;;
+    --release-keys-dir)
+      [[ $# -ge 2 ]] || die "--release-keys-dir requires a value"
+      RELEASE_KEYS_DIR="$2"
+      shift 2
+      ;;
+    --release-created-at)
+      [[ $# -ge 2 ]] || die "--release-created-at requires a value"
+      RELEASE_CREATED_AT="$2"
+      shift 2
+      ;;
+    --release-signer-bin)
+      [[ $# -ge 2 ]] || die "--release-signer-bin requires a value"
+      RELEASE_SIGNER_BIN="$2"
+      shift 2
       ;;
     -h | --help)
       usage
@@ -209,6 +257,34 @@ printf '%s  %s\n' "$ARCHIVE_HASH" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
 cp "$STAGE_DIR/SHA256SUMS" "$OUT_DIR/$ARCHIVE_BASENAME.SHA256SUMS"
 cp "$STAGE_DIR/manifest.json" "$OUT_DIR/$ARCHIVE_BASENAME.manifest.json"
 
+if [[ -n "$RELEASE_SEED_FILE" ]]; then
+  [[ -n "$RELEASE_KEY_ID" ]] || die "--release-key-id is required with --release-seed-file"
+  if [[ -z "$RELEASE_SIGNER_BIN" ]]; then
+    if [[ "$TARGET" != "$(host_target)" ]]; then
+      die "set --release-signer-bin to a host-runnable mayhem binary when signing a cross-target release"
+    fi
+    RELEASE_SIGNER_BIN="$RELEASE_DIR/mayhem$BIN_EXT"
+  fi
+  [[ -x "$RELEASE_SIGNER_BIN" ]] || die "release signer binary is not executable: $RELEASE_SIGNER_BIN"
+  if [[ -z "$RELEASE_CREATED_AT" ]]; then
+    RELEASE_CREATED_AT="$BUILT_AT"
+  fi
+  SIGNATURE="$OUT_DIR/$ARCHIVE_BASENAME.manifest.json.sig"
+  log "signing release manifest"
+  "$RELEASE_SIGNER_BIN" release-sign \
+    --manifest-path "$OUT_DIR/$ARCHIVE_BASENAME.manifest.json" \
+    --signature-output "$SIGNATURE" \
+    --keys-dir "$RELEASE_KEYS_DIR" \
+    --key-id "$RELEASE_KEY_ID" \
+    --seed-file "$RELEASE_SEED_FILE" \
+    --write-key \
+    --created-at "$RELEASE_CREATED_AT" \
+    --force
+fi
+
 log "wrote $ARCHIVE"
 printf 'Archive SHA-256: %s\n' "$ARCHIVE_HASH"
 printf 'Checksum sidecar: %s\n' "$ARCHIVE.sha256"
+if [[ -n "${SIGNATURE:-}" ]]; then
+  printf 'Manifest signature: %s\n' "$SIGNATURE"
+fi

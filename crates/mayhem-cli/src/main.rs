@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use flate2::read::GzDecoder;
 use mayhem_bridge::{
     BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL,
     DEFAULT_SC_BRIDGE_URL,
@@ -62,6 +63,10 @@ const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_LENGTH_MILLIS: u64 = 3_600_000;
+const DEFAULT_RELEASE_FEED_URL: &str =
+    "https://api.github.com/repos/Trac-Systems/operationmayhem/releases/latest";
+const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
+const RELEASE_SIGNATURE_FILE_SUFFIX: &str = ".sig";
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
@@ -125,6 +130,11 @@ enum Commands {
     },
     /// Run a gateway, peer, opencode, and receipt smoke test.
     Test(TestArgs),
+    /// Check for a signed release, verify it, and stage the Mayhem binary.
+    Update(UpdateArgs),
+    /// Sign a release manifest with the operator release key.
+    #[command(hide = true)]
+    ReleaseSign(ReleaseSignArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -833,6 +843,108 @@ struct TestArgs {
     timeout_seconds: u64,
 
     /// Print a machine-readable test report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct UpdateArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Rust target triple for the release artifact. Defaults to the current host target.
+    #[arg(long)]
+    target: Option<String>,
+
+    /// Release version to select from the feed. Defaults to the latest GitHub release tag.
+    #[arg(long)]
+    version: Option<String>,
+
+    /// GitHub release API URL. Defaults to MAYHEM_RELEASE_FEED_URL or the Mayhem latest-release feed.
+    #[arg(long)]
+    release_feed_url: Option<String>,
+
+    /// Direct release archive URL. Must be paired with --manifest-url and --signature-url.
+    #[arg(long)]
+    archive_url: Option<String>,
+
+    /// Direct detached manifest URL. Must be paired with --archive-url and --signature-url.
+    #[arg(long)]
+    manifest_url: Option<String>,
+
+    /// Direct detached manifest signature URL. Must be paired with --archive-url and --manifest-url.
+    #[arg(long)]
+    signature_url: Option<String>,
+
+    /// Local release archive path for test/offline verification.
+    #[arg(long, value_name = "PATH")]
+    archive_path: Option<PathBuf>,
+
+    /// Local detached manifest path for test/offline verification.
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+
+    /// Local detached manifest signature path for test/offline verification.
+    #[arg(long, value_name = "PATH")]
+    signature_path: Option<PathBuf>,
+
+    /// Directory containing trusted release-signing public keys.
+    #[arg(long, value_name = "PATH")]
+    release_keys_dir: Option<PathBuf>,
+
+    /// Trusted release public key as 32 bytes of hex. Useful for bootstrap tests.
+    #[arg(long)]
+    release_public_key: Option<String>,
+
+    /// Expected release key id.
+    #[arg(long)]
+    key_id: Option<String>,
+
+    /// Verify the release without copying it into the staged update directory.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print a machine-readable update report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ReleaseSignArgs {
+    /// Detached release manifest to sign.
+    #[arg(long, value_name = "PATH")]
+    manifest_path: PathBuf,
+
+    /// Write the detached release signature JSON here.
+    #[arg(long, value_name = "PATH")]
+    signature_output: PathBuf,
+
+    /// Directory containing release public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Release signing key id to embed in the detached signature.
+    #[arg(long)]
+    key_id: String,
+
+    /// File containing the 32-byte Ed25519 release signing seed as hex.
+    #[arg(long, value_name = "PATH")]
+    seed_file: PathBuf,
+
+    /// Create the public key record under --keys-dir when it does not already exist.
+    #[arg(long)]
+    write_key: bool,
+
+    /// ISO timestamp for a newly written public key record. Required with --write-key on first use.
+    #[arg(long)]
+    created_at: Option<String>,
+
+    /// Overwrite an existing detached signature output file.
+    #[arg(long)]
+    force: bool,
+
+    /// Print a machine-readable signing report.
     #[arg(long)]
     json: bool,
 }
@@ -2536,6 +2648,8 @@ async fn main() -> Result<()> {
             RulesCommands::Review(args) => rules_review(args).await,
         },
         Commands::Test(args) => mayhem_test(args).await,
+        Commands::Update(args) => update(args).await,
+        Commands::ReleaseSign(args) => release_sign(args),
     }
 }
 
@@ -3375,6 +3489,842 @@ fn read_catalog_signing_seed(path: &Path) -> Result<[u8; 32]> {
         bail!("catalog signing seed file must contain only one 32-byte hex seed");
     }
     hex_decode_array::<32>(seed_hex, "catalog signing seed")
+}
+
+fn release_sign(args: ReleaseSignArgs) -> Result<()> {
+    let manifest_path = absolutize(args.manifest_path)?;
+    let signature_output = absolutize(args.signature_output)?;
+    if signature_output.exists() && !args.force {
+        bail!(
+            "{} already exists; pass --force to overwrite",
+            signature_output.display()
+        );
+    }
+    let keys_dir = args
+        .keys_dir
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("release/keys"))?;
+    let keys_dir = absolutize(keys_dir)?;
+    let seed_file = absolutize(args.seed_file)?;
+
+    let report = release_sign_report(ReleaseSignRequest {
+        manifest_path,
+        signature_output,
+        keys_dir,
+        key_id: args.key_id,
+        seed_file,
+        write_key: args.write_key,
+        created_at: args.created_at,
+    })?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Release manifest signed: {}",
+            report.signature_output.display()
+        );
+        println!("Release key: {} {}", report.key_id, report.public_key);
+        println!("Manifest SHA-256: {}", report.sha256);
+        if let Some(path) = &report.key_path {
+            println!("Release key record: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ReleaseSignRequest {
+    manifest_path: PathBuf,
+    signature_output: PathBuf,
+    keys_dir: PathBuf,
+    key_id: String,
+    seed_file: PathBuf,
+    write_key: bool,
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReleaseSignReport {
+    ok: bool,
+    manifest_path: PathBuf,
+    signature_output: PathBuf,
+    keys_dir: PathBuf,
+    key_path: Option<PathBuf>,
+    key_written: bool,
+    key_id: String,
+    public_key: String,
+    signed_path: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReleaseDetachedSignature {
+    schema_version: u32,
+    alg: String,
+    signed_path: String,
+    key_id: String,
+    public_key: String,
+    sha256: String,
+    sig: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReleasePublicKeyRecord {
+    key_id: String,
+    alg: String,
+    public_key: String,
+    status: String,
+    created_at: String,
+}
+
+fn release_sign_report(request: ReleaseSignRequest) -> Result<ReleaseSignReport> {
+    validate_release_key_id(&request.key_id)?;
+    let manifest_bytes = fs::read(&request.manifest_path)
+        .with_context(|| format!("reading {}", request.manifest_path.display()))?;
+    let file_name = request
+        .manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("manifest path must have a UTF-8 file name")?
+        .to_owned();
+    let seed = read_release_signing_seed(&request.seed_file)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = hex_encode(&signing_key.verifying_key().to_bytes());
+    let sha256 = sha256_bytes_hex(&manifest_bytes);
+    let signature = signing_key.sign(&release_manifest_signing_bytes(&manifest_bytes));
+    let detached = ReleaseDetachedSignature {
+        schema_version: 1,
+        alg: "ed25519".to_owned(),
+        signed_path: file_name.clone(),
+        key_id: request.key_id.clone(),
+        public_key: public_key.clone(),
+        sha256: sha256.clone(),
+        sig: hex_encode(&signature.to_bytes()),
+    };
+
+    let mut key_path = None;
+    let mut key_written = false;
+    if request.write_key {
+        fs::create_dir_all(&request.keys_dir)
+            .with_context(|| format!("creating {}", request.keys_dir.display()))?;
+        let path = request.keys_dir.join(format!("{}.json", request.key_id));
+        if path.exists() {
+            let existing: ReleasePublicKeyRecord =
+                serde_json::from_value(read_json_file(&path)?)
+                    .with_context(|| format!("parsing release key record {}", path.display()))?;
+            if existing.key_id != request.key_id
+                || existing.alg != "ed25519"
+                || !existing.public_key.eq_ignore_ascii_case(&public_key)
+                || existing.status != "active"
+            {
+                bail!(
+                    "existing release key record {} does not match the signing seed/key id",
+                    path.display()
+                );
+            }
+        } else {
+            let created_at = request
+                .created_at
+                .clone()
+                .context("--created-at is required when --write-key creates a new key record")?;
+            write_json_file(
+                &path,
+                &ReleasePublicKeyRecord {
+                    key_id: request.key_id.clone(),
+                    alg: "ed25519".to_owned(),
+                    public_key: public_key.clone(),
+                    status: "active".to_owned(),
+                    created_at,
+                },
+            )?;
+            key_written = true;
+        }
+        key_path = Some(path);
+    }
+
+    write_json_file(&request.signature_output, &detached)?;
+    Ok(ReleaseSignReport {
+        ok: true,
+        manifest_path: request.manifest_path,
+        signature_output: request.signature_output,
+        keys_dir: request.keys_dir,
+        key_path,
+        key_written,
+        key_id: request.key_id,
+        public_key,
+        signed_path: file_name,
+        sha256,
+    })
+}
+
+fn read_release_signing_seed(path: &Path) -> Result<[u8; 32]> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading release signing seed {}", path.display()))?;
+    let seed_hex = text.trim().strip_prefix("0x").unwrap_or(text.trim());
+    if seed_hex.lines().count() != 1 {
+        bail!("release signing seed file must contain only one 32-byte hex seed");
+    }
+    hex_decode_array::<32>(seed_hex, "release signing seed")
+}
+
+async fn update(args: UpdateArgs) -> Result<()> {
+    let json = args.json;
+    let report = update_report(args).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Update verified: {} ({})", report.version, report.target);
+        println!("Release key: {} {}", report.key_id, report.public_key);
+        println!("Manifest SHA-256: {}", report.manifest_sha256);
+        println!("Archive source: {}", report.sources.archive);
+        println!("Manifest source: {}", report.sources.manifest);
+        println!("Signature source: {}", report.sources.signature);
+        if report.dry_run {
+            println!("Staged: false (--dry-run)");
+        } else {
+            println!(
+                "Staged binary: {}",
+                report
+                    .staged_binary
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_owned())
+            );
+            println!(
+                "Staged release dir: {}",
+                report
+                    .stage_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_owned())
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseManifest {
+    schema: u32,
+    name: String,
+    version: String,
+    target: String,
+    binaries: Vec<ReleaseManifestBinary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseManifestBinary {
+    name: String,
+    path: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug)]
+struct UpdateSourceBytes {
+    archive: Vec<u8>,
+    manifest: Vec<u8>,
+    signature: Vec<u8>,
+    archive_name: String,
+    sources: UpdateSourceSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateSourceSummary {
+    archive: String,
+    manifest: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateReport {
+    ok: bool,
+    version: String,
+    target: String,
+    key_id: String,
+    public_key: String,
+    manifest_sha256: String,
+    stage_dir: Option<PathBuf>,
+    staged_binary: Option<PathBuf>,
+    dry_run: bool,
+    sources: UpdateSourceSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct ReleaseStageMetadata {
+    schema: u32,
+    version: String,
+    target: String,
+    manifest_sha256: String,
+    key_id: String,
+    public_key: String,
+    staged_at_unix: u64,
+}
+
+async fn update_report(args: UpdateArgs) -> Result<UpdateReport> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let target = args.target.clone().unwrap_or_else(release_host_target);
+    let keys_dir = if args.release_public_key.is_none() {
+        Some(absolutize(
+            args.release_keys_dir
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| repo_path("release/keys"))?,
+        )?)
+    } else {
+        args.release_keys_dir.clone().map(absolutize).transpose()?
+    };
+
+    let sources = resolve_update_sources(&args, &target).await?;
+    let manifest_sha256 = sha256_bytes_hex(&sources.manifest);
+    let signature: ReleaseDetachedSignature =
+        serde_json::from_slice(&sources.signature).context("parsing release manifest signature")?;
+    let manifest: ReleaseManifest =
+        serde_json::from_slice(&sources.manifest).context("parsing release manifest")?;
+
+    validate_release_manifest(&manifest, &target)?;
+    verify_release_manifest_signature(
+        &sources.manifest,
+        &signature,
+        keys_dir.as_deref(),
+        args.release_public_key.as_deref(),
+        args.key_id.as_deref(),
+    )?;
+
+    let work_dir = temp_work_dir("mayhem-update-verify")?;
+    let archive_path = work_dir.join(&sources.archive_name);
+    fs::write(&archive_path, &sources.archive)
+        .with_context(|| format!("writing {}", archive_path.display()))?;
+    let extract_dir = work_dir.join("extract");
+    fs::create_dir_all(&extract_dir)
+        .with_context(|| format!("creating {}", extract_dir.display()))?;
+    extract_release_archive(&archive_path, &extract_dir)?;
+    let release_root = find_extracted_release_root(&extract_dir, &manifest)?;
+    let archive_manifest_path = release_root.join("manifest.json");
+    let archive_manifest = fs::read(&archive_manifest_path)
+        .with_context(|| format!("reading {}", archive_manifest_path.display()))?;
+    if archive_manifest != sources.manifest {
+        bail!("release archive manifest.json does not match the signed detached manifest");
+    }
+    let verified_binary = verify_release_binaries(&manifest, &release_root)?;
+
+    let (stage_dir, staged_binary) = if args.dry_run {
+        (None, None)
+    } else {
+        let staged = stage_release_update(
+            &home,
+            &manifest,
+            &manifest_sha256,
+            &signature,
+            &sources.signature,
+            &release_root,
+            &verified_binary,
+        )?;
+        (Some(staged.stage_dir), Some(staged.staged_binary))
+    };
+    let _ = fs::remove_dir_all(&work_dir);
+
+    Ok(UpdateReport {
+        ok: true,
+        version: manifest.version,
+        target: manifest.target,
+        key_id: signature.key_id,
+        public_key: signature.public_key,
+        manifest_sha256,
+        stage_dir,
+        staged_binary,
+        dry_run: args.dry_run,
+        sources: sources.sources,
+    })
+}
+
+#[derive(Debug)]
+struct StagedRelease {
+    stage_dir: PathBuf,
+    staged_binary: PathBuf,
+}
+
+async fn resolve_update_sources(args: &UpdateArgs, target: &str) -> Result<UpdateSourceBytes> {
+    let direct_count = [
+        args.archive_url.is_some() || args.archive_path.is_some(),
+        args.manifest_url.is_some() || args.manifest_path.is_some(),
+        args.signature_url.is_some() || args.signature_path.is_some(),
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count();
+    if direct_count > 0 {
+        if direct_count != 3 {
+            bail!("direct update mode requires archive, manifest, and signature sources");
+        }
+        let archive = load_update_blob(
+            args.archive_path.as_ref(),
+            args.archive_url.as_deref(),
+            "archive",
+        )
+        .await?;
+        let manifest = load_update_blob(
+            args.manifest_path.as_ref(),
+            args.manifest_url.as_deref(),
+            "manifest",
+        )
+        .await?;
+        let signature = load_update_blob(
+            args.signature_path.as_ref(),
+            args.signature_url.as_deref(),
+            "signature",
+        )
+        .await?;
+        return Ok(UpdateSourceBytes {
+            archive_name: archive.name,
+            sources: UpdateSourceSummary {
+                archive: archive.source,
+                manifest: manifest.source,
+                signature: signature.source,
+            },
+            archive: archive.bytes,
+            manifest: manifest.bytes,
+            signature: signature.bytes,
+        });
+    }
+
+    let feed_url = args
+        .release_feed_url
+        .clone()
+        .or_else(|| env::var("MAYHEM_RELEASE_FEED_URL").ok())
+        .unwrap_or_else(|| DEFAULT_RELEASE_FEED_URL.to_owned());
+    let feed_bytes = fetch_update_url(&feed_url).await?;
+    let feed: GithubRelease = serde_json::from_slice(&feed_bytes)
+        .with_context(|| format!("parsing GitHub release feed {feed_url}"))?;
+    let version = args
+        .version
+        .clone()
+        .unwrap_or_else(|| feed.tag_name.clone());
+    let base_name = format!("mayhem-{version}-{target}");
+    let manifest_name = format!("{base_name}.manifest.json");
+    let signature_name = format!("{manifest_name}{RELEASE_SIGNATURE_FILE_SUFFIX}");
+    let archive_name = [format!("{base_name}.tar.gz"), format!("{base_name}.zip")]
+        .into_iter()
+        .find(|name| feed.assets.iter().any(|asset| asset.name == *name))
+        .with_context(|| format!("release feed has no archive asset for {base_name}"))?;
+    let archive_url = github_asset_url(&feed, &archive_name)?;
+    let manifest_url = github_asset_url(&feed, &manifest_name)?;
+    let signature_url = github_asset_url(&feed, &signature_name)?;
+    let archive = fetch_update_url(&archive_url).await?;
+    let manifest = fetch_update_url(&manifest_url).await?;
+    let signature = fetch_update_url(&signature_url).await?;
+
+    Ok(UpdateSourceBytes {
+        archive,
+        manifest,
+        signature,
+        archive_name,
+        sources: UpdateSourceSummary {
+            archive: archive_url,
+            manifest: manifest_url,
+            signature: signature_url,
+        },
+    })
+}
+
+#[derive(Debug)]
+struct UpdateBlob {
+    bytes: Vec<u8>,
+    name: String,
+    source: String,
+}
+
+async fn load_update_blob(
+    path: Option<&PathBuf>,
+    url: Option<&str>,
+    label: &str,
+) -> Result<UpdateBlob> {
+    match (path, url) {
+        (Some(_), Some(_)) => bail!("pass either --{label}-path or --{label}-url, not both"),
+        (Some(path), None) => {
+            let path = absolutize(path.clone())?;
+            let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .with_context(|| format!("{label} path must have a UTF-8 file name"))?
+                .to_owned();
+            Ok(UpdateBlob {
+                bytes,
+                name,
+                source: path.display().to_string(),
+            })
+        }
+        (None, Some(url)) => {
+            let bytes = fetch_update_url(url).await?;
+            Ok(UpdateBlob {
+                bytes,
+                name: update_url_basename(url, label)?,
+                source: url.to_owned(),
+            })
+        }
+        (None, None) => bail!("missing {label} source"),
+    }
+}
+
+async fn fetch_update_url(url: &str) -> Result<Vec<u8>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return fs::read(path).with_context(|| format!("reading {url}"));
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("mayhem-update/0.1")
+        .build()
+        .context("building update HTTP client")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching {url}"))?;
+    Ok(response
+        .bytes()
+        .await
+        .with_context(|| format!("reading {url}"))?
+        .to_vec())
+}
+
+fn github_asset_url(feed: &GithubRelease, name: &str) -> Result<String> {
+    feed.assets
+        .iter()
+        .find(|asset| asset.name == name)
+        .map(|asset| asset.browser_download_url.clone())
+        .with_context(|| format!("release feed has no asset {name}"))
+}
+
+fn update_url_basename(url: &str, label: &str) -> Result<String> {
+    let path = url.split('?').next().unwrap_or(url);
+    path.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .with_context(|| format!("{label} URL must end in a file name"))
+}
+
+fn release_manifest_signing_bytes(manifest_bytes: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RELEASE_MANIFEST_DOMAIN.len() + manifest_bytes.len());
+    bytes.extend_from_slice(RELEASE_MANIFEST_DOMAIN);
+    bytes.extend_from_slice(manifest_bytes);
+    bytes
+}
+
+fn verify_release_manifest_signature(
+    manifest_bytes: &[u8],
+    signature: &ReleaseDetachedSignature,
+    keys_dir: Option<&Path>,
+    trusted_public_key: Option<&str>,
+    expected_key_id: Option<&str>,
+) -> Result<()> {
+    if signature.schema_version != 1 {
+        bail!("release manifest signature schema_version must be 1");
+    }
+    if signature.alg != "ed25519" {
+        bail!("release manifest signature alg must be ed25519");
+    }
+    validate_release_key_id(&signature.key_id)?;
+    if let Some(expected) = expected_key_id {
+        if signature.key_id != expected {
+            bail!(
+                "release manifest signed by key id {}, expected {}",
+                signature.key_id,
+                expected
+            );
+        }
+    }
+    let actual_sha256 = sha256_bytes_hex(manifest_bytes);
+    if !signature.sha256.eq_ignore_ascii_case(&actual_sha256) {
+        bail!(
+            "release manifest sha256 mismatch: signature says {}, actual {}",
+            signature.sha256,
+            actual_sha256
+        );
+    }
+    let trusted_key = match (trusted_public_key, keys_dir) {
+        (Some(public_key), _) => public_key.to_owned(),
+        (None, Some(keys_dir)) => {
+            let key_path = keys_dir.join(format!("{}.json", signature.key_id));
+            let record: ReleasePublicKeyRecord = serde_json::from_value(read_json_file(&key_path)?)
+                .with_context(|| format!("parsing release key record {}", key_path.display()))?;
+            if record.key_id != signature.key_id
+                || record.alg != "ed25519"
+                || record.status != "active"
+            {
+                bail!(
+                    "release key record {} is not active/valid",
+                    key_path.display()
+                );
+            }
+            record.public_key
+        }
+        (None, None) => bail!("no trusted release public key configured"),
+    };
+    if !trusted_key.eq_ignore_ascii_case(&signature.public_key) {
+        bail!("release manifest signature public key is not trusted");
+    }
+    let key_bytes = hex_decode_array::<32>(&signature.public_key, "release public key")?;
+    let sig_bytes = hex_decode_array::<64>(&signature.sig, "release manifest signature")?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).context("release public key is invalid")?;
+    verifying_key
+        .verify(
+            &release_manifest_signing_bytes(manifest_bytes),
+            &Signature::from_bytes(&sig_bytes),
+        )
+        .context("release manifest signature verification failed")
+}
+
+fn validate_release_manifest(manifest: &ReleaseManifest, target: &str) -> Result<()> {
+    if manifest.schema != 1 {
+        bail!("release manifest schema must be 1");
+    }
+    if manifest.name != "mayhem" {
+        bail!("release manifest name must be mayhem");
+    }
+    if manifest.version.trim().is_empty() {
+        bail!("release manifest version is required");
+    }
+    if manifest.target != target {
+        bail!(
+            "release manifest target {} does not match requested target {}",
+            manifest.target,
+            target
+        );
+    }
+    if manifest.binaries.is_empty() {
+        bail!("release manifest must list binaries");
+    }
+    if !manifest
+        .binaries
+        .iter()
+        .any(|binary| binary.name == release_mayhem_binary_name())
+    {
+        bail!(
+            "release manifest does not include {}",
+            release_mayhem_binary_name()
+        );
+    }
+    Ok(())
+}
+
+fn extract_release_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
+    let name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("release archive path must have a UTF-8 file name")?;
+    if !name.ends_with(".tar.gz") {
+        bail!("mayhem update currently stages .tar.gz release archives; got {name}");
+    }
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("opening {}", archive_path.display()))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(extract_dir)
+        .with_context(|| format!("extracting {}", archive_path.display()))
+}
+
+fn find_extracted_release_root(extract_dir: &Path, manifest: &ReleaseManifest) -> Result<PathBuf> {
+    let expected = extract_dir.join(format!("mayhem-{}-{}", manifest.version, manifest.target));
+    if expected.join("manifest.json").is_file() {
+        return Ok(expected);
+    }
+    if extract_dir.join("manifest.json").is_file() {
+        return Ok(extract_dir.to_path_buf());
+    }
+    for entry in
+        fs::read_dir(extract_dir).with_context(|| format!("reading {}", extract_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", extract_dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() && path.join("manifest.json").is_file() {
+            return Ok(path);
+        }
+    }
+    bail!("release archive did not contain manifest.json")
+}
+
+fn verify_release_binaries(manifest: &ReleaseManifest, release_root: &Path) -> Result<PathBuf> {
+    let mut mayhem_binary = None;
+    for binary in &manifest.binaries {
+        if !is_hex_len(&binary.sha256, 64) {
+            bail!("release manifest binary {} sha256 is invalid", binary.name);
+        }
+        let path = release_relative_path(release_root, &binary.path)?;
+        if !path.is_file() {
+            bail!(
+                "release manifest binary {} missing at {}",
+                binary.name,
+                path.display()
+            );
+        }
+        let actual = file_sha256_hex(&path)?;
+        if !actual.eq_ignore_ascii_case(&binary.sha256) {
+            bail!(
+                "release binary {} sha256 mismatch: expected {}, actual {}",
+                binary.name,
+                binary.sha256,
+                actual
+            );
+        }
+        if binary.name == release_mayhem_binary_name() {
+            mayhem_binary = Some(path);
+        }
+    }
+    mayhem_binary
+        .with_context(|| format!("release manifest missing {}", release_mayhem_binary_name()))
+}
+
+fn release_relative_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        bail!("release manifest path {relative} must be relative");
+    }
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        ) {
+            bail!("release manifest path {relative} escapes release root");
+        }
+    }
+    Ok(root.join(path))
+}
+
+fn stage_release_update(
+    home: &Path,
+    manifest: &ReleaseManifest,
+    manifest_sha256: &str,
+    signature: &ReleaseDetachedSignature,
+    signature_bytes: &[u8],
+    release_root: &Path,
+    verified_binary: &Path,
+) -> Result<StagedRelease> {
+    let stage_parent = home.join("updates").join("staged");
+    fs::create_dir_all(&stage_parent)
+        .with_context(|| format!("creating {}", stage_parent.display()))?;
+    let dir_name = format!(
+        "{}-{}-{}",
+        safe_path_component(&manifest.version),
+        safe_path_component(&manifest.target),
+        &manifest_sha256[..12]
+    );
+    let stage_dir = stage_parent.join(dir_name);
+    let tmp_stage = stage_parent.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        now_millis_for_path()
+    ));
+    if tmp_stage.exists() {
+        fs::remove_dir_all(&tmp_stage)
+            .with_context(|| format!("removing {}", tmp_stage.display()))?;
+    }
+    copy_dir_all(release_root, &tmp_stage)?;
+    fs::write(tmp_stage.join("manifest.json.sig"), signature_bytes)
+        .with_context(|| format!("writing {}", tmp_stage.join("manifest.json.sig").display()))?;
+    write_json_file(
+        &tmp_stage.join("stage.json"),
+        &ReleaseStageMetadata {
+            schema: 1,
+            version: manifest.version.clone(),
+            target: manifest.target.clone(),
+            manifest_sha256: manifest_sha256.to_owned(),
+            key_id: signature.key_id.clone(),
+            public_key: signature.public_key.clone(),
+            staged_at_unix: unix_epoch_seconds()?,
+        },
+    )?;
+    if stage_dir.exists() {
+        fs::remove_dir_all(&stage_dir)
+            .with_context(|| format!("replacing staged update {}", stage_dir.display()))?;
+    }
+    fs::rename(&tmp_stage, &stage_dir).with_context(|| {
+        format!(
+            "moving staged update {} to {}",
+            tmp_stage.display(),
+            stage_dir.display()
+        )
+    })?;
+    let relative_binary = verified_binary
+        .strip_prefix(release_root)
+        .context("verified binary is not inside release root")?;
+    Ok(StagedRelease {
+        staged_binary: stage_dir.join(relative_binary),
+        stage_dir,
+    })
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", src.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", entry.path().display()))?;
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &to).with_context(|| {
+                format!("copying {} to {}", entry.path().display(), to.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_release_key_id(key_id: &str) -> Result<()> {
+    if key_id.trim().is_empty() {
+        bail!("--key-id must be non-empty");
+    }
+    if !key_id
+        .as_bytes()
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("--key-id may contain only ASCII letters, digits, dash, underscore, and dot");
+    }
+    Ok(())
+}
+
+fn release_host_target() -> String {
+    let arch = match env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => other,
+    };
+    let os = match env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        other => other,
+    };
+    format!("{arch}-{os}")
+}
+
+fn release_mayhem_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "mayhem.exe"
+    } else {
+        "mayhem"
+    }
 }
 
 fn validate_catalog_key_id(key_id: &str) -> Result<()> {
@@ -10083,10 +11033,17 @@ fn temp_work_dir(prefix: &str) -> Result<PathBuf> {
     let path = env::temp_dir().join(format!(
         "{prefix}-{}-{}",
         std::process::id(),
-        now_millis_for_path()
+        now_nanos_for_path()
     ));
     fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
     Ok(path)
+}
+
+fn now_nanos_for_path() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
 }
 
 fn now_millis_for_path() -> u128 {
@@ -13974,6 +14931,12 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn sha256_bytes_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 fn read_optional_token(path: Option<&Path>) -> Result<Option<String>> {
     if let Some(path) = path {
         return fs::read_to_string(path)
@@ -16602,6 +17565,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRelease {
+        home: PathBuf,
+        version: String,
+        target: String,
+        archive_path: PathBuf,
+        manifest_path: PathBuf,
+        signature_path: PathBuf,
+        keys_dir: PathBuf,
+        release_root: PathBuf,
+        binary_path: PathBuf,
+    }
 
     struct FakeEngineBackend {
         output: mayhem_engine::GenerateOutput,
@@ -20654,6 +21629,82 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[tokio::test]
+    async fn update_report_accepts_signed_test_release_and_stages_binary() {
+        let temp = test_temp_dir("mayhem-release-update-ok");
+        let release = write_test_release(&temp, b"mayhem-test-binary").unwrap();
+
+        let report = update_report(UpdateArgs {
+            home: Some(release.home.clone()),
+            target: Some(release.target.clone()),
+            version: None,
+            release_feed_url: None,
+            archive_url: None,
+            manifest_url: None,
+            signature_url: None,
+            archive_path: Some(release.archive_path.clone()),
+            manifest_path: Some(release.manifest_path.clone()),
+            signature_path: Some(release.signature_path.clone()),
+            release_keys_dir: Some(release.keys_dir.clone()),
+            release_public_key: None,
+            key_id: Some("test-release-key".to_owned()),
+            dry_run: false,
+            json: true,
+        })
+        .await
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(report.version, release.version);
+        assert_eq!(report.target, release.target);
+        let staged_binary = report.staged_binary.unwrap();
+        assert!(staged_binary.exists());
+        assert_eq!(fs::read(staged_binary).unwrap(), b"mayhem-test-binary");
+        assert!(report.stage_dir.unwrap().join("stage.json").exists());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn update_report_rejects_tampered_release_archive() {
+        let temp = test_temp_dir("mayhem-release-update-tamper");
+        let release = write_test_release(&temp, b"mayhem-test-binary").unwrap();
+        fs::write(&release.binary_path, b"tampered-binary").unwrap();
+        write_release_archive(
+            &release.release_root,
+            &release.archive_path,
+            &format!("mayhem-{}-{}", release.version, release.target),
+        )
+        .unwrap();
+        assert_eq!(
+            file_sha256_hex(&release.binary_path).unwrap(),
+            sha256_bytes_hex(b"tampered-binary")
+        );
+
+        let err = update_report(UpdateArgs {
+            home: Some(release.home),
+            target: Some(release.target),
+            version: None,
+            release_feed_url: None,
+            archive_url: None,
+            manifest_url: None,
+            signature_url: None,
+            archive_path: Some(release.archive_path),
+            manifest_path: Some(release.manifest_path),
+            signature_path: Some(release.signature_path),
+            release_keys_dir: Some(release.keys_dir),
+            release_public_key: None,
+            key_id: Some("test-release-key".to_owned()),
+            dry_run: false,
+            json: true,
+        })
+        .await
+        .expect_err("tampered archive must fail verification");
+
+        assert!(format!("{err:#}").contains("sha256 mismatch"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
     #[test]
     fn catalog_sign_refuses_to_overwrite_signature_without_force() {
         let temp = env::temp_dir().join(format!(
@@ -21198,6 +22249,96 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    fn test_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_test_release(temp: &Path, binary_bytes: &[u8]) -> Result<TestRelease> {
+        let version = "test-d1".to_owned();
+        let target = release_host_target();
+        let base_name = format!("mayhem-{version}-{target}");
+        let release_root = temp.join(&base_name);
+        let bin_dir = release_root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        let binary_path = bin_dir.join(release_mayhem_binary_name());
+        fs::write(&binary_path, binary_bytes)?;
+        let binary_sha256 = file_sha256_hex(&binary_path)?;
+        let manifest_path = release_root.join("manifest.json");
+        write_json_file(
+            &manifest_path,
+            &json!({
+                "schema": 1,
+                "name": "mayhem",
+                "version": version,
+                "target": target,
+                "built_at_utc": "2026-07-05T00:00:00Z",
+                "binaries": [{
+                    "name": release_mayhem_binary_name(),
+                    "path": format!("bin/{}", release_mayhem_binary_name()),
+                    "sha256": binary_sha256
+                }]
+            }),
+        )?;
+        let detached_manifest_path = temp.join(format!("{base_name}.manifest.json"));
+        fs::copy(&manifest_path, &detached_manifest_path)?;
+        let seed_file = temp.join("release-seed.hex");
+        fs::write(&seed_file, "42".repeat(32))?;
+        let signature_path = temp.join(format!(
+            "{base_name}.manifest.json{RELEASE_SIGNATURE_FILE_SUFFIX}"
+        ));
+        let keys_dir = temp.join("release-keys");
+        release_sign_report(ReleaseSignRequest {
+            manifest_path: detached_manifest_path.clone(),
+            signature_output: signature_path.clone(),
+            keys_dir: keys_dir.clone(),
+            key_id: "test-release-key".to_owned(),
+            seed_file,
+            write_key: true,
+            created_at: Some("2026-07-05T00:00:00Z".to_owned()),
+        })?;
+        let archive_path = temp.join(format!("{base_name}.tar.gz"));
+        write_release_archive(&release_root, &archive_path, &base_name)?;
+        Ok(TestRelease {
+            home: temp.join("home"),
+            version,
+            target,
+            archive_path,
+            manifest_path: detached_manifest_path,
+            signature_path,
+            keys_dir,
+            release_root,
+            binary_path,
+        })
+    }
+
+    fn write_release_archive(
+        release_root: &Path,
+        archive_path: &Path,
+        base_name: &str,
+    ) -> Result<()> {
+        let file = fs::File::create(archive_path)
+            .with_context(|| format!("creating {}", archive_path.display()))?;
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        archive
+            .append_dir_all(base_name, release_root)
+            .with_context(|| format!("archiving {}", release_root.display()))?;
+        archive.finish().context("finishing test release tar")?;
+        let encoder = archive
+            .into_inner()
+            .context("finishing test release gzip")?;
+        encoder.finish().context("finishing test release gzip")?;
+        Ok(())
     }
 
     fn write_temp_calibration_report(report: &CatalogCanaryCalibrationReport) -> PathBuf {
