@@ -4248,20 +4248,52 @@ async fn run_chat_with_route_retry(
         ordered_route_candidates_for_request(state, model, request, options.min_att_tier);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         let rail = state.receipt_config.rail.clone();
-        if model.mayhem.route_candidates.iter().all(|candidate| {
-            !candidate
-                .accepted_rails
-                .iter()
-                .any(|candidate_rail| candidate_rail == &rail)
-        }) {
+        let rail_candidates = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .accepted_rails
+                    .iter()
+                    .any(|candidate_rail| candidate_rail == &rail)
+            })
+            .collect::<Vec<_>>();
+        if rail_candidates.is_empty() {
             return Err(ApiError::payment_required(
                 format!("no provider accepts the {rail} payment rail"),
                 Some("model"),
             ));
         }
+        let att_candidates = rail_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                options
+                    .min_att_tier
+                    .map(|min_tier| candidate.att_tier >= min_tier)
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        if att_candidates.is_empty() {
+            return Err(ApiError::bad_request(
+                "no provider route satisfies X-Mayhem-Min-Att-Tier",
+                Some("X-Mayhem-Min-Att-Tier"),
+            ));
+        }
+        let now_millis = now_millis_u64();
+        if att_candidates
+            .iter()
+            .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
+        {
+            return Err(ApiError::service_unavailable(
+                "all otherwise eligible provider routes are cooling off after a retryable failure",
+                Some("model"),
+            ));
+        }
         return Err(ApiError::bad_request(
-            "no provider route satisfies X-Mayhem-Min-Att-Tier",
-            Some("X-Mayhem-Min-Att-Tier"),
+            "no provider route is currently eligible",
+            Some("model"),
         ));
     }
     let mut attempt_request = request.clone();
@@ -7115,6 +7147,14 @@ impl ApiError {
     fn payment_required(message: impl Into<String>, param: Option<&'static str>) -> Self {
         Self {
             status: StatusCode::PAYMENT_REQUIRED,
+            message: message.into(),
+            param,
+        }
+    }
+
+    fn service_unavailable(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
             param,
         }

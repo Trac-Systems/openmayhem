@@ -71,6 +71,7 @@ Environment:
   MAYHEM_PHASE3_CHAT_TIMEOUT_SECONDS Curl-compatible chat timeout (default: 420 real, 120 shim)
   MAYHEM_PHASE3_CHAT_MAX_TOKENS Curl-compatible chat max_tokens (default: 32)
   MAYHEM_PHASE3_CHAT_ATTEMPTS Curl-compatible chat attempts after provider is ready (default: 3)
+  MAYHEM_PHASE3_CHAT_RETRY_DELAY_SECONDS Delay between chat retries (default: 35; gateway cooloff is 30s)
   MAYHEM_PHASE3_LOCAL_JOINERS Local dev-net joiners to start, 1 or 2 (default: 2)
   MAYHEM_PHASE3_OPENCODE_BIN   opencode binary path/name (default: opencode)
   MAYHEM_PHASE3_LOCAL_DHT_HOST  Local LAN IP advertised to the Mac mini DHT peer
@@ -247,6 +248,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
 
 async function runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, options) {
   const attempts = envPositiveInt('MAYHEM_PHASE3_CHAT_ATTEMPTS', 3);
+  const retryDelayMs = envPositiveInt('MAYHEM_PHASE3_CHAT_RETRY_DELAY_SECONDS', 35) * 1000;
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -255,7 +257,7 @@ async function runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, opt
       lastError = err;
       if (attempt >= attempts) break;
       log(`streaming chat attempt ${attempt}/${attempts} failed before final accept: ${err?.message || err}`);
-      await sleep(5_000);
+      await sleep(retryDelayMs);
     }
   }
   throw lastError;
