@@ -1,0 +1,19 @@
+{
+  "name": "mayhem-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mayhem local Ethereum TAP escrow harness (SAUCE KnowledgePool port; pinned ganache/solc/ethers).",
+  "scripts": {
+    "compile": "node scripts/compile.mjs",
+    "pool": "node scripts/pool-test.mjs",
+    "pool:property": "node scripts/pool-property.mjs",
+    "test": "node scripts/pool-test.mjs && node scripts/pool-property.mjs"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.6.1",
+    "ethers": "6.15.0",
+    "ganache": "7.9.2",
+    "solc": "0.8.30"
+  }
+}
