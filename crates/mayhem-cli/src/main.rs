@@ -30,7 +30,7 @@ use mayhem_enclave::{
     Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
-    EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, ModelArtifact, ToolSpec,
+    ArtifactChunk, EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, ModelArtifact, ToolSpec,
 };
 use mayhem_gateway::{
     heartbeat_signing_payload, normalize_rate_map,
@@ -68,6 +68,7 @@ const OPENCODE_PROVIDER_ID: &str = "mayhem";
 const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
 const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
+const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_LENGTH_MILLIS: u64 = 3_600_000;
 const DEFAULT_RELEASE_FEED_URL: &str =
@@ -17017,30 +17018,8 @@ async fn send_provider_session_output(
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
-    if let Some(tool) = &output.tool {
-        provider_session_debug(format!(
-            "sending tool-call s.delta for session {} request {request_id}",
-            active.session_id
-        ));
-        bridge
-            .session_send(
-                &active.remote,
-                &active.session_id,
-                json!({
-                    "t": "s.delta",
-                    "rid": request_id,
-                    "i": 0,
-                    "d": "",
-                    "tool": tool,
-                    "fin": output.finish_reason,
-                    "usage": { "input_token": output.prompt_tokens, "output_token": output.completion_tokens },
-                    "token_ids": &output.token_ids,
-                }),
-            )
-            .await
-            .context("sending tool-call s.delta")?;
-    } else {
-        let mut index = 0_u64;
+    let mut index = 0_u64;
+    if output.tool.is_none() {
         for part in provider_stream_parts(&output.content) {
             provider_session_debug(format!(
                 "sending content s.delta #{index} for session {} request {request_id}",
@@ -17064,28 +17043,43 @@ async fn send_provider_session_output(
             maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
         }
+    }
+
+    for frame in provider_session_artifact_delta_frames(request_id, index, &output.artifacts) {
         provider_session_debug(format!(
-            "sending final s.delta #{index} for session {} request {request_id}",
-            active.session_id
+            "sending artifact s.delta #{} for session {} request {request_id}",
+            frame.get("i").and_then(Value::as_u64).unwrap_or(index),
+            active.session_id,
         ));
         bridge
-            .session_send(
-                &active.remote,
-                &active.session_id,
-                json!({
-                    "t": "s.delta",
-                    "rid": request_id,
-                    "i": index,
-                    "d": "",
-                    "tool": null,
-                    "fin": output.finish_reason,
-                    "usage": { "input_token": output.prompt_tokens, "output_token": output.completion_tokens },
-                    "token_ids": &output.token_ids,
-                }),
-            )
+            .session_send(&active.remote, &active.session_id, frame)
             .await
-            .context("sending final s.delta")?;
+            .context("sending artifact s.delta")?;
+        index = index.saturating_add(1);
     }
+
+    provider_session_debug(format!(
+        "sending final s.delta #{index} for session {} request {request_id}",
+        active.session_id
+    ));
+    bridge
+        .session_send(
+            &active.remote,
+            &active.session_id,
+            json!({
+                "t": "s.delta",
+                "rid": request_id,
+                "i": index,
+                "d": "",
+                "tool": output.tool.as_ref(),
+                "fin": output.finish_reason,
+                "usage": { "input_token": output.prompt_tokens, "output_token": output.completion_tokens },
+                "token_ids": &output.token_ids,
+                "artifacts": provider_session_artifact_summaries(&output.artifacts),
+            }),
+        )
+        .await
+        .context("sending final s.delta")?;
 
     let receipt = provider_session_receipt(terms, active, body, output, runtime_keypair)
         .context("building provider session receipt")?;
@@ -17108,6 +17102,95 @@ async fn send_provider_session_output(
         .await
         .context("sending s.receipt")?;
     Ok(receipt)
+}
+
+fn provider_session_artifact_delta_frames(
+    request_id: &str,
+    start_index: u64,
+    artifacts: &[ProviderSessionArtifact],
+) -> Vec<Value> {
+    let mut frames = Vec::new();
+    let mut index = start_index;
+    for artifact in artifacts {
+        let total_len = artifact.bytes.len();
+        let digest = blake3_bytes_hex(&artifact.bytes);
+        if artifact.bytes.is_empty() {
+            frames.push(provider_session_artifact_delta_frame(
+                request_id,
+                index,
+                artifact,
+                &digest,
+                0,
+                &[],
+                true,
+            ));
+            index = index.saturating_add(1);
+            continue;
+        }
+        for (chunk_index, chunk) in artifact
+            .bytes
+            .chunks(PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE)
+            .enumerate()
+        {
+            let offset = chunk_index * PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE;
+            let final_chunk = offset + chunk.len() >= total_len;
+            frames.push(provider_session_artifact_delta_frame(
+                request_id,
+                index,
+                artifact,
+                &digest,
+                offset,
+                chunk,
+                final_chunk,
+            ));
+            index = index.saturating_add(1);
+        }
+    }
+    frames
+}
+
+fn provider_session_artifact_delta_frame(
+    request_id: &str,
+    index: u64,
+    artifact: &ProviderSessionArtifact,
+    digest: &str,
+    offset: usize,
+    chunk: &[u8],
+    final_chunk: bool,
+) -> Value {
+    json!({
+        "t": "s.delta",
+        "rid": request_id,
+        "i": index,
+        "d": "",
+        "tool": null,
+        "fin": null,
+        "artifact": {
+            "id": artifact.id,
+            "content_type": artifact.content_type,
+            "encoding": "hex",
+            "offset": offset,
+            "len": chunk.len(),
+            "total_len": artifact.bytes.len(),
+            "blake3": digest,
+            "data": hex_encode(chunk),
+            "final": final_chunk,
+        },
+    })
+}
+
+fn provider_session_artifact_summaries(artifacts: &[ProviderSessionArtifact]) -> Vec<Value> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "id": artifact.id,
+                "content_type": artifact.content_type,
+                "bytes": artifact.bytes.len(),
+                "blake3": blake3_bytes_hex(&artifact.bytes),
+            })
+        })
+        .collect()
 }
 
 async fn maybe_provider_session_delta_delay(session_id: &str, request_id: &str, index: u64) {
@@ -17833,9 +17916,17 @@ fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &s
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct ProviderSessionArtifact {
+    id: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct ProviderSessionOutput {
     content: String,
     tool: Option<Value>,
+    artifacts: Vec<ProviderSessionArtifact>,
     finish_reason: String,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -17850,12 +17941,21 @@ fn provider_engine_session_response(
     let tool_mode = provider_engine_tool_request(body, adapter)?.map(|(strategy, _)| strategy);
     let request = provider_engine_request_from_body(body, adapter)?;
     let mut token_ids = Vec::new();
+    let mut artifact_chunks = Vec::new();
     let output = backend
-        .generate(request, &mut |chunk: mayhem_engine::TokenChunk| {
-            token_ids.push(chunk.token_id);
-            Ok(())
-        })
+        .generate_with_artifacts(
+            request,
+            &mut |chunk: mayhem_engine::TokenChunk| {
+                token_ids.push(chunk.token_id);
+                Ok(())
+            },
+            &mut |chunk: ArtifactChunk| {
+                artifact_chunks.push(chunk);
+                Ok(())
+            },
+        )
         .context("generating provider session response with mayhem-engine")?;
+    let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
     let tool = if let Some(strategy) = tool_mode {
         Some(
             provider_engine_tool_call_output(&output.text, strategy).with_context(|| {
@@ -17875,6 +17975,7 @@ fn provider_engine_session_response(
             output.text
         },
         tool,
+        artifacts,
         finish_reason: if tool_mode.is_some() {
             "tool_calls".to_owned()
         } else {
@@ -17884,6 +17985,62 @@ fn provider_engine_session_response(
         completion_tokens: u64::from(output.usage.completion_tokens),
         token_ids,
     })
+}
+
+fn provider_session_artifacts_from_chunks(
+    chunks: Vec<ArtifactChunk>,
+) -> Result<Vec<ProviderSessionArtifact>> {
+    let mut grouped: BTreeMap<String, Vec<ArtifactChunk>> = BTreeMap::new();
+    for chunk in chunks {
+        if chunk.artifact_id.trim().is_empty() {
+            bail!("provider engine emitted artifact chunk with empty id");
+        }
+        if chunk.content_type.trim().is_empty() {
+            bail!(
+                "provider engine emitted artifact {} with empty content type",
+                chunk.artifact_id
+            );
+        }
+        grouped
+            .entry(chunk.artifact_id.clone())
+            .or_default()
+            .push(chunk);
+    }
+
+    let mut artifacts = Vec::new();
+    for (artifact_id, mut chunks) in grouped {
+        chunks.sort_by_key(|chunk| chunk.index);
+        let content_type = chunks
+            .first()
+            .map(|chunk| chunk.content_type.clone())
+            .unwrap_or_default();
+        let mut bytes = Vec::new();
+        let mut final_seen = false;
+        for (expected, chunk) in chunks.into_iter().enumerate() {
+            let expected =
+                u32::try_from(expected).context("artifact chunk count overflowed u32")?;
+            if chunk.index != expected {
+                bail!(
+                    "provider engine artifact {artifact_id} chunk index gap: expected {expected}, got {}",
+                    chunk.index
+                );
+            }
+            if chunk.content_type != content_type {
+                bail!("provider engine artifact {artifact_id} changed content type mid-stream");
+            }
+            final_seen |= chunk.final_chunk;
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+        if !final_seen {
+            bail!("provider engine artifact {artifact_id} missing final chunk marker");
+        }
+        artifacts.push(ProviderSessionArtifact {
+            id: artifact_id,
+            content_type,
+            bytes,
+        });
+    }
+    Ok(artifacts)
 }
 
 fn provider_engine_request_from_body(
@@ -18180,6 +18337,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             token_ids: content.bytes().map(i32::from).collect(),
             content,
             tool: None,
+            artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens,
         };
@@ -18194,6 +18352,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
                 "arguments": provider_tool_arguments("bash"),
             })),
             finish_reason: "tool_calls".to_owned(),
+            artifacts: Vec::new(),
             prompt_tokens,
             completion_tokens: 1,
             token_ids: Vec::new(),
@@ -18208,6 +18367,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
                 "arguments": provider_tool_arguments(&tool_name),
             })),
             finish_reason: "tool_calls".to_owned(),
+            artifacts: Vec::new(),
             prompt_tokens,
             completion_tokens: 1,
             token_ids: Vec::new(),
@@ -18232,6 +18392,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         token_ids: content.bytes().map(i32::from).collect(),
         content,
         tool: None,
+        artifacts: Vec::new(),
         finish_reason: "stop".to_owned(),
         prompt_tokens,
     }
@@ -19053,6 +19214,7 @@ mod tests {
 
     struct FakeEngineBackend {
         output: mayhem_engine::GenerateOutput,
+        artifact_chunks: Vec<ArtifactChunk>,
         last_request: Option<GenerateRequest>,
     }
 
@@ -19064,8 +19226,14 @@ mod tests {
                     usage: mayhem_engine::UsageCounters::new(4, 2),
                     finish_reason: mayhem_engine::FinishReason::Stop,
                 },
+                artifact_chunks: Vec::new(),
                 last_request: None,
             }
+        }
+
+        fn with_artifact_chunks(mut self, artifact_chunks: Vec<ArtifactChunk>) -> Self {
+            self.artifact_chunks = artifact_chunks;
+            self
         }
     }
 
@@ -19100,6 +19268,19 @@ mod tests {
         ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
             self.last_request = Some(request);
             Ok(self.output.clone())
+        }
+
+        fn generate_with_artifacts(
+            &mut self,
+            request: GenerateRequest,
+            token_sink: &mut dyn mayhem_engine::TokenSink,
+            artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+        ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+            let output = self.generate(request, token_sink)?;
+            for chunk in self.artifact_chunks.clone() {
+                artifact_sink.on_artifact_chunk(chunk)?;
+            }
+            Ok(output)
         }
     }
 
@@ -20836,6 +21017,7 @@ mod tests {
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
             tool: None,
+            artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 3,
             completion_tokens: 4,
@@ -20888,6 +21070,7 @@ mod tests {
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
             tool: None,
+            artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 2,
             completion_tokens: 3,
@@ -21117,6 +21300,73 @@ mod tests {
         assert!(request.prompt.contains("user: hello"));
         assert_eq!(request.max_new_tokens, 8);
         assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_session_response_collects_artifact_chunks() {
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![
+            ArtifactChunk {
+                artifact_id: "image-1".to_owned(),
+                index: 0,
+                content_type: "image/png".to_owned(),
+                bytes: vec![0x89, b'P'],
+                final_chunk: false,
+            },
+            ArtifactChunk {
+                artifact_id: "image-1".to_owned(),
+                index: 1,
+                content_type: "image/png".to_owned(),
+                bytes: vec![b'N', b'G'],
+                final_chunk: true,
+            },
+        ]);
+        let body = json!({
+            "messages": [{ "role": "user", "content": "draw a square" }]
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.artifacts[0].id, "image-1");
+        assert_eq!(output.artifacts[0].content_type, "image/png");
+        assert_eq!(output.artifacts[0].bytes, b"\x89PNG");
+    }
+
+    #[test]
+    fn provider_session_artifact_delta_frames_are_chunked_and_addressed() {
+        let artifact = ProviderSessionArtifact {
+            id: "image-1".to_owned(),
+            content_type: "image/png".to_owned(),
+            bytes: vec![7; PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE + 3],
+        };
+        let frames =
+            provider_session_artifact_delta_frames("rid-1", 2, std::slice::from_ref(&artifact));
+        let expected_hash = blake3_bytes_hex(&artifact.bytes);
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["i"], 2);
+        assert_eq!(frames[0]["artifact"]["id"], "image-1");
+        assert_eq!(frames[0]["artifact"]["encoding"], "hex");
+        assert_eq!(frames[0]["artifact"]["offset"], 0);
+        assert_eq!(
+            frames[0]["artifact"]["len"],
+            PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE
+        );
+        assert_eq!(frames[0]["artifact"]["blake3"], expected_hash);
+        assert_eq!(frames[0]["artifact"]["final"], false);
+        assert_eq!(frames[1]["i"], 3);
+        assert_eq!(
+            frames[1]["artifact"]["offset"],
+            PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE
+        );
+        assert_eq!(frames[1]["artifact"]["len"], 3);
+        assert_eq!(frames[1]["artifact"]["blake3"], expected_hash);
+        assert_eq!(frames[1]["artifact"]["final"], true);
     }
 
     #[test]

@@ -319,6 +319,16 @@ pub struct TokenChunk {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactChunk {
+    pub artifact_id: String,
+    pub index: u32,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub final_chunk: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GenerateOutput {
     pub text: String,
     pub usage: UsageCounters,
@@ -381,6 +391,28 @@ impl TokenSink for NoopTokenSink {
     }
 }
 
+pub trait ArtifactSink {
+    fn on_artifact_chunk(&mut self, chunk: ArtifactChunk) -> Result<()>;
+}
+
+impl<F> ArtifactSink for F
+where
+    F: FnMut(ArtifactChunk) -> Result<()>,
+{
+    fn on_artifact_chunk(&mut self, chunk: ArtifactChunk) -> Result<()> {
+        self(chunk)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct NoopArtifactSink;
+
+impl ArtifactSink for NoopArtifactSink {
+    fn on_artifact_chunk(&mut self, _chunk: ArtifactChunk) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub trait EngineBackend {
     fn backend_id(&self) -> &'static str;
     fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo>;
@@ -390,6 +422,14 @@ pub trait EngineBackend {
         request: GenerateRequest,
         sink: &mut dyn TokenSink,
     ) -> Result<GenerateOutput>;
+    fn generate_with_artifacts(
+        &mut self,
+        request: GenerateRequest,
+        token_sink: &mut dyn TokenSink,
+        _artifact_sink: &mut dyn ArtifactSink,
+    ) -> Result<GenerateOutput> {
+        self.generate(request, token_sink)
+    }
 }
 
 pub fn tool_call_json_schema(tools: &[ToolSpec]) -> Result<Value> {
@@ -1733,9 +1773,70 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    struct EchoBackend;
+
+    impl EngineBackend for EchoBackend {
+        fn backend_id(&self) -> &'static str {
+            "echo"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            Ok(LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact,
+                ctx_size: config.ctx_size,
+                n_ctx_train: config.ctx_size,
+                n_vocab: 0,
+            })
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            Ok(Tokenization {
+                token_ids: text.bytes().map(i32::from).collect(),
+            })
+        }
+
+        fn generate(
+            &mut self,
+            request: GenerateRequest,
+            _sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            Ok(GenerateOutput {
+                text: request.prompt,
+                usage: UsageCounters::new(1, 1),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-engine");
+    }
+
+    #[test]
+    fn default_generate_with_artifacts_delegates_without_artifacts() {
+        let mut backend = EchoBackend;
+        let mut token_chunks = Vec::new();
+        let mut artifact_chunks = Vec::new();
+
+        let output = backend
+            .generate_with_artifacts(
+                GenerateRequest::new("hello"),
+                &mut |chunk| {
+                    token_chunks.push(chunk);
+                    Ok(())
+                },
+                &mut |chunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.text, "hello");
+        assert!(token_chunks.is_empty());
+        assert!(artifact_chunks.is_empty());
     }
 
     #[test]

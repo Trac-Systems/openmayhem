@@ -193,6 +193,8 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
             )
             .await?;
     }
+    let artifact_bytes = b"\x89PNG mayhem direct artifact".to_vec();
+    let artifact_hash = blake3::hash(&artifact_bytes).to_hex().to_string();
     provider_bridge
         .session_send(
             &user_key,
@@ -203,21 +205,68 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
                 "i": 3,
                 "d": "",
                 "tool": null,
+                "fin": null,
+                "artifact": {
+                    "id": "image-1",
+                    "content_type": "image/png",
+                    "encoding": "hex",
+                    "offset": 0,
+                    "len": artifact_bytes.len(),
+                    "total_len": artifact_bytes.len(),
+                    "blake3": artifact_hash,
+                    "data": hex::encode(&artifact_bytes),
+                    "final": true
+                }
+            }),
+        )
+        .await?;
+    provider_bridge
+        .session_send(
+            &user_key,
+            &session_id,
+            json!({
+                "t": "s.delta",
+                "rid": request_id,
+                "i": 4,
+                "d": "",
+                "tool": null,
                 "fin": "stop",
-                "usage": { "in": 3, "out": 3 }
+                "usage": { "in": 3, "out": 3 },
+                "artifacts": [{
+                    "id": "image-1",
+                    "content_type": "image/png",
+                    "bytes": artifact_bytes.len(),
+                    "blake3": artifact_hash
+                }]
             }),
         )
         .await?;
 
     let mut completion = String::new();
-    for _ in 0..4 {
+    let mut artifact_seen = false;
+    for _ in 0..5 {
         let frame = expect_session_frame(&mut user_bridge, &session_id, "s.delta").await?;
         completion.push_str(frame["d"].as_str().unwrap_or_default());
+        if let Some(artifact) = frame.get("artifact") {
+            artifact_seen = true;
+            assert_eq!(artifact["id"], "image-1");
+            assert_eq!(artifact["content_type"], "image/png");
+            assert_eq!(artifact["encoding"], "hex");
+            assert_eq!(artifact["blake3"], artifact_hash);
+            assert_eq!(
+                hex::decode(artifact["data"].as_str().unwrap_or_default())?,
+                artifact_bytes
+            );
+            assert_eq!(artifact["final"], true);
+        }
         if frame["fin"].as_str() == Some("stop") {
             assert_eq!(frame["usage"]["out"], 3);
+            assert_eq!(frame["artifacts"][0]["id"], "image-1");
+            assert_eq!(frame["artifacts"][0]["blake3"], artifact_hash);
         }
     }
     assert_eq!(completion, "hello world");
+    assert!(artifact_seen);
 
     provider_bridge
         .session_send(

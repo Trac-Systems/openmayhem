@@ -4,11 +4,11 @@ use axum::{
     Router,
 };
 use mayhem_gateway::openai::{
-    openai_router, ChatCompletionRequest, ChatMessage, ChatOutput, GatewayCanaryModelConfig,
-    GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayModel,
-    GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture,
-    GatewaySessionInvocation, GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps,
-    PriceRefMu, ShapeAdapterInfo, ToolCallOutput, Usage,
+    openai_router, ChatCompletionRequest, ChatMessage, ChatOutput, GatewayArtifactOutput,
+    GatewayCanaryModelConfig, GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry,
+    GatewayModel, GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError,
+    GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult, GatewayState,
+    MayhemModelInfo, ModelCaps, PriceRefMu, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, text_generation_rate_map, token_fingerprint, ReputationEventKind,
@@ -45,6 +45,7 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                         model.id, invocation.session_id
                     )),
                     tool_call: None,
+                    artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
                         prompt_tokens,
@@ -86,6 +87,7 @@ impl GatewaySessionBackend for ToolCallDirectSessionBackend {
                         name: "write".to_owned(),
                         arguments: r#"{"filePath":"ok.txt"}"#.to_owned(),
                     }),
+                    artifacts: Vec::new(),
                     finish_reason: "tool_calls".to_owned(),
                     usage: Usage {
                         prompt_tokens,
@@ -97,6 +99,49 @@ impl GatewaySessionBackend for ToolCallDirectSessionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![1],
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ArtifactDirectSessionBackend;
+
+impl GatewaySessionBackend for ArtifactDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-artifact-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let prompt_tokens = request.messages.len() as u64;
+            let image = b"\x89PNG mayhem artifact".to_vec();
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(String::new()),
+                    tool_call: None,
+                    artifacts: vec![GatewayArtifactOutput {
+                        id: "image-1".to_owned(),
+                        content_type: "image/png".to_owned(),
+                        blake3: blake3::hash(&image).to_hex().to_string(),
+                        bytes: image,
+                    }],
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens: 0,
+                        total_tokens: prompt_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids: Vec::new(),
             })
         })
     }
@@ -142,6 +187,7 @@ impl GatewaySessionBackend for RetryThenDirectSessionBackend {
                         model.id, provider
                     )),
                     tool_call: None,
+                    artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
                         prompt_tokens,
@@ -219,6 +265,7 @@ impl GatewaySessionBackend for HedgeInspectBackend {
                 output: ChatOutput {
                     content: Some(format!("hedge inspected for {} via {}", model.id, provider)),
                     tool_call: None,
+                    artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
                         prompt_tokens,
@@ -279,6 +326,7 @@ impl GatewaySessionBackend for CanarySubstitutionBackend {
                 output: ChatOutput {
                     content: Some(content),
                     tool_call: None,
+                    artifacts: Vec::new(),
                     finish_reason: "stop".to_owned(),
                     usage: Usage {
                         prompt_tokens,
@@ -622,6 +670,28 @@ async fn chat_completion_can_use_direct_session_backend() {
     let (status, body) = json_request(app, Method::GET, "/mayhem/status", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["backend"], "test-direct-session");
+}
+
+#[tokio::test]
+async fn chat_completion_exposes_direct_session_artifact_summary() {
+    let state = GatewayState::from_models(vec![routed_test_model()])
+        .with_session_backend(Arc::new(ArtifactDirectSessionBackend));
+    let app = openai_router(state);
+    let image = b"\x89PNG mayhem artifact".to_vec();
+    let expected_hash = blake3::hash(&image).to_hex().to_string();
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Generate an image." }]
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mayhem"]["backend"], "test-artifact-direct-session");
+    assert_eq!(body["mayhem"]["artifacts"][0]["id"], "image-1");
+    assert_eq!(body["mayhem"]["artifacts"][0]["content_type"], "image/png");
+    assert_eq!(body["mayhem"]["artifacts"][0]["bytes"], image.len());
+    assert_eq!(body["mayhem"]["artifacts"][0]["blake3"], expected_hash);
 }
 
 #[tokio::test]

@@ -438,8 +438,17 @@ pub struct ScBridgeGatewaySessionBackend {
 pub struct ChatOutput {
     pub content: Option<String>,
     pub tool_call: Option<ToolCallOutput>,
+    pub artifacts: Vec<GatewayArtifactOutput>,
     pub finish_reason: String,
     pub usage: Usage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayArtifactOutput {
+    pub id: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub blake3: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1691,6 +1700,7 @@ async fn collect_direct_session_output(
     let mut usage = None;
     let mut provider_receipt = None;
     let mut token_ids = Vec::new();
+    let mut artifact_builders = BTreeMap::new();
     let deadline = Instant::now() + wait;
 
     while finish_reason.is_none() || provider_receipt.is_none() {
@@ -1720,6 +1730,7 @@ async fn collect_direct_session_output(
                 if tool_call.is_none() {
                     tool_call = tool_call_from_session_delta(&frame);
                 }
+                collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
                     finish_reason = Some(fin.to_owned());
                     usage = usage_from_session_delta(&frame);
@@ -1765,10 +1776,12 @@ async fn collect_direct_session_output(
 
     let prompt_text = chat_prompt_text(request);
     let usage = usage.unwrap_or_else(|| usage_for(&prompt_text, &content));
+    let artifacts = finish_session_artifacts(artifact_builders)?;
     Ok(DirectSessionCollected {
         output: ChatOutput {
             content: tool_call.is_none().then_some(content),
             tool_call,
+            artifacts,
             finish_reason: finish_reason.expect("loop ended with final delta"),
             usage,
         },
@@ -1792,6 +1805,168 @@ fn token_id_from_session_delta(frame: &Value) -> Option<i32> {
         .or_else(|| frame.get("chunk").and_then(|chunk| chunk.get("token_id")))
         .and_then(Value::as_i64)
         .and_then(|id| i32::try_from(id).ok())
+}
+
+#[derive(Debug)]
+struct SessionArtifactBuilder {
+    id: String,
+    content_type: String,
+    bytes: Vec<u8>,
+    total_len: Option<usize>,
+    blake3: String,
+    final_seen: bool,
+}
+
+fn collect_artifact_from_session_delta(
+    frame: &Value,
+    builders: &mut BTreeMap<String, SessionArtifactBuilder>,
+) -> Result<(), GatewaySessionError> {
+    let Some(artifact) = frame.get("artifact") else {
+        return Ok(());
+    };
+    if artifact.is_null() {
+        return Ok(());
+    }
+    let fail = |message: String| GatewaySessionError::new(message);
+    let id = artifact
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| fail("artifact delta missing id".to_owned()))?
+        .to_owned();
+    let content_type = artifact
+        .get("content_type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| fail(format!("artifact {id} missing content_type")))?
+        .to_owned();
+    let encoding = artifact
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("hex");
+    if encoding != "hex" {
+        return Err(fail(format!(
+            "artifact {id} used unsupported encoding {encoding}"
+        )));
+    }
+    let data = artifact
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail(format!("artifact {id} missing data")))?;
+    let bytes = hex::decode(data)
+        .map_err(|err| fail(format!("artifact {id} data is not valid hex: {err}")))?;
+    let offset = artifact
+        .get("offset")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| fail(format!("artifact {id} missing offset")))?;
+    let expected_len = artifact
+        .get("len")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(bytes.len());
+    if expected_len != bytes.len() {
+        return Err(fail(format!(
+            "artifact {id} len {} did not match decoded bytes {}",
+            expected_len,
+            bytes.len()
+        )));
+    }
+    let total_len = artifact
+        .get("total_len")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let blake3 = artifact
+        .get("blake3")
+        .and_then(Value::as_str)
+        .filter(|value| is_hex_len(value, 64))
+        .ok_or_else(|| fail(format!("artifact {id} missing 32-byte blake3 digest")))?
+        .to_ascii_lowercase();
+
+    let builder = builders
+        .entry(id.clone())
+        .or_insert_with(|| SessionArtifactBuilder {
+            id: id.clone(),
+            content_type: content_type.clone(),
+            bytes: Vec::new(),
+            total_len,
+            blake3: blake3.clone(),
+            final_seen: false,
+        });
+    if builder.content_type != content_type {
+        return Err(fail(format!(
+            "artifact {id} changed content_type from {} to {}",
+            builder.content_type, content_type
+        )));
+    }
+    if builder.blake3 != blake3 {
+        return Err(fail(format!("artifact {id} changed blake3 digest")));
+    }
+    if let (Some(previous), Some(next)) = (builder.total_len, total_len) {
+        if previous != next {
+            return Err(fail(format!("artifact {id} changed total_len")));
+        }
+    } else if builder.total_len.is_none() {
+        builder.total_len = total_len;
+    }
+    if offset != builder.bytes.len() {
+        return Err(fail(format!(
+            "artifact {id} offset gap: expected {}, got {offset}",
+            builder.bytes.len()
+        )));
+    }
+    if let Some(total_len) = builder.total_len {
+        if offset.saturating_add(bytes.len()) > total_len {
+            return Err(fail(format!("artifact {id} exceeds declared total_len")));
+        }
+    }
+    builder.bytes.extend_from_slice(&bytes);
+    if artifact
+        .get("final")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        builder.final_seen = true;
+    }
+    Ok(())
+}
+
+fn finish_session_artifacts(
+    builders: BTreeMap<String, SessionArtifactBuilder>,
+) -> Result<Vec<GatewayArtifactOutput>, GatewaySessionError> {
+    let mut artifacts = Vec::new();
+    for (_id, builder) in builders {
+        if !builder.final_seen {
+            return Err(GatewaySessionError::new(format!(
+                "artifact {} ended without final chunk",
+                builder.id
+            )));
+        }
+        if let Some(total_len) = builder.total_len {
+            if total_len != builder.bytes.len() {
+                return Err(GatewaySessionError::new(format!(
+                    "artifact {} total_len {} did not match reconstructed bytes {}",
+                    builder.id,
+                    total_len,
+                    builder.bytes.len()
+                )));
+            }
+        }
+        let actual = blake3_hex(&builder.bytes);
+        if actual != builder.blake3 {
+            return Err(GatewaySessionError::new(format!(
+                "artifact {} blake3 mismatch: expected {}, got {}",
+                builder.id, builder.blake3, actual
+            )));
+        }
+        artifacts.push(GatewayArtifactOutput {
+            id: builder.id,
+            content_type: builder.content_type,
+            bytes: builder.bytes,
+            blake3: builder.blake3,
+        });
+    }
+    Ok(artifacts)
 }
 
 fn provider_signed_receipt_from_frame(
@@ -3108,6 +3283,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
         ChatOutput {
             content: Some(format!("Tool result received: {tool_result}")),
             tool_call: None,
+            artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             usage: usage_for(&prompt_text, &tool_result),
         }
@@ -3120,6 +3296,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
         ChatOutput {
             content: None,
             tool_call: Some(tool_call),
+            artifacts: Vec::new(),
             finish_reason: "tool_calls".to_owned(),
             usage: usage_for(&prompt_text, "{}"),
         }
@@ -3142,6 +3319,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
             usage: usage_for(&prompt_text, &content),
             content: Some(content),
             tool_call: None,
+            artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
         }
     };
@@ -3183,6 +3361,7 @@ fn chat_response_value(
         "mayhem": {
             "backend": mayhem_meta.backend,
             "direct_session": mayhem_meta.direct_session,
+            "artifacts": artifact_summaries(&output.artifacts),
             "hedge": {
                 "requested": mayhem_meta.hedge.requested,
                 "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
@@ -3231,14 +3410,20 @@ fn chat_stream_chunks(
             ));
         }
     }
-    chunks.push(chat_chunk(
+    let mut finish_chunk = chat_chunk(
         id,
         created,
         model,
         json!({}),
         Some(output.finish_reason.as_str()),
         None,
-    ));
+    );
+    if !output.artifacts.is_empty() {
+        finish_chunk["mayhem"] = json!({
+            "artifacts": artifact_summaries(&output.artifacts),
+        });
+    }
+    chunks.push(finish_chunk);
     if include_usage {
         chunks.push(json!({
             "id": id,
@@ -3250,6 +3435,7 @@ fn chat_stream_chunks(
             "mayhem": {
                 "backend": mayhem_meta.backend,
                 "direct_session": mayhem_meta.direct_session,
+                "artifacts": artifact_summaries(&output.artifacts),
                 "hedge": {
                     "requested": mayhem_meta.hedge.requested,
                     "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
@@ -3282,6 +3468,20 @@ fn chat_chunk(
         }],
         "usage": usage,
     })
+}
+
+fn artifact_summaries(artifacts: &[GatewayArtifactOutput]) -> Vec<Value> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "id": artifact.id,
+                "content_type": artifact.content_type,
+                "bytes": artifact.bytes.len(),
+                "blake3": artifact.blake3,
+            })
+        })
+        .collect()
 }
 
 fn tool_call_value(tool_call: &ToolCallOutput) -> Value {
@@ -4187,6 +4387,7 @@ mod tests {
         ChatOutput {
             content: Some("receipt ok".to_owned()),
             tool_call: None,
+            artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             usage: Usage {
                 prompt_tokens: 2,
@@ -4194,6 +4395,87 @@ mod tests {
                 total_tokens: 5,
             },
         }
+    }
+
+    #[test]
+    fn session_artifact_delta_collects_chunks_and_verifies_digest() {
+        let bytes = b"\x89PNG mayhem image".to_vec();
+        let digest = blake3_hex(&bytes);
+        let mut builders = BTreeMap::new();
+
+        collect_artifact_from_session_delta(
+            &json!({
+                "t": "s.delta",
+                "rid": "rid-1",
+                "artifact": {
+                    "id": "image-1",
+                    "content_type": "image/png",
+                    "encoding": "hex",
+                    "offset": 0,
+                    "len": 4,
+                    "total_len": bytes.len(),
+                    "blake3": digest,
+                    "data": hex::encode(&bytes[..4]),
+                    "final": false,
+                }
+            }),
+            &mut builders,
+        )
+        .unwrap();
+        collect_artifact_from_session_delta(
+            &json!({
+                "t": "s.delta",
+                "rid": "rid-1",
+                "artifact": {
+                    "id": "image-1",
+                    "content_type": "image/png",
+                    "encoding": "hex",
+                    "offset": 4,
+                    "len": bytes.len() - 4,
+                    "total_len": bytes.len(),
+                    "blake3": digest,
+                    "data": hex::encode(&bytes[4..]),
+                    "final": true,
+                }
+            }),
+            &mut builders,
+        )
+        .unwrap();
+
+        let artifacts = finish_session_artifacts(builders).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "image-1");
+        assert_eq!(artifacts[0].content_type, "image/png");
+        assert_eq!(artifacts[0].bytes, bytes);
+        assert_eq!(artifacts[0].blake3, blake3_hex(&artifacts[0].bytes));
+    }
+
+    #[test]
+    fn session_artifact_delta_rejects_corrupt_digest() {
+        let bytes = b"not the claimed image".to_vec();
+        let mut builders = BTreeMap::new();
+        collect_artifact_from_session_delta(
+            &json!({
+                "t": "s.delta",
+                "rid": "rid-1",
+                "artifact": {
+                    "id": "image-1",
+                    "content_type": "image/png",
+                    "encoding": "hex",
+                    "offset": 0,
+                    "len": bytes.len(),
+                    "total_len": bytes.len(),
+                    "blake3": "00".repeat(32),
+                    "data": hex::encode(&bytes),
+                    "final": true,
+                }
+            }),
+            &mut builders,
+        )
+        .unwrap();
+
+        let err = finish_session_artifacts(builders).expect_err("digest mismatch must reject");
+        assert!(err.message.contains("blake3 mismatch"));
     }
 
     fn test_provider_receipt(
