@@ -114,7 +114,7 @@ enum Commands {
     Balance(BalanceArgs),
     /// Show provider payout evidence and treasury fee sweeps.
     Payouts(PayoutsArgs),
-    /// Show provider earnings, holdback, paid, and released balances.
+    /// Show provider earnings, holdback, paid, released, and claimable balances.
     Earnings(EarningsArgs),
     /// Auditor probe commands.
     Auditor {
@@ -12759,6 +12759,8 @@ fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
         held_mu: record.held_mu,
         paid_cum_mu: record.paid_cum_mu,
         released_mu: record.total_mu - locked,
+        claimable_mu: record.total_mu - locked,
+        claim_model: "tap_non_custodial_claim".to_owned(),
         holdbacks: record.holdbacks,
         updated_epoch: record.updated_epoch,
         last_payout_msb_tx_hash: record.last_payout_msb_tx_hash,
@@ -12829,7 +12831,7 @@ fn print_earnings_report(report: &Value) {
         .flatten()
     {
         println!(
-            "{}: total={} held={} paid={} released={} {}",
+            "{}: total={} held={} paid={} released={} claimable={} {}",
             entry.get("provider").and_then(Value::as_str).unwrap_or(""),
             entry.get("total_mu").and_then(Value::as_u64).unwrap_or(0),
             entry.get("held_mu").and_then(Value::as_u64).unwrap_or(0),
@@ -12839,6 +12841,10 @@ fn print_earnings_report(report: &Value) {
                 .unwrap_or(0),
             entry
                 .get("released_mu")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            entry
+                .get("claimable_mu")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
             entry
@@ -13375,6 +13381,8 @@ struct EarningsView {
     held_mu: u64,
     paid_cum_mu: u64,
     released_mu: u64,
+    claimable_mu: u64,
+    claim_model: String,
     holdbacks: Vec<LedgerHoldbackBucket>,
     updated_epoch: u64,
     last_payout_msb_tx_hash: Option<String>,
@@ -20364,6 +20372,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(view.released_mu, 4_500);
+        assert_eq!(view.claimable_mu, 4_500);
+        assert_eq!(view.claim_model, "tap_non_custodial_claim");
         assert_eq!(view.holdbacks[0].epoch, 7);
 
         assert!(earning_view(LedgerEarningRecord {

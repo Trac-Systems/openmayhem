@@ -67,6 +67,11 @@ function parseNonNegativeInt(value, label, fallback = null) {
   return parsed;
 }
 
+function parseOptionalNonNegativeInt(value, label) {
+  if (value === undefined || value === null || value === '') return null;
+  return parseNonNegativeInt(value, label);
+}
+
 function parsePositiveInt(value, label, fallback = null) {
   const parsed = parseNonNegativeInt(value, label, fallback);
   if (parsed <= 0) throw new Error(`${label} must be positive`);
@@ -209,6 +214,51 @@ function normalizedReceipts(bundleOrReceipts) {
   throw new Error('settlement input must be a receipt array or object with receipts[]/data[]');
 }
 
+function releasePolicy({ settleThroughEpoch, challengeEpochs = 0, holdbackEpochs = 0 } = {}) {
+  const through = parseOptionalNonNegativeInt(settleThroughEpoch, 'settle through epoch');
+  const challenge = parseNonNegativeInt(challengeEpochs, 'challenge epochs', 0);
+  const holdback = parseNonNegativeInt(holdbackEpochs, 'holdback epochs', 0);
+  return {
+    settle_through_epoch: through,
+    challenge_epochs: challenge,
+    holdback_epochs: holdback,
+    release_delay_epochs: Math.max(challenge, holdback),
+  };
+}
+
+function entryEpoch(entry, body, bundleEpoch) {
+  return entry.release_epoch
+    ?? entry.receipt_epoch
+    ?? entry.epoch
+    ?? body.release_epoch
+    ?? body.receipt_epoch
+    ?? body.epoch
+    ?? bundleEpoch;
+}
+
+function receiptReleaseInfo(entry, body, bundleEpoch, policy) {
+  const explicitReleaseAfter = entry.release_after_epoch
+    ?? entry.eligible_epoch
+    ?? body.release_after_epoch
+    ?? body.eligible_epoch;
+  let releaseAfterEpoch = parseOptionalNonNegativeInt(explicitReleaseAfter, 'release_after_epoch');
+  let receiptEpoch = parseOptionalNonNegativeInt(entryEpoch(entry, body, bundleEpoch), 'receipt epoch');
+  if (releaseAfterEpoch === null && policy.release_delay_epochs > 0) {
+    if (receiptEpoch === null) {
+      throw new Error('receipt epoch required for delayed TAP settlement');
+    }
+    releaseAfterEpoch = receiptEpoch + policy.release_delay_epochs;
+  }
+  if (releaseAfterEpoch !== null && policy.settle_through_epoch === null) {
+    throw new Error('settle_through_epoch required for delayed TAP settlement');
+  }
+  return {
+    receipt_epoch: receiptEpoch,
+    release_after_epoch: releaseAfterEpoch,
+    eligible: releaseAfterEpoch === null || releaseAfterEpoch <= policy.settle_through_epoch,
+  };
+}
+
 function parseEntryAmount(entry, label) {
   if (isObject(entry)) {
     return parseBigIntString(entry.amount ?? entry.cumulative_wei, label);
@@ -248,14 +298,22 @@ export function buildTapSettlement({
   providerAccounts = {},
   tapUsdE6,
   prior = null,
+  settleThroughEpoch = null,
+  challengeEpochs = 0,
+  holdbackEpochs = 0,
 } = {}) {
+  const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
   const rate = parsePositiveInt(tapUsdE6, 'tap_usd_e6');
+  const policy = releasePolicy({ settleThroughEpoch, challengeEpochs, holdbackEpochs });
+  const bundleEpoch = inputBundle?.epoch ?? inputBundle?.receipt_epoch ?? inputBundle?.settlement_epoch;
   const previousBySession = new Map();
   const perProvider = priorProviderMap(prior);
   let cumulativeSpentWei = parseBigIntString(prior?.cumulative_spent_wei ?? prior?.cumulativeSpentWei, 'prior cumulative spent wei');
   let receiptCount = 0;
+  let heldReceiptCount = 0;
   let spentMu = 0;
+  let heldMu = 0;
 
   const sorted = input
     .map(receiptEnvelope)
@@ -267,6 +325,13 @@ export function buildTapSettlement({
   for (const { entry, body } of sorted) {
     const deltaMu = receiptDeltaMu(entry, body, previousBySession);
     if (deltaMu === 0) continue;
+    const release = receiptReleaseInfo(entry, body, bundleEpoch, policy);
+    if (!release.eligible) {
+      heldReceiptCount += 1;
+      heldMu += deltaMu;
+      safeMu(heldMu, 'held_mu', { allowZero: true });
+      continue;
+    }
     const spentWei = muToTapWei(deltaMu, rate);
     if (spentWei <= 0n) throw new Error('receipt converts to zero TAP wei');
     receiptCount += 1;
@@ -289,12 +354,17 @@ export function buildTapSettlement({
   if (entries.length === 0) {
     return {
       posted: false,
-      reason: 'no claimable provider earnings',
+      payout_model: 'non_custodial_claim',
+      custodial_wallet: false,
+      reason: heldReceiptCount > 0 ? 'no matured provider earnings' : 'no claimable provider earnings',
       tap_usd_e6: rate,
       receipt_count: receiptCount,
+      held_receipt_count: heldReceiptCount,
       spent_mu: spentMu,
+      held_mu: heldMu,
       cumulative_spent_wei: cumulativeSpentWei.toString(),
       entries: [],
+      release_policy: policy,
     };
   }
 
@@ -316,15 +386,20 @@ export function buildTapSettlement({
 
   return {
     posted: false,
+    payout_model: 'non_custodial_claim',
+    custodial_wallet: false,
     tap_usd_e6: rate,
     receipt_count: receiptCount,
+    held_receipt_count: heldReceiptCount,
     spent_mu: spentMu,
+    held_mu: heldMu,
     cumulative_spent_wei: cumulativeSpentWei.toString(),
     provider_claimed_wei: providerClaimedWei.toString(),
     provider_cap_wei: providerCapWei.toString(),
     root: dist.root,
     entries: entries.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
     proofs,
+    release_policy: policy,
     dist,
   };
 }
@@ -455,12 +530,24 @@ export async function rollTapSettlement({
   providerAccounts,
   tapUsdE6,
   prior,
+  settleThroughEpoch,
+  challengeEpochs,
+  holdbackEpochs,
   pool,
   ownerSigner,
   epoch,
   post = true,
 } = {}) {
-  const settlement = buildTapSettlement({ bundle, receipts, providerAccounts, tapUsdE6, prior });
+  const settlement = buildTapSettlement({
+    bundle,
+    receipts,
+    providerAccounts,
+    tapUsdE6,
+    prior,
+    settleThroughEpoch,
+    challengeEpochs,
+    holdbackEpochs,
+  });
   if (!settlement.root) return settlement;
   const screen = await guardianScreenSettlement({ settlement, pool, epoch, previous: prior });
   if (!screen.ok) {
@@ -521,6 +608,9 @@ function buildReplayCommand({
   providerAccountsPath,
   tapUsdE6,
   priorPath,
+  settleThroughEpoch,
+  challengeEpochs,
+  holdbackEpochs,
   ethRpc,
   poolAddress,
   epoch,
@@ -532,6 +622,15 @@ function buildReplayCommand({
   if (providerAccountsPath) args.push('--provider-accounts', providerAccountsPath);
   if (tapUsdE6) args.push('--tap-usd-e6', String(tapUsdE6));
   if (priorPath) args.push('--prior', priorPath);
+  if (settleThroughEpoch !== undefined && settleThroughEpoch !== null) {
+    args.push('--settle-through-epoch', String(settleThroughEpoch));
+  }
+  if (challengeEpochs !== undefined && challengeEpochs !== null) {
+    args.push('--challenge-epochs', String(challengeEpochs));
+  }
+  if (holdbackEpochs !== undefined && holdbackEpochs !== null) {
+    args.push('--holdback-epochs', String(holdbackEpochs));
+  }
   if (ethRpc) args.push('--eth-rpc', ethRpc);
   if (poolAddress) args.push('--pool', poolAddress);
   if (epoch) args.push('--epoch', String(epoch));
@@ -576,6 +675,9 @@ async function main() {
     providerAccounts,
     prior,
     tapUsdE6,
+    settleThroughEpoch: args['settle-through-epoch'],
+    challengeEpochs: args['challenge-epochs'] ?? 0,
+    holdbackEpochs: args['holdback-epochs'] ?? 0,
     pool,
     ownerSigner,
     epoch: args.epoch ? parsePositiveInt(args.epoch, '--epoch') : undefined,
@@ -586,6 +688,9 @@ async function main() {
     providerAccountsPath,
     tapUsdE6,
     priorPath,
+    settleThroughEpoch: args['settle-through-epoch'],
+    challengeEpochs: args['challenge-epochs'],
+    holdbackEpochs: args['holdback-epochs'],
     ethRpc,
     poolAddress,
     epoch: report.epoch,
