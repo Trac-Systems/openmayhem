@@ -153,6 +153,16 @@ pub(crate) struct CatalogCaps {
     pub(crate) json: bool,
     pub(crate) ctx_max: u64,
     pub(crate) vision: bool,
+    #[serde(default)]
+    pub(crate) image: bool,
+    #[serde(default)]
+    pub(crate) video: bool,
+    #[serde(default)]
+    pub(crate) audio: bool,
+    #[serde(default)]
+    pub(crate) output_modality: Option<String>,
+    #[serde(default)]
+    pub(crate) output_modalities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -483,6 +493,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             model.model_id
         ));
     }
+    validate_model_caps_modalities(model, errors);
     let _ = (model.caps.tools, model.caps.json);
     if model.requirements.min_ram_gb == 0 {
         errors.push(format!(
@@ -605,6 +616,85 @@ fn valid_model_class(model_class: &str) -> bool {
         model_class,
         DEFAULT_MODEL_CLASS | "embedding" | "image-generation" | "video-generation" | "tts" | "stt"
     )
+}
+
+fn valid_output_modality(modality: &str) -> bool {
+    matches!(modality, "text" | "embedding" | "image" | "video" | "audio")
+}
+
+fn output_modality_allowed_for_class(model_class: &str, modality: &str) -> bool {
+    matches!(
+        (model_class, modality),
+        (DEFAULT_MODEL_CLASS, "text")
+            | ("embedding", "embedding")
+            | ("image-generation", "image")
+            | ("video-generation", "video")
+            | ("tts", "audio")
+            | ("stt", "text")
+    )
+}
+
+fn validate_model_caps_modalities(model: &CatalogModel, errors: &mut Vec<String>) {
+    if let Some(modality) = model.caps.output_modality.as_deref() {
+        if !valid_output_modality(modality) {
+            errors.push(format!(
+                "{} caps.output_modality is unsupported: {}",
+                model.model_id, modality
+            ));
+        } else if !output_modality_allowed_for_class(&model.model_class, modality) {
+            errors.push(format!(
+                "{} caps.output_modality {} is not allowed for model_class {}",
+                model.model_id, modality, model.model_class
+            ));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for modality in &model.caps.output_modalities {
+        if !valid_output_modality(modality) {
+            errors.push(format!(
+                "{} caps.output_modalities entry is unsupported: {}",
+                model.model_id, modality
+            ));
+        } else if !output_modality_allowed_for_class(&model.model_class, modality) {
+            errors.push(format!(
+                "{} caps.output_modalities entry {} is not allowed for model_class {}",
+                model.model_id, modality, model.model_class
+            ));
+        }
+        if !seen.insert(modality.clone()) {
+            errors.push(format!(
+                "{} caps.output_modalities duplicates {}",
+                model.model_id, modality
+            ));
+        }
+    }
+    if let Some(modality) = model.caps.output_modality.as_deref() {
+        if !model.caps.output_modalities.is_empty()
+            && !model
+                .caps
+                .output_modalities
+                .iter()
+                .any(|entry| entry == modality)
+        {
+            errors.push(format!(
+                "{} caps.output_modalities must include output_modality {}",
+                model.model_id, modality
+            ));
+        }
+    }
+    for (flag, modality) in [("image", "image"), ("video", "video")] {
+        let enabled = match flag {
+            "image" => model.caps.image,
+            "video" => model.caps.video,
+            _ => false,
+        };
+        if enabled && !output_modality_allowed_for_class(&model.model_class, modality) {
+            errors.push(format!(
+                "{} caps.{} output is not allowed for model_class {}",
+                model.model_id, flag, model.model_class
+            ));
+        }
+    }
 }
 
 fn validate_artifact(
@@ -1159,6 +1249,11 @@ mod tests {
                 json: true,
                 ctx_max: 1024,
                 vision: false,
+                image: false,
+                video: false,
+                audio: false,
+                output_modality: Some("text".to_owned()),
+                output_modalities: vec!["text".to_owned()],
             },
             requirements: CatalogRequirements {
                 min_ram_gb: 8,

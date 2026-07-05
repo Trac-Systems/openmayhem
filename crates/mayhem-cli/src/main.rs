@@ -3132,6 +3132,11 @@ struct CatalogListCaps {
     json: bool,
     ctx_max: u64,
     vision: bool,
+    image: bool,
+    video: bool,
+    audio: bool,
+    output_modality: Option<String>,
+    output_modalities: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3303,6 +3308,11 @@ fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
             json: model.caps.json,
             ctx_max: model.caps.ctx_max,
             vision: model.caps.vision,
+            image: model.caps.image,
+            video: model.caps.video,
+            audio: model.caps.audio,
+            output_modality: model.caps.output_modality.clone(),
+            output_modalities: model.caps.output_modalities.clone(),
         },
         requirements: CatalogListRequirements {
             min_ram_gb: model.requirements.min_ram_gb,
@@ -3341,9 +3351,26 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             model.price_ref_mu.denom,
             format_rate_map(&model.price_ref_mu.rate_map)
         );
+        let output = if model.caps.output_modalities.is_empty() {
+            model
+                .caps
+                .output_modality
+                .as_deref()
+                .unwrap_or("unspecified")
+                .to_owned()
+        } else {
+            model.caps.output_modalities.join(",")
+        };
         println!(
-            "  caps: ctx_max={} tools={} json={} vision={}",
-            model.caps.ctx_max, model.caps.tools, model.caps.json, model.caps.vision
+            "  caps: ctx_max={} output={} tools={} json={} vision={} image={} video={} audio={}",
+            model.caps.ctx_max,
+            output,
+            model.caps.tools,
+            model.caps.json,
+            model.caps.vision,
+            model.caps.image,
+            model.caps.video,
+            model.caps.audio
         );
         println!(
             "  requirements: ram>={}GB vram_full_offload>={}GB backends={}",
@@ -10530,6 +10557,11 @@ struct ModelSummary {
     tools: bool,
     json: bool,
     context: u64,
+    image: bool,
+    video: bool,
+    audio: bool,
+    output_modality: Option<String>,
+    output_modalities: Vec<String>,
     attestation_tiers: BTreeMap<String, u64>,
     attestation_tier_labels: BTreeMap<String, String>,
     kyb_identities: Vec<ProviderKybInfo>,
@@ -11507,6 +11539,14 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         tools: caps.get("tools").and_then(Value::as_bool).unwrap_or(false),
         json: caps.get("json").and_then(Value::as_bool).unwrap_or(false),
         context: caps.get("ctx").and_then(Value::as_u64).unwrap_or(0),
+        image: caps.get("image").and_then(Value::as_bool).unwrap_or(false),
+        video: caps.get("video").and_then(Value::as_bool).unwrap_or(false),
+        audio: caps.get("audio").and_then(Value::as_bool).unwrap_or(false),
+        output_modality: caps
+            .get("output_modality")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        output_modalities: caps_output_modalities(caps),
         attestation_tiers,
         attestation_tier_labels,
         kyb_identities,
@@ -15689,6 +15729,11 @@ fn empty_gateway_caps() -> ModelCaps {
         json: false,
         ctx: 0,
         vision: false,
+        image: false,
+        video: false,
+        audio: false,
+        output_modality: None,
+        output_modalities: Vec::new(),
     }
 }
 
@@ -15703,7 +15748,31 @@ fn gateway_caps_from_contract(caps: &Value) -> ModelCaps {
             .and_then(|ctx| u32::try_from(ctx).ok())
             .unwrap_or(0),
         vision: caps.get("vision").and_then(Value::as_bool).unwrap_or(false),
+        image: caps.get("image").and_then(Value::as_bool).unwrap_or(false),
+        video: caps.get("video").and_then(Value::as_bool).unwrap_or(false),
+        audio: caps.get("audio").and_then(Value::as_bool).unwrap_or(false),
+        output_modality: caps
+            .get("output_modality")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        output_modalities: caps_output_modalities(caps),
     }
+}
+
+fn caps_output_modalities(caps: &Value) -> Vec<String> {
+    if let Some(entries) = caps.get("output_modalities").and_then(Value::as_array) {
+        return entries
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|modality| !modality.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    caps.get("output_modality")
+        .and_then(Value::as_str)
+        .filter(|modality| !modality.is_empty())
+        .map(|modality| vec![modality.to_owned()])
+        .unwrap_or_default()
 }
 
 fn enclave_cap_u32(caps: &Value, key: &'static str, default: u32) -> Result<u32> {
@@ -15862,7 +15931,7 @@ fn requested_backend(
         .iter()
         .any(|verdict| verdict.backend == requested);
     if !valid {
-        bail!("unknown backend {requested}; expected auto, trt-llm, mlx, or llama.cpp");
+        bail!("unknown backend {requested}; expected auto or a backend reported by hwprobe");
     }
     Ok(Some(requested.to_owned()))
 }
@@ -21536,7 +21605,16 @@ mod tests {
                 "attestation_tier_labels": {
                     "T2": "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
                 },
-                "caps": { "tools": true, "json": false, "ctx": 8192 }
+                "caps": {
+                    "tools": true,
+                    "json": false,
+                    "ctx": 8192,
+                    "image": true,
+                    "video": false,
+                    "audio": false,
+                    "output_modality": "image",
+                    "output_modalities": ["image"]
+                }
             }
         })])
         .unwrap();
@@ -21550,6 +21628,11 @@ mod tests {
         assert!(summaries[0].tools);
         assert!(!summaries[0].json);
         assert_eq!(summaries[0].context, 8192);
+        assert!(summaries[0].image);
+        assert!(!summaries[0].video);
+        assert!(!summaries[0].audio);
+        assert_eq!(summaries[0].output_modality.as_deref(), Some("image"));
+        assert_eq!(summaries[0].output_modalities, vec!["image".to_owned()]);
         assert_eq!(summaries[0].attestation_tiers["T2"], 1);
         assert!(summaries[0].attestation_tier_labels["T2"].contains("GB10"));
         assert_eq!(summaries[0].max_attestation_tier, 2);
@@ -23994,6 +24077,11 @@ mod tests {
                     json: true,
                     ctx_max: 8192,
                     vision: false,
+                    image: false,
+                    video: false,
+                    audio: false,
+                    output_modality: Some("text".to_owned()),
+                    output_modalities: vec!["text".to_owned()],
                 },
                 requirements: catalog::CatalogRequirements {
                     min_ram_gb: 1,

@@ -95,7 +95,17 @@ const ENCLAVE_UPDATE_FIELDS = [
   'binary_hash',
   'caps',
 ];
-const ENCLAVE_BACKENDS = new Set(['llama.cpp', 'mlx', 'trt-llm']);
+const ENCLAVE_BACKENDS = new Set([
+  'llama.cpp',
+  'mlx',
+  'trt-llm',
+  'diffusers',
+  'stable-diffusion.cpp',
+  'comfyui',
+  'whisper.cpp',
+  'piper',
+  'kokoro',
+]);
 const DEFAULT_MODEL_CLASS = 'text-generation';
 const MODEL_CLASSES = new Set([
   DEFAULT_MODEL_CLASS,
@@ -114,6 +124,15 @@ const MODEL_CLASS_RATE_UNITS = Object.freeze({
   tts: new Set(['input_character', 'audio_second']),
   stt: new Set(['audio_second']),
 });
+const CAP_OUTPUT_MODALITIES = new Set(['text', 'embedding', 'image', 'video', 'audio']);
+const MODEL_CLASS_OUTPUT_MODALITIES = Object.freeze({
+  [DEFAULT_MODEL_CLASS]: new Set(['text']),
+  embedding: new Set(['embedding']),
+  'image-generation': new Set(['image']),
+  'video-generation': new Set(['video']),
+  tts: new Set(['audio']),
+  stt: new Set(['text']),
+});
 const ENCLAVE_ARTIFACT_ROOT_KIND = 'blake3_merkle_v1';
 const ENCLAVE_CAP_BOOLEAN_FIELDS = [
   'chat',
@@ -121,15 +140,31 @@ const ENCLAVE_CAP_BOOLEAN_FIELDS = [
   'json',
   'embeddings',
   'vision',
+  'image',
+  'video',
   'audio',
 ];
-const ENCLAVE_CAP_FIELDS = new Set([
-  ...ENCLAVE_CAP_BOOLEAN_FIELDS,
+const ENCLAVE_CAP_INTEGER_FIELDS = [
   'ctx',
   'ctx_max',
   'tp_degree',
   'max_batch_size',
   'max_num_tokens',
+  'max_image_width',
+  'max_image_height',
+  'max_image_steps',
+  'max_video_width',
+  'max_video_height',
+  'max_video_frames',
+  'max_video_seconds',
+  'max_audio_seconds',
+  'sample_rate_hz',
+];
+const ENCLAVE_CAP_FIELDS = new Set([
+  ...ENCLAVE_CAP_BOOLEAN_FIELDS,
+  ...ENCLAVE_CAP_INTEGER_FIELDS,
+  'output_modality',
+  'output_modalities',
 ]);
 const ROOM_POLICY_FIELDS = new Set([
   'region_hint',
@@ -1317,14 +1352,15 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
     if (!this.isSafeModelId(this.value.model_id)) return new Error('Invalid model id.');
 
-    const capsError = this.validateEnclaveCaps(this.value.caps);
-    if (capsError) return capsError;
-    const artifactError = this.validateEnclaveArtifactBinding(this.value);
-    if (artifactError) return artifactError;
-
     const key = `enclave/${this.value.enclave_id}`;
     if ((await this.get(key)) !== null) return new Error('Enclave already registered.');
     const modelClass = this.modelClassFor(this.value);
+    const classError = this.validateModelClass(modelClass, 'Enclave model_class');
+    if (classError) return classError;
+    const capsError = this.validateEnclaveCaps(this.value.caps, modelClass);
+    if (capsError) return capsError;
+    const artifactError = this.validateEnclaveArtifactBinding(this.value);
+    if (artifactError) return artifactError;
 
     const record = {
       enclave_id: this.value.enclave_id,
@@ -1366,14 +1402,15 @@ class MayhemContract extends Contract {
     const updated = cloneValue(record);
     for (const field of ENCLAVE_UPDATE_FIELDS) {
       if (!hasOwn(this.value, field)) continue;
-      if (field === 'caps') {
-        const capsError = this.validateEnclaveCaps(this.value.caps);
-        if (capsError) return capsError;
-      }
       updated[field] = cloneValue(this.value[field]);
       changed = true;
     }
     if (!changed) return new Error('No enclave fields to update.');
+    const modelClass = this.modelClassFor(updated);
+    const classError = this.validateModelClass(modelClass, 'Enclave model_class');
+    if (classError) return classError;
+    const capsError = this.validateEnclaveCaps(updated.caps, modelClass);
+    if (capsError) return capsError;
     const artifactError = this.validateEnclaveArtifactBinding(updated);
     if (artifactError) return artifactError;
 
@@ -3487,10 +3524,12 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  validateEnclaveCaps(caps) {
+  validateEnclaveCaps(caps, modelClass = DEFAULT_MODEL_CLASS) {
     if (!caps || typeof caps !== 'object' || Array.isArray(caps)) {
       return new Error('Enclave caps must be an object.');
     }
+    const classError = this.validateModelClass(modelClass, 'Enclave caps model_class');
+    if (classError) return classError;
     const unknown = Object.keys(caps).filter((key) => !ENCLAVE_CAP_FIELDS.has(key)).sort();
     if (unknown.length > 0) {
       return new Error(`Unsupported enclave caps field: ${unknown.join(', ')}.`);
@@ -3502,13 +3541,55 @@ class MayhemContract extends Contract {
     }
     const hasCtx = hasOwn(caps, 'ctx');
     const hasCtxMax = hasOwn(caps, 'ctx_max');
-    for (const key of ['ctx', 'ctx_max', 'tp_degree', 'max_batch_size', 'max_num_tokens']) {
+    for (const key of ENCLAVE_CAP_INTEGER_FIELDS) {
       if (hasOwn(caps, key) && (!Number.isSafeInteger(caps[key]) || caps[key] <= 0)) {
         return new Error(`Enclave caps ${key} must be a positive integer.`);
       }
     }
     if (hasCtx && hasCtxMax && caps.ctx !== caps.ctx_max) {
       return new Error('Enclave caps ctx and ctx_max must match when both are set.');
+    }
+    const allowedOutputModalities = MODEL_CLASS_OUTPUT_MODALITIES[modelClass] ?? new Set();
+    const validateOutputModality = (modality, label) => {
+      if (typeof modality !== 'string' || modality.length === 0 || modality.length > 32) {
+        return new Error(`Enclave caps ${label} must be a non-empty string.`);
+      }
+      if (!CAP_OUTPUT_MODALITIES.has(modality)) {
+        return new Error(`Unsupported enclave caps ${label}: ${modality}.`);
+      }
+      if (!allowedOutputModalities.has(modality)) {
+        return new Error(`Enclave caps ${label} ${modality} is not allowed for model_class ${modelClass}.`);
+      }
+      return null;
+    };
+    const outputModalities = new Set();
+    if (hasOwn(caps, 'output_modality')) {
+      const error = validateOutputModality(caps.output_modality, 'output_modality');
+      if (error) return error;
+      outputModalities.add(caps.output_modality);
+    }
+    if (hasOwn(caps, 'output_modalities')) {
+      if (!Array.isArray(caps.output_modalities) || caps.output_modalities.length === 0 || caps.output_modalities.length > 8) {
+        return new Error('Enclave caps output_modalities must be a non-empty array with at most 8 entries.');
+      }
+      const seenOutputModalities = new Set();
+      for (const modality of caps.output_modalities) {
+        const error = validateOutputModality(modality, 'output_modalities entry');
+        if (error) return error;
+        if (seenOutputModalities.has(modality)) {
+          return new Error(`Enclave caps output_modalities has duplicate modality ${modality}.`);
+        }
+        seenOutputModalities.add(modality);
+        outputModalities.add(modality);
+      }
+      if (hasOwn(caps, 'output_modality') && !caps.output_modalities.includes(caps.output_modality)) {
+        return new Error('Enclave caps output_modalities must include output_modality.');
+      }
+    }
+    for (const [flag, modality] of [['image', 'image'], ['video', 'video']]) {
+      if (caps[flag] === true && !allowedOutputModalities.has(modality)) {
+        return new Error(`Enclave caps ${flag} output is not allowed for model_class ${modelClass}.`);
+      }
     }
     return null;
   }

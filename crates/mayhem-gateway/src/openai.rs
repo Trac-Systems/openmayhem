@@ -135,6 +135,16 @@ pub struct ModelCaps {
     pub json: bool,
     pub ctx: u32,
     pub vision: bool,
+    #[serde(default)]
+    pub image: bool,
+    #[serde(default)]
+    pub video: bool,
+    #[serde(default)]
+    pub audio: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_modality: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_modalities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -452,6 +462,11 @@ impl GatewayState {
                     json: true,
                     ctx: 8192,
                     vision: false,
+                    image: false,
+                    video: false,
+                    audio: false,
+                    output_modality: Some("text".to_owned()),
+                    output_modalities: vec!["text".to_owned()],
                 },
                 source: "local-fixture".to_owned(),
                 kyb_identities: Vec::new(),
@@ -3038,6 +3053,14 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .and_then(|ctx| u32::try_from(ctx).ok())
                     .unwrap_or(0),
                 vision: caps.get("vision").and_then(Value::as_bool).unwrap_or(false),
+                image: caps.get("image").and_then(Value::as_bool).unwrap_or(false),
+                video: caps.get("video").and_then(Value::as_bool).unwrap_or(false),
+                audio: caps.get("audio").and_then(Value::as_bool).unwrap_or(false),
+                output_modality: caps
+                    .get("output_modality")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                output_modalities: caps_output_modalities(caps),
             },
             source: "catalog".to_owned(),
             kyb_identities: Vec::new(),
@@ -3067,6 +3090,22 @@ fn price_rate_map_from_catalog_value(price: &Value) -> Vec<RateMapEntry> {
         price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
         price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
     )
+}
+
+fn caps_output_modalities(caps: &Value) -> Vec<String> {
+    if let Some(entries) = caps.get("output_modalities").and_then(Value::as_array) {
+        return entries
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|modality| !modality.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    caps.get("output_modality")
+        .and_then(Value::as_str)
+        .filter(|modality| !modality.is_empty())
+        .map(|modality| vec![modality.to_owned()])
+        .unwrap_or_default()
 }
 
 fn attestation_tiers_from_catalog_value(model: &Value) -> BTreeMap<String, u32> {
@@ -3689,6 +3728,11 @@ mod tests {
                     json: true,
                     ctx: 8192,
                     vision: false,
+                    image: false,
+                    video: false,
+                    audio: false,
+                    output_modality: Some("text".to_owned()),
+                    output_modalities: vec!["text".to_owned()],
                 },
                 source: "test".to_owned(),
                 kyb_identities: Vec::new(),

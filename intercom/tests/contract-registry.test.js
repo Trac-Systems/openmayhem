@@ -961,6 +961,65 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   );
   assert.equal(tensorParallelCaps.ok, true, tensorParallelCaps.message);
 
+  const diffusionImageCaps = {
+    image: true,
+    output_modality: 'image',
+    output_modalities: ['image'],
+    max_image_width: 1024,
+    max_image_height: 1024,
+    max_image_steps: 50,
+  };
+  const diffusionImage = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'd'.repeat(64),
+      model_id: 'admin/image-small@fp16',
+      model_class: 'image-generation',
+      backend: 'diffusers',
+      caps: diffusionImageCaps,
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(diffusionImage.ok, true, diffusionImage.message);
+  assert.deepEqual((await storage.get(`enclave/${'d'.repeat(64)}`)).value.caps, diffusionImageCaps);
+
+  const invalidOutputModality = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'e'.repeat(64),
+      caps: {
+        ...catalogStyleCaps,
+        image: true,
+        output_modality: 'image',
+      },
+    },
+    admin.publicKey,
+    7
+  );
+  assert.match(invalidOutputModality.message, /output_modality image is not allowed for model_class text-generation/i);
+
+  const unsupportedBackend = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'f'.repeat(64),
+      backend: 'provider-local-python',
+      caps: catalogStyleCaps,
+    },
+    admin.publicKey,
+    8
+  );
+  assert.match(unsupportedBackend.message, /unsupported enclave backend/i);
+
   const invalidTensorParallelCaps = await execute(
     contract,
     storage,
@@ -974,7 +1033,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
       },
     },
     admin.publicKey,
-    6
+    9
   );
   assert.match(invalidTensorParallelCaps.message, /caps tp_degree must be a positive integer/i);
 
@@ -991,7 +1050,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
       },
     },
     admin.publicKey,
-    7
+    10
   );
   assert.match(unsupportedUpdate.message, /unsupported enclave caps field.*price_ver/i);
 
@@ -1009,7 +1068,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
       caps: updatedCaps,
     },
     admin.publicKey,
-    8
+    11
   );
   assert.equal(validUpdate.ok, true, validUpdate.message);
 
@@ -1017,7 +1076,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   assert.deepEqual(stored.value.caps, updatedCaps);
   assert.equal(stored.value.updated_by, admin.publicKey);
   assert.equal(stored.value.updated_by_role, 'admin');
-  assert.equal(stored.value.updated_at, makeTxKey(8));
+  assert.equal(stored.value.updated_at, makeTxKey(11));
 });
 
 test('MayhemContract accepts canonical integer attestation tiers 1 through 4 only', async () => {
