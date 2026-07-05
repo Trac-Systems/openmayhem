@@ -224,6 +224,7 @@ export function buildTapClaimCalldata({
     from: claimAccount,
     chain_id: addresses.chain_id,
     pool: addresses.pool,
+    token: addresses.token,
     account: claimAccount,
     cumulative_wei: cumulative.toString(),
     proof: proofItems,
@@ -257,6 +258,7 @@ function replayCommand(args, kind, report) {
   } else {
     out.push('--account', report.account, '--cumulative-wei', report.cumulative_wei);
     out.push('--proof', JSON.stringify(report.proof), '--pool', report.pool);
+    out.push('--token', report.token);
   }
   if (report.chain_id !== null && report.chain_id !== undefined) out.push('--chain-id', String(report.chain_id));
   if (boolArg(args.json, false)) out.push('--json');

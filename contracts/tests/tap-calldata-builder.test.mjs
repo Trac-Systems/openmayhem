@@ -109,6 +109,7 @@ test('claim calldata executes KnowledgePool.claim from provider wallet', async (
   assert.equal(claimIntent.server_signs, false);
   assert.equal(claimIntent.from, providerAccount.toLowerCase());
   assert.equal(claimIntent.transaction.to, poolAddr.toLowerCase());
+  assert.equal(claimIntent.token, (await token.getAddress()).toLowerCase());
   await (await providerA.sendTransaction(claimIntent.transaction)).wait();
 
   const expectedClaim = providerShareWei(muToTapWei(2_000_000, TAP_USD_E6));

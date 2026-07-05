@@ -96,6 +96,13 @@ enum Commands {
         #[command(subcommand)]
         command: WalletCommands,
     },
+    /// Add Mayhem credit through TNK, Stripe, or TAP and inspect confirmation state.
+    Deposit {
+        #[command(subcommand)]
+        command: DepositCommands,
+    },
+    /// Cash out claimable TAP distribution entries without giving Mayhem custody.
+    Withdraw(WithdrawArgs),
     /// Probe local hardware and print enclave backend feasibility.
     Doctor(DoctorArgs),
     /// Inspect and verify the admin-signed model catalog.
@@ -235,6 +242,18 @@ enum PayCommands {
     Stripe(PayRailArgs),
     /// Retired: Coinbase Commerce is not an active Mayhem rail.
     Coinbase(PayRailArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DepositCommands {
+    /// Prepare a memo-bound TNK treasury deposit.
+    Tnk(PayTnkArgs),
+    /// Buy credits via Stripe hosted checkout.
+    Stripe(PayRailArgs),
+    /// Build unsigned TAP approve+deposit calldata for an external wallet.
+    Tap(DepositTapArgs),
+    /// Show pending/confirmed deposit state from the contract ledger.
+    Status(DepositStatusArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -921,6 +940,147 @@ struct PayTnkArgs {
     poll_interval_ms: u64,
 
     /// Print a machine-readable TNK payment report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct DepositTapArgs {
+    /// External Ethereum wallet address that will send approve+deposit.
+    #[arg(long)]
+    from: String,
+
+    /// TAP amount to deposit, for example 10 or 10.25.
+    #[arg(long)]
+    amount_tap: Option<String>,
+
+    /// TAP amount as a raw 18-decimal integer wei string.
+    #[arg(long)]
+    amount_wei: Option<String>,
+
+    /// TAP token contract address. Defaults to env/local addresses file.
+    #[arg(long)]
+    token: Option<String>,
+
+    /// TAP KnowledgePool contract address. Defaults to env/local addresses file.
+    #[arg(long)]
+    pool: Option<String>,
+
+    /// TAP chain id.
+    #[arg(long)]
+    chain_id: Option<u64>,
+
+    /// JSON file containing local TAP token/pool addresses.
+    #[arg(long, value_name = "PATH")]
+    addresses: Option<PathBuf>,
+
+    /// Print machine-readable calldata.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct DepositStatusArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Account to inspect. Defaults to the local Mayhem wallet public key.
+    #[arg(long)]
+    who: Option<String>,
+
+    /// TNK deposit memo hash to check for a pending intent.
+    #[arg(long)]
+    memo_hash: Option<String>,
+
+    /// TAP escrow transaction hash to check for admin-oracle confirmation.
+    #[arg(long)]
+    eth_tx_hash: Option<String>,
+
+    /// TAP escrow Deposit log index. Defaults to 0 when --eth-tx-hash is set.
+    #[arg(long)]
+    log_index: Option<u64>,
+
+    /// Balance threshold in mu_usd that counts as confirmed.
+    #[arg(long)]
+    target_mu: Option<u64>,
+
+    /// Wait until --target-mu is reached.
+    #[arg(long)]
+    wait: bool,
+
+    /// Maximum seconds to wait for --target-mu.
+    #[arg(long, default_value_t = 900)]
+    timeout_seconds: u64,
+
+    /// Poll interval in milliseconds while waiting.
+    #[arg(long, default_value_t = 2_000)]
+    poll_interval_ms: u64,
+
+    /// Print a machine-readable status report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct WithdrawArgs {
+    /// External TAP wallet address receiving the claim.
+    #[arg(long)]
+    account: String,
+
+    /// Posted settlement report containing the account distribution and proof.
+    #[arg(long, value_name = "PATH")]
+    settlement: Option<PathBuf>,
+
+    /// Precomputed claim-proof JSON file.
+    #[arg(long, value_name = "PATH")]
+    claim_proof: Option<PathBuf>,
+
+    /// Cumulative claimable TAP wei, when not using --settlement/--claim-proof.
+    #[arg(long)]
+    cumulative_wei: Option<String>,
+
+    /// Merkle proof JSON array/string, when not using --settlement/--claim-proof.
+    #[arg(long)]
+    proof: Option<String>,
+
+    /// Ethereum RPC URL used only for optional live claimability checks.
+    #[arg(long)]
+    eth_rpc: Option<String>,
+
+    /// TAP KnowledgePool contract address. Defaults to env/local addresses file.
+    #[arg(long)]
+    pool: Option<String>,
+
+    /// TAP token contract address. Defaults to env/local addresses file.
+    #[arg(long)]
+    token: Option<String>,
+
+    /// TAP chain id.
+    #[arg(long)]
+    chain_id: Option<u64>,
+
+    /// JSON file containing local TAP token/pool addresses.
+    #[arg(long, value_name = "PATH")]
+    addresses: Option<PathBuf>,
+
+    /// Build calldata even if the proof helper reports no live claimable amount.
+    #[arg(long)]
+    allow_not_claimable: bool,
+
+    /// Print machine-readable withdrawal calldata.
     #[arg(long)]
     json: bool,
 }
@@ -2873,6 +3033,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Setup(args) => setup(args).await,
         Commands::Wallet { command } => wallet_command(command).await,
+        Commands::Deposit { command } => deposit_command(command).await,
+        Commands::Withdraw(args) => withdraw(args).await,
         Commands::Doctor(args) => doctor(args),
         Commands::Catalog { command } => match command {
             CatalogCommands::List(args) => catalog_list(args),
@@ -10022,6 +10184,439 @@ struct PayTnkRate {
     tnk_usd_e6: u64,
     source: String,
     ts: Option<u64>,
+}
+
+async fn deposit_command(command: DepositCommands) -> Result<()> {
+    match command {
+        DepositCommands::Tnk(args) => pay_tnk(args).await,
+        DepositCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
+        DepositCommands::Tap(args) => deposit_tap(args).await,
+        DepositCommands::Status(args) => deposit_status(args).await,
+    }
+}
+
+async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
+    match (&args.amount_tap, &args.amount_wei) {
+        (Some(_), Some(_)) => bail!("pass only one of --amount-tap or --amount-wei"),
+        (None, None) => bail!("pass --amount-tap or --amount-wei"),
+        _ => {}
+    }
+
+    let mut script_args = vec![
+        "deposit".to_owned(),
+        "--from".to_owned(),
+        args.from.clone(),
+        "--json".to_owned(),
+    ];
+    if let Some(amount_tap) = &args.amount_tap {
+        script_args.extend(["--amount-tap".to_owned(), amount_tap.clone()]);
+    }
+    if let Some(amount_wei) = &args.amount_wei {
+        script_args.extend(["--amount-wei".to_owned(), amount_wei.clone()]);
+    }
+    push_tap_contract_args(
+        &mut script_args,
+        args.token.as_deref(),
+        args.pool.as_deref(),
+        args.chain_id,
+        args.addresses.as_deref(),
+    );
+
+    let report =
+        run_contracts_script_json("contracts/scripts/tap-calldata-builder.mjs", script_args)
+            .await?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_tap_deposit_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
+    if args.poll_interval_ms == 0 {
+        bail!("--poll-interval-ms must be positive");
+    }
+    if args.wait && args.target_mu.is_none() {
+        bail!("--wait requires --target-mu");
+    }
+
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let who = if let Some(who) = args.who.clone() {
+        who
+    } else {
+        resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            args.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await?
+        .public_key
+    };
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let before_balance = read_balance_record(&rpc, &who).await?;
+    let before_mu = before_balance
+        .get("mu")
+        .and_then(Value::as_u64)
+        .context("normalized balance record missing mu")?;
+
+    let credit_wait = if args.wait {
+        Some(
+            wait_for_credit(
+                &rpc,
+                &who,
+                before_mu,
+                args.target_mu.expect("--wait checked target_mu"),
+                Duration::from_secs(args.timeout_seconds),
+                Duration::from_millis(args.poll_interval_ms),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let balance = read_balance_record(&rpc, &who).await?;
+    let current_mu = balance
+        .get("mu")
+        .and_then(Value::as_u64)
+        .context("normalized balance record missing mu")?;
+    let pending_tnk = match args.memo_hash.as_deref() {
+        Some(memo_hash) => read_state_value(&rpc, &format!("dep/pending/{memo_hash}")).await?,
+        None => None,
+    };
+    let tap_seen = match args.eth_tx_hash.as_deref() {
+        Some(hash) => {
+            let key = tap_deposit_seen_key(hash, args.log_index.unwrap_or(0));
+            read_state_value(&rpc, &key).await?
+        }
+        None => None,
+    };
+    let status = classify_deposit_status(
+        current_mu,
+        args.target_mu,
+        pending_tnk.as_ref(),
+        tap_seen.as_ref(),
+    );
+    let report = json!({
+        "ok": status != "unknown",
+        "status": status,
+        "rpc_url": rpc_url,
+        "who": who,
+        "target_mu": args.target_mu,
+        "balance": balance,
+        "credit": credit_wait.as_ref().map(|status| json!({
+            "credited": status.credited,
+            "before_mu": status.before_mu,
+            "current_mu": status.current_mu,
+            "target_mu": status.target_mu,
+            "waited_ms": status.waited_ms,
+        })),
+        "tnk": {
+            "memo_hash": args.memo_hash,
+            "pending": pending_tnk,
+        },
+        "tap": {
+            "eth_tx_hash": args.eth_tx_hash.as_ref().map(|value| value.to_ascii_lowercase()),
+            "log_index": args.eth_tx_hash.as_ref().map(|_| args.log_index.unwrap_or(0)),
+            "confirmed_event": tap_seen,
+        },
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_deposit_status_report(&report)?;
+    }
+
+    if let Some(wait) = credit_wait.as_ref().filter(|status| !status.credited) {
+        bail!(
+            "timed out waiting for target balance {} mu_usd; current balance {} mu_usd",
+            wait.target_mu,
+            wait.current_mu
+        );
+    }
+    Ok(())
+}
+
+async fn withdraw(args: WithdrawArgs) -> Result<()> {
+    let proof_report = resolve_withdraw_proof(&args).await?;
+    if proof_report.get("claimable").and_then(Value::as_bool) == Some(false)
+        && !args.allow_not_claimable
+    {
+        let reason = proof_report
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("claim is not currently claimable");
+        bail!("{reason}; pass --allow-not-claimable to build calldata anyway");
+    }
+    let cumulative = proof_report
+        .get("cumulative_wei")
+        .or_else(|| proof_report.get("cumulative"))
+        .and_then(Value::as_str)
+        .or(args.cumulative_wei.as_deref())
+        .context("withdrawal proof is missing cumulative wei")?
+        .to_owned();
+    let proof = proof_report
+        .get("proof")
+        .cloned()
+        .or_else(|| {
+            args.proof
+                .as_ref()
+                .map(|proof| Value::String(proof.clone()))
+        })
+        .context("withdrawal proof is missing proof")?;
+
+    let mut script_args = vec![
+        "claim".to_owned(),
+        "--account".to_owned(),
+        args.account.clone(),
+        "--cumulative-wei".to_owned(),
+        cumulative,
+        "--proof".to_owned(),
+        proof_to_script_arg(&proof)?,
+        "--json".to_owned(),
+    ];
+    push_tap_contract_args(
+        &mut script_args,
+        args.token.as_deref(),
+        args.pool.as_deref(),
+        args.chain_id,
+        args.addresses.as_deref(),
+    );
+    let calldata =
+        run_contracts_script_json("contracts/scripts/tap-calldata-builder.mjs", script_args)
+            .await?;
+    let report = json!({
+        "ok": true,
+        "rail": "tap",
+        "custody": "external_wallet",
+        "server_signs": false,
+        "account": args.account,
+        "proof": proof_report,
+        "calldata": calldata,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_withdraw_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn resolve_withdraw_proof(args: &WithdrawArgs) -> Result<Value> {
+    match (&args.settlement, &args.claim_proof) {
+        (Some(_), Some(_)) => bail!("pass only one of --settlement or --claim-proof"),
+        (None, Some(path)) => read_json_file(path)
+            .with_context(|| format!("reading claim proof from {}", path.display())),
+        (Some(path), None) => {
+            let mut script_args = vec![
+                "--settlement".to_owned(),
+                path.display().to_string(),
+                "--account".to_owned(),
+                args.account.clone(),
+                "--json".to_owned(),
+            ];
+            if let Some(eth_rpc) = &args.eth_rpc {
+                script_args.extend(["--eth-rpc".to_owned(), eth_rpc.clone()]);
+            }
+            if let Some(pool) = &args.pool {
+                script_args.extend(["--pool".to_owned(), pool.clone()]);
+            }
+            run_contracts_script_json("contracts/scripts/tap-claim-proof.mjs", script_args).await
+        }
+        (None, None) => {
+            let cumulative = args
+                .cumulative_wei
+                .as_deref()
+                .context("withdraw requires --settlement, --claim-proof, or --cumulative-wei")?;
+            let proof = args
+                .proof
+                .as_deref()
+                .context("withdraw requires --proof when using --cumulative-wei")?;
+            Ok(json!({
+                "claimable": true,
+                "account": args.account,
+                "cumulative_wei": cumulative,
+                "proof": serde_json::from_str::<Value>(proof).unwrap_or_else(|_| Value::String(proof.to_owned())),
+            }))
+        }
+    }
+}
+
+fn push_tap_contract_args(
+    out: &mut Vec<String>,
+    token: Option<&str>,
+    pool: Option<&str>,
+    chain_id: Option<u64>,
+    addresses: Option<&Path>,
+) {
+    if let Some(token) = token {
+        out.extend(["--token".to_owned(), token.to_owned()]);
+    }
+    if let Some(pool) = pool {
+        out.extend(["--pool".to_owned(), pool.to_owned()]);
+    }
+    if let Some(chain_id) = chain_id {
+        out.extend(["--chain-id".to_owned(), chain_id.to_string()]);
+    }
+    if let Some(addresses) = addresses {
+        out.extend(["--addresses".to_owned(), addresses.display().to_string()]);
+    }
+}
+
+async fn run_contracts_script_json(relative_script: &str, args: Vec<String>) -> Result<Value> {
+    let script = repo_path(relative_script)?;
+    let node = env::var_os("MAYHEM_NODE_BIN").unwrap_or_else(|| "node".into());
+    let output = Command::new(&node)
+        .arg(&script)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "running {} with {}",
+                script.display(),
+                PathBuf::from(&node).display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "{} failed: {}{}{}",
+            script.display(),
+            stderr.trim(),
+            if stderr.trim().is_empty() || stdout.trim().is_empty() {
+                ""
+            } else {
+                "; stdout: "
+            },
+            stdout.trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parsing {} JSON output", script.display()))
+}
+
+fn proof_to_script_arg(proof: &Value) -> Result<String> {
+    match proof {
+        Value::Array(_) => Ok(serde_json::to_string(proof)?),
+        Value::String(value) => Ok(value.clone()),
+        _ => bail!("withdrawal proof must be a JSON array or string"),
+    }
+}
+
+fn tap_deposit_seen_key(eth_tx_hash: &str, log_index: u64) -> String {
+    format!("dep/tap/{}/{log_index}", eth_tx_hash.to_ascii_lowercase())
+}
+
+fn classify_deposit_status(
+    balance_mu: u64,
+    target_mu: Option<u64>,
+    pending_tnk: Option<&Value>,
+    tap_seen: Option<&Value>,
+) -> &'static str {
+    if target_mu.is_some_and(|target| balance_mu >= target) || tap_seen.is_some() {
+        "confirmed"
+    } else if pending_tnk.is_some() || target_mu.is_some() {
+        "pending"
+    } else {
+        "unknown"
+    }
+}
+
+fn print_tap_deposit_report(report: &Value) -> Result<()> {
+    println!("TAP deposit calldata ready.");
+    println!("From: {}", report["from"].as_str().unwrap_or(""));
+    println!("TAP token: {}", report["token"].as_str().unwrap_or(""));
+    println!("Deposit address: {}", report["pool"].as_str().unwrap_or(""));
+    println!(
+        "Amount wei: {}",
+        report["amount_wei"].as_str().unwrap_or("")
+    );
+    println!("Copy/paste approve tx JSON:");
+    println!(
+        "{}",
+        report["copy_paste"]["approve_tx_json"]
+            .as_str()
+            .unwrap_or("")
+    );
+    println!("Copy/paste deposit tx JSON:");
+    println!(
+        "{}",
+        report["copy_paste"]["deposit_tx_json"]
+            .as_str()
+            .unwrap_or("")
+    );
+    if let Some(command) = report["copy_paste_replay_command"].as_str() {
+        println!("Copy/paste replay command:");
+        println!("{command}");
+    }
+    println!(
+        "After the deposit transaction finalizes, check credit with: mayhem deposit status --who {} --eth-tx-hash <tx-hash> --log-index <log-index>",
+        report["from"].as_str().unwrap_or("<address>")
+    );
+    Ok(())
+}
+
+fn print_deposit_status_report(report: &Value) -> Result<()> {
+    println!(
+        "Deposit status: {}",
+        report["status"].as_str().unwrap_or("")
+    );
+    println!("Account: {}", report["who"].as_str().unwrap_or(""));
+    println!(
+        "Balance: {} mu_usd ({})",
+        report["balance"]["mu"].as_u64().unwrap_or(0),
+        mu_to_usd_amount(report["balance"]["mu"].as_u64().unwrap_or(0))
+    );
+    if let Some(target) = report["target_mu"].as_u64() {
+        println!("Target: {target} mu_usd");
+    }
+    if !report["tnk"]["pending"].is_null() {
+        println!("TNK intent: pending");
+    }
+    if !report["tap"]["confirmed_event"].is_null() {
+        println!("TAP event: confirmed by admin oracle");
+    }
+    Ok(())
+}
+
+fn print_withdraw_report(report: &Value) -> Result<()> {
+    println!("TAP withdrawal calldata ready.");
+    println!("Account: {}", report["account"].as_str().unwrap_or(""));
+    println!(
+        "Claimable wei: {}",
+        report["proof"]["claimable_wei"]
+            .as_str()
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Cumulative wei: {}",
+        report["calldata"]["cumulative_wei"].as_str().unwrap_or("")
+    );
+    println!(
+        "Pool: {}",
+        report["calldata"]["pool"].as_str().unwrap_or("")
+    );
+    println!("Copy/paste claim tx JSON:");
+    println!(
+        "{}",
+        report["calldata"]["copy_paste"]["claim_tx_json"]
+            .as_str()
+            .unwrap_or("")
+    );
+    if let Some(command) = report["calldata"]["copy_paste_replay_command"].as_str() {
+        println!("Copy/paste replay command:");
+        println!("{command}");
+    }
+    Ok(())
 }
 
 async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
@@ -19699,6 +20294,119 @@ mod tests {
         );
         assert!(args.yes);
         assert!(args.json);
+    }
+
+    #[test]
+    fn deposit_cli_parses_tap_status_and_withdraw() {
+        let deposit = Cli::try_parse_from([
+            "mayhem",
+            "deposit",
+            "tap",
+            "--from",
+            "0x1111111111111111111111111111111111111111",
+            "--amount-tap",
+            "1.25",
+            "--token",
+            "0x2222222222222222222222222222222222222222",
+            "--pool",
+            "0x3333333333333333333333333333333333333333",
+            "--chain-id",
+            "61000",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Deposit { command } = deposit.command else {
+            panic!("expected deposit command");
+        };
+        let DepositCommands::Tap(args) = command else {
+            panic!("expected deposit tap command");
+        };
+        assert_eq!(args.amount_tap.as_deref(), Some("1.25"));
+        assert_eq!(args.chain_id, Some(61_000));
+        assert!(args.json);
+
+        let status = Cli::try_parse_from([
+            "mayhem",
+            "deposit",
+            "status",
+            "--who",
+            "user-a",
+            "--memo-hash",
+            "aa",
+            "--target-mu",
+            "1000",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Deposit { command } = status.command else {
+            panic!("expected deposit command");
+        };
+        let DepositCommands::Status(args) = command else {
+            panic!("expected deposit status command");
+        };
+        assert_eq!(args.who.as_deref(), Some("user-a"));
+        assert_eq!(args.memo_hash.as_deref(), Some("aa"));
+        assert_eq!(args.target_mu, Some(1000));
+
+        let withdraw = Cli::try_parse_from([
+            "mayhem",
+            "withdraw",
+            "--account",
+            "0x1111111111111111111111111111111111111111",
+            "--cumulative-wei",
+            "100",
+            "--proof",
+            "[]",
+            "--pool",
+            "0x3333333333333333333333333333333333333333",
+            "--token",
+            "0x2222222222222222222222222222222222222222",
+            "--chain-id",
+            "61000",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Withdraw(args) = withdraw.command else {
+            panic!("expected withdraw command");
+        };
+        assert_eq!(args.cumulative_wei.as_deref(), Some("100"));
+        assert_eq!(args.proof.as_deref(), Some("[]"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn deposit_status_classifies_pending_and_confirmed() {
+        assert_eq!(classify_deposit_status(0, None, None, None), "unknown");
+        assert_eq!(
+            classify_deposit_status(0, None, Some(&json!({"status":"pending"})), None),
+            "pending"
+        );
+        assert_eq!(
+            classify_deposit_status(999, Some(1000), None, None),
+            "pending"
+        );
+        assert_eq!(
+            classify_deposit_status(1000, Some(1000), None, None),
+            "confirmed"
+        );
+        assert_eq!(
+            classify_deposit_status(0, None, None, Some(&json!({"rail":"tap"}))),
+            "confirmed"
+        );
+        assert_eq!(tap_deposit_seen_key("0xABCDEF", 7), "dep/tap/0xabcdef/7");
+    }
+
+    #[test]
+    fn withdraw_proof_argument_accepts_array_or_string() {
+        assert_eq!(
+            proof_to_script_arg(&json!(["0xabc", "0xdef"])).unwrap(),
+            r#"["0xabc","0xdef"]"#
+        );
+        assert_eq!(
+            proof_to_script_arg(&Value::String("0xabc 0xdef".to_owned())).unwrap(),
+            "0xabc 0xdef"
+        );
+        assert!(proof_to_script_arg(&json!({"bad": true})).is_err());
     }
 
     #[tokio::test]
