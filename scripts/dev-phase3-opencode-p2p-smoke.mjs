@@ -30,6 +30,10 @@ const SSH_OPTS = [
   '-o', 'PasswordAuthentication=yes',
   '-o', 'KbdInteractiveAuthentication=yes',
   '-o', 'NumberOfPasswordPrompts=1',
+  '-o', 'ConnectTimeout=8',
+  '-o', 'ExitOnForwardFailure=yes',
+  '-o', 'ServerAliveInterval=15',
+  '-o', 'ServerAliveCountMax=3',
   '-o', 'StrictHostKeyChecking=no',
   '-o', `UserKnownHostsFile=${path.join(ROOT, '.mayhem-local/macmini-known-hosts')}`,
 ];
@@ -992,6 +996,28 @@ async function remoteFreePort(remote, passFile) {
   return port;
 }
 
+async function waitReverseTunnel(remote, passFile, url, tunnel, tunnelLog, label, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr = '';
+  const script = [
+    'import sys, urllib.request',
+    `urllib.request.urlopen(${JSON.stringify(url)}, timeout=2).read()`,
+  ].join('\n');
+  while (Date.now() < deadline) {
+    if (tunnel.exitCode !== null) {
+      fail(`${label} reverse tunnel exited early; see ${tunnelLog}`);
+    }
+    try {
+      await ssh(remote, passFile, `/usr/bin/python3 -c ${sh(script)}`, { timeoutMs: 10_000 });
+      return;
+    } catch (err) {
+      lastErr = err?.message || String(err);
+      await sleep(500);
+    }
+  }
+  fail(`${label} reverse tunnel did not answer ${url}: ${lastErr}; see ${tunnelLog}`);
+}
+
 async function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
     usage();
@@ -1447,6 +1473,16 @@ async function main() {
   cleanupState.localChildren.push(tunnel);
   await sleep(1500);
   if (tunnel.exitCode !== null) fail(`reverse tunnel exited early; see ${tunnelLog}`);
+  const remoteContractHealthUrl =
+    `http://127.0.0.1:${remoteAdminRpcTunnelPort}/v1/state?prefix=price%2F&confirmed=false&limit=1`;
+  await waitReverseTunnel(
+    remote,
+    passFile,
+    remoteContractHealthUrl,
+    tunnel,
+    tunnelLog,
+    'remote provider contract RPC'
+  );
 
   log('starting remote provider session server');
   const remoteProviderHome = path.posix.join(remoteRun, 'provider-home');
@@ -1554,6 +1590,14 @@ async function main() {
   await waitHttp(`${gatewayUrl}/mayhem/status`, 120_000, 'local gateway', async () => gateway.exitCode === null);
 
   log('running streaming curl-compatible chat through the gateway');
+  await waitReverseTunnel(
+    remote,
+    passFile,
+    remoteContractHealthUrl,
+    tunnel,
+    tunnelLog,
+    'remote provider contract RPC before chat'
+  );
   const chatStream = await runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, {
     timeoutMs: chatTimeoutSeconds * 1_000,
     maxTokens: chatMaxTokens,

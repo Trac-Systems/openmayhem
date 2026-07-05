@@ -26708,6 +26708,129 @@ mod tests {
     }
 
     #[test]
+    fn gateway_models_keep_multiple_models_and_provider_routes_in_one_snapshot() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+
+        let second_provider = "66".repeat(32);
+        let third_provider = "77".repeat(32);
+        let second_enclave_id = "88".repeat(32);
+        let second_room_id = "dd".repeat(16);
+        let second_model_id = "test/agent-helper@4bit".to_owned();
+
+        contract.providers.push(LedgerProvider {
+            provider: second_provider.clone(),
+            status: "active".to_owned(),
+            accepted_rails: vec!["fiat".to_owned(), "tnk".to_owned()],
+        });
+        contract.providers.push(LedgerProvider {
+            provider: third_provider.clone(),
+            status: "active".to_owned(),
+            accepted_rails: vec!["tap".to_owned()],
+        });
+
+        contract.roomserve.push(LedgerRoomServe {
+            room_id: "aa".repeat(16),
+            provider: second_provider.clone(),
+            enclave_id: "11".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            status: "active".to_owned(),
+        });
+        contract.serves.push(LedgerServe {
+            provider: second_provider.clone(),
+            enclave_id: "11".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            status: "active".to_owned(),
+            rooms: vec!["aa".repeat(16)],
+        });
+
+        let mut second_enclave = contract.enclaves[0].clone();
+        second_enclave.enclave_id = second_enclave_id.clone();
+        second_enclave.model_id = second_model_id.clone();
+        second_enclave.artifact_root = "12".repeat(32);
+        second_enclave.manifest_hash = "13".repeat(32);
+        second_enclave.binary_hash = "14".repeat(32);
+        contract.enclaves.push(second_enclave);
+        contract.rooms.push(LedgerRoom {
+            room_id: second_room_id.clone(),
+            sidechannel: format!("mx/room/{second_room_id}"),
+            enclave_id: Some(second_enclave_id.clone()),
+            model_id: second_model_id.clone(),
+            label: "agent helper".to_owned(),
+            status: "open".to_owned(),
+            creator_role: Some("admin".to_owned()),
+        });
+        contract.roomserve.push(LedgerRoomServe {
+            room_id: second_room_id.clone(),
+            provider: third_provider.clone(),
+            enclave_id: second_enclave_id.clone(),
+            model_id: second_model_id.clone(),
+            status: "active".to_owned(),
+        });
+        contract.serves.push(LedgerServe {
+            provider: third_provider.clone(),
+            enclave_id: second_enclave_id.clone(),
+            model_id: second_model_id.clone(),
+            status: "active".to_owned(),
+            rooms: vec![second_room_id],
+        });
+        contract.prices.push(LedgerPriceSchedule {
+            enclave_id: second_enclave_id.clone(),
+            model_id: second_model_id.clone(),
+            denom: "mu_usd".to_owned(),
+            current: Some(LedgerPriceRecord {
+                ver: 2,
+                denom: "mu_usd".to_owned(),
+                rate_map: text_generation_rate_map(3, 5),
+                per_req_mu: 0,
+                min_session_mu: 0,
+                effective_at: 0,
+                set_by_role: Some("admin".to_owned()),
+            }),
+            pending: None,
+        });
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models.len(), 2);
+        let by_id = models
+            .iter()
+            .map(|model| (model.id.as_str(), model))
+            .collect::<BTreeMap<_, _>>();
+
+        let primary = by_id["test/model@4bit"];
+        assert_eq!(primary.mayhem.providers_online, 2);
+        assert_eq!(primary.mayhem.route_candidates.len(), 2);
+        let primary_providers = primary
+            .mayhem
+            .route_candidates
+            .iter()
+            .map(|candidate| candidate.provider.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            primary_providers,
+            BTreeSet::from(["55".repeat(32), second_provider.clone()])
+        );
+
+        let helper = by_id[second_model_id.as_str()];
+        assert_eq!(helper.mayhem.providers_online, 1);
+        assert_eq!(helper.mayhem.route_candidates.len(), 1);
+        assert_eq!(helper.mayhem.route_candidates[0].provider, third_provider);
+        assert_eq!(
+            helper.mayhem.route_candidates[0].enclave_id,
+            second_enclave_id
+        );
+        assert_eq!(helper.mayhem.price_ref_mu.ver, 2);
+        assert_eq!(
+            helper.mayhem.price_ref_mu.rate_map,
+            text_generation_rate_map(3, 5)
+        );
+        assert_eq!(
+            helper.mayhem.route_candidates[0].accepted_rails,
+            vec!["tap".to_owned()]
+        );
+    }
+
+    #[test]
     fn gateway_models_promote_kyb_providers_to_tier4_and_revoke_back_to_hardware_tier() {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
