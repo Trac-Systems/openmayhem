@@ -158,6 +158,7 @@ pub struct CheckpointPolicy {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpendVoucherBody {
     pub session_id: String,
+    pub rail: String,
     pub enclave_id: String,
     pub price_ver: u64,
     pub max_spend_mu: u64,
@@ -293,6 +294,7 @@ pub struct ReceiptBody {
     pub seq: u64,
     #[serde(rename = "final")]
     pub final_receipt: bool,
+    pub rail: String,
     pub user: String,
     pub provider: String,
     pub enclave_id: String,
@@ -661,6 +663,7 @@ mod tests {
     fn voucher_and_receipt_signing_payloads_are_bound_to_terms() {
         let voucher = SpendVoucherBody {
             session_id: "sess".to_owned(),
+            rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
             max_spend_mu: 5000,
@@ -681,6 +684,7 @@ mod tests {
             session_id: "sess".to_owned(),
             seq: 1,
             final_receipt: false,
+            rail: "fiat".to_owned(),
             user: "user".to_owned(),
             provider: "provider".to_owned(),
             enclave_id: "enclave".to_owned(),
@@ -723,6 +727,7 @@ mod tests {
             session_id: "sess".to_owned(),
             seq: 1,
             final_receipt: false,
+            rail: "fiat".to_owned(),
             user: "user".to_owned(),
             provider: "provider".to_owned(),
             enclave_id: "enclave".to_owned(),
@@ -767,6 +772,7 @@ mod tests {
     fn signing_payloads_are_versioned_and_keep_legacy_payloads_supported() {
         let voucher = SpendVoucherBody {
             session_id: "sess".to_owned(),
+            rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
             max_spend_mu: 5000,
@@ -794,6 +800,7 @@ mod tests {
             session_id: "sess".to_owned(),
             seq: 1,
             final_receipt: false,
+            rail: "fiat".to_owned(),
             user: "user".to_owned(),
             provider: "provider".to_owned(),
             enclave_id: "enclave".to_owned(),

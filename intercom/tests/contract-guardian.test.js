@@ -12,8 +12,9 @@ import {
 
 const rulesHash = '8'.repeat(64);
 
-const seededBalance = (user, mu) => ({
+const seededBalance = (user, mu, rail = 'fiat') => ({
   user,
+  rail,
   denom: 'mu_usd',
   mu,
   updated_epoch: 0,
@@ -57,7 +58,7 @@ async function setupGuardianContract() {
     assert.equal(result.ok, true, result.message);
   }
 
-  await storage.put(`bal/${user.publicKey}`, seededBalance(user.publicKey, 10_000));
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));
   return { admin, provider, user, storage, contract };
 }
 
@@ -65,13 +66,14 @@ const epochApply = (epoch, user, provider, grossMu = 1_000) => ({
   op: 'epoch_apply',
   epoch,
   at: epoch * 3_600,
-  debits: [{ user, mu: grossMu }],
-  earnings: [{ provider, gross_mu: grossMu }],
+  debits: [{ rail: 'fiat', user, mu: grossMu }],
+  earnings: [{ rail: 'fiat', provider, gross_mu: grossMu }],
 });
 
 test('MayhemContract guardian halts epochApply on conservation failure', async () => {
   const { admin, provider, user, storage, contract } = await setupGuardianContract();
-  await storage.put('fee/cum', {
+  await storage.put('fee/fiat/cum', {
+    rail: 'fiat',
     denom: 'mu_usd',
     cum_mu: 5_000,
     swept_cum_mu: 0,
@@ -116,7 +118,7 @@ test('MayhemContract guardian halts epochApply on non-monotonic epochs', async (
 
 test('MayhemContract guardian halts epochApply on negative balances', async () => {
   const { admin, provider, user, storage, contract } = await setupGuardianContract();
-  await storage.put(`bal/${user.publicKey}`, seededBalance(user.publicKey, -1));
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, -1));
   const before = storage.snapshotBytes();
 
   const result = await executeEpochApplyFeature(

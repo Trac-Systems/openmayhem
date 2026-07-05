@@ -186,6 +186,8 @@ pub struct ProviderKybInfo {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct GatewayRouteCandidate {
     pub provider: String,
+    #[serde(default)]
+    pub accepted_rails: Vec<String>,
     pub enclave_id: String,
     pub room_id: String,
     pub price_ver: u64,
@@ -342,6 +344,7 @@ impl GatewayFailoverInvocation {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StoredReceipt {
+    pub rail: String,
     pub voucher: SpendVoucher,
     pub receipt: SessionReceipt,
     pub receipt_ack: ReceiptAck,
@@ -421,6 +424,7 @@ struct GatewayCanaryScheduler {
 struct ReceiptConfig {
     cosign_enabled: bool,
     balance_mu: u64,
+    rail: String,
     rules_ver: u64,
     checkpoint_every: CheckpointPolicy,
     user_seed: [u8; 32],
@@ -623,6 +627,7 @@ pub struct ProviderSignedReceipt {
 pub struct GatewaySessionInvocation {
     pub contract_version: u32,
     pub session_id: String,
+    pub rail: String,
     pub user_pubkey: String,
     pub provider_pubkey: Option<String>,
     pub enclave_id: String,
@@ -831,6 +836,11 @@ impl GatewayState {
         self
     }
 
+    pub fn with_receipt_rail(mut self, rail: impl Into<String>) -> Self {
+        self.receipt_config.rail = rail.into();
+        self
+    }
+
     pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
         self.session_backend = backend;
         self
@@ -962,6 +972,7 @@ impl Default for ReceiptConfig {
         Self {
             cosign_enabled: true,
             balance_mu: 1_000_000,
+            rail: "fiat".to_owned(),
             rules_ver: 1,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
@@ -2927,16 +2938,17 @@ impl ScBridgeGatewaySessionBackend {
             "t": "s.open",
             "v": 1,
             "contract_version": invocation.contract_version,
-            "session_id": invocation.session_id,
-            "user": invocation.user_pubkey,
-            "enclave_id": invocation.enclave_id,
+            "session_id": invocation.session_id.clone(),
+            "rail": invocation.rail.clone(),
+            "user": invocation.user_pubkey.clone(),
+            "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
             "rules_ver": invocation.rules_ver,
-            "voucher": invocation.spend_voucher,
+            "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
-            "sig": invocation.spend_voucher.user_sig,
+            "sig": invocation.spend_voucher.user_sig.clone(),
         });
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
@@ -4022,6 +4034,10 @@ fn validate_provider_receipt(
             "provider receipt finality mismatch",
         ),
         (
+            body.rail == invocation.rail,
+            "provider receipt rail mismatch",
+        ),
+        (
             body.user == invocation.user_pubkey,
             "provider receipt user mismatch",
         ),
@@ -4221,6 +4237,18 @@ async fn run_chat_with_route_retry(
     let mut eligible_routes =
         ordered_route_candidates_for_request(state, model, request, options.min_att_tier);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        let rail = state.receipt_config.rail.clone();
+        if model.mayhem.route_candidates.iter().all(|candidate| {
+            !candidate
+                .accepted_rails
+                .iter()
+                .any(|candidate_rail| candidate_rail == &rail)
+        }) {
+            return Err(ApiError::payment_required(
+                format!("no provider accepts the {rail} payment rail"),
+                Some("model"),
+            ));
+        }
         return Err(ApiError::bad_request(
             "no provider route satisfies X-Mayhem-Min-Att-Tier",
             Some("X-Mayhem-Min-Att-Tier"),
@@ -4393,10 +4421,11 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
-    let eligible_routes = eligible_route_candidates(model, min_att_tier)
-        .into_iter()
-        .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
-        .collect::<Vec<_>>();
+    let eligible_routes =
+        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+            .into_iter()
+            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
+            .collect::<Vec<_>>();
     if eligible_routes.len() <= 1 {
         return eligible_routes;
     }
@@ -4683,18 +4712,23 @@ fn partial_text(partials: &[GatewaySessionPartial]) -> String {
         .collect::<String>()
 }
 
-fn eligible_route_candidates(
-    model: &GatewayModel,
+fn eligible_route_candidates<'a>(
+    model: &'a GatewayModel,
     min_att_tier: Option<u8>,
-) -> Vec<&GatewayRouteCandidate> {
+    rail: &str,
+) -> Vec<&'a GatewayRouteCandidate> {
     model
         .mayhem
         .route_candidates
         .iter()
         .filter(|candidate| {
-            min_att_tier
-                .map(|min_tier| candidate.att_tier >= min_tier)
-                .unwrap_or(true)
+            candidate
+                .accepted_rails
+                .iter()
+                .any(|candidate_rail| candidate_rail == rail)
+                && min_att_tier
+                    .map(|min_tier| candidate.att_tier >= min_tier)
+                    .unwrap_or(true)
         })
         .collect()
 }
@@ -5750,6 +5784,7 @@ impl GatewayState {
         }
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
             max_spend_mu,
@@ -5760,6 +5795,7 @@ impl GatewayState {
         Ok(GatewaySessionInvocation {
             contract_version: CONTRACT_VERSION,
             session_id,
+            rail: self.receipt_config.rail.clone(),
             user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
@@ -5842,6 +5878,7 @@ impl GatewayState {
                 session_id: invocation.session_id.clone(),
                 seq: 1,
                 final_receipt: true,
+                rail: invocation.rail.clone(),
                 user: invocation.user_pubkey.clone(),
                 provider,
                 enclave_id: invocation.enclave_id.clone(),
@@ -5868,6 +5905,7 @@ impl GatewayState {
             user_sig,
         };
         let stored = StoredReceipt {
+            rail: invocation.rail.clone(),
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
@@ -5917,6 +5955,7 @@ impl GatewayState {
             user_sig: receipt.user_sig.clone(),
         };
         let stored = StoredReceipt {
+            rail: invocation.rail.clone(),
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
@@ -5963,6 +6002,7 @@ impl GatewayState {
         let enclave_id = enclave_id_for_model(&model.id);
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver: model.mayhem.price_ref_mu.ver,
             max_spend_mu,
@@ -5991,6 +6031,7 @@ impl GatewayState {
             session_id: session_id.clone(),
             seq: 1,
             final_receipt: true,
+            rail: self.receipt_config.rail.clone(),
             user: verifying_key_hex(&self.receipt_config.user_seed),
             provider: verifying_key_hex(&self.receipt_config.provider_seed),
             enclave_id,
@@ -6015,6 +6056,7 @@ impl GatewayState {
             user_sig,
         };
         let stored = StoredReceipt {
+            rail: self.receipt_config.rail.clone(),
             voucher,
             receipt,
             receipt_ack,
@@ -6494,6 +6536,7 @@ fn tool_call_value(tool_call: &ToolCallOutput) -> Value {
 
 fn receipt_summary(receipt: &StoredReceipt) -> Value {
     json!({
+        "rail": receipt.rail,
         "session_id": receipt.receipt.body.session_id,
         "seq": receipt.receipt.body.seq,
         "final": receipt.receipt.body.final_receipt,
@@ -7471,6 +7514,7 @@ mod tests {
         };
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
+            rail: "fiat".to_owned(),
             enclave_id: enclave_id.clone(),
             price_ver: 7,
             max_spend_mu: 1000,
@@ -7482,6 +7526,7 @@ mod tests {
         GatewaySessionInvocation {
             contract_version: CONTRACT_VERSION,
             session_id,
+            rail: "fiat".to_owned(),
             user_pubkey: verifying_key_hex(&test_user_seed()),
             provider_pubkey: Some(verifying_key_hex(&test_provider_seed())),
             enclave_id,
@@ -7623,6 +7668,7 @@ mod tests {
     fn test_route_candidate(idx: u8) -> GatewayRouteCandidate {
         GatewayRouteCandidate {
             provider: format!("{:02x}", idx.wrapping_add(1)).repeat(32),
+            accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
             enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
             room_id: format!("{:02x}", idx.wrapping_add(160)).repeat(16),
             price_ver: 7,
@@ -8180,6 +8226,7 @@ mod tests {
             session_id: invocation.session_id.clone(),
             seq,
             final_receipt,
+            rail: invocation.rail.clone(),
             user: invocation.user_pubkey.clone(),
             provider: invocation.provider_pubkey.clone().unwrap(),
             enclave_id: invocation.enclave_id.clone(),

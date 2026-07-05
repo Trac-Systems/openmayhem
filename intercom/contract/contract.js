@@ -678,6 +678,7 @@ class MayhemContract extends Contract {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
+        rail: { type: 'string', min: 1, max: 16 },
         session_id: { type: 'string', min: 1, max: 128 },
         reason: { type: 'string', min: 1, max: 64 },
         provider: { type: 'string', min: 1, max: 128, optional: true },
@@ -1125,6 +1126,25 @@ class MayhemContract extends Contract {
         PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
     );
     return accepted;
+  }
+
+  normalizeLedgerRail(value, label = 'ledger rail') {
+    if (typeof value !== 'string') return new Error(`Invalid ${label}.`);
+    const rail = value.toLowerCase();
+    if (!PROVIDER_ACCEPTED_RAILS.has(rail)) return new Error(`Unsupported ${label}.`);
+    return rail;
+  }
+
+  balanceKey(user, rail) {
+    return `bal/${user}/${rail}`;
+  }
+
+  earningKey(provider, rail) {
+    return `earn/${rail}/${provider}`;
+  }
+
+  feeCumKey(rail) {
+    return `fee/${rail}/cum`;
   }
 
   async setProviderRails() {
@@ -2274,9 +2294,9 @@ class MayhemContract extends Contract {
       return new Error('Epoch apply batch exceeds max_apply_batch.');
     }
 
-    const debitMap = this.aggregateLedgerEntries(this.value.debits, 'user', 'mu', 'debit');
+    const debitMap = this.aggregateRailLedgerEntries(this.value.debits, 'user', 'mu', 'debit');
     if (debitMap instanceof Error) return debitMap;
-    const grossEarningMap = this.aggregateLedgerEntries(
+    const grossEarningMap = this.aggregateRailLedgerEntries(
       this.value.earnings,
       'provider',
       'gross_mu',
@@ -2284,26 +2304,29 @@ class MayhemContract extends Contract {
     );
     if (grossEarningMap instanceof Error) return grossEarningMap;
 
-    const debitTotal = this.sumMu(debitMap);
+    const debitTotal = this.sumRailMu(debitMap, 'mu');
     if (debitTotal instanceof Error) return debitTotal;
-    const grossTotal = this.sumMu(grossEarningMap);
+    const grossTotal = this.sumRailMu(grossEarningMap, 'gross_mu');
     if (grossTotal instanceof Error) return grossTotal;
-    if (debitTotal !== grossTotal) {
-      return new Error('Epoch debits must equal gross provider earnings.');
-    }
+    const debitRailTotals = this.railTotals(debitMap, 'mu');
+    if (debitRailTotals instanceof Error) return debitRailTotals;
+    const grossRailTotals = this.railTotals(grossEarningMap, 'gross_mu');
+    if (grossRailTotals instanceof Error) return grossRailTotals;
+    const railTotalError = this.assertMatchingRailTotals(debitRailTotals, grossRailTotals);
+    if (railTotalError) return railTotalError;
 
-    const fee = await this.feeCumRecord();
+    const applyState = await this.epochApplyStateRecord();
     const normalized = {
       epoch: this.value.epoch,
       at: this.value.at,
       fee_bps: params.fee_bps,
-      debits: this.mapEntriesForHash(debitMap, 'user', 'mu'),
-      earnings: this.mapEntriesForHash(grossEarningMap, 'provider', 'gross_mu'),
+      debits: this.mapRailEntriesForHash(debitMap, 'user', 'mu'),
+      earnings: this.mapRailEntriesForHash(grossEarningMap, 'provider', 'gross_mu'),
       roots,
       totals,
     };
     const applyHash = await this.epochApplyHash(normalized);
-    if (fee.updated_epoch === this.value.epoch && fee.last_apply_hash === applyHash) {
+    if (applyState.updated_epoch === this.value.epoch && applyState.last_apply_hash === applyHash) {
       return {
         ok: true,
         op: 'epochApply',
@@ -2314,21 +2337,24 @@ class MayhemContract extends Contract {
         fee_mu: 0,
       };
     }
-    if (this.value.epoch <= fee.updated_epoch) {
+    if (this.value.epoch <= applyState.updated_epoch) {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
-    if (this.value.epoch !== fee.updated_epoch + 1) {
+    if (this.value.epoch !== applyState.updated_epoch + 1) {
       return new Error('Guardian monotonic epoch invariant failed: epoch apply must be contiguous.');
     }
 
     const balances = new Map();
-    for (const [user, debitMu] of debitMap) {
-      const balance = await this.balanceRecord(user);
-      const balanceError = this.guardianValidateBalanceRecord(balance, user);
+    for (const debit of debitMap.values()) {
+      const { rail, user, mu: debitMu } = debit;
+      const balance = await this.balanceRecord(user, rail);
+      if (balance instanceof Error) return balance;
+      const balanceError = this.guardianValidateBalanceRecord(balance, user, rail);
       if (balanceError) return balanceError;
       if (balance.mu < debitMu) return new Error('Insufficient credit balance.');
-      balances.set(user, {
+      balances.set(stableJson([rail, user]), {
         ...balance,
+        rail,
         mu: balance.mu - debitMu,
         updated_epoch: this.value.epoch,
         updated_at: this.tx,
@@ -2336,26 +2362,40 @@ class MayhemContract extends Contract {
     }
 
     const earningDeltas = new Map();
-    let feeDeltaMu = 0;
-    for (const [provider, grossMu] of grossEarningMap) {
+    const feeDeltaByRail = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, 0]));
+    let feeDeltaTotalMu = 0;
+    for (const earning of grossEarningMap.values()) {
+      const { rail, provider, gross_mu: grossMu } = earning;
       const providerRecord = await this.get(`prov/${provider}`);
       if (!providerRecord) return new Error('Provider not found.');
+      if (!Array.isArray(providerRecord.accepted_rails)) {
+        return new Error('Provider accepted rails are not set.');
+      }
+      if (!providerRecord.accepted_rails.includes(rail)) {
+        return new Error('Provider does not accept payment rail.');
+      }
 
       const feeMu = Math.floor((grossMu * params.fee_bps) / 10_000);
       const providerMu = grossMu - feeMu;
-      feeDeltaMu = this.safeAddMu(feeDeltaMu, feeMu);
-      if (feeDeltaMu instanceof Error) return feeDeltaMu;
-      const current = earningDeltas.get(provider) ?? 0;
-      const next = this.safeAddMu(current, providerMu);
+      feeDeltaTotalMu = this.safeAddMu(feeDeltaTotalMu, feeMu);
+      if (feeDeltaTotalMu instanceof Error) return feeDeltaTotalMu;
+      const nextRailFee = this.safeAddMu(feeDeltaByRail.get(rail) ?? 0, feeMu);
+      if (nextRailFee instanceof Error) return nextRailFee;
+      feeDeltaByRail.set(rail, nextRailFee);
+      const key = stableJson([rail, provider]);
+      const current = earningDeltas.get(key) ?? { rail, provider, mu: 0 };
+      const next = this.safeAddMu(current.mu, providerMu);
       if (next instanceof Error) return next;
-      earningDeltas.set(provider, next);
+      earningDeltas.set(key, { ...current, mu: next });
     }
 
     const earnings = new Map();
     let earnCumTotal = 0;
-    for (const [provider, deltaMu] of earningDeltas) {
-      const current = await this.earningRecord(provider);
-      const currentError = this.guardianValidateEarningRecord(current, provider);
+    for (const delta of earningDeltas.values()) {
+      const { rail, provider, mu: deltaMu } = delta;
+      const current = await this.earningRecord(provider, rail);
+      if (current instanceof Error) return current;
+      const currentError = this.guardianValidateEarningRecord(current, provider, rail);
       if (currentError) return currentError;
       const probeGate = await this.probeGateForEarning(provider, current, params);
       if (probeGate instanceof Error) return probeGate;
@@ -2372,8 +2412,9 @@ class MayhemContract extends Contract {
       if (heldMu instanceof Error) return heldMu;
       const holdbacks = this.appendHoldbackBucket(refreshed.holdbacks, this.value.epoch, deltaMu);
       if (holdbacks instanceof Error) return holdbacks;
-      earnings.set(provider, {
+      earnings.set(stableJson([rail, provider]), {
         ...refreshed,
+        rail,
         total_mu: totalMu,
         held_mu: heldMu,
         holdbacks,
@@ -2384,15 +2425,46 @@ class MayhemContract extends Contract {
       if (earnCumTotal instanceof Error) return earnCumTotal;
     }
 
-    const nextFeeCum = this.safeAddMu(fee.cum_mu, feeDeltaMu);
-    if (nextFeeCum instanceof Error) return nextFeeCum;
+    const feeRecords = new Map();
+    const nextFeeRecords = new Map();
+    let nextFeeCumTotal = 0;
+    const touchedRails = new Set([
+      ...Array.from(debitRailTotals.entries()).filter(([, mu]) => mu > 0).map(([rail]) => rail),
+      ...Array.from(grossRailTotals.entries()).filter(([, mu]) => mu > 0).map(([rail]) => rail),
+    ]);
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
+      const fee = await this.feeCumRecord(rail);
+      if (fee instanceof Error) return fee;
+      const feeError = this.guardianValidateFeeRecord(fee, rail);
+      if (feeError) return feeError;
+      feeRecords.set(rail, fee);
+      const feeDeltaMu = feeDeltaByRail.get(rail) ?? 0;
+      const nextFeeCum = this.safeAddMu(fee.cum_mu, feeDeltaMu);
+      if (nextFeeCum instanceof Error) return nextFeeCum;
+      const nextFee = touchedRails.has(rail)
+        ? {
+            ...fee,
+            cum_mu: nextFeeCum,
+            updated_epoch: this.value.epoch,
+            updated_at: this.tx,
+            last_apply_hash: applyHash,
+            last_fee_bps: params.fee_bps,
+          }
+        : fee;
+      nextFeeRecords.set(rail, nextFee);
+      nextFeeCumTotal = this.safeAddMu(nextFeeCumTotal, nextFee.cum_mu);
+      if (nextFeeCumTotal instanceof Error) return nextFeeCumTotal;
+    }
+
     const guardian = this.guardianCheckEpochApply({
       epoch: this.value.epoch,
-      fee,
+      applyState,
+      feeRecords,
       debitTotal,
-      feeDeltaMu,
-      providerDeltaTotal: grossTotal - feeDeltaMu,
-      nextFeeCum,
+      debitRailTotals,
+      feeDeltaByRail,
+      providerDeltaTotal: grossTotal - feeDeltaTotalMu,
+      nextFeeRecords,
       balances,
       earnings,
     });
@@ -2404,38 +2476,41 @@ class MayhemContract extends Contract {
         roots,
         totals,
         debitTotal,
-        feeDeltaMu,
-        nextFeeCum,
+        feeDeltaMu: feeDeltaTotalMu,
+        nextFeeCum: nextFeeCumTotal,
         providerCount: grossEarningMap.size,
         earnCumTotal,
       });
       if (totalsError) return totalsError;
     }
 
-    for (const [user, balance] of this.sortedMapEntries(balances)) {
-      await this.put(`bal/${user}`, balance);
+    for (const balance of this.sortedRailRecords(balances, 'user')) {
+      await this.put(this.balanceKey(balance.user, balance.rail), balance);
     }
-    for (const [provider, earning] of this.sortedMapEntries(earnings)) {
-      await this.put(`earn/${provider}`, earning);
+    for (const earning of this.sortedRailRecords(earnings, 'provider')) {
+      await this.put(this.earningKey(earning.provider, earning.rail), earning);
     }
-    const feeRecord = {
-      ...fee,
-      cum_mu: nextFeeCum,
-      settled_cum_mu: guardian.next_settled_cum_mu,
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER.filter((rail) => touchedRails.has(rail))) {
+      const feeRecord = {
+        ...nextFeeRecords.get(rail),
+        settled_cum_mu: guardian.next_settled_cum_by_rail.get(rail),
+      };
+      await this.put(this.feeCumKey(rail), feeRecord);
+    }
+    await this.put('epoch/apply/state', {
+      ...applyState,
       updated_epoch: this.value.epoch,
       updated_at: this.tx,
       last_apply_hash: applyHash,
-      last_fee_bps: params.fee_bps,
-    };
-    await this.put('fee/cum', feeRecord);
+    });
     if (totals) {
       await this.writeEpochEvidenceRoots({
         epoch: this.value.epoch,
         at: this.value.at,
         roots,
         totals,
-        feeDeltaMu,
-        feeCumMu: nextFeeCum,
+        feeDeltaMu: feeDeltaTotalMu,
+        feeCumMu: nextFeeCumTotal,
       });
     }
 
@@ -2445,8 +2520,11 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       idempotent: false,
       debited_mu: debitTotal,
-      earned_mu: grossTotal - feeDeltaMu,
-      fee_mu: feeDeltaMu,
+      earned_mu: grossTotal - feeDeltaTotalMu,
+      fee_mu: feeDeltaTotalMu,
+      rails: Array.from(touchedRails).sort(
+        (left, right) => PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
+      ),
     };
     console.log('mayhem epochApply', result);
     return result;
@@ -2633,18 +2711,22 @@ class MayhemContract extends Contract {
     const validationError = this.validateDisputeOpen(this.value);
     if (validationError) return validationError;
 
-    const balance = await this.balanceRecord(this.address);
-    const balanceError = this.guardianValidateBalanceRecord(balance, this.address);
+    const rail = this.normalizeLedgerRail(this.value.rail, 'dispute rail');
+    if (rail instanceof Error) return rail;
+    const balance = await this.balanceRecord(this.address, rail);
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, this.address, rail);
     if (balanceError) return balanceError;
     if (balance.mu < DISPUTE_DEPOSIT_MU) return new Error('Insufficient balance for dispute deposit.');
 
     const nextBalance = {
       ...balance,
+      rail,
       mu: balance.mu - DISPUTE_DEPOSIT_MU,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch ?? 0),
       updated_at: this.tx,
     };
-    const nextBalanceError = this.guardianValidateBalanceRecord(nextBalance, this.address);
+    const nextBalanceError = this.guardianValidateBalanceRecord(nextBalance, this.address, rail);
     if (nextBalanceError) return nextBalanceError;
 
     const next = await this.get('disp/next');
@@ -2653,6 +2735,7 @@ class MayhemContract extends Contract {
       type: 'dispute',
       dispute_id: disputeId,
       status: 'open',
+      rail,
       opened_by: this.address,
       session_id: this.value.session_id,
       reason: this.value.reason,
@@ -2670,7 +2753,7 @@ class MayhemContract extends Contract {
     };
     record.dispute_hash = await this.opaqueHash('mayhem-dispute-v1', record);
 
-    await this.put(`bal/${this.address}`, nextBalance);
+    await this.put(this.balanceKey(this.address, rail), nextBalance);
     await this.put(`disp/${disputeId}`, record);
     await this.put('disp/next', { next: disputeId + 1, updated_at: this.tx });
     console.log('mayhem dispute', record);
@@ -2714,23 +2797,28 @@ class MayhemContract extends Contract {
 
     let depositRefundedMu = 0;
     let depositForfeitedMu = 0;
+    const rail = this.normalizeLedgerRail(dispute.rail, 'dispute rail');
+    if (rail instanceof Error) return rail;
     if (this.value.deposit_action === 'refund') {
       depositRefundedMu = dispute.deposit_mu;
-      const balance = await this.balanceRecord(dispute.opened_by);
-      const balanceError = this.guardianValidateBalanceRecord(balance, dispute.opened_by);
+      const balance = await this.balanceRecord(dispute.opened_by, rail);
+      if (balance instanceof Error) return balance;
+      const balanceError = this.guardianValidateBalanceRecord(balance, dispute.opened_by, rail);
       if (balanceError) return balanceError;
       const nextMu = this.safeAddMu(balance.mu, depositRefundedMu);
       if (nextMu instanceof Error) return nextMu;
-      await this.put(`bal/${dispute.opened_by}`, {
+      await this.put(this.balanceKey(dispute.opened_by, rail), {
         ...balance,
+        rail,
         mu: nextMu,
         updated_epoch: Math.max(balance.updated_epoch, dispute.epoch ?? 0),
         updated_at: this.tx,
       });
     } else {
       depositForfeitedMu = dispute.deposit_mu;
-      const fee = await this.feeCumRecord();
-      const feeError = this.guardianValidateFeeRecord(fee);
+      const fee = await this.feeCumRecord(rail);
+      if (fee instanceof Error) return fee;
+      const feeError = this.guardianValidateFeeRecord(fee, rail);
       if (feeError) return feeError;
       const cumMu = this.safeAddMu(fee.cum_mu, depositForfeitedMu);
       if (cumMu instanceof Error) return cumMu;
@@ -2744,9 +2832,9 @@ class MayhemContract extends Contract {
         updated_at: this.tx,
         last_dispute_forfeit_at: this.tx,
       };
-      const updatedFeeError = this.guardianValidateFeeRecord(updatedFee);
+      const updatedFeeError = this.guardianValidateFeeRecord(updatedFee, rail);
       if (updatedFeeError) return updatedFeeError;
-      await this.put('fee/cum', updatedFee);
+      await this.put(this.feeCumKey(rail), updatedFee);
     }
 
     let reputationEvent = null;
@@ -2960,7 +3048,9 @@ class MayhemContract extends Contract {
     if (mu <= 0) return new Error('TNK deposit converts to zero mu.');
     if (pending.quoted_mu !== mu) return new Error('TNK deposit credit does not match pending intent.');
 
-    const balance = await this.balanceRecord(pending.user);
+    const ledgerRail = 'tnk';
+    const balance = await this.balanceRecord(pending.user, ledgerRail);
+    if (balance instanceof Error) return balance;
     const nextMu = this.safeAddMu(balance.mu, mu);
     if (nextMu instanceof Error) return nextMu;
     const leaf = await this.depositLeafHash({
@@ -2984,11 +3074,13 @@ class MayhemContract extends Contract {
 
     const record = {
       ...balance,
+      rail: ledgerRail,
       mu: nextMu,
       updated_at: this.tx,
+      last_deposit_rail: ledgerRail,
       last_deposit_rate_ts: rate.ts,
     };
-    await this.put(`bal/${pending.user}`, record);
+    await this.put(this.balanceKey(pending.user, ledgerRail), record);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     await this.del(pendingKey);
     console.log('mayhem tnkDeposit', {
@@ -3042,8 +3134,10 @@ class MayhemContract extends Contract {
       };
     }
 
-    const balance = await this.balanceRecord(who);
-    const balanceError = this.guardianValidateBalanceRecord(balance, who);
+    const ledgerRail = 'tap';
+    const balance = await this.balanceRecord(who, ledgerRail);
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, who, ledgerRail);
     if (balanceError) return balanceError;
     const nextMu = this.safeAddMu(balance.mu, mu);
     if (nextMu instanceof Error) return nextMu;
@@ -3091,6 +3185,7 @@ class MayhemContract extends Contract {
     const record = {
       ...balance,
       user: who,
+      rail: ledgerRail,
       mu: nextMu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
       updated_at: this.tx,
@@ -3100,7 +3195,7 @@ class MayhemContract extends Contract {
       last_deposit_tap_usd_e6: rate.tap_usd_e6,
     };
     await this.put(seenKey, seen);
-    await this.put(`bal/${who}`, record);
+    await this.put(this.balanceKey(who, ledgerRail), record);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     console.log('mayhem tapDeposit', {
       who,
@@ -3135,13 +3230,16 @@ class MayhemContract extends Contract {
     const fiat = this.fiatEvidenceFields();
     if (fiat instanceof Error) return fiat;
 
-    const balance = await this.balanceRecord(this.value.who);
-    const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who);
+    const ledgerRail = 'fiat';
+    const balance = await this.balanceRecord(this.value.who, ledgerRail);
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who, ledgerRail);
     if (balanceError) return balanceError;
     const nextMu = this.safeAddMu(balance.mu, this.value.mu);
     if (nextMu instanceof Error) return nextMu;
     const leaf = await this.depositLeafHash({
-      rail: this.value.rail,
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
       user_hash: await this.opaqueHash('deposit-user', this.value.who),
       mu: this.value.mu,
       ext_ref_hash: this.value.ext_ref_hash,
@@ -3157,16 +3255,19 @@ class MayhemContract extends Contract {
 
     const record = {
       ...balance,
+      rail: ledgerRail,
       mu: nextMu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
       updated_at: this.tx,
-      last_deposit_rail: this.value.rail,
+      last_deposit_rail: ledgerRail,
+      last_deposit_processor_rail: this.value.rail,
       ...(fiat.fiat_currency ? { last_deposit_fiat_currency: fiat.fiat_currency } : {}),
     };
-    await this.put(`bal/${this.value.who}`, record);
+    await this.put(this.balanceKey(this.value.who, ledgerRail), record);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     console.log('mayhem fiatDeposit', {
-      rail: this.value.rail,
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
       who: this.value.who,
       mu: this.value.mu,
       ...fiat,
@@ -3175,7 +3276,8 @@ class MayhemContract extends Contract {
     return {
       ok: true,
       op: 'fiatDeposit',
-      rail: this.value.rail,
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
       who: this.value.who,
       mu: this.value.mu,
       epoch: this.value.epoch,
@@ -3194,8 +3296,10 @@ class MayhemContract extends Contract {
     const fiat = this.fiatEvidenceFields();
     if (fiat instanceof Error) return fiat;
 
-    const balance = await this.balanceRecord(this.value.who);
-    const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who);
+    const ledgerRail = 'fiat';
+    const balance = await this.balanceRecord(this.value.who, ledgerRail);
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who, ledgerRail);
     if (balanceError) return balanceError;
     const clawbackMu = Math.min(balance.mu, this.value.mu);
     const networkAbsorbedMu = this.value.mu - clawbackMu;
@@ -3203,7 +3307,8 @@ class MayhemContract extends Contract {
     if (nextMu instanceof Error) return nextMu;
 
     const leaf = await this.depositLeafHash({
-      rail: this.value.rail,
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
       user_hash: await this.opaqueHash('deposit-user', this.value.who),
       mu: this.value.mu,
       clawback_mu: clawbackMu,
@@ -3234,7 +3339,8 @@ class MayhemContract extends Contract {
       user: this.value.who,
       status: 'frozen',
       reason: 'fiat_chargeback',
-      rail: this.value.rail,
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
       first_frozen_at: frozen?.first_frozen_at ?? this.tx,
       first_frozen_at_seconds: frozen?.first_frozen_at_seconds ?? this.value.at,
       updated_at: this.tx,
@@ -3249,18 +3355,21 @@ class MayhemContract extends Contract {
       last_fiat_currency: fiat.fiat_currency,
     };
 
-    await this.put(`bal/${this.value.who}`, {
+    await this.put(this.balanceKey(this.value.who, ledgerRail), {
       ...balance,
+      rail: ledgerRail,
       mu: nextMu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
       updated_at: this.tx,
-      last_chargeback_rail: this.value.rail,
+      last_chargeback_rail: ledgerRail,
+      last_chargeback_processor_rail: this.value.rail,
       last_chargeback_fiat_currency: fiat.fiat_currency,
     });
     await this.put(`frozen/${this.value.who}`, freezeRecord);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     console.log('mayhem fiatChargeback', {
-      rail: this.value.rail,
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
       who: this.value.who,
       mu: this.value.mu,
       clawback_mu: clawbackMu,
@@ -3271,7 +3380,8 @@ class MayhemContract extends Contract {
     return {
       ok: true,
       op: 'fiatChargeback',
-      rail: this.value.rail,
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
       who: this.value.who,
       mu: this.value.mu,
       clawback_mu: clawbackMu,
@@ -3948,6 +4058,8 @@ class MayhemContract extends Contract {
   }
 
   validateDisputeOpen(value) {
+    const rail = this.normalizeLedgerRail(value.rail, 'dispute rail');
+    if (rail instanceof Error) return rail;
     if (!this.isSafeKeyPart(value.session_id)) return new Error('Invalid dispute session id.');
     if (!this.isSafeKeyPart(value.reason)) return new Error('Invalid dispute reason.');
     for (const key of ['provider', 'counterparty', 'enclave_id']) {
@@ -4031,9 +4143,12 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  guardianValidateBalanceRecord(record, user = null) {
+  guardianValidateBalanceRecord(record, user = null, rail = null) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) {
       return new Error('Guardian non-negative balance invariant failed.');
+    }
+    if (rail !== null && record.rail !== rail) {
+      return new Error('Guardian balance rail invariant failed.');
     }
     if (record.denom !== PRICE_DENOMINATION) {
       return new Error('Guardian balance denomination invariant failed.');
@@ -4050,9 +4165,12 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  guardianValidateEarningRecord(record, provider = null) {
+  guardianValidateEarningRecord(record, provider = null, rail = null) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) {
       return new Error('Guardian non-negative earnings invariant failed.');
+    }
+    if (rail !== null && record.rail !== rail) {
+      return new Error('Guardian earnings rail invariant failed.');
     }
     if (record.denom !== PRICE_DENOMINATION) {
       return new Error('Guardian earnings denomination invariant failed.');
@@ -4083,9 +4201,12 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  guardianValidateFeeRecord(record) {
+  guardianValidateFeeRecord(record, rail = null) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) {
       return new Error('Guardian fee conservation invariant failed.');
+    }
+    if (rail !== null && record.rail !== rail) {
+      return new Error('Guardian fee rail invariant failed.');
     }
     if (record.denom !== PRICE_DENOMINATION) {
       return new Error('Guardian fee denomination invariant failed.');
@@ -4110,39 +4231,63 @@ class MayhemContract extends Contract {
 
   guardianCheckEpochApply({
     epoch,
-    fee,
+    applyState,
+    feeRecords,
     debitTotal,
-    feeDeltaMu,
+    debitRailTotals,
+    feeDeltaByRail,
     providerDeltaTotal,
-    nextFeeCum,
+    nextFeeRecords,
     balances,
     earnings,
   }) {
-    const feeError = this.guardianValidateFeeRecord(fee);
-    if (feeError) return feeError;
-    if (epoch <= fee.updated_epoch || epoch !== fee.updated_epoch + 1) {
+    if (!applyState || !Number.isSafeInteger(applyState.updated_epoch) || applyState.updated_epoch < 0) {
       return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    if (epoch <= applyState.updated_epoch || epoch !== applyState.updated_epoch + 1) {
+      return new Error('Guardian monotonic epoch invariant failed.');
+    }
+    let feeDeltaMu = 0;
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
+      const fee = feeRecords.get(rail);
+      const feeError = this.guardianValidateFeeRecord(fee, rail);
+      if (feeError) return feeError;
+      const nextFee = nextFeeRecords.get(rail);
+      const nextFeeError = this.guardianValidateFeeRecord(nextFee, rail);
+      if (nextFeeError) return nextFeeError;
+      const railFeeDelta = feeDeltaByRail.get(rail) ?? 0;
+      feeDeltaMu = this.safeAddMu(feeDeltaMu, railFeeDelta);
+      if (feeDeltaMu instanceof Error) return feeDeltaMu;
+      if (nextFee.cum_mu !== fee.cum_mu + railFeeDelta) {
+        return new Error('Guardian fee conservation invariant failed.');
+      }
     }
     if (providerDeltaTotal + feeDeltaMu !== debitTotal) {
       return new Error('Guardian conservation invariant failed.');
     }
 
-    for (const [user, balance] of balances) {
-      const balanceError = this.guardianValidateBalanceRecord(balance, user);
+    for (const balance of balances.values()) {
+      const balanceError = this.guardianValidateBalanceRecord(balance, balance.user, balance.rail);
       if (balanceError) return balanceError;
     }
-    for (const [provider, earning] of earnings) {
-      const earningError = this.guardianValidateEarningRecord(earning, provider);
+    for (const earning of earnings.values()) {
+      const earningError = this.guardianValidateEarningRecord(earning, earning.provider, earning.rail);
       if (earningError) return earningError;
     }
 
-    const priorSettledCumMu = fee.settled_cum_mu ?? fee.cum_mu;
-    const nextSettledCumMu = this.safeAddMu(priorSettledCumMu, debitTotal);
-    if (nextSettledCumMu instanceof Error) return nextSettledCumMu;
-    if (nextFeeCum > nextSettledCumMu) {
-      return new Error('Guardian conservation invariant failed.');
+    const nextSettledCumByRail = new Map();
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
+      const fee = feeRecords.get(rail);
+      const nextFee = nextFeeRecords.get(rail);
+      const priorSettledCumMu = fee.settled_cum_mu ?? fee.cum_mu;
+      const nextSettledCumMu = this.safeAddMu(priorSettledCumMu, debitRailTotals.get(rail) ?? 0);
+      if (nextSettledCumMu instanceof Error) return nextSettledCumMu;
+      if (nextFee.cum_mu > nextSettledCumMu) {
+        return new Error('Guardian conservation invariant failed.');
+      }
+      nextSettledCumByRail.set(rail, nextSettledCumMu);
     }
-    return { ok: true, next_settled_cum_mu: nextSettledCumMu };
+    return { ok: true, next_settled_cum_by_rail: nextSettledCumByRail };
   }
 
   lockedEarningEpochs(params) {
@@ -4557,69 +4702,111 @@ class MayhemContract extends Contract {
     const provider = await this.get(providerKey);
     if (!provider) return new Error('Provider not found.');
 
-    const earning = await this.earningRecord(providerId);
-    const earningError = this.guardianValidateEarningRecord(earning, providerId);
-    if (earningError) return earningError;
-    const holdbacks = this.normalizeHoldbackBuckets(earning);
-    if (holdbacks instanceof Error) return holdbacks;
+    const updatedEarnings = new Map();
+    const beneficiaryBalances = new Map();
+    const updatedFees = new Map();
+    const railSlashRecords = [];
+    let heldBeforeMu = 0;
+    let heldAfterMu = 0;
+    let forfeitedMu = 0;
+    let reporterMu = 0;
+    let treasuryMu = 0;
 
-    const forfeitedMu = this.slashAmount(earning.held_mu, slashBps);
-    if (forfeitedMu instanceof Error) return forfeitedMu;
-    const reporterMu = beneficiary === null ? 0 : Math.floor(forfeitedMu / 2);
-    const treasuryMu = forfeitedMu - reporterMu;
-    const remainingHoldbacks = this.slashHoldbackBuckets(holdbacks, forfeitedMu);
-    if (remainingHoldbacks instanceof Error) return remainingHoldbacks;
-    const heldMu = earning.held_mu - forfeitedMu;
-    const totalMu = earning.total_mu - forfeitedMu;
-    const slashedCumMu = this.safeAddMu(earning.slashed_cum_mu ?? 0, forfeitedMu);
-    if (slashedCumMu instanceof Error) return slashedCumMu;
-    const updatedEarning = {
-      ...earning,
-      total_mu: totalMu,
-      held_mu: heldMu,
-      holdbacks: remainingHoldbacks,
-      slashed_cum_mu: slashedCumMu,
-      last_slash_at: this.tx,
-      updated_at: this.tx,
-    };
-    const updatedEarningError = this.guardianValidateEarningRecord(updatedEarning, providerId);
-    if (updatedEarningError) return updatedEarningError;
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
+      const earning = await this.earningRecord(providerId, rail);
+      if (earning instanceof Error) return earning;
+      const earningError = this.guardianValidateEarningRecord(earning, providerId, rail);
+      if (earningError) return earningError;
+      const holdbacks = this.normalizeHoldbackBuckets(earning);
+      if (holdbacks instanceof Error) return holdbacks;
 
-    let beneficiaryBalance = null;
-    if (reporterMu > 0) {
-      const currentBalance = await this.balanceRecord(beneficiary);
-      const balanceError = this.guardianValidateBalanceRecord(currentBalance, beneficiary);
-      if (balanceError) return balanceError;
-      const nextMu = this.safeAddMu(currentBalance.mu, reporterMu);
-      if (nextMu instanceof Error) return nextMu;
-      beneficiaryBalance = {
-        ...currentBalance,
-        mu: nextMu,
-        updated_epoch: Math.max(currentBalance.updated_epoch, epoch),
-        updated_at: this.tx,
-      };
-    }
+      const railForfeitedMu = this.slashAmount(earning.held_mu, slashBps);
+      if (railForfeitedMu instanceof Error) return railForfeitedMu;
+      const railReporterMu = beneficiary === null ? 0 : Math.floor(railForfeitedMu / 2);
+      const railTreasuryMu = railForfeitedMu - railReporterMu;
+      const remainingHoldbacks = this.slashHoldbackBuckets(holdbacks, railForfeitedMu);
+      if (remainingHoldbacks instanceof Error) return remainingHoldbacks;
+      const railHeldAfterMu = earning.held_mu - railForfeitedMu;
+      const railTotalMu = earning.total_mu - railForfeitedMu;
+      const slashedCumMu = this.safeAddMu(earning.slashed_cum_mu ?? 0, railForfeitedMu);
+      if (slashedCumMu instanceof Error) return slashedCumMu;
 
-    let fee = null;
-    let updatedFee = null;
-    if (treasuryMu > 0) {
-      fee = await this.feeCumRecord();
-      const feeError = this.guardianValidateFeeRecord(fee);
-      if (feeError) return feeError;
-      const cumMu = this.safeAddMu(fee.cum_mu, treasuryMu);
-      if (cumMu instanceof Error) return cumMu;
-      const settledCumMu = this.safeAddMu(fee.settled_cum_mu ?? fee.cum_mu, treasuryMu);
-      if (settledCumMu instanceof Error) return settledCumMu;
-      updatedFee = {
-        ...fee,
-        cum_mu: cumMu,
-        settled_cum_mu: settledCumMu,
-        updated_epoch: Math.max(fee.updated_epoch, epoch),
-        updated_at: this.tx,
-        last_slash_at: this.tx,
-      };
-      const updatedFeeError = this.guardianValidateFeeRecord(updatedFee);
-      if (updatedFeeError) return updatedFeeError;
+      heldBeforeMu = this.safeAddMu(heldBeforeMu, earning.held_mu);
+      if (heldBeforeMu instanceof Error) return heldBeforeMu;
+      heldAfterMu = this.safeAddMu(heldAfterMu, railHeldAfterMu);
+      if (heldAfterMu instanceof Error) return heldAfterMu;
+      forfeitedMu = this.safeAddMu(forfeitedMu, railForfeitedMu);
+      if (forfeitedMu instanceof Error) return forfeitedMu;
+      reporterMu = this.safeAddMu(reporterMu, railReporterMu);
+      if (reporterMu instanceof Error) return reporterMu;
+      treasuryMu = this.safeAddMu(treasuryMu, railTreasuryMu);
+      if (treasuryMu instanceof Error) return treasuryMu;
+
+      if (earning.total_mu > 0 || railForfeitedMu > 0) {
+        const updatedEarning = {
+          ...earning,
+          rail,
+          total_mu: railTotalMu,
+          held_mu: railHeldAfterMu,
+          holdbacks: remainingHoldbacks,
+          slashed_cum_mu: slashedCumMu,
+          last_slash_at: this.tx,
+          updated_at: this.tx,
+        };
+        const updatedEarningError = this.guardianValidateEarningRecord(updatedEarning, providerId, rail);
+        if (updatedEarningError) return updatedEarningError;
+        updatedEarnings.set(rail, updatedEarning);
+      }
+
+      if (railReporterMu > 0) {
+        const currentBalance = await this.balanceRecord(beneficiary, rail);
+        if (currentBalance instanceof Error) return currentBalance;
+        const balanceError = this.guardianValidateBalanceRecord(currentBalance, beneficiary, rail);
+        if (balanceError) return balanceError;
+        const nextMu = this.safeAddMu(currentBalance.mu, railReporterMu);
+        if (nextMu instanceof Error) return nextMu;
+        beneficiaryBalances.set(rail, {
+          ...currentBalance,
+          rail,
+          mu: nextMu,
+          updated_epoch: Math.max(currentBalance.updated_epoch, epoch),
+          updated_at: this.tx,
+        });
+      }
+
+      if (railTreasuryMu > 0) {
+        const fee = await this.feeCumRecord(rail);
+        if (fee instanceof Error) return fee;
+        const feeError = this.guardianValidateFeeRecord(fee, rail);
+        if (feeError) return feeError;
+        const cumMu = this.safeAddMu(fee.cum_mu, railTreasuryMu);
+        if (cumMu instanceof Error) return cumMu;
+        const settledCumMu = this.safeAddMu(fee.settled_cum_mu ?? fee.cum_mu, railTreasuryMu);
+        if (settledCumMu instanceof Error) return settledCumMu;
+        const updatedFee = {
+          ...fee,
+          rail,
+          cum_mu: cumMu,
+          settled_cum_mu: settledCumMu,
+          updated_epoch: Math.max(fee.updated_epoch, epoch),
+          updated_at: this.tx,
+          last_slash_at: this.tx,
+        };
+        const updatedFeeError = this.guardianValidateFeeRecord(updatedFee, rail);
+        if (updatedFeeError) return updatedFeeError;
+        updatedFees.set(rail, updatedFee);
+      }
+
+      if (earning.held_mu > 0 || railForfeitedMu > 0) {
+        railSlashRecords.push({
+          rail,
+          held_before_mu: earning.held_mu,
+          held_after_mu: railHeldAfterMu,
+          forfeited_mu: railForfeitedMu,
+          beneficiary_mu: railReporterMu,
+          treasury_mu: railTreasuryMu,
+        });
+      }
     }
 
     const tombstone = tombstoneEnclave
@@ -4654,11 +4841,12 @@ class MayhemContract extends Contract {
       probe_id: probeId,
       event_id: eventId,
       slash_bps: slashBps,
-      held_before_mu: earning.held_mu,
-      held_after_mu: heldMu,
+      held_before_mu: heldBeforeMu,
+      held_after_mu: heldAfterMu,
       forfeited_mu: forfeitedMu,
       beneficiary_mu: reporterMu,
       treasury_mu: treasuryMu,
+      rails: railSlashRecords,
       tombstone,
       ban_tombstones: banTombstones,
       provider_banned: banProvider,
@@ -4686,9 +4874,15 @@ class MayhemContract extends Contract {
           updated_at: this.tx,
         };
 
-    await this.put(`earn/${providerId}`, updatedEarning);
-    if (beneficiaryBalance) await this.put(`bal/${beneficiary}`, beneficiaryBalance);
-    if (updatedFee) await this.put('fee/cum', updatedFee);
+    for (const [rail, updatedEarning] of updatedEarnings) {
+      await this.put(this.earningKey(providerId, rail), updatedEarning);
+    }
+    for (const [rail, beneficiaryBalance] of beneficiaryBalances) {
+      await this.put(this.balanceKey(beneficiary, rail), beneficiaryBalance);
+    }
+    for (const [rail, updatedFee] of updatedFees) {
+      await this.put(this.feeCumKey(rail), updatedFee);
+    }
     await this.put(providerKey, updatedProvider);
     await this.put(`ev/slash/${providerId}/${this.tx}`, slash);
     return slash;
@@ -4832,6 +5026,7 @@ class MayhemContract extends Contract {
       session_id: bodySource.session_id,
       seq: bodySource.seq,
       final: finalReceipt,
+      rail: bodySource.rail,
       user: bodySource.user,
       provider: bodySource.provider,
       enclave_id: bodySource.enclave_id,
@@ -4910,6 +5105,9 @@ class MayhemContract extends Contract {
     }
     if (!this.isHexBytes(body.user, 32)) return new Error('Invalid receipt user public key.');
     if (!this.isHexBytes(body.provider, 32)) return new Error('Invalid receipt provider public key.');
+    const rail = this.normalizeLedgerRail(body.rail, 'receipt rail');
+    if (rail instanceof Error) return rail;
+    if (body.rail !== rail) return new Error('Receipt rail must be canonical.');
     if (!Number.isSafeInteger(body.seq) || body.seq < 0) return new Error('Invalid receipt sequence.');
     if (typeof body.final !== 'boolean') return new Error('Invalid receipt final flag.');
     if (!Number.isSafeInteger(body.price_ver) || body.price_ver < 1) {
@@ -5118,6 +5316,29 @@ class MayhemContract extends Contract {
     return out;
   }
 
+  aggregateRailLedgerEntries(entries, idKey, amountKey, label) {
+    const out = new Map();
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return new Error(`Invalid ${label} entry.`);
+      }
+      const rail = this.normalizeLedgerRail(entry.rail, `${label} rail`);
+      if (rail instanceof Error) return rail;
+      const id = entry[idKey];
+      const mu = entry[amountKey];
+      if (!this.isSafeKeyPart(id)) return new Error(`Invalid ${label} ${idKey}.`);
+      if (!Number.isSafeInteger(mu) || mu <= 0) {
+        return new Error(`Invalid ${label} amount.`);
+      }
+      const key = stableJson([rail, id]);
+      const current = out.get(key) ?? { rail, [idKey]: id, [amountKey]: 0 };
+      const next = this.safeAddMu(current[amountKey], mu);
+      if (next instanceof Error) return next;
+      out.set(key, { ...current, [amountKey]: next });
+    }
+    return out;
+  }
+
   sumMu(entries) {
     let sum = 0;
     for (const [, mu] of entries) {
@@ -5126,6 +5347,35 @@ class MayhemContract extends Contract {
       sum = next;
     }
     return sum;
+  }
+
+  sumRailMu(entries, amountKey) {
+    let sum = 0;
+    for (const entry of entries.values()) {
+      const next = this.safeAddMu(sum, entry[amountKey]);
+      if (next instanceof Error) return next;
+      sum = next;
+    }
+    return sum;
+  }
+
+  railTotals(entries, amountKey) {
+    const out = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, 0]));
+    for (const entry of entries.values()) {
+      const next = this.safeAddMu(out.get(entry.rail) ?? 0, entry[amountKey]);
+      if (next instanceof Error) return next;
+      out.set(entry.rail, next);
+    }
+    return out;
+  }
+
+  assertMatchingRailTotals(left, right) {
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
+      if ((left.get(rail) ?? 0) !== (right.get(rail) ?? 0)) {
+        return new Error('Epoch debits must equal gross provider earnings per rail.');
+      }
+    }
+    return null;
   }
 
   safeAddMu(a, b) {
@@ -5151,6 +5401,15 @@ class MayhemContract extends Contract {
     return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b));
   }
 
+  sortedRailRecords(map, idKey) {
+    return Array.from(map.values()).sort((a, b) => {
+      const railOrder =
+        PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(a.rail) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(b.rail);
+      if (railOrder !== 0) return railOrder;
+      return a[idKey].localeCompare(b[idKey]);
+    });
+  }
+
   mapEntriesForHash(map, idKey, amountKey) {
     return this.sortedMapEntries(map).map(([id, mu]) => ({
       [idKey]: id,
@@ -5158,9 +5417,20 @@ class MayhemContract extends Contract {
     }));
   }
 
-  async balanceRecord(user) {
-    return (await this.get(`bal/${user}`)) ?? {
+  mapRailEntriesForHash(map, idKey, amountKey) {
+    return this.sortedRailRecords(map, idKey).map((entry) => ({
+      rail: entry.rail,
+      [idKey]: entry[idKey],
+      [amountKey]: entry[amountKey],
+    }));
+  }
+
+  async balanceRecord(user, rail) {
+    const normalizedRail = this.normalizeLedgerRail(rail, 'balance rail');
+    if (normalizedRail instanceof Error) return normalizedRail;
+    return (await this.get(this.balanceKey(user, normalizedRail))) ?? {
       user,
+      rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       mu: 0,
       updated_epoch: 0,
@@ -5168,9 +5438,12 @@ class MayhemContract extends Contract {
     };
   }
 
-  async earningRecord(provider) {
-    return (await this.get(`earn/${provider}`)) ?? {
+  async earningRecord(provider, rail) {
+    const normalizedRail = this.normalizeLedgerRail(rail, 'earning rail');
+    if (normalizedRail instanceof Error) return normalizedRail;
+    return (await this.get(this.earningKey(provider, normalizedRail))) ?? {
       provider,
+      rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       total_mu: 0,
       held_mu: 0,
@@ -5180,8 +5453,11 @@ class MayhemContract extends Contract {
     };
   }
 
-  async feeCumRecord() {
-    return (await this.get('fee/cum')) ?? {
+  async feeCumRecord(rail) {
+    const normalizedRail = this.normalizeLedgerRail(rail, 'fee rail');
+    if (normalizedRail instanceof Error) return normalizedRail;
+    return (await this.get(this.feeCumKey(normalizedRail))) ?? {
+      rail: normalizedRail,
       denom: PRICE_DENOMINATION,
       cum_mu: 0,
       swept_cum_mu: 0,
@@ -5189,6 +5465,14 @@ class MayhemContract extends Contract {
       updated_at: null,
       last_apply_hash: null,
       last_fee_bps: null,
+    };
+  }
+
+  async epochApplyStateRecord() {
+    return (await this.get('epoch/apply/state')) ?? {
+      updated_epoch: 0,
+      updated_at: null,
+      last_apply_hash: null,
     };
   }
 

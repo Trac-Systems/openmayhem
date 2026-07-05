@@ -287,6 +287,7 @@ pub struct StripeCreateCheckoutSessionRequest {
 pub struct StripeCreatePaymentIntentResponse {
     pub ok: bool,
     pub rail: &'static str,
+    pub processor_rail: &'static str,
     pub denom: &'static str,
     pub who: String,
     pub mu: u64,
@@ -297,6 +298,7 @@ pub struct StripeCreatePaymentIntentResponse {
 pub struct StripeCreateCheckoutSessionResponse {
     pub ok: bool,
     pub rail: &'static str,
+    pub processor_rail: &'static str,
     pub denom: &'static str,
     pub who: String,
     pub mu: u64,
@@ -1088,7 +1090,7 @@ async fn create_payment_intent(
     let stripe = &state.config.rails.stripe;
     if !stripe.enabled {
         return Err(PaygateError::InvalidRequest(
-            "Stripe rail is not enabled".to_owned(),
+            "Stripe processor is not enabled".to_owned(),
         ));
     }
     validate_safe_key_part("who", &request.who)?;
@@ -1108,7 +1110,8 @@ async fn create_payment_intent(
     }
     Ok(StripeCreatePaymentIntentResponse {
         ok: true,
-        rail: "stripe",
+        rail: "fiat",
+        processor_rail: "stripe",
         denom: CREDIT_DENOM,
         who: request.who,
         mu: request.mu,
@@ -1123,7 +1126,7 @@ async fn create_checkout_session(
     let stripe = &state.config.rails.stripe;
     if !stripe.enabled {
         return Err(PaygateError::InvalidRequest(
-            "Stripe rail is not enabled".to_owned(),
+            "Stripe processor is not enabled".to_owned(),
         ));
     }
     validate_safe_key_part("who", &request.who)?;
@@ -1152,7 +1155,8 @@ async fn create_checkout_session(
     let copy_paste = checkout_copy_paste(&session.url);
     Ok(StripeCreateCheckoutSessionResponse {
         ok: true,
-        rail: "stripe",
+        rail: "fiat",
+        processor_rail: "stripe",
         denom: CREDIT_DENOM,
         who: request.who,
         mu: request.mu,
@@ -1370,7 +1374,7 @@ async fn handle_stripe_webhook(
     let stripe = &state.config.rails.stripe;
     if !stripe.enabled {
         return Err(PaygateError::InvalidRequest(
-            "Stripe rail is not enabled".to_owned(),
+            "Stripe processor is not enabled".to_owned(),
         ));
     }
     let webhook_secret = stripe

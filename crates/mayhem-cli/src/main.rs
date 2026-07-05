@@ -711,6 +711,10 @@ struct UseArgs {
     #[arg(long)]
     sc_bridge_token: Option<String>,
 
+    /// Payment rail to spend from when serving requests through this gateway.
+    #[arg(long, value_enum, default_value_t = GatewayLedgerRail::Fiat)]
+    rail: GatewayLedgerRail,
+
     /// Seconds to wait for provider s.accept/s.reject after opening a direct session.
     #[arg(long)]
     session_open_timeout_seconds: Option<u64>,
@@ -932,7 +936,7 @@ struct ReceiptsExportArgs {
     #[arg(long)]
     fee_bps: u64,
 
-    /// Prior fee/cum.mu before this epoch.
+    /// Prior cumulative operator fee before this epoch.
     #[arg(long, default_value_t = 0)]
     prior_fee_cum_mu: u64,
 
@@ -3323,10 +3327,33 @@ enum PayRail {
     Stripe,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum GatewayLedgerRail {
+    Fiat,
+    Tap,
+    Tnk,
+}
+
+impl GatewayLedgerRail {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fiat => "fiat",
+            Self::Tap => "tap",
+            Self::Tnk => "tnk",
+        }
+    }
+}
+
 impl PayRail {
     fn as_str(self) -> &'static str {
         match self {
             Self::Stripe => "stripe",
+        }
+    }
+
+    fn balance_rail(self) -> &'static str {
+        match self {
+            Self::Stripe => "fiat",
         }
     }
 }
@@ -10684,7 +10711,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     };
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let before_balance = read_balance_record(&rpc, &who).await?;
+    let before_balance = read_balance_record(&rpc, &who, "fiat").await?;
     let before_mu = before_balance
         .get("mu")
         .and_then(Value::as_u64)
@@ -10705,7 +10732,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     } else {
         None
     };
-    let balance = read_balance_record(&rpc, &who).await?;
+    let balance = read_balance_record(&rpc, &who, "fiat").await?;
     let current_mu = balance
         .get("mu")
         .and_then(Value::as_u64)
@@ -11319,7 +11346,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
 
     let before_mu = if args.wait {
         let rpc = rpc.as_ref().context("--wait requires peer RPC")?;
-        Some(read_user_balance_mu(rpc, &wallet.public_key).await?)
+        Some(read_user_balance_mu(rpc, &wallet.public_key, "tnk").await?)
     } else {
         None
     };
@@ -11514,7 +11541,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let paygate_url = resolve_cli_paygate_url(config.as_ref(), args.paygate_url.as_deref());
     let amount_mu = parse_usd_amount_to_mu(&args.amount)?;
-    let before_mu = read_user_balance_mu(&rpc, &wallet.public_key).await?;
+    let before_mu = read_user_balance_mu(&rpc, &wallet.public_key, rail.balance_rail()).await?;
     let checkout = create_pay_checkout(PayCheckoutRequest {
         rail,
         paygate_url: &paygate_url,
@@ -11747,6 +11774,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         Some(jwks) => state.with_nvidia_offline_jwks(jwks),
         None => state,
     };
+    let state = state.with_receipt_rail(args.rail.as_str());
     let dashboard_url = state.dashboard_url(&gateway_url);
     let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
     let report = json!({
@@ -11759,6 +11787,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "dashboard_session_expires_in_seconds": dashboard_session_expires_in_seconds,
         "source": source,
         "backend": backend,
+        "rail": args.rail.as_str(),
         "models": model_count,
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
         "nvidia_gb10_device_jwks": args.nvidia_gb10_device_jwks_file.is_some(),
@@ -11771,6 +11800,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     } else {
         println!("Mayhem gateway starting.");
         println!("Bind: {bind}");
+        println!("Rail: {}", args.rail.as_str());
         println!("Copy/paste OpenAI base URL: {openai_base_url}");
         println!("Copy/paste dashboard URL: {dashboard_url}");
         println!("Dashboard session expires in: {dashboard_session_expires_in_seconds}s");
@@ -11904,7 +11934,7 @@ async fn balance(args: BalanceArgs) -> Result<()> {
         .public_key
     };
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let balance_record = read_balance_record(&rpc, &who).await?;
+    let balance_record = read_balance_record(&rpc, &who, "fiat").await?;
     let mu = balance_record
         .get("mu")
         .and_then(Value::as_u64)
@@ -11978,7 +12008,7 @@ async fn status(args: StatusArgs) -> Result<()> {
                 Err(err) => component_error(err),
             };
             let balance = if let Some(who) = wallet.get("public_key").and_then(Value::as_str) {
-                match read_balance_record(&rpc, who).await {
+                match read_balance_record(&rpc, who, "fiat").await {
                     Ok(value) => value,
                     Err(err) => component_error(err),
                 }
@@ -12106,10 +12136,11 @@ async fn reputation(args: ReputationArgs) -> Result<()> {
     let reputation = read_state_value(&rpc, &format!("rep/{provider}")).await?;
     let events_head = read_state_value(&rpc, &format!("ev/rep/head/{provider}")).await?;
     let provider_record = read_state_value(&rpc, &format!("prov/{provider}")).await?;
-    let earning = match read_state_value(&rpc, &format!("earn/{provider}")).await? {
+    let earning = match read_state_value(&rpc, &format!("earn/fiat/{provider}")).await? {
         Some(value) => serde_json::from_value(value).context("parsing earning record")?,
         None => LedgerEarningRecord {
             provider: provider.clone(),
+            rail: "fiat".to_owned(),
             denom: "mu_usd".to_owned(),
             total_mu: 0,
             held_mu: 0,
@@ -14496,11 +14527,11 @@ async fn earnings(args: EarningsArgs) -> Result<()> {
     let rpc_url = resolve_cli_rpc_url(args.home.as_ref(), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let records = if let Some(provider) = &args.provider {
-        read_state_value(&rpc, &format!("earn/{provider}"))
+        read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
             .await?
             .into_iter()
-            .map(|value| serde_json::from_value(value).context("parsing earning record"))
-            .collect::<Result<Vec<LedgerEarningRecord>>>()?
+            .filter(|record| record.provider == *provider)
+            .collect::<Vec<_>>()
     } else {
         read_prefix_values(&rpc, "earn/").await?
     };
@@ -14508,7 +14539,11 @@ async fn earnings(args: EarningsArgs) -> Result<()> {
         .into_iter()
         .map(earning_view)
         .collect::<Result<Vec<_>>>()?;
-    views.sort_by(|a, b| a.provider.cmp(&b.provider));
+    views.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| a.rail.cmp(&b.rail))
+    });
     let report = json!({
         "rpc_url": rpc_url,
         "earnings": views,
@@ -15377,6 +15412,14 @@ async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheck
 fn checkout_from_paygate_response(rail: PayRail, value: &Value) -> Result<PayCheckout> {
     match rail {
         PayRail::Stripe => {
+            let response_rail = required_json_string(value, "rail")?;
+            if response_rail != "fiat" {
+                bail!("paygate response rail must be fiat for Stripe checkout");
+            }
+            let processor_rail = required_json_string(value, "processor_rail")?;
+            if processor_rail != "stripe" {
+                bail!("paygate response processor_rail must be stripe for Stripe checkout");
+            }
             let session = value
                 .get("checkout_session")
                 .ok_or_else(|| anyhow::anyhow!("paygate response missing checkout_session"))?;
@@ -15474,7 +15517,7 @@ async fn wait_for_credit(
 ) -> Result<PayCreditStatus> {
     let started = Instant::now();
     loop {
-        let current_mu = read_user_balance_mu(rpc, who).await?;
+        let current_mu = read_user_balance_mu(rpc, who, "fiat").await?;
         if current_mu >= target_mu {
             return Ok(PayCreditStatus {
                 credited: true,
@@ -15501,23 +15544,24 @@ fn millis_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn read_user_balance_mu(rpc: &PeerRpcClient, who: &str) -> Result<u64> {
-    read_balance_record(rpc, who)
+async fn read_user_balance_mu(rpc: &PeerRpcClient, who: &str, rail: &str) -> Result<u64> {
+    read_balance_record(rpc, who, rail)
         .await?
         .get("mu")
         .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("normalized balance record for {who} is missing mu"))
+        .ok_or_else(|| anyhow::anyhow!("normalized {rail} balance record for {who} is missing mu"))
 }
 
-async fn read_balance_record(rpc: &PeerRpcClient, who: &str) -> Result<Value> {
-    let value = read_state_value(rpc, &format!("bal/{who}")).await?;
-    normalize_balance_record(who, value)
+async fn read_balance_record(rpc: &PeerRpcClient, who: &str, rail: &str) -> Result<Value> {
+    let value = read_state_value(rpc, &format!("bal/{who}/{rail}")).await?;
+    normalize_balance_record(who, rail, value)
 }
 
-fn normalize_balance_record(who: &str, value: Option<Value>) -> Result<Value> {
+fn normalize_balance_record(who: &str, rail: &str, value: Option<Value>) -> Result<Value> {
     let mut record = value.unwrap_or_else(|| {
         json!({
             "user": who,
+            "rail": rail,
             "denom": "mu_usd",
             "mu": 0,
             "updated_epoch": 0,
@@ -15540,6 +15584,13 @@ fn normalize_balance_record(who: &str, value: Option<Value>) -> Result<Value> {
         Some(user) => bail!("balance record user mismatch: expected {who}, got {user}"),
         None => {
             object.insert("user".to_owned(), Value::String(who.to_owned()));
+        }
+    }
+    match object.get("rail").and_then(Value::as_str) {
+        Some(value) if value == rail => {}
+        Some(value) => bail!("balance record rail mismatch: expected {rail}, got {value}"),
+        None => {
+            object.insert("rail".to_owned(), Value::String(rail.to_owned()));
         }
     }
     if object.get("mu").and_then(Value::as_u64).is_none() {
@@ -15612,6 +15663,7 @@ fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
     }
     Ok(EarningsView {
         provider: record.provider,
+        rail: record.rail,
         denom: record.denom,
         total_mu: record.total_mu,
         held_mu: record.held_mu,
@@ -15670,7 +15722,8 @@ fn print_earnings_report(report: &Value) {
         .flatten()
     {
         println!(
-            "{}: total={} held={} paid={} released={} claimable={} {}",
+            "{}/{}: total={} held={} paid={} released={} claimable={} {}",
+            entry.get("rail").and_then(Value::as_str).unwrap_or("fiat"),
             entry.get("provider").and_then(Value::as_str).unwrap_or(""),
             entry.get("total_mu").and_then(Value::as_u64).unwrap_or(0),
             entry.get("held_mu").and_then(Value::as_u64).unwrap_or(0),
@@ -15753,14 +15806,19 @@ fn read_prior_earnings(path: Option<&Path>) -> Result<BTreeMap<String, u64>> {
         .as_object()
         .with_context(|| format!("{} must contain a JSON object", path.display()))?;
     let mut out = BTreeMap::new();
-    for (provider, value) in object {
+    for (key, value) in object {
         let mu = value
             .as_u64()
             .or_else(|| value.get("total_mu").and_then(Value::as_u64))
-            .with_context(|| {
-                format!("prior earning for {provider} must be a u64 or record.total_mu")
-            })?;
-        out.insert(provider.clone(), mu);
+            .with_context(|| format!("prior earning for {key} must be a u64 or record.total_mu"))?;
+        let rail_key = match (
+            value.get("rail").and_then(Value::as_str),
+            value.get("provider").and_then(Value::as_str),
+        ) {
+            (Some(rail), Some(provider)) => format!("{rail}/{provider}"),
+            _ => key.clone(),
+        };
+        out.insert(rail_key, mu);
     }
     Ok(out)
 }
@@ -16089,6 +16147,8 @@ struct LedgerServe {
 struct LedgerProvider {
     provider: String,
     status: String,
+    #[serde(default)]
+    accepted_rails: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -16188,6 +16248,7 @@ struct LedgerHoldbackBucket {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct LedgerEarningRecord {
     provider: String,
+    rail: String,
     denom: String,
     total_mu: u64,
     held_mu: u64,
@@ -16209,6 +16270,7 @@ struct LedgerEarningRecord {
 #[derive(Debug, Clone, Serialize)]
 struct EarningsView {
     provider: String,
+    rail: String,
     denom: String,
     total_mu: u64,
     held_mu: u64,
@@ -16325,6 +16387,7 @@ struct ActiveProviderSession {
     remote: String,
     user_pubkey: String,
     session_id: String,
+    rail: String,
 }
 
 #[derive(Clone, Debug)]
@@ -18039,6 +18102,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         .filter(|provider| provider.status == "active")
         .map(|provider| provider.provider.as_str())
         .collect::<BTreeSet<_>>();
+    let active_provider_by_id = contract
+        .providers
+        .iter()
+        .filter(|provider| provider.status == "active")
+        .map(|provider| (provider.provider.as_str(), provider))
+        .collect::<BTreeMap<_, _>>();
     let active_kyb_by_provider = contract
         .kyb
         .iter()
@@ -18169,6 +18238,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 ),
                 GatewayRouteCandidate {
                     provider: serving.provider.clone(),
+                    accepted_rails: active_provider_by_id
+                        .get(serving.provider.as_str())
+                        .map(|provider| provider.accepted_rails.clone())
+                        .unwrap_or_default(),
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
@@ -19327,12 +19400,18 @@ async fn handle_provider_session_frame(
                 .await
                 .context("opening provider side direct session")?;
             provider_session_debug(format!("provider side session {session_id} opened"));
+            let session_rail = provider_session_frame_rail(&frame).unwrap_or_default();
             let static_decision = provider_session_open_decision(&frame, terms);
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
                     provider_session_debug("s.open static decision accepted; rechecking contract");
-                    provider_session_current_state_decision(runtime.rpc, terms, runtime.rooms)
-                        .await?
+                    provider_session_current_state_decision(
+                        runtime.rpc,
+                        terms,
+                        runtime.rooms,
+                        &session_rail,
+                    )
+                    .await?
                 }
                 reject => reject,
             };
@@ -19343,6 +19422,7 @@ async fn handle_provider_session_frame(
                         session_id.clone(),
                         ActiveProviderSession {
                             remote: remote.clone(),
+                            rail: session_rail.to_owned(),
                             user_pubkey: frame
                                 .get("user")
                                 .and_then(Value::as_str)
@@ -19911,6 +19991,7 @@ fn provider_session_receipt(
         session_id: active.session_id.clone(),
         seq: 1,
         final_receipt: true,
+        rail: active.rail.clone(),
         user: active.user_pubkey.clone(),
         provider: terms.provider.clone(),
         enclave_id: terms.enclave_id.clone(),
@@ -20200,12 +20281,14 @@ async fn provider_session_current_state_decision(
     rpc: &PeerRpcClient,
     terms: &ProviderSessionTerms,
     startup_rooms: &[LedgerRoom],
+    rail: &str,
 ) -> Result<ProviderSessionDecision> {
     let contract = read_contract_catalog(rpc).await?;
     Ok(provider_session_contract_decision(
         &contract,
         terms,
         startup_rooms,
+        rail,
     ))
 }
 
@@ -20213,6 +20296,7 @@ fn provider_session_contract_decision(
     contract: &ContractCatalog,
     terms: &ProviderSessionTerms,
     startup_rooms: &[LedgerRoom],
+    rail: &str,
 ) -> ProviderSessionDecision {
     let reject = |code, reason: String| ProviderSessionDecision::Reject { code, reason };
     if contract.rules.as_ref().map(|rules| rules.ver) != Some(terms.rules_ver) {
@@ -20221,16 +20305,30 @@ fn provider_session_contract_decision(
             "current contract rules version no longer matches provider startup terms".to_owned(),
         );
     }
-    if contract
+    let Some(provider_record) = contract
         .providers
         .iter()
         .find(|provider| provider.provider == terms.provider)
-        .map(|provider| provider.status.as_str())
-        != Some("active")
-    {
+    else {
         return reject(
             "BANNED",
             "provider is no longer active in contract state".to_owned(),
+        );
+    };
+    if provider_record.status != "active" {
+        return reject(
+            "BANNED",
+            "provider is no longer active in contract state".to_owned(),
+        );
+    }
+    if !provider_record
+        .accepted_rails
+        .iter()
+        .any(|accepted| accepted == rail)
+    {
+        return reject(
+            "RAIL",
+            format!("provider does not accept the {rail} payment rail in contract state"),
         );
     }
     let Some(enclave) = contract
@@ -20380,6 +20478,13 @@ fn provider_session_open_decision(
             "session rules_ver does not match current rules".to_owned(),
         );
     }
+    let rail = provider_session_frame_rail(frame).unwrap_or("");
+    if !matches!(rail, "fiat" | "tap" | "tnk") {
+        return reject(
+            "RAIL",
+            "session rail must be one of fiat, tap, or tnk".to_owned(),
+        );
+    }
     let voucher = match frame
         .get("voucher")
         .cloned()
@@ -20392,6 +20497,9 @@ fn provider_session_open_decision(
     };
     if voucher.body.session_id.as_str() != session_id {
         return reject("VOUCHER", "voucher session_id mismatch".to_owned());
+    }
+    if voucher.body.rail.as_str() != rail {
+        return reject("VOUCHER", "voucher rail mismatch".to_owned());
     }
     if voucher.body.enclave_id.as_str() != terms.enclave_id.as_str() {
         return reject("VOUCHER", "voucher enclave_id mismatch".to_owned());
@@ -20415,6 +20523,10 @@ fn provider_session_open_decision(
         return reject("SIGNATURE", format!("{err:#}"));
     }
     ProviderSessionDecision::Accept
+}
+
+fn provider_session_frame_rail(frame: &Value) -> Option<&str> {
+    frame.get("rail").and_then(Value::as_str)
 }
 
 fn frame_contract_version(frame: &Value) -> Option<u32> {
@@ -24230,6 +24342,30 @@ mod tests {
             ProviderSessionDecision::Reject { code: "USER", .. }
         ));
 
+        let mut missing_rail = frame.clone();
+        missing_rail.as_object_mut().unwrap().remove("rail");
+        assert!(matches!(
+            provider_session_open_decision(&missing_rail, &terms),
+            ProviderSessionDecision::Reject { code: "RAIL", .. }
+        ));
+
+        let mut bad_rail = frame.clone();
+        bad_rail["rail"] = json!("coinbase");
+        assert!(matches!(
+            provider_session_open_decision(&bad_rail, &terms),
+            ProviderSessionDecision::Reject { code: "RAIL", .. }
+        ));
+
+        let mut rail_mismatch = frame.clone();
+        rail_mismatch["voucher"]["rail"] = json!("tap");
+        assert!(matches!(
+            provider_session_open_decision(&rail_mismatch, &terms),
+            ProviderSessionDecision::Reject {
+                code: "VOUCHER",
+                ..
+            }
+        ));
+
         let mut bad_voucher = frame;
         bad_voucher["voucher"]["price_ver"] = json!(terms.price_ver + 1);
         assert!(matches!(
@@ -24270,7 +24406,7 @@ mod tests {
         let startup_rooms = contract.rooms[..1].to_vec();
 
         assert_eq!(
-            provider_session_contract_decision(&contract, &terms, &startup_rooms),
+            provider_session_contract_decision(&contract, &terms, &startup_rooms, "fiat"),
             ProviderSessionDecision::Accept
         );
 
@@ -24281,21 +24417,33 @@ mod tests {
         let mut missing_role_startup_rooms = startup_rooms.clone();
         missing_role_startup_rooms[0].creator_role = None;
         assert!(matches!(
-            provider_session_contract_decision(&missing_role, &terms, &missing_role_startup_rooms),
+            provider_session_contract_decision(
+                &missing_role,
+                &terms,
+                &missing_role_startup_rooms,
+                "fiat"
+            ),
             ProviderSessionDecision::Reject { .. }
         ));
 
         let mut banned = contract.clone();
         banned.providers[0].status = "banned".to_owned();
         assert!(matches!(
-            provider_session_contract_decision(&banned, &terms, &startup_rooms),
+            provider_session_contract_decision(&banned, &terms, &startup_rooms, "fiat"),
             ProviderSessionDecision::Reject { code: "BANNED", .. }
+        ));
+
+        let mut rail_rejected = contract.clone();
+        rail_rejected.providers[0].accepted_rails = vec!["tnk".to_owned()];
+        assert!(matches!(
+            provider_session_contract_decision(&rail_rejected, &terms, &startup_rooms, "fiat"),
+            ProviderSessionDecision::Reject { code: "RAIL", .. }
         ));
 
         let mut retired = contract.clone();
         retired.enclaves[0].status = "retired".to_owned();
         assert!(matches!(
-            provider_session_contract_decision(&retired, &terms, &startup_rooms),
+            provider_session_contract_decision(&retired, &terms, &startup_rooms, "fiat"),
             ProviderSessionDecision::Reject {
                 code: "ENCLAVE",
                 ..
@@ -24305,7 +24453,12 @@ mod tests {
         let mut provider_created_enclave = contract.clone();
         provider_created_enclave.enclaves[0].created_by_role = Some("provider".to_owned());
         assert!(matches!(
-            provider_session_contract_decision(&provider_created_enclave, &terms, &startup_rooms),
+            provider_session_contract_decision(
+                &provider_created_enclave,
+                &terms,
+                &startup_rooms,
+                "fiat"
+            ),
             ProviderSessionDecision::Reject {
                 code: "ENCLAVE",
                 ..
@@ -24315,7 +24468,7 @@ mod tests {
         let mut stale_rules = contract.clone();
         stale_rules.rules.as_mut().unwrap().ver = terms.rules_ver + 1;
         assert!(matches!(
-            provider_session_contract_decision(&stale_rules, &terms, &startup_rooms),
+            provider_session_contract_decision(&stale_rules, &terms, &startup_rooms, "fiat"),
             ProviderSessionDecision::Reject {
                 code: "CONSENT",
                 ..
@@ -24325,7 +24478,7 @@ mod tests {
         let mut stale_price = contract.clone();
         stale_price.prices[0].current.as_mut().unwrap().ver = terms.price_ver + 1;
         assert!(matches!(
-            provider_session_contract_decision(&stale_price, &terms, &startup_rooms),
+            provider_session_contract_decision(&stale_price, &terms, &startup_rooms, "fiat"),
             ProviderSessionDecision::Reject {
                 code: "PRICE_VER",
                 ..
@@ -24339,7 +24492,7 @@ mod tests {
             .unwrap()
             .set_by_role = Some("provider".to_owned());
         assert!(matches!(
-            provider_session_contract_decision(&provider_priced, &terms, &startup_rooms),
+            provider_session_contract_decision(&provider_priced, &terms, &startup_rooms, "fiat"),
             ProviderSessionDecision::Reject {
                 code: "PRICE_VER",
                 ..
@@ -24349,42 +24502,62 @@ mod tests {
         let mut provider_created_room = contract.clone();
         provider_created_room.rooms[0].creator_role = Some("provider".to_owned());
         assert!(matches!(
-            provider_session_contract_decision(&provider_created_room, &terms, &startup_rooms),
+            provider_session_contract_decision(
+                &provider_created_room,
+                &terms,
+                &startup_rooms,
+                "fiat"
+            ),
             ProviderSessionDecision::Reject { code: "ROOM", .. }
         ));
 
         let mut provider_startup_room = startup_rooms.clone();
         provider_startup_room[0].creator_role = Some("provider".to_owned());
         assert!(matches!(
-            provider_session_contract_decision(&contract, &terms, &provider_startup_room),
+            provider_session_contract_decision(&contract, &terms, &provider_startup_room, "fiat"),
             ProviderSessionDecision::Reject { code: "ROOM", .. }
         ));
 
         let mut wrong_live_sidechannel = contract.clone();
         wrong_live_sidechannel.rooms[0].sidechannel = "mx/room/provider-made".to_owned();
         assert!(matches!(
-            provider_session_contract_decision(&wrong_live_sidechannel, &terms, &startup_rooms),
+            provider_session_contract_decision(
+                &wrong_live_sidechannel,
+                &terms,
+                &startup_rooms,
+                "fiat"
+            ),
             ProviderSessionDecision::Reject { code: "ROOM", .. }
         ));
 
         let mut wrong_startup_sidechannel = startup_rooms.clone();
         wrong_startup_sidechannel[0].sidechannel = "mx/room/provider-made".to_owned();
         assert!(matches!(
-            provider_session_contract_decision(&contract, &terms, &wrong_startup_sidechannel),
+            provider_session_contract_decision(
+                &contract,
+                &terms,
+                &wrong_startup_sidechannel,
+                "fiat"
+            ),
             ProviderSessionDecision::Reject { code: "ROOM", .. }
         ));
 
         let mut tombstoned_roomserve = contract.clone();
         tombstoned_roomserve.roomserve[0].status = "inactive".to_owned();
         assert!(matches!(
-            provider_session_contract_decision(&tombstoned_roomserve, &terms, &startup_rooms),
+            provider_session_contract_decision(
+                &tombstoned_roomserve,
+                &terms,
+                &startup_rooms,
+                "fiat"
+            ),
             ProviderSessionDecision::Reject { code: "ROOM", .. }
         ));
 
         let mut tombstoned_serve = contract.clone();
         tombstoned_serve.serves[0].status = "inactive".to_owned();
         assert!(matches!(
-            provider_session_contract_decision(&tombstoned_serve, &terms, &startup_rooms),
+            provider_session_contract_decision(&tombstoned_serve, &terms, &startup_rooms, "fiat"),
             ProviderSessionDecision::Reject { code: "SERVE", .. }
         ));
     }
@@ -24480,6 +24653,7 @@ mod tests {
             remote: "peer-a".to_owned(),
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
+            rail: "fiat".to_owned(),
         };
         let body = json!({
             "messages": [
@@ -24502,6 +24676,7 @@ mod tests {
             provider_session_receipt(&terms, &active, &body, &output, &runtime_keypair).unwrap();
 
         assert_eq!(receipt.body.session_id, active.session_id);
+        assert_eq!(receipt.body.rail, active.rail);
         assert_eq!(receipt.body.user, active.user_pubkey);
         assert_eq!(receipt.body.provider, terms.provider);
         assert_eq!(receipt.body.enclave_id, terms.enclave_id);
@@ -24536,6 +24711,7 @@ mod tests {
             remote: "peer-a".to_owned(),
             user_pubkey: hex_encode(&user_key.verifying_key().to_bytes()),
             session_id: "aa".repeat(32),
+            rail: "fiat".to_owned(),
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],
@@ -25307,6 +25483,7 @@ mod tests {
     fn earning_view_computes_released_mu_after_holdback_and_paid() {
         let view = earning_view(LedgerEarningRecord {
             provider: "provider-a".to_owned(),
+            rail: "fiat".to_owned(),
             denom: "mu_usd".to_owned(),
             total_mu: 10_000,
             held_mu: 2_500,
@@ -25333,6 +25510,7 @@ mod tests {
             held_mu: 1,
             paid_cum_mu: 1,
             provider: "bad-provider".to_owned(),
+            rail: "fiat".to_owned(),
             denom: "mu_usd".to_owned(),
             holdbacks: Vec::new(),
             updated_epoch: 0,
@@ -25418,9 +25596,10 @@ mod tests {
 
     #[test]
     fn balance_record_defaults_missing_contract_key_to_zero_mu_usd() {
-        let record = normalize_balance_record("user", None).unwrap();
+        let record = normalize_balance_record("user", "fiat", None).unwrap();
 
         assert_eq!(record["user"], "user");
+        assert_eq!(record["rail"], "fiat");
         assert_eq!(record["denom"], "mu_usd");
         assert_eq!(record["mu"], 0);
         assert_eq!(record["updated_epoch"], 0);
@@ -25431,8 +25610,10 @@ mod tests {
     fn balance_record_validates_denom_user_and_mu() {
         let record = normalize_balance_record(
             "user",
+            "fiat",
             Some(json!({
                 "user": "user",
+                "rail": "fiat",
                 "denom": "mu_usd",
                 "mu": 42,
                 "updated_epoch": 3,
@@ -25444,16 +25625,25 @@ mod tests {
 
         assert!(normalize_balance_record(
             "user",
+            "fiat",
             Some(json!({ "user": "user", "denom": "provider_coin", "mu": 1 }))
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
+            "fiat",
             Some(json!({ "user": "other", "denom": "mu_usd", "mu": 1 }))
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
+            "fiat",
+            Some(json!({ "user": "user", "rail": "tap", "denom": "mu_usd", "mu": 1 }))
+        )
+        .is_err());
+        assert!(normalize_balance_record(
+            "user",
+            "fiat",
             Some(json!({ "user": "user", "denom": "mu_usd" }))
         )
         .is_err());
@@ -25464,6 +25654,8 @@ mod tests {
         let stripe = checkout_from_paygate_response(
             PayRail::Stripe,
             &json!({
+                "rail": "fiat",
+                "processor_rail": "stripe",
                 "copy_paste": {
                     "checkout_url": "https://checkout.stripe.com/c/pay/cs_test"
                 },
@@ -25481,6 +25673,8 @@ mod tests {
         assert!(checkout_from_paygate_response(
             PayRail::Stripe,
             &json!({
+                "rail": "fiat",
+                "processor_rail": "stripe",
                 "checkout_session": {
                     "id": "cs_test",
                     "url": "javascript:alert(1)"
@@ -25491,6 +25685,8 @@ mod tests {
         assert!(checkout_from_paygate_response(
             PayRail::Stripe,
             &json!({
+                "rail": "fiat",
+                "processor_rail": "stripe",
                 "checkout_session": {
                     "id": "cs_test",
                     "url": "https://checkout.stripe.com.evil.example/c/pay/cs_test"
@@ -25501,6 +25697,8 @@ mod tests {
         assert!(checkout_from_paygate_response(
             PayRail::Stripe,
             &json!({
+                "rail": "fiat",
+                "processor_rail": "stripe",
                 "copy_paste": {
                     "checkout_url": "https://checkout.stripe.com/c/pay/other"
                 },
@@ -27734,6 +27932,7 @@ mod tests {
         let user = hex_encode(&user_key.verifying_key().to_bytes());
         let voucher_body = mayhem_proto::SpendVoucherBody {
             session_id: session_id.clone(),
+            rail: "fiat".to_owned(),
             enclave_id: terms.enclave_id.clone(),
             price_ver: terms.price_ver,
             max_spend_mu: 1000,
@@ -27752,12 +27951,14 @@ mod tests {
             "v": 1,
             "contract_version": terms.contract_version,
             "session_id": session_id,
+            "rail": &voucher_body.rail,
             "user": user,
             "enclave_id": &terms.enclave_id,
             "price_ver": terms.price_ver,
             "rules_ver": terms.rules_ver,
             "voucher": {
                 "session_id": voucher_body.session_id,
+                "rail": voucher_body.rail,
                 "enclave_id": voucher_body.enclave_id,
                 "price_ver": voucher_body.price_ver,
                 "max_spend_mu": voucher_body.max_spend_mu,
@@ -28303,6 +28504,7 @@ mod tests {
             providers: vec![LedgerProvider {
                 provider: "55".repeat(32),
                 status: "active".to_owned(),
+                accepted_rails: vec!["fiat".to_owned()],
             }],
             kyb: Vec::new(),
             prices: vec![LedgerPriceSchedule {

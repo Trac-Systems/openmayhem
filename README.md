@@ -164,7 +164,7 @@ Opt out:
 mayhem provider stop
 ```
 
-Providers are paid from settlement evidence. On the TAP rail, providers claim their own cumulative earnings from the escrow proof path; Mayhem does not push custodial payouts.
+Providers are paid from settlement evidence on the rail they accepted for the served session.
 
 ## Catalog And Enclaves
 
@@ -189,15 +189,15 @@ The contract and gateway settle usage through the generic metered map instead of
 
 ## Payments And Receipts
 
-All prices are denominated in `mu_usd`, integer micro-USD. Payment rails credit that same unit:
+All prices are denominated in `mu_usd`, integer micro-USD. The canonical ledger rails are exactly `fiat`, `tap`, and `tnk`; each rail has separate user balances, provider earnings, and operator-fee buckets. Money never crosses rails during settlement.
 
 | Rail | Use |
 |------|-----|
-| TAP | Crypto payment and provider claim rail. Users deposit TAP; providers claim TAP from settlement proofs. |
-| Stripe | Fiat checkout rail that credits the same `mu_usd` balance. |
-| TNK | Trac Network gas for paid ledger operations, not the user/provider payment unit. |
+| `fiat` | Fiat checkout rail. Stripe is the current processor for this rail and credits `bal/<user>/fiat`. |
+| `tap` | TAP crypto rail. Users deposit TAP and providers settle TAP earnings from `earn/tap/<provider>`. |
+| `tnk` | TNK crypto rail. Users deposit TNK and providers settle TNK earnings from `earn/tnk/<provider>`. |
 
-Each served session produces signed receipt evidence. The hot path avoids per-token ledger writes; receipts roll into epoch settlement roots.
+Providers choose which admin-supported rails they accept; they do not set prices, submit models, or create canonical rooms. Each served session produces signed receipt evidence bound to one rail. The hot path avoids per-token ledger writes; receipts roll into epoch settlement roots.
 
 ## Dashboards
 

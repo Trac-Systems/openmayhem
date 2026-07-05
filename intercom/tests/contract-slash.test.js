@@ -188,8 +188,9 @@ function signedCanaryProbe(ctx, overrides = {}) {
 }
 
 function seedHeldEarnings(storage, provider, overrides = {}) {
-  return storage.put(`earn/${provider.publicKey}`, {
+  return storage.put(`earn/fiat/${provider.publicKey}`, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 10_000,
     held_mu: 6_000,
@@ -230,8 +231,9 @@ test('MayhemContract canary mismatch slashes held earnings, tombstones serving, 
   assert.equal(result.ok, true, result.message);
   assert.equal(result.provenance_violation, true);
 
-  assert.deepEqual((await ctx.storage.get(`earn/${ctx.provider.publicKey}`)).value, {
+  assert.deepEqual((await ctx.storage.get(`earn/fiat/${ctx.provider.publicKey}`)).value, {
     provider: ctx.provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 4_000,
     held_mu: 0,
@@ -242,14 +244,16 @@ test('MayhemContract canary mismatch slashes held earnings, tombstones serving, 
     slashed_cum_mu: 6_000,
     last_slash_at: makeTxKey(10),
   });
-  assert.deepEqual((await ctx.storage.get(`bal/${ctx.auditor.publicKey}`)).value, {
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.auditor.publicKey}/fiat`)).value, {
     user: ctx.auditor.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     mu: 3_000,
     updated_epoch: 3,
     updated_at: makeTxKey(10),
   });
-  assert.deepEqual((await ctx.storage.get('fee/cum')).value, {
+  assert.deepEqual((await ctx.storage.get('fee/fiat/cum')).value, {
+    rail: 'fiat',
     denom: 'mu_usd',
     cum_mu: 3_000,
     swept_cum_mu: 0,
@@ -320,8 +324,9 @@ test('MayhemContract dispute_lost reputation event partially slashes held earnin
   assert.equal(result.slash.reason, 'dispute_lost');
   assert.equal(result.slash.forfeited_mu, 2_000);
 
-  assert.deepEqual((await ctx.storage.get(`earn/${ctx.provider.publicKey}`)).value, {
+  assert.deepEqual((await ctx.storage.get(`earn/fiat/${ctx.provider.publicKey}`)).value, {
     provider: ctx.provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 18_000,
     held_mu: 8_000,
@@ -336,8 +341,8 @@ test('MayhemContract dispute_lost reputation event partially slashes held earnin
     last_slash_at: makeTxKey(5),
   });
   assert.equal((await ctx.storage.get(`prov/${ctx.provider.publicKey}`)).value.status, 'active');
-  assert.equal((await ctx.storage.get(`bal/${ctx.admin.publicKey}`)).value.mu, 1_000);
-  assert.equal((await ctx.storage.get('fee/cum')).value.cum_mu, 1_000);
+  assert.equal((await ctx.storage.get(`bal/${ctx.admin.publicKey}/fiat`)).value.mu, 1_000);
+  assert.equal((await ctx.storage.get('fee/fiat/cum')).value.cum_mu, 1_000);
 
   const slash = (await ctx.storage.get(`ev/slash/${ctx.provider.publicKey}/${makeTxKey(5)}`)).value;
   assert.equal(slash.source, 'dispute');

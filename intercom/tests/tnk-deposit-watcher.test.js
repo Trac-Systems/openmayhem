@@ -171,6 +171,7 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
     pending: null,
     balance: {
       user: pubkey,
+      rail: 'tnk',
       denom: 'mu_usd',
       mu: 50_000,
     },
@@ -212,7 +213,7 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
 
   assert.equal(result.verified, true);
   assert.deepEqual(seenKeys.sort(), [
-    `bal/${pubkey}`,
+    `bal/${pubkey}/tnk`,
     'dep/pending/memo-a',
     'ev/dep/7',
   ].sort());

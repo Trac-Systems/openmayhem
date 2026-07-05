@@ -4,6 +4,8 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 
 const ROOT_KINDS = ['dep', 'use', 'earn', 'fee'];
+const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
+const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 
 export const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
@@ -46,11 +48,28 @@ function safeAmount(value, label, { allowZero = false } = {}) {
   return value;
 }
 
-function addAmount(map, key, amount, label) {
-  if (typeof key !== 'string' || key.length === 0) throw new Error(`${label} id is required`);
-  const next = (map.get(key) ?? 0) + amount;
+function normalizeLedgerRail(value) {
+  if (typeof value !== 'string') throw new Error('receipt rail is required');
+  const rail = value.toLowerCase();
+  if (!LEDGER_RAILS.has(rail)) throw new Error('receipt rail is unsupported');
+  return rail;
+}
+
+function addRailAmount(map, rail, id, amount, label) {
+  if (typeof id !== 'string' || id.length === 0) throw new Error(`${label} id is required`);
+  const key = JSON.stringify([rail, id]);
+  const current = map.get(key) ?? { rail, id, mu: 0 };
+  const next = current.mu + amount;
   safeAmount(next, label, { allowZero: true });
-  map.set(key, next);
+  map.set(key, { ...current, mu: next });
+}
+
+function sortedRailEntries(map) {
+  return Array.from(map.values()).sort((a, b) => {
+    const railOrder = LEDGER_RAIL_ORDER.indexOf(a.rail) - LEDGER_RAIL_ORDER.indexOf(b.rail);
+    if (railOrder !== 0) return railOrder;
+    return a.id.localeCompare(b.id);
+  });
 }
 
 function canonicalUsageUnit(unit) {
@@ -229,27 +248,29 @@ export async function recomputeEpoch(bundle) {
     const settleMu = receiptAmount(entry, body, previousBySession);
     previousBySession.set(body.session_id, body.mu_owed_cum ?? settleMu);
     if (settleMu === 0) continue;
+    const rail = normalizeLedgerRail(entry.rail ?? body.rail);
     sessions.add(body.session_id);
-    addAmount(debitMap, body.user, settleMu, 'debit');
-    addAmount(grossEarningMap, body.provider, settleMu, 'earning');
+    addRailAmount(debitMap, rail, body.user, settleMu, 'debit');
+    addRailAmount(grossEarningMap, rail, body.provider, settleMu, 'earning');
     usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', receiptLeafEnvelope(envelope)));
   }
 
   const earningEntries = [];
   let feeMu = 0;
   let earnCumMu = 0;
-  for (const [provider, grossMu] of Array.from(grossEarningMap.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+  for (const entry of sortedRailEntries(grossEarningMap)) {
+    const { rail, id: provider, mu: grossMu } = entry;
     const providerFeeMu = Math.floor((grossMu * feeBps) / 10_000);
     const netMu = grossMu - providerFeeMu;
     feeMu += providerFeeMu;
     safeAmount(feeMu, 'fee_mu', { allowZero: true });
-    const priorMu = priorEarnings[provider] ?? 0;
+    const priorMu = priorEarnings[`${rail}/${provider}`] ?? 0;
     safeAmount(priorMu, 'prior provider earning', { allowZero: true });
     const cumulative_mu = priorMu + netMu;
     safeAmount(cumulative_mu, 'provider cumulative earning', { allowZero: true });
     earnCumMu += cumulative_mu;
     safeAmount(earnCumMu, 'earn_mu', { allowZero: true });
-    earningEntries.push({ provider, gross_mu: grossMu, net_mu: netMu, cumulative_mu });
+    earningEntries.push({ rail, provider, gross_mu: grossMu, net_mu: netMu, cumulative_mu });
   }
   const feeCumMu = priorFeeCumMu + feeMu;
   safeAmount(feeCumMu, 'fee_cum_mu', { allowZero: true });
@@ -267,12 +288,10 @@ export async function recomputeEpoch(bundle) {
     if (!/^[0-9a-f]{64}$/.test(roots[key])) throw new Error(`invalid ${key} root`);
   }
 
-  const debits = Array.from(debitMap.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([user, mu]) => ({ user, mu }));
-  const earnings = Array.from(grossEarningMap.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([provider, gross_mu]) => ({ provider, gross_mu }));
+  const debits = sortedRailEntries(debitMap)
+    .map(({ rail, id: user, mu }) => ({ rail, user, mu }));
+  const earnings = sortedRailEntries(grossEarningMap)
+    .map(({ rail, id: provider, mu: gross_mu }) => ({ rail, provider, gross_mu }));
   const useMu = debits.reduce((sum, entry) => sum + entry.mu, 0);
   const totals = {
     dep_count: dep.count,

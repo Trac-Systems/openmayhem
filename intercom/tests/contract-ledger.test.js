@@ -19,8 +19,9 @@ const providerRegistration = {
   op: 'register_provider',
 };
 
-const seededBalance = (user, mu) => ({
+const seededBalance = (user, mu, rail = 'fiat') => ({
   user,
+  rail,
   denom: 'mu_usd',
   mu,
   updated_epoch: 0,
@@ -29,15 +30,15 @@ const seededBalance = (user, mu) => ({
 
 const paymentKeys = (storage) =>
   Array.from(storage.values.keys())
-    .filter((key) => key.startsWith('bal/') || key.startsWith('earn/') || key === 'fee/cum')
+    .filter((key) => key.startsWith('bal/') || key.startsWith('earn/') || key.startsWith('fee/'))
     .sort();
 
 const makeEpochApply = (epoch, user, provider, grossMu) => ({
   op: 'epoch_apply',
   epoch,
   at: epoch * 3600,
-  debits: [{ user, mu: grossMu }],
-  earnings: [{ provider, gross_mu: grossMu }],
+  debits: [{ rail: 'fiat', user, mu: grossMu }],
+  earnings: [{ rail: 'fiat', provider, gross_mu: grossMu }],
 });
 
 const mapPaidOps = (commands) => {
@@ -85,7 +86,7 @@ async function setupLedgerContract(identities = null) {
     assert.equal(result.ok, true, result.message);
   }
 
-  await storage.put(`bal/${user.publicKey}`, seededBalance(user.publicKey, 1_000_000));
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 1_000_000));
   return { admin, provider, user, outsider, storage, contract };
 }
 
@@ -289,8 +290,8 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
       op: 'epoch_apply',
       epoch: 1,
       at: 3600,
-      debits: [{ user: user.publicKey, mu: 1_500 }],
-      earnings: [{ provider: provider.publicKey, gross_mu: 1_400 }],
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 1_500 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 1_400 }],
     },
     admin.publicKey
   );
@@ -301,12 +302,12 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     epoch: 1,
     at: 3600,
     debits: [
-      { user: user.publicKey, mu: 1_000 },
-      { user: user.publicKey, mu: 500 },
+      { rail: 'fiat', user: user.publicKey, mu: 1_000 },
+      { rail: 'fiat', user: user.publicKey, mu: 500 },
     ],
     earnings: [
-      { provider: provider.publicKey, gross_mu: 1_250 },
-      { provider: provider.publicKey, gross_mu: 250 },
+      { rail: 'fiat', provider: provider.publicKey, gross_mu: 1_250 },
+      { rail: 'fiat', provider: provider.publicKey, gross_mu: 250 },
     ],
   };
   const firstApplyKey = await epochApplyFeatureKey(contract, firstApply);
@@ -336,17 +337,20 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     debited_mu: 1_500,
     earned_mu: 1_275,
     fee_mu: 225,
+    rails: ['fiat'],
   });
 
-  assert.deepEqual((await storage.get(`bal/${user.publicKey}`)).value, {
+  assert.deepEqual((await storage.get(`bal/${user.publicKey}/fiat`)).value, {
     user: user.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     mu: 998_500,
     updated_epoch: 1,
     updated_at: firstApplyKey,
   });
-  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+  assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 1_275,
     held_mu: 1_275,
@@ -356,7 +360,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     updated_at: firstApplyKey,
     last_holdback_release_epoch: 1,
   });
-  const feeAfterFirst = (await storage.get('fee/cum')).value;
+  const feeAfterFirst = (await storage.get('fee/fiat/cum')).value;
   assert.equal(feeAfterFirst.denom, 'mu_usd');
   assert.equal(feeAfterFirst.cum_mu, 225);
   assert.equal(feeAfterFirst.swept_cum_mu, 0);
@@ -449,14 +453,14 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   assert.equal(left.storage.values.size, totalKeysAfterFirst);
   assert.deepEqual(paymentKeys(left.storage), paymentKeysAfterFirst);
   assert.deepEqual(paymentKeysAfterFirst, [
-    `bal/${identities.user.publicKey}`,
-    `earn/${identities.provider.publicKey}`,
-    'fee/cum',
+    `bal/${identities.user.publicKey}/fiat`,
+    `earn/fiat/${identities.provider.publicKey}`,
+    'fee/fiat/cum',
   ].sort());
 
-  const balance = (await left.storage.get(`bal/${identities.user.publicKey}`)).value;
-  const earning = (await left.storage.get(`earn/${identities.provider.publicKey}`)).value;
-  const fee = (await left.storage.get('fee/cum')).value;
+  const balance = (await left.storage.get(`bal/${identities.user.publicKey}/fiat`)).value;
+  const earning = (await left.storage.get(`earn/fiat/${identities.provider.publicKey}`)).value;
+  const fee = (await left.storage.get('fee/fiat/cum')).value;
   assert.equal(balance.mu, 1_000_000 - expectedDebited);
   assert.equal(earning.total_mu, expectedDebited - expectedFee);
   assert.equal(earning.held_mu, expectedDebited - expectedFee);
@@ -469,6 +473,7 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
   const { admin, provider, storage, contract } = await setupLedgerContract();
   const before = storage.snapshotBytes();
   const tooManyDebits = Array.from({ length: 501 }, (_, i) => ({
+    rail: 'fiat',
     user: `user-${i}`,
     mu: 1,
   }));
@@ -480,7 +485,7 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
       epoch: 1,
       at: 3600,
       debits: tooManyDebits,
-      earnings: [{ provider: provider.publicKey, gross_mu: 501 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 501 }],
     },
     admin.publicKey
   );

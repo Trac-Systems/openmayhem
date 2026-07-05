@@ -337,7 +337,7 @@ test('MayhemContract rejects admin ops before genesis admin is present', async (
       epoch: 1,
       at: 3_600,
       debits: [],
-      earnings: [{ provider: outsider.publicKey, gross_mu: 1_000 }],
+      earnings: [{ rail: 'fiat', provider: outsider.publicKey, gross_mu: 1_000 }],
     },
     outsider.publicKey
   );
@@ -382,7 +382,7 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
       epoch: 1,
       at: 3_600,
       debits: [],
-      earnings: [{ provider: provider.publicKey, gross_mu: 1_000 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 1_000 }],
     },
     providerSender
   );

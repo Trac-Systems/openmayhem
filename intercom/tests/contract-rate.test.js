@@ -246,7 +246,7 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     admin.publicKey
   );
   assert.match(staleDeposit.message, /TAP rate oracle is stale/i);
-  assert.equal(await storage.get(`bal/${buyer}`), null);
+  assert.equal(await storage.get(`bal/${buyer}/tap`), null);
 
   const freshTapValue = { ...tapDeposit, at: 1_900 };
   const freshTapKey = await depositFeatureKey(contract, freshTapValue);
@@ -259,8 +259,9 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
   assert.equal(freshDeposit.ok, true, freshDeposit.message);
   assert.equal(freshDeposit.mu, 2_000_000);
   assert.equal(freshDeposit.rate_ts, 1_000);
-  assert.deepEqual((await storage.get(`bal/${buyer}`)).value, {
+  assert.deepEqual((await storage.get(`bal/${buyer}/tap`)).value, {
     user: buyer,
+    rail: 'tap',
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 1,
@@ -284,7 +285,7 @@ test('MayhemContract refuses TNK deposit credits when the rate is stale', async 
     admin.publicKey
   );
   assert.match(staleDeposit.message, /rate oracle is stale/i);
-  assert.equal(await storage.get(`bal/${user.publicKey}`), null);
+  assert.equal(await storage.get(`bal/${user.publicKey}/tnk`), null);
 
   const userConsent = await execute(
     contract,
@@ -324,12 +325,14 @@ test('MayhemContract refuses TNK deposit credits when the rate is stale', async 
   assert.equal(freshDeposit.epoch, 1);
   assert.equal(freshDeposit.deposit_root.length, 64);
   assert.equal(freshDeposit.rate_ts, 1_000);
-  assert.deepEqual((await storage.get(`bal/${user.publicKey}`)).value, {
+  assert.deepEqual((await storage.get(`bal/${user.publicKey}/tnk`)).value, {
     user: user.publicKey,
+    rail: 'tnk',
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 0,
     updated_at: freshTnkKey,
+    last_deposit_rail: 'tnk',
     last_deposit_rate_ts: 1_000,
   });
 });

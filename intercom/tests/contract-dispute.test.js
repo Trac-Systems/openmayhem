@@ -61,8 +61,9 @@ async function setupDisputeContract() {
     assert.equal(result.ok, true, result.message);
   }
 
-  await storage.put(`bal/${user.publicKey}`, {
+  await storage.put(`bal/${user.publicKey}/fiat`, {
     user: user.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     mu: 10_000,
     updated_epoch: 0,
@@ -75,6 +76,7 @@ function openDispute(user, provider, overrides = {}) {
   return {
     op: 'dispute',
     session_id: 'session-dispute-1',
+    rail: 'fiat',
     reason: 'service_failure',
     provider: provider.publicKey,
     counterparty: provider.publicKey,
@@ -92,8 +94,9 @@ function openDispute(user, provider, overrides = {}) {
 }
 
 function seedProviderHoldback(storage, provider, overrides = {}) {
-  return storage.put(`earn/${provider.publicKey}`, {
+  return storage.put(`earn/fiat/${provider.publicKey}`, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 20_000,
     held_mu: 10_000,
@@ -123,7 +126,7 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
   assert.equal(opened.ok, true, opened.message);
   assert.equal(opened.dispute_id, 1);
   assert.equal(opened.deposit_mu, 5_000);
-  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 5_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
 
   const nonAdmin = await execute(
     contract,
@@ -166,9 +169,10 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
   assert.equal(resolved.slash.beneficiary_mu, 1_000);
   assert.equal(resolved.slash.treasury_mu, 1_000);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 11_000);
-  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 11_000);
+  assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 18_000,
     held_mu: 8_000,
@@ -182,7 +186,7 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
     slashed_cum_mu: 2_000,
     last_slash_at: makeTxKey(7),
   });
-  assert.equal((await storage.get('fee/cum')).value.cum_mu, 1_000);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 1_000);
 
   const dispute = (await storage.get('disp/1')).value;
   assert.equal(dispute.status, 'resolved');
@@ -232,7 +236,7 @@ test('MayhemContract dispute resolution validates slash target before mutating f
     5
   );
   assert.equal(opened.ok, true, opened.message);
-  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 5_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
 
   const invalid = await execute(
     contract,
@@ -253,11 +257,11 @@ test('MayhemContract dispute resolution validates slash target before mutating f
   );
   assert.match(invalid.message, /invalid slash beneficiary/i);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 5_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
   assert.equal((await storage.get('disp/1')).value.status, 'open');
   assert.equal(await storage.get(`ev/rep/${provider.publicKey}/dispute-1-lost`), null);
   assert.equal(await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(6)}`), null);
-  assert.equal(await storage.get('fee/cum'), null);
+  assert.equal(await storage.get('fee/fiat/cum'), null);
 });
 
 test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', async () => {
@@ -298,8 +302,8 @@ test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', asy
   assert.equal(resolved.deposit_forfeited_mu, 5_000);
   assert.equal(resolved.slash, null);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 5_000);
-  assert.equal((await storage.get('fee/cum')).value.cum_mu, 5_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 5_000);
   const dispute = (await storage.get('disp/1')).value;
   assert.equal(dispute.status, 'resolved');
   assert.equal(dispute.outcome, 'opener_fault');

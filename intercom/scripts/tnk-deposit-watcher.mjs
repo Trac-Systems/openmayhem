@@ -304,6 +304,7 @@ export function depositStateMatches(match, {
   const depositMuTotal = nonNegativeSafeInteger(depositRoot?.mu_total);
   return pending === null
     && balance?.user === match.user
+    && balance?.rail === 'tnk'
     && balance?.denom === 'mu_usd'
     && balanceMu !== null
     && balanceMu >= quotedMu
@@ -327,7 +328,7 @@ export async function waitForDepositState(match, {
   while (Date.now() <= deadline) {
     const [pending, balance, depositRoot] = await Promise.all([
       readContractStateValue(rpcUrl, `dep/pending/${match.memo_hash}`, { fetchImpl }),
-      readContractStateValue(rpcUrl, `bal/${match.user}`, { fetchImpl }),
+      readContractStateValue(rpcUrl, `bal/${match.user}/tnk`, { fetchImpl }),
       readContractStateValue(rpcUrl, `ev/dep/${epoch}`, { fetchImpl }),
     ]);
     state = { pending, balance, depositRoot };

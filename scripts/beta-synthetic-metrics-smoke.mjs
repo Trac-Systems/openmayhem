@@ -267,9 +267,24 @@ function buildPaymentRailEvidence(outDir) {
   const paygateHealth = writeJson(path.join(outDir, 'paygate-health.json'), {
     ok: true,
     paygate_admin_controls_verified: true,
-    stripe_enabled: true,
+    fiat_enabled: true,
+    tap_enabled: true,
     coinbase_enabled: false,
+    stripe_processor_enabled: true,
     ledger_denom: 'mu_usd',
+  });
+  const fiatCredit = writeJson(path.join(outDir, 'fiat-credit-proof.json'), {
+    rail: 'fiat',
+    processor: 'stripe',
+    ledger_denom: 'mu_usd',
+    credits_mu_usd: true,
+    evidence_kind: 'synthetic-p8.5-credit',
+  });
+  const tapCredit = writeJson(path.join(outDir, 'tap-credit-proof.json'), {
+    rail: 'tap',
+    ledger_denom: 'mu_usd',
+    credits_mu_usd: true,
+    evidence_kind: 'synthetic-p8.5-credit',
   });
   const tnkCredit = writeJson(path.join(outDir, 'tnk-credit-proof.json'), {
     rail: 'tnk',
@@ -277,24 +292,21 @@ function buildPaymentRailEvidence(outDir) {
     credits_mu_usd: true,
     evidence_kind: 'synthetic-p8.5-credit',
   });
-  const stripeCredit = writeJson(path.join(outDir, 'stripe-credit-proof.json'), {
-    rail: 'stripe',
-    ledger_denom: 'mu_usd',
-    credits_mu_usd: true,
-    evidence_kind: 'synthetic-p8.5-credit',
-  });
   return writeJson(path.join(outDir, 'payment-rails-report.json'), {
     payment_rails: {
       ledger_denom: 'mu_usd',
+      fiat_enabled: true,
+      tap_enabled: true,
       tnk_enabled: true,
-      stripe_enabled: true,
+      stripe_processor_enabled: true,
       coinbase_enabled: false,
       rails_credit_mu_usd: true,
       paygate_admin_controls_verified: true,
       evidence: [
         fileEvidence(paygateHealth, ['paygate_admin_controls']),
+        fileEvidence(fiatCredit, ['rail:fiat', 'processor:stripe', 'credits_mu_usd']),
+        fileEvidence(tapCredit, ['rail:tap', 'credits_mu_usd']),
         fileEvidence(tnkCredit, ['rail:tnk', 'credits_mu_usd']),
-        fileEvidence(stripeCredit, ['rail:stripe', 'credits_mu_usd']),
       ],
     },
   });

@@ -21,15 +21,18 @@
   },
   "payment_rails": {
     "ledger_denom": "mu_usd",
+    "fiat_enabled": true,
+    "tap_enabled": true,
     "tnk_enabled": true,
-    "stripe_enabled": true,
+    "stripe_processor_enabled": true,
     "coinbase_enabled": false,
     "rails_credit_mu_usd": true,
     "paygate_admin_controls_verified": true,
     "evidence": [
       "<file:paygate-health.json#sha256:64-hex#paygate_admin_controls>",
-      "<file:tnk-credit-proof.json#sha256:64-hex#rail:tnk#credits_mu_usd>",
-      "<file:stripe-credit-proof.json#sha256:64-hex#rail:stripe#credits_mu_usd>"
+      "<file:fiat-credit-proof.json#sha256:64-hex#rail:fiat#processor:stripe#credits_mu_usd>",
+      "<file:tap-credit-proof.json#sha256:64-hex#rail:tap#credits_mu_usd>",
+      "<file:tnk-credit-proof.json#sha256:64-hex#rail:tnk#credits_mu_usd>"
     ]
   },
   "window": {
@@ -133,10 +136,10 @@
   "browser_handoffs": {
     "copy_paste_urls_printed": true,
     "rails_verified": [
-      "stripe"
+      "fiat"
     ],
     "samples": [
-      "<file:checkout-handoffs.log#sha256:64-hex#copy_paste.checkout_url:https://checkout.stripe.com/c/pay/cs_test_beta#rail:stripe>"
+      "<file:checkout-handoffs.log#sha256:64-hex#copy_paste.checkout_url:https://checkout.stripe.com/c/pay/cs_test_beta#rail:fiat#processor:stripe>"
     ]
   },
   "tracker": {

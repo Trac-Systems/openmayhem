@@ -306,7 +306,7 @@ function validatePaygatePublicBase(add, paygate) {
   return parsed.origin;
 }
 
-function requireRailCheckoutUrl(add, value, name, rail, expectedPathSegment, expectedOrigin = null) {
+function requireProcessorCheckoutUrl(add, value, name, processor, expectedPathSegment, expectedOrigin = null) {
   requireString(add, value, name, httpsUrl);
   const parsed = parseCheckedUrl(add, value, name);
   if (!parsed) return;
@@ -320,8 +320,8 @@ function requireRailCheckoutUrl(add, value, name, rail, expectedPathSegment, exp
   const segments = parsed.pathname.split('/').filter(Boolean);
   const last = segments.at(-1);
   const previous = segments.at(-2);
-  if (previous !== rail || last !== expectedPathSegment) {
-    add('error', `${name} must end with /${rail}/${expectedPathSegment}`);
+  if (previous !== processor || last !== expectedPathSegment) {
+    add('error', `${name} must end with /${processor}/${expectedPathSegment}`);
   }
 }
 
@@ -447,15 +447,15 @@ function verifyEnclaveDistributionSignature(add, adminPubkey, enclave, name) {
 
 function validateCheckoutUrls(add, paygate, expectedOrigin = null) {
   if (!requireObject(add, paygate.checkout_urls, 'paygate.checkout_urls')) return;
-  const activeRails = ['stripe'];
-  requireOnlyKeys(add, paygate.checkout_urls, 'paygate.checkout_urls', activeRails);
-  for (const rail of activeRails) {
-    const railConfig = paygate.checkout_urls[rail];
-    const prefix = `paygate.checkout_urls.${rail}`;
-    if (!requireObject(add, railConfig, prefix)) continue;
-    requireOnlyKeys(add, railConfig, prefix, ['success_url', 'cancel_url']);
-    requireRailCheckoutUrl(add, railConfig.success_url, `${prefix}.success_url`, rail, 'return', expectedOrigin);
-    requireRailCheckoutUrl(add, railConfig.cancel_url, `${prefix}.cancel_url`, rail, 'cancel', expectedOrigin);
+  const activeProcessors = ['stripe'];
+  requireOnlyKeys(add, paygate.checkout_urls, 'paygate.checkout_urls', activeProcessors);
+  for (const processor of activeProcessors) {
+    const processorConfig = paygate.checkout_urls[processor];
+    const prefix = `paygate.checkout_urls.${processor}`;
+    if (!requireObject(add, processorConfig, prefix)) continue;
+    requireOnlyKeys(add, processorConfig, prefix, ['success_url', 'cancel_url']);
+    requireProcessorCheckoutUrl(add, processorConfig.success_url, `${prefix}.success_url`, processor, 'return', expectedOrigin);
+    requireProcessorCheckoutUrl(add, processorConfig.cancel_url, `${prefix}.cancel_url`, processor, 'cancel', expectedOrigin);
   }
 }
 
@@ -1406,7 +1406,7 @@ function printHuman(report, commands, { args }) {
   }
 
   console.log('');
-  console.log('Copy/paste payment commands; hosted rails print the checkout URL before any browser open:');
+  console.log('Copy/paste payment commands; hosted processors print the checkout URL before any browser open:');
   for (const command of commands.checkoutCommands) console.log(command);
 
   console.log('');

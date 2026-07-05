@@ -1635,6 +1635,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
     let room_id = format!("{:02x}", idx + 160).repeat(16);
     GatewayRouteCandidate {
         provider: provider.to_owned(),
+        accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
         enclave_id: catalog_enclave_id(&identity),
         room_id,
         price_ver: 7,

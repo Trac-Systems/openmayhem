@@ -390,7 +390,7 @@ async function checkPaygate(manifest, args) {
       ? check(
         'paygate.public_health',
         true,
-        `public paygate health matches active rails and admin-control flags (${url.href})`,
+        `public paygate health matches active processors and admin-control flags (${url.href})`,
         {
           url: url.href,
           status_code: response.status,
@@ -398,7 +398,7 @@ async function checkPaygate(manifest, args) {
       )
       : advisory(
         'paygate.public_health',
-        'public paygate health did not match mu_usd rails/admin-control flags; Stripe checkout handoff evidence remains sufficient for beta',
+        'public paygate health did not match mu_usd processor/admin-control flags; Stripe checkout handoff evidence remains sufficient for beta',
         {
           url: url.href,
           status_code: response.status,

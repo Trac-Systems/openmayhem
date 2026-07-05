@@ -164,12 +164,14 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
   assert.equal(confirmed.rate_ts, 1_000);
   assert.equal(await ctx.storage.get('dep/pending/memo-a'), null);
 
-  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}`)).value, {
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value, {
     user: ctx.user.publicKey,
+    rail: 'tnk',
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 0,
     updated_at: confirmedKey,
+    last_deposit_rail: 'tnk',
     last_deposit_rate_ts: 1_000,
   });
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, {
@@ -330,8 +332,9 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     credited_by: ctx.admin.publicKey,
     credited_by_role: 'admin',
   });
-  assert.deepEqual((await ctx.storage.get(`bal/${buyer}`)).value, {
+  assert.deepEqual((await ctx.storage.get(`bal/${buyer}/tap`)).value, {
     user: buyer,
+    rail: 'tap',
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 1,
@@ -355,7 +358,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.equal(replay.mu, 0);
   assert.equal(replay.credited_mu, 2_000_000);
   assert.equal(replay.deposit_root, confirmed.deposit_root);
-  assert.deepEqual((await ctx.storage.get(`bal/${buyer}`)).value.mu, 2_000_000);
+  assert.deepEqual((await ctx.storage.get(`bal/${buyer}/tap`)).value.mu, 2_000_000);
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
 });
 
@@ -389,20 +392,23 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   const confirmed = await executeDepositFeature(ctx.contract, ctx.storage, fiatValue, ctx.admin.publicKey);
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.op, 'fiatDeposit');
-  assert.equal(confirmed.rail, 'stripe');
+  assert.equal(confirmed.rail, 'fiat');
+  assert.equal(confirmed.processor_rail, 'stripe');
   assert.equal(confirmed.who, ctx.user.publicKey);
   assert.equal(confirmed.mu, 2_500_000);
   assert.equal(confirmed.fiat_currency, 'usd');
   assert.equal(confirmed.fiat_amount_minor, 250);
   assert.equal(confirmed.deposit_root.length, 64);
 
-  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}`)).value, {
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value, {
     user: ctx.user.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     mu: 2_500_000,
     updated_epoch: 1,
     updated_at: confirmedKey,
-    last_deposit_rail: 'stripe',
+    last_deposit_rail: 'fiat',
+    last_deposit_processor_rail: 'stripe',
     last_deposit_fiat_currency: 'usd',
   });
   const root = (await ctx.storage.get('ev/dep/1')).value;
@@ -457,6 +463,8 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
   );
   assert.equal(chargeback.ok, true, chargeback.message);
   assert.equal(chargeback.op, 'fiatChargeback');
+  assert.equal(chargeback.rail, 'fiat');
+  assert.equal(chargeback.processor_rail, 'stripe');
   assert.equal(chargeback.clawback_mu, 2_500_000);
   assert.equal(chargeback.network_absorbed_mu, 500_000);
   assert.equal(chargeback.fiat_currency, 'eur');
@@ -464,22 +472,26 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
   assert.equal(chargeback.frozen, true);
   assert.equal(chargeback.deposit_root.length, 64);
 
-  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}`)).value, {
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value, {
     user: ctx.user.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     mu: 0,
     updated_epoch: 2,
     updated_at: makeTxKey(4),
-    last_deposit_rail: 'stripe',
+    last_deposit_rail: 'fiat',
+    last_deposit_processor_rail: 'stripe',
     last_deposit_fiat_currency: 'eur',
-    last_chargeback_rail: 'stripe',
+    last_chargeback_rail: 'fiat',
+    last_chargeback_processor_rail: 'stripe',
     last_chargeback_fiat_currency: 'eur',
   });
   assert.deepEqual((await ctx.storage.get(`frozen/${ctx.user.publicKey}`)).value, {
     user: ctx.user.publicKey,
     status: 'frozen',
     reason: 'fiat_chargeback',
-    rail: 'stripe',
+    rail: 'fiat',
+    processor_rail: 'stripe',
     first_frozen_at: makeTxKey(4),
     first_frozen_at_seconds: 3_600,
     updated_at: makeTxKey(4),

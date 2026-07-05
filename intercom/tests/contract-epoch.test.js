@@ -24,8 +24,9 @@ const enclaveId = 'e'.repeat(64);
 const modelId = 'meta/llama-3.1-8b-instruct@4bit';
 const scriptPath = fileURLToPath(new URL('../scripts/recompute-epoch-roots.mjs', import.meta.url));
 
-const seededBalance = (user, mu) => ({
+const seededBalance = (user, mu, rail = 'fiat') => ({
   user,
+  rail,
   denom: 'mu_usd',
   mu,
   updated_epoch: 0,
@@ -70,7 +71,7 @@ async function setupEpochContract() {
     assert.equal(result.ok, true, result.message);
   }
 
-  await storage.put(`bal/${user.publicKey}`, seededBalance(user.publicKey, 1_000_000));
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 1_000_000));
   return { admin, provider, user, submitter, storage, contract };
 }
 
@@ -86,6 +87,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       session_id: 'session-epoch-1',
       seq: 1,
       final: true,
+      rail: 'fiat',
       user: user.publicKey,
       provider: provider.publicKey,
       enclave_id: enclaveId,
@@ -155,6 +157,7 @@ const signedReceipt = (user, provider, enclave, overrides = {}) => {
     session_id: 'session-epoch-1',
     seq: 1,
     final: true,
+    rail: 'fiat',
     user: user.publicKey,
     provider: provider.publicKey,
     enclave_id: enclaveId,
@@ -269,17 +272,20 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     debited_mu: 2_000,
     earned_mu: 1_700,
     fee_mu: 300,
+    rails: ['fiat'],
   });
 
-  assert.deepEqual((await storage.get(`bal/${user.publicKey}`)).value, {
+  assert.deepEqual((await storage.get(`bal/${user.publicKey}/fiat`)).value, {
     user: user.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     mu: 998_000,
     updated_epoch: 1,
     updated_at: applyKey,
   });
-  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+  assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 1_700,
     held_mu: 1_700,
@@ -449,7 +455,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
   );
   assert.match(voidApply.message, /commit is void/i);
   assert.equal((await storage.get('ev/use/1')), null);
-  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
 
   const emptyEpoch = await recomputeEpoch({
     epoch: 2,
@@ -508,8 +514,9 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
   const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
     receipts: [inflatedReceipt],
   }));
-  await storage.put(`earn/${provider.publicKey}`, {
+  await storage.put(`earn/fiat/${provider.publicKey}`, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 8_500,
     held_mu: 8_500,
@@ -567,8 +574,9 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
   assert.equal(proof.slash.beneficiary_mu, 4_250);
   assert.equal(proof.slash.treasury_mu, 4_250);
 
-  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+  assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 0,
     held_mu: 0,
@@ -579,8 +587,8 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
     slashed_cum_mu: 8_500,
     last_slash_at: makeTxKey(5),
   });
-  assert.equal((await storage.get(`bal/${prover.publicKey}`)).value.mu, 4_250);
-  assert.equal((await storage.get('fee/cum')).value.cum_mu, 4_250);
+  assert.equal((await storage.get(`bal/${prover.publicKey}/fiat`)).value.mu, 4_250);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 4_250);
   assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'banned');
   assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.status, 'tombstoned');
 
@@ -662,7 +670,7 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
     admin.publicKey
   );
   assert.match(noCommit.message, /commit required/i);
-  assert.equal((await storage.get('fee/cum')), null);
+  assert.equal((await storage.get('fee/fiat/cum')), null);
   assert.equal((await storage.get('ev/use/1')), null);
 
   const commit = await execute(
@@ -696,9 +704,9 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
     admin.publicKey
   );
   assert.match(mismatch.message, /do not match committed roots/i);
-  assert.equal((await storage.get('fee/cum')), null);
+  assert.equal((await storage.get('fee/fiat/cum')), null);
   assert.equal((await storage.get('ev/use/1')), null);
-  assert.equal((await storage.get(`bal/${user.publicKey}`)).value.mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
 });
 
 test('epoch root recompute script CLI matches the imported independent recompute function', async () => {

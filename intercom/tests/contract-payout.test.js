@@ -67,8 +67,9 @@ async function setupPayoutContract() {
     assert.equal(result.ok, true, result.message);
   }
 
-  await storage.put(`bal/${user.publicKey}`, {
+  await storage.put(`bal/${user.publicKey}/fiat`, {
     user: user.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     mu: 5_000_000,
     updated_epoch: 0,
@@ -81,8 +82,8 @@ const epochApply = (epoch, user, provider, grossMu, overrides = {}) => ({
   op: 'epoch_apply',
   epoch,
   at: epoch * 3_600,
-  debits: [{ user, mu: grossMu }],
-  earnings: [{ provider, gross_mu: grossMu }],
+  debits: [{ rail: 'fiat', user, mu: grossMu }],
+  earnings: [{ rail: 'fiat', provider, gross_mu: grossMu }],
   ...overrides,
 });
 
@@ -98,6 +99,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       session_id: 'session-payout-rollup-1',
       seq: 1,
       final: true,
+      rail: 'fiat',
       user,
       provider,
       enclave_id: enclaveId,
@@ -231,10 +233,12 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
     debited_mu: 2_000_000,
     earned_mu: 1_700_000,
     fee_mu: 300_000,
+    rails: ['fiat'],
   });
 
-  assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
+  assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
+    rail: 'fiat',
     denom: 'mu_usd',
     total_mu: 1_700_000,
     held_mu: 1_700_000,
@@ -293,7 +297,8 @@ test('MayhemContract provider payoutConfirm is retired and cannot mutate state',
 
 test('MayhemContract fee-sweep payoutConfirm is retired and cannot mutate fee evidence', async () => {
   const { admin, storage, contract } = await setupPayoutContract();
-  await storage.put('fee/cum', {
+  await storage.put('fee/fiat/cum', {
+    rail: 'fiat',
     denom: 'mu_usd',
     cum_mu: 2_000_000,
     swept_cum_mu: 0,

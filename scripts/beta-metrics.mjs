@@ -14,6 +14,7 @@ const thresholds = {
   externalProviders: 20,
   users: 100,
 };
+const canonicalLedgerRails = ['fiat', 'tap', 'tnk'];
 
 function usage() {
   console.log(`Usage: node scripts/beta-metrics.mjs [--metrics PATH] [--allow-placeholders] [--json]
@@ -203,11 +204,11 @@ function checkoutUrlMatchesRail(value, rail) {
   }
   if (parsed.protocol !== 'https:') return false;
   const hostname = parsed.hostname.toLowerCase();
-  if (rail === 'stripe') return hostname === 'checkout.stripe.com';
+  if (rail === 'fiat') return hostname === 'checkout.stripe.com';
   return false;
 }
 
-function validatePaymentRailEvidence(add, value, requiredRails = ['tnk', 'stripe']) {
+function validatePaymentRailEvidence(add, value, requiredRails = canonicalLedgerRails) {
   validateEvidenceArray(add, value, 'payment_rails.evidence');
   if (!Array.isArray(value)) return;
   if (value.some((item) => isPlaceholder(item))) return;
@@ -215,6 +216,7 @@ function validatePaymentRailEvidence(add, value, requiredRails = ['tnk', 'stripe
     if (!value.some((item) => (
       isFileEvidence(item)
       && hasEvidenceTag(item, `rail:${rail}`)
+      && (rail !== 'fiat' || hasEvidenceTag(item, 'processor:stripe'))
       && hasEvidenceTag(item, 'credits_mu_usd')
     ))) {
       add('error', `payment_rails.evidence must include file-bound mu_usd credit evidence for ${rail}`);
@@ -246,11 +248,12 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
     add('error', 'browser_handoffs.samples must include copy_paste.checkout_url evidence');
   }
   if (!Array.isArray(railsVerified)) return;
-  for (const rail of ['stripe']) {
+  for (const rail of ['fiat']) {
     if (!railsVerified.includes(rail)) continue;
     if (!value.some((sample) => (
       isFileEvidence(sample)
       && hasEvidenceTag(sample, `rail:${rail}`)
+      && (rail !== 'fiat' || hasEvidenceTag(sample, 'processor:stripe'))
       && checkoutUrlMatchesRail(sample, rail)
     ))) {
       add('error', `browser_handoffs.samples must include file-bound hosted ${rail} checkout URL evidence`);
@@ -258,15 +261,15 @@ function validateCheckoutHandoffSamples(add, value, railsVerified) {
   }
 }
 
-function validateRequiredRails(add, value, requiredRails = ['stripe']) {
+function validateRequiredRails(add, value, requiredRails = ['fiat']) {
   if (!requireArray(add, value, 'browser_handoffs.rails_verified', requiredRails.length)) return;
-  const allowed = new Set(['stripe']);
+  const allowed = new Set(canonicalLedgerRails);
   const seen = new Set();
   for (const [index, rail] of value.entries()) {
     requireString(add, rail, `browser_handoffs.rails_verified[${index}]`);
     if (typeof rail !== 'string' || isPlaceholder(rail)) continue;
     if (!allowed.has(rail)) {
-      add('error', `browser_handoffs.rails_verified[${index}] must be stripe`);
+      add('error', `browser_handoffs.rails_verified[${index}] must be one of fiat, tap, or tnk`);
     }
     if (seen.has(rail)) {
       add('error', `browser_handoffs.rails_verified[${index}] duplicates another rail`);
@@ -328,8 +331,10 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
 
   if (requireObject(add, metrics.payment_rails, 'payment_rails')) {
     requireLiteral(add, metrics.payment_rails.ledger_denom, 'mu_usd', 'payment_rails.ledger_denom');
+    requireBoolean(add, metrics.payment_rails.fiat_enabled, true, 'payment_rails.fiat_enabled');
+    requireBoolean(add, metrics.payment_rails.tap_enabled, true, 'payment_rails.tap_enabled');
     requireBoolean(add, metrics.payment_rails.tnk_enabled, true, 'payment_rails.tnk_enabled');
-    requireBoolean(add, metrics.payment_rails.stripe_enabled, true, 'payment_rails.stripe_enabled');
+    requireBoolean(add, metrics.payment_rails.stripe_processor_enabled, true, 'payment_rails.stripe_processor_enabled');
     requireBoolean(add, metrics.payment_rails.coinbase_enabled, false, 'payment_rails.coinbase_enabled');
     requireBoolean(add, metrics.payment_rails.rails_credit_mu_usd, true, 'payment_rails.rails_credit_mu_usd');
     requireBoolean(
@@ -338,7 +343,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       true,
       'payment_rails.paygate_admin_controls_verified',
     );
-    validatePaymentRailEvidence(add, metrics.payment_rails.evidence, ['tnk', 'stripe']);
+    validatePaymentRailEvidence(add, metrics.payment_rails.evidence);
   }
 
   if (requireObject(add, metrics.window, 'window')) {
@@ -532,7 +537,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
 
   if (requireObject(add, metrics.browser_handoffs, 'browser_handoffs')) {
     requireBoolean(add, metrics.browser_handoffs.copy_paste_urls_printed, true, 'browser_handoffs.copy_paste_urls_printed');
-    validateRequiredRails(add, metrics.browser_handoffs.rails_verified, ['stripe']);
+    validateRequiredRails(add, metrics.browser_handoffs.rails_verified, ['fiat']);
     validateCheckoutHandoffSamples(add, metrics.browser_handoffs.samples, metrics.browser_handoffs.rails_verified);
   }
 

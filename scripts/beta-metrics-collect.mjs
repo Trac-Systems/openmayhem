@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultOut = 'config/beta/metrics.json';
 const hex64 = /^[0-9a-fA-F]{64}$/;
+const canonicalLedgerRails = ['fiat', 'tap', 'tnk'];
 
 function usage() {
   console.log(`Usage: node scripts/beta-metrics-collect.mjs --window-start ISO --window-end ISO \\
@@ -25,7 +26,7 @@ Accepted evidence shapes are intentionally plain:
 - launch-manifest: a strict P8.4 beta launch manifest accepted by scripts/beta-launch.mjs
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
-- payment-rails: paygate/rail report proving TNK and Stripe credit mu_usd; Coinbase is retired and must remain coinbase_enabled:false
+- payment-rails: rail report proving fiat, TAP, and TNK credit mu_usd; Stripe is only the fiat processor; Coinbase is retired and must remain coinbase_enabled:false
 - guardian: small summary JSON; the source file hash is recorded as evidence
 - canary: small summary JSON; the source file hash is recorded as evidence
 - browser: small summary JSON; browser handoffs may also be a text log`);
@@ -164,7 +165,8 @@ function checkoutUrlFromPayReport(value) {
 
 function normalizeRail(value) {
   const normalized = typeof value === 'string' ? value.toLowerCase() : value;
-  return normalized === 'stripe' ? normalized : null;
+  if (normalized === 'stripe') return 'fiat';
+  return canonicalLedgerRails.includes(normalized) ? normalized : null;
 }
 
 function railFromUrl(url) {
@@ -175,7 +177,17 @@ function railFromUrl(url) {
     return null;
   }
   const hostname = parsed.hostname.toLowerCase();
-  if (hostname === 'checkout.stripe.com') return 'stripe';
+  if (hostname === 'checkout.stripe.com') return 'fiat';
+  return null;
+}
+
+function processorFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() === 'checkout.stripe.com') return 'stripe';
+  } catch {
+    return null;
+  }
   return null;
 }
 
@@ -185,7 +197,7 @@ function checkoutRecordsFromText(text) {
   let match = pattern.exec(text);
   while (match) {
     const prefix = text.slice(Math.max(0, match.index - 160), match.index);
-    const railMatches = Array.from(prefix.matchAll(/Mayhem\s+(stripe)\s+checkout/gi));
+    const railMatches = Array.from(prefix.matchAll(/Mayhem\s+(fiat|stripe)\s+checkout/gi));
     const railMatch = railMatches.at(-1);
     const url = match[1].replace(/[),.;]+$/g, '');
     records.push({ url, rail: normalizeRail(railMatch?.[1]) ?? railFromUrl(url) });
@@ -196,8 +208,10 @@ function checkoutRecordsFromText(text) {
 
 function checkoutUrlEvidence(records, sourceEvidence) {
   return records.map(({ url, rail }) => {
-    const suffix = rail ? `#rail:${rail}` : '';
-    return `${sourceEvidence}#copy_paste.checkout_url:${url}${suffix}`;
+    const railSuffix = rail ? `#rail:${rail}` : '';
+    const processor = processorFromUrl(url);
+    const processorSuffix = processor ? `#processor:${processor}` : '';
+    return `${sourceEvidence}#copy_paste.checkout_url:${url}${railSuffix}${processorSuffix}`;
   });
 }
 
@@ -218,7 +232,8 @@ function checkoutRecordsFromJson(value) {
 }
 
 function railsFromCheckoutRecords(records) {
-  return Array.from(new Set(records.map((record) => record.rail).filter(Boolean))).sort();
+  const rails = new Set(records.map((record) => record.rail).map(normalizeRail).filter(Boolean));
+  return canonicalLedgerRails.filter((rail) => rails.has(rail));
 }
 
 function stableJson(value) {
@@ -436,7 +451,9 @@ function collectBrowserHandoffs(args) {
       .filter(Boolean) ?? [];
     return {
       copy_paste_urls_printed: explicitCopyPaste === true || checkoutSamples.length > 0,
-      rails_verified: Array.from(new Set([...railsFromCheckoutRecords(checkoutRecords), ...explicitRails])).sort(),
+      rails_verified: canonicalLedgerRails.filter((rail) => (
+        new Set([...railsFromCheckoutRecords(checkoutRecords), ...explicitRails]).has(rail)
+      )),
       samples: [
         source.evidence,
         ...checkoutSamples,
@@ -532,12 +549,18 @@ function collectPaymentRails(args) {
   const source = readJsonEvidence(requireArg(args, 'paymentRails'));
   const value = source.value;
   const record = firstDefined(value, ['payment_rails']) ?? value;
+  const stripeProcessorEnabled =
+    firstDefined(record, ['stripe_processor_enabled', 'stripe.enabled', 'paygate.stripe_enabled', 'rails.stripe.enabled']) === true
+    || firstDefined(value, ['paygate.stripe_enabled', 'rails.stripe.enabled']) === true
+    || firstDefined(record, ['stripe_enabled']) === true;
   return {
     ledger_denom: firstDefined(record, ['ledger_denom', 'denom', 'network.denom']) ?? firstDefined(value, ['network.denom']),
+    fiat_enabled:
+      firstDefined(record, ['fiat_enabled', 'fiat.enabled', 'rails.fiat.enabled']) === true
+      || stripeProcessorEnabled,
+    tap_enabled: firstDefined(record, ['tap_enabled', 'tap.enabled', 'rails.tap.enabled']) === true,
     tnk_enabled: firstDefined(record, ['tnk_enabled', 'tnk.enabled', 'rails.tnk.enabled']) === true,
-    stripe_enabled:
-      firstDefined(record, ['stripe_enabled', 'stripe.enabled', 'paygate.stripe_enabled', 'rails.stripe.enabled']) === true
-      || firstDefined(value, ['paygate.stripe_enabled', 'rails.stripe.enabled']) === true,
+    stripe_processor_enabled: stripeProcessorEnabled,
     coinbase_enabled: false,
     rails_credit_mu_usd: firstDefined(record, ['rails_credit_mu_usd', 'credit_mu_usd', 'credits_mu_usd']) === true,
     paygate_admin_controls_verified:
