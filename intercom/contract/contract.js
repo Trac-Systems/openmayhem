@@ -122,6 +122,23 @@ export const receiptMessage = (body) => JSON.stringify({
   domain: 'mayhem-session-receipt-v1',
   body,
 });
+export const probeResultEvidence = (value, auditor) => ({
+  auditor,
+  probe_id: value.probe_id,
+  probe_kind: value.probe_kind,
+  provider: value.provider,
+  enclave_id: value.enclave_id,
+  binary_hash: value.binary_hash,
+  canary_set: value.canary_set,
+  session_receipt_hash: value.session_receipt_hash,
+  evidence_hash: value.evidence_hash,
+  match_bps: value.match_bps,
+  pass: value.pass,
+  epoch: value.epoch,
+  at: value.at,
+});
+export const probeResultMessage = (value, auditor) =>
+  `mayhem-probe-result-v1${stableJson(probeResultEvidence(value, auditor))}`;
 export const roomSidechannelName = (roomId) => `mx/room/${roomId}`;
 export const deriveRoomId = async (modelId, creator, nonce) => {
   const digest = await blake3(b4a.from(`${modelId}${creator}${nonce}`));
@@ -461,6 +478,7 @@ class MayhemContract extends Contract {
         probe_kind: { type: 'string', min: 1, max: 64 },
         provider: { type: 'string', min: 1, max: 128 },
         enclave_id: { type: 'string', min: 1, max: 128, optional: true },
+        binary_hash: { type: 'string', min: 1, max: 128, optional: true },
         epoch: { type: 'number', integer: true, min: 0 },
         at: { type: 'number', integer: true, min: 0 },
         canary_set: { type: 'string', min: 1, max: 128, optional: true },
@@ -468,6 +486,7 @@ class MayhemContract extends Contract {
         pass: { type: 'boolean', optional: true },
         session_receipt_hash: { type: 'string', min: 1, max: 128, optional: true },
         evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
+        auditor_sig: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
 
@@ -1767,6 +1786,11 @@ class MayhemContract extends Contract {
     const provider = await this.get(providerKey);
     if (!provider) return new Error('Provider not found.');
 
+    if (this.value.probe_kind === 'canary') {
+      const canaryBindingError = await this.requireBoundCanaryProbe(this.value, this.address);
+      if (canaryBindingError) return canaryBindingError;
+    }
+
     const params = await this.activeParamsAt(this.value.at, [
       'canary_match_min_bps',
       'probe_reward_mu',
@@ -1835,10 +1859,12 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       at: this.value.at,
       canary_set: this.value.canary_set ?? null,
+      binary_hash: this.value.binary_hash ?? null,
       match_bps: this.value.match_bps ?? null,
       pass,
       session_receipt_hash: this.value.session_receipt_hash ?? null,
       evidence_hash: this.value.evidence_hash ?? null,
+      auditor_sig: this.value.auditor_sig ?? null,
       reputation_head: (await this.get(`ev/rep/head/${this.value.provider}`))?.head ?? null,
       provenance_violation: provenanceViolation,
       probe_reward_mu: params.probe_reward_mu,
@@ -3423,15 +3449,47 @@ class MayhemContract extends Contract {
     if (!PROBE_KINDS.has(value.probe_kind)) return new Error('Unsupported probe kind.');
     if (value.probe_kind === 'canary') {
       if (!value.enclave_id) return new Error('Canary probe requires enclave_id.');
+      if (!value.binary_hash) return new Error('Canary probe requires binary_hash.');
       if (!Number.isInteger(value.match_bps)) return new Error('Canary probe requires match_bps.');
+      if (typeof value.pass !== 'boolean') return new Error('Canary probe requires pass.');
       if (!value.canary_set) return new Error('Canary probe requires canary_set.');
       if (!value.session_receipt_hash) return new Error('Canary probe requires session_receipt_hash.');
       if (!value.evidence_hash) return new Error('Canary probe requires evidence_hash.');
+      if (!value.auditor_sig) return new Error('Canary probe requires auditor_sig.');
       if (!this.isSafeKeyPart(value.enclave_id)) return new Error('Invalid canary enclave id.');
-      if (!this.isSafeKeyPart(value.session_receipt_hash)) {
+      if (!this.isHexBytes(value.binary_hash, 32)) return new Error('Invalid canary binary hash.');
+      if (!this.isHexBytes(value.session_receipt_hash, 32)) {
         return new Error('Invalid canary session receipt hash.');
       }
-      if (!this.isSafeKeyPart(value.evidence_hash)) return new Error('Invalid canary evidence hash.');
+      if (!this.isHexBytes(value.evidence_hash, 32)) return new Error('Invalid canary evidence hash.');
+      if (!this.isHexBytes(value.auditor_sig, 64)) return new Error('Invalid canary auditor signature.');
+    }
+    return null;
+  }
+
+  async requireBoundCanaryProbe(value, auditor) {
+    const catalogError = await this.requirePublishedCanarySet(value.canary_set);
+    if (catalogError) return catalogError;
+
+    const enclave = await this.get(`enclave/${value.enclave_id}`);
+    if (!enclave) return new Error('Canary probe enclave not found.');
+    if (enclave.binary_hash !== value.binary_hash) {
+      return new Error('Canary probe binary_hash does not match enclave.');
+    }
+
+    if (!this.verifyProbeResultSignature(auditor, value)) {
+      return new Error('Invalid canary auditor signature.');
+    }
+    return null;
+  }
+
+  async requirePublishedCanarySet(canarySet) {
+    const catalog = await this.get('catalog/current');
+    if (!catalog || catalog.status !== 'active') {
+      return new Error('Published catalog required for canary probe.');
+    }
+    if (!Array.isArray(catalog.canaries) || !catalog.canaries.some((entry) => entry.set_id === canarySet)) {
+      return new Error('Canary set is not published in the active catalog.');
     }
     return null;
   }
@@ -4840,6 +4898,12 @@ class MayhemContract extends Contract {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
     return verify.call(this.protocol.peer.wallet, sig, providerLifecycleIntentMessage(intent), provider) === true;
+  }
+
+  verifyProbeResultSignature(auditor, value) {
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function') return false;
+    return verify.call(this.protocol.peer.wallet, value.auditor_sig, probeResultMessage(value, auditor), auditor) === true;
   }
 }
 

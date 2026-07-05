@@ -7,11 +7,14 @@ import {
   makeIdentity,
   makeTxKey,
   makeVerifier,
+  signProbeResult,
   signConsent,
 } from './helpers/contract.js';
 
 const rulesHash = 'a9'.repeat(32);
 const enclaveId = 'b9'.repeat(32);
+const binaryHash = 'c9'.repeat(32);
+const modelId = 'mayhem/auditor-canary-model';
 
 const providerRegistration = {
   op: 'register_provider',
@@ -60,6 +63,52 @@ async function setupAuditorContract() {
       sender: provider.publicKey,
       txNo: 4,
     },
+    {
+      type: 'registerEnclave',
+      value: {
+        op: 'register_enclave',
+        enclave_id: enclaveId,
+        model_id: modelId,
+        backend: 'llama.cpp',
+        artifact_root: 'a'.repeat(64),
+        artifact_root_kind: 'blake3_merkle_v1',
+        artifact_source: {
+          kind: 'huggingface',
+          repo: 'mayhem-test/auditor-canary-model',
+          revision: '1'.repeat(40),
+          path: 'auditor-canary-model.gguf',
+        },
+        manifest_hash: 'b'.repeat(64),
+        att_tier: 1,
+        binary_hash: binaryHash,
+        caps: { chat: true, tools: false, ctx: 32768 },
+      },
+      sender: admin.publicKey,
+      txNo: 5,
+    },
+    {
+      type: 'publishCatalog',
+      value: {
+        op: 'publish_catalog',
+        catalog_id: 'mayhem-models',
+        source_kind: 'huggingface',
+        catalog_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json',
+        signature_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig',
+        catalog_hash: '8'.repeat(64),
+        signature_hash: '9'.repeat(64),
+        key_id: 'mayhem-catalog-tracnetwork-v1',
+        public_key: 'a'.repeat(64),
+        model_count: 1,
+        artifact_count: 1,
+        canaries: [{
+          set_id: 'canary-dev-v1',
+          url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-dev-v1.json',
+          hash: 'b'.repeat(64),
+        }],
+      },
+      sender: admin.publicKey,
+      txNo: 6,
+    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
@@ -68,21 +117,28 @@ async function setupAuditorContract() {
   return { admin, provider, auditor, storage, contract };
 }
 
-const canaryProbe = (provider, overrides = {}) => ({
-  op: 'probe_result',
-  probe_id: 'canary-good',
-  probe_kind: 'canary',
-  provider: provider.publicKey,
-  enclave_id: enclaveId,
-  epoch: 1,
-  at: 10_000,
-  canary_set: 'canary-dev-v1',
-  match_bps: 9_700,
-  pass: true,
-  session_receipt_hash: 'c'.repeat(64),
-  evidence_hash: 'd'.repeat(64),
-  ...overrides,
-});
+const canaryProbe = (provider, auditor, overrides = {}, options = {}) => {
+  const value = {
+    op: 'probe_result',
+    probe_id: 'canary-good',
+    probe_kind: 'canary',
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    binary_hash: binaryHash,
+    epoch: 1,
+    at: 10_000,
+    canary_set: 'canary-dev-v1',
+    match_bps: 9_700,
+    pass: true,
+    session_receipt_hash: 'c'.repeat(64),
+    evidence_hash: 'd'.repeat(64),
+    ...overrides,
+  };
+  if (options.sign !== false && value.auditor_sig === undefined) {
+    value.auditor_sig = signProbeResult(auditor.wallet, value, auditor.publicKey);
+  }
+  return value;
+};
 
 test('MayhemContract auditor probes write evidence, uptime ticks, and canary violation bans', async () => {
   const { admin, provider, auditor, storage, contract } = await setupAuditorContract();
@@ -91,9 +147,9 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
     contract,
     storage,
     'probeResult',
-    canaryProbe(provider),
+    canaryProbe(provider, auditor),
     auditor.publicKey,
-    5
+    7
   );
   assert.match(beforeRegister.message, /auditor registration required/i);
 
@@ -107,7 +163,7 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
       registered_at_seconds: 0,
     },
     admin.publicKey,
-    6
+    8
   );
   assert.deepEqual(registered, {
     ok: true,
@@ -119,32 +175,42 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
   assert.deepEqual(auditorEntry.value, {
     auditor: auditor.publicKey,
     status: 'active',
-    registered_at: makeTxKey(6),
+    registered_at: makeTxKey(8),
     registered_at_seconds: 0,
     accredited_by: admin.publicKey,
     successful_probes: 0,
     submitted_probes: 0,
     false_reports: 0,
-    updated_at: makeTxKey(6),
+    updated_at: makeTxKey(8),
   });
 
   const missingEnclave = await execute(
     contract,
     storage,
     'probeResult',
-    canaryProbe(provider, { probe_id: 'canary-no-enclave', enclave_id: undefined }),
+    canaryProbe(provider, auditor, { probe_id: 'canary-no-enclave', enclave_id: undefined }),
     auditor.publicKey,
-    7
+    9
   );
   assert.match(missingEnclave.message, /requires enclave_id/i);
+
+  const missingBinary = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, { probe_id: 'canary-no-binary', binary_hash: undefined }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(missingBinary.message, /requires binary_hash/i);
 
   const missingReceipt = await execute(
     contract,
     storage,
     'probeResult',
-    canaryProbe(provider, { probe_id: 'canary-no-receipt', session_receipt_hash: undefined }),
+    canaryProbe(provider, auditor, { probe_id: 'canary-no-receipt', session_receipt_hash: undefined }),
     auditor.publicKey,
-    7
+    9
   );
   assert.match(missingReceipt.message, /requires session_receipt_hash/i);
 
@@ -152,19 +218,99 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
     contract,
     storage,
     'probeResult',
-    canaryProbe(provider, { probe_id: 'canary-no-evidence', evidence_hash: undefined }),
+    canaryProbe(provider, auditor, { probe_id: 'canary-no-evidence', evidence_hash: undefined }),
     auditor.publicKey,
-    7
+    9
   );
   assert.match(missingEvidence.message, /requires evidence_hash/i);
+
+  const unsigned = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, { probe_id: 'canary-unsigned' }, { sign: false }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(unsigned.message, /requires auditor_sig/i);
+
+  const forged = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, {
+      probe_id: 'canary-forged',
+      auditor_sig: '1'.repeat(128),
+    }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(forged.message, /invalid canary auditor signature/i);
+
+  const fabricatedFailure = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, {
+      probe_id: 'canary-fabricated-failure',
+      match_bps: 1_000,
+      pass: false,
+      auditor_sig: '2'.repeat(128),
+    }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(fabricatedFailure.message, /invalid canary auditor signature/i);
+
+  const unbound = canaryProbe(provider, auditor, { probe_id: 'canary-unbound' });
+  unbound.session_receipt_hash = 'e'.repeat(64);
+  const unboundResult = await execute(
+    contract,
+    storage,
+    'probeResult',
+    unbound,
+    auditor.publicKey,
+    9
+  );
+  assert.match(unboundResult.message, /invalid canary auditor signature/i);
+
+  const wrongBinary = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, {
+      probe_id: 'canary-wrong-binary',
+      binary_hash: 'f'.repeat(64),
+    }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(wrongBinary.message, /binary_hash does not match/i);
+
+  const unpublishedCanary = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, {
+      probe_id: 'canary-unpublished',
+      canary_set: 'missing-canary',
+    }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(unpublishedCanary.message, /not published/i);
+
+  assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
+  assert.equal(await storage.get('ev/probe/canary-forged'), null);
+  assert.equal(await storage.get('ev/probe/canary-fabricated-failure'), null);
 
   const canaryOk = await execute(
     contract,
     storage,
     'probeResult',
-    canaryProbe(provider),
+    canaryProbe(provider, auditor),
     auditor.publicKey,
-    7
+    9
   );
   assert.deepEqual(canaryOk, {
     ok: true,
@@ -189,7 +335,7 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
       evidence_hash: 'e'.repeat(64),
     },
     auditor.publicKey,
-    8
+    10
   );
   assert.equal(uptime.ok, true, uptime.message);
   assert.equal(uptime.pass, true);
@@ -198,14 +344,14 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
     contract,
     storage,
     'probeResult',
-    canaryProbe(provider, {
+    canaryProbe(provider, auditor, {
       probe_id: 'canary-bad',
       match_bps: 1_000,
       pass: false,
       evidence_hash: 'f'.repeat(64),
     }),
     auditor.publicKey,
-    9
+    11
   );
   assert.deepEqual(mismatch, {
     ok: true,
@@ -228,7 +374,7 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
   assert.equal(badProbe.value.provenance_violation, true);
   assert.equal(badProbe.value.slash.reason, 'canary_mismatch');
 
-  const slash = await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(9)}`);
+  const slash = await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(11)}`);
   assert.equal(slash.value.reason, 'canary_mismatch');
   assert.equal(slash.value.beneficiary, auditor.publicKey);
   assert.equal(slash.value.slashed_by, auditor.publicKey);
@@ -312,7 +458,7 @@ test('MayhemContract keeps provider and auditor keys separate', async () => {
     contract,
     storage,
     'probeResult',
-    canaryProbe(provider),
+    canaryProbe(provider, auditor),
     provider.publicKey,
     9
   );
@@ -366,6 +512,52 @@ test('MayhemContract auditor probe log replays deterministically', async () => {
         txNo: 4,
       },
       {
+        type: 'registerEnclave',
+        value: {
+          op: 'register_enclave',
+          enclave_id: enclaveId,
+          model_id: modelId,
+          backend: 'llama.cpp',
+          artifact_root: 'a'.repeat(64),
+          artifact_root_kind: 'blake3_merkle_v1',
+          artifact_source: {
+            kind: 'huggingface',
+            repo: 'mayhem-test/auditor-canary-model',
+            revision: '1'.repeat(40),
+            path: 'auditor-canary-model.gguf',
+          },
+          manifest_hash: 'b'.repeat(64),
+          att_tier: 1,
+          binary_hash: binaryHash,
+          caps: { chat: true, tools: false, ctx: 32768 },
+        },
+        sender: ctx.admin.publicKey,
+        txNo: 5,
+      },
+      {
+        type: 'publishCatalog',
+        value: {
+          op: 'publish_catalog',
+          catalog_id: 'mayhem-models',
+          source_kind: 'huggingface',
+          catalog_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json',
+          signature_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig',
+          catalog_hash: '8'.repeat(64),
+          signature_hash: '9'.repeat(64),
+          key_id: 'mayhem-catalog-tracnetwork-v1',
+          public_key: 'a'.repeat(64),
+          model_count: 1,
+          artifact_count: 1,
+          canaries: [{
+            set_id: 'canary-dev-v1',
+            url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-dev-v1.json',
+            hash: 'b'.repeat(64),
+          }],
+        },
+        sender: ctx.admin.publicKey,
+        txNo: 6,
+      },
+      {
         type: 'auditorRegister',
         value: {
           op: 'auditor_register',
@@ -373,13 +565,17 @@ test('MayhemContract auditor probe log replays deterministically', async () => {
           registered_at_seconds: 0,
         },
         sender: ctx.admin.publicKey,
-        txNo: 5,
+        txNo: 7,
       },
       {
         type: 'probeResult',
-        value: canaryProbe(ctx.provider, { probe_id: 'canary-bad', match_bps: 1_000, pass: false }),
+        value: canaryProbe(ctx.provider, ctx.auditor, {
+          probe_id: 'canary-bad',
+          match_bps: 1_000,
+          pass: false,
+        }),
         sender: ctx.auditor.publicKey,
-        txNo: 6,
+        txNo: 8,
       },
     ]) {
       const result = await execute(ctx.contract, ctx.storage, op.type, op.value, op.sender, op.txNo);

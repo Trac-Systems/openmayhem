@@ -136,6 +136,7 @@ pub struct StoredProbeEvent {
     pub model_id: String,
     pub provider: String,
     pub enclave_id: String,
+    pub binary_hash: String,
     pub canary_set: String,
     pub expected_fingerprint: String,
     pub observed_fingerprint: String,
@@ -1946,6 +1947,7 @@ impl GatewayState {
                     &config,
                     err.message,
                     self.canary_policy.epoch,
+                    &self.receipt_config.user_seed,
                 ));
             }
         }
@@ -2041,12 +2043,18 @@ impl GatewayState {
             .provider_pubkey
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let binary_hash = served_invocation
+            .attestation
+            .as_ref()
+            .map(|attestation| attestation.contract.binary_hash.clone())
+            .unwrap_or_default();
         let evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-automatic-canary-probe-evidence",
             "model": model.id,
             "provider": provider,
             "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
             "canary_set": config.canary_set,
             "catalog_expected_fingerprint": expected_fingerprint,
             "observed_fingerprint": observed_fingerprint,
@@ -2067,12 +2075,13 @@ impl GatewayState {
             "epoch": self.canary_policy.epoch,
             "evidence_hash": evidence_hash,
         }));
-        let probe_command = json!({
+        let mut probe_command = json!({
             "op": "probe_result",
             "probe_id": probe_id,
             "probe_kind": "canary",
             "provider": provider,
             "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
             "epoch": self.canary_policy.epoch,
             "at": at,
             "canary_set": config.canary_set,
@@ -2081,6 +2090,11 @@ impl GatewayState {
             "session_receipt_hash": session_receipt_hash,
             "evidence_hash": evidence_hash,
         });
+        probe_command["auditor_sig"] = json!(probe_result_signature(
+            &self.receipt_config.user_seed,
+            &probe_command,
+            &verifying_key_hex(&self.receipt_config.user_seed),
+        ));
         let event = StoredProbeEvent {
             probe_id: probe_command["probe_id"]
                 .as_str()
@@ -2089,6 +2103,7 @@ impl GatewayState {
             model_id: model.id.clone(),
             provider,
             enclave_id: served_invocation.enclave_id.clone(),
+            binary_hash,
             canary_set: config.canary_set.clone(),
             expected_fingerprint: evaluation.expected_fingerprint.clone(),
             observed_fingerprint: evaluation.observed_fingerprint.clone(),
@@ -2429,17 +2444,24 @@ fn failed_canary_runtime_probe(
     config: &GatewayCanaryModelConfig,
     reason: String,
     epoch: u64,
+    auditor_seed: &[u8; 32],
 ) -> StoredProbeEvent {
     let provider = invocation
         .provider_pubkey
         .clone()
         .unwrap_or_else(|| "local-provider".to_owned());
+    let binary_hash = invocation
+        .attestation
+        .as_ref()
+        .map(|attestation| attestation.contract.binary_hash.clone())
+        .unwrap_or_default();
     let evidence = json!({
         "schema_version": 1,
         "kind": "mayhem-automatic-canary-probe-runtime-failure",
         "model": model.id,
         "provider": provider,
         "enclave_id": invocation.enclave_id,
+        "binary_hash": binary_hash,
         "canary_set": config.canary_set,
         "reason": reason,
     });
@@ -2452,12 +2474,13 @@ fn failed_canary_runtime_probe(
         "epoch": epoch,
         "runtime_failure": evidence_hash,
     }));
-    let probe_command = json!({
+    let mut probe_command = json!({
         "op": "probe_result",
         "probe_id": probe_id,
         "probe_kind": "canary",
         "provider": provider,
         "enclave_id": invocation.enclave_id,
+        "binary_hash": binary_hash,
         "epoch": epoch,
         "at": at,
         "canary_set": config.canary_set,
@@ -2469,11 +2492,17 @@ fn failed_canary_runtime_probe(
         })),
         "evidence_hash": evidence_hash,
     });
+    probe_command["auditor_sig"] = json!(probe_result_signature(
+        auditor_seed,
+        &probe_command,
+        &verifying_key_hex(auditor_seed),
+    ));
     StoredProbeEvent {
         probe_id,
         model_id: model.id.clone(),
         provider,
         enclave_id: invocation.enclave_id.clone(),
+        binary_hash,
         canary_set: config.canary_set.clone(),
         expected_fingerprint: canary_expected_fingerprint(config, invocation).unwrap_or_default(),
         observed_fingerprint: String::new(),
@@ -2866,6 +2895,26 @@ fn stable_json_value(value: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+fn probe_result_signature(auditor_seed: &[u8; 32], value: &Value, auditor: &str) -> String {
+    let evidence = json!({
+        "auditor": auditor,
+        "probe_id": value.get("probe_id").cloned().unwrap_or(Value::Null),
+        "probe_kind": value.get("probe_kind").cloned().unwrap_or(Value::Null),
+        "provider": value.get("provider").cloned().unwrap_or(Value::Null),
+        "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
+        "binary_hash": value.get("binary_hash").cloned().unwrap_or(Value::Null),
+        "canary_set": value.get("canary_set").cloned().unwrap_or(Value::Null),
+        "session_receipt_hash": value.get("session_receipt_hash").cloned().unwrap_or(Value::Null),
+        "evidence_hash": value.get("evidence_hash").cloned().unwrap_or(Value::Null),
+        "match_bps": value.get("match_bps").cloned().unwrap_or(Value::Null),
+        "pass": value.get("pass").cloned().unwrap_or(Value::Null),
+        "epoch": value.get("epoch").cloned().unwrap_or(Value::Null),
+        "at": value.get("at").cloned().unwrap_or(Value::Null),
+    });
+    let message = format!("mayhem-probe-result-v1{}", stable_json_value(&evidence));
+    sign_hex(auditor_seed, message.as_bytes())
 }
 
 fn is_hex_len(value: &str, len: usize) -> bool {

@@ -8,6 +8,7 @@ import {
   makeTxKey,
   makeVerifier,
   seedCurrentAdminPrice,
+  signProbeResult,
   signConsent,
 } from './helpers/contract.js';
 
@@ -92,6 +93,32 @@ async function setupProviderServing(ctx) {
     5
   );
   assert.equal(registered.ok, true, registered.message);
+  const catalog = await execute(
+    ctx.contract,
+    ctx.storage,
+    'publishCatalog',
+    {
+      op: 'publish_catalog',
+      catalog_id: 'mayhem-models',
+      source_kind: 'huggingface',
+      catalog_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json',
+      signature_url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig',
+      catalog_hash: '8'.repeat(64),
+      signature_hash: '9'.repeat(64),
+      key_id: 'mayhem-catalog-tracnetwork-v1',
+      public_key: 'a'.repeat(64),
+      model_count: 1,
+      artifact_count: 1,
+      canaries: [{
+        set_id: 'canary-dev-v1',
+        url: 'https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/canary-dev-v1.json',
+        hash: 'b'.repeat(64),
+      }],
+    },
+    ctx.admin.publicKey,
+    6
+  );
+  assert.equal(catalog.ok, true, catalog.message);
   await seedCurrentAdminPrice(ctx.storage, {
     enclaveId,
     modelId,
@@ -138,6 +165,27 @@ async function setupProviderServing(ctx) {
   return room.room_id;
 }
 
+function signedCanaryProbe(ctx, overrides = {}) {
+  const value = {
+    op: 'probe_result',
+    probe_id: 'canary-slash',
+    probe_kind: 'canary',
+    provider: ctx.provider.publicKey,
+    enclave_id: enclaveId,
+    binary_hash: 'c'.repeat(64),
+    epoch: 3,
+    at: 10_800,
+    canary_set: 'canary-dev-v1',
+    match_bps: 1_000,
+    pass: false,
+    session_receipt_hash: 'c'.repeat(64),
+    evidence_hash: 'd'.repeat(64),
+    ...overrides,
+  };
+  value.auditor_sig = signProbeResult(ctx.auditor.wallet, value, ctx.auditor.publicKey);
+  return value;
+}
+
 function seedHeldEarnings(storage, provider, overrides = {}) {
   return storage.put(`earn/${provider.publicKey}`, {
     provider: provider.publicKey,
@@ -174,20 +222,7 @@ test('MayhemContract canary mismatch slashes held earnings, tombstones serving, 
     ctx.contract,
     ctx.storage,
     'probeResult',
-    {
-      op: 'probe_result',
-      probe_id: 'canary-slash',
-      probe_kind: 'canary',
-      provider: ctx.provider.publicKey,
-      enclave_id: enclaveId,
-      epoch: 3,
-      at: 10_800,
-      canary_set: 'canary-dev-v1',
-      match_bps: 1_000,
-      pass: false,
-      session_receipt_hash: 'c'.repeat(64),
-      evidence_hash: 'd'.repeat(64),
-    },
+    signedCanaryProbe(ctx),
     ctx.auditor.publicKey,
     10
   );

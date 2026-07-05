@@ -8576,6 +8576,7 @@ struct TestModel {
     tools: bool,
     json: bool,
     context: u64,
+    binary_hashes_by_enclave: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -8861,6 +8862,11 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
                 .map(str::to_owned)
         })
         .context("--enclave-id is required when the gateway receipt does not expose enclave_id")?;
+    let binary_hash = model
+        .binary_hashes_by_enclave
+        .get(&enclave_id)
+        .cloned()
+        .context("selected gateway model does not expose a binary_hash for the probed enclave")?;
     let at = args.at.unwrap_or(unix_epoch_seconds()?);
     let evidence = json!({
         "schema_version": 1,
@@ -8887,10 +8893,19 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
             "evidence_hash": evidence_hash,
         }))
     });
-    let probe_command = canary_probe_command(CanaryProbeCommandInput {
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        args.wallet_password.as_deref().unwrap_or(""),
+    )
+    .await?;
+    let keypair_path = PathBuf::from(wallet.keypair_path.clone());
+    let mut probe_command = canary_probe_command(CanaryProbeCommandInput {
         probe_id: probe_id.clone(),
         provider: provider.clone(),
         enclave_id: enclave_id.clone(),
+        binary_hash,
         epoch: args.epoch,
         at,
         canary_set: args.canary_set.clone(),
@@ -8898,7 +8913,16 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
         pass: evaluation.pass,
         session_receipt_hash,
         evidence_hash: evidence_hash.clone(),
+        auditor_sig: String::new(),
     });
+    let auditor_sig = sign_probe_result_command(
+        &keypair_path,
+        args.wallet_password.as_deref().unwrap_or(""),
+        &wallet.public_key,
+        &probe_command,
+    )
+    .await?;
+    probe_command["auditor_sig"] = json!(auditor_sig);
 
     let evidence_output = args
         .evidence_output
@@ -8914,16 +8938,8 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
     }
 
     let tx = if args.submit {
-        let wallet = resolve_cli_wallet(
-            &home,
-            config.as_ref(),
-            &args.peer_store_name,
-            args.wallet_password.as_deref().unwrap_or(""),
-        )
-        .await?;
         let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
         let rpc = PeerRpcClient::new(&rpc_url)?;
-        let keypair_path = PathBuf::from(wallet.keypair_path.clone());
         Some(
             submit_contract_command(
                 &rpc,
@@ -9065,6 +9081,7 @@ struct CanaryProbeCommandInput {
     probe_id: String,
     provider: String,
     enclave_id: String,
+    binary_hash: String,
     epoch: u64,
     at: u64,
     canary_set: String,
@@ -9072,6 +9089,7 @@ struct CanaryProbeCommandInput {
     pass: bool,
     session_receipt_hash: String,
     evidence_hash: String,
+    auditor_sig: String,
 }
 
 fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
@@ -9081,6 +9099,7 @@ fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
         "probe_kind": "canary",
         "provider": input.provider,
         "enclave_id": input.enclave_id,
+        "binary_hash": input.binary_hash,
         "epoch": input.epoch,
         "at": input.at,
         "canary_set": input.canary_set,
@@ -9088,7 +9107,41 @@ fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
         "pass": input.pass,
         "session_receipt_hash": input.session_receipt_hash,
         "evidence_hash": input.evidence_hash,
+        "auditor_sig": input.auditor_sig,
     })
+}
+
+async fn sign_probe_result_command(
+    keypair_path: &Path,
+    password: &str,
+    auditor: &str,
+    value: &Value,
+) -> Result<String> {
+    sign_message(
+        keypair_path,
+        password,
+        &probe_result_message(value, auditor),
+    )
+    .await
+}
+
+fn probe_result_message(value: &Value, auditor: &str) -> String {
+    let evidence = json!({
+        "auditor": auditor,
+        "probe_id": value.get("probe_id").cloned().unwrap_or(Value::Null),
+        "probe_kind": value.get("probe_kind").cloned().unwrap_or(Value::Null),
+        "provider": value.get("provider").cloned().unwrap_or(Value::Null),
+        "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
+        "binary_hash": value.get("binary_hash").cloned().unwrap_or(Value::Null),
+        "canary_set": value.get("canary_set").cloned().unwrap_or(Value::Null),
+        "session_receipt_hash": value.get("session_receipt_hash").cloned().unwrap_or(Value::Null),
+        "evidence_hash": value.get("evidence_hash").cloned().unwrap_or(Value::Null),
+        "match_bps": value.get("match_bps").cloned().unwrap_or(Value::Null),
+        "pass": value.get("pass").cloned().unwrap_or(Value::Null),
+        "epoch": value.get("epoch").cloned().unwrap_or(Value::Null),
+        "at": value.get("at").cloned().unwrap_or(Value::Null),
+    });
+    format!("mayhem-probe-result-v1{}", stable_json_value(&evidence))
 }
 
 fn gateway_chat_observed_text(response: &Value) -> Result<String> {
@@ -9398,6 +9451,19 @@ fn gateway_model_view(model: &Value) -> Result<TestModel> {
             .and_then(|caps| caps.get("ctx"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        binary_hashes_by_enclave: model
+            .get("mayhem")
+            .and_then(|mayhem| mayhem.get("route_candidates"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|candidate| {
+                Some((
+                    candidate.get("enclave_id")?.as_str()?.to_owned(),
+                    candidate.get("binary_hash")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect(),
     })
 }
 
@@ -20567,8 +20633,10 @@ mod tests {
 
         assert_eq!(command["op"], "probe_result");
         assert_eq!(command["enclave_id"], "enclave");
+        assert_eq!(command["binary_hash"], "bb".repeat(32));
         assert_eq!(command["session_receipt_hash"], "rr".repeat(32));
         assert_eq!(command["evidence_hash"], "ee".repeat(32));
+        assert_eq!(command["auditor_sig"], "aa".repeat(64));
     }
 
     #[test]
@@ -21241,6 +21309,7 @@ mod tests {
             probe_id: "probe".to_owned(),
             provider: "provider".to_owned(),
             enclave_id: "enclave".to_owned(),
+            binary_hash: "bb".repeat(32),
             epoch: 7,
             at: 42,
             canary_set: "canary-dev-v1".to_owned(),
@@ -21248,6 +21317,7 @@ mod tests {
             pass: true,
             session_receipt_hash,
             evidence_hash: "ee".repeat(32),
+            auditor_sig: "aa".repeat(64),
         }
     }
 }

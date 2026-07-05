@@ -1,7 +1,11 @@
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import PeerWallet from 'trac-wallet';
-import { consentMessage, providerLifecycleIntentMessage } from '../../contract/contract.js';
+import {
+  consentMessage,
+  probeResultMessage,
+  providerLifecycleIntentMessage,
+} from '../../contract/contract.js';
 
 export const ZERO_HEX = '0'.repeat(64);
 
@@ -128,6 +132,9 @@ export const signConsent = (wallet, ver, hash) =>
 
 export const signProviderLifecycleIntent = (wallet, intent) =>
   b4a.toString(wallet.sign(b4a.from(providerLifecycleIntentMessage(intent))), 'hex');
+
+export const signProbeResult = (wallet, value, auditor) =>
+  b4a.toString(wallet.sign(b4a.from(probeResultMessage(value, auditor))), 'hex');
 
 export const providerLifecycleFeatureKey = async (intent) => {
   const digest = await blake3(b4a.from(providerLifecycleIntentMessage(intent)));
