@@ -7,8 +7,8 @@ import { bufferToBigInt, bigIntToDecimalString } from './utils/amountSerializati
 
 function usage() {
     return `Usage:
-  transfer --network <mainnet|testnet1> --stores-directory <path> --store-name <name> --to <address> --amount <tnk> [--timeout-seconds <n>] [--expected-balance-before <tnk>]
-  batch-transfer --network <mainnet|testnet1> --stores-directory <path> --store-name <name> (--outputs-json <json> | --outputs-file <path>) [--timeout-seconds <n>] [--expected-balance-before <tnk>]`;
+  transfer --network <mainnet|testnet1> --stores-directory <path> --store-name <name> --to <address> --amount <tnk> [--timeout-seconds <n>] [--max-retries <n>] [--expected-balance-before <tnk>]
+  batch-transfer --network <mainnet|testnet1> --stores-directory <path> --store-name <name> (--outputs-json <json> | --outputs-file <path>) [--timeout-seconds <n>] [--max-retries <n>] [--expected-balance-before <tnk>]`;
 }
 
 function fail(message) {
@@ -58,6 +58,7 @@ export async function runTransferHelper(rawArgs, options = {}) {
     const outputsJsonArg = command === 'batch-transfer' ? takeOption(args, '--outputs-json') : null;
     const outputsFile = command === 'batch-transfer' ? takeOption(args, '--outputs-file') : null;
     const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
+    const maxRetries = Number.parseInt(takeOption(args, '--max-retries') ?? '3', 10);
     const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
 
     if (args.length > 0) fail(`Unknown argument: ${args[0]}`);
@@ -66,6 +67,9 @@ export async function runTransferHelper(rawArgs, options = {}) {
     }
     if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds <= 0) {
         fail('--timeout-seconds must be a positive safe integer.');
+    }
+    if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+        fail('--max-retries must be a non-negative safe integer.');
     }
 
     const env = {
@@ -99,6 +103,7 @@ export async function runTransferHelper(rawArgs, options = {}) {
         storesDirectory: normalizedStoresDirectory,
         enableInteractiveMode: false,
         enableWallet: true,
+        maxRetries,
     });
 
     const msb = new MainSettlementBus(config);

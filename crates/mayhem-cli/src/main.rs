@@ -62,8 +62,6 @@ use tokio::time::sleep;
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
-const COINBASE_RETIRED_MESSAGE: &str =
-    "Coinbase Commerce is retired for Mayhem; use Stripe fiat checkout or TAP.";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
 const DEFAULT_HOLDBACK_EPOCHS: u64 = 168;
 const DEFAULT_CHALLENGE_EPOCHS: u64 = 6;
@@ -82,6 +80,7 @@ const DEFAULT_RELEASE_FEED_URL: &str =
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
 const RELEASE_SIGNATURE_FILE_SUFFIX: &str = ".sig";
 const CONTRACT_SIGNING_MESSAGE_VERSION: u32 = 2;
+const PROVIDER_ACCEPTED_RAIL_ORDER: [&str; 3] = ["fiat", "tap", "tnk"];
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
@@ -196,6 +195,11 @@ enum ProviderCommands {
     List(ProviderListArgs),
     /// Show provider serving state and local gateway route visibility.
     Health(ProviderHealthArgs),
+    /// Inspect or set the payment rails this provider accepts for serving.
+    Rails {
+        #[command(subcommand)]
+        command: ProviderRailsCommands,
+    },
     /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
     Start(Box<ProviderStartArgs>),
     /// Register if needed, then join an existing admin-created enclave and canonical rooms.
@@ -217,6 +221,14 @@ enum ProviderRoomsCommands {
     Join(ProviderRoomJoinArgs),
     /// Leave one canonical room.
     Leave(ProviderRoomLeaveArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderRailsCommands {
+    /// Read the provider's canonical accepted rails from contract state.
+    Get(ProviderRailsGetArgs),
+    /// Set the provider's accepted serving rails.
+    Set(ProviderRailsSetArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -291,8 +303,6 @@ enum PayCommands {
     Tnk(PayTnkArgs),
     /// Buy credits via Stripe hosted checkout.
     Stripe(PayRailArgs),
-    /// Retired: Coinbase Commerce is not an active Mayhem rail.
-    Coinbase(PayRailArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -2300,7 +2310,6 @@ struct CatalogApplyCanaryReportsArgs {
 enum AdminPayoutMethod {
     Tnk,
     Stripe,
-    Coinbase,
 }
 
 impl AdminPayoutMethod {
@@ -2308,7 +2317,6 @@ impl AdminPayoutMethod {
         match self {
             Self::Tnk => "tnk",
             Self::Stripe => "stripe",
-            Self::Coinbase => "coinbase",
         }
     }
 }
@@ -2316,14 +2324,12 @@ impl AdminPayoutMethod {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum AdminFiatRail {
     Stripe,
-    Coinbase,
 }
 
 impl AdminFiatRail {
     fn as_str(self) -> &'static str {
         match self {
             Self::Stripe => "stripe",
-            Self::Coinbase => "coinbase",
         }
     }
 }
@@ -2827,6 +2833,10 @@ struct AdminTnkSettlementArgs {
     #[arg(long, default_value_t = 180)]
     msb_transfer_timeout_seconds: u64,
 
+    /// Maximum validator send retries inside the Pear MSB transfer helper.
+    #[arg(long, default_value_t = 3)]
+    msb_transfer_max_retries: u64,
+
     /// Refuse transfer retry unless the treasury balance before broadcast matches this decimal TNK value.
     #[arg(long)]
     expected_treasury_balance_before: Option<String>,
@@ -2995,15 +3005,15 @@ struct AdminPayoutConfirmArgs {
     #[arg(long)]
     msb_tx_hash: Option<String>,
 
-    /// External fiat transfer reference. Required for Stripe/Coinbase payouts.
+    /// External fiat transfer reference. Required for fiat payouts.
     #[arg(long)]
     external_ref: Option<String>,
 
-    /// Fiat payout currency. Required for Stripe/Coinbase payouts.
+    /// Fiat payout currency. Required for fiat payouts.
     #[arg(long)]
     fiat_currency: Option<String>,
 
-    /// Fiat payout amount in minor units. Required for Stripe/Coinbase payouts.
+    /// Fiat payout amount in minor units. Required for fiat payouts.
     #[arg(long)]
     fiat_amount_minor: Option<u64>,
 
@@ -3121,6 +3131,37 @@ struct ProviderTxArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderContractTxArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted provider keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Sign and submit the command through peer RPC. Otherwise only print copy/paste commands.
+    #[arg(long)]
+    submit: bool,
+
+    /// Submit with peer RPC sim mode when --submit is used.
+    #[arg(long)]
+    sim: bool,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderReadArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -3165,6 +3206,22 @@ struct ProviderHealthArgs {
     /// Maximum seconds for gateway HTTP checks.
     #[arg(long, default_value_t = 5)]
     timeout_seconds: u64,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderRailsGetArgs {
+    #[command(flatten)]
+    read: ProviderReadArgs,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderRailsSetArgs {
+    #[command(flatten)]
+    tx: ProviderContractTxArgs,
+
+    /// Comma-separated accepted serving rails from fiat,tap,tnk.
+    #[arg(long)]
+    rails: String,
 }
 
 #[derive(Debug, Parser)]
@@ -3550,6 +3607,10 @@ async fn main() -> Result<()> {
         Commands::Provider { command } => match *command {
             ProviderCommands::List(args) => provider_list(args).await,
             ProviderCommands::Health(args) => provider_health(args).await,
+            ProviderCommands::Rails { command } => match command {
+                ProviderRailsCommands::Get(args) => provider_rails_get(args).await,
+                ProviderRailsCommands::Set(args) => provider_rails_set(args).await,
+            },
             ProviderCommands::Start(args) => provider_start(*args).await,
             ProviderCommands::Join(args) => provider_join(args).await,
             ProviderCommands::Leave(args) => provider_leave(args).await,
@@ -3565,7 +3626,6 @@ async fn main() -> Result<()> {
         Commands::Pay { command } => match command {
             PayCommands::Tnk(args) => pay_tnk(args).await,
             PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
-            PayCommands::Coinbase(_) => bail!(COINBASE_RETIRED_MESSAGE),
         },
         Commands::Balance(args) => balance(args).await,
         Commands::Status(args) => status(args).await,
@@ -10110,7 +10170,7 @@ fn admin_set_provider_payout_payload(args: &AdminSetProviderPayoutArgs) -> Resul
                 bail!("TNK payout targets must not include --payout-currency");
             }
         }
-        AdminPayoutMethod::Stripe | AdminPayoutMethod::Coinbase => {
+        AdminPayoutMethod::Stripe => {
             let payout_currency = args
                 .payout_currency
                 .as_deref()
@@ -10345,6 +10405,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             &store_name,
             &plan.msb_outputs,
             args.msb_transfer_timeout_seconds,
+            args.msb_transfer_max_retries,
             args.expected_treasury_balance_before.as_deref(),
         )
         .await?;
@@ -10389,7 +10450,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     }
 
     let copy_paste_submit = format!(
-        "mayhem admin tnk-settlement --epoch {} --at {} --treasury-address {} --operator-tnk-address {} --msb-network {} --submit-transfer --submit{}{}{}{}",
+        "mayhem admin tnk-settlement --epoch {} --at {} --treasury-address {} --operator-tnk-address {} --msb-network {} --submit-transfer --submit{}{}{}{}{}",
         epoch,
         at,
         shell_single_quote(&treasury_address),
@@ -10411,6 +10472,9 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .as_deref()
             .map(|url| format!(" --rpc-url {}", shell_single_quote(url)))
             .unwrap_or_default(),
+        (args.msb_transfer_max_retries != 3)
+            .then(|| format!(" --msb-transfer-max-retries {}", args.msb_transfer_max_retries))
+            .unwrap_or_default(),
         args
             .expected_treasury_balance_before
             .as_deref()
@@ -10430,10 +10494,12 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
     });
     let msb_outputs_json = serde_json::to_string(&plan.msb_outputs)?;
     let msb_transfer_command = format!(
-        "pear run --no-ask {} --transfer-helper batch-transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --outputs-json {}",
+        "pear run --no-ask {} --transfer-helper batch-transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --outputs-json {} --timeout-seconds {} --max-retries {}",
         shell_single_quote(&repo_path("intercom/trac/msb")?.display().to_string()),
         shell_single_quote(&network),
-        shell_single_quote(&msb_outputs_json)
+        shell_single_quote(&msb_outputs_json),
+        args.msb_transfer_timeout_seconds,
+        args.msb_transfer_max_retries
     );
 
     let report = json!({
@@ -16184,6 +16250,7 @@ async fn submit_msb_batch_transfer(
     store_name: &str,
     outputs: &[MsbBatchTransferOutputEntry],
     timeout_seconds: u64,
+    max_retries: u64,
     expected_balance_before: Option<&str>,
 ) -> Result<MsbBatchTransferOutput> {
     let mut args = vec![
@@ -16198,6 +16265,8 @@ async fn submit_msb_batch_transfer(
         serde_json::to_string(outputs)?,
         "--timeout-seconds".to_owned(),
         timeout_seconds.to_string(),
+        "--max-retries".to_owned(),
+        max_retries.to_string(),
     ];
     if let Some(balance) = expected_balance_before {
         args.extend([
@@ -17946,6 +18015,85 @@ async fn provider_health(args: ProviderHealthArgs) -> Result<()> {
     print_provider_health_report(&report, args.read.json)
 }
 
+async fn provider_rails_get(args: ProviderRailsGetArgs) -> Result<()> {
+    let ctx = provider_read_context(&args.read).await?;
+    let key = format!("prov/{}", ctx.provider);
+    let provider_record = read_state_value(&ctx.rpc, &key).await?;
+    let rails = provider_record
+        .as_ref()
+        .and_then(|record| record.get("accepted_rails"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let report = json!({
+        "ok": provider_record.is_some(),
+        "action": "provider.rails.get",
+        "home": ctx.home,
+        "rpc_url": ctx.rpc_url,
+        "config_present": ctx.config_present,
+        "provider": ctx.provider,
+        "wallet": ctx.wallet,
+        "rails": rails,
+        "provider_record": provider_record,
+    });
+    print_provider_rails_report(&report, args.read.json)
+}
+
+async fn provider_rails_set(args: ProviderRailsSetArgs) -> Result<()> {
+    let rails = normalize_provider_accepted_rails_arg(&args.rails)?;
+    let command = json!({
+        "op": "set_provider_rails",
+        "rails": rails,
+    });
+    let compact_command = serde_json::to_string(&command)?;
+    let copy_paste = format!(
+        "/tx --command {} --sim 1",
+        shell_single_quote(&compact_command)
+    );
+    let mut report = json!({
+        "ok": true,
+        "action": "provider.rails.set",
+        "submitted": false,
+        "sim": false,
+        "tx_type": "setProviderRails",
+        "command": command,
+        "copy_paste": {
+            "intercom_sim": copy_paste,
+        },
+    });
+
+    if args.tx.submit {
+        let ctx = provider_contract_tx_context(&args.tx).await?;
+        let submitted = submit_contract_command(
+            &ctx.rpc,
+            &ctx.keypair_path,
+            &ctx.password,
+            &ctx.wallet,
+            "setProviderRails",
+            report["command"].clone(),
+            args.tx.sim,
+        )
+        .await?;
+        report["submitted"] = json!(true);
+        report["sim"] = json!(args.tx.sim);
+        report["home"] = json!(ctx.home);
+        report["rpc_url"] = json!(ctx.rpc_url);
+        report["provider"] = json!(ctx.wallet.public_key.clone());
+        report["wallet"] = json!({
+            "public_key": ctx.wallet.public_key.clone(),
+            "keypair_path": ctx.wallet.keypair_path.clone(),
+        });
+        report["tx"] = submitted;
+        if !args.tx.sim {
+            let key = format!("prov/{}", report["provider"].as_str().unwrap_or_default());
+            report["provider_record"] = read_state_value(&ctx.rpc, &key)
+                .await?
+                .unwrap_or(Value::Null);
+        }
+    }
+
+    print_provider_rails_report(&report, args.tx.json)
+}
+
 struct ProviderTxContext {
     home: PathBuf,
     rpc_url: String,
@@ -17956,6 +18104,27 @@ struct ProviderTxContext {
 }
 
 async fn provider_tx_context(args: &ProviderTxArgs) -> Result<ProviderTxContext> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let password = args.wallet_password.clone().unwrap_or_default();
+    let wallet = resolve_cli_wallet(&home, config.as_ref(), &args.peer_store_name, &password)
+        .await
+        .context("resolving provider wallet")?;
+    let keypair_path = PathBuf::from(&wallet.keypair_path);
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    Ok(ProviderTxContext {
+        home,
+        rpc_url,
+        rpc,
+        wallet,
+        keypair_path,
+        password,
+    })
+}
+
+async fn provider_contract_tx_context(args: &ProviderContractTxArgs) -> Result<ProviderTxContext> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
@@ -18648,6 +18817,35 @@ fn write_provider_heartbeat_cache(
     }))
 }
 
+fn normalize_provider_accepted_rails_arg(raw: &str) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut rails = Vec::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let rail = value.to_ascii_lowercase();
+        if !PROVIDER_ACCEPTED_RAIL_ORDER.contains(&rail.as_str()) {
+            bail!("unsupported provider payment rail {value}; expected fiat, tap, or tnk");
+        }
+        if !seen.insert(rail.clone()) {
+            bail!("duplicate provider payment rail {rail}");
+        }
+        rails.push(rail);
+    }
+    if rails.is_empty() {
+        bail!("provider accepted rails cannot be empty");
+    }
+    rails.sort_by_key(|rail| {
+        PROVIDER_ACCEPTED_RAIL_ORDER
+            .iter()
+            .position(|known| known == rail)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(rails)
+}
+
 fn read_provider_heartbeat_cache(home: &Path, provider: &str) -> Value {
     let path = provider_heartbeat_cache_path(home, provider);
     match read_json_file(&path) {
@@ -18896,6 +19094,32 @@ fn print_provider_health_report(report: &Value, json_output: bool) -> Result<()>
         "Gateway routes visible: {}",
         report["gateway"]["route_count"].as_u64().unwrap_or(0)
     );
+    Ok(())
+}
+
+fn print_provider_rails_report(report: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Provider rails command complete.");
+    println!("Action: {}", report["action"].as_str().unwrap_or(""));
+    if let Some(provider) = report["provider"].as_str() {
+        println!("Provider: {provider}");
+    }
+    if !report["rails"].is_null() {
+        println!("{}", serde_json::to_string_pretty(&report["rails"])?);
+    }
+    if let Some(command) = report["copy_paste"]["intercom_sim"].as_str() {
+        println!("Copy/paste Intercom sim command:");
+        println!("{command}");
+    }
+    if report["submitted"].as_bool() == Some(true) {
+        println!("Submitted: true");
+        if let Some(tx) = report["tx"]["tx"].as_str() {
+            println!("Tx: {tx}");
+        }
+    }
     Ok(())
 }
 
@@ -24310,6 +24534,7 @@ mod tests {
                 submit_transfer: false,
                 msb_tx_hash: None,
                 msb_transfer_timeout_seconds: 180,
+                msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
             })
             .unwrap(),
@@ -24337,6 +24562,7 @@ mod tests {
                 submit_transfer: false,
                 msb_tx_hash: None,
                 msb_transfer_timeout_seconds: 180,
+                msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
             }))
             .unwrap_err()
@@ -24419,11 +24645,11 @@ mod tests {
         assert_eq!(
             admin_fiat_chargeback_payload(&AdminFiatChargebackArgs {
                 tx: test_admin_tx_args(),
-                rail: AdminFiatRail::Coinbase,
+                rail: AdminFiatRail::Stripe,
                 who: "user-a".to_owned(),
                 mu: 5_000_000,
-                ext_ref_hash: "coinbase-ref-hash".to_owned(),
-                dispute_ref_hash: "coinbase-dispute-hash".to_owned(),
+                ext_ref_hash: "stripe-ref-hash".to_owned(),
+                dispute_ref_hash: "stripe-dispute-hash".to_owned(),
                 fiat_currency: "eur".to_owned(),
                 fiat_amount_minor: 500,
                 epoch: 8,
@@ -24432,11 +24658,11 @@ mod tests {
             .unwrap(),
             json!({
                 "op": "fiat_chargeback",
-                "rail": "coinbase",
+                "rail": "stripe",
                 "who": "user-a",
                 "mu": 5_000_000,
-                "ext_ref_hash": "coinbase-ref-hash",
-                "dispute_ref_hash": "coinbase-dispute-hash",
+                "ext_ref_hash": "stripe-ref-hash",
+                "dispute_ref_hash": "stripe-dispute-hash",
                 "fiat_currency": "eur",
                 "fiat_amount_minor": 500,
                 "epoch": 8,
@@ -25013,6 +25239,41 @@ mod tests {
             Some("http://127.0.0.1:11435")
         );
         assert_eq!(args.timeout_seconds, 2);
+
+        let rails = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "rails",
+            "set",
+            "--rails",
+            "tnk,fiat,tap",
+            "--submit",
+            "--sim",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command } = rails.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Rails { command } = *command else {
+            panic!("expected provider rails command");
+        };
+        let ProviderRailsCommands::Set(args) = command else {
+            panic!("expected provider rails set command");
+        };
+        assert_eq!(args.rails, "tnk,fiat,tap");
+        assert!(args.tx.submit);
+        assert!(args.tx.sim);
+        assert!(args.tx.json);
+
+        assert_eq!(
+            normalize_provider_accepted_rails_arg("tnk,fiat,tap").unwrap(),
+            vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()]
+        );
+        assert!(normalize_provider_accepted_rails_arg("fiat,fiat").is_err());
+        assert!(normalize_provider_accepted_rails_arg("coinbase").is_err());
+
+        assert!(Cli::try_parse_from(["mayhem", "pay", "coinbase"]).is_err());
     }
 
     #[test]
