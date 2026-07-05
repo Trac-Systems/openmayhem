@@ -21,6 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tower::ServiceExt;
 
@@ -344,12 +345,40 @@ impl GatewaySessionBackend for AlwaysRetryDirectSessionBackend {
 
 #[derive(Debug)]
 struct HedgeInspectBackend {
-    invocations: Arc<Mutex<Vec<(String, bool, usize)>>>,
+    invocations: Arc<Mutex<Vec<HedgeInvocationRecord>>>,
+    probes: Arc<Mutex<Vec<String>>>,
+    probe_delays_ms: BTreeMap<String, u64>,
 }
+
+type HedgeInvocationRecord = (String, bool, usize, usize, Option<String>);
 
 impl GatewaySessionBackend for HedgeInspectBackend {
     fn name(&self) -> &str {
         "test-hedge-inspect"
+    }
+
+    fn hedge_probe<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> mayhem_gateway::openai::GatewayHedgeProbeFuture<'a> {
+        Box::pin(async move {
+            let provider = invocation
+                .provider_pubkey
+                .clone()
+                .unwrap_or_else(|| "<none>".to_owned());
+            self.probes
+                .lock()
+                .expect("probes lock")
+                .push(provider.clone());
+            let delay = self.probe_delays_ms.get(&provider).copied().unwrap_or(1);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            Ok(mayhem_gateway::openai::GatewayHedgeProbeResult {
+                provider,
+                ttft_ms: delay.max(1),
+            })
+        })
     }
 
     fn run_chat<'a>(
@@ -367,6 +396,8 @@ impl GatewaySessionBackend for HedgeInspectBackend {
                 provider.clone(),
                 invocation.hedge.requested,
                 invocation.hedge.planned_probe_count,
+                invocation.hedge.actual_probe_count,
+                invocation.hedge.winner_provider.clone(),
             ));
             let prompt_tokens = request.messages.len() as u64;
             let completion_tokens = 2;
@@ -1302,12 +1333,17 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
     let first_provider = "55".repeat(32);
     let second_provider = "66".repeat(32);
     let invocations = Arc::new(Mutex::new(Vec::new()));
+    let probes = Arc::new(Mutex::new(Vec::new()));
+    let probe_delays_ms =
+        BTreeMap::from([(first_provider.clone(), 25), (second_provider.clone(), 1)]);
     let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
         first_provider.clone(),
         second_provider.clone(),
     ])])
     .with_session_backend(Arc::new(HedgeInspectBackend {
         invocations: invocations.clone(),
+        probes: probes.clone(),
+        probe_delays_ms,
     }));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1328,13 +1364,25 @@ async fn chat_completion_binds_x_mayhem_hedge_to_direct_session_invocation() {
     assert_eq!(body["mayhem"]["backend"], "test-hedge-inspect");
     assert_eq!(body["mayhem"]["hedge"]["requested"], true);
     assert_eq!(body["mayhem"]["hedge"]["planned_probe_count"], 2);
+    assert_eq!(body["mayhem"]["hedge"]["actual_probe_count"], 2);
+    assert_eq!(body["mayhem"]["hedge"]["winner_provider"], second_provider);
+    assert_eq!(body["mayhem"]["hedge"]["winner_ttft_ms"], 1);
+    let probes = probes.lock().expect("probes lock").clone();
+    assert_eq!(probes.iter().cloned().collect::<BTreeSet<_>>().len(), 2);
+    assert!(probes.contains(&first_provider));
+    assert!(probes.contains(&second_provider));
     let invocations = invocations.lock().expect("invocations lock").clone();
     assert_eq!(invocations.len(), 1);
-    assert!(matches!(
+    assert_eq!(
         invocations[0],
-        (ref provider, true, 2)
-            if provider == &first_provider || provider == &second_provider
-    ));
+        (
+            second_provider.clone(),
+            true,
+            2,
+            2,
+            Some(second_provider.clone())
+        )
+    );
     assert_eq!(state.receipts().len(), 1);
     assert_eq!(state.receipts()[0].receipt.body.provider, invocations[0].0);
 }
@@ -1348,6 +1396,8 @@ async fn invalid_x_mayhem_hedge_header_is_rejected_before_session_start() {
     ])])
     .with_session_backend(Arc::new(HedgeInspectBackend {
         invocations: invocations.clone(),
+        probes: Arc::new(Mutex::new(Vec::new())),
+        probe_delays_ms: BTreeMap::new(),
     }));
     let app = openai_router(state.clone());
     let request = json!({
@@ -1383,6 +1433,8 @@ async fn invalid_x_mayhem_min_att_tier_header_is_rejected_before_session_start()
     ])])
     .with_session_backend(Arc::new(HedgeInspectBackend {
         invocations: invocations.clone(),
+        probes: Arc::new(Mutex::new(Vec::new())),
+        probe_delays_ms: BTreeMap::new(),
     }));
     let app = openai_router(state.clone());
     let request = json!({

@@ -459,8 +459,25 @@ struct ApiError {
 pub type GatewaySessionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GatewaySessionResult, GatewaySessionError>> + Send + 'a>>;
 
+pub type GatewayHedgeProbeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GatewayHedgeProbeResult, GatewaySessionError>> + Send + 'a>>;
+
 pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
+    fn hedge_probe<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayHedgeProbeFuture<'a> {
+        Box::pin(async move {
+            Ok(GatewayHedgeProbeResult {
+                provider: invocation.provider_pubkey.clone().unwrap_or_default(),
+                ttft_ms: 0,
+            })
+        })
+    }
+
     fn run_chat<'a>(
         &'a self,
         model: &'a GatewayModel,
@@ -518,10 +535,30 @@ pub struct GatewaySessionInvocation {
     receipt_user_seed: [u8; 32],
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+impl GatewaySessionInvocation {
+    fn with_hedge_probe_outcome(mut self, outcome: &GatewayHedgeProbeOutcome) -> Self {
+        self.hedge.actual_probe_count = outcome.actual_probe_count;
+        if let Some(winner) = outcome.winner.as_ref() {
+            self.hedge.winner_provider = Some(winner.provider.clone());
+            self.hedge.winner_ttft_ms = Some(winner.ttft_ms);
+        }
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GatewayHedgeInvocation {
     pub requested: bool,
     pub planned_probe_count: usize,
+    pub actual_probe_count: usize,
+    pub winner_provider: Option<String>,
+    pub winner_ttft_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayHedgeProbeResult {
+    pub provider: String,
+    pub ttft_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2005,7 +2042,7 @@ enum ChatResponse {
     Sse(Vec<Value>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ResponseMayhemMeta<'a> {
     backend: &'a str,
     direct_session: bool,
@@ -2036,6 +2073,12 @@ struct GatewaySessionRun {
     invocation: GatewaySessionInvocation,
     metering_request: ChatCompletionRequest,
     metering_output: ChatOutput,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GatewayHedgeProbeOutcome {
+    actual_probe_count: usize,
+    winner: Option<GatewayHedgeProbeResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2545,6 +2588,15 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
         "sc-bridge-direct-session"
     }
 
+    fn hedge_probe<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayHedgeProbeFuture<'a> {
+        Box::pin(async move { self.hedge_probe_over_bridge(invocation).await })
+    }
+
     fn run_chat<'a>(
         &'a self,
         model: &'a GatewayModel,
@@ -2556,6 +2608,67 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
 }
 
 impl ScBridgeGatewaySessionBackend {
+    async fn hedge_probe_over_bridge(
+        &self,
+        invocation: &GatewaySessionInvocation,
+    ) -> Result<GatewayHedgeProbeResult, GatewaySessionError> {
+        let provider = invocation
+            .provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("hedge probe has no canonical provider"))?;
+        let started = Instant::now();
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(provider, self.config.open_timeout)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "hedge peer connect to provider {} for session {} failed: {err}",
+                    provider, invocation.session_id
+                ))
+            })?;
+        let opened = bridge
+            .session_open(provider, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "hedge session open {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        if opened.get("direct").and_then(Value::as_bool) != Some(true)
+            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(GatewaySessionError::retryable(format!(
+                "hedge session {} was not direct/non-relayed",
+                invocation.session_id
+            )));
+        }
+        let _ = bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.close",
+                    "v": 1,
+                    "session_id": invocation.session_id,
+                    "reason": "hedge_probe_pre_spend",
+                }),
+            )
+            .await;
+        Ok(GatewayHedgeProbeResult {
+            provider: provider.to_owned(),
+            ttft_ms: duration_millis_u64(started.elapsed()).max(1),
+        })
+    }
+
     async fn run_chat_over_bridge(
         &self,
         model: &GatewayModel,
@@ -3795,7 +3908,7 @@ async fn build_chat_completion(
     let mayhem_meta = ResponseMayhemMeta {
         backend: &backend,
         direct_session,
-        hedge: invocation.hedge,
+        hedge: invocation.hedge.clone(),
     };
     let receipt = state.meter_chat_session(
         &model,
@@ -3838,13 +3951,26 @@ async fn run_chat_with_route_retry(
     request: &ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewaySessionRun, ApiError> {
-    let eligible_routes =
+    let mut eligible_routes =
         ordered_route_candidates_for_request(state, model, request, options.min_att_tier);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         return Err(ApiError::bad_request(
             "no provider route satisfies X-Mayhem-Min-Att-Tier",
             Some("X-Mayhem-Min-Att-Tier"),
         ));
+    }
+    let mut attempt_request = request.clone();
+    let hedge_probe =
+        run_hedge_probes_if_requested(state, model, &attempt_request, &eligible_routes, options)
+            .await?;
+    if let Some(winner) = hedge_probe.winner.as_ref() {
+        if let Some(winner_index) = eligible_routes
+            .iter()
+            .position(|route| route.provider == winner.provider)
+        {
+            let winner_route = eligible_routes.remove(winner_index);
+            eligible_routes.insert(0, winner_route);
+        }
     }
     let attempt_count = if eligible_routes.is_empty() {
         1
@@ -3855,12 +3981,12 @@ async fn run_chat_with_route_retry(
     };
     let mut last_retryable_error = None;
     let mut partials = Vec::new();
-    let mut attempt_request = request.clone();
 
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
         let invocation =
             state.prepare_chat_invocation_for_route(model, &attempt_request, route, options)?;
+        let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -3939,6 +4065,39 @@ fn ordered_route_candidates_for_request<'a>(
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = route_selection_seed(model, request, now_millis_u64());
     ordered_route_candidates_for_request_with_seed(state, model, request, min_att_tier, seed)
+}
+
+async fn run_hedge_probes_if_requested(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    routes: &[&GatewayRouteCandidate],
+    options: GatewayRequestOptions,
+) -> Result<GatewayHedgeProbeOutcome, ApiError> {
+    if !options.hedge_requested || routes.len() < 2 {
+        return Ok(GatewayHedgeProbeOutcome::default());
+    }
+    let first_invocation =
+        state.prepare_chat_invocation_for_route(model, request, Some(routes[0]), options)?;
+    let second_invocation =
+        state.prepare_chat_invocation_for_route(model, request, Some(routes[1]), options)?;
+    let (first, second) = tokio::join!(
+        state
+            .session_backend
+            .hedge_probe(model, request, &first_invocation),
+        state
+            .session_backend
+            .hedge_probe(model, request, &second_invocation)
+    );
+    let mut successes = [first.ok(), second.ok()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    successes.sort_by(|left, right| left.ttft_ms.cmp(&right.ttft_ms));
+    Ok(GatewayHedgeProbeOutcome {
+        actual_probe_count: 2,
+        winner: successes.into_iter().next(),
+    })
 }
 
 fn ordered_route_candidates_for_request_with_seed<'a>(
@@ -5749,6 +5908,9 @@ fn hedge_invocation_for_model(
     GatewayHedgeInvocation {
         requested: options.hedge_requested,
         planned_probe_count,
+        actual_probe_count: 0,
+        winner_provider: None,
+        winner_ttft_ms: None,
     }
 }
 
@@ -5858,6 +6020,9 @@ fn chat_response_value(
             "hedge": {
                 "requested": mayhem_meta.hedge.requested,
                 "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
+                "actual_probe_count": mayhem_meta.hedge.actual_probe_count,
+                "winner_provider": mayhem_meta.hedge.winner_provider,
+                "winner_ttft_ms": mayhem_meta.hedge.winner_ttft_ms,
             },
             "model": model.mayhem,
             "receipt": receipt_summary(receipt),
@@ -5932,6 +6097,9 @@ fn chat_stream_chunks(
                 "hedge": {
                     "requested": mayhem_meta.hedge.requested,
                     "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
+                    "actual_probe_count": mayhem_meta.hedge.actual_probe_count,
+                    "winner_provider": mayhem_meta.hedge.winner_provider,
+                    "winner_ttft_ms": mayhem_meta.hedge.winner_ttft_ms,
                 },
                 "receipt": receipt_summary(receipt),
             },
