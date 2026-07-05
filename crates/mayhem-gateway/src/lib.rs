@@ -133,7 +133,7 @@ pub struct AttestationVerificationRequest<'a> {
     pub contract: &'a EnclaveContractRecord,
     pub trusted_binary_hashes: &'a BTreeSet<String>,
     pub expected_nonce: &'a str,
-    pub expected_provider_pubkey: Option<&'a str>,
+    pub expected_provider_pubkey: &'a str,
     pub now_ts: u64,
     pub max_report_age_secs: u64,
     pub max_report_clock_skew_secs: u64,
@@ -252,6 +252,7 @@ impl<'a> AttestationVerificationRequest<'a> {
         contract: &'a EnclaveContractRecord,
         trusted_binary_hashes: &'a BTreeSet<String>,
         expected_nonce: &'a str,
+        expected_provider_pubkey: &'a str,
         now_ts: u64,
     ) -> Self {
         Self {
@@ -259,7 +260,7 @@ impl<'a> AttestationVerificationRequest<'a> {
             contract,
             trusted_binary_hashes,
             expected_nonce,
-            expected_provider_pubkey: None,
+            expected_provider_pubkey,
             now_ts,
             max_report_age_secs: DEFAULT_MAX_REPORT_AGE_SECS,
             max_report_clock_skew_secs: DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS,
@@ -400,13 +401,11 @@ pub fn verify_tier1_attestation(
             actual: report.nonce_u.clone(),
         });
     }
-    if let Some(expected_provider) = request.expected_provider_pubkey {
-        compare_field(
-            "provider_pubkey",
-            expected_provider,
-            &report.provider_pubkey,
-        )?;
-    }
+    compare_field(
+        "provider_pubkey",
+        request.expected_provider_pubkey,
+        &report.provider_pubkey,
+    )?;
 
     compare_field(
         "manifest_hash",

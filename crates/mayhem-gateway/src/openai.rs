@@ -1243,9 +1243,9 @@ fn validate_direct_session_accept(
             &attestation.contract,
             &attestation.trusted_binary_hashes,
             expected_att_nonce,
+            provider,
             now_ts,
         );
-        request.expected_provider_pubkey = Some(provider);
         request.trusted_nvidia_nras_jwks = attestation.trusted_nvidia_nras_jwks.as_ref();
         verify_tier1_attestation(&request).map_err(|err| {
             fail(format!(

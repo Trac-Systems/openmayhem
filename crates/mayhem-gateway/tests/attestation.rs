@@ -10,7 +10,8 @@ use mayhem_enclave::{
     Tier1AttestationOptions, Tier2AttestationOptions, TIER2_ATTESTATION_TIER,
 };
 use mayhem_gateway::{
-    verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, GatewayError,
+    verify_attestation, verify_tier1_attestation, AttestationVerificationRequest,
+    EnclaveContractRecord, GatewayError,
 };
 use mayhem_proto::{
     catalog_enclave_id, hardware_quote_binding, AttestationBody, AttestationRuntimeConfig,
@@ -228,11 +229,16 @@ fn test_nvidia_evidence(binding: &str, gpu_measurement_success: bool) -> String 
 #[test]
 fn verifies_signed_tier1_report() {
     let (_temp, report, contract, trusted) = test_report();
-    let mut request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
-    request.expected_provider_pubkey = Some(&report.provider_pubkey);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
 
-    let verified = verify_tier1_attestation(&request).expect("valid report verifies");
+    let verified = verify_attestation(&request).expect("valid report verifies");
 
     assert_eq!(verified.enclave_id, contract.enclave_id);
     assert_eq!(verified.provider_pubkey, report.provider_pubkey);
@@ -241,11 +247,41 @@ fn verifies_signed_tier1_report() {
 }
 
 #[test]
+fn verification_rejects_wrong_provider_pubkey_on_default_path() {
+    let (_temp, report, contract, trusted) = test_report();
+    let wrong_provider = "dd".repeat(32);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &wrong_provider,
+        210,
+    );
+
+    let err = verify_attestation(&request).expect_err("provider binding must match registered key");
+
+    assert!(matches!(
+        err,
+        GatewayError::ContractMismatch {
+            field: "provider_pubkey",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn verification_rejects_runtime_tp_degree_mismatch() {
     let (_temp, report, mut contract, trusted) = test_report();
     contract.caps = serde_json::json!({ "tp_degree": 2 });
-    let request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
 
     let err = verify_tier1_attestation(&request).expect_err("tp_degree must match admin caps");
 
@@ -261,8 +297,14 @@ fn verification_rejects_runtime_tp_degree_mismatch() {
 #[test]
 fn verifies_mock_tier2_report_when_explicitly_enabled() {
     let (_temp, report, contract, trusted) = test_tier2_report(HardwareQuoteKind::MockTier2);
-    let mut request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
     request.allow_mock_hardware_quote = true;
 
     let verified = verify_tier1_attestation(&request).expect("mock tier2 report verifies");
@@ -274,8 +316,14 @@ fn verifies_mock_tier2_report_when_explicitly_enabled() {
 #[test]
 fn tier2_report_requires_hardware_quote_verification() {
     let (_temp, report, contract, trusted) = test_tier2_report(HardwareQuoteKind::MockTier2);
-    let request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
 
     let err = verify_tier1_attestation(&request).expect_err("mock quotes require opt-in");
 
@@ -289,8 +337,14 @@ fn verifies_nvidia_nras_tier2_report_with_trusted_jwks() {
             test_nvidia_evidence(binding, true)
         });
     let jwks = test_nvidia_jwks();
-    let mut request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
     request.trusted_nvidia_nras_jwks = Some(&jwks);
 
     let verified =
@@ -306,8 +360,14 @@ fn nvidia_nras_tier2_report_requires_trusted_jwks() {
         test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |binding| {
             test_nvidia_evidence(binding, true)
         });
-    let request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
 
     let err = verify_tier1_attestation(&request).expect_err("NVIDIA NRAS quotes need trusted JWKS");
 
@@ -324,8 +384,14 @@ fn nvidia_nras_tier2_report_rejects_signed_failed_appraisal() {
             test_nvidia_evidence(binding, false)
         });
     let jwks = test_nvidia_jwks();
-    let mut request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
     request.trusted_nvidia_nras_jwks = Some(&jwks);
 
     let err = verify_tier1_attestation(&request)
@@ -341,8 +407,14 @@ fn nvidia_nras_tier2_report_rejects_signed_failed_appraisal() {
 #[test]
 fn sev_snp_and_tdx_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
     let (_temp, report, contract, trusted) = test_tier2_report(HardwareQuoteKind::IntelTdxDcap);
-    let mut request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
     request.allow_mock_hardware_quote = true;
 
     let err = verify_tier1_attestation(&request).expect_err("vendor quote verifier is required");
@@ -359,6 +431,7 @@ fn verification_rejects_wrong_binary_hash() {
         &contract,
         &empty_release_set,
         &report.nonce_u,
+        &report.provider_pubkey,
         210,
     );
 
@@ -372,8 +445,14 @@ fn verification_rejects_wrong_binary_hash() {
 fn verification_rejects_wrong_manifest() {
     let (_temp, report, mut contract, trusted) = test_report();
     contract.manifest_hash = "manifest-hash-v2".to_owned();
-    let request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 210);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
 
     let err = verify_tier1_attestation(&request).expect_err("manifest must match contract");
 
@@ -390,8 +469,14 @@ fn verification_rejects_wrong_manifest() {
 fn verification_rejects_stale_nonce() {
     let (_temp, report, contract, trusted) = test_report();
     let stale_nonce = "bb".repeat(32);
-    let request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &stale_nonce, 210);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &stale_nonce,
+        &report.provider_pubkey,
+        210,
+    );
 
     let err = verify_tier1_attestation(&request).expect_err("nonce must be challenge-fresh");
 
@@ -401,8 +486,14 @@ fn verification_rejects_stale_nonce() {
 #[test]
 fn verification_rejects_stale_report_timestamp() {
     let (_temp, report, contract, trusted) = test_report();
-    let request =
-        AttestationVerificationRequest::new(&report, &contract, &trusted, &report.nonce_u, 100_000);
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        100_000,
+    );
 
     let err = verify_tier1_attestation(&request).expect_err("report timestamp must be fresh");
 
