@@ -719,6 +719,14 @@ struct UseArgs {
     #[arg(long)]
     session_frame_timeout_seconds: Option<u64>,
 
+    /// Seconds to wait for the first provider token after s.accept.
+    #[arg(long)]
+    session_ttft_timeout_seconds: Option<u64>,
+
+    /// Minimum sustained provider throughput before the gateway reroutes.
+    #[arg(long)]
+    min_tok_s: Option<f64>,
+
     /// Trusted Apple App Attest JWKS JSON file for verifying Tier 2 Apple hardware-identity quotes.
     #[arg(long, value_name = "PATH")]
     apple_app_attest_jwks_file: Option<PathBuf>,
@@ -11685,18 +11693,38 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         if args.session_frame_timeout_seconds == Some(0) {
             bail!("--session-frame-timeout-seconds must be positive");
         }
+        if args.session_ttft_timeout_seconds == Some(0) {
+            bail!("--session-ttft-timeout-seconds must be positive");
+        }
+        if args
+            .min_tok_s
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            bail!("--min-tok-s must be a positive finite number");
+        }
         let mut session_config =
             ScBridgeGatewaySessionConfig::new(sc_bridge_url.clone(), sc_bridge_token);
         if let Some(seconds) = args.session_open_timeout_seconds {
             session_config.open_timeout = Duration::from_secs(seconds);
         }
+        if let Some(seconds) = args.session_ttft_timeout_seconds {
+            session_config.ttft_timeout = Duration::from_secs(seconds);
+        }
         if let Some(seconds) = args.session_frame_timeout_seconds {
             session_config.frame_timeout = Duration::from_secs(seconds);
         }
+        session_config.min_tok_s = args.min_tok_s;
+        let failover_policy = mayhem_gateway::openai::GatewayFailoverPolicyConfig {
+            open_timeout_ms: Some(duration_millis_u64(session_config.open_timeout)),
+            ttft_timeout_ms: Some(duration_millis_u64(session_config.ttft_timeout)),
+            stall_timeout_ms: Some(duration_millis_u64(session_config.frame_timeout)),
+            min_tok_s: session_config.min_tok_s,
+        };
         let backend = ScBridgeGatewaySessionBackend::new(session_config);
         (
             GatewayState::from_models(models)
                 .with_provider_earnings(provider_earnings)
+                .with_failover_policy(failover_policy)
                 .with_session_backend(Arc::new(backend)),
             format!("contract:{rpc_url}"),
             Some(model_count),
@@ -14241,6 +14269,10 @@ fn now_millis_for_path() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn print_test_report(report: &Value) {
@@ -18207,6 +18239,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
                 adapter: mayhem_gateway::openai::ShapeAdapterInfo::default(),
+                failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
                 source: "contract".to_owned(),
                 kyb_identities,
                 route_candidates,

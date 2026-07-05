@@ -1618,6 +1618,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 output_modalities: vec!["text".to_owned()],
             },
             adapter: ShapeAdapterInfo::default(),
+            failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
             source: "contract".to_owned(),
             kyb_identities: Vec::new(),
             route_candidates: providers

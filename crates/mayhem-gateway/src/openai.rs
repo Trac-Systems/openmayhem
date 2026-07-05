@@ -72,7 +72,12 @@ const EMBEDDED_CANARY_LAUNCH_V1: &str =
 const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
+const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
+const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
+const X_MAYHEM_STALL_TIMEOUT_MS_HEADER: &str = "x-mayhem-stall-timeout-ms";
+const X_MAYHEM_MIN_TOK_S_HEADER: &str = "x-mayhem-min-tok-s";
 const DEFAULT_CANARY_SEED: i64 = 7;
+const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
 const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
@@ -101,6 +106,7 @@ pub struct GatewayState {
     provider_earnings: Arc<Vec<Value>>,
     provider_table: Arc<Mutex<ProviderTable>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
+    failover_policy: GatewayFailoverPolicyConfig,
 }
 
 #[derive(Clone)]
@@ -159,6 +165,8 @@ pub struct MayhemModelInfo {
     pub caps: ModelCaps,
     #[serde(default)]
     pub adapter: ShapeAdapterInfo,
+    #[serde(default, skip_serializing_if = "GatewayFailoverPolicyConfig::is_empty")]
+    pub failover: GatewayFailoverPolicyConfig,
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kyb_identities: Vec<ProviderKybInfo>,
@@ -237,6 +245,98 @@ impl Default for ShapeAdapterInfo {
             modality_set: vec!["text".to_owned()],
             response_normalization: "openai_chat".to_owned(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GatewayFailoverPolicyConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tok_s: Option<f64>,
+}
+
+impl GatewayFailoverPolicyConfig {
+    pub fn is_empty(&self) -> bool {
+        self.open_timeout_ms.is_none()
+            && self.ttft_timeout_ms.is_none()
+            && self.stall_timeout_ms.is_none()
+            && self.min_tok_s.is_none()
+    }
+
+    fn sanitized(self) -> Self {
+        Self {
+            open_timeout_ms: self.open_timeout_ms.filter(|value| *value > 0),
+            ttft_timeout_ms: self.ttft_timeout_ms.filter(|value| *value > 0),
+            stall_timeout_ms: self.stall_timeout_ms.filter(|value| *value > 0),
+            min_tok_s: self
+                .min_tok_s
+                .filter(|value| value.is_finite() && *value > 0.0),
+        }
+    }
+
+    fn merged_with(self, override_config: Self) -> Self {
+        let base = self.sanitized();
+        let override_config = override_config.sanitized();
+        Self {
+            open_timeout_ms: override_config.open_timeout_ms.or(base.open_timeout_ms),
+            ttft_timeout_ms: override_config.ttft_timeout_ms.or(base.ttft_timeout_ms),
+            stall_timeout_ms: override_config.stall_timeout_ms.or(base.stall_timeout_ms),
+            min_tok_s: override_config.min_tok_s.or(base.min_tok_s),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GatewayFailoverInvocation {
+    pub open_timeout_ms: u64,
+    pub ttft_timeout_ms: u64,
+    pub stall_timeout_ms: u64,
+    pub min_tok_s: Option<f64>,
+}
+
+impl Default for GatewayFailoverInvocation {
+    fn default() -> Self {
+        Self {
+            open_timeout_ms: DEFAULT_OPEN_TIMEOUT_MILLIS,
+            ttft_timeout_ms: DEFAULT_STALL_TIMEOUT_MILLIS,
+            stall_timeout_ms: DEFAULT_STALL_TIMEOUT_MILLIS,
+            min_tok_s: None,
+        }
+    }
+}
+
+impl GatewayFailoverInvocation {
+    fn from_config(config: GatewayFailoverPolicyConfig) -> Self {
+        let config = config.sanitized();
+        Self {
+            open_timeout_ms: config
+                .open_timeout_ms
+                .unwrap_or(DEFAULT_OPEN_TIMEOUT_MILLIS),
+            ttft_timeout_ms: config
+                .ttft_timeout_ms
+                .unwrap_or(DEFAULT_STALL_TIMEOUT_MILLIS),
+            stall_timeout_ms: config
+                .stall_timeout_ms
+                .unwrap_or(DEFAULT_STALL_TIMEOUT_MILLIS),
+            min_tok_s: config.min_tok_s,
+        }
+    }
+
+    fn open_timeout(self) -> Duration {
+        Duration::from_millis(self.open_timeout_ms)
+    }
+
+    fn ttft_timeout(self) -> Duration {
+        Duration::from_millis(self.ttft_timeout_ms)
+    }
+
+    fn stall_timeout(self) -> Duration {
+        Duration::from_millis(self.stall_timeout_ms)
     }
 }
 
@@ -531,6 +631,7 @@ pub struct GatewaySessionInvocation {
     pub spend_voucher: SpendVoucher,
     pub attestation: Option<GatewaySessionAttestation>,
     pub hedge: GatewayHedgeInvocation,
+    pub failover: GatewayFailoverInvocation,
     receipt_cosign_enabled: bool,
     receipt_user_seed: [u8; 32],
 }
@@ -586,7 +687,9 @@ pub struct ScBridgeGatewaySessionConfig {
     pub url: String,
     pub token: String,
     pub open_timeout: Duration,
+    pub ttft_timeout: Duration,
     pub frame_timeout: Duration,
+    pub min_tok_s: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -681,6 +784,7 @@ impl GatewayState {
                     output_modalities: vec!["text".to_owned()],
                 },
                 adapter: ShapeAdapterInfo::default(),
+                failover: GatewayFailoverPolicyConfig::default(),
                 source: "local-fixture".to_owned(),
                 kyb_identities: Vec::new(),
                 route_candidates: Vec::new(),
@@ -718,6 +822,7 @@ impl GatewayState {
             provider_earnings: Arc::new(Vec::new()),
             provider_table: Arc::new(Mutex::new(provider_table)),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
+            failover_policy: GatewayFailoverPolicyConfig::default(),
         }
     }
 
@@ -745,6 +850,11 @@ impl GatewayState {
 
     pub fn with_provider_earnings(mut self, earnings: Vec<Value>) -> Self {
         self.provider_earnings = Arc::new(earnings);
+        self
+    }
+
+    pub fn with_failover_policy(mut self, policy: GatewayFailoverPolicyConfig) -> Self {
+        self.failover_policy = policy.sanitized();
         self
     }
 
@@ -2049,10 +2159,11 @@ struct ResponseMayhemMeta<'a> {
     hedge: GatewayHedgeInvocation,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct GatewayRequestOptions {
     hedge_requested: bool,
     min_att_tier: Option<u8>,
+    failover_overrides: GatewayFailoverPolicyConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -2474,8 +2585,94 @@ impl GatewayRequestOptions {
         Ok(Self {
             hedge_requested: parse_x_mayhem_hedge(headers)?,
             min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
+            failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
         })
     }
+}
+
+fn parse_x_mayhem_failover_overrides(
+    headers: &HeaderMap,
+) -> Result<GatewayFailoverPolicyConfig, ApiError> {
+    Ok(GatewayFailoverPolicyConfig {
+        open_timeout_ms: parse_positive_millis_header(
+            headers,
+            X_MAYHEM_OPEN_TIMEOUT_MS_HEADER,
+            "X-Mayhem-Open-Timeout-Ms",
+        )?,
+        ttft_timeout_ms: parse_positive_millis_header(
+            headers,
+            X_MAYHEM_TTFT_TIMEOUT_MS_HEADER,
+            "X-Mayhem-TTFT-Timeout-Ms",
+        )?,
+        stall_timeout_ms: parse_positive_millis_header(
+            headers,
+            X_MAYHEM_STALL_TIMEOUT_MS_HEADER,
+            "X-Mayhem-Stall-Timeout-Ms",
+        )?,
+        min_tok_s: parse_positive_float_header(
+            headers,
+            X_MAYHEM_MIN_TOK_S_HEADER,
+            "X-Mayhem-Min-Tok-S",
+        )?,
+    })
+}
+
+fn parse_positive_millis_header(
+    headers: &HeaderMap,
+    key: &'static str,
+    display: &'static str,
+) -> Result<Option<u64>, ApiError> {
+    let Some(value) = headers.get(key) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            format!("{display} must be an ASCII positive integer number of milliseconds"),
+            Some(display),
+        )
+    })?;
+    let parsed = value.trim().parse::<u64>().map_err(|_| {
+        ApiError::bad_request(
+            format!("{display} must be a positive integer number of milliseconds"),
+            Some(display),
+        )
+    })?;
+    if parsed == 0 {
+        return Err(ApiError::bad_request(
+            format!("{display} must be greater than 0"),
+            Some(display),
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_positive_float_header(
+    headers: &HeaderMap,
+    key: &'static str,
+    display: &'static str,
+) -> Result<Option<f64>, ApiError> {
+    let Some(value) = headers.get(key) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            format!("{display} must be an ASCII positive token-per-second value"),
+            Some(display),
+        )
+    })?;
+    let parsed = value.trim().parse::<f64>().map_err(|_| {
+        ApiError::bad_request(
+            format!("{display} must be a positive token-per-second value"),
+            Some(display),
+        )
+    })?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(ApiError::bad_request(
+            format!("{display} must be greater than 0"),
+            Some(display),
+        ));
+    }
+    Ok(Some(parsed))
 }
 
 fn parse_x_mayhem_min_att_tier(headers: &HeaderMap) -> Result<Option<u8>, ApiError> {
@@ -2572,7 +2769,9 @@ impl ScBridgeGatewaySessionConfig {
             url: url.into(),
             token: token.into(),
             open_timeout: Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS),
+            ttft_timeout: Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS),
             frame_timeout: Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS),
+            min_tok_s: None,
         }
     }
 }
@@ -2626,7 +2825,7 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, self.config.open_timeout)
+            .peer_connect(provider, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
@@ -2688,7 +2887,7 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, self.config.open_timeout)
+            .peer_connect(provider, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
@@ -2746,7 +2945,7 @@ impl ScBridgeGatewaySessionBackend {
         let accept = next_session_frame(
             &mut bridge,
             &invocation.session_id,
-            self.config.open_timeout,
+            invocation.failover.open_timeout(),
             &["s.accept", "s.reject"],
         )
         .await
@@ -2800,7 +2999,7 @@ impl ScBridgeGatewaySessionBackend {
             &mut bridge,
             &invocation.session_id,
             &request_id,
-            self.config.frame_timeout,
+            invocation.failover,
             request,
             &accept_info.enclave_pubkey,
         )
@@ -3138,6 +3337,7 @@ struct DirectSessionWatchdog {
     ttft_timeout_millis: u64,
     idle_timeout_millis: u64,
     overall_timeout_millis: Option<u64>,
+    min_tok_s: Option<f64>,
 }
 
 impl DirectSessionWatchdog {
@@ -3146,6 +3346,7 @@ impl DirectSessionWatchdog {
         ttft_timeout: Duration,
         idle_timeout: Duration,
         overall_timeout: Option<Duration>,
+        min_tok_s: Option<f64>,
     ) -> Self {
         Self {
             started_at_millis,
@@ -3154,6 +3355,7 @@ impl DirectSessionWatchdog {
             ttft_timeout_millis: duration_millis_u64(ttft_timeout),
             idle_timeout_millis: duration_millis_u64(idle_timeout),
             overall_timeout_millis: overall_timeout.map(duration_millis_u64),
+            min_tok_s: min_tok_s.filter(|value| value.is_finite() && *value > 0.0),
         }
     }
 
@@ -3220,6 +3422,20 @@ impl DirectSessionWatchdog {
             DirectSessionTimeoutKind::IdleGap
         }
     }
+
+    fn throughput_floor_violation(&self, output_tokens: u64, now_millis: u64) -> Option<f64> {
+        let min_tok_s = self.min_tok_s?;
+        self.first_delta_at_millis?;
+        if output_tokens == 0 {
+            return None;
+        }
+        let elapsed_millis = now_millis.saturating_sub(self.started_at_millis).max(1);
+        if elapsed_millis < DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS {
+            return None;
+        }
+        let tok_s = output_tokens as f64 * 1000.0 / elapsed_millis as f64;
+        (tok_s < min_tok_s).then_some(tok_s)
+    }
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -3243,11 +3459,25 @@ fn direct_session_timeout_error(
     })
 }
 
+fn direct_session_throughput_floor_error(session_id: &str, tok_s: f64, min_tok_s: f64) -> String {
+    format!(
+        "provider throughput {tok_s:.2} tok/s stayed below floor {min_tok_s:.2} tok/s on session {session_id}"
+    )
+}
+
+fn streamed_output_token_count(content: &str, token_ids: &[i32]) -> u64 {
+    if token_ids.is_empty() {
+        rough_tokens(content)
+    } else {
+        u64::try_from(token_ids.len()).unwrap_or(u64::MAX)
+    }
+}
+
 async fn collect_direct_session_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
     request_id: &str,
-    wait: Duration,
+    failover: GatewayFailoverInvocation,
     request: &ChatCompletionRequest,
     enclave_pubkey: &str,
 ) -> Result<DirectSessionCollected, GatewaySessionError> {
@@ -3259,7 +3489,13 @@ async fn collect_direct_session_output(
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
     let started_at_millis = now_millis_u64();
-    let mut watchdog = DirectSessionWatchdog::new(started_at_millis, wait, wait, None);
+    let mut watchdog = DirectSessionWatchdog::new(
+        started_at_millis,
+        failover.ttft_timeout(),
+        failover.stall_timeout(),
+        None,
+        failover.min_tok_s,
+    );
 
     while finish_reason.is_none() || provider_receipt.is_none() {
         let remaining_millis = watchdog
@@ -3297,7 +3533,8 @@ async fn collect_direct_session_output(
         };
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
-                watchdog.record_delta(now_millis_u64());
+                let now = now_millis_u64();
+                watchdog.record_delta(now);
                 if let Some(delta) = frame.get("d").and_then(Value::as_str) {
                     content.push_str(delta);
                 }
@@ -3313,6 +3550,28 @@ async fn collect_direct_session_output(
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
                     finish_reason = Some(fin.to_owned());
                     usage = usage_from_session_delta(&frame);
+                }
+                if finish_reason.is_none() {
+                    let output_tokens = streamed_output_token_count(&content, &token_ids);
+                    if let Some(tok_s) = watchdog.throughput_floor_violation(output_tokens, now) {
+                        let err = direct_session_throughput_floor_error(
+                            session_id,
+                            tok_s,
+                            failover.min_tok_s.expect("floor checked"),
+                        );
+                        if let Some(partial) = interrupted_direct_session_partial(
+                            &content,
+                            tool_call.clone(),
+                            provider_receipt.as_ref(),
+                            &token_ids,
+                            &watchdog,
+                            now,
+                            "throughput_floor",
+                        ) {
+                            return Err(GatewaySessionError::retryable_partial(err, partial));
+                        }
+                        return Err(GatewaySessionError::retryable(err));
+                    }
                 }
             }
             Some("s.receipt") => {
@@ -3994,6 +4253,24 @@ async fn run_chat_with_route_retry(
             .await
         {
             Ok(mut result) => {
+                if let Some(message) = throughput_floor_retry_message(&result, &invocation.failover)
+                {
+                    if result.provider_receipt.is_none() {
+                        if let Some(route) = route {
+                            state.cool_route_provider(route, now_millis_u64());
+                        }
+                        record_route_observation(
+                            state,
+                            route,
+                            observation_sample_from_floor_failure(
+                                &result,
+                                attempt_started.elapsed(),
+                            ),
+                        );
+                        last_retryable_error = Some(message);
+                        continue;
+                    }
+                }
                 record_route_observation(
                     state,
                     route,
@@ -4283,6 +4560,25 @@ fn observation_sample_from_success(
             }),
         error: false,
     }
+}
+
+fn throughput_floor_retry_message(
+    result: &GatewaySessionResult,
+    failover: &GatewayFailoverInvocation,
+) -> Option<String> {
+    let min_tok_s = failover.min_tok_s?;
+    let tok_s = result.quality.and_then(|quality| quality.tok_s)?;
+    (tok_s < min_tok_s)
+        .then(|| format!("provider throughput {tok_s:.2} tok/s below floor {min_tok_s:.2} tok/s"))
+}
+
+fn observation_sample_from_floor_failure(
+    result: &GatewaySessionResult,
+    elapsed: Duration,
+) -> ProviderObservationSample {
+    let mut sample = observation_sample_from_success(result, elapsed);
+    sample.error = true;
+    sample
 }
 
 fn observation_sample_from_error(elapsed: Duration) -> ProviderObservationSample {
@@ -5396,6 +5692,7 @@ impl GatewayState {
         options: GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
+        let failover = self.failover_thresholds_for_model(model, options);
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -5453,10 +5750,23 @@ impl GatewayState {
                 user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
             },
             attestation,
-            hedge: hedge_invocation_for_model(model, options),
+            hedge: hedge_invocation_for_model(model, options, failover),
+            failover,
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
+    }
+
+    fn failover_thresholds_for_model(
+        &self,
+        model: &GatewayModel,
+        options: GatewayRequestOptions,
+    ) -> GatewayFailoverInvocation {
+        let config = self
+            .failover_policy
+            .merged_with(model.mayhem.failover)
+            .merged_with(options.failover_overrides);
+        GatewayFailoverInvocation::from_config(config)
     }
 
     fn meter_chat_session(
@@ -5880,6 +6190,7 @@ fn failed_canary_runtime_probe(
 fn hedge_invocation_for_model(
     model: &GatewayModel,
     options: GatewayRequestOptions,
+    failover: GatewayFailoverInvocation,
 ) -> GatewayHedgeInvocation {
     let candidates = model
         .mayhem
@@ -5893,8 +6204,13 @@ fn hedge_invocation_for_model(
             )
         })
         .collect::<Vec<_>>();
+    let policy = FailoverPolicy {
+        open_timeout_millis: failover.open_timeout_ms,
+        stall_timeout_millis: failover.stall_timeout_ms,
+        ..FailoverPolicy::default()
+    };
     let failover_state = SessionFailoverState::new(
-        FailoverPolicy::default(),
+        policy,
         SessionPriceMu {
             rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
         },
@@ -6239,11 +6555,45 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 output_modalities: caps_output_modalities(caps),
             },
             adapter: shape_adapter_from_catalog_value(model),
+            failover: failover_policy_from_catalog_value(model),
             source: "catalog".to_owned(),
             kyb_identities: Vec::new(),
             route_candidates: Vec::new(),
         },
     })
+}
+
+fn failover_policy_from_catalog_value(model: &Value) -> GatewayFailoverPolicyConfig {
+    let failover = model
+        .get("failover")
+        .or_else(|| {
+            model
+                .get("quality")
+                .and_then(|quality| quality.get("failover"))
+        })
+        .unwrap_or(&Value::Null);
+    GatewayFailoverPolicyConfig {
+        open_timeout_ms: positive_u64_field(failover, "open_timeout_ms"),
+        ttft_timeout_ms: positive_u64_field(failover, "ttft_timeout_ms"),
+        stall_timeout_ms: positive_u64_field(failover, "stall_timeout_ms")
+            .or_else(|| positive_u64_field(failover, "idle_timeout_ms")),
+        min_tok_s: positive_f64_field(failover, "min_tok_s")
+            .or_else(|| positive_f64_field(failover, "min_tokens_per_second")),
+    }
+}
+
+fn positive_u64_field(value: &Value, key: &str) -> Option<u64> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+}
+
+fn positive_f64_field(value: &Value, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn price_rate_map_from_catalog_value(price: &Value) -> Vec<RateMapEntry> {
@@ -6762,9 +7112,14 @@ mod tests {
             Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
         );
         assert_eq!(
+            config.ttft_timeout,
+            Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS)
+        );
+        assert_eq!(
             config.frame_timeout,
             Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS)
         );
+        assert_eq!(config.min_tok_s, None);
         assert!(config.open_timeout <= Duration::from_secs(3));
         assert!(config.frame_timeout < Duration::from_secs(20));
     }
@@ -6775,6 +7130,7 @@ mod tests {
             0,
             Duration::from_millis(15),
             Duration::from_millis(15),
+            None,
             None,
         );
         assert_eq!(watchdog.next_wait_millis(15), Ok(1));
@@ -6797,6 +7153,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(15),
             None,
+            None,
         );
         assert_eq!(watchdog.next_wait_millis(110), Ok(1));
         assert_eq!(
@@ -6812,6 +7169,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(10),
             Some(Duration::from_millis(30)),
+            None,
         );
         watchdog.record_delta(25);
         assert_eq!(watchdog.next_wait_millis(30), Ok(1));
@@ -6819,6 +7177,99 @@ mod tests {
             watchdog.next_wait_millis(31),
             Err(DirectSessionTimeoutKind::OverallBudget)
         );
+    }
+
+    #[test]
+    fn direct_session_watchdog_detects_throughput_floor_after_sample_window() {
+        let mut watchdog = DirectSessionWatchdog::new(
+            0,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            None,
+            Some(5.0),
+        );
+        watchdog.record_delta(100);
+        assert_eq!(watchdog.throughput_floor_violation(1, 999), None);
+        assert_eq!(watchdog.throughput_floor_violation(1, 1_000), Some(1.0));
+        assert_eq!(watchdog.throughput_floor_violation(5, 1_000), None);
+    }
+
+    #[test]
+    fn failover_thresholds_merge_gateway_model_and_request_overrides() {
+        let mut model = test_model();
+        model.mayhem.failover = GatewayFailoverPolicyConfig {
+            ttft_timeout_ms: Some(7_000),
+            min_tok_s: Some(20.0),
+            ..GatewayFailoverPolicyConfig::default()
+        };
+        let state = GatewayState::from_models(vec![model.clone()]).with_failover_policy(
+            GatewayFailoverPolicyConfig {
+                open_timeout_ms: Some(4_000),
+                stall_timeout_ms: Some(6_000),
+                min_tok_s: Some(10.0),
+                ..GatewayFailoverPolicyConfig::default()
+            },
+        );
+        let options = GatewayRequestOptions {
+            failover_overrides: GatewayFailoverPolicyConfig {
+                stall_timeout_ms: Some(9_000),
+                min_tok_s: Some(30.0),
+                ..GatewayFailoverPolicyConfig::default()
+            },
+            ..GatewayRequestOptions::default()
+        };
+        let request = test_chat_request(&model.id);
+        let invocation = state
+            .prepare_chat_invocation_for_route(&model, &request, None, options)
+            .expect("invocation");
+
+        assert_eq!(invocation.failover.open_timeout_ms, 4_000);
+        assert_eq!(invocation.failover.ttft_timeout_ms, 7_000);
+        assert_eq!(invocation.failover.stall_timeout_ms, 9_000);
+        assert_eq!(invocation.failover.min_tok_s, Some(30.0));
+    }
+
+    #[test]
+    fn catalog_model_parses_per_model_failover_policy() {
+        let model = model_from_catalog_value(
+            &json!({
+                "model_id": "admin/quality-test",
+                "failover": {
+                    "open_timeout_ms": 2_000,
+                    "ttft_timeout_ms": 5_000,
+                    "stall_timeout_ms": 8_000,
+                    "min_tok_s": 12.5
+                }
+            }),
+            1,
+        )
+        .expect("catalog model");
+
+        assert_eq!(model.mayhem.failover.open_timeout_ms, Some(2_000));
+        assert_eq!(model.mayhem.failover.ttft_timeout_ms, Some(5_000));
+        assert_eq!(model.mayhem.failover.stall_timeout_ms, Some(8_000));
+        assert_eq!(model.mayhem.failover.min_tok_s, Some(12.5));
+    }
+
+    #[test]
+    fn request_failover_headers_parse_and_reject_invalid_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mayhem-open-timeout-ms", HeaderValue::from_static("2500"));
+        headers.insert("x-mayhem-ttft-timeout-ms", HeaderValue::from_static("4000"));
+        headers.insert(
+            "x-mayhem-stall-timeout-ms",
+            HeaderValue::from_static("9000"),
+        );
+        headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
+        let options = GatewayRequestOptions::from_headers(&headers).expect("headers parse");
+        assert_eq!(options.failover_overrides.open_timeout_ms, Some(2_500));
+        assert_eq!(options.failover_overrides.ttft_timeout_ms, Some(4_000));
+        assert_eq!(options.failover_overrides.stall_timeout_ms, Some(9_000));
+        assert_eq!(options.failover_overrides.min_tok_s, Some(17.5));
+
+        headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("0"));
+        let err = GatewayRequestOptions::from_headers(&headers).expect_err("zero floor rejects");
+        assert_eq!(err.param, Some("X-Mayhem-Min-Tok-S"));
     }
 
     #[test]
@@ -7029,6 +7480,7 @@ mod tests {
                 trusted_nvidia_offline_jwks: None,
             }),
             hedge: GatewayHedgeInvocation::default(),
+            failover: GatewayFailoverInvocation::default(),
             receipt_cosign_enabled: true,
             receipt_user_seed: test_user_seed(),
         }
@@ -7065,6 +7517,7 @@ mod tests {
                     output_modalities: vec!["text".to_owned()],
                 },
                 adapter: ShapeAdapterInfo::default(),
+                failover: GatewayFailoverPolicyConfig::default(),
                 source: "test".to_owned(),
                 kyb_identities: Vec::new(),
                 route_candidates: Vec::new(),
@@ -7255,6 +7708,59 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SlowQualityThenSuccessBackend {
+        providers: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GatewaySessionBackend for SlowQualityThenSuccessBackend {
+        fn name(&self) -> &str {
+            "test-slow-quality-then-success"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                let attempt = {
+                    let mut providers = self.providers.lock().expect("providers lock");
+                    providers.push(invocation.provider_pubkey.clone().unwrap_or_default());
+                    providers.len()
+                };
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                let (content, tok_s) = if attempt == 1 {
+                    ("slow", 1.0)
+                } else {
+                    ("fast", 25.0)
+                };
+                Ok(GatewaySessionResult {
+                    output: ChatOutput {
+                        content: Some(content.to_owned()),
+                        tool_call: None,
+                        artifacts: Vec::new(),
+                        finish_reason: "stop".to_owned(),
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens: 1,
+                            total_tokens: prompt_tokens + 1,
+                        },
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: None,
+                    token_ids: vec![attempt as i32],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(tok_s),
+                    }),
+                })
+            })
+        }
+    }
+
     #[test]
     fn route_selection_uses_weighted_p2c_not_array_order() {
         let model = test_routed_model(4);
@@ -7423,6 +7929,39 @@ mod tests {
         assert_eq!(receipts.len(), 2);
         assert!(receipts[1].receipt.body.final_receipt);
         assert_eq!(receipts[1].receipt.body.usage.output_tokens(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_retry_abandons_below_floor_provider_and_reroutes() {
+        let model = test_routed_model(2);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
+            SlowQualityThenSuccessBackend {
+                providers: providers.clone(),
+            },
+        ));
+        let request = test_chat_request(&model.id);
+        let options = GatewayRequestOptions {
+            failover_overrides: GatewayFailoverPolicyConfig {
+                min_tok_s: Some(10.0),
+                ..GatewayFailoverPolicyConfig::default()
+            },
+            ..GatewayRequestOptions::default()
+        };
+
+        let run = run_chat_with_route_retry(&state, &model, &request, options)
+            .await
+            .expect("slow provider should be rerouted");
+
+        assert_eq!(run.result.output.content.as_deref(), Some("fast"));
+        let providers = providers.lock().expect("providers lock").clone();
+        assert_eq!(providers.len(), 2);
+        assert_ne!(providers[0], providers[1]);
+        let post_failure_order =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert!(!post_failure_order
+            .iter()
+            .any(|candidate| candidate.provider == providers[0]));
     }
 
     #[test]
