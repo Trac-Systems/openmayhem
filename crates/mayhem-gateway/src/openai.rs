@@ -73,7 +73,10 @@ const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0
 const DASHBOARD_CSS: &str = r#"
 @font-face{font-family:Exo;src:url('/mayhem/dashboard/assets/exo-latin.woff2') format('woff2');font-style:normal;font-weight:400 700;font-display:swap}
 :root{color-scheme:dark;--bg:rgb(11,11,12);--surface:rgb(22,22,26);--surface-card:rgb(24,24,27);--surface-raised:rgb(42,42,46);--border:rgb(42,42,46);--border-strong:rgb(41,41,41);--text-primary:rgb(229,231,235);--text-inverse:rgb(255,255,255);--text-muted:rgb(136,138,140);--accent-primary:rgb(197,68,89);--accent-primary-light:rgb(214,120,102);--accent-secondary:rgb(66,187,147);--radius-sm:6px;--radius-md:8px;--radius-pill:999px;--space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-5:20px;--space-6:24px}
-*{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
+*{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px;text-decoration:none}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
+"#;
+const DASHBOARD_USER_CSS: &str = r#"
+.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted)}.segment.active{border-color:var(--accent-primary);color:var(--accent-primary)}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.privacy-note{color:var(--text-muted);font-size:13px}@media(max-width:1050px){.overview-grid,.wide-grid{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
 "#;
 
 #[derive(Clone, Debug)]
@@ -825,6 +828,10 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/probes", get(mayhem_probes))
         .route("/mayhem/balance", get(mayhem_balance))
         .route("/mayhem/dashboard", get(mayhem_dashboard))
+        .route(
+            "/mayhem/dashboard/components",
+            get(mayhem_dashboard_components),
+        )
         .route("/mayhem/dashboard/session", get(mayhem_dashboard_session))
         .route(
             "/mayhem/dashboard/assets/exo-latin.woff2",
@@ -953,9 +960,33 @@ async fn mayhem_dashboard(
             None,
         );
     }
+    let origin = dashboard_origin_from_headers(&headers);
     dashboard_html_response(
         StatusCode::OK,
-        dashboard_shell_html(state.dashboard_session.expires_in().as_secs()),
+        dashboard_user_html(
+            &state,
+            state.dashboard_session.expires_in().as_secs(),
+            &origin,
+        ),
+        Some(&state.dashboard_session.token),
+    )
+}
+
+async fn mayhem_dashboard_components(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+        return dashboard_html_response(
+            StatusCode::UNAUTHORIZED,
+            dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
+            None,
+        );
+    }
+    dashboard_html_response(
+        StatusCode::OK,
+        dashboard_components_html(state.dashboard_session.expires_in().as_secs()),
         Some(&state.dashboard_session.token),
     )
 }
@@ -1136,6 +1167,16 @@ fn with_dashboard_security_headers(mut response: Response) -> Response {
     response
 }
 
+fn dashboard_origin_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| host.starts_with("127.0.0.1"))
+        .map(|host| format!("http://{host}"))
+        .unwrap_or_else(|| "http://127.0.0.1".to_owned())
+}
+
 fn dashboard_locked_html(expires_in_seconds: u64) -> String {
     dashboard_html_document(
         "Locked",
@@ -1145,7 +1186,37 @@ fn dashboard_locked_html(expires_in_seconds: u64) -> String {
     )
 }
 
-fn dashboard_shell_html(expires_in_seconds: u64) -> String {
+fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &str) -> String {
+    let receipts = state.receipts();
+    let latest_receipts = dashboard_latest_receipts(&receipts);
+    let active_sessions = latest_receipts
+        .iter()
+        .filter(|receipt| !receipt.receipt.body.final_receipt)
+        .count()
+        .saturating_add(state.paused_session_count());
+    let lifetime_spend_mu = latest_receipts
+        .iter()
+        .map(|receipt| receipt.receipt.body.mu_owed_cum)
+        .sum::<u64>();
+    let gateway_root = origin.trim_end_matches('/');
+    let openai_base_url = format!("{gateway_root}/v1");
+    let session_rows = dashboard_session_rows(&latest_receipts);
+    let model_rows = dashboard_model_rows(&state.models);
+    let spend_body = dashboard_spend_body(&latest_receipts);
+    let balance_usd = format_mu_usd(state.receipt_config.balance_mu);
+    let lifetime_spend = format_mu_usd(lifetime_spend_mu);
+    let api_key_masked = "mayhem-local";
+    dashboard_html_document(
+        "User Dashboard",
+        &format!(
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/components">Components</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented"><span class="segment active">T1+</span><span class="segment">T2+</span><span class="segment">T3+</span><span class="toggle">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
+            receipt_count = receipts.len(),
+        ),
+    )
+}
+
+fn dashboard_components_html(expires_in_seconds: u64) -> String {
     dashboard_html_document(
         "Local Dashboard",
         &format!(
@@ -1154,9 +1225,177 @@ fn dashboard_shell_html(expires_in_seconds: u64) -> String {
     )
 }
 
+fn dashboard_latest_receipts(receipts: &[StoredReceipt]) -> Vec<StoredReceipt> {
+    let mut latest = BTreeMap::<String, StoredReceipt>::new();
+    for receipt in receipts {
+        let body = &receipt.receipt.body;
+        let replace = latest
+            .get(&body.session_id)
+            .map(|current| body.seq > current.receipt.body.seq)
+            .unwrap_or(true);
+        if replace {
+            latest.insert(body.session_id.clone(), receipt.clone());
+        }
+    }
+    let mut out = latest.into_values().collect::<Vec<_>>();
+    out.sort_by(|a, b| {
+        b.receipt
+            .body
+            .ts
+            .cmp(&a.receipt.body.ts)
+            .then_with(|| b.receipt.body.seq.cmp(&a.receipt.body.seq))
+    });
+    out
+}
+
+fn dashboard_session_rows(receipts: &[StoredReceipt]) -> String {
+    if receipts.is_empty() {
+        return r#"<tr><td colspan="5"><span class="privacy-note">No sessions yet</span></td></tr>"#
+            .to_owned();
+    }
+    receipts
+        .iter()
+        .take(8)
+        .map(|receipt| {
+            let body = &receipt.receipt.body;
+            let status = if body.final_receipt {
+                r#"<span class="status-dot muted">Completed</span>"#
+            } else {
+                r#"<span class="status-dot">Running</span>"#
+            };
+            format!(
+                r#"<tr><td class="mono">{}</td><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td class="mono">{}/{}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
+                html_escape(short_text(&body.model_id, 28).as_ref()),
+                html_escape(short_text(&body.provider, 18).as_ref()),
+                body.usage.input_tokens(),
+                body.usage.output_tokens(),
+                format_mu_usd(body.mu_owed_cum),
+            )
+        })
+        .collect::<String>()
+}
+
+fn dashboard_model_rows(models: &[GatewayModel]) -> String {
+    if models.is_empty() {
+        return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>No models loaded</p></div></div>"#
+            .to_owned();
+    }
+    models
+        .iter()
+        .take(6)
+        .map(|model| {
+            let availability = if model.mayhem.providers_online > 0 {
+                r#"<span class="status-dot">Online</span>"#
+            } else {
+                r#"<span class="status-dot muted">Offline</span>"#
+            };
+            let max_tier = model
+                .mayhem
+                .attestation_tiers
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let kyb = model
+                .mayhem
+                .kyb_identities
+                .first()
+                .map(|identity| {
+                    format!(
+                        " · verified: {} ({})",
+                        html_escape(&identity.legal_name),
+                        html_escape(&identity.jurisdiction)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta">{} · {} · T{}{} · {}</div></div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
+                html_escape(&model.id),
+                html_escape(&model.mayhem.model_class),
+                html_escape(&dashboard_model_price(model)),
+                max_tier,
+                kyb,
+                availability,
+            )
+        })
+        .collect::<String>()
+}
+
+fn dashboard_model_price(model: &GatewayModel) -> String {
+    let entries = model
+        .mayhem
+        .price_ref_mu
+        .rate_map
+        .iter()
+        .take(3)
+        .map(|entry| {
+            format!(
+                "{}mu/{}/{}",
+                entry.per_unit_mu, entry.granularity, entry.unit
+            )
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        "unpriced".to_owned()
+    } else {
+        entries.join(" + ")
+    }
+}
+
+fn dashboard_spend_body(receipts: &[StoredReceipt]) -> String {
+    if receipts.is_empty() {
+        return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>No spend yet</p></div></div>"#
+            .to_owned();
+    }
+    let max = receipts
+        .iter()
+        .map(|receipt| receipt.receipt.body.mu_owed_cum)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let bars = receipts
+        .iter()
+        .take(12)
+        .map(|receipt| {
+            let height = 8 + (receipt.receipt.body.mu_owed_cum.saturating_mul(92) / max);
+            format!(r#"<span class="bar" style="--h:{height}%"></span>"#)
+        })
+        .collect::<String>();
+    format!(r#"<div class="spend-bars">{bars}</div>"#)
+}
+
+fn format_mu_usd(mu: u64) -> String {
+    let cents = mu.saturating_add(5_000) / 10_000;
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+fn short_text(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_owned();
+    }
+    let keep = max.saturating_sub(3).max(1);
+    format!("{}...", value.chars().take(keep).collect::<String>())
+}
+
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn dashboard_html_document(title: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>{DASHBOARD_CSS}</style></head><body>{body}</body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>{DASHBOARD_CSS}{DASHBOARD_USER_CSS}</style></head><body>{body}</body></html>"#
     )
 }
 

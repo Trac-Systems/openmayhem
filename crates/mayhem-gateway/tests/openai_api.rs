@@ -1843,10 +1843,12 @@ async fn dashboard_component_gallery_uses_local_design_system_and_font_asset() {
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
         .expect("dashboard url is rooted at gateway");
+    let component_path =
+        dashboard_path.replacen("/mayhem/dashboard", "/mayhem/dashboard/components", 1);
     let app = openai_router(state);
 
     let (status, headers, bytes) =
-        raw_request(app.clone(), Method::GET, dashboard_path, None).await;
+        raw_request(app.clone(), Method::GET, &component_path, None).await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("dashboard html");
     for expected in [
@@ -1885,6 +1887,46 @@ async fn dashboard_component_gallery_uses_local_design_system_and_font_asset() {
         Some("font/woff2")
     );
     assert!(bytes.len() > 10_000);
+}
+
+#[tokio::test]
+async fn user_dashboard_renders_live_gateway_data() {
+    let state = GatewayState::from_embedded_catalog();
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let app = openai_router(state);
+    let model = first_model_id().await;
+    let request = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let (status, _) =
+        json_request(app.clone(), Method::POST, "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        dashboard_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("dashboard html");
+    assert!(body.contains("User dashboard"));
+    assert!(body.contains("$1.00"));
+    assert!(body.contains("TAP rate not loaded"));
+    assert!(body.contains("http://127.0.0.1:11435/v1"));
+    assert!(body.contains("OPENAI_BASE_URL=http://127.0.0.1:11435/v1"));
+    assert!(body.contains("Sessions"));
+    assert!(body.contains("Models"));
+    assert!(body.contains("Spend"));
+    assert!(body.contains(&model));
+    assert!(!body.contains("1,240.00 TAP"));
+    assert_no_external_urls(&body);
 }
 
 #[test]
