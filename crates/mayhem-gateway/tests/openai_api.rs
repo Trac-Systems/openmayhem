@@ -5,11 +5,12 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use mayhem_gateway::openai::{
-    openai_router, ChatCompletionRequest, ChatMessage, ChatOutput, GatewayArtifactOutput,
-    GatewayCanaryModelConfig, GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry,
-    GatewayModel, GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError,
-    GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult, GatewayState,
-    MayhemModelInfo, ModelCaps, PriceRefMu, ShapeAdapterInfo, ToolCallOutput, Usage,
+    openai_router, validate_loopback_dashboard_bind, ChatCompletionRequest, ChatMessage,
+    ChatOutput, GatewayArtifactOutput, GatewayCanaryModelConfig, GatewayCanaryProbePolicy,
+    GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayModel, GatewayRouteCandidate,
+    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
+    GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, ShapeAdapterInfo,
+    ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, text_generation_rate_map, token_fingerprint, ReputationEventKind,
@@ -18,6 +19,7 @@ use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity, DEFAULT_MODEL_CLA
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
+    net::{Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
 use tower::ServiceExt;
@@ -1769,4 +1771,89 @@ async fn mayhem_local_endpoints_report_status_receipts_and_balance() {
         json_request(test_app(), Method::GET, "/mayhem/balance", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["denom"], "mu_usd");
+}
+
+#[tokio::test]
+async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
+    let state = GatewayState::from_embedded_catalog();
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let query = dashboard_path
+        .strip_prefix("/mayhem/dashboard")
+        .expect("dashboard path");
+    let app = openai_router(state);
+
+    let (status, headers, bytes) =
+        raw_request(app.clone(), Method::GET, "/mayhem/dashboard", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let csp = headers
+        .get("content-security-policy")
+        .and_then(|value| value.to_str().ok())
+        .expect("dashboard CSP header");
+    assert!(csp.contains("connect-src 'self' http://127.0.0.1:*"));
+    assert!(!csp.contains("https:"));
+    assert!(!csp.contains("http://") || csp.contains("http://127.0.0.1:*"));
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let locked = String::from_utf8(bytes).expect("locked dashboard html");
+    assert_no_external_urls(&locked);
+
+    let (status, headers, bytes) =
+        raw_request(app.clone(), Method::GET, dashboard_path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("set-cookie").is_some());
+    let body = String::from_utf8(bytes).expect("dashboard html");
+    assert!(body.contains("Runs entirely on this machine. No external network calls."));
+    assert_no_external_urls(&body);
+
+    let cookie = headers
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .expect("dashboard session cookie")
+        .to_owned();
+    let (status, _, _) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        "/mayhem/dashboard",
+        None,
+        &[("cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let session_path = format!("/mayhem/dashboard/session{query}");
+    let (status, body) = json_request(app, Method::GET, &session_path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    let expires = body["expires_in_seconds"].as_u64().expect("expiry seconds");
+    assert!(expires > 0);
+    assert!(expires <= 900);
+}
+
+#[test]
+fn dashboard_bind_refuses_unspecified_and_lan_addresses() {
+    assert!(
+        validate_loopback_dashboard_bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 11_435))).is_ok()
+    );
+    assert!(validate_loopback_dashboard_bind(SocketAddr::from(([0, 0, 0, 0], 11_435))).is_err());
+    assert!(
+        validate_loopback_dashboard_bind(SocketAddr::from(([192, 168, 1, 20], 11_435))).is_err()
+    );
+}
+
+fn assert_no_external_urls(html: &str) {
+    assert!(!html.contains("https://"));
+    for (index, _) in html.match_indices("http://") {
+        assert!(
+            html[index..].starts_with("http://127.0.0.1"),
+            "unexpected non-local URL in dashboard HTML: {}",
+            &html[index..html.len().min(index + 80)]
+        );
+    }
 }

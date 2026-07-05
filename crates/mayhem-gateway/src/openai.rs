@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    fmt,
     future::Future,
-    net::SocketAddr,
+    io,
+    net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,9 +27,8 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::Multipart,
-    extract::State,
-    http::{header, HeaderMap, StatusCode},
+    extract::{Multipart, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -35,7 +36,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+    },
+    Engine as _,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
@@ -60,6 +66,9 @@ const EMBEDDED_CANARY_LAUNCH_V1: &str =
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
 const DEFAULT_CANARY_SEED: i64 = 7;
+const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
+const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
+const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
 
 #[derive(Clone, Debug)]
 pub struct GatewayState {
@@ -73,6 +82,42 @@ pub struct GatewayState {
     canaries: Arc<GatewayCanaryRegistry>,
     canary_policy: GatewayCanaryProbePolicy,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
+    dashboard_session: Arc<DashboardSession>,
+}
+
+#[derive(Clone)]
+struct DashboardSession {
+    token: String,
+    issued_at: Instant,
+    ttl: Duration,
+}
+
+impl fmt::Debug for DashboardSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DashboardSession")
+            .field("token", &"<redacted>")
+            .field("ttl", &self.ttl)
+            .field("expires_in", &self.expires_in())
+            .finish()
+    }
+}
+
+impl DashboardSession {
+    fn new() -> Self {
+        Self {
+            token: new_dashboard_token(),
+            issued_at: Instant::now(),
+            ttl: Duration::from_secs(DASHBOARD_SESSION_TTL_SECONDS),
+        }
+    }
+
+    fn expires_in(&self) -> Duration {
+        self.ttl.saturating_sub(self.issued_at.elapsed())
+    }
+
+    fn is_valid(&self, token: &str) -> bool {
+        !self.expires_in().is_zero() && token == self.token
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -594,6 +639,7 @@ impl GatewayState {
             canaries: Arc::new(canaries),
             canary_policy: GatewayCanaryProbePolicy::default(),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
+            dashboard_session: Arc::new(DashboardSession::new()),
         }
     }
 
@@ -617,6 +663,18 @@ impl GatewayState {
         self.canary_policy = policy;
         self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
         self
+    }
+
+    pub fn dashboard_url(&self, gateway_root: &str) -> String {
+        format!(
+            "{}/mayhem/dashboard?token={}",
+            gateway_root.trim_end_matches('/'),
+            self.dashboard_session.token
+        )
+    }
+
+    pub fn dashboard_session_expires_in(&self) -> Duration {
+        self.dashboard_session.expires_in()
     }
 
     pub fn with_apple_app_attest_jwks(mut self, jwks: Value) -> Self {
@@ -760,12 +818,25 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/receipts", get(mayhem_receipts))
         .route("/mayhem/probes", get(mayhem_probes))
         .route("/mayhem/balance", get(mayhem_balance))
+        .route("/mayhem/dashboard", get(mayhem_dashboard))
+        .route("/mayhem/dashboard/session", get(mayhem_dashboard_session))
         .with_state(Arc::new(state))
 }
 
 pub async fn serve(bind: SocketAddr, state: GatewayState) -> std::io::Result<()> {
+    validate_loopback_dashboard_bind(bind)?;
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, openai_router(state)).await
+}
+
+pub fn validate_loopback_dashboard_bind(bind: SocketAddr) -> std::io::Result<()> {
+    match bind {
+        SocketAddr::V4(addr) if *addr.ip() == Ipv4Addr::LOCALHOST => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Mayhem gateway/dashboard must bind 127.0.0.1 only; got {bind}"),
+        )),
+    }
 }
 
 async fn list_models(State(state): State<SharedState>) -> Response {
@@ -855,6 +926,62 @@ async fn create_audio_transcription(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardQuery {
+    token: Option<String>,
+}
+
+async fn mayhem_dashboard(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+        return dashboard_html_response(
+            StatusCode::UNAUTHORIZED,
+            dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
+            None,
+        );
+    }
+    dashboard_html_response(
+        StatusCode::OK,
+        dashboard_shell_html(state.dashboard_session.expires_in().as_secs()),
+        Some(&state.dashboard_session.token),
+    )
+}
+
+async fn mayhem_dashboard_session(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+        return dashboard_json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({
+                "ok": false,
+                "error": "dashboard_session_required",
+            }),
+            None,
+        );
+    }
+    dashboard_json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "expires_in_seconds": state.dashboard_session.expires_in().as_secs(),
+            "paths": {
+                "dashboard": "/mayhem/dashboard",
+                "status": "/mayhem/status",
+                "models": "/v1/models",
+                "receipts": "/mayhem/receipts",
+                "balance": "/mayhem/balance",
+            },
+        }),
+        Some(&state.dashboard_session.token),
+    )
+}
+
 async fn mayhem_status(State(state): State<SharedState>) -> Response {
     Json(json!({
         "ok": true,
@@ -894,6 +1021,133 @@ async fn mayhem_balance(State(state): State<SharedState>) -> Response {
         "held_mu": 0
     }))
     .into_response()
+}
+
+fn dashboard_request_authorized(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> bool {
+    query_token
+        .into_iter()
+        .chain(dashboard_header_token(headers))
+        .chain(dashboard_bearer_token(headers))
+        .chain(dashboard_cookie_token(headers))
+        .any(|token| state.dashboard_session.is_valid(token))
+}
+
+fn dashboard_header_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-mayhem-dashboard-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn dashboard_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn dashboard_cookie_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| {
+            cookie.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                (name == DASHBOARD_COOKIE_NAME).then_some(value.trim())
+            })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn dashboard_html_response(status: StatusCode, body: String, token: Option<&str>) -> Response {
+    let mut response = (status, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    if let Some(token) = token {
+        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(token)) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+    with_dashboard_security_headers(response)
+}
+
+fn dashboard_json_response(status: StatusCode, body: Value, token: Option<&str>) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    if let Some(token) = token {
+        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(token)) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+    with_dashboard_security_headers(response)
+}
+
+fn dashboard_cookie_value(token: &str) -> String {
+    format!(
+        "{DASHBOARD_COOKIE_NAME}={token}; Path=/mayhem/dashboard; Max-Age={DASHBOARD_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Strict"
+    )
+}
+
+fn with_dashboard_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(DASHBOARD_CSP),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
+}
+
+fn dashboard_locked_html(expires_in_seconds: u64) -> String {
+    dashboard_html_document(
+        "Locked",
+        &format!(
+            r#"<section class="panel"><p class="eyebrow">LOCAL SESSION</p><h1>MAY<span>HEM</span></h1><p class="muted">Dashboard token required.</p><p class="mono">expires in {expires_in_seconds}s</p></section>"#
+        ),
+    )
+}
+
+fn dashboard_shell_html(expires_in_seconds: u64) -> String {
+    dashboard_html_document(
+        "Local Dashboard",
+        &format!(
+            r#"<nav><strong>MAY<span>HEM</span></strong><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard">Provider</a><b>LOCAL</b></nav><main><section class="panel"><p class="eyebrow">LOCAL SESSION</p><h1>MAY<span>HEM</span></h1><div class="grid"><div><label>Gateway</label><p class="mono">127.0.0.1</p></div><div><label>Session</label><p class="mono">{expires_in_seconds}s</p></div></div></section></main><footer>Runs entirely on this machine. No external network calls.</footer>"#
+        ),
+    )
+}
+
+fn dashboard_html_document(title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>:root{{color-scheme:dark;--bg:rgb(11,11,12);--surface:rgb(22,22,26);--card:rgb(24,24,27);--border:rgb(42,42,46);--text:rgb(229,231,235);--muted:rgb(136,138,140);--accent:rgb(197,68,89);--live:rgb(66,187,147)}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:Exo,system-ui,sans-serif}}nav{{height:64px;display:flex;align-items:center;gap:20px;padding:0 24px;background:var(--surface);border-bottom:1px solid var(--border)}}nav strong,nav b{{letter-spacing:0}}nav strong span,h1 span{{background:linear-gradient(90deg,var(--accent),rgb(214,120,102));-webkit-background-clip:text;background-clip:text;color:transparent}}nav a{{color:var(--text);text-decoration:none}}nav b{{margin-left:auto;background:var(--live);color:rgb(4,24,19);border-radius:999px;padding:6px 10px;font-size:12px}}main{{max-width:960px;margin:0 auto;padding:56px 24px}}.panel{{border:1px solid var(--border);border-radius:8px;background:var(--card);padding:24px}}.eyebrow,label{{color:var(--muted);font-size:12px;letter-spacing:0;text-transform:uppercase}}h1{{margin:8px 0 24px;font-size:48px;line-height:1;letter-spacing:0}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}.muted,footer{{color:var(--muted)}}footer{{border-top:1px solid var(--border);padding:18px 24px;font-size:13px}}@media(max-width:640px){{.grid{{grid-template-columns:1fr}}h1{{font-size:40px}}nav{{gap:12px;padding:0 16px}}}}</style></head><body>{body}</body></html>"#
+    )
+}
+
+fn new_dashboard_token() -> String {
+    let mut bytes = [0_u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"mayhem-dashboard-token-fallback");
+        hasher.update(
+            &SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+        hasher.update(&(bytes.as_ptr() as usize).to_be_bytes());
+        bytes.copy_from_slice(hasher.finalize().as_bytes());
+    }
+    BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
 enum ChatResponse {

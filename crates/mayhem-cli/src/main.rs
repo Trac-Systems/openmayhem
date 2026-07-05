@@ -36,9 +36,9 @@ use mayhem_engine::{
 use mayhem_gateway::{
     heartbeat_signing_payload, normalize_rate_map,
     openai::{
-        serve as serve_gateway, GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo,
-        ModelCaps, PriceRefMu, ProviderKybInfo, ScBridgeGatewaySessionBackend,
-        ScBridgeGatewaySessionConfig,
+        serve as serve_gateway, validate_loopback_dashboard_bind, GatewayModel,
+        GatewayRouteCandidate, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
+        ProviderKybInfo, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
     },
     rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
     RateMapEntry, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
@@ -11707,12 +11707,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         Some(jwks) => state.with_nvidia_offline_jwks(jwks),
         None => state,
     };
+    let dashboard_url = state.dashboard_url(&gateway_url);
+    let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
     let report = json!({
         "ok": true,
         "home": home,
         "bind": bind.to_string(),
         "gateway_url": gateway_url,
         "openai_base_url": openai_base_url,
+        "dashboard_url": dashboard_url,
+        "dashboard_session_expires_in_seconds": dashboard_session_expires_in_seconds,
         "source": source,
         "backend": backend,
         "models": model_count,
@@ -11728,6 +11732,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         println!("Mayhem gateway starting.");
         println!("Bind: {bind}");
         println!("Copy/paste OpenAI base URL: {openai_base_url}");
+        println!("Copy/paste dashboard URL: {dashboard_url}");
+        println!("Dashboard session expires in: {dashboard_session_expires_in_seconds}s");
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
             println!("Backend: local OpenAI-shape smoke backend.");
@@ -14146,9 +14152,11 @@ fn gateway_bind_addr(
     if let Some(bind) = bind {
         let bind = bind.trim();
         if !bind.is_empty() {
-            return bind
+            let bind = bind
                 .parse()
-                .with_context(|| format!("parsing gateway bind address {bind}"));
+                .with_context(|| format!("parsing gateway bind address {bind}"))?;
+            validate_loopback_dashboard_bind(bind)?;
+            return Ok(bind);
         }
     }
     let port = config
@@ -14156,7 +14164,9 @@ fn gateway_bind_addr(
         .and_then(|network| network.gateway_url.as_deref())
         .and_then(gateway_port_from_url)
         .unwrap_or(port);
-    Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    validate_loopback_dashboard_bind(bind)?;
+    Ok(bind)
 }
 
 fn gateway_port_from_url(value: &str) -> Option<u16> {
@@ -25608,7 +25618,7 @@ mod tests {
     }
 
     #[test]
-    fn use_gateway_bind_addr_honors_config_port_and_explicit_bind() {
+    fn use_gateway_bind_addr_honors_config_port_and_rejects_non_loopback_bind() {
         let config = MayhemConfig {
             identity: None,
             network: Some(ConfigNetwork {
@@ -25626,9 +25636,12 @@ mod tests {
         let from_config = gateway_bind_addr(Some(&config), None, 11_435).unwrap();
         assert_eq!(from_config.to_string(), "127.0.0.1:4242");
 
-        let explicit = gateway_bind_addr(Some(&config), Some("0.0.0.0:5252"), 11_435).unwrap();
-        assert_eq!(explicit.to_string(), "0.0.0.0:5252");
+        let explicit = gateway_bind_addr(Some(&config), Some("127.0.0.1:5252"), 11_435).unwrap();
+        assert_eq!(explicit.to_string(), "127.0.0.1:5252");
         assert_eq!(gateway_public_url(explicit), "http://127.0.0.1:5252");
+
+        assert!(gateway_bind_addr(Some(&config), Some("0.0.0.0:5252"), 11_435).is_err());
+        assert!(gateway_bind_addr(Some(&config), Some("192.168.1.5:5252"), 11_435).is_err());
     }
 
     #[test]
