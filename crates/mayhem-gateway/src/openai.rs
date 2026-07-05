@@ -18,8 +18,9 @@ use crate::{
         DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
-        x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState, SessionPriceMu,
-        DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
+        midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState,
+        SessionPriceMu, DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS,
+        DEFAULT_STALL_TIMEOUT_MILLIS,
     },
     pricing::{normalize_rate_map, text_generation_rate_map, text_usage_mu, RateMapEntry},
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, ProviderKey,
@@ -2838,6 +2839,126 @@ fn set_optional_json(body: &mut Value, key: &str, value: Option<Value>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectSessionTimeoutKind {
+    TimeToFirstToken,
+    IdleGap,
+    OverallBudget,
+}
+
+#[derive(Clone, Debug)]
+struct DirectSessionWatchdog {
+    started_at_millis: u64,
+    first_delta_at_millis: Option<u64>,
+    last_delta_at_millis: Option<u64>,
+    ttft_timeout_millis: u64,
+    idle_timeout_millis: u64,
+    overall_timeout_millis: Option<u64>,
+}
+
+impl DirectSessionWatchdog {
+    fn new(
+        started_at_millis: u64,
+        ttft_timeout: Duration,
+        idle_timeout: Duration,
+        overall_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            started_at_millis,
+            first_delta_at_millis: None,
+            last_delta_at_millis: None,
+            ttft_timeout_millis: duration_millis_u64(ttft_timeout),
+            idle_timeout_millis: duration_millis_u64(idle_timeout),
+            overall_timeout_millis: overall_timeout.map(duration_millis_u64),
+        }
+    }
+
+    fn record_delta(&mut self, now_millis: u64) {
+        self.first_delta_at_millis.get_or_insert(now_millis);
+        self.last_delta_at_millis = Some(now_millis);
+    }
+
+    fn timeout_kind(&self, now_millis: u64) -> Option<DirectSessionTimeoutKind> {
+        if self
+            .overall_timeout_millis
+            .is_some_and(|timeout| now_millis.saturating_sub(self.started_at_millis) > timeout)
+        {
+            return Some(DirectSessionTimeoutKind::OverallBudget);
+        }
+        if self.first_delta_at_millis.is_none() {
+            if now_millis.saturating_sub(self.started_at_millis) > self.ttft_timeout_millis {
+                return Some(DirectSessionTimeoutKind::TimeToFirstToken);
+            }
+            return None;
+        }
+        midstream_stalled_after(
+            self.last_delta_at_millis,
+            now_millis,
+            self.idle_timeout_millis,
+        )
+        .then_some(DirectSessionTimeoutKind::IdleGap)
+    }
+
+    fn next_wait_millis(&self, now_millis: u64) -> Result<u64, DirectSessionTimeoutKind> {
+        if let Some(kind) = self.timeout_kind(now_millis) {
+            return Err(kind);
+        }
+        let mut deadline = if let Some(last_delta) = self.last_delta_at_millis {
+            last_delta
+                .saturating_add(self.idle_timeout_millis)
+                .saturating_add(1)
+        } else {
+            self.started_at_millis
+                .saturating_add(self.ttft_timeout_millis)
+                .saturating_add(1)
+        };
+        if let Some(overall) = self.overall_timeout_millis {
+            deadline = deadline.min(
+                self.started_at_millis
+                    .saturating_add(overall)
+                    .saturating_add(1),
+            );
+        }
+        Ok(deadline.saturating_sub(now_millis).max(1))
+    }
+
+    fn timeout_error(&self, session_id: &str, now_millis: u64) -> GatewaySessionError {
+        let kind = self
+            .timeout_kind(now_millis)
+            .unwrap_or_else(|| self.pending_timeout_kind());
+        direct_session_timeout_error(kind, session_id)
+    }
+
+    fn pending_timeout_kind(&self) -> DirectSessionTimeoutKind {
+        if self.first_delta_at_millis.is_none() {
+            DirectSessionTimeoutKind::TimeToFirstToken
+        } else {
+            DirectSessionTimeoutKind::IdleGap
+        }
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn direct_session_timeout_error(
+    kind: DirectSessionTimeoutKind,
+    session_id: &str,
+) -> GatewaySessionError {
+    GatewaySessionError::new(match kind {
+        DirectSessionTimeoutKind::TimeToFirstToken => {
+            format!("timed out waiting for first s.delta on session {session_id}")
+        }
+        DirectSessionTimeoutKind::IdleGap => format!(
+            "timed out waiting for next s.delta or s.receipt after idle gap on session {session_id}"
+        ),
+        DirectSessionTimeoutKind::OverallBudget => {
+            format!("timed out waiting for direct session request budget on session {session_id}")
+        }
+    })
+}
+
 async fn collect_direct_session_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
@@ -2853,24 +2974,29 @@ async fn collect_direct_session_output(
     let mut provider_receipt = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
-    let deadline = Instant::now() + wait;
+    let mut watchdog = DirectSessionWatchdog::new(now_millis_u64(), wait, wait, None);
 
     while finish_reason.is_none() || provider_receipt.is_none() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(GatewaySessionError::new(format!(
-                "timed out waiting for final s.delta and s.receipt on session {session_id}"
-            )));
-        }
-        let frame = next_session_frame(
+        let remaining_millis = watchdog
+            .next_wait_millis(now_millis_u64())
+            .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
+        let frame = match next_session_frame(
             bridge,
             session_id,
-            remaining,
+            Duration::from_millis(remaining_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
-        .await?;
+        .await
+        {
+            Ok(frame) => frame,
+            Err(err) if err.message.starts_with("timed out waiting") => {
+                return Err(watchdog.timeout_error(session_id, now_millis_u64()));
+            }
+            Err(err) => return Err(err),
+        };
         match frame.get("t").and_then(Value::as_str) {
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                watchdog.record_delta(now_millis_u64());
                 if let Some(delta) = frame.get("d").and_then(Value::as_str) {
                     content.push_str(delta);
                 }
@@ -5784,6 +5910,58 @@ mod tests {
         );
         assert!(config.open_timeout <= Duration::from_secs(3));
         assert!(config.frame_timeout < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn direct_session_watchdog_resets_idle_gap_per_delta() {
+        let mut watchdog = DirectSessionWatchdog::new(
+            0,
+            Duration::from_millis(15),
+            Duration::from_millis(15),
+            None,
+        );
+        assert_eq!(watchdog.next_wait_millis(15), Ok(1));
+        watchdog.record_delta(10);
+        assert_eq!(watchdog.next_wait_millis(25), Ok(1));
+        watchdog.record_delta(25);
+        assert_eq!(watchdog.next_wait_millis(40), Ok(1));
+        watchdog.record_delta(40);
+        assert_eq!(watchdog.next_wait_millis(55), Ok(1));
+        assert_eq!(
+            watchdog.next_wait_millis(56),
+            Err(DirectSessionTimeoutKind::IdleGap)
+        );
+    }
+
+    #[test]
+    fn direct_session_watchdog_trips_ttft_before_first_delta() {
+        let watchdog = DirectSessionWatchdog::new(
+            100,
+            Duration::from_millis(10),
+            Duration::from_millis(15),
+            None,
+        );
+        assert_eq!(watchdog.next_wait_millis(110), Ok(1));
+        assert_eq!(
+            watchdog.next_wait_millis(111),
+            Err(DirectSessionTimeoutKind::TimeToFirstToken)
+        );
+    }
+
+    #[test]
+    fn direct_session_watchdog_has_distinct_overall_budget() {
+        let mut watchdog = DirectSessionWatchdog::new(
+            0,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Some(Duration::from_millis(30)),
+        );
+        watchdog.record_delta(25);
+        assert_eq!(watchdog.next_wait_millis(30), Ok(1));
+        assert_eq!(
+            watchdog.next_wait_millis(31),
+            Err(DirectSessionTimeoutKind::OverallBudget)
+        );
     }
 
     #[test]

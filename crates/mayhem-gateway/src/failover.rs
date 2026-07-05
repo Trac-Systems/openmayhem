@@ -11,6 +11,15 @@ pub const DEFAULT_MAX_OPEN_ATTEMPTS: u8 = 4;
 pub const DEFAULT_PROVIDER_COOLOFF_MILLIS: u64 = 30_000;
 pub const DEFAULT_STALL_TIMEOUT_MILLIS: u64 = 15_000;
 
+pub fn midstream_stalled_after(
+    last_delta_at_millis: Option<u64>,
+    now_millis: u64,
+    stall_timeout_millis: u64,
+) -> bool {
+    last_delta_at_millis
+        .is_some_and(|last_delta| now_millis.saturating_sub(last_delta) > stall_timeout_millis)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FailoverPolicy {
     pub open_timeout_millis: u64,
@@ -352,9 +361,11 @@ impl SessionFailoverState {
     }
 
     pub fn midstream_stalled(&self, now_millis: u64) -> bool {
-        self.last_delta_at_millis.is_some_and(|last_delta| {
-            now_millis.saturating_sub(last_delta) > self.policy.stall_timeout_millis
-        })
+        midstream_stalled_after(
+            self.last_delta_at_millis,
+            now_millis,
+            self.policy.stall_timeout_millis,
+        )
     }
 
     pub fn record_midstream_stall(&mut self, now_millis: u64) -> Option<RedispatchPlan> {
