@@ -161,6 +161,19 @@ The model catalog is admin-canonical. Users and providers should discover curren
 
 Enclave model bundles are separate release artifacts. They are not committed as repo blobs; production catalog entries point at admin-approved downloads with hashes, sizes, signatures, and provenance.
 
+## Model Classes And Routes
+
+Catalog entries carry a `model_class` and admin-defined `rate_map`. Text models price token units, embeddings price embedding/input units, image models price image/step units, and audio routes price their own metered dimensions. The gateway exposes the matching OpenAI-compatible route families:
+
+| Class | Routes |
+|-------|--------|
+| Text generation | `/v1/chat/completions`, `/v1/completions`, including tools, JSON mode, streaming, and vision input when the catalog says the enclave supports it. |
+| Embedding | `/v1/embeddings` |
+| Image generation | `/v1/images/generations` |
+| Audio | `/v1/audio/speech`, `/v1/audio/transcriptions` |
+
+The contract and gateway settle usage through the generic metered map instead of assuming every model is prompt/completion tokens.
+
 ## Payments And Receipts
 
 All prices are denominated in `mu_usd`, integer micro-USD. Payment rails credit that same unit:
@@ -183,6 +196,12 @@ Each served session produces signed receipt evidence. The hot path avoids per-to
 | Provider | `/mayhem/dashboard/provider` | Enclave status, live sessions, earnings, reputation/holdback, and claim commands. |
 
 The server binds `127.0.0.1` only, uses short-lived local tokens, and serves assets locally.
+
+## Updates And Versioning
+
+`mayhem update` stages release artifacts only after verifying the signed release manifest, SHA-256s, and release signing key. Applying a staged update has a delay window, health check, and rollback path.
+
+Contract-changing releases advertise `CONTRACT_VERSION`. Out-of-sync nodes receive an explicit `UPGRADE_REQUIRED` signal instead of drifting into invalid-signature failures, and receipt/signing schema migrations run through declared version hooks.
 
 ## Install
 
