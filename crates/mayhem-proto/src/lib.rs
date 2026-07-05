@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 pub const CRATE_NAME: &str = "mayhem-proto";
@@ -7,6 +9,7 @@ pub const CONTRACT_VERSION: u32 = 1;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 2;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
@@ -166,6 +169,56 @@ pub struct SessionReceipt {
     pub body: ReceiptBody,
     pub enclave_sig: String,
     pub user_sig: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReceiptSchemaMigrationError {
+    Unsupported { from: u32, to: u32 },
+}
+
+impl fmt::Display for ReceiptSchemaMigrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported { from, to } => {
+                write!(f, "unsupported receipt schema migration {from} -> {to}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReceiptSchemaMigrationError {}
+
+pub fn migrate_receipt_body(
+    body: &ReceiptBody,
+) -> Result<ReceiptBody, ReceiptSchemaMigrationError> {
+    migrate_receipt_body_to_schema(body, SESSION_RECEIPT_SCHEMA_VERSION)
+}
+
+pub fn migrate_receipt_body_to_schema(
+    body: &ReceiptBody,
+    target_schema_version: u32,
+) -> Result<ReceiptBody, ReceiptSchemaMigrationError> {
+    let mut migrated = body.clone();
+    if migrated.schema_version > target_schema_version {
+        return Err(ReceiptSchemaMigrationError::Unsupported {
+            from: migrated.schema_version,
+            to: target_schema_version,
+        });
+    }
+
+    while migrated.schema_version < target_schema_version {
+        match migrated.schema_version {
+            1 => migrated.schema_version = 2,
+            from => {
+                return Err(ReceiptSchemaMigrationError::Unsupported {
+                    from,
+                    to: target_schema_version,
+                });
+            }
+        }
+    }
+
+    Ok(migrated)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -489,6 +542,50 @@ mod tests {
         assert_ne!(
             receipt_signing_bytes(&receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn receipt_schema_migration_accepts_v1_for_v2_nodes() {
+        let receipt = ReceiptBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            session_id: "sess".to_owned(),
+            seq: 1,
+            final_receipt: false,
+            user: "user".to_owned(),
+            provider: "provider".to_owned(),
+            enclave_id: "enclave".to_owned(),
+            model_id: "model".to_owned(),
+            price_ver: 1,
+            rules_ver: 1,
+            usage: ReceiptUsage {
+                in_tokens: 3,
+                out_tokens: 5,
+            },
+            mu_owed_cum: 1,
+            prompt_hash: "hash".to_owned(),
+            ts: 10,
+        };
+
+        assert_eq!(migrate_receipt_body(&receipt).unwrap(), receipt);
+
+        let migrated =
+            migrate_receipt_body_to_schema(&receipt, NEXT_SESSION_RECEIPT_SCHEMA_VERSION).unwrap();
+        assert_eq!(migrated.schema_version, NEXT_SESSION_RECEIPT_SCHEMA_VERSION);
+        assert_eq!(migrated.session_id, receipt.session_id);
+        assert_eq!(migrated.usage, receipt.usage);
+
+        let mut unsupported = receipt.clone();
+        unsupported.schema_version = 99;
+        assert_eq!(
+            migrate_receipt_body_to_schema(&unsupported, NEXT_SESSION_RECEIPT_SCHEMA_VERSION)
+                .unwrap_err(),
+            ReceiptSchemaMigrationError::Unsupported { from: 99, to: 2 }
+        );
+
+        assert_eq!(
+            migrate_receipt_body_to_schema(&migrated, SESSION_RECEIPT_SCHEMA_VERSION).unwrap_err(),
+            ReceiptSchemaMigrationError::Unsupported { from: 2, to: 1 }
         );
     }
 

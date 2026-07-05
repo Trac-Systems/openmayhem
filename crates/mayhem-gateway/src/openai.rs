@@ -35,7 +35,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    migrate_receipt_body, receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
     spend_voucher_signing_bytes, supported_receipt_signing_bytes, AttestationReport,
     CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
     SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
@@ -1668,12 +1668,12 @@ fn validate_provider_receipt(
     provider_receipt: &ProviderSignedReceipt,
     expected: ExpectedProviderReceipt<'_>,
 ) -> Result<(), GatewaySessionError> {
-    let body = &provider_receipt.body;
+    let body = migrate_receipt_body(&provider_receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "provider receipt schema_version is not supported: {err}"
+        ))
+    })?;
     let checks = [
-        (
-            body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION,
-            "provider receipt schema_version is not supported",
-        ),
         (
             body.session_id == invocation.session_id,
             "provider receipt session_id mismatch",

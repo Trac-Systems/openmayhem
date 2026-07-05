@@ -30,7 +30,8 @@ const DISPUTE_DEPOSIT_MU = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-const SESSION_RECEIPT_SCHEMA_VERSION = 1;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 1;
+export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 2;
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
@@ -4334,7 +4335,8 @@ class MayhemContract extends Contract {
     return totals;
   }
 
-  normalizeReceiptEnvelope(value) {
+  normalizeReceiptEnvelope(value, options = {}) {
+    const targetSchemaVersion = options.targetSchemaVersion ?? SESSION_RECEIPT_SCHEMA_VERSION;
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Fraud proof receipt must be an object.');
     }
@@ -4374,15 +4376,19 @@ class MayhemContract extends Contract {
       ts: bodySource.ts,
     };
 
-    const bodyError = this.validateReceiptBody(body);
+    const migratedBody = this.migrateReceiptBody(body, targetSchemaVersion);
+    if (migratedBody instanceof Error) return migratedBody;
+
+    const bodyError = this.validateReceiptBody(migratedBody, targetSchemaVersion);
     if (bodyError) return bodyError;
 
     const envelope = {
-      body,
+      body: migratedBody,
       enclave_sig: receipt.enclave_sig ?? value.enclave_sig,
       user_sig: receipt.user_sig ?? value.user_sig,
       enclave_pubkey: receipt.enclave_pubkey ?? value.enclave_pubkey ?? bodySource.enclave_pubkey ?? null,
     };
+    if (stableJson(body) !== stableJson(migratedBody)) envelope.signed_body = body;
     if (!this.isHexBytes(envelope.enclave_sig, 64)) return new Error('Invalid enclave receipt signature.');
     if (!this.isHexBytes(envelope.user_sig, 64)) return new Error('Invalid user receipt signature.');
     if (envelope.enclave_pubkey !== null && !this.isHexBytes(envelope.enclave_pubkey, 32)) {
@@ -4391,8 +4397,37 @@ class MayhemContract extends Contract {
     return envelope;
   }
 
-  validateReceiptBody(body) {
-    if (body.schema_version !== SESSION_RECEIPT_SCHEMA_VERSION) {
+  migrateReceiptBody(body, targetSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
+    if (!Number.isSafeInteger(targetSchemaVersion) || targetSchemaVersion < 1) {
+      return new Error('Invalid target receipt schema version.');
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return new Error('Invalid receipt body.');
+    }
+    if (!Number.isSafeInteger(body.schema_version) || body.schema_version < 1) {
+      return new Error('Unsupported receipt schema version.');
+    }
+    if (body.schema_version > targetSchemaVersion) {
+      return new Error(
+        `Unsupported receipt schema migration ${body.schema_version} -> ${targetSchemaVersion}.`
+      );
+    }
+
+    const migrated = cloneValue(body);
+    while (migrated.schema_version < targetSchemaVersion) {
+      if (migrated.schema_version === 1) {
+        migrated.schema_version = 2;
+      } else {
+        return new Error(
+          `Unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}.`
+        );
+      }
+    }
+    return migrated;
+  }
+
+  validateReceiptBody(body, expectedSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
+    if (body.schema_version !== expectedSchemaVersion) {
       return new Error('Unsupported receipt schema version.');
     }
     for (const field of ['session_id', 'user', 'provider', 'enclave_id', 'model_id', 'prompt_hash']) {
@@ -4426,25 +4461,30 @@ class MayhemContract extends Contract {
   verifyReceiptEnvelope(envelope) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
+    const signedBody = envelope.signed_body ?? envelope.body;
     const enclaveKey = envelope.enclave_pubkey ?? (
-      this.isHexBytes(envelope.body.enclave_id, 32) ? envelope.body.enclave_id : null
+      this.isHexBytes(signedBody.enclave_id, 32) ? signedBody.enclave_id : null
     );
     if (!enclaveKey) return false;
     return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) => {
-      const message = receiptMessage(envelope.body, signingVersion);
+      const message = receiptMessage(signedBody, signingVersion);
       return (
         verify.call(this.protocol.peer.wallet, envelope.enclave_sig, message, enclaveKey) === true &&
-        verify.call(this.protocol.peer.wallet, envelope.user_sig, message, envelope.body.user) === true
+        verify.call(this.protocol.peer.wallet, envelope.user_sig, message, signedBody.user) === true
       );
     });
   }
 
   receiptLeafEnvelope(envelope) {
-    return {
+    const leaf = {
       body: cloneValue(envelope.body),
       enclave_sig: envelope.enclave_sig,
       user_sig: envelope.user_sig,
     };
+    if (envelope.signed_body && stableJson(envelope.signed_body) !== stableJson(envelope.body)) {
+      leaf.signed_body = cloneValue(envelope.signed_body);
+    }
+    return leaf;
   }
 
   async usageLeafHash(envelope) {

@@ -3,6 +3,8 @@ import test from 'node:test';
 import b4a from 'b4a';
 import MayhemContract, {
   CONTRACT_VERSION,
+  NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
+  SESSION_RECEIPT_SCHEMA_VERSION,
   consentMessage,
   providerLifecycleIntentMessage,
   receiptMessage,
@@ -142,4 +144,49 @@ test('receipt verifier accepts v1 and v2 receipt signing payloads', async () => 
       true
     );
   }
+});
+
+test('receipt schema migration accepts v1 receipts for v2 nodes', async () => {
+  const user = await makeIdentity();
+  const provider = await makeIdentity();
+  const enclave = await makeIdentity();
+  const contract = new MayhemContract({ peer: { wallet: makeVerifier(enclave.wallet) } }, {});
+  const body = {
+    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+    session_id: 'session-schema-migration',
+    seq: 1,
+    final: true,
+    user: user.publicKey,
+    provider: provider.publicKey,
+    enclave_id: 'enclave-schema-migration',
+    model_id: 'model/schema-migration',
+    price_ver: 1,
+    rules_ver: 1,
+    usage: { in: 10, out: 20 },
+    mu_owed_cum: 100,
+    prompt_hash: 'a'.repeat(64),
+    ts: 1_000,
+  };
+  const message = b4a.from(receiptMessage(body));
+  const envelope = {
+    body,
+    enclave_pubkey: enclave.publicKey,
+    enclave_sig: b4a.toString(enclave.wallet.sign(message), 'hex'),
+    user_sig: b4a.toString(user.wallet.sign(message), 'hex'),
+  };
+
+  const migrated = contract.normalizeReceiptEnvelope(envelope, {
+    targetSchemaVersion: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
+  });
+  assert.equal(migrated instanceof Error, false, migrated.message);
+  assert.equal(migrated.body.schema_version, NEXT_SESSION_RECEIPT_SCHEMA_VERSION);
+  assert.deepEqual(migrated.signed_body, body);
+  assert.equal(contract.verifyReceiptEnvelope(migrated), true);
+
+  const unsupported = contract.normalizeReceiptEnvelope(
+    { ...envelope, body: { ...body, schema_version: 99 } },
+    { targetSchemaVersion: NEXT_SESSION_RECEIPT_SCHEMA_VERSION }
+  );
+  assert.equal(unsupported instanceof Error, true);
+  assert.match(unsupported.message, /Unsupported receipt schema migration/);
 });
