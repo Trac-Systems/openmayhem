@@ -10,6 +10,10 @@ use mayhem_proto::{default_model_class, DEFAULT_MODEL_CLASS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
+const VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
+const VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
+
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
     pub catalog_path: PathBuf,
@@ -179,10 +183,16 @@ pub(crate) struct CatalogRequirements {
 pub(crate) struct CanaryRef {
     pub(crate) set_id: String,
     pub(crate) match_min: f64,
+    #[serde(default = "default_canary_verification_method")]
+    pub(crate) verification_method: String,
+    #[serde(default)]
+    pub(crate) verification_tolerance_bps: Option<u32>,
     #[serde(default)]
     pub(crate) fingerprints: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) token_prefixes: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
+    #[serde(default)]
+    pub(crate) perceptual_hashes: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +227,10 @@ struct CanarySet {
     set_id: String,
     #[serde(default)]
     prompts: Vec<Value>,
+}
+
+fn default_canary_verification_method() -> String {
+    VERIFICATION_TOKEN_FINGERPRINT.to_owned()
 }
 
 pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
@@ -547,6 +561,87 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             model.model_id
         ));
     }
+    validate_canary_verification(model, errors);
+    if model.price_ref_mu.denom != "mu_usd" {
+        errors.push(format!(
+            "{} price_ref_mu.denom must be mu_usd",
+            model.model_id
+        ));
+    }
+    if model.price_ref_mu.in_per_1k == 0 || model.price_ref_mu.out_per_1k == 0 {
+        errors.push(format!(
+            "{} price references must be positive",
+            model.model_id
+        ));
+    }
+}
+
+fn validate_canary_verification(model: &CatalogModel, errors: &mut Vec<String>) {
+    let method = model.canary.verification_method.as_str();
+    if !valid_canary_verification_method(method) {
+        errors.push(format!(
+            "{} canary.verification_method is unsupported: {}",
+            model.model_id, method
+        ));
+        return;
+    }
+    if !canary_verification_method_allowed_for_class(&model.model_class, method) {
+        errors.push(format!(
+            "{} canary.verification_method {} is not allowed for model_class {}",
+            model.model_id, method, model.model_class
+        ));
+    }
+    if let Some(tolerance_bps) = model.canary.verification_tolerance_bps {
+        if tolerance_bps > 10_000 {
+            errors.push(format!(
+                "{} canary.verification_tolerance_bps must be between 0 and 10000",
+                model.model_id
+            ));
+        }
+    }
+    match method {
+        VERIFICATION_TOKEN_FINGERPRINT => validate_token_fingerprint_canary(model, errors),
+        VERIFICATION_SEED_PERCEPTUAL_HASH => validate_seed_perceptual_hash_canary(model, errors),
+        VERIFICATION_ATTESTATION_OF_COMPUTE => {
+            validate_attestation_of_compute_canary(model, errors)
+        }
+        _ => {}
+    }
+}
+
+fn valid_canary_verification_method(method: &str) -> bool {
+    matches!(
+        method,
+        VERIFICATION_TOKEN_FINGERPRINT
+            | VERIFICATION_SEED_PERCEPTUAL_HASH
+            | VERIFICATION_ATTESTATION_OF_COMPUTE
+    )
+}
+
+fn canary_verification_method_allowed_for_class(model_class: &str, method: &str) -> bool {
+    matches!(
+        (model_class, method),
+        (DEFAULT_MODEL_CLASS, VERIFICATION_TOKEN_FINGERPRINT)
+            | ("embedding", VERIFICATION_TOKEN_FINGERPRINT)
+            | ("image-generation", VERIFICATION_SEED_PERCEPTUAL_HASH)
+            | ("video-generation", VERIFICATION_SEED_PERCEPTUAL_HASH)
+            | (_, VERIFICATION_ATTESTATION_OF_COMPUTE)
+    )
+}
+
+fn validate_token_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    if model.canary.verification_tolerance_bps.unwrap_or(0) != 0 {
+        errors.push(format!(
+            "{} token_fingerprint canary must not set verification_tolerance_bps",
+            model.model_id
+        ));
+    }
+    if !model.canary.perceptual_hashes.is_empty() {
+        errors.push(format!(
+            "{} token_fingerprint canary must not set perceptual_hashes",
+            model.model_id
+        ));
+    }
     for artifact_name in model.artifacts.keys() {
         if !model.canary.fingerprints.contains_key(artifact_name) {
             errors.push(format!(
@@ -569,6 +664,10 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             ));
         }
     }
+    validate_token_prefixes(model, errors);
+}
+
+fn validate_token_prefixes(model: &CatalogModel, errors: &mut Vec<String>) {
     for (artifact, prefixes) in &model.canary.token_prefixes {
         if !model.artifacts.contains_key(artifact) {
             errors.push(format!(
@@ -597,18 +696,77 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             }
         }
     }
-    if model.price_ref_mu.denom != "mu_usd" {
+}
+
+fn validate_seed_perceptual_hash_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    if model.canary.verification_tolerance_bps.is_none() {
         errors.push(format!(
-            "{} price_ref_mu.denom must be mu_usd",
+            "{} seed_perceptual_hash canary requires verification_tolerance_bps",
             model.model_id
         ));
     }
-    if model.price_ref_mu.in_per_1k == 0 || model.price_ref_mu.out_per_1k == 0 {
+    if !model.canary.fingerprints.is_empty() {
         errors.push(format!(
-            "{} price references must be positive",
+            "{} seed_perceptual_hash canary must use perceptual_hashes, not fingerprints",
             model.model_id
         ));
     }
+    if !model.canary.token_prefixes.is_empty() {
+        errors.push(format!(
+            "{} seed_perceptual_hash canary must not set token_prefixes",
+            model.model_id
+        ));
+    }
+    for artifact_name in model.artifacts.keys() {
+        if !model.canary.perceptual_hashes.contains_key(artifact_name) {
+            errors.push(format!(
+                "{} canary perceptual_hashes missing artifact {}",
+                model.model_id, artifact_name
+            ));
+        }
+    }
+    for (artifact, hashes) in &model.canary.perceptual_hashes {
+        if !model.artifacts.contains_key(artifact) {
+            errors.push(format!(
+                "{} canary perceptual_hashes references unknown artifact {}",
+                model.model_id, artifact
+            ));
+        }
+        if hashes.is_empty() {
+            errors.push(format!(
+                "{} canary perceptual_hashes for {} must not be empty",
+                model.model_id, artifact
+            ));
+        }
+        for (prompt_id, hash) in hashes {
+            if prompt_id.trim().is_empty() {
+                errors.push(format!(
+                    "{} canary perceptual_hashes for {} has empty prompt id",
+                    model.model_id, artifact
+                ));
+            }
+            if !valid_perceptual_hash(hash) {
+                errors.push(format!(
+                    "{} canary perceptual_hashes for {} prompt {} must be hex between 64 and 256 bits",
+                    model.model_id, artifact, prompt_id
+                ));
+            }
+        }
+    }
+}
+
+fn validate_attestation_of_compute_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    if model.canary.verification_tolerance_bps.is_some() {
+        errors.push(format!(
+            "{} attestation_of_compute canary must not set verification_tolerance_bps",
+            model.model_id
+        ));
+    }
+}
+
+fn valid_perceptual_hash(value: &str) -> bool {
+    let bits = value.len().saturating_mul(4);
+    (64..=256).contains(&bits) && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
 fn valid_model_class(model_class: &str) -> bool {
@@ -704,7 +862,18 @@ fn validate_artifact(
     artifact: &CatalogArtifact,
     errors: &mut Vec<String>,
 ) {
-    if !matches!(artifact.engine.as_str(), "llama.cpp" | "mlx" | "trt-llm") {
+    if !matches!(
+        artifact.engine.as_str(),
+        "llama.cpp"
+            | "mlx"
+            | "trt-llm"
+            | "diffusers"
+            | "stable-diffusion.cpp"
+            | "comfyui"
+            | "whisper.cpp"
+            | "piper"
+            | "kokoro"
+    ) {
         errors.push(format!(
             "{model_id}/{name} has unsupported engine {}",
             artifact.engine
@@ -1264,8 +1433,11 @@ mod tests {
             canary: CanaryRef {
                 set_id: "canary-launch-v1".to_owned(),
                 match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
                 fingerprints: BTreeMap::new(),
                 token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
             },
             price_ref_mu: PriceRef {
                 denom: "mu_usd".to_owned(),
@@ -1308,6 +1480,155 @@ mod tests {
             .artifacts
             .insert("gguf-q4_k_m".to_owned(), artifact.clone());
         assert!(launch_source_metadata_errors(&model, "gguf-q4_k_m", &artifact).is_empty());
+    }
+
+    #[test]
+    fn canary_verification_descriptor_is_class_specific() {
+        let text = verification_test_model(
+            "admin/text@fixture",
+            DEFAULT_MODEL_CLASS,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                )]),
+                perceptual_hashes: BTreeMap::new(),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_model(&text, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let image = verification_test_model(
+            "admin/image@fixture",
+            "image-generation",
+            "diffusers",
+            CanaryRef {
+                set_id: "canary-image-v1".to_owned(),
+                match_min: 0.95,
+                verification_method: VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
+                verification_tolerance_bps: Some(500),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-image".to_owned(), "f".repeat(16))]),
+                )]),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_model(&image, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut invalid_image = image.clone();
+        invalid_image.canary.verification_method = VERIFICATION_TOKEN_FINGERPRINT.to_owned();
+        invalid_image.canary.verification_tolerance_bps = None;
+        invalid_image.canary.fingerprints =
+            BTreeMap::from([("fixture".to_owned(), "b".repeat(64))]);
+        invalid_image.canary.token_prefixes = BTreeMap::from([(
+            "fixture".to_owned(),
+            BTreeMap::from([("fixed-image".to_owned(), vec![4, 5, 6])]),
+        )]);
+        invalid_image.canary.perceptual_hashes = BTreeMap::new();
+        let mut errors = Vec::new();
+        validate_model(&invalid_image, &mut errors);
+        assert!(errors.iter().any(|error| error.contains(
+            "canary.verification_method token_fingerprint is not allowed for model_class image-generation"
+        )));
+
+        let mut missing_tolerance = image.clone();
+        missing_tolerance.canary.verification_tolerance_bps = None;
+        let mut errors = Vec::new();
+        validate_model(&missing_tolerance, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("requires verification_tolerance_bps")));
+    }
+
+    fn verification_test_model(
+        model_id: &str,
+        model_class: &str,
+        engine: &str,
+        canary: CanaryRef,
+    ) -> CatalogModel {
+        let output_modality = match model_class {
+            "image-generation" => "image",
+            _ => "text",
+        };
+        CatalogModel {
+            model_id: model_id.to_owned(),
+            model_class: model_class.to_owned(),
+            family: "fixture".to_owned(),
+            params_b: 1.0,
+            tier: "launch".to_owned(),
+            provenance: Provenance {
+                source: SourceRef {
+                    kind: "huggingface".to_owned(),
+                    repo: "admin/source".to_owned(),
+                    revision: "1".repeat(40),
+                    publisher_key: None,
+                },
+                conversion: vec![ConversionRef {
+                    tool: "fixture-convert".to_owned(),
+                    method: "fixture".to_owned(),
+                    input_sha256: "2".repeat(64),
+                    output_sha256: "3".repeat(64),
+                }],
+                license: "apache-2.0".to_owned(),
+                license_sha256: "4".repeat(64),
+            },
+            artifacts: BTreeMap::from([(
+                "fixture".to_owned(),
+                CatalogArtifact {
+                    engine: engine.to_owned(),
+                    source: SourceRef {
+                        kind: "huggingface".to_owned(),
+                        repo: "admin/model".to_owned(),
+                        revision: "5".repeat(40),
+                        publisher_key: None,
+                    },
+                    path: "model.safetensors".to_owned(),
+                    artifact_root: "6".repeat(64),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 1,
+                    source_sha256: Some("7".repeat(64)),
+                    tokenizer_sha256: None,
+                    chat_template_sha256: None,
+                    min_compute_cap: None,
+                    download_check: false,
+                    notes: None,
+                },
+            )]),
+            caps: CatalogCaps {
+                tools: model_class == DEFAULT_MODEL_CLASS,
+                json: model_class == DEFAULT_MODEL_CLASS,
+                ctx_max: 1024,
+                vision: false,
+                image: model_class == "image-generation",
+                video: false,
+                audio: false,
+                output_modality: Some(output_modality.to_owned()),
+                output_modalities: vec![output_modality.to_owned()],
+            },
+            requirements: CatalogRequirements {
+                min_ram_gb: 1,
+                min_vram_gb_full_offload: 0,
+                cpu_flags: Vec::new(),
+                backends: vec![engine.to_owned()],
+            },
+            canary,
+            price_ref_mu: PriceRef {
+                denom: "mu_usd".to_owned(),
+                in_per_1k: 1,
+                out_per_1k: 1,
+            },
+        }
     }
 
     fn hex_string(bytes: &[u8]) -> String {

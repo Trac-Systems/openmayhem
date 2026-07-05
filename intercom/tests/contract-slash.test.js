@@ -176,6 +176,7 @@ function signedCanaryProbe(ctx, overrides = {}) {
     epoch: 3,
     at: 10_800,
     canary_set: 'canary-dev-v1',
+    verification_method: 'token_fingerprint',
     match_bps: 1_000,
     pass: false,
     session_receipt_hash: 'c'.repeat(64),

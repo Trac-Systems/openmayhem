@@ -7,6 +7,9 @@ use crate::ReputationEventKind;
 
 pub const DEFAULT_CANARY_MATCH_MIN_BPS: u32 = 9_000;
 pub const DEFAULT_CANARY_TEMPERATURE: f64 = 0.0;
+pub const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
+pub const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
+pub const CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CanaryProbeSpec {
@@ -26,6 +29,7 @@ pub struct CanaryTokenFingerprint {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CanaryProbeEvaluation {
+    pub verification_method: String,
     pub canary_set: String,
     pub prompt_id: String,
     pub expected_fingerprint: String,
@@ -81,6 +85,15 @@ pub fn token_fingerprint(token_ids: impl IntoIterator<Item = i32>) -> CanaryToke
     }
 }
 
+pub fn supported_canary_verification_method(method: &str) -> bool {
+    matches!(
+        method,
+        CANARY_VERIFICATION_TOKEN_FINGERPRINT
+            | CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
+            | CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE
+    )
+}
+
 pub fn aggregate_canary_fingerprints<'a>(
     prompts: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
@@ -112,6 +125,7 @@ pub fn evaluate_canary_probe(
         ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
     };
     CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
         canary_set: spec.canary_set.clone(),
         prompt_id: spec.prompt_id.clone(),
         expected_fingerprint: token_fingerprint(expected.iter().copied()).digest,
@@ -135,6 +149,7 @@ pub fn evaluate_catalog_canary_probe(
         0
     };
     CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
         canary_set: spec.canary_set.clone(),
         prompt_id: spec.prompt_id.clone(),
         expected_fingerprint: expected_fingerprint.to_owned(),
@@ -197,6 +212,7 @@ pub fn evaluate_catalog_canary_token_prefix_probe(
     );
 
     CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
         canary_set: spec.canary_set.clone(),
         prompt_id: spec.prompt_id.clone(),
         expected_fingerprint,
@@ -205,6 +221,59 @@ pub fn evaluate_catalog_canary_token_prefix_probe(
         total_positions,
         match_bps,
         pass: total_positions > 0 && matched_positions == total_positions,
+    }
+}
+
+pub fn evaluate_seed_perceptual_hash_probe(
+    spec: &CanaryProbeSpec,
+    expected_hash: &str,
+    observed_hash: &str,
+    min_match_bps: u32,
+) -> CanaryProbeEvaluation {
+    let (matched_positions, total_positions, match_bps) =
+        perceptual_hash_match_stats(expected_hash, observed_hash).unwrap_or((0, 1, 0));
+    CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint: expected_hash.to_ascii_lowercase(),
+        observed_fingerprint: observed_hash.to_ascii_lowercase(),
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: match_bps >= min_match_bps,
+    }
+}
+
+pub fn perceptual_hash_match_stats(
+    expected_hash: &str,
+    observed_hash: &str,
+) -> Option<(u32, u32, u32)> {
+    if expected_hash.is_empty() || expected_hash.len() != observed_hash.len() {
+        return None;
+    }
+    let mut matched_bits = 0_u32;
+    let mut total_bits = 0_u32;
+    for (expected, observed) in expected_hash.bytes().zip(observed_hash.bytes()) {
+        let expected = hex_nibble(expected)?;
+        let observed = hex_nibble(observed)?;
+        let distance = (expected ^ observed).count_ones();
+        matched_bits = matched_bits.saturating_add(4_u32.saturating_sub(distance));
+        total_bits = total_bits.saturating_add(4);
+    }
+    if total_bits == 0 {
+        return None;
+    }
+    let match_bps = ((u64::from(matched_bits) * 10_000) / u64::from(total_bits)) as u32;
+    Some((matched_bits, total_bits, match_bps))
+}
+
+fn hex_nibble(byte: u8) -> Option<u32> {
+    match byte {
+        b'0'..=b'9' => Some(u32::from(byte - b'0')),
+        b'a'..=b'f' => Some(u32::from(byte - b'a' + 10)),
+        b'A'..=b'F' => Some(u32::from(byte - b'A' + 10)),
+        _ => None,
     }
 }
 
@@ -248,6 +317,10 @@ mod tests {
         assert_eq!(evaluation.total_positions, 5);
         assert_eq!(evaluation.match_bps, 6_000);
         assert!(!evaluation.pass);
+        assert_eq!(
+            evaluation.verification_method,
+            CANARY_VERIFICATION_TOKEN_FINGERPRINT
+        );
         assert!(evaluation.provenance_violation());
         assert_eq!(
             evaluation.reputation_event_kind(),
@@ -330,5 +403,26 @@ mod tests {
         assert_eq!(mismatch.total_positions, 5);
         assert_eq!(mismatch.match_bps, 8_000);
         assert!(!mismatch.pass);
+    }
+
+    #[test]
+    fn seed_perceptual_hash_evaluation_uses_hamming_tolerance() {
+        let near = evaluate_seed_perceptual_hash_probe(&spec(), "ffff", "fffe", 9_000);
+        assert_eq!(
+            near.verification_method,
+            CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
+        );
+        assert_eq!(near.matched_positions, 15);
+        assert_eq!(near.total_positions, 16);
+        assert_eq!(near.match_bps, 9_375);
+        assert!(near.pass);
+
+        let far = evaluate_seed_perceptual_hash_probe(&spec(), "ffff", "0000", 9_000);
+        assert_eq!(far.match_bps, 0);
+        assert!(!far.pass);
+
+        let malformed = evaluate_seed_perceptual_hash_probe(&spec(), "ffff", "not-hex", 9_000);
+        assert_eq!(malformed.match_bps, 0);
+        assert!(!malformed.pass);
     }
 }

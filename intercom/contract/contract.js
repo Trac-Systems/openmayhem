@@ -69,6 +69,11 @@ const REPUTATION_EVENT_KINDS = new Set([
   'provenance_violation',
 ]);
 const PROBE_KINDS = new Set(['canary', 'uptime_tick']);
+const PROBE_VERIFICATION_METHODS = new Set([
+  'token_fingerprint',
+  'seed_perceptual_hash',
+  'attestation_of_compute',
+]);
 const FRAUD_PROOF_REASONS = new Set(['over_credit']);
 const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
 const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit']);
@@ -223,6 +228,7 @@ export const probeResultEvidence = (value, auditor) => ({
   enclave_id: value.enclave_id,
   binary_hash: value.binary_hash,
   canary_set: value.canary_set,
+  verification_method: value.verification_method,
   session_receipt_hash: value.session_receipt_hash,
   evidence_hash: value.evidence_hash,
   match_bps: value.match_bps,
@@ -614,6 +620,7 @@ class MayhemContract extends Contract {
         epoch: { type: 'number', integer: true, min: 0 },
         at: { type: 'number', integer: true, min: 0 },
         canary_set: { type: 'string', min: 1, max: 128, optional: true },
+        verification_method: { type: 'string', min: 1, max: 64, optional: true },
         match_bps: { type: 'number', integer: true, min: 0, max: 10_000, optional: true },
         pass: { type: 'boolean', optional: true },
         session_receipt_hash: { type: 'string', min: 1, max: 128, optional: true },
@@ -2138,6 +2145,7 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       at: this.value.at,
       canary_set: this.value.canary_set ?? null,
+      verification_method: this.value.verification_method ?? null,
       binary_hash: this.value.binary_hash ?? null,
       match_bps: this.value.match_bps ?? null,
       pass,
@@ -3828,6 +3836,10 @@ class MayhemContract extends Contract {
       if (!Number.isInteger(value.match_bps)) return new Error('Canary probe requires match_bps.');
       if (typeof value.pass !== 'boolean') return new Error('Canary probe requires pass.');
       if (!value.canary_set) return new Error('Canary probe requires canary_set.');
+      if (!value.verification_method) return new Error('Canary probe requires verification_method.');
+      if (!PROBE_VERIFICATION_METHODS.has(value.verification_method)) {
+        return new Error('Unsupported canary verification_method.');
+      }
       if (!value.session_receipt_hash) return new Error('Canary probe requires session_receipt_hash.');
       if (!value.evidence_hash) return new Error('Canary probe requires evidence_hash.');
       if (!value.auditor_sig) return new Error('Canary probe requires auditor_sig.');

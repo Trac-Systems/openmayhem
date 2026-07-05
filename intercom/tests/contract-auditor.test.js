@@ -128,6 +128,7 @@ const canaryProbe = (provider, auditor, overrides = {}, options = {}) => {
     epoch: 1,
     at: 10_000,
     canary_set: 'canary-dev-v1',
+    verification_method: 'token_fingerprint',
     match_bps: 9_700,
     pass: true,
     session_receipt_hash: 'c'.repeat(64),
@@ -223,6 +224,26 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
     9
   );
   assert.match(missingEvidence.message, /requires evidence_hash/i);
+
+  const missingVerificationMethod = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, { probe_id: 'canary-no-method', verification_method: undefined }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(missingVerificationMethod.message, /requires verification_method/i);
+
+  const unsupportedVerificationMethod = await execute(
+    contract,
+    storage,
+    'probeResult',
+    canaryProbe(provider, auditor, { probe_id: 'canary-bad-method', verification_method: 'provider-local-screenshot' }),
+    auditor.publicKey,
+    9
+  );
+  assert.match(unsupportedVerificationMethod.message, /unsupported canary verification_method/i);
 
   const unsigned = await execute(
     contract,
@@ -375,6 +396,7 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
 
   const goodProbe = await storage.get('ev/probe/canary-good');
   assert.equal(goodProbe.value.pass, true);
+  assert.equal(goodProbe.value.verification_method, 'token_fingerprint');
   assert.equal(goodProbe.value.probe_reward_mu, 5_000);
 
   const badProbe = await storage.get('ev/probe/canary-bad');

@@ -3117,6 +3117,8 @@ struct CatalogListModel {
     requirements: CatalogListRequirements,
     canary_set: String,
     canary_match_min: f64,
+    canary_verification_method: String,
+    canary_verification_tolerance_bps: Option<u32>,
     artifacts: Vec<CatalogListArtifact>,
 }
 
@@ -3321,6 +3323,8 @@ fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
         },
         canary_set: model.canary.set_id.clone(),
         canary_match_min: model.canary.match_min,
+        canary_verification_method: model.canary.verification_method.clone(),
+        canary_verification_tolerance_bps: model.canary.verification_tolerance_bps,
         artifacts,
     }
 }
@@ -3379,8 +3383,14 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             model.requirements.backends.join(",")
         );
         println!(
-            "  canary: {} match_min={}",
-            model.canary_set, model.canary_match_min
+            "  canary: {} method={} match_min={} tolerance_bps={}",
+            model.canary_set,
+            model.canary_verification_method,
+            model.canary_match_min,
+            model
+                .canary_verification_tolerance_bps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
         );
         for artifact in &model.artifacts {
             println!(
@@ -10849,12 +10859,14 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
         .cloned()
         .context("selected gateway model does not expose a binary_hash for the probed enclave")?;
     let at = args.at.unwrap_or(unix_epoch_seconds()?);
+    let verification_method = "token_fingerprint";
     let evidence = json!({
         "schema_version": 1,
         "kind": "mayhem-canary-probe-evidence",
         "gateway_url": gateway_root,
         "model": model.id,
         "canary_set": args.canary_set,
+        "verification_method": verification_method,
         "prompt_id": canary.id,
         "request": request,
         "response": response,
@@ -10890,6 +10902,7 @@ async fn auditor_canary(args: AuditorCanaryArgs) -> Result<()> {
         epoch: args.epoch,
         at,
         canary_set: args.canary_set.clone(),
+        verification_method: verification_method.to_owned(),
         match_bps: evaluation.match_bps,
         pass: evaluation.pass,
         session_receipt_hash,
@@ -11066,6 +11079,7 @@ struct CanaryProbeCommandInput {
     epoch: u64,
     at: u64,
     canary_set: String,
+    verification_method: String,
     match_bps: u32,
     pass: bool,
     session_receipt_hash: String,
@@ -11084,6 +11098,7 @@ fn canary_probe_command(input: CanaryProbeCommandInput) -> Value {
         "epoch": input.epoch,
         "at": input.at,
         "canary_set": input.canary_set,
+        "verification_method": input.verification_method,
         "match_bps": input.match_bps,
         "pass": input.pass,
         "session_receipt_hash": input.session_receipt_hash,
@@ -11115,6 +11130,7 @@ fn probe_result_message(value: &Value, auditor: &str) -> String {
         "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
         "binary_hash": value.get("binary_hash").cloned().unwrap_or(Value::Null),
         "canary_set": value.get("canary_set").cloned().unwrap_or(Value::Null),
+        "verification_method": value.get("verification_method").cloned().unwrap_or(Value::Null),
         "session_receipt_hash": value.get("session_receipt_hash").cloned().unwrap_or(Value::Null),
         "evidence_hash": value.get("evidence_hash").cloned().unwrap_or(Value::Null),
         "match_bps": value.get("match_bps").cloned().unwrap_or(Value::Null),
@@ -21770,6 +21786,11 @@ mod tests {
         assert_eq!(report.model_count, 1);
         assert_eq!(report.artifact_count, 1);
         assert_eq!(report.models[0].model_id, "test/launch@4bit");
+        assert_eq!(
+            report.models[0].canary_verification_method,
+            "token_fingerprint"
+        );
+        assert_eq!(report.models[0].canary_verification_tolerance_bps, None);
         assert_eq!(report.models[0].artifacts[0].source_repo, "test/model");
         assert_eq!(
             report.models[0].artifacts[0].source_url.as_deref(),
@@ -23347,6 +23368,7 @@ mod tests {
         assert_eq!(command["op"], "probe_result");
         assert_eq!(command["enclave_id"], "enclave");
         assert_eq!(command["binary_hash"], "bb".repeat(32));
+        assert_eq!(command["verification_method"], "token_fingerprint");
         assert_eq!(command["session_receipt_hash"], "rr".repeat(32));
         assert_eq!(command["evidence_hash"], "ee".repeat(32));
         assert_eq!(command["auditor_sig"], "aa".repeat(64));
@@ -24092,8 +24114,11 @@ mod tests {
                 canary: catalog::CanaryRef {
                     set_id: "test-canary".to_owned(),
                     match_min: 0.9,
+                    verification_method: "token_fingerprint".to_owned(),
+                    verification_tolerance_bps: None,
                     fingerprints: BTreeMap::new(),
                     token_prefixes: BTreeMap::new(),
+                    perceptual_hashes: BTreeMap::new(),
                 },
                 price_ref_mu: catalog::PriceRef {
                     denom: "mu_usd".to_owned(),
@@ -24211,6 +24236,7 @@ mod tests {
             epoch: 7,
             at: 42,
             canary_set: "canary-dev-v1".to_owned(),
+            verification_method: "token_fingerprint".to_owned(),
             match_bps: 9_700,
             pass: true,
             session_receipt_hash,

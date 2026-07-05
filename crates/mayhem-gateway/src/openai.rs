@@ -11,7 +11,8 @@ use std::{
 use crate::{
     audit::{
         aggregate_canary_fingerprints, evaluate_catalog_canary_token_prefix_probe,
-        token_fingerprint, CanaryProbeSpec, DEFAULT_CANARY_MATCH_MIN_BPS,
+        supported_canary_verification_method, token_fingerprint, CanaryProbeSpec,
+        CANARY_VERIFICATION_TOKEN_FINGERPRINT, DEFAULT_CANARY_MATCH_MIN_BPS,
         DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
@@ -168,6 +169,7 @@ pub struct StoredProbeEvent {
     pub enclave_id: String,
     pub binary_hash: String,
     pub canary_set: String,
+    pub verification_method: String,
     pub expected_fingerprint: String,
     pub observed_fingerprint: String,
     pub match_bps: u32,
@@ -188,11 +190,15 @@ pub struct GatewayCanaryRegistry {
 pub struct GatewayCanaryModelConfig {
     pub canary_set: String,
     pub match_min_bps: u32,
+    pub verification_method: String,
+    pub verification_tolerance_bps: Option<u32>,
     pub prompts: Vec<GatewayCanaryPrompt>,
     pub fingerprints_by_artifact_root: BTreeMap<String, String>,
     pub token_prefixes_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
+    pub perceptual_hashes_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub default_fingerprint: Option<String>,
     pub default_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
+    pub default_perceptual_hashes: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -840,6 +846,18 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
             .and_then(Value::as_f64)
             .map(|value| (value * 10_000.0).round().clamp(0.0, 10_000.0) as u32)
             .unwrap_or(DEFAULT_CANARY_MATCH_MIN_BPS);
+        let verification_method = canary
+            .get("verification_method")
+            .and_then(Value::as_str)
+            .unwrap_or(CANARY_VERIFICATION_TOKEN_FINGERPRINT)
+            .to_owned();
+        if !supported_canary_verification_method(&verification_method) {
+            continue;
+        }
+        let verification_tolerance_bps = canary
+            .get("verification_tolerance_bps")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
         let fingerprints = canary
             .get("fingerprints")
             .and_then(Value::as_object)
@@ -851,47 +869,64 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
                     .map(|fingerprint| (artifact_name.as_str(), fingerprint.to_owned()))
             })
             .collect::<BTreeMap<_, _>>();
-        if fingerprints.is_empty() {
+        let token_prefixes = canary_token_prefixes_by_artifact(canary);
+        if verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT
+            && (fingerprints.is_empty() || token_prefixes.is_empty())
+        {
             continue;
         }
-        let token_prefixes = canary_token_prefixes_by_artifact(canary);
-        if token_prefixes.is_empty() {
+        let perceptual_hashes = canary_perceptual_hashes_by_artifact(canary);
+        if verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT
+            && perceptual_hashes.is_empty()
+        {
             continue;
         }
         let mut fingerprints_by_artifact_root = BTreeMap::new();
         let mut token_prefixes_by_artifact_root = BTreeMap::new();
+        let mut perceptual_hashes_by_artifact_root = BTreeMap::new();
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
             for (artifact_name, artifact) in artifacts {
-                let Some(fingerprint) = fingerprints.get(artifact_name.as_str()) else {
-                    continue;
-                };
-                let Some(prefixes) = token_prefixes.get(artifact_name.as_str()) else {
-                    continue;
-                };
-                let expected_fingerprint = aggregate_token_prefixes_for_prompts(&prompts, prefixes);
-                if expected_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                    continue;
-                }
                 if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
-                    fingerprints_by_artifact_root
-                        .insert(artifact_root.to_owned(), fingerprint.clone());
-                    token_prefixes_by_artifact_root
-                        .insert(artifact_root.to_owned(), prefixes.clone());
+                    if verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+                        let Some(fingerprint) = fingerprints.get(artifact_name.as_str()) else {
+                            continue;
+                        };
+                        let Some(prefixes) = token_prefixes.get(artifact_name.as_str()) else {
+                            continue;
+                        };
+                        let expected_fingerprint =
+                            aggregate_token_prefixes_for_prompts(&prompts, prefixes);
+                        if expected_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                            continue;
+                        }
+                        fingerprints_by_artifact_root
+                            .insert(artifact_root.to_owned(), fingerprint.clone());
+                        token_prefixes_by_artifact_root
+                            .insert(artifact_root.to_owned(), prefixes.clone());
+                    } else if let Some(hashes) = perceptual_hashes.get(artifact_name.as_str()) {
+                        perceptual_hashes_by_artifact_root
+                            .insert(artifact_root.to_owned(), hashes.clone());
+                    }
                 }
             }
         }
         let default_fingerprint = fingerprints.values().next().cloned();
         let default_token_prefixes = token_prefixes.values().next().cloned();
+        let default_perceptual_hashes = perceptual_hashes.values().next().cloned();
         models.insert(
             model_id.to_owned(),
             GatewayCanaryModelConfig {
                 canary_set: canary_set.to_owned(),
                 match_min_bps,
+                verification_method,
+                verification_tolerance_bps,
                 prompts,
                 fingerprints_by_artifact_root,
                 token_prefixes_by_artifact_root,
+                perceptual_hashes_by_artifact_root,
                 default_fingerprint,
                 default_token_prefixes,
+                default_perceptual_hashes,
             },
         );
     }
@@ -920,6 +955,29 @@ fn canary_token_prefixes_by_artifact(
                 })
                 .collect::<BTreeMap<_, _>>();
             (!prefixes.is_empty()).then_some((artifact_name.clone(), prefixes))
+        })
+        .collect()
+}
+
+fn canary_perceptual_hashes_by_artifact(
+    canary: &Value,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    canary
+        .get("perceptual_hashes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(artifact_name, value)| {
+            let prompts = value.as_object()?;
+            let prompts = prompts
+                .iter()
+                .filter_map(|(prompt_id, hash)| {
+                    hash.as_str()
+                        .filter(|hash| !hash.is_empty())
+                        .map(|hash| (prompt_id.clone(), hash.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!prompts.is_empty()).then(|| (artifact_name.clone(), prompts))
         })
         .collect()
 }
@@ -2118,6 +2176,9 @@ impl GatewayState {
         if config.prompts.is_empty() {
             return;
         }
+        if config.verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+            return;
+        }
         let route_key = canary_route_key(model, invocation);
         let should_probe = self
             .canary_scheduler
@@ -2247,6 +2308,7 @@ impl GatewayState {
             "enclave_id": served_invocation.enclave_id,
             "binary_hash": binary_hash,
             "canary_set": config.canary_set,
+            "verification_method": config.verification_method,
             "catalog_expected_fingerprint": expected_fingerprint,
             "catalog_expected_token_prefixes": expected_token_prefixes,
             "observed_fingerprint": evaluation.observed_fingerprint,
@@ -2277,6 +2339,7 @@ impl GatewayState {
             "epoch": self.canary_policy.epoch,
             "at": at,
             "canary_set": config.canary_set,
+            "verification_method": config.verification_method,
             "match_bps": evaluation.match_bps,
             "pass": evaluation.pass,
             "session_receipt_hash": session_receipt_hash,
@@ -2297,6 +2360,7 @@ impl GatewayState {
             enclave_id: served_invocation.enclave_id.clone(),
             binary_hash,
             canary_set: config.canary_set.clone(),
+            verification_method: evaluation.verification_method.clone(),
             expected_fingerprint: evaluation.expected_fingerprint.clone(),
             observed_fingerprint: evaluation.observed_fingerprint.clone(),
             match_bps: evaluation.match_bps,
@@ -2692,6 +2756,7 @@ fn failed_canary_runtime_probe(
         "enclave_id": invocation.enclave_id,
         "binary_hash": binary_hash,
         "canary_set": config.canary_set,
+        "verification_method": config.verification_method,
         "reason": reason,
     });
     let evidence_hash = stable_value_hash(&evidence);
@@ -2713,6 +2778,7 @@ fn failed_canary_runtime_probe(
         "epoch": epoch,
         "at": at,
         "canary_set": config.canary_set,
+        "verification_method": config.verification_method,
         "match_bps": 0,
         "pass": false,
         "session_receipt_hash": stable_value_hash(&json!({
@@ -2733,6 +2799,7 @@ fn failed_canary_runtime_probe(
         enclave_id: invocation.enclave_id.clone(),
         binary_hash,
         canary_set: config.canary_set.clone(),
+        verification_method: config.verification_method.clone(),
         expected_fingerprint: canary_expected_fingerprint(config, invocation).unwrap_or_default(),
         observed_fingerprint: String::new(),
         match_bps: 0,
@@ -3226,6 +3293,7 @@ fn probe_result_signature(auditor_seed: &[u8; 32], value: &Value, auditor: &str)
         "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
         "binary_hash": value.get("binary_hash").cloned().unwrap_or(Value::Null),
         "canary_set": value.get("canary_set").cloned().unwrap_or(Value::Null),
+        "verification_method": value.get("verification_method").cloned().unwrap_or(Value::Null),
         "session_receipt_hash": value.get("session_receipt_hash").cloned().unwrap_or(Value::Null),
         "evidence_hash": value.get("evidence_hash").cloned().unwrap_or(Value::Null),
         "match_bps": value.get("match_bps").cloned().unwrap_or(Value::Null),
@@ -3739,6 +3807,47 @@ mod tests {
                 route_candidates: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn canary_registry_preserves_seed_perceptual_hash_descriptor() {
+        let root = json!({
+            "models": [{
+                "model_id": "admin/image-fixture",
+                "canary": {
+                    "set_id": "canary-dev-v1",
+                    "match_min": 0.95,
+                    "verification_method": "seed_perceptual_hash",
+                    "verification_tolerance_bps": 500,
+                    "perceptual_hashes": {
+                        "diffusers-fp16": {
+                            "fixed-image": "ffffffffffffffff"
+                        }
+                    }
+                },
+                "artifacts": {
+                    "diffusers-fp16": {
+                        "artifact_root": "ab".repeat(32)
+                    }
+                }
+            }]
+        });
+
+        let registry = canary_registry_from_catalog_root(&root);
+        let config = registry
+            .models
+            .get("admin/image-fixture")
+            .expect("image canary config");
+        assert_eq!(config.verification_method, "seed_perceptual_hash");
+        assert_eq!(config.verification_tolerance_bps, Some(500));
+        assert_eq!(config.match_min_bps, 9_500);
+        assert!(config.fingerprints_by_artifact_root.is_empty());
+        assert!(config.token_prefixes_by_artifact_root.is_empty());
+        assert_eq!(
+            config.perceptual_hashes_by_artifact_root
+                ["abababababababababababababababababababababababababababababababab"]["fixed-image"],
+            "ffffffffffffffff"
+        );
     }
 
     fn test_chat_request(model_id: &str) -> ChatCompletionRequest {

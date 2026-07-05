@@ -515,7 +515,12 @@ async fn automatic_canary_probe_catches_substituted_served_enclave() {
     assert_eq!(probe.reputation_event_kind, ReputationEventKind::ProbeFail);
     assert_eq!(probe.probe_command["op"], "probe_result");
     assert_eq!(probe.probe_command["probe_kind"], "canary");
+    assert_eq!(
+        probe.probe_command["verification_method"],
+        "token_fingerprint"
+    );
     assert_eq!(probe.probe_command["pass"], false);
+    assert_eq!(probe.verification_method, "token_fingerprint");
     assert_eq!(probe.probe_command["provider"], "55".repeat(32));
     assert_eq!(
         probe.probe_command["enclave_id"],
@@ -862,6 +867,8 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
             GatewayCanaryModelConfig {
                 canary_set: "canary-test-v1".to_owned(),
                 match_min_bps: 9_000,
+                verification_method: "token_fingerprint".to_owned(),
+                verification_tolerance_bps: None,
                 prompts: vec![GatewayCanaryPrompt {
                     id: "fixed-probe".to_owned(),
                     messages: vec![ChatMessage {
@@ -881,8 +888,10 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-probe".to_owned(), expected_tokens.to_vec())]),
                 )]),
+                perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
+                default_perceptual_hashes: None,
             },
         )]),
     }
