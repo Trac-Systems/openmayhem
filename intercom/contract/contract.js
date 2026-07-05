@@ -29,6 +29,7 @@ const DAY_SECONDS = 24 * 60 * 60;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const FULL_SLASH_BPS = 10_000;
 const DISPUTE_LOST_SLASH_BPS = 2_000;
+const MAX_OPERATOR_FEE_BPS = 5_000;
 const DISPUTE_DEPOSIT_MU = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
@@ -53,7 +54,7 @@ const PARAM_DEFINITIONS = Object.freeze({
   probe_reward_mu: { default: 5_000, min: 0, max: Number.MAX_SAFE_INTEGER },
   uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
   holdback_epochs: { default: 168, min: 0, max: 1_000_000 },
-  fee_bps: { default: 1_500, min: 0, max: 10_000 },
+  fee_bps: { default: 1_500, min: 0, max: MAX_OPERATOR_FEE_BPS },
   payout_min_mu: { default: 1_000_000, min: 0, max: Number.MAX_SAFE_INTEGER },
   price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
   price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },

@@ -53,8 +53,10 @@ test('claim-proof returns provider proof that submits to KnowledgePool.claim()',
     bundle,
     providerAccounts: { provider_a: providerAccount },
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
+    operatorAddress: await operator.getAddress(),
     post: true,
   });
   const expectedClaim = providerShareWei(muToTapWei(2_000_000, TAP_USD_E6));

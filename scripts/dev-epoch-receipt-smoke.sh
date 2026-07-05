@@ -63,8 +63,8 @@ command -v node >/dev/null 2>&1 || die "node is required"
 if ! [[ "$EPOCH" =~ ^[1-9][0-9]*$ ]]; then
   die "MAYHEM_EPOCH_SMOKE_EPOCH must be a positive integer"
 fi
-if ! [[ "$FEE_BPS" =~ ^[0-9]+$ ]] || (( FEE_BPS > 10000 )); then
-  die "MAYHEM_EPOCH_SMOKE_FEE_BPS must be an integer from 0 to 10000"
+if ! [[ "$FEE_BPS" =~ ^[0-9]+$ ]] || (( FEE_BPS > 5000 )); then
+  die "MAYHEM_EPOCH_SMOKE_FEE_BPS must be an integer from 0 to 5000"
 fi
 if curl -fsS "$GATEWAY_URL/mayhem/status" >/dev/null 2>&1; then
   die "$GATEWAY_URL already has a Mayhem gateway; set MAYHEM_EPOCH_SMOKE_BIND to another port"

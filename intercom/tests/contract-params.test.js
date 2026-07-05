@@ -171,4 +171,18 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       },
     },
   });
+
+  const aboveFeeCap = await execute(
+    contract,
+    storage,
+    'setParams',
+    makeSetParams({
+      submitted_at: DAY_SECONDS,
+      effective_at: 2 * DAY_SECONDS,
+      values: { fee_bps: 5_001 },
+    }),
+    admin.publicKey,
+    8
+  );
+  assert.match(aboveFeeCap.message, /fee_bps.*out of range/i);
 });

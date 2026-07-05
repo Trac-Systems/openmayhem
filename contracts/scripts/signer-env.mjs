@@ -29,8 +29,9 @@ export function walletFromEnv(provider, {
   label = 'Ethereum signer private key',
 } = {}) {
   const resolved = privateKeyFromEnv(env, names, label);
+  const wallet = new ethers.Wallet(resolved.privateKey, provider);
   return {
     envName: resolved.envName,
-    wallet: new ethers.Wallet(resolved.privateKey, provider),
+    wallet: new ethers.NonceManager(wallet),
   };
 }

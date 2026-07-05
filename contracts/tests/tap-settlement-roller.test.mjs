@@ -14,6 +14,7 @@ import { distribution } from '../scripts/merkle.mjs';
 import {
   buildTapSettlement,
   encodeSetRootCalldata,
+  encodeWithdrawOperatorCalldata,
   guardianPreSignReport,
   muToTapWei,
   providerShareWei,
@@ -88,6 +89,7 @@ test('TAP settlement roller posts root and provider proof verifies independently
   const buyer = await provider.getSigner(1);
   const providerA = await provider.getSigner(2);
   const providerB = await provider.getSigner(3);
+  const operatorTreasury = await provider.getSigner(4);
   const { token, pool, poolAddr } = await deployPool(operator);
 
   await (await token.mint(await buyer.getAddress(), U(10))).wait();
@@ -108,8 +110,10 @@ test('TAP settlement roller posts root and provider proof verifies independently
     bundle,
     providerAccounts,
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
+    operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
 
@@ -130,6 +134,12 @@ test('TAP settlement roller posts root and provider proof verifies independently
   assert.equal(await pool.epoch(), 1n);
   assert.equal(await pool.cumulativeSpent(), spentA + spentB);
   assert.equal(await pool.merkleRoot(), expectedDist.root);
+  assert.equal(rolled.operator_fee.auto_sent, true);
+  assert.equal(rolled.operator_fee.predicted_claimable_wei, ((spentA + spentB) * 1500n / 10_000n).toString());
+  assert.equal(rolled.operator_fee.actual_claimable_wei, rolled.operator_fee.predicted_claimable_wei);
+  assert.match(rolled.operator_fee.tx, /^0x[0-9a-f]{64}$/i);
+  assert.equal(await token.balanceOf(await operatorTreasury.getAddress()), (spentA + spentB) * 1500n / 10_000n);
+  assert.equal(await pool.operatorClaimable(), 0n);
 
   await (await pool.connect(providerA).claim(
     providerAccounts.provider_a,
@@ -149,6 +159,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   const operator = await provider.getSigner(0);
   const buyer = await provider.getSigner(1);
   const providerA = await provider.getSigner(2);
+  const operatorTreasury = await provider.getSigner(3);
   const { token, pool, poolAddr } = await deployPool(operator);
   await (await token.mint(await buyer.getAddress(), U(5))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(5))).wait();
@@ -158,8 +169,17 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
     receipts: [receipt({ session: 's1', provider: 'provider_a', mu: 1_000_000 })],
   };
   assert.throws(
-    () => buildTapSettlement({ bundle, tapUsdE6: TAP_USD_E6 }),
+    () => buildTapSettlement({ bundle, tapUsdE6: TAP_USD_E6, ledgerFeeBps: 1500 }),
     /Missing TAP claim address/
+  );
+  assert.throws(
+    () => buildTapSettlement({
+      bundle,
+      providerAccounts: { provider_a: '0x1111111111111111111111111111111111111111' },
+      tapUsdE6: TAP_USD_E6,
+      ledgerFeeBps: 1200,
+    }),
+    /must equal on-chain OPERATOR_BPS/
   );
 
   const providerAccounts = { provider_a: await providerA.getAddress() };
@@ -167,8 +187,10 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
     bundle,
     providerAccounts,
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
+    operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
   assert.equal(first.posted, true);
@@ -177,8 +199,10 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
     bundle,
     providerAccounts,
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
+    operatorAddress: await operatorTreasury.getAddress(),
     post: true,
   });
   assert.equal(replay.posted, false);
@@ -191,6 +215,7 @@ test('TAP settlement roller supports weighted multi-provider receipts', () => {
   const b = '0x2222222222222222222222222222222222222222';
   const settlement = buildTapSettlement({
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     bundle: {
       receipts: [{
         receipt: {
@@ -316,6 +341,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   const operator = new ethers.NonceManager(new ethers.Wallet(OPERATOR_KEY, provider));
   const buyer = new ethers.Wallet(BUYER_KEY, provider);
   const providerSigner = new ethers.Wallet(PROVIDER_KEY, provider);
+  const operatorTreasury = ethers.Wallet.createRandom().connect(provider);
   const { token, pool, poolAddr } = await deployPool(operator);
 
   await (await token.mint(await buyer.getAddress(), U(10))).wait();
@@ -338,8 +364,10 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     '--bundle', bundlePath,
     '--provider-accounts', providerAccountsPath,
     '--tap-usd-e6', String(TAP_USD_E6),
+    '--ledger-fee-bps', '1500',
     '--eth-rpc', rpc,
     '--pool', poolAddr,
+    '--operator-address', await operatorTreasury.getAddress(),
     '--json',
   ];
   const baseEnv = { ...process.env };
@@ -368,7 +396,15 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     epoch: report.epoch,
     cumulativeSpentWei: report.cumulative_spent_wei,
   }));
+  assert.equal(report.operator_fee.destination, (await operatorTreasury.getAddress()).toLowerCase());
+  assert.equal(report.operator_fee.predicted_claimable_wei, (muToTapWei(1_000_000, TAP_USD_E6) * 1500n / 10_000n).toString());
+  assert.equal(report.operator_fee.calldata, encodeWithdrawOperatorCalldata({
+    to: await operatorTreasury.getAddress(),
+    amountWei: report.operator_fee.predicted_claimable_wei,
+  }));
+  assert.equal(report.operator_fee.auto_sent, false);
   assert.match(report.copy_paste_confirm_command, /--confirm/);
+  assert.match(report.copy_paste_confirm_command, /--operator-address/);
   assert.doesNotMatch(JSON.stringify(report), new RegExp(OPERATOR_KEY.slice(2), 'i'));
   assert.equal(await pool.epoch(), 0n);
 
@@ -381,5 +417,10 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   assert.equal(posted.posted, true);
   assert.match(posted.tx, /^0x[0-9a-f]{64}$/i);
   assert.equal(posted.signing_address, (await operator.getAddress()).toLowerCase());
+  assert.equal(posted.operator_fee.auto_sent, true);
+  assert.match(posted.operator_fee.tx, /^0x[0-9a-f]{64}$/i);
+  assert.equal(posted.operator_fee.actual_claimable_wei, posted.operator_fee.predicted_claimable_wei);
+  assert.equal(await token.balanceOf(await operatorTreasury.getAddress()), BigInt(posted.operator_fee.predicted_claimable_wei));
+  assert.equal(await pool.operatorClaimable(), 0n);
   assert.equal(await pool.epoch(), 1n);
 });

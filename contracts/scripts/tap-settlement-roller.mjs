@@ -28,6 +28,9 @@ export const POOL_SETTLEMENT_ABI = [
   'function maxEpochDelta() view returns (uint256)',
   'function merkleRoot() view returns (bytes32)',
   'function claimed(address account) view returns (uint256)',
+  'function operatorClaimable() view returns (uint256)',
+  'function operatorWithdrawn() view returns (uint256)',
+  'function withdrawOperator(address to, uint256 amount)',
 ];
 const POOL_SETTLEMENT_INTERFACE = new ethers.Interface(POOL_SETTLEMENT_ABI);
 export const TAP_ROLLER_SIGNER_ENVS = [TAP_ROLLER_SIGNER_ENV];
@@ -53,6 +56,16 @@ export function encodeSetRootCalldata({
   const safeEpoch = parseNonNegativeInt(epoch, 'setRoot epoch');
   const spent = parseBigIntString(cumulativeSpentWei, 'setRoot cumulative spent wei');
   return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('setRoot', [root, BigInt(safeEpoch), spent]);
+}
+
+export function encodeWithdrawOperatorCalldata({
+  to,
+  amountWei,
+} = {}) {
+  const destination = normalizeAddress(to, 'operator fee address');
+  const amount = parseBigIntString(amountWei, 'operator fee amount wei');
+  if (amount <= 0n) throw new Error('operator fee amount wei must be positive');
+  return POOL_SETTLEMENT_INTERFACE.encodeFunctionData('withdrawOperator', [destination, amount]);
 }
 
 function shellQuote(value) {
@@ -256,6 +269,21 @@ function releasePolicy({ settleThroughEpoch, challengeEpochs = 0, holdbackEpochs
   };
 }
 
+function tapLedgerFeeBps(inputBundle, explicitFeeBps) {
+  const raw = explicitFeeBps
+    ?? inputBundle?.params?.fee_bps
+    ?? inputBundle?.audited_epoch?.params?.fee_bps
+    ?? inputBundle?.recomputed?.params?.fee_bps;
+  if (raw === undefined || raw === null || raw === '') {
+    throw new Error('TAP settlement requires admin ledger fee_bps');
+  }
+  const feeBps = parseNonNegativeInt(raw, 'ledger fee_bps');
+  if (feeBps !== Number(OPERATOR_BPS)) {
+    throw new Error(`TAP ledger fee_bps must equal on-chain OPERATOR_BPS ${OPERATOR_BPS}`);
+  }
+  return feeBps;
+}
+
 function entryEpoch(entry, body, bundleEpoch) {
   return entry.release_epoch
     ?? entry.receipt_epoch
@@ -327,6 +355,7 @@ export function buildTapSettlement({
   receipts,
   providerAccounts = {},
   tapUsdE6,
+  ledgerFeeBps,
   prior = null,
   settleThroughEpoch = null,
   challengeEpochs = 0,
@@ -335,6 +364,7 @@ export function buildTapSettlement({
   const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
   const rate = parsePositiveInt(tapUsdE6, 'tap_usd_e6');
+  const feeBps = tapLedgerFeeBps(inputBundle, ledgerFeeBps);
   const policy = releasePolicy({ settleThroughEpoch, challengeEpochs, holdbackEpochs });
   const bundleEpoch = inputBundle?.epoch ?? inputBundle?.receipt_epoch ?? inputBundle?.settlement_epoch;
   const previousBySession = new Map();
@@ -388,6 +418,7 @@ export function buildTapSettlement({
       custodial_wallet: false,
       reason: heldReceiptCount > 0 ? 'no matured provider earnings' : 'no claimable provider earnings',
       tap_usd_e6: rate,
+      ledger_fee_bps: feeBps,
       receipt_count: receiptCount,
       held_receipt_count: heldReceiptCount,
       spent_mu: spentMu,
@@ -419,6 +450,7 @@ export function buildTapSettlement({
     payout_model: 'non_custodial_claim',
     custodial_wallet: false,
     tap_usd_e6: rate,
+    ledger_fee_bps: feeBps,
     receipt_count: receiptCount,
     held_receipt_count: heldReceiptCount,
     spent_mu: spentMu,
@@ -460,6 +492,31 @@ export async function dryRunSetRoot({
     }
     if (writablePool.setRoot.estimateGas) {
       out.gas_estimate = (await writablePool.setRoot.estimateGas(root, safeEpoch, spent)).toString();
+    }
+    out.ok = true;
+    return out;
+  } catch (error) {
+    return { ...out, error: errorMessage(error) };
+  }
+}
+
+export async function dryRunWithdrawOperator({
+  writablePool,
+  to,
+  amountWei,
+} = {}) {
+  if (!writablePool?.withdrawOperator) throw new Error('Missing writable pool contract');
+  const destination = normalizeAddress(to, 'operator fee address');
+  const amount = parseBigIntString(amountWei, 'operator fee amount wei');
+  if (amount <= 0n) throw new Error('operator fee amount wei must be positive');
+  const out = { ok: false, static_call_ok: false, gas_estimate: null };
+  try {
+    if (writablePool.withdrawOperator.staticCall) {
+      await writablePool.withdrawOperator.staticCall(destination, amount);
+      out.static_call_ok = true;
+    }
+    if (writablePool.withdrawOperator.estimateGas) {
+      out.gas_estimate = (await writablePool.withdrawOperator.estimateGas(destination, amount)).toString();
     }
     out.ok = true;
     return out;
@@ -584,12 +641,14 @@ export async function rollTapSettlement({
   receipts,
   providerAccounts,
   tapUsdE6,
+  ledgerFeeBps,
   prior,
   settleThroughEpoch,
   challengeEpochs,
   holdbackEpochs,
   pool,
   ownerSigner,
+  operatorAddress,
   epoch,
   post = true,
 } = {}) {
@@ -598,6 +657,7 @@ export async function rollTapSettlement({
     receipts,
     providerAccounts,
     tapUsdE6,
+    ledgerFeeBps,
     prior,
     settleThroughEpoch,
     challengeEpochs,
@@ -619,8 +679,39 @@ export async function rollTapSettlement({
   }
   let writable = null;
   let setRootDryRun = null;
+  let operatorFee = null;
   if (pool && ownerSigner) {
     writable = pool.connect ? pool.connect(ownerSigner) : pool;
+    const operatorWithdrawn = pool.operatorWithdrawn ? await pool.operatorWithdrawn() : 0n;
+    const cumulativeSpentWei = parseBigIntString(settlement.cumulative_spent_wei, 'settlement cumulative spent wei');
+    const operatorCapWei = bpsOf(cumulativeSpentWei, OPERATOR_BPS);
+    const predictedClaimableWei = operatorCapWei > operatorWithdrawn ? operatorCapWei - operatorWithdrawn : 0n;
+    const destination = operatorAddress
+      ? normalizeAddress(operatorAddress, 'operator fee address')
+      : null;
+    operatorFee = {
+      auto_sent: false,
+      destination,
+      predicted_claimable_wei: predictedClaimableWei.toString(),
+      calldata: destination && predictedClaimableWei > 0n
+        ? encodeWithdrawOperatorCalldata({ to: destination, amountWei: predictedClaimableWei })
+        : null,
+      dry_run: null,
+      tx: null,
+    };
+    if (predictedClaimableWei > 0n && !destination) {
+      return {
+        ...settlement,
+        posted: false,
+        blocked: true,
+        reasons: ['operator fee destination is required for TAP auto-withdraw'],
+        epoch: screen.epoch,
+        signing_address: signingAddress,
+        set_root_calldata: setRootCalldata,
+        operator_fee: operatorFee,
+        screen,
+      };
+    }
     setRootDryRun = await dryRunSetRoot({
       writablePool: writable,
       root: settlement.root,
@@ -637,6 +728,7 @@ export async function rollTapSettlement({
         signing_address: signingAddress,
         set_root_calldata: setRootCalldata,
         set_root_dry_run: setRootDryRun,
+        operator_fee: operatorFee,
         screen,
       };
     }
@@ -648,6 +740,40 @@ export async function rollTapSettlement({
     const sent = await writable.setRoot(settlement.root, screen.epoch, BigInt(settlement.cumulative_spent_wei));
     await sent.wait();
     tx = sent.hash;
+    if (operatorFee?.destination) {
+      const claimable = pool.operatorClaimable ? await pool.operatorClaimable() : 0n;
+      operatorFee.actual_claimable_wei = claimable.toString();
+      if (claimable > 0n) {
+        operatorFee.calldata = encodeWithdrawOperatorCalldata({
+          to: operatorFee.destination,
+          amountWei: claimable,
+        });
+        operatorFee.dry_run = await dryRunWithdrawOperator({
+          writablePool: writable,
+          to: operatorFee.destination,
+          amountWei: claimable,
+        });
+        if (!operatorFee.dry_run.ok) {
+          return {
+            ...settlement,
+            posted: true,
+            blocked: true,
+            reasons: [`withdrawOperator dry-run failed: ${operatorFee.dry_run.error}`],
+            epoch: screen.epoch,
+            tx,
+            signing_address: signingAddress,
+            set_root_calldata: setRootCalldata,
+            set_root_dry_run: setRootDryRun,
+            operator_fee: operatorFee,
+            screen,
+          };
+        }
+        const feeSent = await writable.withdrawOperator(operatorFee.destination, claimable);
+        await feeSent.wait();
+        operatorFee.tx = feeSent.hash;
+        operatorFee.auto_sent = true;
+      }
+    }
   }
   return {
     ...settlement,
@@ -657,6 +783,7 @@ export async function rollTapSettlement({
     signing_address: signingAddress,
     set_root_calldata: setRootCalldata,
     set_root_dry_run: setRootDryRun,
+    operator_fee: operatorFee,
     screen,
   };
 }
@@ -699,12 +826,14 @@ function buildReplayCommand({
   bundlePath,
   providerAccountsPath,
   tapUsdE6,
+  ledgerFeeBps,
   priorPath,
   settleThroughEpoch,
   challengeEpochs,
   holdbackEpochs,
   ethRpc,
   poolAddress,
+  operatorAddress,
   epoch,
   confirm,
   json,
@@ -713,6 +842,7 @@ function buildReplayCommand({
   if (bundlePath) args.push('--bundle', bundlePath);
   if (providerAccountsPath) args.push('--provider-accounts', providerAccountsPath);
   if (tapUsdE6) args.push('--tap-usd-e6', String(tapUsdE6));
+  if (ledgerFeeBps !== undefined && ledgerFeeBps !== null) args.push('--ledger-fee-bps', String(ledgerFeeBps));
   if (priorPath) args.push('--prior', priorPath);
   if (settleThroughEpoch !== undefined && settleThroughEpoch !== null) {
     args.push('--settle-through-epoch', String(settleThroughEpoch));
@@ -725,6 +855,7 @@ function buildReplayCommand({
   }
   if (ethRpc) args.push('--eth-rpc', ethRpc);
   if (poolAddress) args.push('--pool', poolAddress);
+  if (operatorAddress) args.push('--operator-address', operatorAddress);
   if (epoch) args.push('--epoch', String(epoch));
   if (confirm) args.push('--confirm');
   if (json) args.push('--json');
@@ -753,9 +884,11 @@ async function main() {
     tapUsdE6: args['tap-usd-e6'],
     peerRpcUrl,
   });
+  const ledgerFeeBps = args['ledger-fee-bps'];
 
   const ethRpc = args['eth-rpc'] || args.rpc || process.env.MAYHEM_TAP_ETH_RPC;
   const poolAddress = args.pool || process.env.MAYHEM_TAP_POOL_ADDRESS;
+  const operatorAddress = args['operator-address'] || process.env.MAYHEM_TAP_OPERATOR_ADDRESS;
   const confirm = boolArg(args.confirm, false);
   const json = boolArg(args.json, false);
   let pool = null;
@@ -776,11 +909,13 @@ async function main() {
     providerAccounts,
     prior,
     tapUsdE6,
+    ledgerFeeBps,
     settleThroughEpoch: args['settle-through-epoch'],
     challengeEpochs: args['challenge-epochs'] ?? 0,
     holdbackEpochs: args['holdback-epochs'] ?? 0,
     pool,
     ownerSigner,
+    operatorAddress,
     epoch: args.epoch ? parsePositiveInt(args.epoch, '--epoch') : undefined,
     post: confirm,
   });
@@ -789,12 +924,14 @@ async function main() {
     bundlePath,
     providerAccountsPath,
     tapUsdE6,
+    ledgerFeeBps,
     priorPath,
     settleThroughEpoch: args['settle-through-epoch'],
     challengeEpochs: args['challenge-epochs'],
     holdbackEpochs: args['holdback-epochs'],
     ethRpc,
     poolAddress,
+    operatorAddress,
     epoch: report.epoch,
     confirm,
     json: true,
@@ -804,12 +941,14 @@ async function main() {
       bundlePath,
       providerAccountsPath,
       tapUsdE6,
+      ledgerFeeBps,
       priorPath,
       settleThroughEpoch: args['settle-through-epoch'],
       challengeEpochs: args['challenge-epochs'],
       holdbackEpochs: args['holdback-epochs'],
       ethRpc,
       poolAddress,
+      operatorAddress,
       epoch: report.epoch,
       confirm: true,
       json: true,

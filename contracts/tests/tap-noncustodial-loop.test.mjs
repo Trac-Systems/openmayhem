@@ -68,6 +68,7 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
     bundle,
     providerAccounts: { provider_a: providerAccount },
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     settleThroughEpoch: 1,
     challengeEpochs: 1,
     pool,
@@ -86,10 +87,12 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
     bundle,
     providerAccounts: { provider_a: providerAccount },
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     settleThroughEpoch: 2,
     challengeEpochs: 1,
     pool,
     ownerSigner: operator,
+    operatorAddress: await operator.getAddress(),
     post: true,
   });
   assert.equal(matured.posted, true);

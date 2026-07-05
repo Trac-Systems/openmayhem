@@ -88,8 +88,10 @@ test('claim calldata executes KnowledgePool.claim from provider wallet', async (
     },
     providerAccounts: { provider_a: providerAccount },
     tapUsdE6: TAP_USD_E6,
+    ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
+    operatorAddress: await operator.getAddress(),
     post: true,
   });
   const proof = await claimProofForAccount({
