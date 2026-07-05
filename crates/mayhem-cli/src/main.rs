@@ -430,6 +430,10 @@ struct ModelsArgs {
     #[arg(long)]
     gateway: bool,
 
+    /// Minimum live provider attestation tier to show; requires --gateway.
+    #[arg(long)]
+    min_att_tier: Option<u8>,
+
     /// Print a machine-readable model list.
     #[arg(long)]
     json: bool,
@@ -9819,6 +9823,14 @@ async fn models(args: ModelsArgs) -> Result<()> {
     if args.timeout_seconds == 0 {
         bail!("--timeout-seconds must be positive");
     }
+    if let Some(min_att_tier) = args.min_att_tier {
+        if !(1..=4).contains(&min_att_tier) {
+            bail!("--min-att-tier must be between 1 and 4");
+        }
+        if !args.gateway {
+            bail!("--min-att-tier requires --gateway because attestation tier is live provider capacity");
+        }
+    }
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
@@ -9828,11 +9840,15 @@ async fn models(args: ModelsArgs) -> Result<()> {
     if args.gateway {
         let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
         let models = fetch_gateway_models(&client, &gateway_root).await?;
-        let summaries = gateway_model_summaries(&models)?;
+        let summaries = filter_model_summaries_by_min_att_tier(
+            gateway_model_summaries(&models)?,
+            args.min_att_tier,
+        );
         let report = json!({
             "ok": true,
             "source": "gateway_live",
             "gateway_url": gateway_root,
+            "min_att_tier": args.min_att_tier,
             "models": summaries,
         });
 
@@ -10060,6 +10076,9 @@ struct ModelSummary {
     context: u64,
     attestation_tiers: BTreeMap<String, u64>,
     attestation_tier_labels: BTreeMap<String, String>,
+    max_attestation_tier: u8,
+    prompt_confidential: bool,
+    prompt_confidentiality_note: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -10944,6 +10963,19 @@ fn gateway_model_summaries(models: &[Value]) -> Result<Vec<ModelSummary>> {
     models.iter().map(gateway_model_summary).collect()
 }
 
+fn filter_model_summaries_by_min_att_tier(
+    summaries: Vec<ModelSummary>,
+    min_att_tier: Option<u8>,
+) -> Vec<ModelSummary> {
+    let Some(min_att_tier) = min_att_tier else {
+        return summaries;
+    };
+    summaries
+        .into_iter()
+        .filter(|summary| summary.max_attestation_tier >= min_att_tier)
+        .collect()
+}
+
 fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
     let id = model
         .get("id")
@@ -10975,6 +11007,13 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_else(|| attestation_tier_labels_for_counts(&attestation_tiers));
+    let max_attestation_tier = max_attestation_tier(&attestation_tiers);
+    let prompt_confidential = attestation_tiers
+        .get("T3")
+        .or_else(|| attestation_tiers.get("3"))
+        .copied()
+        .unwrap_or(0)
+        > 0;
     Ok(ModelSummary {
         id: id.to_owned(),
         providers_online: mayhem
@@ -10994,7 +11033,35 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         context: caps.get("ctx").and_then(Value::as_u64).unwrap_or(0),
         attestation_tiers,
         attestation_tier_labels,
+        max_attestation_tier,
+        prompt_confidential,
+        prompt_confidentiality_note: prompt_confidentiality_note(prompt_confidential).to_owned(),
     })
+}
+
+fn max_attestation_tier(tiers: &BTreeMap<String, u64>) -> u8 {
+    tiers
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .filter_map(|(tier, _)| attestation_tier_number(tier))
+        .max()
+        .unwrap_or(1)
+}
+
+fn attestation_tier_number(tier: &str) -> Option<u8> {
+    let tier = tier.trim();
+    let tier = tier.strip_prefix('T').unwrap_or(tier);
+    tier.parse::<u8>()
+        .ok()
+        .filter(|tier| (1..=4).contains(tier))
+}
+
+fn prompt_confidentiality_note(prompt_confidential: bool) -> &'static str {
+    if prompt_confidential {
+        "Tier 3 route available: prompt-confidential hardware compute may be selectable"
+    } else {
+        "Not prompt-confidential: providers on Tier 1, Tier 2, or Tier 4 can read prompts in memory"
+    }
 }
 
 fn attestation_tier_labels_for_counts(tiers: &BTreeMap<String, u64>) -> BTreeMap<String, String> {
@@ -11591,6 +11658,12 @@ fn print_test_report(report: &Value) {
 
 fn print_models_report(report: &Value) -> Result<()> {
     println!("Gateway: {}", report["gateway_url"].as_str().unwrap_or(""));
+    if let Some(min_att_tier) = report["min_att_tier"].as_u64() {
+        println!("Filter: minimum attestation tier T{min_att_tier}");
+    }
+    println!(
+        "Prompt privacy: only Tier 3 is prompt-confidential; Tier 1, Tier 2, and Tier 4 providers can read prompts in memory."
+    );
     println!(
         "{:<44} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}  {:<44}",
         "MODEL", "PROVIDERS", "ROOMS", "MU/1K IN/OUT", "CTX", "TOOLS", "JSON", "ATTESTATION"
@@ -20882,6 +20955,48 @@ mod tests {
         assert_eq!(summaries[0].context, 8192);
         assert_eq!(summaries[0].attestation_tiers["T2"], 1);
         assert!(summaries[0].attestation_tier_labels["T2"].contains("GB10"));
+        assert_eq!(summaries[0].max_attestation_tier, 2);
+        assert!(!summaries[0].prompt_confidential);
+        assert!(summaries[0]
+            .prompt_confidentiality_note
+            .contains("Not prompt-confidential"));
+    }
+
+    #[test]
+    fn model_summaries_filter_by_min_att_tier_and_mark_tier3_privacy() {
+        let summaries = gateway_model_summaries(&[
+            json!({
+                "id": "mayhem/t1",
+                "mayhem": {
+                    "providers_online": 1,
+                    "rooms": 1,
+                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "attestation_tiers": { "T1": 1 },
+                    "caps": { "tools": false, "json": false, "ctx": 4096 }
+                }
+            }),
+            json!({
+                "id": "mayhem/t3",
+                "mayhem": {
+                    "providers_online": 1,
+                    "rooms": 1,
+                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "attestation_tiers": { "T3": 1, "T4": 1 },
+                    "caps": { "tools": false, "json": false, "ctx": 4096 }
+                }
+            }),
+        ])
+        .unwrap();
+
+        let filtered = filter_model_summaries_by_min_att_tier(summaries, Some(3));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "mayhem/t3");
+        assert_eq!(filtered[0].max_attestation_tier, 4);
+        assert!(filtered[0].prompt_confidential);
+        assert!(filtered[0]
+            .prompt_confidentiality_note
+            .contains("Tier 3 route available"));
     }
 
     #[test]

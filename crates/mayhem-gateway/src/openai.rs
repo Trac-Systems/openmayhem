@@ -52,6 +52,7 @@ const EMBEDDED_CANARY_DEV_V1: &str = include_str!("../../../catalog/canaries/can
 const EMBEDDED_CANARY_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-launch-v1.json");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
+const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
 const DEFAULT_CANARY_SEED: i64 = 7;
 
 #[derive(Clone, Debug)]
@@ -737,6 +738,7 @@ struct ResponseMayhemMeta<'a> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct GatewayRequestOptions {
     hedge_requested: bool,
+    min_att_tier: Option<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -995,7 +997,36 @@ impl GatewayRequestOptions {
     fn from_headers(headers: &HeaderMap) -> Result<Self, ApiError> {
         Ok(Self {
             hedge_requested: parse_x_mayhem_hedge(headers)?,
+            min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
         })
+    }
+}
+
+fn parse_x_mayhem_min_att_tier(headers: &HeaderMap) -> Result<Option<u8>, ApiError> {
+    let Some(value) = headers.get(X_MAYHEM_MIN_ATT_TIER_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Min-Att-Tier must be an ASCII integer from 1 through 4",
+            Some("X-Mayhem-Min-Att-Tier"),
+        )
+    })?;
+    let value = value.trim();
+    let value = value.strip_prefix('T').unwrap_or(value);
+    let tier = value.parse::<u8>().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Min-Att-Tier must be an integer from 1 through 4",
+            Some("X-Mayhem-Min-Att-Tier"),
+        )
+    })?;
+    if (1..=4).contains(&tier) {
+        Ok(Some(tier))
+    } else {
+        Err(ApiError::bad_request(
+            "X-Mayhem-Min-Att-Tier must be between 1 and 4",
+            Some("X-Mayhem-Min-Att-Tier"),
+        ))
     }
 }
 
@@ -1907,24 +1938,25 @@ async fn run_chat_with_route_retry(
     request: &ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<(GatewaySessionResult, GatewaySessionInvocation), ApiError> {
-    let attempt_count = if model.mayhem.route_candidates.is_empty() {
+    let eligible_routes = eligible_route_candidates(model, options.min_att_tier);
+    if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        return Err(ApiError::bad_request(
+            "no provider route satisfies X-Mayhem-Min-Att-Tier",
+            Some("X-Mayhem-Min-Att-Tier"),
+        ));
+    }
+    let attempt_count = if eligible_routes.is_empty() {
         1
     } else {
-        model
-            .mayhem
-            .route_candidates
+        eligible_routes
             .len()
             .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
     };
     let mut last_retryable_error = None;
 
     for attempt_index in 0..attempt_count {
-        let invocation = state.prepare_chat_invocation_for_route(
-            model,
-            request,
-            model.mayhem.route_candidates.get(attempt_index),
-            options,
-        )?;
+        let route = eligible_routes.get(attempt_index).copied();
+        let invocation = state.prepare_chat_invocation_for_route(model, request, route, options)?;
         match state
             .session_backend
             .run_chat(model, request, &invocation)
@@ -1945,6 +1977,22 @@ async fn run_chat_with_route_retry(
         ),
         Some("model"),
     ))
+}
+
+fn eligible_route_candidates(
+    model: &GatewayModel,
+    min_att_tier: Option<u8>,
+) -> Vec<&GatewayRouteCandidate> {
+    model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| {
+            min_att_tier
+                .map(|min_tier| candidate.att_tier >= min_tier)
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 fn build_completion(

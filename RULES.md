@@ -89,6 +89,13 @@ Prompts, outputs, tool inputs, and session payloads must travel over direct
 encrypted data-plane channels. The contract and settlement evidence should store
 hashes, counters, roots, and minimal metadata, not raw prompts or outputs.
 
+Direct encryption protects the network path, not the provider's machine. On
+Tier 1, Tier 2, and Tier 4 routes, inference still requires plaintext in the
+provider host/runtime and the provider can read prompts in memory. Only Tier 3
+hardware confidential compute is intended to keep prompts private from the
+provider host. Apple Metal and NVIDIA GB10 Tier 2 device identity are not Tier 3
+prompt confidentiality. Tier 4 KYB identity is accountability, not privacy.
+
 Providers must not log, sell, reuse, train on, or disclose user prompts or model
 outputs except where the user explicitly requests storage as part of the
 session. Providers may keep hashes, counters, signatures, and encrypted

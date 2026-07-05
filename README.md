@@ -52,7 +52,17 @@ development only, use `mayhem use --dev-embedded-catalog`.
 `mayhem models` discovers the current admin catalog release from the ledger and
 verifies the fetched JSONs before printing launch models. Use
 `mayhem models --gateway` to inspect what the currently connected local gateway
-can route right now.
+can route right now. For sensitive prompts, inspect and pin attestation tier:
+
+```bash
+mayhem models --gateway --min-att-tier 3
+```
+
+Only Tier 3 is prompt-confidential. Tier 1 is economic/self-attestation, Tier 2
+is Apple/NVIDIA device identity, and Tier 4 is a known KYB'd provider identity;
+on Tier 1, Tier 2, and Tier 4 the provider can still read prompts in memory.
+OpenAI-compatible clients can request a routing pin with
+`X-Mayhem-Min-Att-Tier: 3`.
 
 ## Install
 
