@@ -90,6 +90,8 @@ pub struct MayhemModelInfo {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attestation_tier_labels: BTreeMap<String, String>,
     pub caps: ModelCaps,
+    #[serde(default)]
+    pub adapter: ShapeAdapterInfo,
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kyb_identities: Vec<ProviderKybInfo>,
@@ -146,6 +148,29 @@ pub struct ModelCaps {
     pub output_modality: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_modalities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ShapeAdapterInfo {
+    pub request_shape_family: String,
+    pub chat_template_id: String,
+    pub tool_call_strategy: String,
+    pub reasoning_passthrough: String,
+    pub modality_set: Vec<String>,
+    pub response_normalization: String,
+}
+
+impl Default for ShapeAdapterInfo {
+    fn default() -> Self {
+        Self {
+            request_shape_family: "openai_chat".to_owned(),
+            chat_template_id: "generic_chatml".to_owned(),
+            tool_call_strategy: "mayhem_json".to_owned(),
+            reasoning_passthrough: "strip".to_owned(),
+            modality_set: vec!["text".to_owned()],
+            response_normalization: "openai_chat".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -474,6 +499,7 @@ impl GatewayState {
                     output_modality: Some("text".to_owned()),
                     output_modalities: vec!["text".to_owned()],
                 },
+                adapter: ShapeAdapterInfo::default(),
                 source: "local-fixture".to_owned(),
                 kyb_identities: Vec::new(),
                 route_candidates: Vec::new(),
@@ -3129,6 +3155,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .map(str::to_owned),
                 output_modalities: caps_output_modalities(caps),
             },
+            adapter: shape_adapter_from_catalog_value(model),
             source: "catalog".to_owned(),
             kyb_identities: Vec::new(),
             route_candidates: Vec::new(),
@@ -3173,6 +3200,50 @@ fn caps_output_modalities(caps: &Value) -> Vec<String> {
         .filter(|modality| !modality.is_empty())
         .map(|modality| vec![modality.to_owned()])
         .unwrap_or_default()
+}
+
+fn shape_adapter_from_catalog_value(model: &Value) -> ShapeAdapterInfo {
+    let adapter = model.get("adapter").unwrap_or(&Value::Null);
+    let defaults = ShapeAdapterInfo::default();
+    ShapeAdapterInfo {
+        request_shape_family: adapter
+            .get("request_shape_family")
+            .and_then(Value::as_str)
+            .unwrap_or(defaults.request_shape_family.as_str())
+            .to_owned(),
+        chat_template_id: adapter
+            .get("chat_template_id")
+            .and_then(Value::as_str)
+            .unwrap_or(defaults.chat_template_id.as_str())
+            .to_owned(),
+        tool_call_strategy: adapter
+            .get("tool_call_strategy")
+            .and_then(Value::as_str)
+            .unwrap_or(defaults.tool_call_strategy.as_str())
+            .to_owned(),
+        reasoning_passthrough: adapter
+            .get("reasoning_passthrough")
+            .and_then(Value::as_str)
+            .unwrap_or(defaults.reasoning_passthrough.as_str())
+            .to_owned(),
+        modality_set: adapter
+            .get("modality_set")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|entries| !entries.is_empty())
+            .unwrap_or(defaults.modality_set),
+        response_normalization: adapter
+            .get("response_normalization")
+            .and_then(Value::as_str)
+            .unwrap_or(defaults.response_normalization.as_str())
+            .to_owned(),
+    }
 }
 
 fn attestation_tiers_from_catalog_value(model: &Value) -> BTreeMap<String, u32> {
@@ -3802,6 +3873,7 @@ mod tests {
                     output_modality: Some("text".to_owned()),
                     output_modalities: vec!["text".to_owned()],
                 },
+                adapter: ShapeAdapterInfo::default(),
                 source: "test".to_owned(),
                 kyb_identities: Vec::new(),
                 route_candidates: Vec::new(),

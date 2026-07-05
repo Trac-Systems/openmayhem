@@ -3115,6 +3115,7 @@ struct CatalogListModel {
     price_ref_mu: CatalogListPrice,
     caps: CatalogListCaps,
     requirements: CatalogListRequirements,
+    adapter: catalog::CatalogAdapter,
     canary_set: String,
     canary_match_min: f64,
     canary_verification_method: String,
@@ -3321,6 +3322,7 @@ fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
             min_vram_gb_full_offload: model.requirements.min_vram_gb_full_offload,
             backends: model.requirements.backends.clone(),
         },
+        adapter: model.adapter.clone(),
         canary_set: model.canary.set_id.clone(),
         canary_match_min: model.canary.match_min,
         canary_verification_method: model.canary.verification_method.clone(),
@@ -3381,6 +3383,15 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             model.requirements.min_ram_gb,
             model.requirements.min_vram_gb_full_offload,
             model.requirements.backends.join(",")
+        );
+        println!(
+            "  adapter: request_shape={} template={} tool_call={} reasoning={} modalities={} normalization={}",
+            model.adapter.request_shape_family,
+            model.adapter.chat_template_id,
+            model.adapter.tool_call_strategy,
+            model.adapter.reasoning_passthrough,
+            model.adapter.modality_set.join(","),
+            model.adapter.response_normalization
         );
         println!(
             "  canary: {} method={} match_min={} tolerance_bps={}",
@@ -8535,7 +8546,7 @@ fn calibrate_canary_prompt(
     include_output: bool,
 ) -> Result<CanaryCalibrationPromptReport> {
     let body = canary_probe_request(&model.model_id, prompt);
-    let mut request = provider_engine_request_from_body(&body)?;
+    let mut request = provider_engine_request_from_body(&body, &model.adapter)?;
     request.temperature = Some(prompt.temperature.unwrap_or(0.0) as f32);
     request.seed = Some(seed);
     let max_tokens = request.max_new_tokens;
@@ -14226,6 +14237,7 @@ struct ProviderSessionTerms {
     provider: String,
     enclave_id: String,
     model_id: String,
+    adapter: catalog::CatalogAdapter,
     room_ids: Vec<String>,
     price_ver: u64,
     in_per_1k_mu: u64,
@@ -14283,10 +14295,10 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 
     fn respond(
         &mut self,
-        _terms: &ProviderSessionTerms,
+        terms: &ProviderSessionTerms,
         body: &Value,
     ) -> Result<ProviderSessionOutput> {
-        provider_engine_session_response(self.backend.as_mut(), body)
+        provider_engine_session_response(self.backend.as_mut(), &terms.adapter, body)
     }
 }
 
@@ -15692,6 +15704,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 caps: caps_by_model
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
+                adapter: mayhem_gateway::openai::ShapeAdapterInfo::default(),
                 source: "contract".to_owned(),
                 kyb_identities,
                 route_candidates,
@@ -17556,6 +17569,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         provider: ctx.wallet.public_key.clone(),
         enclave_id: ctx.selected.enclave.enclave_id.clone(),
         model_id: ctx.selected.enclave.model_id.clone(),
+        adapter: ctx.selected.model.adapter.clone(),
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
         in_per_1k_mu: text_rate_per_1k_mu(&price.rate_map, INPUT_TOKEN_UNIT),
@@ -17830,13 +17844,11 @@ struct ProviderSessionOutput {
 
 fn provider_engine_session_response(
     backend: &mut dyn EngineBackend,
+    adapter: &catalog::CatalogAdapter,
     body: &Value,
 ) -> Result<ProviderSessionOutput> {
-    let request = provider_engine_request_from_body(body)?;
-    let wants_tool = request
-        .grammar
-        .as_ref()
-        .is_some_and(|grammar| matches!(grammar, GrammarSpec::ToolCall { .. }));
+    let tool_mode = provider_engine_tool_request(body, adapter)?.map(|(strategy, _)| strategy);
+    let request = provider_engine_request_from_body(body, adapter)?;
     let mut token_ids = Vec::new();
     let output = backend
         .generate(request, &mut |chunk: mayhem_engine::TokenChunk| {
@@ -17844,9 +17856,9 @@ fn provider_engine_session_response(
             Ok(())
         })
         .context("generating provider session response with mayhem-engine")?;
-    let tool = if wants_tool {
+    let tool = if let Some(strategy) = tool_mode {
         Some(
-            provider_engine_tool_call_output(&output.text).with_context(|| {
+            provider_engine_tool_call_output(&output.text, strategy).with_context(|| {
                 format!(
                     "provider engine did not return valid tool-call JSON: {}",
                     output.text.trim()
@@ -17863,7 +17875,7 @@ fn provider_engine_session_response(
             output.text
         },
         tool,
-        finish_reason: if wants_tool {
+        finish_reason: if tool_mode.is_some() {
             "tool_calls".to_owned()
         } else {
             output.finish_reason.to_string()
@@ -17874,13 +17886,16 @@ fn provider_engine_session_response(
     })
 }
 
-fn provider_engine_request_from_body(body: &Value) -> Result<GenerateRequest> {
+fn provider_engine_request_from_body(
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<GenerateRequest> {
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let prompt = provider_engine_prompt(messages);
+    let prompt = provider_engine_prompt(messages, adapter)?;
     let mut request = GenerateRequest::new(prompt);
     if let Some(max_tokens) = body
         .get("max_tokens")
@@ -17899,12 +17914,18 @@ fn provider_engine_request_from_body(body: &Value) -> Result<GenerateRequest> {
     if let Some(seed) = body.get("seed").and_then(Value::as_u64) {
         request.seed = Some(u32::try_from(seed).context("seed exceeds u32")?);
     }
-    if body.get("tool_choice").and_then(Value::as_str) != Some("none") {
-        let tools = provider_engine_tool_specs(body)?;
-        if !tools.is_empty() {
-            request.grammar = Some(GrammarSpec::ToolCall { tools });
-            return Ok(request);
+    if let Some((strategy, tools)) = provider_engine_tool_request(body, adapter)? {
+        match strategy {
+            ProviderEngineToolStrategy::MayhemJson => {
+                request.grammar = Some(GrammarSpec::ToolCall { tools });
+            }
+            ProviderEngineToolStrategy::OpenAiToolCalls => {
+                request.grammar = Some(GrammarSpec::JsonSchema {
+                    schema: provider_openai_tool_calls_json_schema(&tools),
+                });
+            }
         }
+        return Ok(request);
     }
     if provider_wants_json(body) {
         request.grammar = Some(GrammarSpec::JsonSchema {
@@ -17914,18 +17935,74 @@ fn provider_engine_request_from_body(body: &Value) -> Result<GenerateRequest> {
     Ok(request)
 }
 
-fn provider_engine_prompt(messages: &[Value]) -> String {
+fn provider_engine_prompt(messages: &[Value], adapter: &catalog::CatalogAdapter) -> Result<String> {
+    match adapter.chat_template_id.as_str() {
+        "generic_chatml" | "qwen2.5-instruct" => {
+            Ok(provider_engine_generic_chatml_prompt(messages, adapter))
+        }
+        "llama3-instruct" => Ok(provider_engine_llama3_prompt(messages, adapter)),
+        other => bail!("unsupported catalog adapter.chat_template_id: {other}"),
+    }
+}
+
+fn provider_engine_generic_chatml_prompt(
+    messages: &[Value],
+    adapter: &catalog::CatalogAdapter,
+) -> String {
     let mut prompt = String::new();
     for message in messages {
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("user");
-        let content = provider_message_to_text(message);
+        let content = provider_message_to_text_for_adapter(message, adapter);
         let _ = writeln!(prompt, "{role}: {content}");
     }
     prompt.push_str("assistant:");
     prompt
+}
+
+fn provider_engine_llama3_prompt(messages: &[Value], adapter: &catalog::CatalogAdapter) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let content = provider_message_to_text_for_adapter(message, adapter);
+        let _ = write!(
+            prompt,
+            "<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+        );
+    }
+    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    prompt
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderEngineToolStrategy {
+    MayhemJson,
+    OpenAiToolCalls,
+}
+
+fn provider_engine_tool_request(
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<Option<(ProviderEngineToolStrategy, Vec<ToolSpec>)>> {
+    if body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        return Ok(None);
+    }
+    let tools = provider_engine_tool_specs(body)?;
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let strategy = match adapter.tool_call_strategy.as_str() {
+        "mayhem_json" => ProviderEngineToolStrategy::MayhemJson,
+        "openai_tool_calls" => ProviderEngineToolStrategy::OpenAiToolCalls,
+        "none" => return Ok(None),
+        other => bail!("unsupported catalog adapter.tool_call_strategy: {other}"),
+    };
+    Ok(Some((strategy, tools)))
 }
 
 fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
@@ -17964,6 +18041,44 @@ fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
     Ok(specs)
 }
 
+fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec]) -> Value {
+    let names = tools
+        .iter()
+        .map(|tool| Value::String(tool.name.clone()))
+        .collect::<Vec<_>>();
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "OpenAIToolCalls",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool_calls"],
+        "properties": {
+            "tool_calls": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "type", "function"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "type": { "const": "function" },
+                        "function": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["name", "arguments"],
+                            "properties": {
+                                "name": { "type": "string", "enum": names },
+                                "arguments": { "type": "string" },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    })
+}
+
 fn provider_response_json_schema(body: &Value) -> Value {
     body.get("response_format")
         .and_then(|format| format.get("json_schema"))
@@ -17972,23 +18087,73 @@ fn provider_response_json_schema(body: &Value) -> Value {
         .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true }))
 }
 
-fn provider_engine_tool_call_output(text: &str) -> Option<Value> {
+fn provider_engine_tool_call_output(
+    text: &str,
+    strategy: ProviderEngineToolStrategy,
+) -> Option<Value> {
+    match strategy {
+        ProviderEngineToolStrategy::MayhemJson => provider_mayhem_json_tool_call_output(text),
+        ProviderEngineToolStrategy::OpenAiToolCalls => provider_openai_tool_calls_output(text),
+    }
+}
+
+fn provider_mayhem_json_tool_call_output(text: &str) -> Option<Value> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
     let name = value
         .get("tool")
         .or_else(|| value.get("name"))
         .and_then(Value::as_str)?
         .to_owned();
-    let arguments = value
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}))
-        .to_string();
-    Some(json!({
-        "id": format!("call-{}", stable_value_hash(&json!({ "tool": name, "arguments": arguments }))),
+    let arguments = provider_tool_arguments_string(
+        value.get("arguments").cloned().unwrap_or_else(|| json!({})),
+    );
+    Some(provider_normalized_tool_call(None, name, arguments))
+}
+
+fn provider_openai_tool_calls_output(text: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let call = value
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .and_then(|calls| calls.first())
+        .or_else(|| {
+            if value.get("function").is_some() {
+                Some(&value)
+            } else {
+                None
+            }
+        })?;
+    let function = call.get("function")?;
+    let name = function.get("name").and_then(Value::as_str)?.to_owned();
+    let arguments = provider_tool_arguments_string(
+        function
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    );
+    let id = call.get("id").and_then(Value::as_str).map(str::to_owned);
+    Some(provider_normalized_tool_call(id, name, arguments))
+}
+
+fn provider_tool_arguments_string(arguments: Value) -> String {
+    arguments
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| arguments.to_string())
+}
+
+fn provider_normalized_tool_call(id: Option<String>, name: String, arguments: String) -> Value {
+    let id = id.unwrap_or_else(|| {
+        format!(
+            "call-{}",
+            stable_value_hash(&json!({ "tool": name, "arguments": arguments }))
+        )
+    });
+    json!({
+        "id": id,
         "name": name,
         "arguments": arguments,
-    }))
+    })
 }
 
 fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> ProviderSessionOutput {
@@ -18123,6 +18288,24 @@ fn provider_last_user_text(messages: &[Value]) -> String {
 
 fn provider_message_to_text(message: &Value) -> String {
     provider_content_to_text(message.get("content").unwrap_or(&Value::Null))
+}
+
+fn provider_message_to_text_for_adapter(
+    message: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> String {
+    let content = provider_message_to_text(message);
+    if adapter.reasoning_passthrough != "preserve" {
+        return content;
+    }
+    let Some(reasoning) = message.get("reasoning").and_then(Value::as_str) else {
+        return content;
+    };
+    if content.trim().is_empty() {
+        reasoning.to_owned()
+    } else {
+        format!("{reasoning}\n{content}")
+    }
 }
 
 fn provider_content_to_text(value: &Value) -> String {
@@ -20787,7 +20970,8 @@ mod tests {
             "temperature": 0,
             "seed": 42
         });
-        let request = provider_engine_request_from_body(&body).unwrap();
+        let request =
+            provider_engine_request_from_body(&body, &catalog::CatalogAdapter::default()).unwrap();
 
         assert!(request.prompt.contains("system: be precise"));
         assert!(request.prompt.contains("user: write a file"));
@@ -20799,6 +20983,91 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "write");
         assert_eq!(tools[0].description.as_deref(), Some("write a file"));
+    }
+
+    #[test]
+    fn provider_engine_request_uses_openai_tool_call_adapter_schema() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "openai_tool_calls".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "description": "write a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "filePath": { "type": "string" } }
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        });
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        let Some(GrammarSpec::JsonSchema { schema }) = request.grammar else {
+            panic!("expected OpenAI tool_calls JSON schema grammar");
+        };
+        assert_eq!(schema["title"], "OpenAIToolCalls");
+        assert_eq!(
+            schema["properties"]["tool_calls"]["items"]["properties"]["function"]["properties"]
+                ["name"]["enum"][0],
+            "write"
+        );
+    }
+
+    #[test]
+    fn provider_engine_request_ignores_tools_for_none_adapter() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "none".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "write", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": "auto"
+        });
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_request_resolves_template_and_reasoning_policy() {
+        let preserving_adapter = catalog::CatalogAdapter {
+            chat_template_id: "llama3-instruct".to_owned(),
+            reasoning_passthrough: "preserve".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "reasoning": "scratchpad stays only for preserve adapters",
+                "content": "final user content"
+            }]
+        });
+        let request = provider_engine_request_from_body(&body, &preserving_adapter).unwrap();
+
+        assert!(request
+            .prompt
+            .contains("<|start_header_id|>user<|end_header_id|>"));
+        assert!(request
+            .prompt
+            .contains("scratchpad stays only for preserve adapters"));
+        assert!(request.prompt.contains("final user content"));
+
+        let stripped_request =
+            provider_engine_request_from_body(&body, &catalog::CatalogAdapter::default()).unwrap();
+        assert!(!stripped_request
+            .prompt
+            .contains("scratchpad stays only for preserve adapters"));
+        assert!(stripped_request.prompt.contains("user: final user content"));
     }
 
     #[test]
@@ -20816,7 +21085,8 @@ mod tests {
                 }
             }
         });
-        let request = provider_engine_request_from_body(&body).unwrap();
+        let request =
+            provider_engine_request_from_body(&body, &catalog::CatalogAdapter::default()).unwrap();
 
         let Some(GrammarSpec::JsonSchema { schema }) = request.grammar else {
             panic!("expected json schema grammar");
@@ -20831,7 +21101,12 @@ mod tests {
             "messages": [{ "role": "user", "content": "hello" }],
             "max_tokens": 8
         });
-        let output = provider_engine_session_response(&mut backend, &body).unwrap();
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+        )
+        .unwrap();
 
         assert_eq!(output.content, "engine says hi");
         assert!(output.tool.is_none());
@@ -20855,8 +21130,12 @@ mod tests {
             }],
             "tool_choice": "auto"
         });
-        let err = provider_engine_session_response(&mut backend, &body)
-            .expect_err("tool mode requires valid tool-call JSON");
+        let err = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+        )
+        .expect_err("tool mode requires valid tool-call JSON");
 
         assert!(
             format!("{err:#}").contains("provider engine did not return valid tool-call JSON"),
@@ -20869,6 +21148,41 @@ mod tests {
                 .grammar
                 .expect("tool grammar"),
             GrammarSpec::ToolCall { .. }
+        ));
+    }
+
+    #[test]
+    fn provider_engine_session_response_normalizes_openai_tool_calls_adapter() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "openai_tool_calls".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let mut backend = FakeEngineBackend::new(
+            r#"{ "tool_calls": [{ "id": "call-openai", "type": "function", "function": { "name": "write", "arguments": "{\"filePath\":\"ok.txt\"}" } }] }"#,
+        );
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write a file" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "write", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": "auto"
+        });
+        let output = provider_engine_session_response(&mut backend, &adapter, &body).unwrap();
+
+        assert_eq!(output.finish_reason, "tool_calls");
+        assert_eq!(output.content, "");
+        let tool = output.tool.expect("tool call");
+        assert_eq!(tool["id"], "call-openai");
+        assert_eq!(tool["name"], "write");
+        assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
+        assert!(matches!(
+            backend
+                .last_request
+                .expect("engine request")
+                .grammar
+                .expect("OpenAI tool_calls schema"),
+            GrammarSpec::JsonSchema { .. }
         ));
     }
 
@@ -20993,12 +21307,26 @@ mod tests {
     fn provider_engine_tool_call_output_maps_engine_json_to_openai_shape() {
         let tool = provider_engine_tool_call_output(
             r#"{ "tool": "write", "arguments": { "filePath": "ok.txt" } }"#,
+            ProviderEngineToolStrategy::MayhemJson,
         )
         .expect("tool call");
 
         assert_eq!(tool["name"], "write");
         assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
         assert!(tool["id"].as_str().unwrap().starts_with("call-"));
+    }
+
+    #[test]
+    fn provider_engine_tool_call_output_maps_openai_tool_calls_to_internal_shape() {
+        let tool = provider_engine_tool_call_output(
+            r#"{ "tool_calls": [{ "id": "call-openai", "type": "function", "function": { "name": "write", "arguments": { "filePath": "ok.txt" } } }] }"#,
+            ProviderEngineToolStrategy::OpenAiToolCalls,
+        )
+        .expect("tool call");
+
+        assert_eq!(tool["id"], "call-openai");
+        assert_eq!(tool["name"], "write");
+        assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
     }
 
     #[tokio::test]
@@ -23620,6 +23948,7 @@ mod tests {
             provider: "55".repeat(32),
             enclave_id: "11".repeat(32),
             model_id: "test/model@4bit".to_owned(),
+            adapter: catalog::CatalogAdapter::default(),
             room_ids: vec!["aa".repeat(16)],
             price_ver: 1,
             in_per_1k_mu: 1,
@@ -24111,6 +24440,7 @@ mod tests {
                     cpu_flags: Vec::new(),
                     backends: vec!["llama.cpp".to_owned()],
                 },
+                adapter: catalog::CatalogAdapter::default(),
                 canary: catalog::CanaryRef {
                     set_id: "test-canary".to_owned(),
                     match_min: 0.9,

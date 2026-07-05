@@ -8,7 +8,7 @@ use mayhem_gateway::openai::{
     GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayModel,
     GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture,
     GatewaySessionInvocation, GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps,
-    PriceRefMu, Usage,
+    PriceRefMu, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, text_generation_rate_map, token_fingerprint, ReputationEventKind,
@@ -56,6 +56,47 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![1, 2, 3, 4],
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ToolCallDirectSessionBackend;
+
+impl GatewaySessionBackend for ToolCallDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-tool-call-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = 1;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: None,
+                    tool_call: Some(ToolCallOutput {
+                        id: "call-normalized".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: r#"{"filePath":"ok.txt"}"#.to_owned(),
+                    }),
+                    finish_reason: "tool_calls".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids: vec![1],
             })
         })
     }
@@ -354,6 +395,10 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
         "output_token"
     );
     assert_eq!(body["data"][0]["mayhem"]["caps"]["tools"], true);
+    assert_eq!(
+        body["data"][0]["mayhem"]["adapter"]["tool_call_strategy"],
+        "mayhem_json"
+    );
 }
 
 #[tokio::test]
@@ -929,6 +974,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 output_modality: Some("text".to_owned()),
                 output_modalities: vec!["text".to_owned()],
             },
+            adapter: ShapeAdapterInfo::default(),
             source: "contract".to_owned(),
             kyb_identities: Vec::new(),
             route_candidates: providers
@@ -998,6 +1044,48 @@ async fn chat_completion_streams_openai_sse_chunks_with_usage() {
     assert!(body.contains("\"backend\":\"local-openai-shape\""));
     assert!(body.contains("\"direct_session\":false"));
     assert!(body.contains("\"receipt\":{"));
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn chat_completion_streams_normalized_tool_call_delta() {
+    let mut model = routed_test_model();
+    model.mayhem.adapter = ShapeAdapterInfo {
+        tool_call_strategy: "openai_tool_calls".to_owned(),
+        ..ShapeAdapterInfo::default()
+    };
+    let state = GatewayState::from_models(vec![model])
+        .with_session_backend(Arc::new(ToolCallDirectSessionBackend));
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Write a file." }],
+        "tools": [{
+            "type": "function",
+            "function": { "name": "write", "parameters": { "type": "object" } }
+        }],
+        "stream": true
+    });
+    let (status, headers, bytes) = raw_request(
+        openai_router(state),
+        Method::POST,
+        "/v1/chat/completions",
+        Some(request),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .starts_with("text/event-stream"));
+    let body = String::from_utf8(bytes).expect("SSE body is utf8");
+    assert!(body.contains("\"tool_calls\":["));
+    assert!(body.contains("\"id\":\"call-normalized\""));
+    assert!(body.contains("\"type\":\"function\""));
+    assert!(body.contains("\"name\":\"write\""));
+    assert!(body.contains("\"arguments\":\"{\\\"filePath\\\":\\\"ok.txt\\\"}\""));
+    assert!(body.contains("\"finish_reason\":\"tool_calls\""));
     assert!(body.contains("data: [DONE]"));
 }
 

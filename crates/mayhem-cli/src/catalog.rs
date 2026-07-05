@@ -88,6 +88,8 @@ pub(crate) struct CatalogModel {
     pub(crate) artifacts: BTreeMap<String, CatalogArtifact>,
     pub(crate) caps: CatalogCaps,
     pub(crate) requirements: CatalogRequirements,
+    #[serde(default)]
+    pub(crate) adapter: CatalogAdapter,
     pub(crate) canary: CanaryRef,
     pub(crate) price_ref_mu: PriceRef,
 }
@@ -177,6 +179,59 @@ pub(crate) struct CatalogRequirements {
     pub(crate) cpu_flags: Vec<String>,
     #[serde(default)]
     pub(crate) backends: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CatalogAdapter {
+    #[serde(default = "default_request_shape_family")]
+    pub(crate) request_shape_family: String,
+    #[serde(default = "default_chat_template_id")]
+    pub(crate) chat_template_id: String,
+    #[serde(default = "default_tool_call_strategy")]
+    pub(crate) tool_call_strategy: String,
+    #[serde(default = "default_reasoning_passthrough")]
+    pub(crate) reasoning_passthrough: String,
+    #[serde(default = "default_modality_set")]
+    pub(crate) modality_set: Vec<String>,
+    #[serde(default = "default_response_normalization")]
+    pub(crate) response_normalization: String,
+}
+
+impl Default for CatalogAdapter {
+    fn default() -> Self {
+        Self {
+            request_shape_family: default_request_shape_family(),
+            chat_template_id: default_chat_template_id(),
+            tool_call_strategy: default_tool_call_strategy(),
+            reasoning_passthrough: default_reasoning_passthrough(),
+            modality_set: default_modality_set(),
+            response_normalization: default_response_normalization(),
+        }
+    }
+}
+
+fn default_request_shape_family() -> String {
+    "openai_chat".to_owned()
+}
+
+fn default_chat_template_id() -> String {
+    "generic_chatml".to_owned()
+}
+
+fn default_tool_call_strategy() -> String {
+    "mayhem_json".to_owned()
+}
+
+fn default_reasoning_passthrough() -> String {
+    "strip".to_owned()
+}
+
+fn default_modality_set() -> Vec<String> {
+    vec!["text".to_owned()]
+}
+
+fn default_response_normalization() -> String {
+    "openai_chat".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -508,6 +563,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     validate_model_caps_modalities(model, errors);
+    validate_model_adapter(model, errors);
     let _ = (model.caps.tools, model.caps.json);
     if model.requirements.min_ram_gb == 0 {
         errors.push(format!(
@@ -852,6 +908,79 @@ fn validate_model_caps_modalities(model: &CatalogModel, errors: &mut Vec<String>
                 model.model_id, flag, model.model_class
             ));
         }
+    }
+}
+
+fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
+    let adapter = &model.adapter;
+    if adapter.request_shape_family != "openai_chat" {
+        errors.push(format!(
+            "{} adapter.request_shape_family is unsupported: {}",
+            model.model_id, adapter.request_shape_family
+        ));
+    }
+    if !matches!(
+        adapter.chat_template_id.as_str(),
+        "generic_chatml" | "llama3-instruct" | "qwen2.5-instruct"
+    ) {
+        errors.push(format!(
+            "{} adapter.chat_template_id is unsupported: {}",
+            model.model_id, adapter.chat_template_id
+        ));
+    }
+    if !matches!(
+        adapter.tool_call_strategy.as_str(),
+        "none" | "mayhem_json" | "openai_tool_calls"
+    ) {
+        errors.push(format!(
+            "{} adapter.tool_call_strategy is unsupported: {}",
+            model.model_id, adapter.tool_call_strategy
+        ));
+    }
+    if !matches!(adapter.reasoning_passthrough.as_str(), "strip" | "preserve") {
+        errors.push(format!(
+            "{} adapter.reasoning_passthrough is unsupported: {}",
+            model.model_id, adapter.reasoning_passthrough
+        ));
+    }
+    if adapter.modality_set.is_empty() || adapter.modality_set.len() > 8 {
+        errors.push(format!(
+            "{} adapter.modality_set must have 1..=8 entries",
+            model.model_id
+        ));
+    }
+    let mut caps_modalities = BTreeSet::new();
+    if let Some(modality) = model.caps.output_modality.as_deref() {
+        caps_modalities.insert(modality);
+    }
+    for modality in &model.caps.output_modalities {
+        caps_modalities.insert(modality.as_str());
+    }
+    let mut seen = BTreeSet::new();
+    for modality in &adapter.modality_set {
+        if !valid_output_modality(modality) {
+            errors.push(format!(
+                "{} adapter.modality_set entry is unsupported: {}",
+                model.model_id, modality
+            ));
+        } else if !caps_modalities.is_empty() && !caps_modalities.contains(modality.as_str()) {
+            errors.push(format!(
+                "{} adapter.modality_set entry {} is not declared in caps.output_modalities",
+                model.model_id, modality
+            ));
+        }
+        if !seen.insert(modality.clone()) {
+            errors.push(format!(
+                "{} adapter.modality_set duplicates {}",
+                model.model_id, modality
+            ));
+        }
+    }
+    if adapter.response_normalization != "openai_chat" {
+        errors.push(format!(
+            "{} adapter.response_normalization is unsupported: {}",
+            model.model_id, adapter.response_normalization
+        ));
     }
 }
 
@@ -1430,6 +1559,7 @@ mod tests {
                 cpu_flags: Vec::new(),
                 backends: vec!["llama.cpp".to_owned()],
             },
+            adapter: CatalogAdapter::default(),
             canary: CanaryRef {
                 set_id: "canary-launch-v1".to_owned(),
                 match_min: 0.9,
@@ -1551,6 +1681,72 @@ mod tests {
             .any(|error| error.contains("requires verification_tolerance_bps")));
     }
 
+    #[test]
+    fn adapter_descriptor_validates_registry_keys_and_modalities() {
+        let mut model = verification_test_model(
+            "admin/text@adapter",
+            DEFAULT_MODEL_CLASS,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                )]),
+                perceptual_hashes: BTreeMap::new(),
+            },
+        );
+        model.adapter.tool_call_strategy = "openai_tool_calls".to_owned();
+        model.adapter.chat_template_id = "qwen2.5-instruct".to_owned();
+        model.adapter.reasoning_passthrough = "preserve".to_owned();
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut invalid = model.clone();
+        invalid.adapter.request_shape_family = "provider_native".to_owned();
+        invalid.adapter.chat_template_id = String::new();
+        invalid.adapter.tool_call_strategy = "provider_custom".to_owned();
+        invalid.adapter.reasoning_passthrough = "leak".to_owned();
+        invalid.adapter.modality_set = vec![
+            "text".to_owned(),
+            "text".to_owned(),
+            "image".to_owned(),
+            "smell".to_owned(),
+        ];
+        invalid.adapter.response_normalization = "raw".to_owned();
+        let mut errors = Vec::new();
+        validate_model(&invalid, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("request_shape_family")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("chat_template_id")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("tool_call_strategy")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("reasoning_passthrough")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("adapter.modality_set duplicates text")));
+        assert!(errors.iter().any(|error| error.contains(
+            "adapter.modality_set entry image is not declared in caps.output_modalities"
+        )));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("adapter.modality_set entry is unsupported: smell")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("response_normalization")));
+    }
+
     fn verification_test_model(
         model_id: &str,
         model_class: &str,
@@ -1621,6 +1817,15 @@ mod tests {
                 min_vram_gb_full_offload: 0,
                 cpu_flags: Vec::new(),
                 backends: vec![engine.to_owned()],
+            },
+            adapter: CatalogAdapter {
+                modality_set: vec![output_modality.to_owned()],
+                tool_call_strategy: if model_class == DEFAULT_MODEL_CLASS {
+                    "mayhem_json".to_owned()
+                } else {
+                    "none".to_owned()
+                },
+                ..CatalogAdapter::default()
             },
             canary,
             price_ref_mu: PriceRef {
