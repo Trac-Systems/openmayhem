@@ -1929,6 +1929,71 @@ async fn user_dashboard_renders_live_gateway_data() {
     assert_no_external_urls(&body);
 }
 
+#[tokio::test]
+async fn provider_dashboard_renders_routes_receipts_and_earnings() {
+    let provider = "55".repeat(32);
+    let state = GatewayState::from_models(vec![routed_test_model_with_providers(
+        std::slice::from_ref(&provider),
+    )])
+    .with_provider_earnings(vec![json!({
+        "provider": provider,
+        "denom": "mu_usd",
+        "total_mu": 2_500_000_u64,
+        "held_mu": 500_000_u64,
+        "paid_cum_mu": 250_000_u64,
+        "released_mu": 1_750_000_u64,
+        "claimable_mu": 1_750_000_u64,
+        "claim_model": "tap_non_custodial_claim",
+        "holdbacks": [{"epoch": 7, "mu": 500_000_u64}],
+        "updated_epoch": 9_u64
+    })])
+    .with_session_backend(Arc::new(TestDirectSessionBackend));
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let query = dashboard_path
+        .strip_prefix("/mayhem/dashboard?")
+        .expect("dashboard token query");
+    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={}", provider);
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{"role": "user", "content": "serve this provider session"}]
+    });
+    let (status, _) =
+        json_request(app.clone(), Method::POST, "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(state.receipts().len(), 1);
+    assert_eq!(state.receipts()[0].receipt.body.provider, provider);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &provider_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("provider dashboard html");
+    assert!(body.contains("Provider dashboard"));
+    assert!(body.contains("matches mayhem earnings"));
+    assert!(body.contains("$2.50"));
+    assert!(body.contains("$1.75"));
+    assert!(body.contains("$0.25"));
+    assert!(body.contains("mayhem/routed-test"));
+    assert!(body.contains("Enclaves"));
+    assert!(body.contains("Live sessions"));
+    assert!(body.contains("Earnings"));
+    assert!(body.contains("Reputation / Holdback"));
+    assert!(body.contains("Hardware / Health"));
+    assert!(body.contains("mayhem earnings --provider"));
+    assert!(body.contains("mayhem withdraw --claim-proof"));
+    assert!(!body.contains("ledger earnings not loaded"));
+    assert_no_external_urls(&body);
+}
+
 #[test]
 fn dashboard_bind_refuses_unspecified_and_lan_addresses() {
     assert!(

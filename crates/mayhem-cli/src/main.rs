@@ -11664,6 +11664,16 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         let contract = read_contract_catalog(&rpc).await?;
         let models = gateway_models_from_contract(&contract)?;
         let model_count = models.len();
+        let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
+            .await?
+            .into_iter()
+            .map(earning_view)
+            .map(|view| {
+                view.and_then(|view| {
+                    serde_json::to_value(view).context("serializing provider earning view")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
             Some(&home),
             args.sc_bridge_url.as_deref(),
@@ -11685,7 +11695,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         let backend = ScBridgeGatewaySessionBackend::new(session_config);
         (
-            GatewayState::from_models(models).with_session_backend(Arc::new(backend)),
+            GatewayState::from_models(models)
+                .with_provider_earnings(provider_earnings)
+                .with_session_backend(Arc::new(backend)),
             format!("contract:{rpc_url}"),
             Some(model_count),
             format!("sc-bridge-direct-session:{sc_bridge_url}"),

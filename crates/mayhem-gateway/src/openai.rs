@@ -76,7 +76,7 @@ const DASHBOARD_CSS: &str = r#"
 *{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px;text-decoration:none}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
 "#;
 const DASHBOARD_USER_CSS: &str = r#"
-.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted)}.segment.active{border-color:var(--accent-primary);color:var(--accent-primary)}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.privacy-note{color:var(--text-muted);font-size:13px}@media(max-width:1050px){.overview-grid,.wide-grid{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
+.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted)}.segment.active{border-color:var(--accent-primary);color:var(--accent-primary)}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
 "#;
 
 #[derive(Clone, Debug)]
@@ -92,6 +92,7 @@ pub struct GatewayState {
     canary_policy: GatewayCanaryProbePolicy,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
+    provider_earnings: Arc<Vec<Value>>,
 }
 
 #[derive(Clone)]
@@ -649,6 +650,7 @@ impl GatewayState {
             canary_policy: GatewayCanaryProbePolicy::default(),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
+            provider_earnings: Arc::new(Vec::new()),
         }
     }
 
@@ -671,6 +673,11 @@ impl GatewayState {
     pub fn with_canary_probe_policy(mut self, policy: GatewayCanaryProbePolicy) -> Self {
         self.canary_policy = policy;
         self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
+        self
+    }
+
+    pub fn with_provider_earnings(mut self, earnings: Vec<Value>) -> Self {
+        self.provider_earnings = Arc::new(earnings);
         self
     }
 
@@ -828,6 +835,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/probes", get(mayhem_probes))
         .route("/mayhem/balance", get(mayhem_balance))
         .route("/mayhem/dashboard", get(mayhem_dashboard))
+        .route("/mayhem/dashboard/provider", get(mayhem_dashboard_provider))
         .route(
             "/mayhem/dashboard/components",
             get(mayhem_dashboard_components),
@@ -946,6 +954,7 @@ async fn create_audio_transcription(
 #[derive(Debug, Deserialize)]
 struct DashboardQuery {
     token: Option<String>,
+    provider: Option<String>,
 }
 
 async fn mayhem_dashboard(
@@ -967,6 +976,31 @@ async fn mayhem_dashboard(
             &state,
             state.dashboard_session.expires_in().as_secs(),
             &origin,
+        ),
+        Some(&state.dashboard_session.token),
+    )
+}
+
+async fn mayhem_dashboard_provider(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+        return dashboard_html_response(
+            StatusCode::UNAUTHORIZED,
+            dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
+            None,
+        );
+    }
+    let origin = dashboard_origin_from_headers(&headers);
+    dashboard_html_response(
+        StatusCode::OK,
+        dashboard_provider_html(
+            &state,
+            state.dashboard_session.expires_in().as_secs(),
+            &origin,
+            query.provider.as_deref(),
         ),
         Some(&state.dashboard_session.token),
     )
@@ -1013,6 +1047,7 @@ async fn mayhem_dashboard_session(
             "expires_in_seconds": state.dashboard_session.expires_in().as_secs(),
             "paths": {
                 "dashboard": "/mayhem/dashboard",
+                "provider_dashboard": "/mayhem/dashboard/provider",
                 "status": "/mayhem/status",
                 "models": "/v1/models",
                 "receipts": "/mayhem/receipts",
@@ -1209,18 +1244,536 @@ fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &s
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/components">Components</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented"><span class="segment active">T1+</span><span class="segment">T2+</span><span class="segment">T3+</span><span class="toggle">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/provider">Provider</a><a href="/mayhem/dashboard/components">Components</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented"><span class="segment active">T1+</span><span class="segment">T2+</span><span class="segment">T3+</span><span class="toggle">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
 OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
     )
 }
 
+fn dashboard_provider_html(
+    state: &GatewayState,
+    expires_in_seconds: u64,
+    origin: &str,
+    provider_filter: Option<&str>,
+) -> String {
+    let receipts = state.receipts();
+    let latest_receipts = dashboard_latest_receipts(&receipts);
+    let probes = state.probes();
+    let candidates = dashboard_provider_candidates(&state.models, provider_filter);
+    let provider_scope = dashboard_provider_scope(
+        provider_filter,
+        &candidates,
+        &latest_receipts,
+        &probes,
+        state.provider_earnings.as_ref(),
+    );
+    let earning_totals =
+        dashboard_provider_earning_totals(state.provider_earnings.as_ref(), &provider_scope);
+    let local_earned_mu = dashboard_provider_receipt_mu(&latest_receipts, &provider_scope);
+    let earned_mu = if earning_totals.loaded {
+        earning_totals.total_mu
+    } else {
+        local_earned_mu
+    };
+    let claimable_value = if earning_totals.loaded {
+        format_mu_usd(earning_totals.claimable_mu)
+    } else {
+        "not loaded".to_owned()
+    };
+    let active_sessions = latest_receipts
+        .iter()
+        .filter(|receipt| {
+            dashboard_provider_in_scope(&provider_scope, &receipt.receipt.body.provider)
+                && !receipt.receipt.body.final_receipt
+        })
+        .count();
+    let saturation_pct = dashboard_provider_saturation_pct(active_sessions, candidates.len());
+    let reputation = dashboard_provider_reputation_bps(&latest_receipts, &probes, &provider_scope)
+        .map(format_bps_percent)
+        .unwrap_or_else(|| "not loaded".to_owned());
+    let gateway_root = origin.trim_end_matches('/');
+    let provider_scope_label = dashboard_provider_scope_label(provider_filter, &provider_scope);
+    let provider_query = provider_filter
+        .map(|provider| format!("?provider={}", html_escape(provider)))
+        .unwrap_or_default();
+    let enclave_rows = dashboard_provider_enclave_rows(&candidates, &latest_receipts);
+    let live_session_rows =
+        dashboard_provider_live_session_rows(&latest_receipts, &candidates, &provider_scope);
+    let earnings_body =
+        dashboard_provider_earnings_body(&latest_receipts, &provider_scope, &earning_totals);
+    let holdback_body = dashboard_provider_holdback_body(&earning_totals);
+    let hardware_body = dashboard_provider_hwprobe_body(&candidates, &probes, &provider_scope);
+    let claim_body =
+        dashboard_provider_claim_body(provider_filter, &provider_scope, &earning_totals);
+    dashboard_html_document(
+        "Provider Dashboard",
+        &format!(
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/provider">Provider</a><a href="/mayhem/dashboard/components">Components</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section><p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section><section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
+            earned = format_mu_usd(earned_mu),
+            earned_source = if earning_totals.loaded {
+                "ledger earn/* rows"
+            } else {
+                "local receipts only"
+            },
+            paid = format_mu_usd(earning_totals.paid_mu),
+            earnings_source = if earning_totals.loaded {
+                "matches mayhem earnings"
+            } else {
+                "ledger earnings not loaded"
+            },
+            epoch_label = earning_totals
+                .updated_epoch
+                .map(|epoch| format!("epoch {epoch}"))
+                .unwrap_or_else(|| "epoch not loaded".to_owned()),
+            hardware_status_class = if candidates.is_empty() {
+                "status-dot muted"
+            } else {
+                "status-dot"
+            },
+            hardware_status = if candidates.is_empty() {
+                "No route"
+            } else {
+                "Healthy"
+            },
+            candidate_count = candidates.len(),
+            receipt_count = latest_receipts
+                .iter()
+                .filter(|receipt| dashboard_provider_in_scope(
+                    &provider_scope,
+                    &receipt.receipt.body.provider
+                ))
+                .count(),
+        ),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct DashboardProviderCandidate {
+    provider: String,
+    model_id: String,
+    enclave_id: String,
+    room_id: String,
+    backend: String,
+    att_tier: u8,
+    kyb: Option<ProviderKybInfo>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DashboardProviderEarningTotals {
+    loaded: bool,
+    total_mu: u64,
+    held_mu: u64,
+    paid_mu: u64,
+    claimable_mu: u64,
+    updated_epoch: Option<u64>,
+    holdback_count: usize,
+}
+
+fn dashboard_provider_candidates(
+    models: &[GatewayModel],
+    provider_filter: Option<&str>,
+) -> Vec<DashboardProviderCandidate> {
+    let mut out = Vec::new();
+    for model in models {
+        for candidate in &model.mayhem.route_candidates {
+            if provider_filter.is_some_and(|provider| provider != candidate.provider) {
+                continue;
+            }
+            out.push(DashboardProviderCandidate {
+                provider: candidate.provider.clone(),
+                model_id: model.id.clone(),
+                enclave_id: candidate.enclave_id.clone(),
+                room_id: candidate.room_id.clone(),
+                backend: model.mayhem.adapter.request_shape_family.clone(),
+                att_tier: candidate.att_tier,
+                kyb: candidate.kyb.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn dashboard_provider_scope(
+    provider_filter: Option<&str>,
+    candidates: &[DashboardProviderCandidate],
+    receipts: &[StoredReceipt],
+    probes: &[StoredProbeEvent],
+    earnings: &[Value],
+) -> BTreeSet<String> {
+    let mut scope = BTreeSet::new();
+    if let Some(provider) = provider_filter {
+        scope.insert(provider.to_owned());
+        return scope;
+    }
+    for candidate in candidates {
+        scope.insert(candidate.provider.clone());
+    }
+    for receipt in receipts {
+        scope.insert(receipt.receipt.body.provider.clone());
+    }
+    for probe in probes {
+        scope.insert(probe.provider.clone());
+    }
+    for entry in earnings {
+        if let Some(provider) = entry.get("provider").and_then(Value::as_str) {
+            scope.insert(provider.to_owned());
+        }
+    }
+    scope
+}
+
+fn dashboard_provider_in_scope(scope: &BTreeSet<String>, provider: &str) -> bool {
+    scope.is_empty() || scope.contains(provider)
+}
+
+fn dashboard_provider_scope_label(
+    provider_filter: Option<&str>,
+    scope: &BTreeSet<String>,
+) -> String {
+    if let Some(provider) = provider_filter {
+        return format!(
+            "provider {}",
+            html_escape(short_text(provider, 34).as_ref())
+        );
+    }
+    if scope.is_empty() {
+        "all local providers".to_owned()
+    } else {
+        format!("all local providers ({})", scope.len())
+    }
+}
+
+fn dashboard_provider_earning_totals(
+    earnings: &[Value],
+    scope: &BTreeSet<String>,
+) -> DashboardProviderEarningTotals {
+    let mut totals = DashboardProviderEarningTotals {
+        loaded: !earnings.is_empty(),
+        ..DashboardProviderEarningTotals::default()
+    };
+    for entry in earnings {
+        let provider = entry.get("provider").and_then(Value::as_str).unwrap_or("");
+        if !provider.is_empty() && !dashboard_provider_in_scope(scope, provider) {
+            continue;
+        }
+        totals.total_mu = totals
+            .total_mu
+            .saturating_add(entry.get("total_mu").and_then(Value::as_u64).unwrap_or(0));
+        totals.held_mu = totals
+            .held_mu
+            .saturating_add(entry.get("held_mu").and_then(Value::as_u64).unwrap_or(0));
+        totals.paid_mu = totals.paid_mu.saturating_add(
+            entry
+                .get("paid_cum_mu")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        totals.claimable_mu = totals.claimable_mu.saturating_add(
+            entry
+                .get("claimable_mu")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        totals.updated_epoch = entry
+            .get("updated_epoch")
+            .and_then(Value::as_u64)
+            .or(totals.updated_epoch)
+            .max(totals.updated_epoch);
+        totals.holdback_count = totals.holdback_count.saturating_add(
+            entry
+                .get("holdbacks")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+        );
+    }
+    totals
+}
+
+fn dashboard_provider_receipt_mu(receipts: &[StoredReceipt], scope: &BTreeSet<String>) -> u64 {
+    receipts
+        .iter()
+        .filter(|receipt| dashboard_provider_in_scope(scope, &receipt.receipt.body.provider))
+        .map(|receipt| receipt.receipt.body.mu_owed_cum)
+        .sum()
+}
+
+fn dashboard_provider_saturation_pct(active_sessions: usize, candidate_count: usize) -> u64 {
+    if candidate_count == 0 {
+        return 0;
+    }
+    ((active_sessions as u64).saturating_mul(100) / candidate_count as u64).min(100)
+}
+
+fn dashboard_provider_reputation_bps(
+    receipts: &[StoredReceipt],
+    probes: &[StoredProbeEvent],
+    scope: &BTreeSet<String>,
+) -> Option<u32> {
+    let mut total = 0_u32;
+    let mut score = 0_u32;
+    for receipt in receipts {
+        if !dashboard_provider_in_scope(scope, &receipt.receipt.body.provider) {
+            continue;
+        }
+        total = total.saturating_add(1);
+        score = score.saturating_add(if receipt.receipt.body.final_receipt {
+            10_000
+        } else {
+            5_000
+        });
+    }
+    for probe in probes {
+        if !dashboard_provider_in_scope(scope, &probe.provider) {
+            continue;
+        }
+        total = total.saturating_add(1);
+        score = score.saturating_add(if probe.pass { 10_000 } else { 0 });
+    }
+    if total == 0 {
+        None
+    } else {
+        Some(score / total)
+    }
+}
+
+fn dashboard_provider_enclave_rows(
+    candidates: &[DashboardProviderCandidate],
+    receipts: &[StoredReceipt],
+) -> String {
+    if candidates.is_empty() {
+        return r#"<tr><td colspan="5"><span class="privacy-note">No provider routes loaded</span></td></tr>"#
+            .to_owned();
+    }
+    candidates
+        .iter()
+        .take(10)
+        .map(|candidate| {
+            let active = receipts
+                .iter()
+                .filter(|receipt| {
+                    receipt.receipt.body.provider == candidate.provider
+                        && receipt.receipt.body.model_id == candidate.model_id
+                        && !receipt.receipt.body.final_receipt
+                })
+                .count();
+            let saturation = dashboard_provider_saturation_pct(active, 1);
+            let kyb = candidate
+                .kyb
+                .as_ref()
+                .map(|identity| {
+                    format!(
+                        " · KYB {} ({})",
+                        html_escape(&identity.legal_name),
+                        html_escape(&identity.jurisdiction)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td class="mono">{}</td><td class="mono">T{}{}</td><td><div class="mini-bar"><span style="--w:{}%"></span></div><span class="privacy-note">{}%</span></td><td><span class="status-dot">Serving</span></td></tr>"#,
+                html_escape(short_text(&candidate.model_id, 30).as_ref()),
+                html_escape(short_text(&candidate.enclave_id, 22).as_ref()),
+                html_escape(&candidate.backend),
+                candidate.att_tier,
+                kyb,
+                saturation,
+                saturation,
+            )
+        })
+        .collect::<String>()
+}
+
+fn dashboard_provider_live_session_rows(
+    receipts: &[StoredReceipt],
+    candidates: &[DashboardProviderCandidate],
+    scope: &BTreeSet<String>,
+) -> String {
+    let scoped = receipts
+        .iter()
+        .filter(|receipt| dashboard_provider_in_scope(scope, &receipt.receipt.body.provider))
+        .take(8)
+        .collect::<Vec<_>>();
+    if scoped.is_empty() {
+        return r#"<tr><td colspan="5"><span class="privacy-note">No served sessions yet</span></td></tr>"#
+            .to_owned();
+    }
+    scoped
+        .into_iter()
+        .map(|receipt| {
+            let body = &receipt.receipt.body;
+            let room = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.provider == body.provider
+                        && candidate.model_id == body.model_id
+                        && candidate.enclave_id == body.enclave_id
+                })
+                .map(|candidate| candidate.room_id.as_str())
+                .unwrap_or("room not loaded");
+            let status = if body.final_receipt {
+                r#"<span class="status-dot muted">Completed</span>"#
+            } else {
+                r#"<span class="status-dot">Streaming</span>"#
+            };
+            format!(
+                r#"<tr><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td class="mono">{}</td><td class="mono">{}/{}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
+                html_escape(short_text(room, 18).as_ref()),
+                html_escape(short_text(&body.model_id, 24).as_ref()),
+                body.usage.input_tokens(),
+                body.usage.output_tokens(),
+                format_elapsed_since(body.ts),
+            )
+        })
+        .collect::<String>()
+}
+
+fn dashboard_provider_earnings_body(
+    receipts: &[StoredReceipt],
+    scope: &BTreeSet<String>,
+    totals: &DashboardProviderEarningTotals,
+) -> String {
+    if totals.loaded {
+        let max = totals
+            .total_mu
+            .max(totals.held_mu)
+            .max(totals.paid_mu)
+            .max(totals.claimable_mu)
+            .max(1);
+        let bars = [
+            ("total", totals.total_mu),
+            ("held", totals.held_mu),
+            ("paid", totals.paid_mu),
+            ("claimable", totals.claimable_mu),
+        ]
+        .into_iter()
+        .map(|(label, value)| {
+            let height = 8 + value.saturating_mul(92) / max;
+            format!(
+                r#"<span class="bar" style="--h:{height}%" title="{label} {}"></span>"#,
+                format_mu_usd(value)
+            )
+        })
+        .collect::<String>();
+        return format!(r#"<div class="spend-bars">{bars}</div>"#);
+    }
+    let scoped = receipts
+        .iter()
+        .filter(|receipt| dashboard_provider_in_scope(scope, &receipt.receipt.body.provider))
+        .cloned()
+        .collect::<Vec<_>>();
+    dashboard_spend_body(&scoped)
+}
+
+fn dashboard_provider_holdback_body(totals: &DashboardProviderEarningTotals) -> String {
+    if !totals.loaded {
+        return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>Ledger holdback not loaded</p></div></div>"#
+            .to_owned();
+    }
+    let held_pct = if totals.total_mu == 0 {
+        0
+    } else {
+        totals.held_mu.saturating_mul(100) / totals.total_mu
+    };
+    format!(
+        r#"<div class="detail-grid"><div><span class="label">Held</span><p class="value mono">{}</p></div><div><span class="label">Release buckets</span><p class="value mono">{}</p></div><div><span class="label">Released</span><p class="value mono">{}</p></div><div><span class="label">Claim model</span><p class="value mono">TAP claim</p></div></div><div class="mini-bar"><span style="--w:{}%"></span></div>"#,
+        format_mu_usd(totals.held_mu),
+        totals.holdback_count,
+        format_mu_usd(totals.claimable_mu),
+        held_pct.min(100),
+    )
+}
+
+fn dashboard_provider_hwprobe_body(
+    candidates: &[DashboardProviderCandidate],
+    probes: &[StoredProbeEvent],
+    scope: &BTreeSet<String>,
+) -> String {
+    let last_probe = probes
+        .iter()
+        .filter(|probe| dashboard_provider_in_scope(scope, &probe.provider))
+        .max_by_key(|probe| {
+            probe
+                .evidence
+                .get("at")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        });
+    let max_tier = candidates
+        .iter()
+        .map(|candidate| candidate.att_tier)
+        .max()
+        .unwrap_or(0);
+    let max_tier_label = if max_tier == 0 {
+        "not loaded".to_owned()
+    } else {
+        format!("T{max_tier}")
+    };
+    let providers = candidates
+        .iter()
+        .map(|candidate| candidate.provider.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let last_probe_label = last_probe
+        .map(|probe| {
+            if probe.pass {
+                format!("probe ok {}", format_bps_percent(probe.match_bps))
+            } else {
+                format!("probe fail {}", format_bps_percent(probe.match_bps))
+            }
+        })
+        .unwrap_or_else(|| "no probe evidence".to_owned());
+    format!(
+        r#"<div class="detail-grid"><div><span class="label">Providers</span><p class="value mono">{providers}</p></div><div><span class="label">Max tier</span><p class="value mono">{}</p></div><div><span class="label">Last probe</span><p class="value mono">{}</p></div><div><span class="label">hwprobe</span><p class="value mono">not loaded</p></div></div>"#,
+        html_escape(&max_tier_label),
+        html_escape(&last_probe_label),
+    )
+}
+
+fn dashboard_provider_claim_body(
+    provider_filter: Option<&str>,
+    scope: &BTreeSet<String>,
+    totals: &DashboardProviderEarningTotals,
+) -> String {
+    let provider_arg = provider_filter
+        .or_else(|| scope.iter().next().map(String::as_str))
+        .map(|provider| format!(" --provider {}", shell_single_quote_dashboard(provider)))
+        .unwrap_or_default();
+    let claimable = if totals.loaded {
+        format_mu_usd(totals.claimable_mu)
+    } else {
+        "not loaded".to_owned()
+    };
+    format!(
+        r#"<div class="detail-grid"><div><span class="label">Claimable</span><p class="value mono">{claimable}</p></div><div><span class="label">Payout target</span><p class="value mono">claim proof required</p></div></div><pre>mayhem earnings{provider_arg} --json
+mayhem withdraw --claim-proof &lt;claim-proof.json&gt; --account &lt;tap-account&gt; --json</pre>"#
+    )
+}
+
+fn format_bps_percent(bps: u32) -> String {
+    format!("{}.{:02}%", bps / 100, bps % 100)
+}
+
+fn format_elapsed_since(ts: u64) -> String {
+    let age = now_secs().saturating_sub(ts);
+    if age < 60 {
+        format!("{age}s")
+    } else if age < 3_600 {
+        format!("{}m", age / 60)
+    } else {
+        format!("{}h", age / 3_600)
+    }
+}
+
+fn shell_single_quote_dashboard(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn dashboard_components_html(expires_in_seconds: u64) -> String {
     dashboard_html_document(
         "Local Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">127.0.0.1 local gateway</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Local dashboard surface</p></section><section class="component-grid"><article class="card strong"><div class="card-header"><h2>Account</h2><a class="link" href="/mayhem/dashboard">View all</a></div><div class="detail-grid"><div><span class="label">Balance</span><p class="value mono">1,240.00 TAP</p></div><div><span class="label">Sessions</span><p class="value"><span class="count-chip">12</span></p></div><div><span class="label">Provider</span><div class="copy-row"><span class="mono">testtrac1n57xm5de...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Gateway</span><p class="value mono">127.0.0.1</p></div></div><div class="card-footer"><span>Local session {expires_in_seconds}s</span><span class="status-dot">Online</span></div></article><article class="card"><div class="card-header"><h2>Throughput</h2><div class="toggle-row"><span class="count-chip">42 tok/s</span><span class="icon-toggle active">L</span><span class="icon-toggle">B</span></div></div><div class="chart-shell"><div class="chart-grid"></div><div class="chart-line"></div><span class="chart-point">42</span></div><div class="card-footer"><span>Synced locally</span><span class="status-dot muted">Idle</span></div></article><article class="card"><div class="card-header"><h2>Components</h2><span class="count-chip">06</span></div><div class="detail-grid"><div><span class="label">Status</span><p class="status-dot">Online</p></div><div><span class="label">Copy</span><button class="copy-chip" type="button">Copy</button></div><div><span class="label">Count</span><span class="count-chip">128</span></div><div><span class="label">Mono</span><p class="mono">mx/s/session</p></div></div></article><article class="card"><div class="card-header"><h2>Queue</h2><a class="link" href="/mayhem/dashboard">View all</a></div><div class="empty-state"><div><div class="empty-icon"></div><p>No sessions yet</p></div></div></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">127.0.0.1 local gateway</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Local dashboard surface</p></section><section class="component-grid"><article class="card strong"><div class="card-header"><h2>Account</h2><a class="link" href="/mayhem/dashboard">View all</a></div><div class="detail-grid"><div><span class="label">Balance</span><p class="value mono">1,240.00 TAP</p></div><div><span class="label">Sessions</span><p class="value"><span class="count-chip">12</span></p></div><div><span class="label">Provider</span><div class="copy-row"><span class="mono">testtrac1n57xm5de...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Gateway</span><p class="value mono">127.0.0.1</p></div></div><div class="card-footer"><span>Local session {expires_in_seconds}s</span><span class="status-dot">Online</span></div></article><article class="card"><div class="card-header"><h2>Throughput</h2><div class="toggle-row"><span class="count-chip">42 tok/s</span><span class="icon-toggle active">L</span><span class="icon-toggle">B</span></div></div><div class="chart-shell"><div class="chart-grid"></div><div class="chart-line"></div><span class="chart-point">42</span></div><div class="card-footer"><span>Synced locally</span><span class="status-dot muted">Idle</span></div></article><article class="card"><div class="card-header"><h2>Components</h2><span class="count-chip">06</span></div><div class="detail-grid"><div><span class="label">Status</span><p class="status-dot">Online</p></div><div><span class="label">Copy</span><button class="copy-chip" type="button">Copy</button></div><div><span class="label">Count</span><span class="count-chip">128</span></div><div><span class="label">Mono</span><p class="mono">mx/s/session</p></div></div></article><article class="card"><div class="card-header"><h2>Queue</h2><a class="link" href="/mayhem/dashboard">View all</a></div><div class="empty-state"><div><div class="empty-icon"></div><p>No sessions yet</p></div></div></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#
         ),
     )
 }
