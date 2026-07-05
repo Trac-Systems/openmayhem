@@ -166,6 +166,13 @@ fn test_nvidia_jwks() -> serde_json::Value {
     })
 }
 
+fn test_nvidia_offline_jwks() -> serde_json::Value {
+    serde_json::json!({
+        "jwks": test_nvidia_jwks(),
+        "issuers": ["https://local.verifier.attestation.nvidia.com"]
+    })
+}
+
 fn test_nvidia_signed_eat(claims: serde_json::Value) -> String {
     let mut header = Header::new(Algorithm::ES384);
     header.kid = Some(TEST_NVIDIA_NRAS_KID.to_owned());
@@ -216,6 +223,51 @@ fn test_nvidia_evidence(binding: &str, gpu_measurement_success: bool) -> String 
         "x-nvidia-gpu-vbios-rim-signature-verified": true,
         "x-nvidia-gpu-vbios-rim-measurements-available": true,
         "x-nvidia-gpu-vbios-index-no-conflict": true
+    }));
+    serde_json::json!({
+        "detached_eat": [
+            ["JWT", overall],
+            { "GPU-0": gpu }
+        ]
+    })
+    .to_string()
+}
+
+fn test_nvidia_offline_evidence(binding: &str, measurements_match: bool) -> String {
+    let exp = 4_102_444_800_u64;
+    let overall = test_nvidia_signed_eat(serde_json::json!({
+        "iss": "https://local.verifier.attestation.nvidia.com",
+        "sub": "NVIDIA-LOCAL-VERIFIER-ATTESTATION",
+        "exp": exp,
+        "eat_nonce": binding,
+        "x-nvidia-overall-att-result": true
+    }));
+    let gpu = test_nvidia_signed_eat(serde_json::json!({
+        "iss": "https://local.verifier.attestation.nvidia.com",
+        "sub": "NVIDIA-GPU-LOCAL-VERIFIER",
+        "exp": exp,
+        "eat_nonce": binding,
+        "x-nv-gpu-cert-chain-verified": true,
+        "x-nv-gpu-cert-check-complete": true,
+        "x-nv-gpu-measurement-available": true,
+        "x-nv-gpu-root-cert-available": true,
+        "x-nv-gpu-info-fetched": true,
+        "x-nv-gpu-available": true,
+        "x-nv-gpu-attestation-report-available": true,
+        "x-nv-gpu-attestation-report-driver-version-match": true,
+        "x-nv-gpu-attestation-report-vbios-version-match": true,
+        "x-nv-gpu-attestation-report-verified": true,
+        "x-nv-gpu-driver-rim-schema-fetched": true,
+        "x-nv-gpu-driver-rim-cert-extracted": true,
+        "x-nv-gpu-vbios-rim-cert-extracted": true,
+        "x-nv-gpu-vbios-rim-driver-measurements-available": true,
+        "x-nv-gpu-driver-rim-driver-measurements-available": true,
+        "x-nvidia-gpu-arch-check": true,
+        "x-nvidia-gpu-driver-rim-signature-verified": true,
+        "x-nvidia-gpu-vbios-rim-signature-verified": true,
+        "x-nvidia-gpu-attestation-report-parsed": true,
+        "x-nv-gpu-nonce-match": true,
+        "x-nv-gpu-measurements-match": measurements_match
     }));
     serde_json::json!({
         "detached_eat": [
@@ -540,6 +592,110 @@ fn nvidia_nras_tier2_report_rejects_signed_failed_appraisal() {
         err,
         GatewayError::HardwareQuoteInvalid { reason, .. }
             if reason.contains("measres")
+    ));
+}
+
+#[test]
+fn verifies_nvidia_nvtrust_offline_cc_quote_with_trusted_jwks() {
+    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        |_, binding| test_nvidia_offline_evidence(binding, true),
+    );
+    let jwks = test_nvidia_offline_jwks();
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.trusted_nvidia_offline_jwks = Some(&jwks);
+
+    let verified = verify_tier1_attestation(&request).expect("offline NVIDIA CC quote verifies");
+
+    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.enclave_id, contract.enclave_id);
+}
+
+#[test]
+fn nvidia_nvtrust_offline_cc_quote_requires_trusted_jwks() {
+    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        |_, binding| test_nvidia_offline_evidence(binding, true),
+    );
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+
+    let err = verify_tier1_attestation(&request).expect_err("offline NVIDIA CC needs trusted JWKS");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteTrustRootMissing { kind }
+            if kind == "nvidia_nvtrust_offline_jwt"
+    ));
+}
+
+#[test]
+fn nvidia_nvtrust_offline_cc_quote_rejects_failed_measurements() {
+    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        |_, binding| test_nvidia_offline_evidence(binding, false),
+    );
+    let jwks = test_nvidia_offline_jwks();
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.trusted_nvidia_offline_jwks = Some(&jwks);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("failed offline NVIDIA measurements must reject");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { kind, reason }
+            if kind == "nvidia_nvtrust_offline_jwt" && reason.contains("measurements")
+    ));
+}
+
+#[test]
+fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
+    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        |body, binding| test_nvidia_gb10_device_evidence(body, binding, "NVIDIA GB10 DGX Spark"),
+    );
+    let jwks = serde_json::json!({
+        "jwks": test_nvidia_jwks(),
+        "issuers": ["https://nras.attestation.nvidia.com"]
+    });
+    let mut request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.trusted_nvidia_offline_jwks = Some(&jwks);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("GB10 device identity is not a confidential-compute quote");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { kind, .. }
+            if kind == "nvidia_nvtrust_offline_jwt"
     ));
 }
 

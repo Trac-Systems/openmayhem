@@ -251,6 +251,7 @@ enum HardwareQuoteKindArg {
     IntelTdxDcap,
     NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
+    NvidiaNvtrustOfflineJwt,
     MockTier2,
 }
 
@@ -262,6 +263,9 @@ impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
             HardwareQuoteKindArg::IntelTdxDcap => HardwareQuoteKind::IntelTdxDcap,
             HardwareQuoteKindArg::NvidiaGb10DeviceJwt => HardwareQuoteKind::NvidiaGb10DeviceJwt,
             HardwareQuoteKindArg::NvidiaNrasJwt => HardwareQuoteKind::NvidiaNrasJwt,
+            HardwareQuoteKindArg::NvidiaNvtrustOfflineJwt => {
+                HardwareQuoteKind::NvidiaNvtrustOfflineJwt
+            }
             HardwareQuoteKindArg::MockTier2 => HardwareQuoteKind::MockTier2,
         }
     }
@@ -275,6 +279,7 @@ impl HardwareQuoteKindArg {
             HardwareQuoteKindArg::IntelTdxDcap => "intel_tdx_dcap",
             HardwareQuoteKindArg::NvidiaGb10DeviceJwt => "nvidia_gb10_device_jwt",
             HardwareQuoteKindArg::NvidiaNrasJwt => "nvidia_nras_jwt",
+            HardwareQuoteKindArg::NvidiaNvtrustOfflineJwt => "nvidia_nvtrust_offline_jwt",
             HardwareQuoteKindArg::MockTier2 => "mock_tier2",
         }
     }

@@ -78,6 +78,7 @@ pub enum HardwareQuoteKind {
     IntelTdxDcap,
     NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
+    NvidiaNvtrustOfflineJwt,
     MockTier2,
 }
 

@@ -387,6 +387,10 @@ struct UseArgs {
     #[arg(long, value_name = "PATH")]
     nvidia_nras_jwks_file: Option<PathBuf>,
 
+    /// Trusted NVIDIA nvTrust/local-verifier JWKS JSON file for offline confidential-compute quotes.
+    #[arg(long, value_name = "PATH")]
+    nvidia_offline_jwks_file: Option<PathBuf>,
+
     /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
     #[arg(long)]
     bind: Option<String>,
@@ -9689,6 +9693,18 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         None => None,
     };
+    let nvidia_offline_jwks = match &args.nvidia_offline_jwks_file {
+        Some(path) => {
+            let path = absolutize(path.clone())?;
+            Some(read_json_file(&path).with_context(|| {
+                format!(
+                    "loading NVIDIA offline-verifier JWKS from {}",
+                    path.display()
+                )
+            })?)
+        }
+        None => None,
+    };
     let (state, source, model_count, backend) = if args.dev_embedded_catalog {
         let state = GatewayState::from_embedded_catalog();
         (
@@ -9742,6 +9758,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         Some(jwks) => state.with_nvidia_nras_jwks(jwks),
         None => state,
     };
+    let state = match nvidia_offline_jwks {
+        Some(jwks) => state.with_nvidia_offline_jwks(jwks),
+        None => state,
+    };
     let report = json!({
         "ok": true,
         "home": home,
@@ -9754,6 +9774,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
         "nvidia_gb10_device_jwks": args.nvidia_gb10_device_jwks_file.is_some(),
         "nvidia_nras_jwks": args.nvidia_nras_jwks_file.is_some(),
+        "nvidia_offline_jwks": args.nvidia_offline_jwks_file.is_some(),
     });
 
     if args.json {
@@ -9779,6 +9800,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             }
             if args.nvidia_nras_jwks_file.is_some() {
                 println!("NVIDIA NRAS verification: trusted JWKS loaded.");
+            }
+            if args.nvidia_offline_jwks_file.is_some() {
+                println!("NVIDIA offline verifier fallback: trusted JWKS loaded.");
             }
         }
         println!("Use Ctrl-C to stop.");

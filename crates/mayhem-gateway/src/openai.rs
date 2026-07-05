@@ -209,6 +209,7 @@ struct HardwareQuoteTrust {
     apple_app_attest_jwks: Option<Value>,
     nvidia_gb10_device_jwks: Option<Value>,
     nvidia_nras_jwks: Option<Value>,
+    nvidia_offline_jwks: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -339,6 +340,7 @@ pub struct GatewaySessionAttestation {
     pub trusted_apple_app_attest_jwks: Option<Value>,
     pub trusted_nvidia_gb10_device_jwks: Option<Value>,
     pub trusted_nvidia_nras_jwks: Option<Value>,
+    pub trusted_nvidia_offline_jwks: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -507,6 +509,13 @@ impl GatewayState {
     pub fn with_nvidia_nras_jwks(mut self, jwks: Value) -> Self {
         let mut trust = (*self.hardware_quote_trust).clone();
         trust.nvidia_nras_jwks = Some(jwks);
+        self.hardware_quote_trust = Arc::new(trust);
+        self
+    }
+
+    pub fn with_nvidia_offline_jwks(mut self, jwks: Value) -> Self {
+        let mut trust = (*self.hardware_quote_trust).clone();
+        trust.nvidia_offline_jwks = Some(jwks);
         self.hardware_quote_trust = Arc::new(trust);
         self
     }
@@ -1352,6 +1361,7 @@ fn validate_direct_session_accept(
         request.trusted_nvidia_gb10_device_jwks =
             attestation.trusted_nvidia_gb10_device_jwks.as_ref();
         request.trusted_nvidia_nras_jwks = attestation.trusted_nvidia_nras_jwks.as_ref();
+        request.trusted_nvidia_offline_jwks = attestation.trusted_nvidia_offline_jwks.as_ref();
         verify_tier1_attestation(&request).map_err(|err| {
             fail(format!(
                 "provider accept attestation verification failed: {err}"
@@ -2261,6 +2271,7 @@ impl GatewayState {
                 .nvidia_gb10_device_jwks
                 .clone(),
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
+            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
         let max_spend_mu = estimate_max_spend_mu(model, request, &prompt_text);
         if max_spend_mu > self.receipt_config.balance_mu {
@@ -3562,6 +3573,7 @@ mod tests {
                 trusted_apple_app_attest_jwks: None,
                 trusted_nvidia_gb10_device_jwks: None,
                 trusted_nvidia_nras_jwks: None,
+                trusted_nvidia_offline_jwks: None,
             }),
             hedge: GatewayHedgeInvocation::default(),
             receipt_cosign_enabled: true,
