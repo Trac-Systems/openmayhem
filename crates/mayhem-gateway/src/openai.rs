@@ -41,7 +41,7 @@ use mayhem_proto::{
     session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
     AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
     SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_INPUT_TOKEN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -330,6 +330,18 @@ pub struct CompletionRequest {
     pub seed: Option<i64>,
     #[serde(default)]
     pub stop: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: Value,
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 #[derive(Debug)]
@@ -689,6 +701,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/completions", post(create_completion))
+        .route("/v1/embeddings", post(create_embedding))
         .route("/mayhem/status", get(mayhem_status))
         .route("/mayhem/receipts", get(mayhem_receipts))
         .route("/mayhem/probes", get(mayhem_probes))
@@ -741,6 +754,16 @@ async fn create_completion(
     match build_completion(&state, request) {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn create_embedding(
+    State(state): State<SharedState>,
+    Json(request): Json<EmbeddingRequest>,
+) -> Response {
+    match build_embedding(&state, request) {
+        Ok(value) => Json(value).into_response(),
         Err(err) => err.into_response(),
     }
 }
@@ -2146,6 +2169,205 @@ fn build_completion(
     } else {
         Ok(ChatResponse::Json(chunk))
     }
+}
+
+fn build_embedding(state: &GatewayState, request: EmbeddingRequest) -> Result<Value, ApiError> {
+    let model = require_model(state, &request.model)?;
+    if !model_supports_embeddings(&model) {
+        return Err(ApiError::bad_request(
+            "model does not support embeddings",
+            Some("model"),
+        ));
+    }
+    if request
+        .encoding_format
+        .as_deref()
+        .is_some_and(|format| format != "float")
+    {
+        return Err(ApiError::bad_request(
+            "only encoding_format=float is supported for embeddings",
+            Some("encoding_format"),
+        ));
+    }
+    let dimensions = embedding_dimensions(request.dimensions)?;
+    let inputs = embedding_inputs(&request.input)?;
+    let prompt_tokens = embedding_prompt_tokens(&inputs);
+    let prompt_text = inputs.join("\n");
+    let receipt = state.meter_session(
+        &model,
+        &prompt_text,
+        ReceiptUsage::from_units([(USAGE_INPUT_TOKEN, prompt_tokens)]),
+    )?;
+    let data = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            json!({
+                "object": "embedding",
+                "embedding": deterministic_embedding_vector(&model.id, input, dimensions),
+                "index": index,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "object": "list",
+        "data": data,
+        "model": model.id,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens,
+        },
+        "mayhem": {
+            "backend": "local-embedding-shape",
+            "model": model.mayhem,
+            "receipt": receipt_summary(&receipt),
+        },
+    }))
+}
+
+fn model_supports_embeddings(model: &GatewayModel) -> bool {
+    model.mayhem.model_class == "embedding"
+        || model.mayhem.caps.output_modality.as_deref() == Some("embedding")
+        || model
+            .mayhem
+            .caps
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "embedding")
+        || model
+            .mayhem
+            .adapter
+            .modality_set
+            .iter()
+            .any(|modality| modality == "embedding")
+}
+
+fn embedding_dimensions(requested: Option<usize>) -> Result<usize, ApiError> {
+    let dimensions = requested.unwrap_or(32);
+    if (1..=3072).contains(&dimensions) {
+        Ok(dimensions)
+    } else {
+        Err(ApiError::bad_request(
+            "dimensions must be between 1 and 3072",
+            Some("dimensions"),
+        ))
+    }
+}
+
+fn embedding_inputs(value: &Value) -> Result<Vec<String>, ApiError> {
+    match value {
+        Value::String(text) => Ok(vec![text.clone()]),
+        Value::Array(items) if items.is_empty() => Err(ApiError::bad_request(
+            "input must contain at least one item",
+            Some("input"),
+        )),
+        Value::Array(items) if items.iter().all(Value::is_string) => Ok(items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()),
+        Value::Array(items) if items.iter().all(embedding_token_value) => {
+            Ok(vec![embedding_token_array_to_text(items)?])
+        }
+        Value::Array(items) if items.iter().all(Value::is_array) => items
+            .iter()
+            .map(|item| {
+                let tokens = item.as_array().ok_or_else(|| {
+                    ApiError::bad_request("input token arrays must be arrays", Some("input"))
+                })?;
+                embedding_token_array_to_text(tokens)
+            })
+            .collect(),
+        _ => Err(ApiError::bad_request(
+            "input must be a string, an array of strings, token IDs, or token ID arrays",
+            Some("input"),
+        )),
+    }
+}
+
+fn embedding_token_value(value: &Value) -> bool {
+    value.as_i64().is_some() || value.as_u64().is_some()
+}
+
+fn embedding_token_array_to_text(tokens: &[Value]) -> Result<String, ApiError> {
+    if tokens.is_empty() {
+        return Err(ApiError::bad_request(
+            "token input arrays must not be empty",
+            Some("input"),
+        ));
+    }
+    let mut parts = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if let Some(token) = token.as_i64() {
+            parts.push(token.to_string());
+        } else if let Some(token) = token.as_u64() {
+            parts.push(token.to_string());
+        } else {
+            return Err(ApiError::bad_request(
+                "token input arrays must contain only integers",
+                Some("input"),
+            ));
+        }
+    }
+    Ok(parts.join(" "))
+}
+
+fn embedding_prompt_tokens(inputs: &[String]) -> u64 {
+    inputs.iter().map(|input| rough_tokens(input).max(1)).sum()
+}
+
+fn deterministic_embedding_vector(model_id: &str, input: &str, dimensions: usize) -> Vec<f32> {
+    let mut values = (0..dimensions)
+        .map(|index| {
+            let digest =
+                blake3::hash(format!("mayhem-embedding-v1:{model_id}:{input}:{index}").as_bytes());
+            let bytes: [u8; 4] = digest.as_bytes()[..4]
+                .try_into()
+                .expect("blake3 digest has at least four bytes");
+            let raw = u32::from_le_bytes(bytes);
+            (((f64::from(raw) / f64::from(u32::MAX)) * 2.0) - 1.0) as f32
+        })
+        .collect::<Vec<_>>();
+    let norm = values
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut values {
+            *value = (f64::from(*value) / norm) as f32;
+        }
+    }
+    values
+}
+
+pub fn embedding_cosine_similarity_bps(expected: &[f32], observed: &[f32]) -> Option<u32> {
+    if expected.is_empty() || expected.len() != observed.len() {
+        return None;
+    }
+    let (dot, expected_norm, observed_norm) = expected.iter().zip(observed).fold(
+        (0.0, 0.0, 0.0),
+        |(dot, left_norm, right_norm), (left, right)| {
+            let left = f64::from(*left);
+            let right = f64::from(*right);
+            (
+                dot + left * right,
+                left_norm + left * left,
+                right_norm + right * right,
+            )
+        },
+    );
+    if expected_norm == 0.0 || observed_norm == 0.0 {
+        return None;
+    }
+    let cosine = dot / (expected_norm.sqrt() * observed_norm.sqrt());
+    Some((cosine.clamp(0.0, 1.0) * 10_000.0).round() as u32)
+}
+
+pub fn embedding_canary_matches(expected: &[f32], observed: &[f32], tolerance_bps: u32) -> bool {
+    let min_bps = 10_000u32.saturating_sub(tolerance_bps);
+    embedding_cosine_similarity_bps(expected, observed).is_some_and(|score| score >= min_bps)
 }
 
 impl GatewayCanaryScheduler {
@@ -3645,6 +3867,23 @@ mod tests {
         );
         assert!(config.open_timeout <= Duration::from_secs(3));
         assert!(config.frame_timeout < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn embedding_canary_matches_exact_vector_and_cosine_tolerance() {
+        let expected = deterministic_embedding_vector("admin/embed-fixture", "fixed canary", 16);
+        let same = deterministic_embedding_vector("admin/embed-fixture", "fixed canary", 16);
+        let different =
+            deterministic_embedding_vector("admin/embed-fixture", "different canary", 16);
+
+        assert_eq!(expected, same);
+        assert_eq!(
+            embedding_cosine_similarity_bps(&expected, &same),
+            Some(10_000)
+        );
+        assert!(embedding_canary_matches(&expected, &same, 0));
+        assert!(!embedding_canary_matches(&expected, &different, 1));
+        assert_eq!(embedding_cosine_similarity_bps(&expected, &[]), None);
     }
 
     #[test]

@@ -436,6 +436,101 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
 }
 
 #[tokio::test]
+async fn embeddings_endpoint_returns_vectors_and_records_receipt() {
+    let catalog = json!({
+        "models": [{
+            "model_id": "admin/embed-fixture",
+            "model_class": "embedding",
+            "caps": {
+                "tools": false,
+                "json": false,
+                "ctx_max": 8192,
+                "vision": false,
+                "output_modality": "embedding",
+                "output_modalities": ["embedding"]
+            },
+            "adapter": {
+                "request_shape_family": "openai_chat",
+                "chat_template_id": "generic_chatml",
+                "tool_call_strategy": "none",
+                "reasoning_passthrough": "strip",
+                "modality_set": ["embedding"],
+                "response_normalization": "openai_chat"
+            },
+            "price_ref_mu": {
+                "denom": "mu_usd",
+                "ver": 3,
+                "rate_map": [
+                    { "unit": "input_token", "per_unit_mu": 10, "granularity": 1000 }
+                ]
+            },
+            "attestation_tiers": { "T1": 1 }
+        }]
+    });
+    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/embed-fixture",
+        "input": ["alpha", "beta"],
+        "dimensions": 8,
+        "encoding_format": "float"
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/embeddings", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "admin/embed-fixture");
+    assert_eq!(body["data"].as_array().expect("embedding data").len(), 2);
+    assert_eq!(body["data"][0]["object"], "embedding");
+    assert_eq!(
+        body["data"][0]["embedding"]
+            .as_array()
+            .expect("embedding vector")
+            .len(),
+        8
+    );
+    assert_eq!(body["usage"]["prompt_tokens"], 2);
+    assert_eq!(body["usage"]["total_tokens"], 2);
+    assert_eq!(body["mayhem"]["backend"], "local-embedding-shape");
+    assert_eq!(
+        body["mayhem"]["model"]["adapter"]["modality_set"][0],
+        "embedding"
+    );
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].receipt.body.model_id, "admin/embed-fixture");
+    assert_eq!(receipts[0].receipt.body.price_ver, 3);
+    assert_eq!(receipts[0].receipt.body.usage.input_tokens(), 2);
+    assert_eq!(receipts[0].receipt.body.usage.output_tokens(), 0);
+    assert_eq!(
+        receipts[0].receipt.body.prompt_hash,
+        body["mayhem"]["receipt"]["prompt_hash"]
+            .as_str()
+            .expect("prompt hash")
+    );
+}
+
+#[tokio::test]
+async fn embeddings_endpoint_rejects_non_embedding_model() {
+    let model = first_model_id().await;
+    let (status, body) = json_request(
+        test_app(),
+        Method::POST,
+        "/v1/embeddings",
+        json!({ "model": model, "input": "hello" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "model");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("does not support embeddings"));
+}
+
+#[tokio::test]
 async fn chat_completion_returns_tool_call_and_accepts_tool_result_followup() {
     let model = first_model_id().await;
     let tool_request = json!({
