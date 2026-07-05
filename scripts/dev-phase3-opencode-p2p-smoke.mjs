@@ -315,6 +315,18 @@ function safeMu(value, label) {
   return number;
 }
 
+async function readDepositRootSnapshot(rpcUrl, epoch) {
+  const value = await readStateValue(rpcUrl, `ev/dep/${epoch}`);
+  if (!value) return null;
+  if (value.type !== 'deposit_root') fail(`ev/dep/${epoch} is not a deposit root`);
+  return {
+    merkle_root: value.merkle_root,
+    count: safeMu(value.count, `ev/dep/${epoch} count`),
+    mu_total: safeMu(value.mu_total, `ev/dep/${epoch} mu_total`),
+    source: `ev/dep/${epoch}`,
+  };
+}
+
 async function readLedgerSnapshot(rpcUrl, user, provider) {
   const [balance, earning, fee] = await Promise.all([
     readStateValue(rpcUrl, `bal/${user}/fiat`),
@@ -369,6 +381,12 @@ async function settleGatewayReceiptEpoch({
     '--no-verify',
     '--json',
   ], exportPath);
+  const bundle = readJson(bundlePath);
+  const depositRoot = await readDepositRootSnapshot(adminRpcUrl, epoch);
+  if (depositRoot) {
+    bundle.deposit_root = depositRoot;
+    fs.writeFileSync(bundlePath, `${JSON.stringify(bundle, null, 2)}\n`);
+  }
 
   const recomputedStdout = runSync('node', [path.join(ROOT, 'intercom/scripts/recompute-epoch-roots.mjs'), bundlePath]);
   fs.writeFileSync(recomputedPath, recomputedStdout);

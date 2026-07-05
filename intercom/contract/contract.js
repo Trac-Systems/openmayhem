@@ -889,6 +889,7 @@ class MayhemContract extends Contract {
     };
     await this.put(`consent/${value.sender}`, record);
     console.log('mayhem consent feature', { address: value.sender, ...record });
+    return { ok: true, op: 'consentFeature', address: value.sender, ...record };
   }
 
   async applyProviderLifecycleFeature(key, value) {
@@ -908,20 +909,15 @@ class MayhemContract extends Contract {
 
     switch (intent.op) {
       case 'register_provider':
-        await this.applyRegisterProvider(intent.provider, key);
-        return;
+        return await this.applyRegisterProvider(intent.provider, key);
       case 'join_enclave':
-        await this.applyJoinEnclave(intent.provider, intent.enclave_id, key);
-        return;
+        return await this.applyJoinEnclave(intent.provider, intent.enclave_id, key);
       case 'leave_enclave':
-        await this.applyLeaveEnclave(intent.provider, intent.enclave_id, key);
-        return;
+        return await this.applyLeaveEnclave(intent.provider, intent.enclave_id, key);
       case 'join_room':
-        await this.applyJoinRoom(intent.provider, intent.room_id, intent.enclave_id, key);
-        return;
+        return await this.applyJoinRoom(intent.provider, intent.room_id, intent.enclave_id, key);
       case 'leave_room':
-        await this.applyLeaveRoom(intent.provider, intent.room_id, intent.enclave_id, key);
-        return;
+        return await this.applyLeaveRoom(intent.provider, intent.room_id, intent.enclave_id, key);
       default:
         return;
     }

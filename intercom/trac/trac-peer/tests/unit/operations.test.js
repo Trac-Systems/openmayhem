@@ -562,6 +562,10 @@ test("operations: feature executes contract when admin-signed", async (t) => {
 
   t.is((await batch.get("feature_called"))?.value ?? null, true);
   t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
+  const featureResult = (await batch.get(`fr/${signature}`))?.value ?? null;
+  t.is(featureResult?.ok, true);
+  t.is(featureResult?.status, "applied");
+  t.is(featureResult?.feature_key, "my_feature");
 });
 
 test("operations: feature does not burn replay hash when contract returns an error", async (t) => {
@@ -604,10 +608,17 @@ test("operations: feature does not burn replay hash when contract returns an err
   await op.handle(opObj, batch, base, node);
   t.is((await batch.get(`sh/${signature}`))?.value ?? null, null);
   t.is((await batch.get("feature_called_after_retry"))?.value ?? null, null);
+  const rejected = (await batch.get(`fr/${signature}`))?.value ?? null;
+  t.is(rejected?.ok, false);
+  t.is(rejected?.status, "rejected");
+  t.is(rejected?.error?.message, "commit required");
 
   await op.handle(opObj, batch, base, node);
   t.is((await batch.get("feature_called_after_retry"))?.value ?? null, true);
   t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
+  const applied = (await batch.get(`fr/${signature}`))?.value ?? null;
+  t.is(applied?.ok, true);
+  t.is(applied?.status, "applied");
 });
 
 test("operations: feature does not burn replay hash when contract returns undefined", async (t) => {
@@ -635,4 +646,8 @@ test("operations: feature does not burn replay hash when contract returns undefi
   await op.handle(opObj, batch, base, node);
 
   t.is((await batch.get(`sh/${signature}`))?.value ?? null, null);
+  const featureResult = (await batch.get(`fr/${signature}`))?.value ?? null;
+  t.is(featureResult?.ok, false);
+  t.is(featureResult?.status, "rejected");
+  t.is(featureResult?.error?.message, "Feature returned no result.");
 });

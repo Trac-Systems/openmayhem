@@ -205,6 +205,19 @@ async function depositRoot(deposits) {
   };
 }
 
+function depositRootFromEvidence(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const root = value.root ?? value.merkle_root;
+  if (typeof root !== 'string' || !/^[0-9a-f]{64}$/.test(root)) {
+    throw new Error('deposit_root.merkle_root must be 32 bytes of hex');
+  }
+  const count = safeAmount(value.count, 'deposit_root count', { allowZero: true });
+  const muTotal = safeAmount(value.mu_total ?? value.muTotal, 'deposit_root mu_total', { allowZero: true });
+  return { root, count, muTotal };
+}
+
 export async function recomputeEpoch(bundle) {
   if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle)) {
     throw new Error('epoch bundle must be an object');
@@ -225,7 +238,7 @@ export async function recomputeEpoch(bundle) {
   const priorFeeCumMu = bundle.prior_fee_cum_mu ?? 0;
   safeAmount(priorFeeCumMu, 'prior_fee_cum_mu', { allowZero: true });
 
-  const dep = await depositRoot(deposits);
+  const dep = depositRootFromEvidence(bundle.deposit_root) ?? await depositRoot(deposits);
   const usageLeaves = [];
   const debitMap = new Map();
   const grossEarningMap = new Map();

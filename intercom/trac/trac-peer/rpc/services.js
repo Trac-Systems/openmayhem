@@ -157,8 +157,49 @@ export async function contractFeature(peer, { feature = "mayhem", key, value } =
   if (!registered || typeof registered.append !== "function") {
     throw new Error(`Feature ${featureName} is not available.`);
   }
-  await registered.append(recordKey, value);
-  return { ok: true, feature: featureName, key: recordKey };
+  const appended = await registered.append(recordKey, value);
+  const hash = appended?.hash ?? null;
+  const resultKey = hash ? `fr/${hash}` : null;
+  const featureResult = resultKey ? await waitForFeatureResult(peer, resultKey) : null;
+  if (!featureResult) {
+    return {
+      ok: false,
+      accepted: true,
+      status: "pending",
+      feature: featureName,
+      key: recordKey,
+      hash,
+      message: "Feature append was accepted but no applied result appeared before timeout.",
+      result_key: resultKey,
+    };
+  }
+  const ok = featureResult.ok === true;
+  return {
+    ok,
+    accepted: true,
+    status: featureResult.status,
+    feature: featureName,
+    key: recordKey,
+    hash,
+    message: ok ? "Feature applied." : featureResult.error?.message ?? "Feature rejected.",
+    result_key: resultKey,
+    result: featureResult,
+  };
+}
+
+async function waitForFeatureResult(peer, key, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const session = stateView(peer, false);
+    try {
+      const result = await session.view.get(key);
+      if (result !== null) return result.value;
+    } finally {
+      await session.close();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return null;
 }
 
 const stateView = (peer, confirmed) => {
