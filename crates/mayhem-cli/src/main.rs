@@ -4,6 +4,7 @@ mod catalog;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -904,6 +905,34 @@ struct UpdateArgs {
     /// Verify the release without copying it into the staged update directory.
     #[arg(long)]
     dry_run: bool,
+
+    /// Apply an already staged update instead of checking the release feed.
+    #[arg(long)]
+    apply_staged: bool,
+
+    /// Staged update directory to apply. Defaults to the newest <home>/updates/staged entry.
+    #[arg(long, value_name = "PATH")]
+    stage_dir: Option<PathBuf>,
+
+    /// Binary to replace when applying. Defaults to the current mayhem executable.
+    #[arg(long, value_name = "PATH")]
+    current_bin: Option<PathBuf>,
+
+    /// Delay before a staged update may be applied.
+    #[arg(long, default_value_t = 3_600)]
+    apply_delay_seconds: u64,
+
+    /// Bypass the apply delay. Intended for local tests and emergency operator use.
+    #[arg(long)]
+    bypass_apply_delay: bool,
+
+    /// Argument passed to the upgraded binary for the post-upgrade health gate. Repeatable.
+    #[arg(long = "post-upgrade-arg")]
+    post_upgrade_args: Vec<String>,
+
+    /// State path to snapshot before apply and restore on rollback. Repeatable.
+    #[arg(long = "state-path", value_name = "PATH")]
+    state_paths: Vec<PathBuf>,
 
     /// Print a machine-readable update report.
     #[arg(long)]
@@ -3670,6 +3699,19 @@ fn read_release_signing_seed(path: &Path) -> Result<[u8; 32]> {
 
 async fn update(args: UpdateArgs) -> Result<()> {
     let json = args.json;
+    if args.apply_staged {
+        let report = update_apply_report(args)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("Applied staged update: {}", report.stage_dir.display());
+            println!("Current binary: {}", report.current_bin.display());
+            println!("Backup dir: {}", report.backup_dir.display());
+            println!("Health gate: passed");
+        }
+        return Ok(());
+    }
+
     let report = update_report(args).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3762,7 +3804,7 @@ struct UpdateReport {
     sources: UpdateSourceSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ReleaseStageMetadata {
     schema: u32,
     version: String,
@@ -3771,6 +3813,24 @@ struct ReleaseStageMetadata {
     key_id: String,
     public_key: String,
     staged_at_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateApplyReport {
+    ok: bool,
+    stage_dir: PathBuf,
+    current_bin: PathBuf,
+    backup_dir: PathBuf,
+    delay_seconds: u64,
+    health_args: Vec<String>,
+    state_snapshots: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct StateSnapshotEntry {
+    original: PathBuf,
+    backup: PathBuf,
+    existed: bool,
 }
 
 async fn update_report(args: UpdateArgs) -> Result<UpdateReport> {
@@ -3851,10 +3911,141 @@ async fn update_report(args: UpdateArgs) -> Result<UpdateReport> {
     })
 }
 
+fn update_apply_report(args: UpdateArgs) -> Result<UpdateApplyReport> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let stage_dir = args
+        .stage_dir
+        .clone()
+        .map(absolutize)
+        .transpose()?
+        .map(Ok)
+        .unwrap_or_else(|| latest_staged_update(&home))?;
+    let metadata: ReleaseStageMetadata =
+        serde_json::from_value(read_json_file(&stage_dir.join("stage.json"))?)
+            .with_context(|| format!("parsing {}", stage_dir.join("stage.json").display()))?;
+    if metadata.schema != 1 {
+        bail!("staged update metadata schema must be 1");
+    }
+    if !args.bypass_apply_delay {
+        let now = unix_epoch_seconds()?;
+        let ready_at = metadata
+            .staged_at_unix
+            .saturating_add(args.apply_delay_seconds);
+        if now < ready_at {
+            bail!(
+                "staged update delay has not elapsed: ready at {ready_at}, now {now}; pass --bypass-apply-delay only for tests/emergency use"
+            );
+        }
+    }
+
+    let current_bin = args
+        .current_bin
+        .clone()
+        .map(absolutize)
+        .transpose()?
+        .unwrap_or(env::current_exe().context("locating current mayhem executable")?);
+    let staged_binary = stage_dir.join("bin").join(release_mayhem_binary_name());
+    if !staged_binary.is_file() {
+        bail!("staged update binary missing: {}", staged_binary.display());
+    }
+    if current_bin == staged_binary {
+        bail!("current binary and staged binary are the same path");
+    }
+
+    let backup_dir = home.join("updates").join("backups").join(format!(
+        "{}-{}-{}",
+        safe_path_component(&metadata.version),
+        safe_path_component(&metadata.target),
+        now_nanos_for_path()
+    ));
+    let backup_bin = backup_dir.join("bin").join(
+        current_bin
+            .file_name()
+            .unwrap_or_else(|| OsStr::new(release_mayhem_binary_name())),
+    );
+    copy_file_preserve_mode(&current_bin, &backup_bin)?;
+    let state_snapshots = snapshot_update_state(&home, &args.state_paths, &backup_dir)?;
+    copy_file_preserve_mode(&staged_binary, &current_bin)?;
+
+    let health_args = if args.post_upgrade_args.is_empty() {
+        vec!["doctor".to_owned(), "--json".to_owned()]
+    } else {
+        args.post_upgrade_args.clone()
+    };
+    let health = std::process::Command::new(&current_bin)
+        .args(&health_args)
+        .status();
+    match health {
+        Ok(status) if status.success() => Ok(UpdateApplyReport {
+            ok: true,
+            stage_dir,
+            current_bin,
+            backup_dir,
+            delay_seconds: args.apply_delay_seconds,
+            health_args,
+            state_snapshots: state_snapshots
+                .iter()
+                .filter(|entry| entry.existed)
+                .map(|entry| entry.backup.clone())
+                .collect(),
+        }),
+        Ok(status) => {
+            rollback_update(&current_bin, &backup_bin, &state_snapshots)?;
+            bail!(
+                "post-upgrade health gate failed with status {}; rolled back to {}",
+                status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated".to_owned()),
+                backup_dir.display()
+            );
+        }
+        Err(error) => {
+            rollback_update(&current_bin, &backup_bin, &state_snapshots)?;
+            bail!(
+                "post-upgrade health gate could not run: {error}; rolled back to {}",
+                backup_dir.display()
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StagedRelease {
     stage_dir: PathBuf,
     staged_binary: PathBuf,
+}
+
+fn latest_staged_update(home: &Path) -> Result<PathBuf> {
+    let staged_root = home.join("updates").join("staged");
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for entry in fs::read_dir(&staged_root)
+        .with_context(|| format!("reading staged updates in {}", staged_root.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", staged_root.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let metadata_path = path.join("stage.json");
+        if !metadata_path.is_file() {
+            continue;
+        }
+        let metadata: ReleaseStageMetadata =
+            serde_json::from_value(read_json_file(&metadata_path)?)
+                .with_context(|| format!("parsing {}", metadata_path.display()))?;
+        if newest
+            .as_ref()
+            .map(|(staged_at, _)| metadata.staged_at_unix > *staged_at)
+            .unwrap_or(true)
+        {
+            newest = Some((metadata.staged_at_unix, path));
+        }
+    }
+    newest
+        .map(|(_, path)| path)
+        .with_context(|| format!("no staged updates found in {}", staged_root.display()))
 }
 
 async fn resolve_update_sources(args: &UpdateArgs, target: &str) -> Result<UpdateSourceBytes> {
@@ -4288,6 +4479,102 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn copy_file_preserve_mode(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::copy(src, dst)
+        .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+    #[cfg(unix)]
+    {
+        let permissions = fs::metadata(src)
+            .with_context(|| format!("reading permissions for {}", src.display()))?
+            .permissions();
+        fs::set_permissions(dst, permissions)
+            .with_context(|| format!("setting permissions on {}", dst.display()))?;
+    }
+    Ok(())
+}
+
+fn snapshot_update_state(
+    home: &Path,
+    requested_paths: &[PathBuf],
+    backup_dir: &Path,
+) -> Result<Vec<StateSnapshotEntry>> {
+    let paths = if requested_paths.is_empty() {
+        vec![home.join("config.toml"), home.join("rules")]
+    } else {
+        requested_paths
+            .iter()
+            .map(|path| absolutize(path.clone()))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut snapshots = Vec::new();
+    for original in paths {
+        let name = original
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(safe_path_component)
+            .unwrap_or_else(|| "state".to_owned());
+        let backup = backup_dir.join("state").join(name);
+        if original.exists() {
+            copy_path(&original, &backup)?;
+            snapshots.push(StateSnapshotEntry {
+                original,
+                backup,
+                existed: true,
+            });
+        } else {
+            snapshots.push(StateSnapshotEntry {
+                original,
+                backup,
+                existed: false,
+            });
+        }
+    }
+    Ok(snapshots)
+}
+
+fn rollback_update(
+    current_bin: &Path,
+    backup_bin: &Path,
+    state_snapshots: &[StateSnapshotEntry],
+) -> Result<()> {
+    copy_file_preserve_mode(backup_bin, current_bin)?;
+    for entry in state_snapshots {
+        if entry.existed {
+            remove_path_if_exists(&entry.original)?;
+            copy_path(&entry.backup, &entry.original)?;
+        } else {
+            remove_path_if_exists(&entry.original)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_path(src: &Path, dst: &Path) -> Result<()> {
+    if src.is_dir() {
+        if dst.exists() {
+            fs::remove_dir_all(dst)
+                .with_context(|| format!("removing existing {}", dst.display()))?;
+        }
+        copy_dir_all(src, dst)
+    } else {
+        copy_file_preserve_mode(src, dst)
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
+    } else {
+        fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
+    }
 }
 
 fn validate_release_key_id(key_id: &str) -> Result<()> {
@@ -21649,6 +21936,13 @@ mod tests {
             release_public_key: None,
             key_id: Some("test-release-key".to_owned()),
             dry_run: false,
+            apply_staged: false,
+            stage_dir: None,
+            current_bin: None,
+            apply_delay_seconds: 3_600,
+            bypass_apply_delay: false,
+            post_upgrade_args: Vec::new(),
+            state_paths: Vec::new(),
             json: true,
         })
         .await
@@ -21696,12 +21990,74 @@ mod tests {
             release_public_key: None,
             key_id: Some("test-release-key".to_owned()),
             dry_run: false,
+            apply_staged: false,
+            stage_dir: None,
+            current_bin: None,
+            apply_delay_seconds: 3_600,
+            bypass_apply_delay: false,
+            post_upgrade_args: Vec::new(),
+            state_paths: Vec::new(),
             json: true,
         })
         .await
         .expect_err("tampered archive must fail verification");
 
         assert!(format!("{err:#}").contains("sha256 mismatch"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn update_apply_rejects_staged_update_before_delay() {
+        let temp = test_temp_dir("mayhem-update-delay");
+        let home = temp.join("home");
+        let current_bin = temp.join("current-mayhem");
+        write_executable_file(&current_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        let stage_dir =
+            write_test_stage(&home, "#!/bin/sh\nexit 0\n", unix_epoch_seconds().unwrap()).unwrap();
+
+        let err = update_apply_report(update_apply_test_args(
+            &home,
+            &stage_dir,
+            &current_bin,
+            3_600,
+            false,
+        ))
+        .expect_err("apply must wait for the configured delay");
+
+        assert!(format!("{err:#}").contains("delay has not elapsed"));
+        assert!(std::process::Command::new(&current_bin)
+            .status()
+            .unwrap()
+            .success());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn update_apply_rolls_back_broken_staged_binary() {
+        let temp = test_temp_dir("mayhem-update-rollback");
+        let home = temp.join("home");
+        let current_bin = temp.join("current-mayhem");
+        write_executable_file(&current_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        let state_path = home.join("config.toml");
+        write_json_file(&state_path, &json!({ "version": "old" })).unwrap();
+        let stage_dir = write_test_stage(&home, "#!/bin/sh\nexit 23\n", 0).unwrap();
+
+        let mut args = update_apply_test_args(&home, &stage_dir, &current_bin, 0, false);
+        args.state_paths = vec![state_path.clone()];
+        args.post_upgrade_args = vec!["--health".to_owned()];
+        let err = update_apply_report(args).expect_err("broken staged update must roll back");
+
+        assert!(format!("{err:#}").contains("rolled back"));
+        assert!(std::process::Command::new(&current_bin)
+            .arg("--health")
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            read_json_file(&state_path).unwrap(),
+            json!({ "version": "old" })
+        );
+        assert!(home.join("updates").join("backups").exists());
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -22339,6 +22695,75 @@ mod tests {
             .context("finishing test release gzip")?;
         encoder.finish().context("finishing test release gzip")?;
         Ok(())
+    }
+
+    fn write_test_stage(home: &Path, script: &str, staged_at_unix: u64) -> Result<PathBuf> {
+        let stage_dir = home.join("updates").join("staged").join(format!(
+            "test-stage-{}",
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bin_dir = stage_dir.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        write_executable_file(&bin_dir.join(release_mayhem_binary_name()), script)?;
+        write_json_file(
+            &stage_dir.join("stage.json"),
+            &ReleaseStageMetadata {
+                schema: 1,
+                version: "test-d2".to_owned(),
+                target: release_host_target(),
+                manifest_sha256: "aa".repeat(32),
+                key_id: "test-release-key".to_owned(),
+                public_key: "bb".repeat(32),
+                staged_at_unix,
+            },
+        )?;
+        Ok(stage_dir)
+    }
+
+    fn write_executable_file(path: &Path, content: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    }
+
+    fn update_apply_test_args(
+        home: &Path,
+        stage_dir: &Path,
+        current_bin: &Path,
+        delay_seconds: u64,
+        bypass_delay: bool,
+    ) -> UpdateArgs {
+        UpdateArgs {
+            home: Some(home.to_path_buf()),
+            target: None,
+            version: None,
+            release_feed_url: None,
+            archive_url: None,
+            manifest_url: None,
+            signature_url: None,
+            archive_path: None,
+            manifest_path: None,
+            signature_path: None,
+            release_keys_dir: None,
+            release_public_key: None,
+            key_id: None,
+            dry_run: false,
+            apply_staged: true,
+            stage_dir: Some(stage_dir.to_path_buf()),
+            current_bin: Some(current_bin.to_path_buf()),
+            apply_delay_seconds: delay_seconds,
+            bypass_apply_delay: bypass_delay,
+            post_upgrade_args: Vec::new(),
+            state_paths: Vec::new(),
+            json: true,
+        }
     }
 
     fn write_temp_calibration_report(report: &CatalogCanaryCalibrationReport) -> PathBuf {
