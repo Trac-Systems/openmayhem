@@ -271,6 +271,104 @@ test('MayhemContract deposit root accumulation is deterministic and root-only', 
   assert.equal(rootJson.includes('2'.repeat(64)), false);
 });
 
+test('MayhemContract tapDeposit credits a finalized event exactly once under replay', async () => {
+  const ctx = await setupDepositContract();
+  const buyer = '0x1111111111111111111111111111111111111111';
+  const pool = '0x2222222222222222222222222222222222222222';
+  const ethTxHash = `0x${'a'.repeat(64)}`;
+  const value = {
+    op: 'tap_deposit',
+    who: buyer,
+    tap_wei: oneTnkE18,
+    tap_usd_e6: 2_000_000,
+    eth_tx_hash: ethTxHash,
+    log_index: 0,
+    block_number: 123,
+    pool_address: pool,
+    chain_id: 61_000,
+    epoch: 1,
+    at: 1_800,
+  };
+
+  const nonAdmin = await execute(
+    ctx.contract,
+    ctx.storage,
+    'tapDeposit',
+    value,
+    ctx.outsider.publicKey,
+    2
+  );
+  assert.match(nonAdmin.message, /admin required/i);
+
+  const confirmed = await execute(
+    ctx.contract,
+    ctx.storage,
+    'tapDeposit',
+    value,
+    ctx.admin.publicKey,
+    3
+  );
+  assert.equal(confirmed.ok, true, confirmed.message);
+  assert.equal(confirmed.op, 'tapDeposit');
+  assert.equal(confirmed.duplicate, false);
+  assert.equal(confirmed.who, buyer);
+  assert.equal(confirmed.mu, 2_000_000);
+  assert.equal(confirmed.eth_tx_hash, ethTxHash);
+  assert.equal(confirmed.log_index, 0);
+  assert.equal(confirmed.deposit_root.length, 64);
+
+  const seenKey = `dep/tap/${ethTxHash}/0`;
+  assert.deepEqual((await ctx.storage.get(seenKey)).value, {
+    rail: 'tap',
+    who: buyer,
+    tap_wei: oneTnkE18,
+    tap_usd_e6: 2_000_000,
+    mu: 2_000_000,
+    eth_tx_hash: ethTxHash,
+    log_index: 0,
+    block_number: 123,
+    pool_address: pool,
+    chain_id: 61_000,
+    epoch: 1,
+    at: 1_800,
+    credited_at: makeTxKey(3),
+    credited_by: ctx.admin.publicKey,
+    credited_by_role: 'admin',
+  });
+  assert.deepEqual((await ctx.storage.get(`bal/${buyer}`)).value, {
+    user: buyer,
+    denom: 'mu_usd',
+    mu: 2_000_000,
+    updated_epoch: 1,
+    updated_at: makeTxKey(3),
+    last_deposit_rail: 'tap',
+    last_deposit_tap_usd_e6: 2_000_000,
+  });
+  const root = (await ctx.storage.get('ev/dep/1')).value;
+  assert.equal(root.type, 'deposit_root');
+  assert.equal(root.count, 1);
+  assert.equal(root.mu_total, 2_000_000);
+  assert.equal(root.merkle_root, confirmed.deposit_root);
+  assert.equal(JSON.stringify(root).includes(buyer), false);
+  assert.equal(JSON.stringify(root).includes(ethTxHash), false);
+
+  const replay = await execute(
+    ctx.contract,
+    ctx.storage,
+    'tapDeposit',
+    value,
+    ctx.admin.publicKey,
+    4
+  );
+  assert.equal(replay.ok, true, replay.message);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.mu, 0);
+  assert.equal(replay.credited_mu, 2_000_000);
+  assert.equal(replay.deposit_root, confirmed.deposit_root);
+  assert.deepEqual((await ctx.storage.get(`bal/${buyer}`)).value.mu, 2_000_000);
+  assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
+});
+
 test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', async () => {
   const ctx = await setupDepositContract();
   await consentUser(ctx, 2);

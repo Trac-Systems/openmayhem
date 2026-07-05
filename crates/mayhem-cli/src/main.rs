@@ -195,6 +195,8 @@ enum AdminCommands {
     RateOracle(AdminRateOracleArgs),
     /// Confirm a memo-bound TNK deposit into the canonical credit ledger.
     TnkDeposit(AdminTnkDepositArgs),
+    /// Confirm a finalized TAP escrow Deposit event into the canonical credit ledger.
+    TapDeposit(AdminTapDepositArgs),
     /// Confirm a fiat checkout deposit into the canonical credit ledger.
     FiatDeposit(AdminFiatDepositArgs),
     /// Record a fiat chargeback clawback and account freeze.
@@ -2071,6 +2073,45 @@ struct AdminTnkDepositArgs {
 
     #[arg(long)]
     msb_tx_hash: String,
+
+    #[arg(long)]
+    epoch: u64,
+
+    #[arg(long)]
+    at: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminTapDepositArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// User/account key to credit. For TAP deposits this is the lowercased Ethereum buyer address.
+    #[arg(long)]
+    who: String,
+
+    /// Deposited TAP amount as 18-decimal integer wei string.
+    #[arg(long)]
+    tap_wei: String,
+
+    /// Admin policy TAP/USD rate in integer micro-USD per TAP.
+    #[arg(long)]
+    tap_usd_e6: u64,
+
+    #[arg(long)]
+    eth_tx_hash: String,
+
+    #[arg(long)]
+    log_index: u64,
+
+    #[arg(long)]
+    block_number: u64,
+
+    #[arg(long)]
+    pool_address: String,
+
+    #[arg(long)]
+    chain_id: u64,
 
     #[arg(long)]
     epoch: u64,
@@ -8407,6 +8448,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::AuditorRegister(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
         AdminCommands::TnkDeposit(args) => &args.tx,
+        AdminCommands::TapDeposit(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
         AdminCommands::FiatChargeback(args) => &args.tx,
         AdminCommands::PayoutConfirm(args) => &args.tx,
@@ -8452,6 +8494,7 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         }
         AdminCommands::RateOracle(args) => Ok(("rateOracle", admin_rate_oracle_payload(args))),
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
+        AdminCommands::TapDeposit(args) => Ok(("tapDeposit", admin_tap_deposit_payload(args))),
         AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args)?)),
         AdminCommands::FiatChargeback(args) => {
             Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)?))
@@ -8851,6 +8894,22 @@ fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
         "memo_hash": &args.memo_hash,
         "tnk_e18": &args.tnk_e18,
         "msb_tx_hash": &args.msb_tx_hash,
+        "epoch": args.epoch,
+        "at": args.at,
+    })
+}
+
+fn admin_tap_deposit_payload(args: &AdminTapDepositArgs) -> Value {
+    json!({
+        "op": "tap_deposit",
+        "who": &args.who,
+        "tap_wei": &args.tap_wei,
+        "tap_usd_e6": args.tap_usd_e6,
+        "eth_tx_hash": &args.eth_tx_hash,
+        "log_index": args.log_index,
+        "block_number": args.block_number,
+        "pool_address": &args.pool_address,
+        "chain_id": args.chain_id,
         "epoch": args.epoch,
         "at": args.at,
     })
@@ -18404,6 +18463,35 @@ mod tests {
                 "msb_tx_hash": "msb",
                 "epoch": 1,
                 "at": 3_600,
+            })
+        );
+
+        assert_eq!(
+            admin_tap_deposit_payload(&AdminTapDepositArgs {
+                tx: test_admin_tx_args(),
+                who: "0x0000000000000000000000000000000000000001".to_owned(),
+                tap_wei: "1000000000000000000".to_owned(),
+                tap_usd_e6: 2_000_000,
+                eth_tx_hash: "0xabc".to_owned(),
+                log_index: 0,
+                block_number: 123,
+                pool_address: "0x0000000000000000000000000000000000000abc".to_owned(),
+                chain_id: 61_000,
+                epoch: 7,
+                at: 25_200,
+            }),
+            json!({
+                "op": "tap_deposit",
+                "who": "0x0000000000000000000000000000000000000001",
+                "tap_wei": "1000000000000000000",
+                "tap_usd_e6": 2_000_000,
+                "eth_tx_hash": "0xabc",
+                "log_index": 0,
+                "block_number": 123,
+                "pool_address": "0x0000000000000000000000000000000000000abc",
+                "chain_id": 61_000,
+                "epoch": 7,
+                "at": 25_200,
             })
         );
 

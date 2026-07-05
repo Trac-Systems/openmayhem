@@ -33,6 +33,7 @@ const FRAUD_PROOF_MAX_BYTES = 4_096;
 export const SESSION_RECEIPT_SCHEMA_VERSION = 1;
 export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 2;
 const TNK_E18 = 1_000_000_000_000_000_000n;
+const TAP_WEI = 1_000_000_000_000_000_000n;
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
@@ -642,6 +643,24 @@ class MayhemContract extends Contract {
         memo_hash: { type: 'string', min: 1, max: 128 },
         tnk_e18: { type: 'string', min: 1, max: 80 },
         msb_tx_hash: { type: 'string', min: 1, max: 128 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
+    this.addSchema('tapDeposit', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        who: { type: 'string', min: 1, max: 128 },
+        tap_wei: { type: 'string', min: 1, max: 80 },
+        tap_usd_e6: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        eth_tx_hash: { type: 'string', min: 1, max: 128 },
+        log_index: { type: 'number', integer: true, min: 0, max: Number.MAX_SAFE_INTEGER },
+        block_number: { type: 'number', integer: true, min: 0, max: Number.MAX_SAFE_INTEGER },
+        pool_address: { type: 'string', min: 1, max: 128 },
+        chain_id: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
         epoch: { type: 'number', integer: true, min: 1 },
         at: { type: 'number', integer: true, min: 0 },
       },
@@ -2626,6 +2645,113 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
       rate_ts: rate.ts,
+    };
+  }
+
+  async tapDeposit() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid TAP deposit recipient.');
+    if (!this.isSafeKeyPart(this.value.eth_tx_hash)) return new Error('Invalid Ethereum tx hash.');
+    if (!this.isSafeKeyPart(this.value.pool_address)) return new Error('Invalid TAP pool address.');
+
+    const tapWei = this.parseTapWei(this.value.tap_wei);
+    if (tapWei instanceof Error) return tapWei;
+    const mu = this.tapWeiToMu(tapWei, this.value.tap_usd_e6);
+    if (mu instanceof Error) return mu;
+    if (mu <= 0) return new Error('TAP deposit converts to zero mu.');
+
+    const who = this.value.who.toLowerCase();
+    const ethTxHash = this.value.eth_tx_hash.toLowerCase();
+    const poolAddress = this.value.pool_address.toLowerCase();
+    const seenKey = `dep/tap/${ethTxHash}/${this.value.log_index}`;
+    const existing = await this.get(seenKey);
+    if (existing !== null) {
+      return {
+        ok: true,
+        op: 'tapDeposit',
+        duplicate: true,
+        who: existing.who,
+        mu: 0,
+        credited_mu: existing.mu ?? null,
+        epoch: existing.epoch ?? this.value.epoch,
+        deposit_root: (await this.get(`ev/dep/${existing.epoch ?? this.value.epoch}`))?.merkle_root ?? null,
+      };
+    }
+
+    const balance = await this.balanceRecord(who);
+    const balanceError = this.guardianValidateBalanceRecord(balance, who);
+    if (balanceError) return balanceError;
+    const nextMu = this.safeAddMu(balance.mu, mu);
+    if (nextMu instanceof Error) return nextMu;
+    const leaf = await this.depositLeafHash({
+      rail: 'tap',
+      user_hash: await this.opaqueHash('deposit-user', who),
+      mu,
+      tap_wei: this.value.tap_wei,
+      tap_usd_e6: this.value.tap_usd_e6,
+      eth_tx_hash: ethTxHash,
+      log_index: this.value.log_index,
+      block_number: this.value.block_number,
+      chain_id: this.value.chain_id,
+      pool_address_hash: await this.opaqueHash('deposit-pool', poolAddress),
+    });
+    const depositRoot = await this.nextDepositRoot({
+      epoch: this.value.epoch,
+      leaf,
+      mu,
+      at: this.value.at,
+    });
+    if (depositRoot instanceof Error) return depositRoot;
+
+    const seen = {
+      rail: 'tap',
+      who,
+      tap_wei: this.value.tap_wei,
+      tap_usd_e6: this.value.tap_usd_e6,
+      mu,
+      eth_tx_hash: ethTxHash,
+      log_index: this.value.log_index,
+      block_number: this.value.block_number,
+      pool_address: poolAddress,
+      chain_id: this.value.chain_id,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      credited_at: this.tx,
+      credited_by: this.address,
+      credited_by_role: 'admin',
+    };
+    const record = {
+      ...balance,
+      user: who,
+      mu: nextMu,
+      updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
+      updated_at: this.tx,
+      last_deposit_rail: 'tap',
+      last_deposit_tap_usd_e6: this.value.tap_usd_e6,
+    };
+    await this.put(seenKey, seen);
+    await this.put(`bal/${who}`, record);
+    await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
+    console.log('mayhem tapDeposit', {
+      who,
+      mu,
+      tap_wei: this.value.tap_wei,
+      tap_usd_e6: this.value.tap_usd_e6,
+      eth_tx_hash: ethTxHash,
+      log_index: this.value.log_index,
+      epoch: this.value.epoch,
+    });
+    return {
+      ok: true,
+      op: 'tapDeposit',
+      duplicate: false,
+      who,
+      mu,
+      epoch: this.value.epoch,
+      deposit_root: depositRoot.merkle_root,
+      eth_tx_hash: ethTxHash,
+      log_index: this.value.log_index,
     };
   }
 
@@ -4755,6 +4881,15 @@ class MayhemContract extends Contract {
     return parsed;
   }
 
+  parseTapWei(value) {
+    if (typeof value !== 'string' || !/^[0-9]+$/.test(value)) {
+      return new Error('tap_wei must be a decimal integer string.');
+    }
+    const parsed = BigInt(value);
+    if (parsed <= 0n) return new Error('tap_wei must be positive.');
+    return parsed;
+  }
+
   normalizeFiatCurrency(value) {
     if (typeof value !== 'string') return new Error('Invalid fiat currency.');
     const currency = value.trim().toLowerCase();
@@ -4785,6 +4920,15 @@ class MayhemContract extends Contract {
       return new Error('Invalid TNK/USD rate.');
     }
     const mu = (tnkE18 * BigInt(tnkUsdE6)) / TNK_E18;
+    if (mu > BigInt(Number.MAX_SAFE_INTEGER)) return new Error('mu value overflow.');
+    return Number(mu);
+  }
+
+  tapWeiToMu(tapWei, tapUsdE6) {
+    if (!Number.isSafeInteger(tapUsdE6) || tapUsdE6 <= 0) {
+      return new Error('Invalid TAP/USD policy rate.');
+    }
+    const mu = (tapWei * BigInt(tapUsdE6)) / TAP_WEI;
     if (mu > BigInt(Number.MAX_SAFE_INTEGER)) return new Error('mu value overflow.');
     return Number(mu);
   }
