@@ -106,11 +106,20 @@ pub struct RailSettings {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StripeSettings {
     pub enabled: bool,
+    pub mode: StripeMode,
     pub secret_key: Option<String>,
     pub webhook_secret: Option<String>,
     pub api_base_url: String,
     pub event_store_path: PathBuf,
     pub webhook_tolerance_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StripeMode {
+    #[default]
+    Test,
+    Live,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,6 +165,7 @@ struct OracleConfigFile {
 #[derive(Debug, Default, Deserialize)]
 struct StripeConfigFile {
     enabled: Option<bool>,
+    mode: Option<String>,
     secret_key: Option<String>,
     webhook_secret: Option<String>,
     api_base_url: Option<String>,
@@ -228,6 +238,7 @@ struct HealthRails {
 #[derive(Debug, Serialize)]
 struct HealthStripeRail {
     enabled: bool,
+    mode: &'static str,
     api_configured: bool,
     webhook_configured: bool,
 }
@@ -491,6 +502,7 @@ impl Default for StripeSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: StripeMode::Test,
             secret_key: None,
             webhook_secret: None,
             api_base_url: DEFAULT_STRIPE_API_BASE_URL.to_owned(),
@@ -508,6 +520,15 @@ impl Default for CoinbaseSettings {
             webhook_secret: None,
             api_base_url: DEFAULT_COINBASE_COMMERCE_API_BASE_URL.to_owned(),
             event_store_path: default_coinbase_event_store_path(),
+        }
+    }
+}
+
+impl StripeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            StripeMode::Test => "test",
+            StripeMode::Live => "live",
         }
     }
 }
@@ -548,18 +569,13 @@ impl PaygateConfig {
             ));
         }
         if self.rails.stripe.enabled {
-            if self
-                .rails
-                .stripe
-                .secret_key
-                .as_deref()
-                .unwrap_or("")
-                .is_empty()
-            {
+            let secret_key = self.rails.stripe.secret_key.as_deref().unwrap_or("");
+            if secret_key.is_empty() {
                 return Err(PaygateError::InvalidConfig(
                     "stripe.secret_key is required when Stripe is enabled".to_owned(),
                 ));
             }
+            validate_stripe_secret_key_mode(secret_key, self.rails.stripe.mode)?;
             if self
                 .rails
                 .stripe
@@ -576,6 +592,26 @@ impl PaygateConfig {
                 return Err(PaygateError::InvalidConfig(
                     "stripe.webhook_tolerance_seconds cannot be zero".to_owned(),
                 ));
+            }
+            if self.rails.stripe.mode == StripeMode::Live {
+                if self.rails.stripe.api_base_url.trim_end_matches('/')
+                    != DEFAULT_STRIPE_API_BASE_URL
+                {
+                    return Err(PaygateError::InvalidConfig(
+                        "Stripe live mode requires the official Stripe API base URL".to_owned(),
+                    ));
+                }
+                if self.contract_simulate {
+                    return Err(PaygateError::InvalidConfig(
+                        "contract.simulate is forbidden in Stripe live mode".to_owned(),
+                    ));
+                }
+                if contract_rpc_is_localhost(&self.contract_rpc_url) {
+                    return Err(PaygateError::InvalidConfig(
+                        "Stripe live mode requires an explicit non-local contract.rpc_url"
+                            .to_owned(),
+                    ));
+                }
             }
         }
         if self.rails.coinbase.enabled {
@@ -610,6 +646,9 @@ impl PaygateConfig {
         }
         if let Some(enabled) = file.stripe.enabled {
             self.rails.stripe.enabled = enabled;
+        }
+        if let Some(mode) = file.stripe.mode {
+            self.rails.stripe.mode = parse_stripe_mode("stripe.mode", &mode)?;
         }
         if let Some(secret_key) = file.stripe.secret_key {
             self.rails.stripe.secret_key = Some(secret_key);
@@ -662,6 +701,9 @@ impl PaygateConfig {
         }
         if let Ok(enabled) = env::var("MAYHEM_PAYGATE_STRIPE_ENABLED") {
             self.rails.stripe.enabled = parse_bool("MAYHEM_PAYGATE_STRIPE_ENABLED", &enabled)?;
+        }
+        if let Ok(mode) = env::var("MAYHEM_STRIPE_MODE") {
+            self.rails.stripe.mode = parse_stripe_mode("MAYHEM_STRIPE_MODE", &mode)?;
         }
         if let Ok(secret_key) = env::var("MAYHEM_STRIPE_SECRET_KEY") {
             self.rails.stripe.secret_key = Some(secret_key);
@@ -827,6 +869,7 @@ impl PaygateState {
             rails: HealthRails {
                 stripe: HealthStripeRail {
                     enabled: self.config.rails.stripe.enabled,
+                    mode: self.config.rails.stripe.mode.as_str(),
                     api_configured: self.config.rails.stripe.secret_key.is_some(),
                     webhook_configured: self.config.rails.stripe.webhook_secret.is_some(),
                 },
@@ -1871,11 +1914,44 @@ fn parse_bool(field: &str, value: &str) -> Result<bool> {
     }
 }
 
+fn parse_stripe_mode(field: &str, value: &str) -> Result<StripeMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "test" | "sandbox" => Ok(StripeMode::Test),
+        "live" | "production" | "prod" => Ok(StripeMode::Live),
+        _ => Err(PaygateError::InvalidConfig(format!(
+            "{field} must be test or live"
+        ))),
+    }
+}
+
 fn parse_u64(field: &str, value: &str) -> Result<u64> {
     value
         .trim()
         .parse()
         .map_err(|err| PaygateError::InvalidConfig(format!("{field} is invalid: {err}")))
+}
+
+fn validate_stripe_secret_key_mode(secret_key: &str, mode: StripeMode) -> Result<()> {
+    match mode {
+        StripeMode::Test if secret_key.starts_with("sk_test_") => Ok(()),
+        StripeMode::Live if secret_key.starts_with("sk_live_") => Ok(()),
+        StripeMode::Test => Err(PaygateError::InvalidConfig(
+            "Stripe test mode requires a sk_test_ secret key".to_owned(),
+        )),
+        StripeMode::Live => Err(PaygateError::InvalidConfig(
+            "Stripe live mode requires a sk_live_ secret key".to_owned(),
+        )),
+    }
+}
+
+fn contract_rpc_is_localhost(value: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(value.trim()) else {
+        return false;
+    };
+    matches!(
+        parsed.host_str(),
+        Some("127.0.0.1") | Some("localhost") | Some("::1")
+    )
 }
 
 fn json_string_field(value: &Value, field: &str) -> Result<String> {
@@ -2128,6 +2204,7 @@ mod tests {
 
             [stripe]
             enabled = true
+            mode = "test"
             secret_key = "sk_test_local"
             webhook_secret = "whsec_local"
             api_base_url = "http://127.0.0.1:19999"
@@ -2151,6 +2228,7 @@ mod tests {
             PathBuf::from("/tmp/mayhem-paygate-test.seed")
         );
         assert!(config.rails.stripe.enabled);
+        assert_eq!(config.rails.stripe.mode, StripeMode::Test);
         assert_eq!(
             config.rails.stripe.secret_key.as_deref(),
             Some("sk_test_local")
@@ -2169,6 +2247,92 @@ mod tests {
             Some("ccwhsec_local")
         );
         Ok(())
+    }
+
+    #[test]
+    fn stripe_mode_rejects_wrong_secret_key_prefix() {
+        let test_err = PaygateConfig::from_toml_str(
+            r#"
+            [contract]
+            simulate = true
+
+            [stripe]
+            enabled = true
+            mode = "test"
+            secret_key = "sk_live_wrong"
+            webhook_secret = "whsec_local"
+            "#,
+        )
+        .expect_err("live key rejected in test mode");
+        assert!(test_err
+            .to_string()
+            .contains("test mode requires a sk_test_"));
+
+        let live_err = PaygateConfig::from_toml_str(
+            r#"
+            [contract]
+            rpc_url = "https://contract.testnet.trac.network/v1"
+
+            [stripe]
+            enabled = true
+            mode = "live"
+            secret_key = "sk_test_wrong"
+            webhook_secret = "whsec_local"
+            "#,
+        )
+        .expect_err("test key rejected in live mode");
+        assert!(live_err
+            .to_string()
+            .contains("live mode requires a sk_live_"));
+    }
+
+    #[test]
+    fn stripe_live_mode_rejects_simulation_and_local_contract_rpc() {
+        let simulated = PaygateConfig::from_toml_str(
+            r#"
+            [contract]
+            rpc_url = "https://contract.testnet.trac.network/v1"
+            simulate = true
+
+            [stripe]
+            enabled = true
+            mode = "live"
+            secret_key = "sk_live_local"
+            webhook_secret = "whsec_local"
+            "#,
+        )
+        .expect_err("live Stripe refuses contract simulation");
+        assert!(simulated.to_string().contains("simulate is forbidden"));
+
+        let local = PaygateConfig::from_toml_str(
+            r#"
+            [stripe]
+            enabled = true
+            mode = "live"
+            secret_key = "sk_live_local"
+            webhook_secret = "whsec_local"
+            "#,
+        )
+        .expect_err("live Stripe refuses default localhost RPC");
+        assert!(local.to_string().contains("non-local contract.rpc_url"));
+
+        let api_base = PaygateConfig::from_toml_str(
+            r#"
+            [contract]
+            rpc_url = "https://contract.testnet.trac.network/v1"
+
+            [stripe]
+            enabled = true
+            mode = "live"
+            secret_key = "sk_live_local"
+            webhook_secret = "whsec_local"
+            api_base_url = "http://127.0.0.1:19999"
+            "#,
+        )
+        .expect_err("live Stripe refuses alternate API base");
+        assert!(api_base
+            .to_string()
+            .contains("official Stripe API base URL"));
     }
 
     #[test]

@@ -275,6 +275,7 @@ key_path = "${tomlString(oracleKey)}"
 
 [stripe]
 enabled = true
+mode = "test"
 secret_key = "${tomlString(secretKey)}"
 webhook_secret = "${tomlString(webhookSecret)}"
 event_store_path = "${tomlString(eventStore)}"
@@ -474,7 +475,7 @@ async function main() {
     const replay = await postRawJson(`${paygateBase}/v1/stripe/webhook`, payload, {
       'stripe-signature': signature,
     });
-    const balance = await getJson(`${contractBase}/state?key=${encodeURIComponent(`bal/${args.who}`)}`);
+    const balance = await getJson(`${contractBase}/state?key=${encodeURIComponent(`bal/${args.who}/fiat`)}`);
     const depositRoot = await getJson(`${contractBase}/state?key=${encodeURIComponent(`ev/dep/${epoch}`)}`);
     const eventLog = existsSync(eventStore) ? await readFile(eventStore, 'utf8') : '';
     const eventLogLines = eventLog.trim() ? eventLog.trim().split(/\r?\n/).length : 0;
@@ -510,7 +511,7 @@ async function main() {
       const disputeReplay = await postRawJson(`${paygateBase}/v1/stripe/webhook`, disputePayload, {
         'stripe-signature': disputeSignature,
       });
-      const balanceAfter = await getJson(`${contractBase}/state?key=${encodeURIComponent(`bal/${args.who}`)}`);
+      const balanceAfter = await getJson(`${contractBase}/state?key=${encodeURIComponent(`bal/${args.who}/fiat`)}`);
       const frozen = await getJson(`${contractBase}/state?key=${encodeURIComponent(`frozen/${args.who}`)}`);
       const reversalRoot = await getJson(`${contractBase}/state?key=${encodeURIComponent(`ev/dep/${epoch}`)}`);
       const updatedEventLog = existsSync(eventStore) ? await readFile(eventStore, 'utf8') : '';
@@ -546,14 +547,14 @@ async function main() {
       || (
         dispute?.first_clawed_back === true
         && dispute?.replay_duplicate === true
-	        && dispute?.balance_after_chargeback_mu === 0
-	        && dispute?.frozen_status === 'frozen'
-	        && dispute?.disputed_mu_cum === args.mu
-	        && dispute?.event_log_lines === 2
-	        && dispute?.reversed_mu_total === args.mu
-	        && dispute?.clawback_mu_total === args.mu
-	        && contract.submitted.length === 2
-	      );
+        && dispute?.balance_after_chargeback_mu === 0
+        && dispute?.frozen_status === 'frozen'
+        && dispute?.disputed_mu_cum === args.mu
+        && dispute?.event_log_lines === 2
+        && dispute?.reversed_mu_total === args.mu
+        && dispute?.clawback_mu_total === args.mu
+        && contract.submitted.length === 2
+      );
     const ok = creditOk && disputeOk;
     const report = {
       ok,

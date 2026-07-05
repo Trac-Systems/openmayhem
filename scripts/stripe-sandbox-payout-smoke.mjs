@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 const DEFAULT_STRIPE_ENV_FILE = '/Applications/MAMP/htdocs/gpd/stripe.txt';
 const DEFAULT_MU = 1_000_000;
 const DEFAULT_STRIPE_AMOUNT_MINOR = 100;
+const DEFAULT_FEE_BPS = 1500;
 const DEFAULT_BUSINESS_URL = 'https://trac.network';
 const CONNECT_READY_TIMEOUT_MS = 180_000;
 const CHARGE_TRANSFER_TIMEOUT_MS = 120_000;
@@ -30,6 +31,8 @@ Options:
   --currency <usd|eur>       Stripe payout evidence currency (default: usd)
   --amount-cents <cents>     Test charge/transfer amount in minor units
                              (default: ${DEFAULT_STRIPE_AMOUNT_MINOR})
+  --fee-bps <bps>            Operator fee retained via application_fee_amount
+                             (default: ${DEFAULT_FEE_BPS})
   --business-url <url>       Valid business URL for the test connected account
                              (default: ${DEFAULT_BUSINESS_URL})
   --keep-temp                Keep .mayhem-local smoke directory for inspection
@@ -43,6 +46,7 @@ function parseArgs(argv) {
     mu: DEFAULT_MU,
     currency: 'usd',
     amountCents: DEFAULT_STRIPE_AMOUNT_MINOR,
+    feeBps: DEFAULT_FEE_BPS,
     businessUrl: DEFAULT_BUSINESS_URL,
     keepTemp: false,
     json: false,
@@ -58,6 +62,7 @@ function parseArgs(argv) {
     else if (arg === '--mu') args.mu = Number.parseInt(next(), 10);
     else if (arg === '--currency') args.currency = next().trim().toLowerCase();
     else if (arg === '--amount-cents') args.amountCents = Number.parseInt(next(), 10);
+    else if (arg === '--fee-bps') args.feeBps = Number.parseInt(next(), 10);
     else if (arg === '--business-url') args.businessUrl = next();
     else if (arg === '--keep-temp') args.keepTemp = true;
     else if (arg === '--json') args.json = true;
@@ -72,6 +77,9 @@ function parseArgs(argv) {
   if (!['usd', 'eur'].includes(args.currency)) throw new Error('--currency must be usd or eur');
   if (!Number.isSafeInteger(args.amountCents) || args.amountCents <= 0) {
     throw new Error('--amount-cents must be a positive integer');
+  }
+  if (!Number.isSafeInteger(args.feeBps) || args.feeBps < 0 || args.feeBps > 5000) {
+    throw new Error('--fee-bps must be an integer from 0 to 5000');
   }
   const businessUrl = new URL(args.businessUrl);
   if (!['http:', 'https:'].includes(businessUrl.protocol)) {
@@ -249,8 +257,13 @@ async function waitConnectedAccountReady(secretKey, accountId) {
   return full;
 }
 
-async function createDestinationCharge(secretKey, accountId, tag, currency, amountCents, mu) {
-  const intent = await stripePost(secretKey, 'payment_intents', {
+async function createDestinationCharge(secretKey, accountId, tag, currency, amountCents, feeBps, mu) {
+  const feeCents = Math.floor((amountCents * feeBps) / 10_000);
+  const providerNetCents = amountCents - feeCents;
+  if (providerNetCents <= 0) {
+    throw new Error('operator fee leaves no provider payout amount');
+  }
+  const params = {
     amount: String(amountCents),
     currency,
     payment_method: 'pm_card_visa',
@@ -263,7 +276,14 @@ async function createDestinationCharge(secretKey, accountId, tag, currency, amou
     'metadata[mayhem_mu]': String(mu),
     'metadata[mayhem_fiat_currency]': currency,
     'metadata[mayhem_fiat_amount_minor]': String(amountCents),
-  });
+    'metadata[mayhem_fee_bps]': String(feeBps),
+    'metadata[mayhem_operator_fee_minor]': String(feeCents),
+    'metadata[mayhem_provider_net_minor]': String(providerNetCents),
+  };
+  if (feeCents > 0) {
+    params.application_fee_amount = String(feeCents);
+  }
+  const intent = await stripePost(secretKey, 'payment_intents', params);
   const chargeId = typeof intent.latest_charge === 'string' ? intent.latest_charge : intent.latest_charge?.id;
   if (!chargeId) throw new Error(`Stripe PaymentIntent ${intent.id} did not expose latest_charge`);
   const charge = await waitChargeTransferReady(secretKey, chargeId);
@@ -279,13 +299,27 @@ async function createDestinationCharge(secretKey, accountId, tag, currency, amou
   if (charge.on_behalf_of !== accountId || charge.destination !== accountId) {
     throw new Error('Stripe charge was not settled on behalf of the connected account');
   }
+  const chargeApplicationFeeAmount = charge.application_fee_amount ?? intent.application_fee_amount ?? 0;
+  if (chargeApplicationFeeAmount !== feeCents) {
+    throw new Error(`Stripe application fee was ${chargeApplicationFeeAmount}, expected ${feeCents}`);
+  }
   if (charge.balance_transaction?.currency !== currency) {
     throw new Error(`Stripe balance transaction was not ${currency.toUpperCase()}: ${charge.balance_transaction?.currency}`);
   }
   if (transfer.currency !== currency || transfer.amount !== amountCents || transfer.destination !== accountId) {
     throw new Error(`Stripe transfer did not match expected ${currency.toUpperCase()} destination: ${transfer.id}`);
   }
-  return { intent, charge, transfer };
+  const applicationFeeId = typeof charge.application_fee === 'string' ? charge.application_fee : charge.application_fee?.id;
+  const applicationFee = applicationFeeId
+    ? (typeof charge.application_fee === 'object' ? charge.application_fee : await stripeGet(secretKey, `application_fees/${applicationFeeId}`))
+    : null;
+  if (feeCents > 0) {
+    if (!applicationFee) throw new Error('Stripe charge did not expose an application fee object');
+    if (applicationFee.amount !== feeCents || applicationFee.currency !== currency) {
+      throw new Error(`Stripe application fee did not match ${currency.toUpperCase()} ${feeCents}`);
+    }
+  }
+  return { intent, charge, transfer, applicationFee, feeCents, providerNetCents };
 }
 
 async function waitChargeTransferReady(secretKey, chargeId) {
@@ -294,7 +328,7 @@ async function waitChargeTransferReady(secretKey, chargeId) {
   while (Date.now() < deadline) {
     charge = await stripeGet(
       secretKey,
-      `charges/${chargeId}?expand[]=balance_transaction&expand[]=transfer`
+      `charges/${chargeId}?expand[]=balance_transaction&expand[]=transfer&expand[]=application_fee`
     );
     const transferId = typeof charge.transfer === 'string' ? charge.transfer : charge.transfer?.id;
     if (transferId) return charge;
@@ -302,7 +336,7 @@ async function waitChargeTransferReady(secretKey, chargeId) {
   }
   return charge ?? await stripeGet(
     secretKey,
-    `charges/${chargeId}?expand[]=balance_transaction&expand[]=transfer`
+    `charges/${chargeId}?expand[]=balance_transaction&expand[]=transfer&expand[]=application_fee`
   );
 }
 
@@ -321,6 +355,7 @@ async function main() {
       tag,
       args.currency,
       args.amountCents,
+      args.feeBps,
       args.mu
     );
     const report = {
@@ -344,13 +379,19 @@ async function main() {
         transfer_currency: stripe.transfer.currency,
         transfer_amount_cents: stripe.transfer.amount,
         transfer_destination: stripe.transfer.destination,
+        application_fee_id: stripe.applicationFee?.id ?? null,
+        application_fee_currency: stripe.applicationFee?.currency ?? null,
+        application_fee_amount_cents: stripe.applicationFee?.amount ?? stripe.feeCents,
       },
       ledger: {
         payout_confirm_retired: true,
         evidence_model: 'epoch_settlement_report',
         mu_usd: args.mu,
         fiat_currency: args.currency,
-        fiat_amount_minor: args.amountCents,
+        gross_amount_minor: args.amountCents,
+        fee_bps: args.feeBps,
+        operator_fee_minor: stripe.feeCents,
+        provider_net_minor: stripe.providerNetCents,
       },
       temp_dir: args.keepTemp ? tempDir : undefined,
     };

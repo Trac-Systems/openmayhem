@@ -708,6 +708,22 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('fiatDeposit', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        rail: { type: 'string', min: 1, max: 64 },
+        who: { type: 'string', min: 1, max: 128 },
+        mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        ext_ref_hash: { type: 'string', min: 1, max: 128 },
+        fiat_currency: { type: 'string', min: 3, max: 3 },
+        fiat_amount_minor: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
     this.addSchema('fiatChargeback', {
       value: {
         $$strict: true,

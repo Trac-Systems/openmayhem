@@ -468,6 +468,43 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   assert.equal(root.merkle_root.includes('a'.repeat(64)), false);
 });
 
+test('MayhemContract fiatDeposit accepts paygate admin-oracle tx path', async () => {
+  const ctx = await setupDepositContract();
+  await consentUser(ctx, 2);
+
+  const fiatValue = {
+    op: 'fiat_deposit',
+    rail: 'stripe',
+    who: ctx.user.publicKey,
+    mu: 1_000_000,
+    ext_ref_hash: 'd'.repeat(64),
+    fiat_currency: 'eur',
+    fiat_amount_minor: 100,
+    epoch: 1,
+    at: 2_400,
+  };
+  const nonAdmin = await execute(ctx.contract, ctx.storage, 'fiatDeposit', fiatValue, ctx.outsider.publicKey, 5);
+  assert.match(nonAdmin.message, /admin required/i);
+
+  const confirmed = await execute(ctx.contract, ctx.storage, 'fiatDeposit', fiatValue, ctx.admin.publicKey, 6);
+  assert.equal(confirmed.ok, true, confirmed.message);
+  assert.equal(confirmed.op, 'fiatDeposit');
+  assert.equal(confirmed.rail, 'fiat');
+  assert.equal(confirmed.processor_rail, 'stripe');
+  assert.equal(confirmed.mu, 1_000_000);
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value, {
+    user: ctx.user.publicKey,
+    rail: 'fiat',
+    denom: 'mu_usd',
+    mu: 1_000_000,
+    updated_epoch: 1,
+    updated_at: makeTxKey(6),
+    last_deposit_rail: 'fiat',
+    last_deposit_processor_rail: 'stripe',
+    last_deposit_fiat_currency: 'eur',
+  });
+});
+
 test('MayhemContract fiatChargeback claws back remaining credits and freezes buyer', async () => {
   const ctx = await setupDepositContract();
   await consentUser(ctx, 2);
