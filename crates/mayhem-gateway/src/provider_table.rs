@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use mayhem_proto::ReceiptUsage;
 use serde::{Deserialize, Serialize};
 
-use crate::{HeartbeatCaps, ProviderHeartbeat, ProviderProbation};
+use crate::{text_usage_mu, HeartbeatCaps, ProviderHeartbeat, ProviderProbation, RateMapEntry};
 
 pub const DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS: u64 = 10_000;
 pub const DEFAULT_OBSERVATION_EWMA_ALPHA: f64 = 0.2;
@@ -30,10 +31,8 @@ pub struct ContractProviderSnapshot {
     pub consent_ver: u64,
     pub reputation: f64,
     pub price_ver: u64,
-    pub in_per_1k_mu: u64,
-    pub out_per_1k_mu: u64,
-    pub ref_in_per_1k_mu: u64,
-    pub ref_out_per_1k_mu: u64,
+    pub rate_map: Vec<RateMapEntry>,
+    pub ref_rate_map: Vec<RateMapEntry>,
     pub probation: Option<ProviderProbation>,
     pub caps: HeartbeatCaps,
     pub attestation_head: Option<String>,
@@ -558,20 +557,22 @@ pub fn estimate_request_price_mu(
     contract: &ContractProviderSnapshot,
     request: &RequestRequirements,
 ) -> u64 {
-    let raw = u128::from(request.input_tokens) * u128::from(contract.in_per_1k_mu)
-        + u128::from(request.output_tokens) * u128::from(contract.out_per_1k_mu);
-    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
-    rounded.min(u128::from(u64::MAX)) as u64
+    let usage = ReceiptUsage {
+        in_tokens: request.input_tokens,
+        out_tokens: request.output_tokens,
+    };
+    text_usage_mu(&contract.rate_map, &usage)
 }
 
 pub fn estimate_reference_request_price_mu(
     contract: &ContractProviderSnapshot,
     request: &RequestRequirements,
 ) -> u64 {
-    let raw = u128::from(request.input_tokens) * u128::from(contract.ref_in_per_1k_mu)
-        + u128::from(request.output_tokens) * u128::from(contract.ref_out_per_1k_mu);
-    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
-    rounded.min(u128::from(u64::MAX)) as u64
+    let usage = ReceiptUsage {
+        in_tokens: request.input_tokens,
+        out_tokens: request.output_tokens,
+    };
+    text_usage_mu(&contract.ref_rate_map, &usage)
 }
 
 fn probation_price_over_cap(
@@ -700,6 +701,7 @@ fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_generation_rate_map;
     use crate::{
         HeartbeatAttestation, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProbationCaps,
     };
@@ -736,10 +738,8 @@ mod tests {
             consent_ver: 3,
             reputation: 0.8,
             price_ver: 5,
-            in_per_1k_mu: 20,
-            out_per_1k_mu: 60,
-            ref_in_per_1k_mu: 20,
-            ref_out_per_1k_mu: 60,
+            rate_map: text_generation_rate_map(20, 60),
+            ref_rate_map: text_generation_rate_map(20, 60),
             probation: None,
             caps: caps(),
             attestation_head: None,
@@ -757,10 +757,8 @@ mod tests {
             consent_ver: 3,
             reputation: 0.72,
             price_ver: 5,
-            in_per_1k_mu: 20,
-            out_per_1k_mu: 60,
-            ref_in_per_1k_mu: 20,
-            ref_out_per_1k_mu: 60,
+            rate_map: text_generation_rate_map(20, 60),
+            ref_rate_map: text_generation_rate_map(20, 60),
             probation: None,
             caps: caps(),
             attestation_head: None,
@@ -1156,7 +1154,7 @@ mod tests {
         );
 
         let mut overpriced = entry.clone();
-        overpriced.contract.in_per_1k_mu = 21;
+        overpriced.contract.rate_map = text_generation_rate_map(21, 60);
         assert_eq!(
             evaluate_eligibility(&overpriced, &request),
             Err(IneligibilityReason::ProbationPriceCap)

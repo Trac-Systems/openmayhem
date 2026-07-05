@@ -105,6 +105,15 @@ const MODEL_CLASSES = new Set([
   'tts',
   'stt',
 ]);
+const RATE_MAP_MAX_ENTRIES = 16;
+const MODEL_CLASS_RATE_UNITS = Object.freeze({
+  [DEFAULT_MODEL_CLASS]: new Set(['input_token', 'output_token']),
+  embedding: new Set(['input_token', 'embedding']),
+  'image-generation': new Set(['image']),
+  'video-generation': new Set(['video_second', 'frame']),
+  tts: new Set(['input_character', 'audio_second']),
+  stt: new Set(['audio_second']),
+});
 const ENCLAVE_ARTIFACT_ROOT_KIND = 'blake3_merkle_v1';
 const ENCLAVE_CAP_BOOLEAN_FIELDS = [
   'chat',
@@ -358,7 +367,7 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         model_id: { type: 'string', min: 1, max: 256 },
         model_class: { type: 'string', min: 1, max: 64, optional: true },
-        price_ref_mu: { type: 'any' },
+        rate_map: { type: 'array', min: 1, max: RATE_MAP_MAX_ENTRIES, items: { type: 'any' } },
         source_hash: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
@@ -496,8 +505,7 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
-        in_per_1k_mu: { type: 'number', integer: true, min: 0 },
-        out_per_1k_mu: { type: 'number', integer: true, min: 0 },
+        rate_map: { type: 'array', min: 1, max: RATE_MAP_MAX_ENTRIES, items: { type: 'any' } },
         per_req_mu: { type: 'number', integer: true, min: 0 },
         min_session_mu: { type: 'number', integer: true, min: 0 },
         effective_at: { type: 'number', integer: true, min: 0 },
@@ -1253,10 +1261,7 @@ class MayhemContract extends Contract {
       model_id: this.value.model_id,
       model_class: this.modelClassFor(this.value),
       denom: PRICE_DENOMINATION,
-      price_ref_mu: {
-        in_per_1k: this.value.price_ref_mu.in_per_1k,
-        out_per_1k: this.value.price_ref_mu.out_per_1k,
-      },
+      rate_map: this.normalizeRateMap(this.value.rate_map),
       ver: (current?.ver ?? 0) + 1,
       source_hash: this.value.source_hash ?? null,
       updated_at: this.tx,
@@ -1769,15 +1774,14 @@ class MayhemContract extends Contract {
       return new Error('Model reference model_class must match enclave model_class.');
     }
 
-    const inRef = this.modelRefPrice(modelRef, 'in_per_1k_mu', 'in_per_1k');
-    const outRef = this.modelRefPrice(modelRef, 'out_per_1k_mu', 'out_per_1k');
+    const rateError = this.validateRateMap(this.value.rate_map, this.modelClassFor(enclave), 'Enclave price rate_map', {
+      allowZeroPrice: true,
+    });
+    if (rateError) return rateError;
+    const priceRateMap = this.normalizeRateMap(this.value.rate_map);
     const params = await this.activeParamsAt(this.value.effective_at, ['price_min_bps', 'price_max_bps']);
-    if (!this.priceWithinBounds(this.value.in_per_1k_mu, inRef, params)) {
-      return new Error('Input price outside model reference bounds.');
-    }
-    if (!this.priceWithinBounds(this.value.out_per_1k_mu, outRef, params)) {
-      return new Error('Output price outside model reference bounds.');
-    }
+    const boundsError = this.validateRateMapBounds(priceRateMap, modelRef.rate_map, params);
+    if (boundsError) return boundsError;
 
     const key = `price/${this.value.enclave_id}`;
     const schedule = await this.priceSchedule(key, enclave);
@@ -1794,8 +1798,7 @@ class MayhemContract extends Contract {
       model_id: enclave.model_id,
       denom: PRICE_DENOMINATION,
       ver: latest ? latest.ver + 1 : 1,
-      in_per_1k_mu: this.value.in_per_1k_mu,
-      out_per_1k_mu: this.value.out_per_1k_mu,
+      rate_map: priceRateMap,
       per_req_mu: this.value.per_req_mu,
       min_session_mu: this.value.min_session_mu,
       effective_at: this.value.effective_at,
@@ -3402,16 +3405,8 @@ class MayhemContract extends Contract {
     if (!this.isSafeModelId(value.model_id)) return new Error('Invalid model id.');
     const classError = this.validateModelClass(this.modelClassFor(value), 'Model reference model_class');
     if (classError) return classError;
-    const ref = value.price_ref_mu;
-    if (!ref || typeof ref !== 'object' || Array.isArray(ref)) {
-      return new Error('Model reference price must be an object.');
-    }
-    if (!Number.isInteger(ref.in_per_1k) || ref.in_per_1k <= 0) {
-      return new Error('Model reference input price must be positive.');
-    }
-    if (!Number.isInteger(ref.out_per_1k) || ref.out_per_1k <= 0) {
-      return new Error('Model reference output price must be positive.');
-    }
+    const rateError = this.validateRateMap(value.rate_map, this.modelClassFor(value), 'Model reference rate_map');
+    if (rateError) return rateError;
     if (value.source_hash !== undefined && !this.isSafeKeyPart(value.source_hash)) {
       return new Error('Invalid model reference source hash.');
     }
@@ -3631,12 +3626,6 @@ class MayhemContract extends Contract {
     return schedule.pending ?? schedule.current;
   }
 
-  modelRefPrice(modelRef, directKey, nestedKey) {
-    if (Number.isInteger(modelRef?.[directKey])) return modelRef[directKey];
-    if (Number.isInteger(modelRef?.price_ref_mu?.[nestedKey])) return modelRef.price_ref_mu[nestedKey];
-    return null;
-  }
-
   modelClassFor(value) {
     if (!value || !hasOwn(value, 'model_class') || value.model_class === null || value.model_class === undefined) {
       return DEFAULT_MODEL_CLASS;
@@ -3652,14 +3641,85 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  priceWithinBounds(price, ref, params = {
+  validateRateMap(rateMap, modelClass, label, { allowZeroPrice = false } = {}) {
+    if (!Array.isArray(rateMap) || rateMap.length === 0 || rateMap.length > RATE_MAP_MAX_ENTRIES) {
+      return new Error(`${label} must be a non-empty array with at most ${RATE_MAP_MAX_ENTRIES} entries.`);
+    }
+    const validUnits = MODEL_CLASS_RATE_UNITS[modelClass];
+    if (!validUnits) return new Error(`No rate units configured for model_class ${modelClass}.`);
+    const seen = new Set();
+    for (const entry of rateMap) {
+      const shapeError = this.validateExactObjectKeys(entry, ['unit', 'per_unit_mu', 'granularity'], `${label} entry`);
+      if (shapeError) return shapeError;
+      if (typeof entry.unit !== 'string' || entry.unit.length === 0 || entry.unit.length > 64) {
+        return new Error(`${label} unit must be a non-empty string.`);
+      }
+      if (!validUnits.has(entry.unit)) return new Error(`${label} unit ${entry.unit} is not allowed for model_class ${modelClass}.`);
+      if (seen.has(entry.unit)) return new Error(`${label} has duplicate unit ${entry.unit}.`);
+      seen.add(entry.unit);
+      if (!Number.isSafeInteger(entry.per_unit_mu) || entry.per_unit_mu < 0 || (!allowZeroPrice && entry.per_unit_mu === 0)) {
+        return new Error(`${label} per_unit_mu must be ${allowZeroPrice ? 'a non-negative' : 'a positive'} integer.`);
+      }
+      if (!Number.isSafeInteger(entry.granularity) || entry.granularity <= 0) {
+        return new Error(`${label} granularity must be a positive integer.`);
+      }
+    }
+    return null;
+  }
+
+  normalizeRateMap(rateMap) {
+    return rateMap
+      .map((entry) => ({
+        unit: entry.unit,
+        per_unit_mu: entry.per_unit_mu,
+        granularity: entry.granularity,
+      }))
+      .sort((left, right) => left.unit.localeCompare(right.unit));
+  }
+
+  rateMapByUnit(rateMap) {
+    const byUnit = new Map();
+    for (const entry of rateMap ?? []) byUnit.set(entry.unit, entry);
+    return byUnit;
+  }
+
+  validateRateMapBounds(priceRateMap, referenceRateMap, params) {
+    const priceByUnit = this.rateMapByUnit(priceRateMap);
+    const referenceByUnit = this.rateMapByUnit(referenceRateMap);
+    if (priceByUnit.size !== referenceByUnit.size) {
+      return new Error('Price rate_map units must match model reference rate_map units.');
+    }
+    for (const [unit, ref] of referenceByUnit.entries()) {
+      const price = priceByUnit.get(unit);
+      if (!price) return new Error(`Price rate_map is missing model reference unit ${unit}.`);
+      if (!this.rateWithinBounds(price, ref, params)) {
+        return new Error(`Price rate_map unit ${unit} outside model reference bounds.`);
+      }
+    }
+    return null;
+  }
+
+  rateWithinBounds(price, ref, params = {
     price_min_bps: PARAM_DEFINITIONS.price_min_bps.default,
     price_max_bps: PARAM_DEFINITIONS.price_max_bps.default,
   }) {
-    if (!Number.isInteger(ref) || ref <= 0) return false;
+    if (
+      !Number.isSafeInteger(ref?.per_unit_mu) ||
+      ref.per_unit_mu <= 0 ||
+      !Number.isSafeInteger(ref?.granularity) ||
+      ref.granularity <= 0 ||
+      !Number.isSafeInteger(price?.per_unit_mu) ||
+      price.per_unit_mu < 0 ||
+      !Number.isSafeInteger(price?.granularity) ||
+      price.granularity <= 0
+    ) {
+      return false;
+    }
+    const priceScaled = BigInt(price.per_unit_mu) * BigInt(ref.granularity) * 10_000n;
+    const refScaled = BigInt(ref.per_unit_mu) * BigInt(price.granularity);
     return (
-      price * 10_000 >= ref * params.price_min_bps &&
-      price * 10_000 <= ref * params.price_max_bps
+      priceScaled >= refScaled * BigInt(params.price_min_bps) &&
+      priceScaled <= refScaled * BigInt(params.price_max_bps)
     );
   }
 

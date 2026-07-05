@@ -33,12 +33,14 @@ use mayhem_engine::{
     EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, ModelArtifact, ToolSpec,
 };
 use mayhem_gateway::{
-    heartbeat_signing_payload,
+    heartbeat_signing_payload, normalize_rate_map,
     openai::{
         serve as serve_gateway, GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo,
         ModelCaps, PriceRefMu, ProviderKybInfo, ScBridgeGatewaySessionBackend,
         ScBridgeGatewaySessionConfig,
     },
+    rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
+    RateMapEntry, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
@@ -1828,13 +1830,13 @@ struct AdminSetModelRefArgs {
     #[arg(long)]
     model: String,
 
-    /// Reference input price in integer micro-USD per 1k tokens.
+    /// JSON array of {unit,per_unit_mu,granularity} reference rates.
     #[arg(long)]
-    in_per_1k_mu: u64,
+    rate_map_json: Option<String>,
 
-    /// Reference output price in integer micro-USD per 1k tokens.
-    #[arg(long)]
-    out_per_1k_mu: u64,
+    /// Path to a JSON array of {unit,per_unit_mu,granularity} reference rates.
+    #[arg(long, value_name = "PATH")]
+    rate_map_file: Option<PathBuf>,
 
     /// Optional source hash for the catalog/price reference evidence.
     #[arg(long)]
@@ -2007,13 +2009,13 @@ struct AdminSetPriceArgs {
     #[arg(long)]
     enclave_id: String,
 
-    /// Input price in integer micro-USD per 1k tokens.
+    /// JSON array of {unit,per_unit_mu,granularity} rates.
     #[arg(long)]
-    in_per_1k_mu: u64,
+    rate_map_json: Option<String>,
 
-    /// Output price in integer micro-USD per 1k tokens.
-    #[arg(long)]
-    out_per_1k_mu: u64,
+    /// Path to a JSON array of {unit,per_unit_mu,granularity} rates.
+    #[arg(long, value_name = "PATH")]
+    rate_map_file: Option<PathBuf>,
 
     /// Fixed per-request price in integer micro-USD.
     #[arg(long, default_value_t = 0)]
@@ -3121,8 +3123,7 @@ struct CatalogListModel {
 #[derive(Debug, Serialize)]
 struct CatalogListPrice {
     denom: String,
-    in_per_1k: u64,
-    out_per_1k: u64,
+    rate_map: Vec<RateMapEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3292,8 +3293,10 @@ fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
         license: model.provenance.license.clone(),
         price_ref_mu: CatalogListPrice {
             denom: model.price_ref_mu.denom.clone(),
-            in_per_1k: model.price_ref_mu.in_per_1k,
-            out_per_1k: model.price_ref_mu.out_per_1k,
+            rate_map: text_generation_rate_map(
+                model.price_ref_mu.in_per_1k,
+                model.price_ref_mu.out_per_1k,
+            ),
         },
         caps: CatalogListCaps {
             tools: model.caps.tools,
@@ -3334,8 +3337,9 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             model.model_id, model.tier, model.params_b, model.family
         );
         println!(
-            "  price ref: {} input={} output={} per 1k tokens",
-            model.price_ref_mu.denom, model.price_ref_mu.in_per_1k, model.price_ref_mu.out_per_1k
+            "  price ref: {} {}",
+            model.price_ref_mu.denom,
+            format_rate_map(&model.price_ref_mu.rate_map)
         );
         println!(
             "  caps: ctx_max={} tools={} json={} vision={}",
@@ -3370,6 +3374,19 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             );
         }
     }
+}
+
+fn format_rate_map(rate_map: &[RateMapEntry]) -> String {
+    normalize_rate_map(rate_map.to_vec())
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "{}={}/{}mu",
+                entry.unit, entry.per_unit_mu, entry.granularity
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn short_hash(value: &str) -> &str {
@@ -8635,7 +8652,7 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
     match command {
         AdminCommands::SetRules(args) => Ok(("setRules", admin_set_rules_payload(args))),
         AdminCommands::SetParams(args) => Ok(("setParams", admin_set_params_payload(args)?)),
-        AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args))),
+        AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args)?)),
         AdminCommands::PublishCatalog(args) => {
             Ok(("publishCatalog", admin_publish_catalog_payload(args)?))
         }
@@ -8657,7 +8674,7 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
                 "room_id": &args.room_id,
             }),
         )),
-        AdminCommands::SetPrice(args) => Ok(("setPrice", admin_set_price_payload(args))),
+        AdminCommands::SetPrice(args) => Ok(("setPrice", admin_set_price_payload(args)?)),
         AdminCommands::SetProviderPayout(args) => Ok((
             "setProviderPayout",
             admin_set_provider_payout_payload(args)?,
@@ -8738,19 +8755,22 @@ fn admin_set_params_payload(args: &AdminSetParamsArgs) -> Result<Value> {
     }))
 }
 
-fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Value {
+fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Result<Value> {
+    let rate_map = rate_map_arg_or_file(
+        args.rate_map_json.as_deref(),
+        args.rate_map_file.as_ref(),
+        false,
+        "model reference rate_map",
+    )?;
     let mut payload = json!({
         "op": "set_model_ref",
         "model_id": &args.model,
-        "price_ref_mu": {
-            "in_per_1k": args.in_per_1k_mu,
-            "out_per_1k": args.out_per_1k_mu,
-        },
+        "rate_map": rate_map,
     });
     if let Some(source_hash) = &args.source_hash {
         payload["source_hash"] = json!(source_hash);
     }
-    payload
+    Ok(payload)
 }
 
 fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value> {
@@ -9017,16 +9037,60 @@ fn admin_open_room_payload(args: &AdminOpenRoomArgs) -> Result<Value> {
     Ok(payload)
 }
 
-fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Value {
-    json!({
+fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Result<Value> {
+    let rate_map = rate_map_arg_or_file(
+        args.rate_map_json.as_deref(),
+        args.rate_map_file.as_ref(),
+        true,
+        "price rate_map",
+    )?;
+    Ok(json!({
         "op": "set_price",
         "enclave_id": &args.enclave_id,
-        "in_per_1k_mu": args.in_per_1k_mu,
-        "out_per_1k_mu": args.out_per_1k_mu,
+        "rate_map": rate_map,
         "per_req_mu": args.per_req_mu,
         "min_session_mu": args.min_session_mu,
         "effective_at": args.effective_at,
-    })
+    }))
+}
+
+fn rate_map_arg_or_file(
+    inline: Option<&str>,
+    file: Option<&PathBuf>,
+    allow_zero_per_unit: bool,
+    label: &str,
+) -> Result<Vec<RateMapEntry>> {
+    let value = json_arg_or_file_array(inline, file, None, label)?;
+    let entries = serde_json::from_value::<Vec<RateMapEntry>>(value)
+        .with_context(|| format!("parsing {label} entries"))?;
+    validate_rate_map_entries(&entries, allow_zero_per_unit, label)?;
+    Ok(normalize_rate_map(entries))
+}
+
+fn validate_rate_map_entries(
+    entries: &[RateMapEntry],
+    allow_zero_per_unit: bool,
+    label: &str,
+) -> Result<()> {
+    if entries.is_empty() {
+        bail!("{label} must contain at least one entry");
+    }
+    let mut units = BTreeSet::new();
+    for entry in entries {
+        if entry.unit.trim().is_empty() {
+            bail!("{label} unit must not be empty");
+        }
+        if !units.insert(entry.unit.as_str()) {
+            bail!("{label} contains duplicate unit {}", entry.unit);
+        }
+        if entry.granularity == 0 {
+            bail!("{label} granularity must be positive");
+        }
+        if !allow_zero_per_unit && entry.per_unit_mu == 0 {
+            bail!("{label} per_unit_mu must be positive");
+        }
+    }
+    Ok(())
 }
 
 fn normalize_admin_fiat_currency(value: &str) -> Result<String> {
@@ -10462,8 +10526,7 @@ struct ModelSummary {
     providers_online: u64,
     rooms: u64,
     denom: String,
-    in_per_1k_mu: u64,
-    out_per_1k_mu: u64,
+    rate_map: Vec<RateMapEntry>,
     tools: bool,
     json: bool,
     context: u64,
@@ -11440,8 +11503,7 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
             .and_then(Value::as_str)
             .unwrap_or("mu_usd")
             .to_owned(),
-        in_per_1k_mu: price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
-        out_per_1k_mu: price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
+        rate_map: gateway_price_rate_map(price),
         tools: caps.get("tools").and_then(Value::as_bool).unwrap_or(false),
         json: caps.get("json").and_then(Value::as_bool).unwrap_or(false),
         context: caps.get("ctx").and_then(Value::as_u64).unwrap_or(0),
@@ -11452,6 +11514,22 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         prompt_confidential,
         prompt_confidentiality_note: prompt_confidentiality_note(prompt_confidential).to_owned(),
     })
+}
+
+fn gateway_price_rate_map(price: &Value) -> Vec<RateMapEntry> {
+    if let Some(rate_map) = price
+        .get("rate_map")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<RateMapEntry>>(value).ok())
+    {
+        if !rate_map.is_empty() {
+            return normalize_rate_map(rate_map);
+        }
+    }
+    text_generation_rate_map(
+        price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
+        price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
+    )
 }
 
 fn max_attestation_tier(tiers: &BTreeMap<String, u64>) -> u8 {
@@ -12083,8 +12161,8 @@ fn print_models_report(report: &Value) -> Result<()> {
         "Prompt privacy: only Tier 3 is prompt-confidential; Tier 1, Tier 2, and Tier 4 providers can read prompts in memory."
     );
     println!(
-        "{:<44} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}  {:<44}",
-        "MODEL", "PROVIDERS", "ROOMS", "MU/1K IN/OUT", "CTX", "TOOLS", "JSON", "ATTESTATION"
+        "{:<44} {:>9} {:>5} {:>23} {:>7} {:>5} {:>5}  {:<44}",
+        "MODEL", "PROVIDERS", "ROOMS", "RATE MAP", "CTX", "TOOLS", "JSON", "ATTESTATION"
     );
     for model in report["models"]
         .as_array()
@@ -12093,21 +12171,22 @@ fn print_models_report(report: &Value) -> Result<()> {
         let id = model["id"].as_str().unwrap_or("");
         let providers = model["providers_online"].as_u64().unwrap_or(0);
         let rooms = model["rooms"].as_u64().unwrap_or(0);
-        let price = format!(
-            "{}/{}",
-            model["in_per_1k_mu"].as_u64().unwrap_or(0),
-            model["out_per_1k_mu"].as_u64().unwrap_or(0)
-        );
+        let rate_map = model["rate_map"]
+            .as_array()
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<RateMapEntry>>(Value::Array(value)).ok())
+            .unwrap_or_default();
+        let price = format_rate_map(&rate_map);
         let context = model["context"].as_u64().unwrap_or(0);
         let tools = bool_mark(model["tools"].as_bool().unwrap_or(false));
         let json = bool_mark(model["json"].as_bool().unwrap_or(false));
         let attestation = attestation_summary_for_model(model);
         println!(
-            "{:<44} {:>9} {:>5} {:>17} {:>7} {:>5} {:>5}  {:<44}",
+            "{:<44} {:>9} {:>5} {:>23} {:>7} {:>5} {:>5}  {:<44}",
             truncate_for_table(id, 44),
             providers,
             rooms,
-            price,
+            truncate_for_table(&price, 23),
             context,
             tools,
             json,
@@ -13877,8 +13956,7 @@ struct LedgerPriceSchedule {
 struct LedgerPriceRecord {
     ver: u64,
     denom: String,
-    in_per_1k_mu: u64,
-    out_per_1k_mu: u64,
+    rate_map: Vec<RateMapEntry>,
     per_req_mu: u64,
     min_session_mu: u64,
     effective_at: u64,
@@ -14916,6 +14994,7 @@ fn current_mu_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRe
     let current = schedule.current.as_ref()?;
     (schedule.denom == "mu_usd"
         && current.denom == "mu_usd"
+        && !current.rate_map.is_empty()
         && admin_role_marker_ok(current.set_by_role.as_deref()))
     .then_some(current)
 }
@@ -15548,8 +15627,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 price_ref_mu: PriceRefMu {
                     denom: "mu_usd".to_owned(),
                     ver: price.ver,
-                    in_per_1k: price.in_per_1k_mu,
-                    out_per_1k: price.out_per_1k_mu,
+                    rate_map: normalize_rate_map(price.rate_map.clone()),
                 },
                 attestation_tier_labels: gateway_attestation_tier_labels_for_counts(
                     &attestation_tiers,
@@ -15574,9 +15652,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
 
 fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64) {
     (
-        price.in_per_1k_mu.saturating_add(price.out_per_1k_mu),
-        price.in_per_1k_mu,
-        price.out_per_1k_mu,
+        rate_map_cost_basis_per_1k(&price.rate_map),
+        text_rate_per_1k_mu(&price.rate_map, INPUT_TOKEN_UNIT),
+        text_rate_per_1k_mu(&price.rate_map, OUTPUT_TOKEN_UNIT),
         price.ver,
     )
 }
@@ -15584,8 +15662,7 @@ fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64) {
 fn same_gateway_price_terms(left: &LedgerPriceRecord, right: &LedgerPriceRecord) -> bool {
     left.ver == right.ver
         && left.denom == right.denom
-        && left.in_per_1k_mu == right.in_per_1k_mu
-        && left.out_per_1k_mu == right.out_per_1k_mu
+        && normalize_rate_map(left.rate_map.clone()) == normalize_rate_map(right.rate_map.clone())
 }
 
 fn room_matches_enclave(room: &LedgerRoom, enclave: &LedgerEnclave) -> bool {
@@ -17141,10 +17218,10 @@ fn provider_session_receipt(
 }
 
 fn provider_session_mu_owed(terms: &ProviderSessionTerms, usage: &ReceiptUsage) -> u64 {
-    let raw = u128::from(usage.in_tokens) * u128::from(terms.in_per_1k_mu)
-        + u128::from(usage.out_tokens) * u128::from(terms.out_per_1k_mu);
-    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
-    rounded.min(u128::from(u64::MAX)) as u64
+    text_usage_mu(
+        &text_generation_rate_map(terms.in_per_1k_mu, terms.out_per_1k_mu),
+        usage,
+    )
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
@@ -17399,8 +17476,8 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         model_id: ctx.selected.enclave.model_id.clone(),
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
-        in_per_1k_mu: price.in_per_1k_mu,
-        out_per_1k_mu: price.out_per_1k_mu,
+        in_per_1k_mu: text_rate_per_1k_mu(&price.rate_map, INPUT_TOKEN_UNIT),
+        out_per_1k_mu: text_rate_per_1k_mu(&price.rate_map, OUTPUT_TOKEN_UNIT),
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.model.caps.ctx_max,
     })
@@ -18775,17 +18852,15 @@ mod tests {
     }
 
     #[test]
-    fn admin_set_price_cli_parses_hyphenated_mu_usd_flags() {
+    fn admin_set_price_cli_parses_rate_map_json() {
         let cli = Cli::try_parse_from([
             "mayhem",
             "admin",
             "set-price",
             "--enclave-id",
             "enclave-a",
-            "--in-per-1k-mu",
-            "20",
-            "--out-per-1k-mu",
-            "60",
+            "--rate-map-json",
+            r#"[{"unit":"input_token","per_unit_mu":20,"granularity":1000},{"unit":"output_token","per_unit_mu":60,"granularity":1000}]"#,
             "--per-req-mu",
             "1",
             "--min-session-mu",
@@ -18803,8 +18878,11 @@ mod tests {
             panic!("expected set-price command");
         };
         assert_eq!(args.enclave_id, "enclave-a");
-        assert_eq!(args.in_per_1k_mu, 20);
-        assert_eq!(args.out_per_1k_mu, 60);
+        assert!(args
+            .rate_map_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("input_token"));
         assert_eq!(args.per_req_mu, 1);
         assert_eq!(args.min_session_mu, 100);
         assert_eq!(args.effective_at, 21600);
@@ -18816,20 +18894,25 @@ mod tests {
         let args = AdminSetPriceArgs {
             tx: test_admin_tx_args(),
             enclave_id: "enclave-a".to_owned(),
-            in_per_1k_mu: 20,
-            out_per_1k_mu: 60,
+            rate_map_json: Some(
+                r#"[{"unit":"output_token","per_unit_mu":60,"granularity":1000},{"unit":"input_token","per_unit_mu":20,"granularity":1000}]"#
+                    .to_owned(),
+            ),
+            rate_map_file: None,
             per_req_mu: 0,
             min_session_mu: 100,
             effective_at: 21_600,
         };
 
         assert_eq!(
-            admin_set_price_payload(&args),
+            admin_set_price_payload(&args).unwrap(),
             json!({
                 "op": "set_price",
                 "enclave_id": "enclave-a",
-                "in_per_1k_mu": 20,
-                "out_per_1k_mu": 60,
+                "rate_map": [
+                    { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
+                    { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                ],
                 "per_req_mu": 0,
                 "min_session_mu": 100,
                 "effective_at": 21_600,
@@ -19969,8 +20052,10 @@ mod tests {
         assert_eq!(models[0].mayhem.rooms, 1);
         assert_eq!(models[0].mayhem.price_ref_mu.denom, "mu_usd");
         assert_eq!(models[0].mayhem.price_ref_mu.ver, 1);
-        assert_eq!(models[0].mayhem.price_ref_mu.in_per_1k, 1);
-        assert_eq!(models[0].mayhem.price_ref_mu.out_per_1k, 2);
+        assert_eq!(
+            models[0].mayhem.price_ref_mu.rate_map,
+            text_generation_rate_map(1, 2)
+        );
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
         assert!(models[0].mayhem.kyb_identities.is_empty());
         assert!(models[0].mayhem.caps.tools);
@@ -21445,8 +21530,10 @@ mod tests {
                 "rooms": 2,
                 "price_ref_mu": {
                     "denom": "mu_usd",
-                    "in_per_1k": 20,
-                    "out_per_1k": 60
+                    "rate_map": [
+                        { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
+                        { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                    ]
                 },
                 "attestation_tiers": { "T1": 2, "T2": 1 },
                 "attestation_tier_labels": {
@@ -21462,8 +21549,7 @@ mod tests {
         assert_eq!(summaries[0].providers_online, 3);
         assert_eq!(summaries[0].rooms, 2);
         assert_eq!(summaries[0].denom, "mu_usd");
-        assert_eq!(summaries[0].in_per_1k_mu, 20);
-        assert_eq!(summaries[0].out_per_1k_mu, 60);
+        assert_eq!(summaries[0].rate_map, text_generation_rate_map(20, 60));
         assert!(summaries[0].tools);
         assert!(!summaries[0].json);
         assert_eq!(summaries[0].context, 8192);
@@ -21484,7 +21570,13 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "price_ref_mu": {
+                        "denom": "mu_usd",
+                        "rate_map": [
+                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                        ]
+                    },
                     "attestation_tiers": { "T1": 1 },
                     "caps": { "tools": false, "json": false, "ctx": 4096 }
                 }
@@ -21494,7 +21586,13 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "price_ref_mu": {
+                        "denom": "mu_usd",
+                        "rate_map": [
+                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                        ]
+                    },
                     "attestation_tiers": { "T3": 1, "T4": 1 },
                     "caps": { "tools": false, "json": false, "ctx": 4096 }
                 }
@@ -21521,7 +21619,13 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "price_ref_mu": {
+                        "denom": "mu_usd",
+                        "rate_map": [
+                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                        ]
+                    },
                     "attestation_tiers": { "T1": 1 },
                     "caps": { "tools": false, "json": false, "ctx": 4096 }
                 }
@@ -21531,7 +21635,13 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": { "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 },
+                    "price_ref_mu": {
+                        "denom": "mu_usd",
+                        "rate_map": [
+                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                        ]
+                    },
                     "attestation_tiers": { "T4": 1 },
                     "kyb_identities": [{
                         "provider": "55".repeat(32),
@@ -23992,8 +24102,7 @@ mod tests {
                 current: Some(LedgerPriceRecord {
                     ver: 1,
                     denom: "mu_usd".to_owned(),
-                    in_per_1k_mu: 1,
-                    out_per_1k_mu: 2,
+                    rate_map: text_generation_rate_map(1, 2),
                     per_req_mu: 0,
                     min_session_mu: 0,
                     effective_at: 0,

@@ -18,6 +18,10 @@ use crate::{
         x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState, SessionPriceMu,
         DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
     },
+    pricing::{
+        normalize_rate_map, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
+        RateMapEntry, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
+    },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, ProviderKey,
     ReputationEventKind,
 };
@@ -125,8 +129,7 @@ pub struct GatewayRouteCandidate {
 pub struct PriceRefMu {
     pub denom: String,
     pub ver: u64,
-    pub in_per_1k: u64,
-    pub out_per_1k: u64,
+    pub rate_map: Vec<RateMapEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -440,8 +443,7 @@ impl GatewayState {
                 price_ref_mu: PriceRefMu {
                     denom: "mu_usd".to_owned(),
                     ver: 1,
-                    in_per_1k: 20,
-                    out_per_1k: 60,
+                    rate_map: text_generation_rate_map(20, 60),
                 },
                 attestation_tiers: tiers,
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
@@ -2760,8 +2762,14 @@ fn hedge_invocation_for_model(
     let failover_state = SessionFailoverState::new(
         FailoverPolicy::default(),
         SessionPriceMu {
-            in_per_1k_mu: model.mayhem.price_ref_mu.in_per_1k,
-            out_per_1k_mu: model.mayhem.price_ref_mu.out_per_1k,
+            in_per_1k_mu: text_rate_per_1k_mu(
+                &model.mayhem.price_ref_mu.rate_map,
+                INPUT_TOKEN_UNIT,
+            ),
+            out_per_1k_mu: text_rate_per_1k_mu(
+                &model.mayhem.price_ref_mu.rate_map,
+                OUTPUT_TOKEN_UNIT,
+            ),
         },
         0,
         0,
@@ -3008,6 +3016,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
     let id = model.get("model_id")?.as_str()?.to_owned();
     let caps = model.get("caps").unwrap_or(&Value::Null);
     let price = model.get("price_ref_mu").unwrap_or(&Value::Null);
+    let rate_map = price_rate_map_from_catalog_value(price);
     let tiers = attestation_tiers_from_catalog_value(model);
     Some(GatewayModel {
         id,
@@ -3032,8 +3041,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .or_else(|| price.get("price_ver"))
                     .and_then(Value::as_u64)
                     .unwrap_or(1),
-                in_per_1k: price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
-                out_per_1k: price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
+                rate_map,
             },
             attestation_tier_labels: attestation_tier_labels_from_catalog_value(model)
                 .unwrap_or_else(|| attestation_tier_labels_for_counts(&tiers)),
@@ -3053,6 +3061,29 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
             route_candidates: Vec::new(),
         },
     })
+}
+
+fn price_rate_map_from_catalog_value(price: &Value) -> Vec<RateMapEntry> {
+    if let Some(entries) = price.get("rate_map").and_then(Value::as_array) {
+        let rate_map = entries
+            .iter()
+            .filter_map(|entry| {
+                Some(RateMapEntry {
+                    unit: entry.get("unit")?.as_str()?.to_owned(),
+                    per_unit_mu: entry.get("per_unit_mu")?.as_u64()?,
+                    granularity: entry.get("granularity")?.as_u64()?,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !rate_map.is_empty() {
+            return normalize_rate_map(rate_map);
+        }
+    }
+
+    text_generation_rate_map(
+        price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
+        price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
+    )
 }
 
 fn attestation_tiers_from_catalog_value(model: &Value) -> BTreeMap<String, u32> {
@@ -3127,10 +3158,7 @@ fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiE
 }
 
 fn calculate_mu_owed(price: &PriceRefMu, usage: &ReceiptUsage) -> u64 {
-    let raw = u128::from(usage.in_tokens) * u128::from(price.in_per_1k)
-        + u128::from(usage.out_tokens) * u128::from(price.out_per_1k);
-    let rounded = if raw == 0 { 0 } else { raw.div_ceil(1000) };
-    rounded.min(u128::from(u64::MAX)) as u64
+    text_usage_mu(&price.rate_map, usage)
 }
 
 fn session_id_for(model_id: &str, prompt_text: &str) -> String {
@@ -3666,8 +3694,7 @@ mod tests {
                 price_ref_mu: PriceRefMu {
                     denom: "mu_usd".to_owned(),
                     ver: 7,
-                    in_per_1k: 20,
-                    out_per_1k: 60,
+                    rate_map: text_generation_rate_map(20, 60),
                 },
                 attestation_tiers: BTreeMap::from([("T1".to_owned(), 1)]),
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(

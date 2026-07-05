@@ -10,7 +10,9 @@ use mayhem_gateway::openai::{
     GatewaySessionInvocation, GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps,
     PriceRefMu, Usage,
 };
-use mayhem_gateway::{aggregate_canary_fingerprints, token_fingerprint, ReputationEventKind};
+use mayhem_gateway::{
+    aggregate_canary_fingerprints, text_generation_rate_map, token_fingerprint, ReputationEventKind,
+};
 use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity, DEFAULT_MODEL_CLASS};
 use serde_json::{json, Value};
 use std::{
@@ -343,6 +345,14 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
     assert_eq!(body["data"][0]["owned_by"], "mayhem");
     assert_eq!(body["data"][0]["mayhem"]["price_ref_mu"]["denom"], "mu_usd");
     assert_eq!(body["data"][0]["mayhem"]["price_ref_mu"]["ver"], 1);
+    assert_eq!(
+        body["data"][0]["mayhem"]["price_ref_mu"]["rate_map"][0]["unit"],
+        "input_token"
+    );
+    assert_eq!(
+        body["data"][0]["mayhem"]["price_ref_mu"]["rate_map"][1]["unit"],
+        "output_token"
+    );
     assert_eq!(body["data"][0]["mayhem"]["caps"]["tools"], true);
 }
 
@@ -353,7 +363,14 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
             "model_id": "mayhem/tier2-model",
             "model_class": "embedding",
             "caps": { "tools": true, "json": true, "ctx_max": 4096, "vision": false },
-            "price_ref_mu": { "denom": "mu_usd", "ver": 1, "in_per_1k": 10, "out_per_1k": 30 },
+            "price_ref_mu": {
+                "denom": "mu_usd",
+                "ver": 1,
+                "rate_map": [
+                    { "unit": "input_token", "per_unit_mu": 10, "granularity": 1000 },
+                    { "unit": "output_token", "per_unit_mu": 30, "granularity": 1000 }
+                ]
+            },
             "attestation_tiers": { "T1": 1, "T2": 2 }
         }]
     });
@@ -885,8 +902,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
             price_ref_mu: PriceRefMu {
                 denom: "mu_usd".to_owned(),
                 ver: 7,
-                in_per_1k: 20,
-                out_per_1k: 60,
+                rate_map: text_generation_rate_map(20, 60),
             },
             attestation_tiers: tiers,
             attestation_tier_labels: BTreeMap::from([(

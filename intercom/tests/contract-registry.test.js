@@ -13,6 +13,7 @@ import {
   signConsent,
   signProviderKyb,
   signProviderLifecycleIntent,
+  textRateMap,
 } from './helpers/contract.js';
 
 const rulesHash = '1'.repeat(64);
@@ -75,10 +76,7 @@ const enclaveRetire = {
 const modelRef = {
   op: 'set_model_ref',
   model_id: enclaveRegistration.model_id,
-  price_ref_mu: {
-    in_per_1k: 20,
-    out_per_1k: 60,
-  },
+  rate_map: textRateMap(20, 60),
 };
 
 const catalogRelease = {
@@ -103,8 +101,7 @@ const catalogRelease = {
 const priceSchedule = {
   op: 'set_price',
   enclave_id: enclaveId,
-  in_per_1k_mu: 20,
-  out_per_1k_mu: 60,
+  rate_map: textRateMap(20, 60),
   per_req_mu: 0,
   min_session_mu: 0,
   effective_at: 0,
@@ -306,10 +303,7 @@ test('MayhemContract model_class defaults old text records and allows new admin 
   });
   await storage.put(`modelref/${enclaveRegistration.model_id}`, {
     model_id: enclaveRegistration.model_id,
-    price_ref_mu: {
-      in_per_1k: 20,
-      out_per_1k: 60,
-    },
+    rate_map: textRateMap(20, 60),
   });
 
   const legacyPrice = await execute(
@@ -357,10 +351,7 @@ test('MayhemContract model_class defaults old text records and allows new admin 
       op: 'set_model_ref',
       model_id: embeddingRegistration.model_id,
       model_class: 'embedding',
-      price_ref_mu: {
-        in_per_1k: 2,
-        out_per_1k: 2,
-      },
+      rate_map: [{ unit: 'embedding', per_unit_mu: 2, granularity: 1 }],
     },
     admin.publicKey,
     4
@@ -418,10 +409,7 @@ test('MayhemContract rejects unsupported model classes and mismatched model refe
   await storage.put(`modelref/${enclaveRegistration.model_id}`, {
     model_id: enclaveRegistration.model_id,
     model_class: 'text-generation',
-    price_ref_mu: {
-      in_per_1k: 20,
-      out_per_1k: 60,
-    },
+    rate_map: textRateMap(20, 60),
   });
 
   const mismatchedPrice = await execute(
@@ -1436,13 +1424,12 @@ test('MayhemContract rejects provider-authored serving terms on joins', async ()
       enclave_id: enclaveId,
       model_id: 'provider/custom@4bit',
       price_ver: 999,
-      in_per_1k_mu: 1,
-      out_per_1k_mu: 1,
+      rate_map: textRateMap(1, 1),
     },
     provider.publicKey,
     5
   );
-  assert.match(providerPricedJoin.message, /model_id|price_ver|in_per_1k_mu|forbidden/i);
+  assert.match(providerPricedJoin.message, /model_id|price_ver|rate_map|forbidden/i);
   assert.equal(await storage.get(`serve/${provider.publicKey}/${enclaveId}`), null);
 
   const joinedEnclave = await execute(

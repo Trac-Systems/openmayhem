@@ -12,6 +12,7 @@ import {
   makeVerifier,
   seedCurrentAdminPrice,
   signConsent,
+  textRateMap,
 } from './helpers/contract.js';
 
 const rulesHash = '1'.repeat(64);
@@ -46,10 +47,7 @@ async function setupSecuritySurface() {
 
   await storage.put(`modelref/${modelId}`, {
     model_id: modelId,
-    price_ref_mu: {
-      in_per_1k: 20,
-      out_per_1k: 60,
-    },
+    rate_map: textRateMap(20, 60),
   });
 
   const roomId = await deriveRoomId(enclaveId, admin.publicKey, roomNonce);
@@ -148,10 +146,7 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     {
       op: 'set_model_ref',
       model_id: 'provider/arbitrary-model@q4',
-      price_ref_mu: {
-        in_per_1k: 1,
-        out_per_1k: 1,
-      },
+      rate_map: textRateMap(1, 1),
     },
   ],
   [
@@ -209,8 +204,7 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     {
       op: 'set_price',
       enclave_id: enclaveId,
-      in_per_1k_mu: 18,
-      out_per_1k_mu: 55,
+      rate_map: textRateMap(18, 55),
       per_req_mu: 0,
       min_session_mu: 100,
       effective_at: 21_600,

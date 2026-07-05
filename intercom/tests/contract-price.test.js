@@ -8,6 +8,7 @@ import {
   makeTxKey,
   makeVerifier,
   signConsent,
+  textRateMap,
 } from './helpers/contract.js';
 
 const rulesHash = '8'.repeat(64);
@@ -45,8 +46,7 @@ const enclaveRegistration = {
 const makePrice = (overrides = {}) => ({
   op: 'set_price',
   enclave_id: enclaveId,
-  in_per_1k_mu: 18,
-  out_per_1k_mu: 55,
+  rate_map: textRateMap(18, 55),
   per_req_mu: 0,
   min_session_mu: 100,
   effective_at: 21_600,
@@ -62,10 +62,7 @@ async function setupRegisteredEnclave() {
 
   await storage.put(`modelref/${modelId}`, {
     model_id: modelId,
-    price_ref_mu: {
-      in_per_1k: 20,
-      out_per_1k: 60,
-    },
+    rate_map: textRateMap(20, 60),
   });
 
   for (const op of [
@@ -123,21 +120,21 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     contract,
     storage,
     'setPrice',
-    makePrice({ in_per_1k_mu: 4 }),
+    makePrice({ rate_map: textRateMap(4, 55) }),
     admin.publicKey,
     6
   );
-  assert.match(tooLow.message, /input price outside/i);
+  assert.match(tooLow.message, /unit input_token outside/i);
 
   const tooHigh = await execute(
     contract,
     storage,
     'setPrice',
-    makePrice({ out_per_1k_mu: 241 }),
+    makePrice({ rate_map: textRateMap(18, 241) }),
     admin.publicKey,
     7
   );
-  assert.match(tooHigh.message, /output price outside/i);
+  assert.match(tooHigh.message, /unit output_token outside/i);
 
   const first = await execute(
     contract,
@@ -158,7 +155,7 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     contract,
     storage,
     'setPrice',
-    makePrice({ in_per_1k_mu: 19, effective_at: 21_660 }),
+    makePrice({ rate_map: textRateMap(19, 55), effective_at: 21_660 }),
     admin.publicKey,
     9
   );
@@ -168,7 +165,7 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     contract,
     storage,
     'setPrice',
-    makePrice({ in_per_1k_mu: 19, out_per_1k_mu: 56, effective_at: 43_200 }),
+    makePrice({ rate_map: textRateMap(19, 56), effective_at: 43_200 }),
     admin.publicKey,
     10
   );
@@ -189,8 +186,7 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
       model_id: modelId,
       denom: 'mu_usd',
       ver: 1,
-      in_per_1k_mu: 18,
-      out_per_1k_mu: 55,
+      rate_map: textRateMap(18, 55),
       per_req_mu: 0,
       min_session_mu: 100,
       effective_at: 21_600,
@@ -204,8 +200,7 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
       model_id: modelId,
       denom: 'mu_usd',
       ver: 2,
-      in_per_1k_mu: 19,
-      out_per_1k_mu: 56,
+      rate_map: textRateMap(19, 56),
       per_req_mu: 0,
       min_session_mu: 100,
       effective_at: 43_200,
@@ -246,10 +241,7 @@ test('MayhemContract setModelRef is admin-only and forward-facing', async () => 
   const modelRef = {
     op: 'set_model_ref',
     model_id: modelId,
-    price_ref_mu: {
-      in_per_1k: 20,
-      out_per_1k: 60,
-    },
+    rate_map: textRateMap(20, 60),
     source_hash: 'd'.repeat(64),
   };
 
@@ -285,10 +277,7 @@ test('MayhemContract setModelRef is admin-only and forward-facing', async () => 
     'setModelRef',
     {
       ...modelRef,
-      price_ref_mu: {
-        in_per_1k: 21,
-        out_per_1k: 63,
-      },
+      rate_map: textRateMap(21, 63),
     },
     admin.publicKey,
     3
@@ -304,16 +293,88 @@ test('MayhemContract setModelRef is admin-only and forward-facing', async () => 
     model_id: modelId,
     model_class: 'text-generation',
     denom: 'mu_usd',
-    price_ref_mu: {
-      in_per_1k: 21,
-      out_per_1k: 63,
-    },
+    rate_map: textRateMap(21, 63),
     ver: 2,
     source_hash: 'd'.repeat(64),
     updated_at: makeTxKey(3),
     set_by: admin.publicKey,
     set_by_role: 'admin',
   });
+});
+
+test('MayhemContract validates per-class rate maps including image prices', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const imageEnclave = {
+    ...enclaveRegistration,
+    enclave_id: 'e'.repeat(64),
+    model_id: 'admin/image-small@fp16',
+    model_class: 'image-generation',
+  };
+
+  let result = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    imageEnclave,
+    admin.publicKey,
+    1
+  );
+  assert.equal(result.ok, true, result.message);
+
+  result = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      op: 'set_model_ref',
+      model_id: imageEnclave.model_id,
+      model_class: 'image-generation',
+      rate_map: [{ unit: 'image', per_unit_mu: 500, granularity: 1 }],
+    },
+    admin.publicKey,
+    2
+  );
+  assert.equal(result.ok, true, result.message);
+
+  const invalidTextUnit = await execute(
+    contract,
+    storage,
+    'setPrice',
+    {
+      op: 'set_price',
+      enclave_id: imageEnclave.enclave_id,
+      rate_map: textRateMap(20, 60),
+      per_req_mu: 0,
+      min_session_mu: 0,
+      effective_at: 0,
+    },
+    admin.publicKey,
+    3
+  );
+  assert.match(invalidTextUnit.message, /input_token is not allowed for model_class image-generation/i);
+
+  result = await execute(
+    contract,
+    storage,
+    'setPrice',
+    {
+      op: 'set_price',
+      enclave_id: imageEnclave.enclave_id,
+      rate_map: [{ unit: 'image', per_unit_mu: 600, granularity: 1 }],
+      per_req_mu: 0,
+      min_session_mu: 0,
+      effective_at: 0,
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual((await storage.get(`price/${imageEnclave.enclave_id}`)).value.current.rate_map, [
+    { unit: 'image', per_unit_mu: 600, granularity: 1 },
+  ]);
 });
 
 test('MayhemContract rejects unsafe enclave identifiers in price reads and writes', async () => {
@@ -362,7 +423,7 @@ test('MayhemContract contract admin can edit enclave pricing forward-facing', as
     contract,
     storage,
     'setPrice',
-    makePrice({ in_per_1k_mu: 19, out_per_1k_mu: 56, effective_at: 43_200 }),
+    makePrice({ rate_map: textRateMap(19, 56), effective_at: 43_200 }),
     admin.publicKey,
     6
   );
@@ -423,8 +484,7 @@ test('MayhemContract setPrice uses the active scheduled price-bound params', asy
     storage,
     'setPrice',
     makePrice({
-      in_per_1k_mu: 60,
-      out_per_1k_mu: 180,
+      rate_map: textRateMap(60, 180),
       effective_at: DAY_SECONDS - 1,
     }),
     admin.publicKey,
@@ -442,12 +502,11 @@ test('MayhemContract setPrice uses the active scheduled price-bound params', asy
     storage,
     'setPrice',
     makePrice({
-      in_per_1k_mu: 60,
-      out_per_1k_mu: 180,
+      rate_map: textRateMap(60, 180),
       effective_at: DAY_SECONDS + 21_600,
     }),
     admin.publicKey,
     7
   );
-  assert.match(afterActivation.message, /input price outside/i);
+  assert.match(afterActivation.message, /unit input_token outside/i);
 });

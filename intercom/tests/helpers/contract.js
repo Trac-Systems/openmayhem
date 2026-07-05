@@ -10,6 +10,10 @@ import {
 } from '../../contract/contract.js';
 
 export const ZERO_HEX = '0'.repeat(64);
+export const textRateMap = (inPer1kMu = 20, outPer1kMu = 60) => [
+  { unit: 'input_token', per_unit_mu: inPer1kMu, granularity: 1000 },
+  { unit: 'output_token', per_unit_mu: outPer1kMu, granularity: 1000 },
+];
 
 export class MemoryStorage {
   constructor(initial = {}) {
@@ -145,8 +149,7 @@ export async function seedCurrentAdminPrice(
     model_id: modelId,
     denom: 'mu_usd',
     ver,
-    in_per_1k_mu: inPer1kMu,
-    out_per_1k_mu: outPer1kMu,
+    rate_map: textRateMap(inPer1kMu, outPer1kMu),
     per_req_mu: perReqMu,
     min_session_mu: minSessionMu,
     effective_at: effectiveAt,

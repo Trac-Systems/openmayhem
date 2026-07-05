@@ -3,10 +3,12 @@
 pub mod audit;
 pub mod failover;
 pub mod openai;
+pub mod pricing;
 pub mod provider_table;
 pub mod reputation;
 pub use audit::*;
 pub use failover::*;
+pub use pricing::*;
 pub use provider_table::*;
 pub use reputation::*;
 
