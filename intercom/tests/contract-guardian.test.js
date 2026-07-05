@@ -20,17 +20,6 @@ const seededBalance = (user, mu) => ({
   updated_at: null,
 });
 
-const earningRecord = (provider, overrides = {}) => ({
-  provider,
-  denom: 'mu_usd',
-  total_mu: 5_000,
-  held_mu: 0,
-  paid_cum_mu: 0,
-  updated_epoch: 0,
-  updated_at: null,
-  ...overrides,
-});
-
 async function setupGuardianContract() {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
@@ -63,28 +52,6 @@ async function setupGuardianContract() {
       sender: provider.publicKey,
       txNo: 3,
     },
-    {
-      type: 'setProviderPayout',
-      value: {
-        op: 'set_provider_payout',
-        provider: provider.publicKey,
-        payout_addr: 'trac1guardianprovider',
-        payout_method: 'tnk',
-      },
-      sender: admin.publicKey,
-      txNo: 4,
-    },
-    {
-      type: 'rateOracle',
-      value: {
-        op: 'rate_oracle',
-        tnk_usd_e6: 2_000_000,
-        source: 'gate-spot',
-        ts: 1_000,
-      },
-      sender: admin.publicKey,
-      txNo: 5,
-    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
@@ -100,17 +67,6 @@ const epochApply = (epoch, user, provider, grossMu = 1_000) => ({
   at: epoch * 3_600,
   debits: [{ user, mu: grossMu }],
   earnings: [{ provider, gross_mu: grossMu }],
-});
-
-const payoutConfirm = (provider, overrides = {}) => ({
-  op: 'payout_confirm',
-  who: provider,
-  epoch: 200,
-  mu: 1_000,
-  tnk_e18: '500000000000000',
-  msb_tx_hash: 'a'.repeat(64),
-  at: 1_500,
-  ...overrides,
 });
 
 test('MayhemContract guardian halts epochApply on conservation failure', async () => {
@@ -170,49 +126,5 @@ test('MayhemContract guardian halts epochApply on negative balances', async () =
     admin.publicKey
   );
   assert.match(result.message, /guardian non-negative balance/i);
-  assert.equal(storage.snapshotBytes(), before);
-});
-
-test('MayhemContract guardian halts payoutConfirm on stale rates', async () => {
-  const { admin, provider, storage, contract } = await setupGuardianContract();
-  await storage.put(`earn/${provider.publicKey}`, earningRecord(provider.publicKey, {
-    total_mu: 2_000_000,
-  }));
-  const before = storage.snapshotBytes();
-
-  const result = await execute(
-    contract,
-    storage,
-    'payoutConfirm',
-    payoutConfirm(provider.publicKey, {
-      at: 3_701,
-      mu: 1_000_000,
-      tnk_e18: '500000000000000000',
-    }),
-    admin.publicKey,
-    5
-  );
-  assert.match(result.message, /guardian rate freshness.*rate oracle is stale/i);
-  assert.equal(storage.snapshotBytes(), before);
-});
-
-test('MayhemContract guardian halts payoutConfirm on earnings conservation failure', async () => {
-  const { admin, provider, storage, contract } = await setupGuardianContract();
-  await storage.put(`earn/${provider.publicKey}`, earningRecord(provider.publicKey, {
-    total_mu: 1_000,
-    held_mu: 900,
-    paid_cum_mu: 200,
-  }));
-  const before = storage.snapshotBytes();
-
-  const result = await execute(
-    contract,
-    storage,
-    'payoutConfirm',
-    payoutConfirm(provider.publicKey),
-    admin.publicKey,
-    5
-  );
-  assert.match(result.message, /guardian earnings conservation/i);
   assert.equal(storage.snapshotBytes(), before);
 });

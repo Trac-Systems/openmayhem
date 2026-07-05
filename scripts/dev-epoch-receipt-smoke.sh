@@ -162,11 +162,6 @@ const evidence = {
     mu_fee_epoch: r.totals.fee_mu,
     mu_fee_cum: r.totals.fee_cum_mu,
   },
-  [`ev/pay/${r.epoch}`]: {
-    merkle_root: r.roots.pay,
-    count: r.totals.pay_count,
-    mu_total: r.totals.pay_mu,
-  },
 };
 fs.writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
 NODE

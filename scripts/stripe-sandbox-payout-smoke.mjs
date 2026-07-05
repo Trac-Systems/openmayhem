@@ -5,41 +5,22 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import MayhemContract from '../intercom/contract/contract.js';
-
 const DEFAULT_STRIPE_ENV_FILE = '/Applications/MAMP/htdocs/gpd/stripe.txt';
 const DEFAULT_MU = 1_000_000;
 const DEFAULT_STRIPE_AMOUNT_MINOR = 100;
 const DEFAULT_BUSINESS_URL = 'https://trac.network';
 const CONNECT_READY_TIMEOUT_MS = 180_000;
 const CHARGE_TRANSFER_TIMEOUT_MS = 120_000;
-const ZERO_HEX = '0'.repeat(64);
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-class MemoryStorage {
-  constructor(initial = {}) {
-    this.values = new Map(Object.entries(initial));
-  }
-
-  async get(key) {
-    return this.values.has(key) ? { value: this.values.get(key) } : null;
-  }
-
-  async put(key, value) {
-    this.values.set(key, value);
-  }
-
-  async del(key) {
-    this.values.delete(key);
-  }
-}
 
 const usage = () => `Usage: node scripts/stripe-sandbox-payout-smoke.mjs [options]
 
 Creates a live Stripe test-mode Custom connected account, runs a Stripe
 destination charge on_behalf_of that connected account, extracts the real Stripe
-transfer id, and submits a Mayhem contract payoutConfirm for ev/pay evidence.
+transfer id, and reports the Stripe transfer facts. Contract payoutConfirm /
+ev/pay evidence is retired; fiat transfer evidence is folded through epoch
+settlement reports instead of per-payout Trac writes.
 
 Options:
   --stripe-env-file <path>   File with STRIPE_SECRET_KEY
@@ -168,28 +149,6 @@ async function stripeRequest(secretKey, method, endpoint, params = null) {
 
 const stripePost = (secretKey, endpoint, params) => stripeRequest(secretKey, 'POST', endpoint, params);
 const stripeGet = (secretKey, endpoint) => stripeRequest(secretKey, 'GET', endpoint);
-
-function txKey(n) {
-  return n.toString(16).padStart(64, '0');
-}
-
-async function execute(contract, storage, type, value, sender, txNo) {
-  const previousLog = console.log;
-  try {
-    console.log = () => {};
-    return await contract.execute({
-      type: 'tx',
-      key: txKey(txNo),
-      value: {
-        dispatch: { type, value },
-        ipk: sender,
-        wp: ZERO_HEX,
-      },
-    }, storage);
-  } finally {
-    console.log = previousLog;
-  }
-}
 
 async function createConnectedAccount(secretKey, tag, businessUrl, currency) {
   if (currency === 'eur') return createDeConnectedAccount(secretKey, tag, businessUrl);
@@ -347,74 +306,6 @@ async function waitChargeTransferReady(secretKey, chargeId) {
   );
 }
 
-async function confirmContractPayout({ accountId, transferId, mu, currency, amountCents }) {
-  const admin = randomBytes(32).toString('hex');
-  const provider = randomBytes(32).toString('hex');
-  const epoch = 169;
-  const at = 1_900;
-  const storage = new MemoryStorage({
-    admin,
-    [`prov/${provider}`]: {
-      provider,
-      status: 'active',
-      payout: {
-        addr: accountId,
-        method: 'stripe',
-        currency,
-        set_by: admin,
-        set_by_role: 'admin',
-        set_at: txKey(1),
-      },
-    },
-    [`earn/${provider}`]: {
-      provider,
-      denom: 'mu_usd',
-      total_mu: mu,
-      held_mu: 0,
-      paid_cum_mu: 0,
-      updated_epoch: 1,
-      updated_at: txKey(2),
-      holdbacks: [],
-    },
-  });
-  const contract = new MayhemContract({ peer: { wallet: { verify: () => false } } }, {});
-  const confirmed = await execute(contract, storage, 'payoutConfirm', {
-    op: 'payout_confirm',
-    epoch,
-    who: provider,
-    rail: 'stripe',
-    mu,
-    external_ref: transferId,
-    fiat_currency: currency,
-    fiat_amount_minor: amountCents,
-    at,
-  }, admin, 3);
-  if (confirmed instanceof Error || confirmed.ok !== true) {
-    throw new Error(`contract payoutConfirm failed: ${confirmed?.message ?? JSON.stringify(confirmed)}`);
-  }
-  const earning = (await storage.get(`earn/${provider}`))?.value;
-  const payRoot = (await storage.get(`ev/pay/${epoch}`))?.value;
-  if (
-    earning?.paid_cum_mu !== mu
-    || earning?.last_payout_rail !== 'stripe'
-    || earning?.last_payout_fiat_currency !== currency
-  ) {
-    throw new Error('contract earning state did not record Stripe payout');
-  }
-  if (!payRoot || payRoot.type !== 'payout_root' || payRoot.count !== 1 || payRoot.mu_total !== mu) {
-    throw new Error('contract ev/pay root was not written');
-  }
-  return {
-    admin,
-    provider,
-    epoch,
-    at,
-    confirmed,
-    earning,
-    pay_root: payRoot,
-  };
-}
-
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const secretKey = await loadStripeSecret(args.stripeEnvFile);
@@ -432,13 +323,6 @@ async function main() {
       args.amountCents,
       args.mu
     );
-    const contract = await confirmContractPayout({
-      accountId: account.id,
-      transferId: stripe.transfer.id,
-      mu: args.mu,
-      currency: args.currency,
-      amountCents: args.amountCents,
-    });
     const report = {
       ok: true,
       stripe: {
@@ -461,16 +345,12 @@ async function main() {
         transfer_amount_cents: stripe.transfer.amount,
         transfer_destination: stripe.transfer.destination,
       },
-      contract: {
-        provider: contract.provider,
-        epoch: contract.epoch,
-        mu: args.mu,
-        fiat_currency: contract.confirmed.fiat_currency,
-        fiat_amount_minor: contract.confirmed.fiat_amount_minor,
-        payout_root: contract.confirmed.payout_root,
-        external_ref_hash: contract.confirmed.external_ref_hash,
-        ev_pay_count: contract.pay_root.count,
-        ev_pay_mu_total: contract.pay_root.mu_total,
+      ledger: {
+        payout_confirm_retired: true,
+        evidence_model: 'epoch_settlement_report',
+        mu_usd: args.mu,
+        fiat_currency: args.currency,
+        fiat_amount_minor: args.amountCents,
       },
       temp_dir: args.keepTemp ? tempDir : undefined,
     };

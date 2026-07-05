@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 
-const ROOT_KINDS = ['dep', 'use', 'earn', 'fee', 'pay'];
+const ROOT_KINDS = ['dep', 'use', 'earn', 'fee'];
 
 export const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
@@ -113,6 +113,9 @@ export async function recomputeEpoch(bundle) {
   const deposits = Array.isArray(bundle.deposits) ? bundle.deposits : [];
   const receipts = Array.isArray(bundle.receipts) ? bundle.receipts : [];
   const payouts = Array.isArray(bundle.payouts) ? bundle.payouts : [];
+  if (payouts.length > 0) {
+    throw new Error('payouts are non-custodial TAP claims; do not include payout entries in epoch bundles');
+  }
   const priorEarnings = bundle.prior_earnings && typeof bundle.prior_earnings === 'object'
     ? bundle.prior_earnings
     : {};
@@ -168,15 +171,6 @@ export async function recomputeEpoch(bundle) {
   const feeCumMu = priorFeeCumMu + feeMu;
   safeAmount(feeCumMu, 'fee_cum_mu', { allowZero: true });
 
-  const payoutLeaves = [];
-  let payMu = 0;
-  for (const payout of payouts) {
-    const mu = safeAmount(payout.mu, 'payout mu');
-    payMu += mu;
-    safeAmount(payMu, 'pay_mu', { allowZero: true });
-    payoutLeaves.push(await opaqueHash('mayhem-payout-leaf-v1', stableValue(payout)));
-  }
-
   const roots = {
     dep: dep.root,
     use: await merkleRoot('use', usageLeaves),
@@ -185,7 +179,6 @@ export async function recomputeEpoch(bundle) {
       await Promise.all(earningEntries.map((entry) => opaqueHash('mayhem-earn-leaf-v1', entry)))
     ),
     fee: await opaqueHash('mayhem-fee-root-v1', { epoch, fee_mu: feeMu, fee_cum_mu: feeCumMu }),
-    pay: await merkleRoot('pay', payoutLeaves),
   };
   for (const key of ROOT_KINDS) {
     if (!/^[0-9a-f]{64}$/.test(roots[key])) throw new Error(`invalid ${key} root`);
@@ -207,8 +200,6 @@ export async function recomputeEpoch(bundle) {
     earn_mu: earnCumMu,
     fee_mu: feeMu,
     fee_cum_mu: feeCumMu,
-    pay_count: payouts.length,
-    pay_mu: payMu,
   };
 
   return { epoch, params: { fee_bps: feeBps }, roots, totals, debits, earnings };

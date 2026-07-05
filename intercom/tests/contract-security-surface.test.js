@@ -266,19 +266,6 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     },
   ],
   [
-    'payoutConfirm',
-    {
-      op: 'payout_confirm',
-      kind: 'provider',
-      epoch: 1,
-      who: provider.publicKey,
-      mu: 100,
-      tnk_e18: '1000000000000000000',
-      msb_tx_hash: 'pay-security',
-      at: 3_600,
-    },
-  ],
-  [
     'disputeResolve',
     {
       op: 'dispute_resolve',

@@ -220,12 +220,7 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'payout_confirm') {
-      return {
-        type: 'payoutConfirm',
-        value: json,
-      };
-    }
+    if (json?.op === 'payout_confirm') return null;
     if (json?.op === 'read_key') {
       return {
         type: 'readKey',
@@ -259,7 +254,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "anchor_reputation", "provider": "<pubkey>", "epoch": 1, "folded_at": 3600, "events_head": "<head>", "r_bps": 8700, "raw_milli": 12345, "successful_sessions": 50 }\' --sim 1 | admin/oracle anchors a rep/<provider> snapshot.');
     console.log('- /tx --command \'{ "op": "auditor_register", "auditor": "<pubkey>" }\' --sim 1 | admin accredits an auditor, or a qualified peer self-registers.');
     console.log('- /tx --command \'{ "op": "probe_result", "probe_id": "<id>", "probe_kind": "canary", "provider": "<pk>", "enclave_id": "<id>", "binary_hash": "<hash>", "match_bps": 9700, "pass": true, "canary_set": "canary-dev-v1", "session_receipt_hash": "<receipt-hash>", "evidence_hash": "<hash>", "auditor_sig": "<sig>", "epoch": 1, "at": 3600 }\' --sim 1 | auditor submits signed paid-session canary evidence.');
-    console.log('- /tx --command \'{ "op": "epoch_commit", "epoch": 1, "at": 3600, "roots": { "dep": "<root>", "use": "<root>", "earn": "<root>", "fee": "<root>", "pay": "<root>" }, "totals": { "dep_count": 0, "dep_mu": 0, "use_count": 1, "use_mu": 1000, "provider_count": 1, "earn_mu": 850, "fee_mu": 150, "fee_cum_mu": 150, "pay_count": 0, "pay_mu": 0 } }\' --sim 1 | permissionlessly anchors epoch roots.');
+    console.log('- /tx --command \'{ "op": "epoch_commit", "epoch": 1, "at": 3600, "roots": { "dep": "<root>", "use": "<root>", "earn": "<root>", "fee": "<root>" }, "totals": { "dep_count": 0, "dep_mu": 0, "use_count": 1, "use_mu": 1000, "provider_count": 1, "earn_mu": 850, "fee_mu": 150, "fee_cum_mu": 150 } }\' --sim 1 | permissionlessly anchors epoch roots.');
     console.log('- /tx --command \'{ "op": "fraud_proof", "epoch": 1, "proof_epoch": 2, "at": 7200, "reason": "over_credit", "receipt": { ... }, "claimed_mu_owed_cum": 2000 }\' --sim 1 | submits a signed receipt proving an inflated epoch commit.');
     console.log('- /tx --command \'{ "op": "dispute", "session_id": "<id>", "reason": "service_failure", "provider": "<pk>", "at": 7200, "evidence_hash": "<hash>" }\' --sim 1 | opens a dispute with a refundable 5000 mu deposit.');
     console.log('- /tx --command \'{ "op": "dispute_resolve", "dispute_id": 1, "outcome": "provider_fault", "deposit_action": "refund", "rationale_hash": "<hash>", "slash": true, "at": 10800 }\' --sim 1 | admin resolves a dispute.');
@@ -268,10 +263,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "tap_rate_oracle", "tap_usd_e6": 50000, "source": "uniswap-v2", "ts": 3600 }\' --sim 1 | admin/oracle updates the TAP/USD policy rate for TAP deposits.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk-intent/<memo>/<payload_hash>", "value": { "op": "deposit_tnk", "sender": "<pk>", "intent": { ... }, "sig": "<sig>" } } | user-signed TNK deposit intent for free.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk|tap|fiat/...", "value": { "op": "tnk_deposit|tap_deposit|fiat_deposit", ... } } | admin/oracle credits deposit evidence for free; deposits fold into ev/dep roots.');
-    console.log('- /tx --command \'{ "op": "payout_confirm", "epoch": 7, "who": "<pk>", "mu": 1000000, "tnk_e18": "500000000000000000", "msb_tx_hash": "<hash>", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated TNK provider payout.');
-    console.log('- /tx --command \'{ "op": "payout_confirm", "rail": "stripe", "epoch": 7, "who": "<pk>", "mu": 1000000, "external_ref": "tr_...", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated Stripe Connect provider payout.');
-    console.log('- /tx --command \'{ "op": "payout_confirm", "rail": "coinbase", "epoch": 7, "who": "<pk>", "mu": 1000000, "external_ref": "transfer_...", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated Coinbase provider payout.');
-    console.log('- /tx --command \'{ "op": "payout_confirm", "kind": "fee_sweep", "epoch": 7, "who": "treasury", "mu": 1000000, "tnk_e18": "500000000000000000", "msb_tx_hash": "<hash>", "at": 25200 }\' --sim 1 | admin/oracle confirms a router fee sweep.');
+    console.log('- Provider payouts are non-custodial TAP claims from epoch earning roots; use the TAP claim-proof/calldata tools, not payout_confirm /tx commands.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');

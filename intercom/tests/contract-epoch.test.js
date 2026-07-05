@@ -192,7 +192,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
       op: 'epoch_commit',
       epoch: 1,
       at: 3_600,
-      roots: { ...roll.roots, pay: 'f'.repeat(64) },
+      roots: { ...roll.roots, fee: 'f'.repeat(64) },
       totals: roll.totals,
     },
     submitter.publicKey,
@@ -282,15 +282,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     ts: 3_600,
     updated_at: applyKey,
   });
-  assert.deepEqual((await storage.get('ev/pay/1')).value, {
-    type: 'payout_root',
-    epoch: 1,
-    merkle_root: roll.roots.pay,
-    count: 0,
-    mu_total: 0,
-    ts: 3_600,
-    updated_at: applyKey,
-  });
+  assert.equal(await storage.get('ev/pay/1'), null);
 });
 
 test('MayhemContract fraudProof voids an inflated single-receipt commit and bans submitter', async () => {

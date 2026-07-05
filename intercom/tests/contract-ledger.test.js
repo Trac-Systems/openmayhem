@@ -138,6 +138,37 @@ test('MayhemProtocol keeps deposit evidence off the paid tx route', () => {
   assert.deepEqual(paidOps.map((op) => op.type), ['epochCommit']);
 });
 
+test('MayhemProtocol keeps payout claims off the paid tx route', () => {
+  const protocol = new MayhemProtocol({}, {});
+  const paidOps = [
+    { op: 'epoch_commit', epoch: 1, at: 3_600, roots: {}, totals: {} },
+    {
+      op: 'payout_confirm',
+      epoch: 1,
+      who: 'provider-a',
+      mu: 100,
+      tnk_e18: '1000000000000000000',
+      msb_tx_hash: 'a'.repeat(64),
+      at: 3_600,
+    },
+    {
+      op: 'payout_confirm',
+      epoch: 1,
+      who: 'provider-b',
+      mu: 200,
+      rail: 'stripe',
+      external_ref: 'tr_provider_b',
+      fiat_currency: 'usd',
+      fiat_amount_minor: 1,
+      at: 3_601,
+    },
+  ]
+    .map((command) => protocol.mapTxCommand(JSON.stringify(command)))
+    .filter(Boolean);
+
+  assert.deepEqual(paidOps.map((op) => op.type), ['epochCommit']);
+});
+
 test('MayhemContract epochApply mutates credit, earning, and fee state in place', async () => {
   const { admin, provider, user, outsider, storage, contract } = await setupLedgerContract();
 

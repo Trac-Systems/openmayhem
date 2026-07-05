@@ -210,7 +210,7 @@ enum AdminCommands {
     FiatDeposit(AdminFiatDepositArgs),
     /// Record a fiat chargeback clawback and account freeze.
     FiatChargeback(AdminFiatChargebackArgs),
-    /// Confirm an executed provider payout or router fee sweep.
+    /// Retired: provider payouts are non-custodial TAP claims.
     PayoutConfirm(AdminPayoutConfirmArgs),
     /// Anchor recomputed epoch roots permissionlessly.
     EpochCommit(AdminEpochCommitArgs),
@@ -1752,15 +1752,6 @@ enum AdminPayoutConfirmKind {
     FeeSweep,
 }
 
-impl AdminPayoutConfirmKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Provider => "provider",
-            Self::FeeSweep => "fee_sweep",
-        }
-    }
-}
-
 #[derive(Debug, Parser)]
 struct AdminTxArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
@@ -2372,11 +2363,11 @@ struct AdminEpochCommitArgs {
     #[arg(long, value_name = "PATH")]
     recomputed_file: Option<PathBuf>,
 
-    /// JSON object containing dep/use/earn/fee/pay roots.
+    /// JSON object containing dep/use/earn/fee roots.
     #[arg(long)]
     roots_json: Option<String>,
 
-    /// Path to a JSON object containing dep/use/earn/fee/pay roots.
+    /// Path to a JSON object containing dep/use/earn/fee roots.
     #[arg(long, value_name = "PATH")]
     roots_file: Option<PathBuf>,
 
@@ -2421,11 +2412,11 @@ struct AdminEpochApplyArgs {
     #[arg(long, value_name = "PATH")]
     earnings_file: Option<PathBuf>,
 
-    /// JSON object containing dep/use/earn/fee/pay roots.
+    /// JSON object containing dep/use/earn/fee roots.
     #[arg(long)]
     roots_json: Option<String>,
 
-    /// Path to a JSON object containing dep/use/earn/fee/pay roots.
+    /// Path to a JSON object containing dep/use/earn/fee roots.
     #[arg(long, value_name = "PATH")]
     roots_file: Option<PathBuf>,
 
@@ -8561,6 +8552,11 @@ async fn admin(command: AdminCommands) -> Result<()> {
             )
             .await;
         }
+        AdminCommands::PayoutConfirm(_) => {
+            bail!(
+                "payout-confirm is retired; provider payouts are non-custodial TAP claims from epoch earning roots"
+            );
+        }
         _ => {}
     }
     let tx_args = admin_tx_args(&command);
@@ -8665,7 +8661,7 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)?))
         }
         AdminCommands::PayoutConfirm(args) => {
-            Ok(("payoutConfirm", admin_payout_confirm_payload(args)?))
+            admin_payout_confirm_payload(args).map(|value| ("payoutConfirm", value))
         }
         AdminCommands::EpochCommit(args) => Ok(("epochCommit", admin_epoch_commit_payload(args)?)),
         AdminCommands::EpochApply(args) => Ok(("epochApply", admin_epoch_apply_payload(args)?)),
@@ -9232,69 +9228,10 @@ fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Result<Value
     }))
 }
 
-fn admin_payout_confirm_payload(args: &AdminPayoutConfirmArgs) -> Result<Value> {
-    if args.kind == AdminPayoutConfirmKind::FeeSweep && args.rail != AdminPayoutMethod::Tnk {
-        bail!("fee-sweep payout confirmations must use --rail tnk");
-    }
-    let mut payload = json!({
-        "op": "payout_confirm",
-        "epoch": args.epoch,
-        "who": &args.who,
-        "mu": args.mu,
-        "at": args.at,
-    });
-    if args.kind != AdminPayoutConfirmKind::Provider {
-        payload["kind"] = json!(args.kind.as_str());
-    }
-    match args.rail {
-        AdminPayoutMethod::Tnk => {
-            if args.external_ref.is_some()
-                || args.fiat_currency.is_some()
-                || args.fiat_amount_minor.is_some()
-            {
-                bail!(
-                    "TNK payout confirmations must not include --external-ref, --fiat-currency, or --fiat-amount-minor"
-                );
-            }
-            let tnk_e18 = args
-                .tnk_e18
-                .as_deref()
-                .context("TNK payout confirmations require --tnk-e18")?;
-            let msb_tx_hash = args
-                .msb_tx_hash
-                .as_deref()
-                .context("TNK payout confirmations require --msb-tx-hash")?;
-            payload["tnk_e18"] = json!(tnk_e18);
-            payload["msb_tx_hash"] = json!(msb_tx_hash);
-        }
-        AdminPayoutMethod::Stripe | AdminPayoutMethod::Coinbase => {
-            if args.kind == AdminPayoutConfirmKind::FeeSweep {
-                bail!("fee-sweep payout confirmations must use --rail tnk");
-            }
-            if args.tnk_e18.is_some() || args.msb_tx_hash.is_some() {
-                bail!("fiat payout confirmations must not include --tnk-e18 or --msb-tx-hash");
-            }
-            let external_ref = args
-                .external_ref
-                .as_deref()
-                .context("fiat payout confirmations require --external-ref")?;
-            let fiat_currency = args
-                .fiat_currency
-                .as_deref()
-                .context("fiat payout confirmations require --fiat-currency")?;
-            let fiat_amount_minor = args
-                .fiat_amount_minor
-                .context("fiat payout confirmations require --fiat-amount-minor")?;
-            if fiat_amount_minor == 0 {
-                bail!("fiat payout confirmations require positive --fiat-amount-minor");
-            }
-            payload["rail"] = json!(args.rail.as_str());
-            payload["external_ref"] = json!(external_ref);
-            payload["fiat_currency"] = json!(normalize_admin_fiat_currency(fiat_currency)?);
-            payload["fiat_amount_minor"] = json!(fiat_amount_minor);
-        }
-    }
-    Ok(payload)
+fn admin_payout_confirm_payload(_args: &AdminPayoutConfirmArgs) -> Result<Value> {
+    bail!(
+        "payout-confirm is retired; provider payouts are non-custodial TAP claims from epoch earning roots"
+    )
 }
 
 fn admin_epoch_commit_payload(args: &AdminEpochCommitArgs) -> Result<Value> {
@@ -12238,12 +12175,10 @@ async fn payouts(args: PayoutsArgs) -> Result<()> {
         json!({
             "rpc_url": rpc_url,
             "epoch": epoch,
-            "pay": read_state_value(&rpc, &format!("ev/pay/{epoch}")).await?,
+            "claim_model": "tap_non_custodial_claim",
             "fee": read_state_value(&rpc, &format!("ev/fee/{epoch}")).await?,
         })
     } else {
-        let mut pay = read_prefix_entries(&rpc, "ev/pay/").await?;
-        pay.sort_by(|a, b| a.key.cmp(&b.key));
         let mut fee_sweeps = read_prefix_entries(&rpc, "ev/fee/")
             .await?
             .into_iter()
@@ -12258,7 +12193,7 @@ async fn payouts(args: PayoutsArgs) -> Result<()> {
         fee_sweeps.sort_by(|a, b| a.key.cmp(&b.key));
         json!({
             "rpc_url": rpc_url,
-            "pay": pay,
+            "claim_model": "tap_non_custodial_claim",
             "fee_sweeps": fee_sweeps,
         })
     };
@@ -13406,30 +13341,11 @@ fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
 
 fn print_payouts_report(report: &Value) {
     if let Some(epoch) = report.get("epoch").and_then(Value::as_u64) {
-        println!("Payout evidence for epoch {epoch}");
-        print_optional_evidence("pay", report.get("pay"));
+        println!("Provider payouts for epoch {epoch}: non-custodial TAP claims from earning roots");
         print_optional_evidence("fee", report.get("fee"));
         return;
     }
-    println!("Payout evidence");
-    for entry in report
-        .get("pay")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let key = entry.get("key").and_then(Value::as_str).unwrap_or("");
-        let value = entry.get("value").unwrap_or(&Value::Null);
-        println!(
-            "{key}: count={} mu_total={} root={}",
-            value.get("count").and_then(Value::as_u64).unwrap_or(0),
-            value.get("mu_total").and_then(Value::as_u64).unwrap_or(0),
-            value
-                .get("merkle_root")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        );
-    }
+    println!("Provider payouts: non-custodial TAP claims from earning roots");
     for entry in report
         .get("fee_sweeps")
         .and_then(Value::as_array)
@@ -13574,7 +13490,6 @@ async fn read_evidence_for_export(args: &ReceiptsExportArgs) -> Result<EpochEvid
         r#use: read_state_value(&rpc, &format!("ev/use/{}", args.epoch)).await?,
         earn: read_state_value(&rpc, &format!("ev/earn/{}", args.epoch)).await?,
         fee: read_state_value(&rpc, &format!("ev/fee/{}", args.epoch)).await?,
-        pay: read_state_value(&rpc, &format!("ev/pay/{}", args.epoch)).await?,
     })
 }
 
@@ -13585,7 +13500,6 @@ fn read_evidence_file(path: &Path, epoch: u64) -> Result<EpochEvidenceSnapshot> 
         r#use: evidence_record(&value, epoch, "use"),
         earn: evidence_record(&value, epoch, "earn"),
         fee: evidence_record(&value, epoch, "fee"),
-        pay: evidence_record(&value, epoch, "pay"),
     })
 }
 
@@ -13798,27 +13712,6 @@ fn verify_epoch_evidence(
         &totals["fee_cum_mu"],
         evidence.fee.as_ref(),
         "mu_fee_cum",
-    );
-    push_evidence_check(
-        &mut checks,
-        &format!("ev/pay/{epoch}.merkle_root"),
-        &roots["pay"],
-        evidence.pay.as_ref(),
-        "merkle_root",
-    );
-    push_evidence_check(
-        &mut checks,
-        &format!("ev/pay/{epoch}.count"),
-        &totals["pay_count"],
-        evidence.pay.as_ref(),
-        "count",
-    );
-    push_evidence_check(
-        &mut checks,
-        &format!("ev/pay/{epoch}.mu_total"),
-        &totals["pay_mu"],
-        evidence.pay.as_ref(),
-        "mu_total",
     );
     checks
 }
@@ -14072,8 +13965,6 @@ struct EpochEvidenceSnapshot {
     earn: Option<Value>,
     #[serde(default)]
     fee: Option<Value>,
-    #[serde(default)]
-    pay: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -19379,117 +19270,9 @@ mod tests {
     }
 
     #[test]
-    fn admin_payout_confirm_payloads_enforce_rail_specific_evidence() {
-        let tnk = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
-            tx: test_admin_tx_args(),
-            kind: AdminPayoutConfirmKind::Provider,
-            rail: AdminPayoutMethod::Tnk,
-            epoch: 7,
-            who: "provider-a".to_owned(),
-            mu: 1_000_000,
-            tnk_e18: Some("500000000000000000".to_owned()),
-            msb_tx_hash: Some("msb-tx".to_owned()),
-            external_ref: None,
-            fiat_currency: None,
-            fiat_amount_minor: None,
-            at: 25_200,
-        })
-        .unwrap();
-        assert_eq!(
-            tnk,
-            json!({
-                "op": "payout_confirm",
-                "epoch": 7,
-                "who": "provider-a",
-                "mu": 1_000_000,
-                "tnk_e18": "500000000000000000",
-                "msb_tx_hash": "msb-tx",
-                "at": 25_200,
-            })
-        );
-
-        let stripe = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
-            tx: test_admin_tx_args(),
-            kind: AdminPayoutConfirmKind::Provider,
-            rail: AdminPayoutMethod::Stripe,
-            epoch: 7,
-            who: "provider-a".to_owned(),
-            mu: 1_000_000,
-            tnk_e18: None,
-            msb_tx_hash: None,
-            external_ref: Some("tr_123".to_owned()),
-            fiat_currency: Some("usd".to_owned()),
-            fiat_amount_minor: Some(100),
-            at: 25_200,
-        })
-        .unwrap();
-        assert_eq!(
-            stripe,
-            json!({
-                "op": "payout_confirm",
-                "rail": "stripe",
-                "epoch": 7,
-                "who": "provider-a",
-                "mu": 1_000_000,
-                "external_ref": "tr_123",
-                "fiat_currency": "usd",
-                "fiat_amount_minor": 100,
-                "at": 25_200,
-            })
-        );
-
-        let fee_sweep = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
-            tx: test_admin_tx_args(),
-            kind: AdminPayoutConfirmKind::FeeSweep,
-            rail: AdminPayoutMethod::Tnk,
-            epoch: 7,
-            who: "treasury".to_owned(),
-            mu: 1_000_000,
-            tnk_e18: Some("500000000000000000".to_owned()),
-            msb_tx_hash: Some("treasury-msb-tx".to_owned()),
-            external_ref: None,
-            fiat_currency: None,
-            fiat_amount_minor: None,
-            at: 25_200,
-        })
-        .unwrap();
-        assert_eq!(
-            fee_sweep,
-            json!({
-                "op": "payout_confirm",
-                "kind": "fee_sweep",
-                "epoch": 7,
-                "who": "treasury",
-                "mu": 1_000_000,
-                "tnk_e18": "500000000000000000",
-                "msb_tx_hash": "treasury-msb-tx",
-                "at": 25_200,
-            })
-        );
-
-        let err = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
-            rail: AdminPayoutMethod::Stripe,
-            tnk_e18: Some("1".to_owned()),
-            external_ref: Some("tr_123".to_owned()),
-            fiat_currency: Some("usd".to_owned()),
-            fiat_amount_minor: Some(100),
-            ..test_payout_confirm_args()
-        })
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("fiat payout confirmations must not include"));
-
-        let err = admin_payout_confirm_payload(&AdminPayoutConfirmArgs {
-            kind: AdminPayoutConfirmKind::FeeSweep,
-            rail: AdminPayoutMethod::Coinbase,
-            external_ref: Some("transfer_123".to_owned()),
-            fiat_currency: Some("usd".to_owned()),
-            fiat_amount_minor: Some(100),
-            ..test_payout_confirm_args()
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("fee-sweep"));
+    fn admin_payout_confirm_payload_is_retired() {
+        let err = admin_payout_confirm_payload(&test_payout_confirm_args()).unwrap_err();
+        assert!(err.to_string().contains("payout-confirm is retired"));
     }
 
     #[test]
@@ -19499,7 +19282,6 @@ mod tests {
             "use": "u".repeat(64),
             "earn": "e".repeat(64),
             "fee": "f".repeat(64),
-            "pay": "p".repeat(64),
         });
         let totals = json!({
             "dep_count": 0,
@@ -19510,8 +19292,6 @@ mod tests {
             "earn_mu": 1_700,
             "fee_mu": 300,
             "fee_cum_mu": 300,
-            "pay_count": 0,
-            "pay_mu": 0,
         });
 
         let commit = admin_epoch_commit_payload(&AdminEpochCommitArgs {
@@ -19588,7 +19368,6 @@ mod tests {
             "use": "u".repeat(64),
             "earn": "e".repeat(64),
             "fee": "f".repeat(64),
-            "pay": "p".repeat(64),
         });
         let totals = json!({ "use_mu": 0 });
 
@@ -21223,7 +21002,6 @@ mod tests {
                 "use": "b".repeat(64),
                 "earn": "c".repeat(64),
                 "fee": "d".repeat(64),
-                "pay": "e".repeat(64),
             },
             "totals": {
                 "dep_count": 1,
@@ -21234,8 +21012,6 @@ mod tests {
                 "earn_mu": 6,
                 "fee_mu": 7,
                 "fee_cum_mu": 8,
-                "pay_count": 9,
-                "pay_mu": 10,
             }
         });
         let evidence = EpochEvidenceSnapshot {
@@ -21260,28 +21036,23 @@ mod tests {
                 "mu_fee_epoch": 7,
                 "mu_fee_cum": 8,
             })),
-            pay: Some(json!({
-                "merkle_root": "e".repeat(64),
-                "count": 9,
-                "mu_total": 10,
-            })),
         };
 
         let checks = verify_epoch_evidence(4, &recomputed, &evidence);
-        assert_eq!(checks.len(), 16);
+        assert_eq!(checks.len(), 13);
         assert!(checks.iter().all(|check| check.ok));
 
         let mismatched = EpochEvidenceSnapshot {
-            pay: Some(json!({
-                "merkle_root": "e".repeat(64),
-                "count": 9,
-                "mu_total": 11,
+            fee: Some(json!({
+                "merkle_root": "d".repeat(64),
+                "mu_fee_epoch": 7,
+                "mu_fee_cum": 9,
             })),
             ..evidence
         };
         let checks = verify_epoch_evidence(4, &recomputed, &mismatched);
         assert!(checks.iter().any(|check| {
-            check.key == "ev/pay/4.mu_total" && !check.ok && check.actual == json!(11)
+            check.key == "ev/fee/4.mu_fee_cum" && !check.ok && check.actual == json!(9)
         }));
     }
 
