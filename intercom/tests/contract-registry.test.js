@@ -867,6 +867,64 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   assert.equal(stored.value.updated_at, makeTxKey(8));
 });
 
+test('MayhemContract accepts canonical integer attestation tiers 1 through 4 only', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  const tier4Register = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'd'.repeat(64),
+      att_tier: 4,
+    },
+    admin.publicKey,
+    1
+  );
+  assert.equal(tier4Register.ok, true, tier4Register.message);
+
+  const tier4Stored = await storage.get(`enclave/${'d'.repeat(64)}`);
+  assert.equal(tier4Stored.value.att_tier, 4);
+
+  const tier3Update = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'd'.repeat(64),
+      att_tier: 3,
+    },
+    admin.publicKey,
+    2
+  );
+  assert.equal(tier3Update.ok, true, tier3Update.message);
+
+  const tier3Stored = await storage.get(`enclave/${'d'.repeat(64)}`);
+  assert.equal(tier3Stored.value.att_tier, 3);
+
+  const fractionalRegister = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'e'.repeat(64),
+      att_tier: 3 / 2,
+    },
+    admin.publicKey,
+    3
+  );
+  assert.notEqual(fractionalRegister.ok, true);
+  assert.match(fractionalRegister.message, /invalid schema/i);
+  assert.equal(await storage.get(`enclave/${'e'.repeat(64)}`), null);
+});
+
 test('MayhemContract rejects provider-authored payout and probation hints', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();

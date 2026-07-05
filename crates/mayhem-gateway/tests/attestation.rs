@@ -6,8 +6,8 @@ use std::fs;
 use ed25519_dalek::SigningKey;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use mayhem_enclave::{
-    build_tier1_attestation_report, build_tier2_attestation_report, measure_binary, RuntimeKeypair,
-    Tier1AttestationOptions, Tier2AttestationOptions, TIER2_ATTESTATION_TIER,
+    build_hardware_attestation_report, build_tier1_attestation_report, measure_binary,
+    HardwareAttestationOptions, RuntimeKeypair, Tier1AttestationOptions,
 };
 use mayhem_gateway::{
     verify_attestation, verify_tier1_attestation, AttestationVerificationRequest,
@@ -16,7 +16,7 @@ use mayhem_gateway::{
 use mayhem_proto::{
     catalog_enclave_id, hardware_quote_binding, AttestationBody, AttestationRuntimeConfig,
     CatalogEnclaveIdentity, HardwareQuote, HardwareQuoteKind, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION,
+    ATTESTATION_SCHEMA_VERSION, TIER2_DEVICE_IDENTITY_TIER, TIER3_CONFIDENTIAL_COMPUTE_TIER,
 };
 
 fn test_report() -> (
@@ -63,7 +63,7 @@ fn test_report() -> (
     (temp, attestation.report, contract, trusted)
 }
 
-fn test_tier2_report(
+fn test_hardware_report(
     quote_kind: HardwareQuoteKind,
 ) -> (
     tempfile::TempDir,
@@ -71,10 +71,10 @@ fn test_tier2_report(
     EnclaveContractRecord,
     BTreeSet<String>,
 ) {
-    test_tier2_report_with_evidence(quote_kind, |_, _| "mock-hardware-quote".to_owned())
+    test_hardware_report_with_evidence(quote_kind, |_, _| "mock-hardware-quote".to_owned())
 }
 
-fn test_tier2_report_with_evidence(
+fn test_hardware_report_with_evidence(
     quote_kind: HardwareQuoteKind,
     evidence_for_binding: impl FnOnce(&AttestationBody, &str) -> String,
 ) -> (
@@ -85,10 +85,11 @@ fn test_tier2_report_with_evidence(
 ) {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = temp.path().join("mayhem-enclave-test-bin");
-    fs::write(&binary, b"measured tier2 enclave binary").expect("write test binary");
+    fs::write(&binary, b"measured hardware enclave binary").expect("write test binary");
     let binary_hash = measure_binary(&binary).expect("measure binary");
     let runtime_keypair = RuntimeKeypair::from_seed([9_u8; 32]);
     let provider_signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let att_tier = quote_kind.attestation_tier();
     let identity = CatalogEnclaveIdentity {
         admin_pubkey: "admin-key".to_owned(),
         model_id: "mayhem/qwen3.5-4b@q4".to_owned(),
@@ -104,7 +105,7 @@ fn test_tier2_report_with_evidence(
         provider_pubkey: hex::encode(provider_signing_key.verifying_key().to_bytes()),
         manifest_hash: identity.manifest_hash.clone(),
         binary_hash: identity.binary_hash.clone(),
-        att_tier: TIER2_ATTESTATION_TIER,
+        att_tier,
         hw_quote: None,
         boot_epoch: 100,
         report_ts: 200,
@@ -118,7 +119,7 @@ fn test_tier2_report_with_evidence(
         binding,
         endorsements: vec!["mock-root".to_owned()],
     };
-    let attestation = build_tier2_attestation_report(&Tier2AttestationOptions {
+    let attestation = build_hardware_attestation_report(&HardwareAttestationOptions {
         identity: identity.clone(),
         runtime_keypair,
         provider_signing_seed: [7_u8; 32],
@@ -129,7 +130,7 @@ fn test_tier2_report_with_evidence(
         hw_quote: quote,
         runtime_config: body.runtime_config.clone(),
     })
-    .expect("build tier2 report");
+    .expect("build hardware report");
     let contract = EnclaveContractRecord {
         enclave_id: body.enclave_id,
         admin_pubkey: identity.admin_pubkey,
@@ -137,7 +138,7 @@ fn test_tier2_report_with_evidence(
         artifact_root: identity.artifact_root,
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
-        att_tier: TIER2_ATTESTATION_TIER,
+        att_tier: attestation.report.att_tier,
         caps: serde_json::json!({}),
     };
     let trusted = BTreeSet::from([attestation.report.binary_hash.clone()]);
@@ -387,8 +388,9 @@ fn verification_rejects_runtime_tp_degree_mismatch() {
 }
 
 #[test]
-fn verifies_mock_tier2_report_when_explicitly_enabled() {
-    let (_temp, report, contract, trusted) = test_tier2_report(HardwareQuoteKind::MockTier2);
+fn verifies_mock_device_identity_report_when_explicitly_enabled() {
+    let (_temp, report, contract, trusted) =
+        test_hardware_report(HardwareQuoteKind::MockDeviceIdentity);
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,
@@ -399,15 +401,16 @@ fn verifies_mock_tier2_report_when_explicitly_enabled() {
     );
     request.allow_mock_hardware_quote = true;
 
-    let verified = verify_tier1_attestation(&request).expect("mock tier2 report verifies");
+    let verified = verify_tier1_attestation(&request).expect("mock hardware report verifies");
 
-    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
     assert_eq!(verified.enclave_id, contract.enclave_id);
 }
 
 #[test]
-fn tier2_report_requires_hardware_quote_verification() {
-    let (_temp, report, contract, trusted) = test_tier2_report(HardwareQuoteKind::MockTier2);
+fn hardware_report_requires_quote_verification() {
+    let (_temp, report, contract, trusted) =
+        test_hardware_report(HardwareQuoteKind::MockDeviceIdentity);
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
@@ -424,10 +427,10 @@ fn tier2_report_requires_hardware_quote_verification() {
 
 #[test]
 fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
-    let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::AppleAppAttestJwt, |body, binding| {
-            test_apple_app_attest_evidence(body, binding)
-        });
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+        HardwareQuoteKind::AppleAppAttestJwt,
+        test_apple_app_attest_evidence,
+    );
     let jwks = test_nvidia_jwks();
     let mut request = AttestationVerificationRequest::new(
         &report,
@@ -440,18 +443,18 @@ fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
     request.trusted_apple_app_attest_jwks = Some(&jwks);
 
     let verified =
-        verify_tier1_attestation(&request).expect("Apple App Attest tier2 identity verifies");
+        verify_tier1_attestation(&request).expect("Apple App Attest Tier 2 identity verifies");
 
-    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
     assert_eq!(verified.enclave_id, contract.enclave_id);
 }
 
 #[test]
 fn apple_app_attest_tier2_identity_requires_trusted_jwks() {
-    let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::AppleAppAttestJwt, |body, binding| {
-            test_apple_app_attest_evidence(body, binding)
-        });
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+        HardwareQuoteKind::AppleAppAttestJwt,
+        test_apple_app_attest_evidence,
+    );
     let request = AttestationVerificationRequest::new(
         &report,
         &contract,
@@ -472,10 +475,10 @@ fn apple_app_attest_tier2_identity_requires_trusted_jwks() {
 
 #[test]
 fn verifies_nvidia_gb10_tier2_device_identity_with_trusted_jwks() {
-    let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaGb10DeviceJwt, |body, binding| {
-            test_nvidia_gb10_device_evidence(body, binding, "NVIDIA GB10 DGX Spark")
-        });
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+        HardwareQuoteKind::NvidiaGb10DeviceJwt,
+        |body, binding| test_nvidia_gb10_device_evidence(body, binding, "NVIDIA GB10 DGX Spark"),
+    );
     let jwks = test_nvidia_jwks();
     let mut request = AttestationVerificationRequest::new(
         &report,
@@ -490,16 +493,16 @@ fn verifies_nvidia_gb10_tier2_device_identity_with_trusted_jwks() {
     let verified =
         verify_tier1_attestation(&request).expect("NVIDIA GB10 device identity verifies");
 
-    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
     assert_eq!(verified.enclave_id, contract.enclave_id);
 }
 
 #[test]
 fn nvidia_gb10_tier2_device_identity_rejects_non_gb10_hardware() {
-    let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaGb10DeviceJwt, |body, binding| {
-            test_nvidia_gb10_device_evidence(body, binding, "NVIDIA H100")
-        });
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
+        HardwareQuoteKind::NvidiaGb10DeviceJwt,
+        |body, binding| test_nvidia_gb10_device_evidence(body, binding, "NVIDIA H100"),
+    );
     let jwks = test_nvidia_jwks();
     let mut request = AttestationVerificationRequest::new(
         &report,
@@ -522,9 +525,9 @@ fn nvidia_gb10_tier2_device_identity_rejects_non_gb10_hardware() {
 }
 
 #[test]
-fn verifies_nvidia_nras_tier2_report_with_trusted_jwks() {
+fn verifies_nvidia_nras_tier3_report_with_trusted_jwks() {
     let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
+        test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
         });
     let jwks = test_nvidia_jwks();
@@ -539,16 +542,16 @@ fn verifies_nvidia_nras_tier2_report_with_trusted_jwks() {
     request.trusted_nvidia_nras_jwks = Some(&jwks);
 
     let verified =
-        verify_tier1_attestation(&request).expect("signed NVIDIA NRAS tier2 report verifies");
+        verify_tier1_attestation(&request).expect("signed NVIDIA NRAS hardware report verifies");
 
-    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.att_tier, TIER3_CONFIDENTIAL_COMPUTE_TIER);
     assert_eq!(verified.enclave_id, contract.enclave_id);
 }
 
 #[test]
-fn nvidia_nras_tier2_report_requires_trusted_jwks() {
+fn nvidia_nras_tier3_report_requires_trusted_jwks() {
     let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
+        test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
         });
     let request = AttestationVerificationRequest::new(
@@ -569,9 +572,40 @@ fn nvidia_nras_tier2_report_requires_trusted_jwks() {
 }
 
 #[test]
-fn nvidia_nras_tier2_report_rejects_signed_failed_appraisal() {
+fn hardware_quote_kind_must_match_report_tier() {
+    let (_temp, mut report, mut contract, trusted) =
+        test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
+            test_nvidia_evidence(binding, true)
+        });
+    report.att_tier = TIER2_DEVICE_IDENTITY_TIER;
+    contract.att_tier = TIER2_DEVICE_IDENTITY_TIER;
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("NVIDIA CC quote must not be accepted as Tier 2 identity");
+
+    assert!(matches!(
+        err,
+        GatewayError::ContractMismatch {
+            field: "hw_quote.att_tier",
+            expected,
+            actual
+        } if expected == TIER3_CONFIDENTIAL_COMPUTE_TIER.to_string()
+            && actual == TIER2_DEVICE_IDENTITY_TIER.to_string()
+    ));
+}
+
+#[test]
+fn nvidia_nras_tier3_report_rejects_signed_failed_appraisal() {
     let (_temp, report, contract, trusted) =
-        test_tier2_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
+        test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, false)
         });
     let jwks = test_nvidia_jwks();
@@ -597,7 +631,7 @@ fn nvidia_nras_tier2_report_rejects_signed_failed_appraisal() {
 
 #[test]
 fn verifies_nvidia_nvtrust_offline_cc_quote_with_trusted_jwks() {
-    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |_, binding| test_nvidia_offline_evidence(binding, true),
     );
@@ -614,13 +648,13 @@ fn verifies_nvidia_nvtrust_offline_cc_quote_with_trusted_jwks() {
 
     let verified = verify_tier1_attestation(&request).expect("offline NVIDIA CC quote verifies");
 
-    assert_eq!(verified.att_tier, 2);
+    assert_eq!(verified.att_tier, TIER3_CONFIDENTIAL_COMPUTE_TIER);
     assert_eq!(verified.enclave_id, contract.enclave_id);
 }
 
 #[test]
 fn nvidia_nvtrust_offline_cc_quote_requires_trusted_jwks() {
-    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |_, binding| test_nvidia_offline_evidence(binding, true),
     );
@@ -644,7 +678,7 @@ fn nvidia_nvtrust_offline_cc_quote_requires_trusted_jwks() {
 
 #[test]
 fn nvidia_nvtrust_offline_cc_quote_rejects_failed_measurements() {
-    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |_, binding| test_nvidia_offline_evidence(binding, false),
     );
@@ -671,7 +705,7 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_failed_measurements() {
 
 #[test]
 fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
-    let (_temp, report, contract, trusted) = test_tier2_report_with_evidence(
+    let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |body, binding| test_nvidia_gb10_device_evidence(body, binding, "NVIDIA GB10 DGX Spark"),
     );
@@ -701,7 +735,7 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
 
 #[test]
 fn sev_snp_and_tdx_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
-    let (_temp, report, contract, trusted) = test_tier2_report(HardwareQuoteKind::IntelTdxDcap);
+    let (_temp, report, contract, trusted) = test_hardware_report(HardwareQuoteKind::IntelTdxDcap);
     let mut request = AttestationVerificationRequest::new(
         &report,
         &contract,

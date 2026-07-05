@@ -17,7 +17,8 @@ use hkdf::Hkdf;
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
     AttestationBody, AttestationReport, AttestationRuntimeConfig, AttestationSigner,
-    CatalogEnclaveIdentity, HardwareQuote, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    CatalogEnclaveIdentity, HardwareQuote, HardwareQuoteKind, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, TIER1_SOFTWARE_ATTESTATION_TIER,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -27,8 +28,6 @@ pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MERKLE_KIND: &str = "blake3_merkle_v1";
 pub const SEALED_STORE_MANIFEST: &str = "sealed-manifest.json";
 pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
-pub const TIER1_ATTESTATION_TIER: u8 = 1;
-pub const TIER2_ATTESTATION_TIER: u8 = 2;
 pub const SANDBOX_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TCP_PROBE_TIMEOUT_MS: u64 = 2_000;
 pub const SATURATION_SHED_THRESHOLD: f64 = 0.9;
@@ -144,7 +143,7 @@ pub struct Tier1AttestationOptions {
 }
 
 #[derive(Clone, Debug)]
-pub struct Tier2AttestationOptions {
+pub struct HardwareAttestationOptions {
     pub identity: CatalogEnclaveIdentity,
     pub runtime_keypair: RuntimeKeypair,
     pub provider_signing_seed: [u8; 32],
@@ -157,7 +156,7 @@ pub struct Tier2AttestationOptions {
 }
 
 #[derive(Clone, Debug)]
-pub struct Tier2HardwareQuoteBindingOptions {
+pub struct HardwareQuoteBindingOptions {
     pub identity: CatalogEnclaveIdentity,
     pub runtime_keypair: RuntimeKeypair,
     pub provider_signing_seed: [u8; 32],
@@ -165,6 +164,7 @@ pub struct Tier2HardwareQuoteBindingOptions {
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub nonce_u: String,
+    pub hw_quote_kind: HardwareQuoteKind,
     pub runtime_config: AttestationRuntimeConfig,
 }
 
@@ -1273,7 +1273,7 @@ pub fn build_tier1_attestation_report(
         provider_pubkey,
         manifest_hash: identity.manifest_hash,
         binary_hash,
-        att_tier: TIER1_ATTESTATION_TIER,
+        att_tier: TIER1_SOFTWARE_ATTESTATION_TIER,
         hw_quote: None,
         boot_epoch: options.boot_epoch,
         report_ts: options.report_ts,
@@ -1311,16 +1311,16 @@ pub fn build_tier1_attestation_report(
     })
 }
 
-pub fn build_tier2_attestation_report(
-    options: &Tier2AttestationOptions,
+pub fn build_hardware_attestation_report(
+    options: &HardwareAttestationOptions,
 ) -> Result<Tier1AttestationReport> {
     if options.hw_quote.evidence.is_empty() {
         return Err(EnclaveError::InvalidInput(
-            "Tier-2 hardware quote evidence is required".to_owned(),
+            "hardware quote evidence is required".to_owned(),
         ));
     }
 
-    let binding_options = Tier2HardwareQuoteBindingOptions {
+    let binding_options = HardwareQuoteBindingOptions {
         identity: options.identity.clone(),
         runtime_keypair: options.runtime_keypair.clone(),
         provider_signing_seed: options.provider_signing_seed,
@@ -1328,14 +1328,15 @@ pub fn build_tier2_attestation_report(
         boot_epoch: options.boot_epoch,
         report_ts: options.report_ts,
         nonce_u: options.nonce_u.clone(),
+        hw_quote_kind: options.hw_quote.kind.clone(),
         runtime_config: options.runtime_config.clone(),
     };
-    let mut body = tier2_attestation_body(&binding_options)?;
+    let mut body = hardware_attestation_body(&binding_options)?;
     let binding =
         hardware_quote_binding(&body).map_err(|err| EnclaveError::Crypto(err.to_string()))?;
     if options.hw_quote.binding != binding {
         return Err(EnclaveError::InvalidInput(
-            "Tier-2 hardware quote binding does not match attestation body".to_owned(),
+            "hardware quote binding does not match attestation body".to_owned(),
         ));
     }
     body.hw_quote = Some(options.hw_quote.clone());
@@ -1371,14 +1372,12 @@ pub fn build_tier2_attestation_report(
     })
 }
 
-pub fn prepare_tier2_hardware_quote_binding(
-    options: &Tier2HardwareQuoteBindingOptions,
-) -> Result<String> {
-    let body = tier2_attestation_body(options)?;
+pub fn prepare_hardware_quote_binding(options: &HardwareQuoteBindingOptions) -> Result<String> {
+    let body = hardware_attestation_body(options)?;
     hardware_quote_binding(&body).map_err(|err| EnclaveError::Crypto(err.to_string()))
 }
 
-fn tier2_attestation_body(options: &Tier2HardwareQuoteBindingOptions) -> Result<AttestationBody> {
+fn hardware_attestation_body(options: &HardwareQuoteBindingOptions) -> Result<AttestationBody> {
     validate_identity(&options.identity)?;
     validate_hex_field("nonce_u", &options.nonce_u, 32)?;
 
@@ -1403,7 +1402,7 @@ fn tier2_attestation_body(options: &Tier2HardwareQuoteBindingOptions) -> Result<
         provider_pubkey,
         manifest_hash: identity.manifest_hash,
         binary_hash,
-        att_tier: TIER2_ATTESTATION_TIER,
+        att_tier: options.hw_quote_kind.attestation_tier(),
         hw_quote: None,
         boot_epoch: options.boot_epoch,
         report_ts: options.report_ts,
@@ -1438,7 +1437,7 @@ pub fn prepare_tier1_attestation_report(
         provider_pubkey: options.provider_pubkey.clone(),
         manifest_hash: identity.manifest_hash,
         binary_hash,
-        att_tier: TIER1_ATTESTATION_TIER,
+        att_tier: TIER1_SOFTWARE_ATTESTATION_TIER,
         hw_quote: None,
         boot_epoch: options.boot_epoch,
         report_ts: options.report_ts,
@@ -2688,7 +2687,7 @@ mod tests {
         })?;
         assert_eq!(report.report.binary_hash, binary_hash);
         assert_eq!(report.report.manifest_hash, identity.manifest_hash);
-        assert_eq!(report.report.att_tier, TIER1_ATTESTATION_TIER);
+        assert_eq!(report.report.att_tier, TIER1_SOFTWARE_ATTESTATION_TIER);
 
         let mut wrong_identity = identity;
         wrong_identity.binary_hash = "00".repeat(32);
@@ -2708,7 +2707,7 @@ mod tests {
     }
 
     #[test]
-    fn tier2_quote_binding_helper_matches_report_builder() -> Result<()> {
+    fn hardware_quote_binding_helper_matches_report_builder() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let binary = temp.path().join("mayhem-enclave-test-bin");
         fs::write(&binary, b"test binary bytes")?;
@@ -2720,7 +2719,7 @@ mod tests {
             manifest_hash: "manifest".to_owned(),
             binary_hash,
         };
-        let binding_options = Tier2HardwareQuoteBindingOptions {
+        let binding_options = HardwareQuoteBindingOptions {
             identity: identity.clone(),
             runtime_keypair: RuntimeKeypair::from_seed([9_u8; 32]),
             provider_signing_seed: [7_u8; 32],
@@ -2728,10 +2727,11 @@ mod tests {
             boot_epoch: 100,
             report_ts: 200,
             nonce_u: "aa".repeat(32),
+            hw_quote_kind: mayhem_proto::HardwareQuoteKind::NvidiaNrasJwt,
             runtime_config: AttestationRuntimeConfig::default(),
         };
-        let binding = prepare_tier2_hardware_quote_binding(&binding_options)?;
-        let report = build_tier2_attestation_report(&Tier2AttestationOptions {
+        let binding = prepare_hardware_quote_binding(&binding_options)?;
+        let report = build_hardware_attestation_report(&HardwareAttestationOptions {
             identity,
             runtime_keypair: binding_options.runtime_keypair,
             provider_signing_seed: binding_options.provider_signing_seed,
@@ -2748,9 +2748,12 @@ mod tests {
             runtime_config: binding_options.runtime_config,
         })?;
 
-        assert_eq!(report.report.att_tier, TIER2_ATTESTATION_TIER);
         assert_eq!(
-            report.report.hw_quote.expect("tier2 quote").binding,
+            report.report.att_tier,
+            mayhem_proto::TIER3_CONFIDENTIAL_COMPUTE_TIER
+        );
+        assert_eq!(
+            report.report.hw_quote.expect("hardware quote").binding,
             binding
         );
         Ok(())

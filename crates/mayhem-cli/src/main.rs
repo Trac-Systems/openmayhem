@@ -380,11 +380,11 @@ struct UseArgs {
     #[arg(long)]
     session_frame_timeout_seconds: Option<u64>,
 
-    /// Trusted Apple App Attest JWKS JSON file for verifying Tier-2 Apple hardware-identity quotes.
+    /// Trusted Apple App Attest JWKS JSON file for verifying Tier 2 Apple hardware-identity quotes.
     #[arg(long, value_name = "PATH")]
     apple_app_attest_jwks_file: Option<PathBuf>,
 
-    /// Trusted NVIDIA GB10 device JWKS JSON file for verifying Tier-2 GPU hardware-identity quotes.
+    /// Trusted NVIDIA GB10 device JWKS JSON file for verifying Tier 2 GPU hardware-identity quotes.
     #[arg(long, value_name = "PATH")]
     nvidia_gb10_device_jwks_file: Option<PathBuf>,
 
@@ -9979,10 +9979,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             );
             println!("Backend: {backend}");
             if args.apple_app_attest_jwks_file.is_some() {
-                println!("Tier-2 Apple App Attest verification: trusted JWKS loaded.");
+                println!("Tier 2 Apple App Attest verification: trusted JWKS loaded.");
             }
             if args.nvidia_gb10_device_jwks_file.is_some() {
-                println!("Tier-2 NVIDIA GB10 device verification: trusted JWKS loaded.");
+                println!("Tier 2 NVIDIA GB10 device verification: trusted JWKS loaded.");
             }
             if args.nvidia_nras_jwks_file.is_some() {
                 println!("NVIDIA NRAS verification: trusted JWKS loaded.");

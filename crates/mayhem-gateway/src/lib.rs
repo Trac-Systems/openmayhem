@@ -81,13 +81,13 @@ pub enum GatewayError {
     ReportHash(String),
     #[error("attestation signing payload failed: {0}")]
     SigningPayload(String),
-    #[error("Tier-2 attestation requires a hardware quote")]
+    #[error("hardware attestation requires a hardware quote")]
     HardwareQuoteRequired,
     #[error("hardware quote evidence is empty")]
     HardwareQuoteEvidenceMissing,
     #[error("hardware quote binding mismatch: expected {expected}, got {actual}")]
     HardwareQuoteBindingMismatch { expected: String, actual: String },
-    #[error("mock Tier-2 hardware quotes are disabled")]
+    #[error("mock hardware quotes are disabled")]
     MockHardwareQuoteDisabled,
     #[error("hardware quote kind {kind} is not verified by this build")]
     HardwareQuoteUnsupported { kind: String },
@@ -511,6 +511,14 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
     if quote.evidence.is_empty() {
         return Err(GatewayError::HardwareQuoteEvidenceMissing);
     }
+    let expected_quote_tier = quote.kind.attestation_tier();
+    if request.report.att_tier != expected_quote_tier {
+        return Err(GatewayError::ContractMismatch {
+            field: "hw_quote.att_tier",
+            expected: expected_quote_tier.to_string(),
+            actual: request.report.att_tier.to_string(),
+        });
+    }
     let expected = hardware_quote_binding(&request.report.body())
         .map_err(|err| GatewayError::SigningPayload(err.to_string()))?;
     if quote.binding != expected {
@@ -526,8 +534,8 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
             &expected,
             request.report,
         ),
-        HardwareQuoteKind::MockTier2 if request.allow_mock_hardware_quote => Ok(()),
-        HardwareQuoteKind::MockTier2 => Err(GatewayError::MockHardwareQuoteDisabled),
+        HardwareQuoteKind::MockDeviceIdentity if request.allow_mock_hardware_quote => Ok(()),
+        HardwareQuoteKind::MockDeviceIdentity => Err(GatewayError::MockHardwareQuoteDisabled),
         HardwareQuoteKind::AmdSevSnpVcek => Err(GatewayError::HardwareQuoteUnsupported {
             kind: "amd_sev_snp_vcek".to_owned(),
         }),

@@ -14,6 +14,10 @@ pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
+pub const TIER1_SOFTWARE_ATTESTATION_TIER: u8 = 1;
+pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
+pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
+pub const TIER4_PROVIDER_KYB_TIER: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttestationSigner {
@@ -79,7 +83,21 @@ pub enum HardwareQuoteKind {
     NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
     NvidiaNvtrustOfflineJwt,
-    MockTier2,
+    MockDeviceIdentity,
+}
+
+impl HardwareQuoteKind {
+    pub fn attestation_tier(&self) -> u8 {
+        match self {
+            Self::AppleAppAttestJwt | Self::NvidiaGb10DeviceJwt | Self::MockDeviceIdentity => {
+                TIER2_DEVICE_IDENTITY_TIER
+            }
+            Self::AmdSevSnpVcek
+            | Self::IntelTdxDcap
+            | Self::NvidiaNrasJwt
+            | Self::NvidiaNvtrustOfflineJwt => TIER3_CONFIDENTIAL_COMPUTE_TIER,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -480,7 +498,7 @@ mod tests {
             provider_pubkey: "provider-pub".to_owned(),
             manifest_hash: "manifest".to_owned(),
             binary_hash: "binary".to_owned(),
-            att_tier: 2,
+            att_tier: TIER2_DEVICE_IDENTITY_TIER,
             hw_quote: None,
             boot_epoch: 1,
             report_ts: 2,
@@ -489,7 +507,7 @@ mod tests {
         };
         let base = hardware_quote_binding(&body).unwrap();
         body.hw_quote = Some(HardwareQuote {
-            kind: HardwareQuoteKind::MockTier2,
+            kind: HardwareQuoteKind::MockDeviceIdentity,
             evidence: "mock".to_owned(),
             binding: base.clone(),
             endorsements: Vec::new(),

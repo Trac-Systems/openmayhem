@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mayhem_enclave::{
-    boot_sealed_store, build_merkle_manifest, build_sandbox_profile,
-    build_tier1_attestation_report, build_tier2_attestation_report, exec_sandboxed_child,
+    boot_sealed_store, build_hardware_attestation_report, build_merkle_manifest,
+    build_sandbox_profile, build_tier1_attestation_report, exec_sandboxed_child,
     expect_outbound_tcp_denied, hex_secret, load_or_create_runtime_keypair_store, measure_binary,
-    measure_current_binary, prepare_tier2_hardware_quote_binding, probe_outbound_tcp,
+    measure_current_binary, prepare_hardware_quote_binding, probe_outbound_tcp,
     provider_signing_seed_from_hex, run_sandboxed_command, seal_artifact, unix_timestamp_now,
-    BootOptions, KeyContext, RuntimeKeyContext, RuntimeKeypairStoreOptions, SandboxConfig,
-    SandboxPlatform, SealOptions, Tier1AttestationOptions, Tier2AttestationOptions,
-    Tier2HardwareQuoteBindingOptions, DEFAULT_CHUNK_SIZE, DEFAULT_TCP_PROBE_TIMEOUT_MS,
+    BootOptions, HardwareAttestationOptions, HardwareQuoteBindingOptions, KeyContext,
+    RuntimeKeyContext, RuntimeKeypairStoreOptions, SandboxConfig, SandboxPlatform, SealOptions,
+    Tier1AttestationOptions, DEFAULT_CHUNK_SIZE, DEFAULT_TCP_PROBE_TIMEOUT_MS,
 };
 use mayhem_proto::{
     catalog_enclave_id, AttestationRuntimeConfig, CatalogEnclaveIdentity, HardwareQuote,
@@ -219,23 +219,23 @@ struct AttestArgs {
     #[arg(long, value_name = "JSON")]
     runtime_config_json: Option<String>,
 
-    /// Print the Tier-2 hardware quote binding and exit. Use it as the vendor attestation nonce.
+    /// Print the hardware quote binding and exit. Use it as the vendor attestation nonce.
     #[arg(long)]
     print_hw_quote_binding: bool,
 
-    /// Tier-2 hardware quote kind.
+    /// Hardware quote kind.
     #[arg(long, value_enum, default_value_t = HardwareQuoteKindArg::NvidiaNrasJwt)]
     hw_quote_kind: HardwareQuoteKindArg,
 
-    /// Tier-2 hardware quote evidence file.
+    /// Hardware quote evidence file.
     #[arg(long, value_name = "PATH")]
     hw_quote_evidence_file: Option<PathBuf>,
 
-    /// Tier-2 hardware quote binding. Must match the printed binding used as quote nonce.
+    /// Hardware quote binding. Must match the printed binding used as quote nonce.
     #[arg(long)]
     hw_quote_binding: Option<String>,
 
-    /// Optional Tier-2 hardware quote endorsement string. Repeatable.
+    /// Optional hardware quote endorsement string. Repeatable.
     #[arg(long)]
     hw_quote_endorsement: Vec<String>,
 
@@ -252,7 +252,7 @@ enum HardwareQuoteKindArg {
     NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
     NvidiaNvtrustOfflineJwt,
-    MockTier2,
+    MockDeviceIdentity,
 }
 
 impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
@@ -266,7 +266,7 @@ impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
             HardwareQuoteKindArg::NvidiaNvtrustOfflineJwt => {
                 HardwareQuoteKind::NvidiaNvtrustOfflineJwt
             }
-            HardwareQuoteKindArg::MockTier2 => HardwareQuoteKind::MockTier2,
+            HardwareQuoteKindArg::MockDeviceIdentity => HardwareQuoteKind::MockDeviceIdentity,
         }
     }
 }
@@ -280,7 +280,7 @@ impl HardwareQuoteKindArg {
             HardwareQuoteKindArg::NvidiaGb10DeviceJwt => "nvidia_gb10_device_jwt",
             HardwareQuoteKindArg::NvidiaNrasJwt => "nvidia_nras_jwt",
             HardwareQuoteKindArg::NvidiaNvtrustOfflineJwt => "nvidia_nvtrust_offline_jwt",
-            HardwareQuoteKindArg::MockTier2 => "mock_tier2",
+            HardwareQuoteKindArg::MockDeviceIdentity => "mock_device_identity",
         }
     }
 }
@@ -522,9 +522,10 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
     let boot_epoch = args.boot_epoch.unwrap_or(now);
     let report_ts = args.report_ts.unwrap_or(now);
     let runtime_config = parse_runtime_config(args.runtime_config_json.as_deref())?;
+    let hw_quote_kind = HardwareQuoteKind::from(args.hw_quote_kind);
 
     if args.print_hw_quote_binding {
-        let binding = prepare_tier2_hardware_quote_binding(&Tier2HardwareQuoteBindingOptions {
+        let binding = prepare_hardware_quote_binding(&HardwareQuoteBindingOptions {
             identity: identity.clone(),
             runtime_keypair,
             provider_signing_seed,
@@ -532,6 +533,7 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
             boot_epoch,
             report_ts,
             nonce_u: args.nonce_u,
+            hw_quote_kind: hw_quote_kind.clone(),
             runtime_config,
         })?;
         if args.json {
@@ -557,9 +559,9 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
     let report = if let Some(evidence_file) = args.hw_quote_evidence_file {
         let binding = args
             .hw_quote_binding
-            .ok_or("Tier-2 attestation requires --hw-quote-binding")?;
+            .ok_or("hardware attestation requires --hw-quote-binding")?;
         let evidence = fs::read_to_string(&evidence_file)?;
-        build_tier2_attestation_report(&Tier2AttestationOptions {
+        build_hardware_attestation_report(&HardwareAttestationOptions {
             identity,
             runtime_keypair,
             provider_signing_seed,
@@ -568,7 +570,7 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
             report_ts,
             nonce_u: args.nonce_u,
             hw_quote: HardwareQuote {
-                kind: args.hw_quote_kind.into(),
+                kind: hw_quote_kind,
                 evidence,
                 binding,
                 endorsements: args.hw_quote_endorsement,
