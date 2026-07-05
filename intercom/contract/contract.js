@@ -567,28 +567,6 @@ class MayhemContract extends Contract {
       },
     });
 
-    this.addSchema('epochApply', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        epoch: { type: 'number', integer: true, min: 1 },
-        at: { type: 'number', integer: true, min: 0 },
-        debits: {
-          type: 'array',
-          max: LEDGER_BATCH_SCHEMA_MAX,
-          items: { type: 'any' },
-        },
-        earnings: {
-          type: 'array',
-          max: LEDGER_BATCH_SCHEMA_MAX,
-          items: { type: 'any' },
-        },
-        roots: { type: 'any', optional: true },
-        totals: { type: 'any', optional: true },
-      },
-    });
-
     this.addSchema('epochCommit', {
       value: {
         $$strict: true,
@@ -802,8 +780,12 @@ class MayhemContract extends Contract {
   }
 
   async mayhemFeature() {
+    this._mayhemLastFeatureResult = undefined;
     const adminError = await this.requireAdmin(this.address);
-    if (adminError) return;
+    if (adminError) {
+      this._mayhemLastFeatureResult = adminError;
+      return adminError;
+    }
     const rawKey = this.op?.key;
     const key = typeof rawKey === 'string' && rawKey.startsWith('mayhem_')
       ? rawKey.slice('mayhem_'.length)
@@ -813,11 +795,19 @@ class MayhemContract extends Contract {
       return;
     }
     if (value.op === 'consent') {
-      await this.applyConsentFeature(key, value);
-      return;
+      const result = await this.applyConsentFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
     }
     if (value.op === 'provider_lifecycle') {
-      await this.applyProviderLifecycleFeature(key, value);
+      const result = await this.applyProviderLifecycleFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'epoch_apply') {
+      const result = await this.applyEpochApplyFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
     }
   }
 
@@ -878,6 +868,20 @@ class MayhemContract extends Contract {
         return;
       default:
         return;
+    }
+  }
+
+  async applyEpochApplyFeature(key, value) {
+    const expectedKey = await this.epochApplyFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      return await this.epochApply();
+    } finally {
+      this.tx = previousTx;
     }
   }
 
@@ -3926,6 +3930,29 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  validateEpochApplyFeatureValue(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('epochApply feature value must be an object.');
+    }
+    const required = ['op', 'epoch', 'at', 'debits', 'earnings'];
+    const allowed = new Set([...required, 'roots', 'totals']);
+    const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
+    if (unknown.length > 0) {
+      return new Error(`epochApply feature does not accept fields: ${unknown.join(', ')}.`);
+    }
+    for (const key of required) {
+      if (!hasOwn(value, key)) return new Error(`epochApply feature is missing ${key}.`);
+    }
+    if (value.op !== 'epoch_apply') return new Error('Invalid epochApply feature op.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) {
+      return new Error('Invalid epochApply feature epoch.');
+    }
+    if (!Number.isSafeInteger(value.at) || value.at < 0) {
+      return new Error('Invalid epochApply feature timestamp.');
+    }
+    return this.validateEpochApplyShape(value);
+  }
+
   guardianValidateBalanceRecord(record, user = null) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) {
       return new Error('Guardian non-negative balance invariant failed.');
@@ -5300,6 +5327,16 @@ class MayhemContract extends Contract {
       value,
     })));
     return b4a.toString(digest, 'hex');
+  }
+
+  async epochApplyFeatureKey(value) {
+    const shapeError = this.validateEpochApplyFeatureValue(value);
+    if (shapeError) return shapeError;
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-epoch-apply-feature-v1',
+      value,
+    })));
+    return `epoch/apply/${value.epoch}/${b4a.toString(digest, 'hex')}`;
   }
 
   async epochCommitHash(value) {

@@ -171,12 +171,7 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'epoch_apply') {
-      return {
-        type: 'epochApply',
-        value: json,
-      };
-    }
+    if (json?.op === 'epoch_apply') return null;
     if (json?.op === 'epoch_commit') {
       return {
         type: 'epochCommit',
@@ -266,7 +261,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "set_rules", "ver": 1, "hash": "<hash>" }\' --sim 1 | sets the active rules version.');
     console.log('- /tx --command \'{ "op": "set_params", "submitted_at": 0, "effective_at": 86400, "values": { "fee_bps": 1500 } }\' --sim 1 | schedules parameter changes.');
     console.log('- /tx --command \'{ "op": "read_params", "at": 86400, "keys": ["fee_bps"] }\' --sim 1 | reads active parameters at a timestamp.');
-    console.log('- Consent and provider lifecycle are free Mayhem Feature records submitted by the Mayhem CLI/RPC feature path, not /tx commands.');
+    console.log('- Consent, provider lifecycle, and epoch apply are free Mayhem Feature records submitted by the Mayhem CLI/RPC feature path, not /tx commands.');
     console.log('- /tx --command \'{ "op": "set_provider_payout", "provider": "<pubkey>", "payout_addr": "<target>", "payout_method": "tnk|stripe|coinbase" }\' --sim 1 | admin sets a provider payout target.');
     console.log('- /tx --command \'{ "op": "set_provider_kyb", "provider": "<pubkey>", "legal_name": "Acme AI GmbH", "jurisdiction": "DE", "proof_hash": "<blake3>", "kyb_ref": "<off-ledger-ref>", "verified_at": 3600, "admin_sig": "<sig>" }\' --sim 1 | admin verifies provider business identity for Tier 4 accountability.');
     console.log('- /tx --command \'{ "op": "revoke_provider_kyb", "provider": "<pubkey>", "reason_hash": "<hash>" }\' --sim 1 | admin revokes provider KYB and drops them back to their hardware tier.');
@@ -286,7 +281,7 @@ class MayhemProtocol extends Protocol {
     console.log('- /tx --command \'{ "op": "fraud_proof", "epoch": 1, "proof_epoch": 2, "at": 7200, "reason": "over_credit", "receipt": { ... }, "claimed_mu_owed_cum": 2000 }\' --sim 1 | submits a signed receipt proving an inflated epoch commit.');
     console.log('- /tx --command \'{ "op": "dispute", "session_id": "<id>", "reason": "service_failure", "provider": "<pk>", "at": 7200, "evidence_hash": "<hash>" }\' --sim 1 | opens a dispute with a refundable 5000 mu deposit.');
     console.log('- /tx --command \'{ "op": "dispute_resolve", "dispute_id": 1, "outcome": "provider_fault", "deposit_action": "refund", "rationale_hash": "<hash>", "slash": true, "at": 10800 }\' --sim 1 | admin resolves a dispute.');
-    console.log('- /tx --command \'{ "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] }\' --sim 1 | admin/oracle applies bounded credit, earning, and fee deltas.');
+    console.log('- Feature { "feature": "mayhem", "key": "epoch/apply/<epoch>/<payload_hash>", "value": { "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] } } | admin/oracle applies bounded credit, earning, and fee deltas for free after epochCommit.');
     console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "gate-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
     console.log('- /tx --command \'{ "op": "tap_rate_oracle", "tap_usd_e6": 50000, "source": "uniswap-v2", "ts": 3600 }\' --sim 1 | admin/oracle updates the TAP/USD policy rate for TAP deposits.');
     console.log('- /tx --command \'{ "op": "deposit_tnk", "memo_hash": "<hash>" }\' --sim 1 | user creates a memo-bound TNK deposit intent.');

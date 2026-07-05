@@ -11,6 +11,8 @@ import { recomputeEpoch } from '../scripts/recompute-epoch-roots.mjs';
 import {
   MemoryStorage,
   execute,
+  executeEpochApplyFeature,
+  epochApplyFeatureKey,
   makeIdentity,
   makeTxKey,
   makeVerifier,
@@ -198,21 +200,21 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
   );
   assert.match(changed.message, /already exists/i);
 
-  const applied = await execute(
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 3_600,
+    debits: roll.debits,
+    earnings: roll.earnings,
+    roots: roll.roots,
+    totals: roll.totals,
+  };
+  const applyKey = await epochApplyFeatureKey(contract, applyValue);
+  const applied = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      debits: roll.debits,
-      earnings: roll.earnings,
-      roots: roll.roots,
-      totals: roll.totals,
-    },
-    admin.publicKey,
-    7
+    applyValue,
+    admin.publicKey
   );
   assert.deepEqual(applied, {
     ok: true,
@@ -229,7 +231,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     denom: 'mu_usd',
     mu: 998_000,
     updated_epoch: 1,
-    updated_at: makeTxKey(7),
+    updated_at: applyKey,
   });
   assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
@@ -239,7 +241,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     paid_cum_mu: 0,
     holdbacks: [{ epoch: 1, mu: 1_700 }],
     updated_epoch: 1,
-    updated_at: makeTxKey(7),
+    updated_at: applyKey,
     last_holdback_release_epoch: 1,
   });
   assert.deepEqual((await storage.get('ev/dep/1')).value, {
@@ -249,7 +251,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     count: 0,
     mu_total: 0,
     ts: 3_600,
-    updated_at: makeTxKey(7),
+    updated_at: applyKey,
   });
   assert.deepEqual((await storage.get('ev/use/1')).value, {
     type: 'usage_root',
@@ -259,7 +261,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     mu_total: 2_000,
     providers: 1,
     ts: 3_600,
-    updated_at: makeTxKey(7),
+    updated_at: applyKey,
   });
   assert.deepEqual((await storage.get('ev/earn/1')).value, {
     type: 'earn_root',
@@ -268,7 +270,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     provider_count: 1,
     mu_cum_total: 1_700,
     ts: 3_600,
-    updated_at: makeTxKey(7),
+    updated_at: applyKey,
   });
   assert.deepEqual((await storage.get('ev/fee/1')).value, {
     type: 'fee_root',
@@ -278,7 +280,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     mu_fee_cum: 300,
     sweep_msb_tx_hash: null,
     ts: 3_600,
-    updated_at: makeTxKey(7),
+    updated_at: applyKey,
   });
   assert.deepEqual((await storage.get('ev/pay/1')).value, {
     type: 'payout_root',
@@ -287,7 +289,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     count: 0,
     mu_total: 0,
     ts: 3_600,
-    updated_at: makeTxKey(7),
+    updated_at: applyKey,
   });
 });
 
@@ -394,10 +396,9 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
     banned_submitter: submitter.publicKey,
   });
 
-  const voidApply = await execute(
+  const voidApply = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     {
       op: 'epoch_apply',
       epoch: 1,
@@ -407,8 +408,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
       roots: inflatedRoll.roots,
       totals: inflatedRoll.totals,
     },
-    admin.publicKey,
-    7
+    admin.publicKey
   );
   assert.match(voidApply.message, /commit is void/i);
   assert.equal((await storage.get('ev/use/1')), null);
@@ -610,10 +610,9 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
   const { admin, provider, user, storage, contract } = await setupEpochContract();
   const roll = await recomputeEpoch(receiptBundle(user, provider));
 
-  const noCommit = await execute(
+  const noCommit = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     {
       op: 'epoch_apply',
       epoch: 1,
@@ -623,8 +622,7 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
       roots: roll.roots,
       totals: roll.totals,
     },
-    admin.publicKey,
-    4
+    admin.publicKey
   );
   assert.match(noCommit.message, /commit required/i);
   assert.equal((await storage.get('fee/cum')), null);
@@ -646,10 +644,9 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
   );
   assert.equal(commit.ok, true, commit.message);
 
-  const mismatch = await execute(
+  const mismatch = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     {
       op: 'epoch_apply',
       epoch: 1,
@@ -659,8 +656,7 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
       roots: { ...roll.roots, use: 'd'.repeat(64) },
       totals: roll.totals,
     },
-    admin.publicKey,
-    6
+    admin.publicKey
   );
   assert.match(mismatch.message, /do not match committed roots/i);
   assert.equal((await storage.get('fee/cum')), null);

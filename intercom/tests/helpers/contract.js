@@ -67,6 +67,25 @@ export const makeFeatureOperation = (featureType, key, value, sender) => ({
 export const executeFeature = (contract, storage, featureType, key, value, sender) =>
   contract.execute(makeFeatureOperation(featureType, key, value, sender), storage);
 
+export async function epochApplyFeatureKey(contract, value) {
+  const key = await contract.epochApplyFeatureKey(value);
+  if (key instanceof Error) throw key;
+  return key;
+}
+
+export async function executeEpochApplyFeature(contract, storage, value, sender) {
+  contract._mayhemLastFeatureResult = undefined;
+  const result = await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await epochApplyFeatureKey(contract, value),
+    value,
+    sender
+  );
+  return result ?? contract._mayhemLastFeatureResult;
+}
+
 export async function seedCurrentAdminPrice(
   storage,
   {

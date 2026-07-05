@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import MayhemContract from '../contract/contract.js';
+import MayhemProtocol from '../contract/protocol.js';
 import {
   MemoryStorage,
   execute,
+  executeEpochApplyFeature,
+  executeFeature,
+  epochApplyFeatureKey,
   makeIdentity,
-  makeTxKey,
   makeVerifier,
   signConsent,
 } from './helpers/contract.js';
@@ -79,6 +82,18 @@ async function setupLedgerContract(identities = null) {
   return { admin, provider, user, outsider, storage, contract };
 }
 
+test('MayhemProtocol keeps epochApply off the paid tx route', () => {
+  const protocol = new MayhemProtocol({}, {});
+  const paidOps = [
+    { op: 'epoch_commit', epoch: 1, at: 3_600, roots: {}, totals: {} },
+    makeEpochApply(1, 'user-a', 'provider-a', 1_000),
+  ]
+    .map((command) => protocol.mapTxCommand(JSON.stringify(command)))
+    .filter(Boolean);
+
+  assert.deepEqual(paidOps.map((op) => op.type), ['epochCommit']);
+});
+
 test('MayhemContract epochApply mutates credit, earning, and fee state in place', async () => {
   const { admin, provider, user, outsider, storage, contract } = await setupLedgerContract();
 
@@ -90,12 +105,19 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     outsider.publicKey,
     4
   );
-  assert.match(nonAdmin.message, /admin required/i);
+  assert.match(nonAdmin.message, /unknown contract operation type|function not registered/i);
 
-  const mismatch = await execute(
+  const nonAdminFeature = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
+    makeEpochApply(1, user.publicKey, provider.publicKey, 1_500),
+    outsider.publicKey
+  );
+  assert.match(nonAdminFeature.message, /admin required/i);
+
+  const mismatch = await executeEpochApplyFeature(
+    contract,
+    storage,
     {
       op: 'epoch_apply',
       epoch: 1,
@@ -103,8 +125,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
       debits: [{ user: user.publicKey, mu: 1_500 }],
       earnings: [{ provider: provider.publicKey, gross_mu: 1_400 }],
     },
-    admin.publicKey,
-    5
+    admin.publicKey
   );
   assert.match(mismatch.message, /must equal/i);
 
@@ -121,13 +142,24 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
       { provider: provider.publicKey, gross_mu: 250 },
     ],
   };
-  const first = await execute(
+  const firstApplyKey = await epochApplyFeatureKey(contract, firstApply);
+  const wrongKeySnapshot = storage.snapshotBytes();
+  const wrongKey = await executeFeature(
     contract,
     storage,
-    'epochApply',
+    'mayhem_feature',
+    `epoch/apply/1/${'0'.repeat(64)}`,
     firstApply,
-    admin.publicKey,
-    6
+    admin.publicKey
+  );
+  assert.equal(wrongKey, undefined);
+  assert.equal(storage.snapshotBytes(), wrongKeySnapshot);
+
+  const first = await executeEpochApplyFeature(
+    contract,
+    storage,
+    firstApply,
+    admin.publicKey
   );
   assert.deepEqual(first, {
     ok: true,
@@ -144,7 +176,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     denom: 'mu_usd',
     mu: 998_500,
     updated_epoch: 1,
-    updated_at: makeTxKey(6),
+    updated_at: firstApplyKey,
   });
   assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
@@ -154,7 +186,7 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     paid_cum_mu: 0,
     holdbacks: [{ epoch: 1, mu: 1_275 }],
     updated_epoch: 1,
-    updated_at: makeTxKey(6),
+    updated_at: firstApplyKey,
     last_holdback_release_epoch: 1,
   });
   const feeAfterFirst = (await storage.get('fee/cum')).value;
@@ -162,18 +194,16 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   assert.equal(feeAfterFirst.cum_mu, 225);
   assert.equal(feeAfterFirst.swept_cum_mu, 0);
   assert.equal(feeAfterFirst.updated_epoch, 1);
-  assert.equal(feeAfterFirst.updated_at, makeTxKey(6));
+  assert.equal(feeAfterFirst.updated_at, firstApplyKey);
   assert.equal(feeAfterFirst.last_fee_bps, 1_500);
   assert.equal(feeAfterFirst.last_apply_hash.length, 64);
 
   const snapshotBeforeReplay = storage.snapshotBytes();
-  const replay = await execute(
+  const replay = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     firstApply,
-    admin.publicKey,
-    7
+    admin.publicKey
   );
   assert.deepEqual(replay, {
     ok: true,
@@ -186,34 +216,28 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   });
   assert.equal(storage.snapshotBytes(), snapshotBeforeReplay);
 
-  const changedReplay = await execute(
+  const changedReplay = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     makeEpochApply(1, user.publicKey, provider.publicKey, 2_000),
-    admin.publicKey,
-    8
+    admin.publicKey
   );
   assert.match(changedReplay.message, /monotonic/i);
 
-  const gap = await execute(
+  const gap = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     makeEpochApply(3, user.publicKey, provider.publicKey, 1_000),
-    admin.publicKey,
-    9
+    admin.publicKey
   );
   assert.match(gap.message, /contiguous/i);
 
   const insufficientSnapshot = storage.snapshotBytes();
-  const insufficient = await execute(
+  const insufficient = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     makeEpochApply(2, user.publicKey, provider.publicKey, 2_000_000),
-    admin.publicKey,
-    10
+    admin.publicKey
   );
   assert.match(insufficient.message, /insufficient credit balance/i);
   assert.equal(storage.snapshotBytes(), insufficientSnapshot);
@@ -238,13 +262,11 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
     expectedDebited += grossMu;
     expectedFee += Math.floor((grossMu * 1_500) / 10_000);
     for (const ctx of [left, right]) {
-      const result = await execute(
+      const result = await executeEpochApplyFeature(
         ctx.contract,
         ctx.storage,
-        'epochApply',
         makeEpochApply(epoch, identities.user.publicKey, identities.provider.publicKey, grossMu),
-        identities.admin.publicKey,
-        10 + epoch
+        identities.admin.publicKey
       );
       assert.equal(result.ok, true, result.message);
       assert.equal(result.epoch, epoch);
@@ -283,10 +305,9 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
     user: `user-${i}`,
     mu: 1,
   }));
-  const tooLarge = await execute(
+  const tooLarge = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     {
       op: 'epoch_apply',
       epoch: 1,
@@ -294,8 +315,7 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
       debits: tooManyDebits,
       earnings: [{ provider: provider.publicKey, gross_mu: 501 }],
     },
-    admin.publicKey,
-    4
+    admin.publicKey
   );
   assert.match(tooLarge.message, /max_apply_batch/i);
   assert.equal(storage.snapshotBytes(), before);

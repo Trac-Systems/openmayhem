@@ -4,6 +4,7 @@ import MayhemContract from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
+  executeEpochApplyFeature,
   makeIdentity,
   makeVerifier,
   signConsent,
@@ -126,13 +127,11 @@ test('MayhemContract guardian halts epochApply on conservation failure', async (
   });
   const before = storage.snapshotBytes();
 
-  const result = await execute(
+  const result = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey),
-    admin.publicKey,
-    5
+    admin.publicKey
   );
   assert.match(result.message, /guardian conservation/i);
   assert.equal(storage.snapshotBytes(), before);
@@ -140,24 +139,20 @@ test('MayhemContract guardian halts epochApply on conservation failure', async (
 
 test('MayhemContract guardian halts epochApply on non-monotonic epochs', async () => {
   const { admin, provider, user, storage, contract } = await setupGuardianContract();
-  const first = await execute(
+  const first = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey),
-    admin.publicKey,
-    5
+    admin.publicKey
   );
   assert.equal(first.ok, true, first.message);
   const before = storage.snapshotBytes();
 
-  const replayWithChangedDelta = await execute(
+  const replayWithChangedDelta = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey, 2_000),
-    admin.publicKey,
-    6
+    admin.publicKey
   );
   assert.match(replayWithChangedDelta.message, /guardian monotonic epoch/i);
   assert.equal(storage.snapshotBytes(), before);
@@ -168,13 +163,11 @@ test('MayhemContract guardian halts epochApply on negative balances', async () =
   await storage.put(`bal/${user.publicKey}`, seededBalance(user.publicKey, -1));
   const before = storage.snapshotBytes();
 
-  const result = await execute(
+  const result = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey),
-    admin.publicKey,
-    5
+    admin.publicKey
   );
   assert.match(result.message, /guardian non-negative balance/i);
   assert.equal(storage.snapshotBytes(), before);

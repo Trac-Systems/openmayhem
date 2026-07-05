@@ -4,6 +4,8 @@ import MayhemContract from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
+  executeEpochApplyFeature,
+  epochApplyFeatureKey,
   makeIdentity,
   makeTxKey,
   makeVerifier,
@@ -179,14 +181,14 @@ test('MayhemContract setProviderPayout stamps admin authority evidence', async (
 
 test('MayhemContract payoutConfirm releases earnings only after challenge plus holdback lock', async () => {
   const { admin, provider, user, storage, contract } = await setupPayoutContract();
+  const applyValue = epochApply(1, user.publicKey, provider.publicKey, 2_000_000);
+  const applyKey = await epochApplyFeatureKey(contract, applyValue);
 
-  const settled = await execute(
+  const settled = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
-    epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
-    admin.publicKey,
-    6
+    applyValue,
+    admin.publicKey
   );
   assert.equal(settled.ok, true, settled.message);
   assert.deepEqual((await storage.get(`earn/${provider.publicKey}`)).value, {
@@ -197,7 +199,7 @@ test('MayhemContract payoutConfirm releases earnings only after challenge plus h
     paid_cum_mu: 0,
     holdbacks: [{ epoch: 1, mu: 1_700_000 }],
     updated_epoch: 1,
-    updated_at: makeTxKey(6),
+    updated_at: applyKey,
     last_holdback_release_epoch: 1,
   });
 
@@ -310,13 +312,11 @@ test('MayhemContract payoutConfirm keeps configured probe-gated earnings held un
     canaries: [{ set_id: 'canary-dev-v1' }],
   });
 
-  const applied = await execute(
+  const applied = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey, 2_000_000, { at: DAY_SECONDS }),
-    admin.publicKey,
-    9
+    admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
 
@@ -396,13 +396,11 @@ test('MayhemContract payoutConfirm keeps configured probe-gated earnings held un
 
 test('MayhemContract payoutConfirm rejects non-admin payout target provenance', async () => {
   const { admin, provider, user, storage, contract } = await setupPayoutContract();
-  const settled = await execute(
+  const settled = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
-    admin.publicKey,
-    6
+    admin.publicKey
   );
   assert.equal(settled.ok, true, settled.message);
 
@@ -442,13 +440,11 @@ test('MayhemContract payoutConfirm requires admin role marker on payout targets'
     payout: missingRolePayout,
   });
 
-  const settled = await execute(
+  const settled = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
-    admin.publicKey,
-    6
+    admin.publicKey
   );
   assert.equal(settled.ok, true, settled.message);
 
@@ -529,13 +525,11 @@ test('MayhemContract payoutConfirm fails closed without current admin key', asyn
     updated_epoch: 0,
     updated_at: null,
   });
-  const settled = await execute(
+  const settled = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
-    admin.publicKey,
-    6
+    admin.publicKey
   );
   assert.equal(settled.ok, true, settled.message);
   await storage.del('admin');
@@ -576,13 +570,11 @@ test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async (
     );
     assert.equal(retargeted.ok, true, retargeted.message);
 
-    const settled = await execute(
+    const settled = await executeEpochApplyFeature(
       contract,
       storage,
-      'epochApply',
       epochApply(1, user.publicKey, provider.publicKey, 2_000_000),
-      admin.publicKey,
-      7
+      admin.publicKey
     );
     assert.equal(settled.ok, true, settled.message);
 
@@ -642,13 +634,11 @@ test('MayhemContract payoutConfirm accepts admin-set fiat payout rails', async (
 
 test('MayhemContract payoutConfirm clears previous rail metadata on rail switch', async () => {
   const { admin, provider, user, storage, contract } = await setupPayoutContract();
-  const settled = await execute(
+  const settled = await executeEpochApplyFeature(
     contract,
     storage,
-    'epochApply',
     epochApply(1, user.publicKey, provider.publicKey, 3_000_000),
-    admin.publicKey,
-    6
+    admin.publicKey
   );
   assert.equal(settled.ok, true, settled.message);
 

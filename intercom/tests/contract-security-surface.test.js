@@ -4,6 +4,7 @@ import MayhemContract, { deriveRoomId } from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
+  executeEpochApplyFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
@@ -240,16 +241,6 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     },
   ],
   [
-    'epochApply',
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      debits: [],
-      earnings: [{ provider: provider.publicKey, gross_mu: 1_000 }],
-    },
-  ],
-  [
     'rateOracle',
     {
       op: 'rate_oracle',
@@ -338,6 +329,22 @@ test('MayhemContract rejects admin ops before genesis admin is present', async (
     assert.equal(storage.snapshotBytes(), before, `${type} must not mutate state before genesis admin`);
     txNo += 1;
   }
+
+  const beforeFeature = storage.snapshotBytes();
+  const featureResult = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 3_600,
+      debits: [],
+      earnings: [{ provider: outsider.publicKey, gross_mu: 1_000 }],
+    },
+    outsider.publicKey
+  );
+  assert.match(featureResult.message, /admin required/i, 'epochApply feature should require genesis admin');
+  assert.equal(storage.snapshotBytes(), beforeFeature, 'epochApply feature must not mutate before genesis admin');
 });
 
 test('MayhemContract keeps providers out of canonical economy and control-plane ops', async () => {
@@ -353,6 +360,22 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
     assert.equal(storage.snapshotBytes(), before, `${type} must not mutate state`);
     txNo += 1;
   }
+
+  const beforeFeature = storage.snapshotBytes();
+  const featureResult = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 3_600,
+      debits: [],
+      earnings: [{ provider: provider.publicKey, gross_mu: 1_000 }],
+    },
+    providerSender
+  );
+  assert.match(featureResult.message, /admin required/i, 'epochApply feature should be admin-only');
+  assert.equal(storage.snapshotBytes(), beforeFeature, 'epochApply feature must not mutate state');
 
   const joinedEnclave = await execute(
     contract,

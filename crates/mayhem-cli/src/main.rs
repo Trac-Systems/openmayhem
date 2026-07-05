@@ -8535,10 +8535,19 @@ fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> St
 }
 
 async fn admin(command: AdminCommands) -> Result<()> {
+    if let AdminCommands::EpochApply(args) = &command {
+        return run_admin_epoch_apply_feature(args).await;
+    }
     let tx_args = admin_tx_args(&command);
     let (tx_type, mut value) = admin_command_payload(&command)?;
     ensure_admin_command_signatures(tx_args, &mut value).await?;
     run_admin_command(tx_args, tx_type, value).await
+}
+
+async fn run_admin_epoch_apply_feature(args: &AdminEpochApplyArgs) -> Result<()> {
+    let value = admin_epoch_apply_payload(args)?;
+    let key = epoch_apply_feature_key(&value)?;
+    run_admin_feature_command(&args.tx, "epochApply", key, value).await
 }
 
 fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
@@ -9318,6 +9327,18 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
     }))
 }
 
+fn epoch_apply_feature_key(value: &Value) -> Result<String> {
+    let epoch = value
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .context("epoch apply payload missing epoch")?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-epoch-apply-feature-v1",
+        "value": value,
+    }));
+    Ok(format!("epoch/apply/{epoch}/{digest}"))
+}
+
 fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option<Value>> {
     path.map(|path| {
         read_json_file(path)
@@ -9443,6 +9464,62 @@ async fn run_admin_command(args: &AdminTxArgs, tx_type: &'static str, value: Val
     Ok(())
 }
 
+async fn run_admin_feature_command(
+    args: &AdminTxArgs,
+    feature_type: &'static str,
+    key: String,
+    value: Value,
+) -> Result<()> {
+    let feature = json!({
+        "feature": "mayhem",
+        "key": key,
+        "value": value,
+    });
+    let feature_json = serde_json::to_string(&feature)?;
+    let rpc_hint = args.rpc_url.as_deref().unwrap_or(DEFAULT_RPC_URL);
+    let rpc_endpoint = format!("{}/contract/feature", rpc_hint.trim_end_matches('/'));
+    let copy_paste = format!(
+        "curl -sS -X POST {} -H 'content-type: application/json' --data {}",
+        shell_single_quote(&rpc_endpoint),
+        shell_single_quote(&feature_json)
+    );
+    let mut report = json!({
+        "ok": true,
+        "submitted": false,
+        "feature_type": feature_type,
+        "feature": feature,
+        "copy_paste": {
+            "peer_rpc": copy_paste,
+        },
+    });
+
+    if args.submit && !args.sim {
+        let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let submitted = rpc
+            .submit_feature(&report["feature"])
+            .await
+            .with_context(|| format!("submitting free {feature_type} feature"))?;
+        if submitted.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!("{feature_type} feature was not accepted: {submitted}");
+        }
+        report["submitted"] = json!(true);
+        report["rpc_url"] = json!(rpc_url);
+        report["result"] = submitted;
+    } else if args.submit && args.sim {
+        report["sim"] = json!(true);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_admin_feature_report(&report)?;
+    }
+    Ok(())
+}
+
 fn print_admin_report(report: &Value) -> Result<()> {
     println!("Admin contract command ready.");
     println!("Tx type: {}", report["tx_type"].as_str().unwrap_or(""));
@@ -9463,6 +9540,35 @@ fn print_admin_report(report: &Value) -> Result<()> {
         }
     } else {
         println!("Submitted: false (pass --submit to sign and send through peer RPC)");
+    }
+    Ok(())
+}
+
+fn print_admin_feature_report(report: &Value) -> Result<()> {
+    println!("Admin feature command ready.");
+    println!(
+        "Feature type: {}",
+        report["feature_type"].as_str().unwrap_or("")
+    );
+    println!(
+        "Record key: {}",
+        report["feature"]["key"].as_str().unwrap_or("")
+    );
+    println!("Feature JSON:");
+    println!("{}", serde_json::to_string_pretty(&report["feature"])?);
+    println!("Copy/paste peer RPC command:");
+    println!(
+        "{}",
+        report["copy_paste"]["peer_rpc"].as_str().unwrap_or("")
+    );
+    if report["submitted"].as_bool() == Some(true) {
+        println!("Submitted: true");
+        println!("Result:");
+        println!("{}", serde_json::to_string_pretty(&report["result"])?);
+    } else if report["sim"].as_bool() == Some(true) {
+        println!("Submitted: false (--sim dry-run for free feature)");
+    } else {
+        println!("Submitted: false (pass --submit to append through peer RPC)");
     }
     Ok(())
 }
@@ -19335,6 +19441,22 @@ mod tests {
                 "roots": commit["roots"],
                 "totals": commit["totals"],
             })
+        );
+        let apply_key = epoch_apply_feature_key(&apply).unwrap();
+        assert!(apply_key.starts_with("epoch/apply/7/"));
+        assert_eq!(apply_key.len(), "epoch/apply/7/".len() + 64);
+        assert_eq!(
+            apply_key,
+            epoch_apply_feature_key(&json!({
+                "totals": commit["totals"],
+                "roots": commit["roots"],
+                "earnings": [{"gross_mu": 2000, "provider": "provider-a"}],
+                "debits": [{"mu": 2000, "user": "user-a"}],
+                "at": 25_200,
+                "epoch": 7,
+                "op": "epoch_apply",
+            }))
+            .unwrap()
         );
     }
 
