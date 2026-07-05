@@ -4,6 +4,7 @@ import MayhemContract, { deriveRoomId } from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
+  executeDepositFeature,
   executeEpochApplyFeature,
   makeIdentity,
   makeTxKey,
@@ -250,31 +251,6 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     },
   ],
   [
-    'tnkDeposit',
-    {
-      op: 'tnk_deposit',
-      memo_hash: 'memo-security',
-      tnk_e18: '1000000000000000000',
-      msb_tx_hash: 'msb-security',
-      epoch: 1,
-      at: 3_600,
-    },
-  ],
-  [
-    'fiatDeposit',
-    {
-      op: 'fiat_deposit',
-      rail: 'stripe',
-      who: provider.publicKey,
-      mu: 1_000_000,
-      ext_ref_hash: 'c'.repeat(64),
-      fiat_currency: 'usd',
-      fiat_amount_minor: 100,
-      epoch: 1,
-      at: 3_600,
-    },
-  ],
-  [
     'fiatChargeback',
     {
       op: 'fiat_chargeback',
@@ -316,6 +292,40 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
   ],
 ];
 
+const buildAdminOnlyFeatureAttempts = (provider) => [
+  {
+    op: 'tnk_deposit',
+    memo_hash: 'memo-security',
+    tnk_e18: '1000000000000000000',
+    msb_tx_hash: 'msb-security',
+    epoch: 1,
+    at: 3_600,
+  },
+  {
+    op: 'tap_deposit',
+    who: '0x1111111111111111111111111111111111111111',
+    tap_wei: '1000000000000000000',
+    eth_tx_hash: `0x${'e'.repeat(64)}`,
+    log_index: 0,
+    block_number: 123,
+    pool_address: '0x2222222222222222222222222222222222222222',
+    chain_id: 61_000,
+    epoch: 1,
+    at: 3_600,
+  },
+  {
+    op: 'fiat_deposit',
+    rail: 'stripe',
+    who: provider.publicKey,
+    mu: 1_000_000,
+    ext_ref_hash: 'c'.repeat(64),
+    fiat_currency: 'usd',
+    fiat_amount_minor: 100,
+    epoch: 1,
+    at: 3_600,
+  },
+];
+
 test('MayhemContract rejects admin ops before genesis admin is present', async () => {
   const outsider = await makeIdentity();
   const storage = new MemoryStorage();
@@ -345,6 +355,13 @@ test('MayhemContract rejects admin ops before genesis admin is present', async (
   );
   assert.match(featureResult.message, /admin required/i, 'epochApply feature should require genesis admin');
   assert.equal(storage.snapshotBytes(), beforeFeature, 'epochApply feature must not mutate before genesis admin');
+
+  for (const value of buildAdminOnlyFeatureAttempts(outsider)) {
+    const before = storage.snapshotBytes();
+    const result = await executeDepositFeature(contract, storage, value, outsider.publicKey);
+    assert.match(result.message, /admin required/i, `${value.op} feature should require genesis admin`);
+    assert.equal(storage.snapshotBytes(), before, `${value.op} feature must not mutate before genesis admin`);
+  }
 });
 
 test('MayhemContract keeps providers out of canonical economy and control-plane ops', async () => {
@@ -376,6 +393,13 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
   );
   assert.match(featureResult.message, /admin required/i, 'epochApply feature should be admin-only');
   assert.equal(storage.snapshotBytes(), beforeFeature, 'epochApply feature must not mutate state');
+
+  for (const value of buildAdminOnlyFeatureAttempts(provider)) {
+    const before = storage.snapshotBytes();
+    const result = await executeDepositFeature(contract, storage, value, providerSender);
+    assert.match(result.message, /admin required/i, `${value.op} feature should be admin-only`);
+    assert.equal(storage.snapshotBytes(), before, `${value.op} feature must not mutate state`);
+  }
 
   const joinedEnclave = await execute(
     contract,

@@ -3,6 +3,7 @@ import { blake3 } from '@tracsystems/blake3';
 import PeerWallet from 'trac-wallet';
 import {
   consentMessage,
+  depositTnkIntentMessage,
   probeResultMessage,
   providerKybMessage,
   providerLifecycleIntentMessage,
@@ -86,6 +87,25 @@ export async function executeEpochApplyFeature(contract, storage, value, sender)
   return result ?? contract._mayhemLastFeatureResult;
 }
 
+export async function depositFeatureKey(contract, value) {
+  const key = await contract.depositFeatureKey(value);
+  if (key instanceof Error) throw key;
+  return key;
+}
+
+export async function executeDepositFeature(contract, storage, value, sender) {
+  contract._mayhemLastFeatureResult = undefined;
+  const result = await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await depositFeatureKey(contract, value),
+    value,
+    sender
+  );
+  return result ?? contract._mayhemLastFeatureResult;
+}
+
 export async function seedCurrentAdminPrice(
   storage,
   {
@@ -149,6 +169,9 @@ export const makeVerifier = (wallet) => ({
 
 export const signConsent = (wallet, ver, hash, signingVersion) =>
   b4a.toString(wallet.sign(b4a.from(consentMessage(ver, hash, signingVersion))), 'hex');
+
+export const signDepositTnkIntent = (wallet, intent) =>
+  b4a.toString(wallet.sign(b4a.from(depositTnkIntentMessage(intent))), 'hex');
 
 export const signProviderLifecycleIntent = (wallet, intent, signingVersion) =>
   b4a.toString(wallet.sign(b4a.from(providerLifecycleIntentMessage(intent, signingVersion))), 'hex');

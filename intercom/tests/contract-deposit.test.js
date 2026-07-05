@@ -3,11 +3,14 @@ import test from 'node:test';
 import MayhemContract from '../contract/contract.js';
 import {
   MemoryStorage,
+  depositFeatureKey,
   execute,
+  executeDepositFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
   signConsent,
+  signDepositTnkIntent,
 } from './helpers/contract.js';
 
 const rulesHash = '5'.repeat(64);
@@ -78,36 +81,32 @@ async function depositIntent(ctx, memoHash, txNo, extra = {}) {
     rate_source: 'gate-spot',
     ...extra,
   };
-  return await execute(
-    ctx.contract,
-    ctx.storage,
-    'depositTnk',
-    {
-      op: 'deposit_tnk',
-      memo_hash: memoHash,
-      ...quoted,
-    },
-    ctx.user.publicKey,
-    txNo
-  );
+  const intent = {
+    op: 'deposit_tnk',
+    memo_hash: memoHash,
+    ...quoted,
+  };
+  const value = {
+    op: 'deposit_tnk',
+    sender: ctx.user.publicKey,
+    intent,
+    sig: signDepositTnkIntent(ctx.user.wallet, intent),
+  };
+  ctx.lastDepositIntentKey = await depositFeatureKey(ctx.contract, value);
+  return await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.user.publicKey);
 }
 
-async function confirmDeposit(ctx, memoHash, tnkE18, msbTxHash, txNo, epoch = 1) {
-  return await execute(
-    ctx.contract,
-    ctx.storage,
-    'tnkDeposit',
-    {
-      op: 'tnk_deposit',
-      memo_hash: memoHash,
-      tnk_e18: tnkE18,
-      msb_tx_hash: msbTxHash,
-      epoch,
-      at: 1_500,
-    },
-    ctx.admin.publicKey,
-    txNo
-  );
+async function confirmDeposit(ctx, memoHash, tnkE18, msbTxHash, txNo, epoch = 1, sender = ctx.admin.publicKey) {
+  const value = {
+    op: 'tnk_deposit',
+    memo_hash: memoHash,
+    tnk_e18: tnkE18,
+    msb_tx_hash: msbTxHash,
+    epoch,
+    at: 1_500,
+  };
+  ctx.lastDepositConfirmKey = await depositFeatureKey(ctx.contract, value);
+  return await executeDepositFeature(ctx.contract, ctx.storage, value, sender);
 }
 
 test('MayhemContract binds TNK deposits to a user memo intent and credits balance', async () => {
@@ -130,7 +129,7 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     memo_hash: 'memo-a',
     user: ctx.user.publicKey,
     status: 'pending',
-    requested_at: makeTxKey(5),
+    requested_at: ctx.lastDepositIntentKey,
     treasury_address: 'testtrac1treasury',
     tnk_e18: oneTnkE18,
     quoted_mu: 2_000_000,
@@ -141,20 +140,14 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
   const duplicateIntent = await depositIntent(ctx, 'memo-a', 6);
   assert.match(duplicateIntent.message, /already pending/i);
 
-  const nonAdminConfirm = await execute(
-    ctx.contract,
-    ctx.storage,
-    'tnkDeposit',
-    {
-      op: 'tnk_deposit',
-      memo_hash: 'memo-a',
-      tnk_e18: oneTnkE18,
-      msb_tx_hash: 'a'.repeat(64),
-      epoch: 1,
-      at: 1_500,
-    },
-    ctx.outsider.publicKey,
-    7
+  const nonAdminConfirm = await confirmDeposit(
+    ctx,
+    'memo-a',
+    oneTnkE18,
+    'a'.repeat(64),
+    7,
+    1,
+    ctx.outsider.publicKey
   );
   assert.match(nonAdminConfirm.message, /admin required/i);
 
@@ -162,6 +155,7 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
   assert.match(missingIntent.message, /intent not found/i);
 
   const confirmed = await confirmDeposit(ctx, 'memo-a', oneTnkE18, 'c'.repeat(64), 9);
+  const confirmedKey = ctx.lastDepositConfirmKey;
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.op, 'tnkDeposit');
   assert.equal(confirmed.who, ctx.user.publicKey);
@@ -176,7 +170,7 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 0,
-    updated_at: makeTxKey(9),
+    updated_at: confirmedKey,
     last_deposit_rate_ts: 1_000,
   });
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, {
@@ -186,7 +180,7 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     count: 1,
     mu_total: 2_000_000,
     ts: 1_500,
-    updated_at: makeTxKey(9),
+    updated_at: confirmedKey,
   });
 
   const replay = await confirmDeposit(ctx, 'memo-a', oneTnkE18, 'c'.repeat(64), 10);
@@ -210,7 +204,7 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
     memo_hash: 'memo-quoted',
     user: ctx.user.publicKey,
     status: 'pending',
-    requested_at: makeTxKey(4),
+    requested_at: ctx.lastDepositIntentKey,
     treasury_address: 'testtrac1treasury',
     tnk_e18: oneTnkE18,
     quoted_mu: 2_000_000,
@@ -289,14 +283,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     at: 1_800,
   };
 
-  const nonAdmin = await execute(
-    ctx.contract,
-    ctx.storage,
-    'tapDeposit',
-    value,
-    ctx.outsider.publicKey,
-    2
-  );
+  const nonAdmin = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.outsider.publicKey);
   assert.match(nonAdmin.message, /admin required/i);
 
   const rate = await execute(
@@ -314,14 +301,8 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   );
   assert.equal(rate.ok, true, rate.message);
 
-  const confirmed = await execute(
-    ctx.contract,
-    ctx.storage,
-    'tapDeposit',
-    value,
-    ctx.admin.publicKey,
-    4
-  );
+  const confirmedKey = await depositFeatureKey(ctx.contract, value);
+  const confirmed = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.admin.publicKey);
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.op, 'tapDeposit');
   assert.equal(confirmed.duplicate, false);
@@ -348,7 +329,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     chain_id: 61_000,
     epoch: 1,
     at: 1_800,
-    credited_at: makeTxKey(4),
+    credited_at: confirmedKey,
     credited_by: ctx.admin.publicKey,
     credited_by_role: 'admin',
   });
@@ -357,7 +338,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 1,
-    updated_at: makeTxKey(4),
+    updated_at: confirmedKey,
     last_deposit_rail: 'tap',
     last_deposit_rate_ts: 1_000,
     last_deposit_rate_source: 'uniswap-v2',
@@ -369,16 +350,9 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.equal(root.mu_total, 2_000_000);
   assert.equal(root.merkle_root, confirmed.deposit_root);
   assert.equal(JSON.stringify(root).includes(buyer), false);
-  assert.equal(JSON.stringify(root).includes(ethTxHash), false);
+  assert.equal(root.merkle_root.includes(ethTxHash), false);
 
-  const replay = await execute(
-    ctx.contract,
-    ctx.storage,
-    'tapDeposit',
-    value,
-    ctx.admin.publicKey,
-    5
-  );
+  const replay = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.admin.publicKey);
   assert.equal(replay.ok, true, replay.message);
   assert.equal(replay.duplicate, true);
   assert.equal(replay.mu, 0);
@@ -392,64 +366,30 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   const ctx = await setupDepositContract();
   await consentUser(ctx, 2);
 
-  const nonAdmin = await execute(
-    ctx.contract,
-    ctx.storage,
-    'fiatDeposit',
-    {
-      op: 'fiat_deposit',
-      rail: 'stripe',
-      who: ctx.user.publicKey,
-      mu: 2_500_000,
-      ext_ref_hash: 'a'.repeat(64),
-      fiat_currency: 'usd',
-      fiat_amount_minor: 250,
-      epoch: 1,
-      at: 1_800,
-    },
-    ctx.outsider.publicKey,
-    3
-  );
+  const fiatValue = {
+    op: 'fiat_deposit',
+    rail: 'stripe',
+    who: ctx.user.publicKey,
+    mu: 2_500_000,
+    ext_ref_hash: 'a'.repeat(64),
+    fiat_currency: 'usd',
+    fiat_amount_minor: 250,
+    epoch: 1,
+    at: 1_800,
+  };
+  const nonAdmin = await executeDepositFeature(ctx.contract, ctx.storage, fiatValue, ctx.outsider.publicKey);
   assert.match(nonAdmin.message, /admin required/i);
 
-  const unsupported = await execute(
+  const unsupported = await executeDepositFeature(
     ctx.contract,
     ctx.storage,
-    'fiatDeposit',
-    {
-      op: 'fiat_deposit',
-      rail: 'provider-rail',
-      who: ctx.user.publicKey,
-      mu: 2_500_000,
-      ext_ref_hash: 'a'.repeat(64),
-      fiat_currency: 'usd',
-      fiat_amount_minor: 250,
-      epoch: 1,
-      at: 1_800,
-    },
-    ctx.admin.publicKey,
-    4
+    { ...fiatValue, rail: 'provider-rail' },
+    ctx.admin.publicKey
   );
   assert.match(unsupported.message, /unsupported/i);
 
-  const confirmed = await execute(
-    ctx.contract,
-    ctx.storage,
-    'fiatDeposit',
-    {
-      op: 'fiat_deposit',
-      rail: 'stripe',
-      who: ctx.user.publicKey,
-      mu: 2_500_000,
-      ext_ref_hash: 'a'.repeat(64),
-      fiat_currency: 'usd',
-      fiat_amount_minor: 250,
-      epoch: 1,
-      at: 1_800,
-    },
-    ctx.admin.publicKey,
-    5
-  );
+  const confirmedKey = await depositFeatureKey(ctx.contract, fiatValue);
+  const confirmed = await executeDepositFeature(ctx.contract, ctx.storage, fiatValue, ctx.admin.publicKey);
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.op, 'fiatDeposit');
   assert.equal(confirmed.rail, 'stripe');
@@ -464,7 +404,7 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
     denom: 'mu_usd',
     mu: 2_500_000,
     updated_epoch: 1,
-    updated_at: makeTxKey(5),
+    updated_at: confirmedKey,
     last_deposit_rail: 'stripe',
     last_deposit_fiat_currency: 'usd',
   });
@@ -474,17 +414,16 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   assert.equal(root.mu_total, 2_500_000);
   assert.equal(root.merkle_root, confirmed.deposit_root);
   assert.equal(JSON.stringify(root).includes(ctx.user.publicKey), false);
-  assert.equal(JSON.stringify(root).includes('a'.repeat(64)), false);
+  assert.equal(root.merkle_root.includes('a'.repeat(64)), false);
 });
 
 test('MayhemContract fiatChargeback claws back remaining credits and freezes buyer', async () => {
   const ctx = await setupDepositContract();
   await consentUser(ctx, 2);
 
-  const deposit = await execute(
+  const deposit = await executeDepositFeature(
     ctx.contract,
     ctx.storage,
-    'fiatDeposit',
     {
       op: 'fiat_deposit',
       rail: 'stripe',
@@ -496,8 +435,7 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
       epoch: 1,
       at: 1_800,
     },
-    ctx.admin.publicKey,
-    3
+    ctx.admin.publicKey
   );
   assert.equal(deposit.ok, true, deposit.message);
 

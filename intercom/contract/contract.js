@@ -146,6 +146,8 @@ export const providerLifecycleIntentMessage = (intent, signingVersion = SIGNING_
   }
   throw new Error(`Unsupported signing message version: ${signingVersion}`);
 };
+export const depositTnkIntentMessage = (intent) =>
+  `mayhem-deposit-tnk-intent-v1${stableJson(intent)}`;
 export const receiptMessage = (body, signingVersion = SIGNING_MESSAGE_VERSION) => {
   if (signingVersion === 1) {
     return JSON.stringify({
@@ -648,66 +650,6 @@ class MayhemContract extends Contract {
       },
     });
 
-    this.addSchema('depositTnk', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        memo_hash: { type: 'string', min: 1, max: 128 },
-        treasury_address: { type: 'string', min: 1, max: 128 },
-        tnk_e18: { type: 'string', min: 1, max: 80 },
-        quoted_mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        rate_tnk_usd_e6: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        rate_source: { type: 'string', min: 1, max: 64 },
-      },
-    });
-
-    this.addSchema('tnkDeposit', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        memo_hash: { type: 'string', min: 1, max: 128 },
-        tnk_e18: { type: 'string', min: 1, max: 80 },
-        msb_tx_hash: { type: 'string', min: 1, max: 128 },
-        epoch: { type: 'number', integer: true, min: 1 },
-        at: { type: 'number', integer: true, min: 0 },
-      },
-    });
-
-    this.addSchema('tapDeposit', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        who: { type: 'string', min: 1, max: 128 },
-        tap_wei: { type: 'string', min: 1, max: 80 },
-        eth_tx_hash: { type: 'string', min: 1, max: 128 },
-        log_index: { type: 'number', integer: true, min: 0, max: Number.MAX_SAFE_INTEGER },
-        block_number: { type: 'number', integer: true, min: 0, max: Number.MAX_SAFE_INTEGER },
-        pool_address: { type: 'string', min: 1, max: 128 },
-        chain_id: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        epoch: { type: 'number', integer: true, min: 1 },
-        at: { type: 'number', integer: true, min: 0 },
-      },
-    });
-
-    this.addSchema('fiatDeposit', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        rail: { type: 'string', min: 1, max: 64 },
-        who: { type: 'string', min: 1, max: 128 },
-        mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        ext_ref_hash: { type: 'string', min: 1, max: 128 },
-        fiat_currency: { type: 'string', min: 3, max: 3 },
-        fiat_amount_minor: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
-        epoch: { type: 'number', integer: true, min: 1 },
-        at: { type: 'number', integer: true, min: 0 },
-      },
-    });
-
     this.addSchema('fiatChargeback', {
       value: {
         $$strict: true,
@@ -781,11 +723,6 @@ class MayhemContract extends Contract {
 
   async mayhemFeature() {
     this._mayhemLastFeatureResult = undefined;
-    const adminError = await this.requireAdmin(this.address);
-    if (adminError) {
-      this._mayhemLastFeatureResult = adminError;
-      return adminError;
-    }
     const rawKey = this.op?.key;
     const key = typeof rawKey === 'string' && rawKey.startsWith('mayhem_')
       ? rawKey.slice('mayhem_'.length)
@@ -793,6 +730,11 @@ class MayhemContract extends Contract {
     const value = this.value;
     if (typeof key !== 'string' || !value || typeof value !== 'object' || Array.isArray(value)) {
       return;
+    }
+    if (value.op === 'deposit_tnk') {
+      const result = await this.applyDepositTnkFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
     }
     if (value.op === 'consent') {
       const result = await this.applyConsentFeature(key, value);
@@ -804,8 +746,18 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    const adminError = await this.requireAdmin(this.address);
+    if (adminError) {
+      this._mayhemLastFeatureResult = adminError;
+      return adminError;
+    }
     if (value.op === 'epoch_apply') {
       const result = await this.applyEpochApplyFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (['tnk_deposit', 'tap_deposit', 'fiat_deposit'].includes(value.op)) {
+      const result = await this.applyDepositCreditFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -880,6 +832,57 @@ class MayhemContract extends Contract {
     this.tx = key;
     try {
       return await this.epochApply();
+    } finally {
+      this.tx = previousTx;
+    }
+  }
+
+  async applyDepositTnkFeature(key, value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'sender', 'intent', 'sig'],
+      'deposit TNK feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'deposit_tnk') return new Error('Invalid deposit TNK feature op.');
+    if (!this.isHexBytes(value.sender, 32)) return new Error('Invalid deposit TNK sender.');
+    if (!this.isHexBytes(value.sig, 64)) return new Error('Invalid deposit TNK signature.');
+    const intentError = this.validateDepositTnkIntent(value.intent);
+    if (intentError) return intentError;
+    if (!this.verifyDepositTnkSignature(value.sender, value.intent, value.sig)) {
+      return new Error('Invalid deposit TNK signature.');
+    }
+    const expectedKey = await this.depositFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousAddress = this.address;
+    const previousTx = this.tx;
+    const previousValue = this.value;
+    this.address = value.sender;
+    this.tx = key;
+    this.value = value.intent;
+    try {
+      return await this.depositTnk();
+    } finally {
+      this.address = previousAddress;
+      this.tx = previousTx;
+      this.value = previousValue;
+    }
+  }
+
+  async applyDepositCreditFeature(key, value) {
+    const expectedKey = await this.depositFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      if (value.op === 'tnk_deposit') return await this.tnkDeposit();
+      if (value.op === 'tap_deposit') return await this.tapDeposit();
+      if (value.op === 'fiat_deposit') return await this.fiatDeposit();
+      return;
     } finally {
       this.tx = previousTx;
     }
@@ -3953,6 +3956,36 @@ class MayhemContract extends Contract {
     return this.validateEpochApplyShape(value);
   }
 
+  validateDepositTnkIntent(intent) {
+    const shapeError = this.validateExactObjectKeys(
+      intent,
+      [
+        'op',
+        'memo_hash',
+        'treasury_address',
+        'tnk_e18',
+        'quoted_mu',
+        'rate_tnk_usd_e6',
+        'rate_source',
+      ],
+      'deposit TNK intent'
+    );
+    if (shapeError) return shapeError;
+    if (intent.op !== 'deposit_tnk') return new Error('Invalid deposit TNK intent op.');
+    if (!this.isSafeKeyPart(intent.memo_hash)) return new Error('Invalid deposit memo hash.');
+    if (!this.isSafeKeyPart(intent.treasury_address)) return new Error('Invalid TNK treasury address.');
+    if (!Number.isSafeInteger(intent.quoted_mu) || intent.quoted_mu < 1) {
+      return new Error('Invalid TNK quoted credit.');
+    }
+    if (!Number.isSafeInteger(intent.rate_tnk_usd_e6) || intent.rate_tnk_usd_e6 < 1) {
+      return new Error('Invalid TNK quoted rate.');
+    }
+    if (!this.isSafeKeyPart(intent.rate_source)) return new Error('Invalid TNK rate source.');
+    const tnkE18 = this.parseTnkE18(intent.tnk_e18);
+    if (tnkE18 instanceof Error) return tnkE18;
+    return null;
+  }
+
   guardianValidateBalanceRecord(record, user = null) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) {
       return new Error('Guardian non-negative balance invariant failed.');
@@ -5339,6 +5372,41 @@ class MayhemContract extends Contract {
     return `epoch/apply/${value.epoch}/${b4a.toString(digest, 'hex')}`;
   }
 
+  async depositFeatureKey(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Deposit feature value must be an object.');
+    }
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-deposit-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    if (value.op === 'deposit_tnk' && value.intent) {
+      const intentError = this.validateDepositTnkIntent(value.intent);
+      if (intentError) return intentError;
+      return `dep/tnk-intent/${value.intent.memo_hash}/${digest}`;
+    }
+    if (value.op === 'tnk_deposit') {
+      if (!this.isSafeKeyPart(value.memo_hash)) return new Error('Invalid deposit memo hash.');
+      return `dep/tnk/${value.memo_hash}/${digest}`;
+    }
+    if (value.op === 'tap_deposit') {
+      if (!this.isSafeKeyPart(value.eth_tx_hash)) return new Error('Invalid Ethereum tx hash.');
+      if (!Number.isSafeInteger(value.log_index) || value.log_index < 0) {
+        return new Error('Invalid TAP deposit log index.');
+      }
+      return `dep/tap/${value.eth_tx_hash.toLowerCase()}/${value.log_index}/${digest}`;
+    }
+    if (value.op === 'fiat_deposit') {
+      if (!this.isSafeKeyPart(value.rail)) return new Error('Invalid fiat deposit rail.');
+      if (!this.isSafeKeyPart(value.ext_ref_hash)) return new Error('Invalid external reference hash.');
+      return `dep/fiat/${value.rail}/${value.ext_ref_hash}/${digest}`;
+    }
+    return new Error('Unsupported deposit feature op.');
+  }
+
   async epochCommitHash(value) {
     const digest = await blake3(b4a.from(stableJson({
       domain: 'mayhem-epoch-commit-v1',
@@ -5534,6 +5602,12 @@ class MayhemContract extends Contract {
     return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) =>
       verify.call(this.protocol.peer.wallet, sig, providerLifecycleIntentMessage(intent, signingVersion), provider) === true
     );
+  }
+
+  verifyDepositTnkSignature(sender, intent, sig) {
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function') return false;
+    return verify.call(this.protocol.peer.wallet, sig, depositTnkIntentMessage(intent), sender) === true;
   }
 
   verifyProbeResultSignature(auditor, value) {

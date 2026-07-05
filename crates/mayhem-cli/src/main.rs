@@ -789,7 +789,7 @@ struct PayTnkArgs {
     #[arg(long)]
     wallet_password: Option<String>,
 
-    /// Sign and submit the depositTnk intent through peer RPC.
+    /// Sign and submit the free TNK deposit intent feature through peer RPC.
     #[arg(long)]
     submit_intent: bool,
 
@@ -8535,8 +8535,33 @@ fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> St
 }
 
 async fn admin(command: AdminCommands) -> Result<()> {
-    if let AdminCommands::EpochApply(args) = &command {
-        return run_admin_epoch_apply_feature(args).await;
+    match &command {
+        AdminCommands::EpochApply(args) => return run_admin_epoch_apply_feature(args).await,
+        AdminCommands::TnkDeposit(args) => {
+            return run_admin_deposit_feature(
+                &args.tx,
+                "tnkDeposit",
+                admin_tnk_deposit_payload(args),
+            )
+            .await;
+        }
+        AdminCommands::TapDeposit(args) => {
+            return run_admin_deposit_feature(
+                &args.tx,
+                "tapDeposit",
+                admin_tap_deposit_payload(args),
+            )
+            .await;
+        }
+        AdminCommands::FiatDeposit(args) => {
+            return run_admin_deposit_feature(
+                &args.tx,
+                "fiatDeposit",
+                admin_fiat_deposit_payload(args)?,
+            )
+            .await;
+        }
+        _ => {}
     }
     let tx_args = admin_tx_args(&command);
     let (tx_type, mut value) = admin_command_payload(&command)?;
@@ -8548,6 +8573,15 @@ async fn run_admin_epoch_apply_feature(args: &AdminEpochApplyArgs) -> Result<()>
     let value = admin_epoch_apply_payload(args)?;
     let key = epoch_apply_feature_key(&value)?;
     run_admin_feature_command(&args.tx, "epochApply", key, value).await
+}
+
+async fn run_admin_deposit_feature(
+    args: &AdminTxArgs,
+    feature_type: &'static str,
+    value: Value,
+) -> Result<()> {
+    let key = deposit_feature_key(&value)?;
+    run_admin_feature_command(args, feature_type, key, value).await
 }
 
 fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
@@ -9339,6 +9373,58 @@ fn epoch_apply_feature_key(value: &Value) -> Result<String> {
     Ok(format!("epoch/apply/{epoch}/{digest}"))
 }
 
+fn deposit_feature_key(value: &Value) -> Result<String> {
+    let op = value
+        .get("op")
+        .and_then(Value::as_str)
+        .context("deposit feature payload missing op")?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-deposit-feature-v1",
+        "value": value,
+    }));
+    match op {
+        "deposit_tnk" => {
+            let memo_hash = value
+                .get("intent")
+                .and_then(|intent| intent.get("memo_hash"))
+                .and_then(Value::as_str)
+                .context("deposit_tnk feature missing intent.memo_hash")?;
+            Ok(format!("dep/tnk-intent/{memo_hash}/{digest}"))
+        }
+        "tnk_deposit" => {
+            let memo_hash = value
+                .get("memo_hash")
+                .and_then(Value::as_str)
+                .context("tnk_deposit feature missing memo_hash")?;
+            Ok(format!("dep/tnk/{memo_hash}/{digest}"))
+        }
+        "tap_deposit" => {
+            let eth_tx_hash = value
+                .get("eth_tx_hash")
+                .and_then(Value::as_str)
+                .context("tap_deposit feature missing eth_tx_hash")?
+                .to_ascii_lowercase();
+            let log_index = value
+                .get("log_index")
+                .and_then(Value::as_u64)
+                .context("tap_deposit feature missing log_index")?;
+            Ok(format!("dep/tap/{eth_tx_hash}/{log_index}/{digest}"))
+        }
+        "fiat_deposit" => {
+            let rail = value
+                .get("rail")
+                .and_then(Value::as_str)
+                .context("fiat_deposit feature missing rail")?;
+            let ext_ref_hash = value
+                .get("ext_ref_hash")
+                .and_then(Value::as_str)
+                .context("fiat_deposit feature missing ext_ref_hash")?;
+            Ok(format!("dep/fiat/{rail}/{ext_ref_hash}/{digest}"))
+        }
+        _ => bail!("unsupported deposit feature op {op}"),
+    }
+}
+
 fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option<Value>> {
     path.map(|path| {
         read_json_file(path)
@@ -9647,6 +9733,32 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         rate.tnk_usd_e6,
         rpc_url.as_deref(),
     );
+    let keypair_path = PathBuf::from(wallet.keypair_path.clone());
+    let intent_sig = sign_message(
+        &keypair_path,
+        args.wallet_password.as_deref().unwrap_or(""),
+        &deposit_tnk_intent_message(&intent_payload),
+    )
+    .await?;
+    let intent_feature_value = json!({
+        "op": "deposit_tnk",
+        "sender": wallet.public_key,
+        "intent": intent_payload,
+        "sig": intent_sig,
+    });
+    let intent_feature = json!({
+        "feature": "mayhem",
+        "key": deposit_feature_key(&intent_feature_value)?,
+        "value": intent_feature_value,
+    });
+    let intent_feature_json = serde_json::to_string(&intent_feature)?;
+    let intent_feature_rpc_command = rpc_url.as_deref().map(|url| {
+        format!(
+            "curl -sS -X POST {} -H 'content-type: application/json' --data {}",
+            shell_single_quote(&format!("{}/contract/feature", url.trim_end_matches('/'))),
+            shell_single_quote(&intent_feature_json)
+        )
+    });
     let admin_confirm_command = format!(
         "mayhem admin tnk-deposit --memo-hash {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --epoch <epoch> --at <unix-seconds>",
         shell_single_quote(&memo_hash),
@@ -9670,19 +9782,18 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
 
     let submitted = if args.submit_intent {
         let rpc = rpc.as_ref().context("--submit-intent requires peer RPC")?;
-        let keypair_path = PathBuf::from(wallet.keypair_path.clone());
-        Some(
-            submit_contract_command(
-                rpc,
-                &keypair_path,
-                args.wallet_password.as_deref().unwrap_or(""),
-                &wallet,
-                "depositTnk",
-                intent_payload.clone(),
-                args.sim,
-            )
-            .await?,
-        )
+        if args.sim {
+            Some(json!({ "sim": true, "submitted": false }))
+        } else {
+            let response = rpc
+                .submit_feature(&intent_feature)
+                .await
+                .context("submitting free TNK deposit intent feature")?;
+            if response.get("ok").and_then(Value::as_bool) != Some(true) {
+                bail!("TNK deposit intent feature was not accepted: {response}");
+            }
+            Some(response)
+        }
     } else {
         None
     };
@@ -9743,10 +9854,10 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             "ts": rate.ts,
         },
         "deposit_intent": {
-            "tx_type": "depositTnk",
-            "command": intent_payload,
-            "submitted": submitted.is_some(),
-            "tx": submitted,
+            "feature": intent_feature,
+            "submitted": args.submit_intent && !args.sim,
+            "sim": args.submit_intent && args.sim,
+            "result": submitted,
         },
         "tnk": {
             "tnk_e18": tnk_e18.to_string(),
@@ -9759,6 +9870,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             "msb_transfer_command": msb_transfer_command,
             "transfer_memo_reference": memo_hash,
             "deposit_intent_command": deposit_intent_command,
+            "deposit_intent_rpc_command": intent_feature_rpc_command,
             "admin_confirm_command": admin_confirm_command,
         },
         "credit": credit.as_ref().map(|status| json!({
@@ -9787,13 +9899,14 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         if let Some(ts) = rate.ts {
             println!("Rate timestamp: {ts}");
         }
-        if submitted.is_some() {
-            println!("Submitted deposit intent: true");
-            if let Some(tx) = report["deposit_intent"]["tx"]["tx"].as_str() {
-                println!("Tx: {tx}");
+        if args.submit_intent {
+            if args.sim {
+                println!("Submitted deposit intent: false (--sim dry-run)");
+            } else {
+                println!("Submitted deposit intent: true");
             }
-            if let Some(command_hash) = report["deposit_intent"]["tx"]["command_hash"].as_str() {
-                println!("Command hash: {command_hash}");
+            if let Some(key) = report["deposit_intent"]["feature"]["key"].as_str() {
+                println!("Deposit intent feature key: {key}");
             }
         } else {
             println!(
@@ -9807,6 +9920,10 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             }
         } else if args.submit_transfer {
             println!("Submitted MSB transfer: false");
+        }
+        if let Some(command) = report["copy_paste"]["deposit_intent_rpc_command"].as_str() {
+            println!("Copy/paste deposit intent feature RPC command:");
+            println!("{command}");
         }
         println!("Copy/paste admin/oracle confirmation command after MSB finality:");
         println!(
@@ -12693,6 +12810,10 @@ fn pay_tnk_deposit_intent_payload(
         "rate_tnk_usd_e6": rate.tnk_usd_e6,
         "rate_source": rate.source,
     })
+}
+
+fn deposit_tnk_intent_message(intent: &Value) -> String {
+    format!("mayhem-deposit-tnk-intent-v1{}", stable_json_value(intent))
 }
 
 async fn resolve_tnk_rate(

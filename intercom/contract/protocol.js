@@ -208,30 +208,12 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'deposit_tnk') {
-      return {
-        type: 'depositTnk',
-        value: json,
-      };
-    }
-    if (json?.op === 'tnk_deposit') {
-      return {
-        type: 'tnkDeposit',
-        value: json,
-      };
-    }
-    if (json?.op === 'tap_deposit') {
-      return {
-        type: 'tapDeposit',
-        value: json,
-      };
-    }
-    if (json?.op === 'fiat_deposit') {
-      return {
-        type: 'fiatDeposit',
-        value: json,
-      };
-    }
+    if (
+      json?.op === 'deposit_tnk' ||
+      json?.op === 'tnk_deposit' ||
+      json?.op === 'tap_deposit' ||
+      json?.op === 'fiat_deposit'
+    ) return null;
     if (json?.op === 'fiat_chargeback') {
       return {
         type: 'fiatChargeback',
@@ -284,9 +266,8 @@ class MayhemProtocol extends Protocol {
     console.log('- Feature { "feature": "mayhem", "key": "epoch/apply/<epoch>/<payload_hash>", "value": { "op": "epoch_apply", "epoch": 1, "at": 3600, "debits": [{ "user": "<pk>", "mu": 1000 }], "earnings": [{ "provider": "<pk>", "gross_mu": 1000 }] } } | admin/oracle applies bounded credit, earning, and fee deltas for free after epochCommit.');
     console.log('- /tx --command \'{ "op": "rate_oracle", "tnk_usd_e6": 50000, "source": "gate-spot", "ts": 3600 }\' --sim 1 | admin/oracle updates the TNK/USD rate.');
     console.log('- /tx --command \'{ "op": "tap_rate_oracle", "tap_usd_e6": 50000, "source": "uniswap-v2", "ts": 3600 }\' --sim 1 | admin/oracle updates the TAP/USD policy rate for TAP deposits.');
-    console.log('- /tx --command \'{ "op": "deposit_tnk", "memo_hash": "<hash>" }\' --sim 1 | user creates a memo-bound TNK deposit intent.');
-    console.log('- /tx --command \'{ "op": "tnk_deposit", "memo_hash": "<hash>", "tnk_e18": "1000000000000000000", "msb_tx_hash": "<hash>", "epoch": 1, "at": 3600 }\' --sim 1 | admin/oracle credits a memo-bound TNK deposit using a fresh rate.');
-    console.log('- /tx --command \'{ "op": "tap_deposit", "who": "0x...", "tap_wei": "1000000000000000000", "eth_tx_hash": "0x...", "log_index": 0, "block_number": 123, "pool_address": "0x...", "chain_id": 11155111, "epoch": 1, "at": 3600 }\' --sim 1 | admin/oracle credits a finalized TAP escrow Deposit event exactly once using the fresh TAP rate.');
+    console.log('- Feature { "feature": "mayhem", "key": "dep/tnk-intent/<memo>/<payload_hash>", "value": { "op": "deposit_tnk", "sender": "<pk>", "intent": { ... }, "sig": "<sig>" } } | user-signed TNK deposit intent for free.');
+    console.log('- Feature { "feature": "mayhem", "key": "dep/tnk|tap|fiat/...", "value": { "op": "tnk_deposit|tap_deposit|fiat_deposit", ... } } | admin/oracle credits deposit evidence for free; deposits fold into ev/dep roots.');
     console.log('- /tx --command \'{ "op": "payout_confirm", "epoch": 7, "who": "<pk>", "mu": 1000000, "tnk_e18": "500000000000000000", "msb_tx_hash": "<hash>", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated TNK provider payout.');
     console.log('- /tx --command \'{ "op": "payout_confirm", "rail": "stripe", "epoch": 7, "who": "<pk>", "mu": 1000000, "external_ref": "tr_...", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated Stripe Connect provider payout.');
     console.log('- /tx --command \'{ "op": "payout_confirm", "rail": "coinbase", "epoch": 7, "who": "<pk>", "mu": 1000000, "external_ref": "transfer_...", "at": 25200 }\' --sim 1 | admin/oracle confirms an automated Coinbase provider payout.');

@@ -3,11 +3,14 @@ import test from 'node:test';
 import MayhemContract from '../contract/contract.js';
 import {
   MemoryStorage,
+  depositFeatureKey,
   execute,
+  executeDepositFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
   signConsent,
+  signDepositTnkIntent,
 } from './helpers/contract.js';
 
 const rulesHash = '6'.repeat(64);
@@ -71,6 +74,40 @@ const tapRateOracle = (overrides = {}) => ({
   tap_usd_e6: 2_000_000,
   source: 'uniswap-v2',
   ts: 1_000,
+  ...overrides,
+});
+
+async function tnkDepositIntent(contract, storage, user, memoHash, overrides = {}) {
+  const intent = {
+    op: 'deposit_tnk',
+    memo_hash: memoHash,
+    treasury_address: 'testtrac1treasury',
+    tnk_e18: oneTnkE18,
+    quoted_mu: 2_000_000,
+    rate_tnk_usd_e6: 2_000_000,
+    rate_source: 'gate-spot',
+    ...overrides,
+  };
+  return await executeDepositFeature(
+    contract,
+    storage,
+    {
+      op: 'deposit_tnk',
+      sender: user.publicKey,
+      intent,
+      sig: signDepositTnkIntent(user.wallet, intent),
+    },
+    user.publicKey
+  );
+}
+
+const tnkDepositConfirm = (memoHash, overrides = {}) => ({
+  op: 'tnk_deposit',
+  memo_hash: memoHash,
+  tnk_e18: oneTnkE18,
+  msb_tx_hash: 'd'.repeat(64),
+  epoch: 1,
+  at: 1_900,
   ...overrides,
 });
 
@@ -203,24 +240,22 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
   );
   assert.match(older.message, /timestamp must not decrease/i);
 
-  const staleDeposit = await execute(
+  const staleDeposit = await executeDepositFeature(
     contract,
     storage,
-    'tapDeposit',
     tapDeposit,
-    admin.publicKey,
-    8
+    admin.publicKey
   );
   assert.match(staleDeposit.message, /TAP rate oracle is stale/i);
   assert.equal(await storage.get(`bal/${buyer}`), null);
 
-  const freshDeposit = await execute(
+  const freshTapValue = { ...tapDeposit, at: 1_900 };
+  const freshTapKey = await depositFeatureKey(contract, freshTapValue);
+  const freshDeposit = await executeDepositFeature(
     contract,
     storage,
-    'tapDeposit',
-    { ...tapDeposit, at: 1_900 },
-    admin.publicKey,
-    9
+    freshTapValue,
+    admin.publicKey
   );
   assert.equal(freshDeposit.ok, true, freshDeposit.message);
   assert.equal(freshDeposit.mu, 2_000_000);
@@ -230,7 +265,7 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 1,
-    updated_at: makeTxKey(9),
+    updated_at: freshTapKey,
     last_deposit_rail: 'tap',
     last_deposit_rate_ts: 1_000,
     last_deposit_rate_source: 'uniswap-v2',
@@ -260,20 +295,11 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     updated_at: null,
   });
 
-  const staleDeposit = await execute(
+  const staleDeposit = await executeDepositFeature(
     contract,
     storage,
-    'tnkDeposit',
-    {
-      op: 'tnk_deposit',
-      memo_hash: 'stale-deposit',
-      tnk_e18: oneTnkE18,
-      msb_tx_hash: 'd'.repeat(64),
-      epoch: 1,
-      at: 3_701,
-    },
-    admin.publicKey,
-    5
+    tnkDepositConfirm('stale-deposit', { at: 3_701 }),
+    admin.publicKey
   );
   assert.match(staleDeposit.message, /rate oracle is stale/i);
   assert.equal(await storage.get(`bal/${user.publicKey}`), null);
@@ -327,38 +353,21 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
   );
   assert.equal(userConsent.ok, true, userConsent.message);
 
-  const intent = await execute(
+  const intent = await tnkDepositIntent(
     contract,
     storage,
-    'depositTnk',
-    {
-      op: 'deposit_tnk',
-      memo_hash: 'fresh-deposit',
-      treasury_address: 'testtrac1treasury',
-      tnk_e18: oneTnkE18,
-      quoted_mu: 2_000_000,
-      rate_tnk_usd_e6: 2_000_000,
-      rate_source: 'gate-spot',
-    },
-    user.publicKey,
-    8
+    user,
+    'fresh-deposit'
   );
   assert.equal(intent.ok, true, intent.message);
 
-  const freshDeposit = await execute(
+  const freshTnkValue = tnkDepositConfirm('fresh-deposit', { msb_tx_hash: 'f'.repeat(64) });
+  const freshTnkKey = await depositFeatureKey(contract, freshTnkValue);
+  const freshDeposit = await executeDepositFeature(
     contract,
     storage,
-    'tnkDeposit',
-    {
-      op: 'tnk_deposit',
-      memo_hash: 'fresh-deposit',
-      tnk_e18: oneTnkE18,
-      msb_tx_hash: 'f'.repeat(64),
-      epoch: 1,
-      at: 1_900,
-    },
-    admin.publicKey,
-    9
+    freshTnkValue,
+    admin.publicKey
   );
   assert.equal(freshDeposit.ok, true, freshDeposit.message);
   assert.equal(freshDeposit.op, 'tnkDeposit');
@@ -372,7 +381,7 @@ test('MayhemContract refuses TNK deposits and payouts when the rate is stale', a
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 0,
-    updated_at: makeTxKey(9),
+    updated_at: freshTnkKey,
     last_deposit_rate_ts: 1_000,
   });
 
@@ -458,20 +467,11 @@ test('MayhemContract rate staleness follows scheduled params', async () => {
   );
   assert.equal(rate.ok, true, rate.message);
 
-  const staleByScheduledParam = await execute(
+  const staleByScheduledParam = await executeDepositFeature(
     contract,
     storage,
-    'tnkDeposit',
-    {
-      op: 'tnk_deposit',
-      memo_hash: 'scheduled-stale',
-      tnk_e18: oneTnkE18,
-      msb_tx_hash: '2'.repeat(64),
-      epoch: 1,
-      at: 86_461,
-    },
-    admin.publicKey,
-    6
+    tnkDepositConfirm('scheduled-stale', { msb_tx_hash: '2'.repeat(64), at: 86_461 }),
+    admin.publicKey
   );
   assert.match(staleByScheduledParam.message, /rate oracle is stale/i);
 });
