@@ -20,7 +20,7 @@ use crate::{
     failover::{
         midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy, RedispatchMode,
         SessionFailoverState, SessionPriceMu, DEFAULT_MAX_OPEN_ATTEMPTS,
-        DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
+        DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
     },
     pricing::{normalize_rate_map, text_generation_rate_map, text_usage_mu, RateMapEntry},
     provider_table::{
@@ -100,6 +100,7 @@ pub struct GatewayState {
     dashboard_session: Arc<DashboardSession>,
     provider_earnings: Arc<Vec<Value>>,
     provider_table: Arc<Mutex<ProviderTable>>,
+    provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
 }
 
 #[derive(Clone)]
@@ -679,6 +680,7 @@ impl GatewayState {
             dashboard_session: Arc::new(DashboardSession::new()),
             provider_earnings: Arc::new(Vec::new()),
             provider_table: Arc::new(Mutex::new(provider_table)),
+            provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -3884,6 +3886,9 @@ async fn run_chat_with_route_retry(
                 });
             }
             Err(err) if err.retryable => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
                 record_route_observation(
                     state,
                     route,
@@ -3904,6 +3909,9 @@ async fn run_chat_with_route_retry(
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
                 record_route_observation(
                     state,
                     route,
@@ -3940,13 +3948,16 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
     min_att_tier: Option<u8>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
-    let eligible_routes = eligible_route_candidates(model, min_att_tier);
+    let now_millis = now_millis_u64();
+    let eligible_routes = eligible_route_candidates(model, min_att_tier)
+        .into_iter()
+        .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
+        .collect::<Vec<_>>();
     if eligible_routes.len() <= 1 {
         return eligible_routes;
     }
 
     state.refresh_provider_table_routes(model);
-    let now_millis = now_millis_u64();
     let requirements = request_requirements_for_chat(state, model, request, now_millis);
     let route_by_key = eligible_routes
         .iter()
@@ -4006,6 +4017,23 @@ impl GatewayState {
             ));
             table.upsert_heartbeat(heartbeat_for_route(model, candidate, now), now);
         }
+    }
+
+    fn cool_route_provider(&self, route: &GatewayRouteCandidate, now_millis: u64) -> u64 {
+        let cooled_until = now_millis.saturating_add(DEFAULT_PROVIDER_COOLOFF_MILLIS);
+        self.provider_cooloffs
+            .lock()
+            .expect("provider cooloff map poisoned")
+            .insert(route_key(route), cooled_until);
+        cooled_until
+    }
+
+    fn route_provider_in_cooloff(&self, route: &GatewayRouteCandidate, now_millis: u64) -> bool {
+        self.provider_cooloffs
+            .lock()
+            .expect("provider cooloff map poisoned")
+            .get(&route_key(route))
+            .is_some_and(|cooled_until| *cooled_until > now_millis)
     }
 }
 
@@ -6970,6 +6998,7 @@ mod tests {
     #[derive(Debug)]
     struct PartialThenSuccessBackend {
         attempts: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        providers: Arc<Mutex<Vec<String>>>,
     }
 
     impl GatewaySessionBackend for PartialThenSuccessBackend {
@@ -6985,6 +7014,10 @@ mod tests {
         ) -> GatewaySessionFuture<'a> {
             Box::pin(async move {
                 let attempt = {
+                    self.providers
+                        .lock()
+                        .expect("providers lock")
+                        .push(invocation.provider_pubkey.clone().unwrap_or_default());
                     let mut attempts = self.attempts.lock().expect("attempts lock");
                     attempts.push(request.messages.clone());
                     attempts.len()
@@ -7139,13 +7172,42 @@ mod tests {
         assert_eq!(after, 0);
     }
 
+    #[test]
+    fn route_selection_excludes_provider_during_cooloff_and_readmits_after_expiry() {
+        let model = test_routed_model(3);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let request = test_chat_request(&model.id);
+        let cooled_route = &model.mayhem.route_candidates[0];
+        let cooled_provider = cooled_route.provider.clone();
+
+        state.cool_route_provider(cooled_route, now_millis_u64());
+        let cooled_order =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert!(!cooled_order
+            .iter()
+            .any(|candidate| candidate.provider == cooled_provider));
+
+        state
+            .provider_cooloffs
+            .lock()
+            .expect("provider cooloff map poisoned")
+            .insert(route_key(cooled_route), 0);
+        let readmitted_order =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert!(readmitted_order
+            .iter()
+            .any(|candidate| candidate.provider == cooled_provider));
+    }
+
     #[tokio::test]
     async fn route_retry_records_partial_receipt_and_redispatches_remaining_history() {
         let model = test_routed_model(2);
         let attempts = Arc::new(Mutex::new(Vec::new()));
+        let providers = Arc::new(Mutex::new(Vec::new()));
         let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
             PartialThenSuccessBackend {
                 attempts: attempts.clone(),
+                providers: providers.clone(),
             },
         ));
         let mut request = test_chat_request(&model.id);
@@ -7166,6 +7228,14 @@ mod tests {
             .iter()
             .any(|message| message.role == "assistant" && message.content == json!("hello ")));
         assert_eq!(attempts.lock().expect("attempts lock").len(), 2);
+        let providers = providers.lock().expect("providers lock").clone();
+        assert_eq!(providers.len(), 2);
+        let failed_provider = &providers[0];
+        let post_failure_order =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert!(!post_failure_order
+            .iter()
+            .any(|candidate| &candidate.provider == failed_provider));
 
         let partial_receipts = state.receipts();
         assert_eq!(partial_receipts.len(), 1);
