@@ -144,7 +144,9 @@ fn ceil_div_u128(value: u128, divisor: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mayhem_proto::{ReceiptUsage, USAGE_IMAGE, USAGE_STEP};
+    use mayhem_proto::{
+        ReceiptUsage, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    };
 
     #[test]
     fn text_rate_map_matches_legacy_two_token_charge() {
@@ -179,5 +181,32 @@ mod tests {
             serde_json::json!({ "image": 2, "step": 60 })
         );
         assert_eq!(usage_map_mu(&rate_map, &usage), 1_120);
+    }
+
+    #[test]
+    fn audio_usage_aliases_settle_against_canonical_units() {
+        let usage: ReceiptUsage = serde_json::from_value(serde_json::json!({
+            "input_chars": 12,
+            "audio_seconds": 3
+        }))
+        .unwrap();
+        let rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_mu: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_mu: 100,
+                granularity: 1,
+            },
+        ];
+
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({ "audio_second": 3, "input_character": 12 })
+        );
+        assert_eq!(usage_map_mu(&rate_map, &usage), 312);
     }
 }

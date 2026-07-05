@@ -24,6 +24,8 @@ use crate::{
     ReputationEventKind,
 };
 use axum::{
+    body::Body,
+    extract::Multipart,
     extract::State,
     http::{header, HeaderMap, StatusCode},
     response::{
@@ -33,6 +35,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
@@ -41,7 +44,8 @@ use mayhem_proto::{
     session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
     AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
     SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_INPUT_TOKEN,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -342,6 +346,44 @@ pub struct EmbeddingRequest {
     pub dimensions: Option<usize>,
     #[serde(default)]
     pub user: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageGenerationRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub response_format: Option<String>,
+    #[serde(default)]
+    pub steps: Option<u64>,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AudioSpeechRequest {
+    pub model: String,
+    pub input: String,
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub response_format: Option<String>,
+    #[serde(default)]
+    pub speed: Option<f64>,
+}
+
+#[derive(Debug)]
+struct AudioTranscriptionRequest {
+    model: String,
+    audio: Vec<u8>,
+    filename: Option<String>,
+    response_format: Option<String>,
+    language: Option<String>,
+    prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -711,6 +753,9 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/completions", post(create_completion))
         .route("/v1/embeddings", post(create_embedding))
+        .route("/v1/images/generations", post(create_image_generation))
+        .route("/v1/audio/speech", post(create_audio_speech))
+        .route("/v1/audio/transcriptions", post(create_audio_transcription))
         .route("/mayhem/status", get(mayhem_status))
         .route("/mayhem/receipts", get(mayhem_receipts))
         .route("/mayhem/probes", get(mayhem_probes))
@@ -772,6 +817,39 @@ async fn create_embedding(
     Json(request): Json<EmbeddingRequest>,
 ) -> Response {
     match build_embedding(&state, request) {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn create_image_generation(
+    State(state): State<SharedState>,
+    Json(request): Json<ImageGenerationRequest>,
+) -> Response {
+    match build_image_generation(&state, request) {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn create_audio_speech(
+    State(state): State<SharedState>,
+    Json(request): Json<AudioSpeechRequest>,
+) -> Response {
+    match build_audio_speech(&state, request) {
+        Ok(response) => response,
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn create_audio_transcription(
+    State(state): State<SharedState>,
+    multipart: Multipart,
+) -> Response {
+    match parse_audio_transcription_multipart(multipart)
+        .await
+        .and_then(|request| build_audio_transcription(&state, request))
+    {
         Ok(value) => Json(value).into_response(),
         Err(err) => err.into_response(),
     }
@@ -2401,6 +2479,239 @@ fn build_embedding(state: &GatewayState, request: EmbeddingRequest) -> Result<Va
     }))
 }
 
+fn build_image_generation(
+    state: &GatewayState,
+    request: ImageGenerationRequest,
+) -> Result<Value, ApiError> {
+    let model = require_model(state, &request.model)?;
+    if !model_supports_image_generation(&model) {
+        return Err(ApiError::bad_request(
+            "model does not support image generation",
+            Some("model"),
+        ));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "prompt must not be empty",
+            Some("prompt"),
+        ));
+    }
+    let count = image_count(request.n)?;
+    let (width, height, size) = image_size(request.size.as_deref())?;
+    let steps = image_steps(request.steps)?;
+    let response_format = request.response_format.as_deref().unwrap_or("b64_json");
+    if !matches!(response_format, "b64_json" | "url") {
+        return Err(ApiError::bad_request(
+            "response_format must be b64_json or url",
+            Some("response_format"),
+        ));
+    }
+
+    let usage = ReceiptUsage::from_units([
+        (USAGE_IMAGE, u64::from(count)),
+        (USAGE_STEP, steps.saturating_mul(u64::from(count))),
+    ]);
+    let receipt = state.meter_session(&model, &image_prompt_text(&request, &size), usage)?;
+    let data = (0..count)
+        .map(|index| {
+            let bytes =
+                deterministic_image_bytes(&model.id, &request.prompt, index, width, height, steps);
+            let encoded = BASE64_STANDARD.encode(&bytes);
+            let artifact = json!({
+                "id": format!("image-{index}"),
+                "content_type": "image/png",
+                "bytes": bytes.len(),
+                "blake3": blake3_hex(&bytes),
+            });
+            if response_format == "url" {
+                json!({
+                    "url": format!("data:image/png;base64,{encoded}"),
+                    "revised_prompt": request.prompt,
+                    "mayhem": { "artifact": artifact },
+                })
+            } else {
+                json!({
+                    "b64_json": encoded,
+                    "revised_prompt": request.prompt,
+                    "mayhem": { "artifact": artifact },
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "created": now_secs(),
+        "data": data,
+        "usage": receipt.receipt.body.usage,
+        "mayhem": {
+            "backend": "local-image-shape",
+            "model": model.mayhem,
+            "receipt": receipt_summary(&receipt),
+        },
+    }))
+}
+
+fn build_audio_speech(
+    state: &GatewayState,
+    request: AudioSpeechRequest,
+) -> Result<Response, ApiError> {
+    let model = require_model(state, &request.model)?;
+    if !model_supports_tts(&model) {
+        return Err(ApiError::bad_request(
+            "model does not support audio speech",
+            Some("model"),
+        ));
+    }
+    let input = request.input.trim();
+    if input.is_empty() {
+        return Err(ApiError::bad_request(
+            "input must not be empty",
+            Some("input"),
+        ));
+    }
+    let format = speech_response_format(request.response_format.as_deref())?;
+    let speed = speech_speed(request.speed)?;
+    let input_characters = input.chars().count() as u64;
+    let audio_seconds = speech_audio_seconds(input_characters, speed);
+    let usage = ReceiptUsage::from_units([
+        (USAGE_INPUT_CHARACTER, input_characters),
+        (USAGE_AUDIO_SECOND, audio_seconds),
+    ]);
+    let receipt = state.meter_session(&model, &speech_prompt_text(&request), usage)?;
+    let bytes = deterministic_audio_bytes(
+        &format,
+        &model.id,
+        input,
+        request.voice.as_deref().unwrap_or("alloy"),
+        audio_seconds,
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, speech_content_type(&format))
+        .header(
+            "x-mayhem-receipt-session-id",
+            receipt.receipt.body.session_id.as_str(),
+        )
+        .header(
+            "x-mayhem-mu-owed-cum",
+            receipt.receipt.body.mu_owed_cum.to_string(),
+        )
+        .header(
+            "x-mayhem-usage-input-character",
+            input_characters.to_string(),
+        )
+        .header("x-mayhem-usage-audio-second", audio_seconds.to_string())
+        .body(Body::from(bytes))
+        .map_err(|err| {
+            ApiError::internal_message(format!("building speech response failed: {err}"))
+        })
+}
+
+async fn parse_audio_transcription_multipart(
+    mut multipart: Multipart,
+) -> Result<AudioTranscriptionRequest, ApiError> {
+    let mut model = None;
+    let mut audio = None;
+    let mut filename = None;
+    let mut response_format = None;
+    let mut language = None;
+    let mut prompt = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|err| {
+        ApiError::bad_request(format!("invalid multipart form: {err}"), Some("file"))
+    })? {
+        let name = field.name().unwrap_or_default().to_owned();
+        match name.as_str() {
+            "model" => {
+                model = Some(field.text().await.map_err(|err| {
+                    ApiError::bad_request(format!("invalid model field: {err}"), Some("model"))
+                })?);
+            }
+            "file" => {
+                filename = field.file_name().map(str::to_owned);
+                let bytes = field.bytes().await.map_err(|err| {
+                    ApiError::bad_request(format!("invalid file field: {err}"), Some("file"))
+                })?;
+                audio = Some(bytes.to_vec());
+            }
+            "response_format" => {
+                response_format = Some(field.text().await.map_err(|err| {
+                    ApiError::bad_request(
+                        format!("invalid response_format field: {err}"),
+                        Some("response_format"),
+                    )
+                })?);
+            }
+            "language" => {
+                language = Some(field.text().await.map_err(|err| {
+                    ApiError::bad_request(
+                        format!("invalid language field: {err}"),
+                        Some("language"),
+                    )
+                })?);
+            }
+            "prompt" => {
+                prompt = Some(field.text().await.map_err(|err| {
+                    ApiError::bad_request(format!("invalid prompt field: {err}"), Some("prompt"))
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(AudioTranscriptionRequest {
+        model: model
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ApiError::bad_request("multipart form missing model", Some("model")))?,
+        audio: audio
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or_else(|| ApiError::bad_request("multipart form missing file", Some("file")))?,
+        filename,
+        response_format,
+        language,
+        prompt,
+    })
+}
+
+fn build_audio_transcription(
+    state: &GatewayState,
+    request: AudioTranscriptionRequest,
+) -> Result<Value, ApiError> {
+    let model = require_model(state, &request.model)?;
+    if !model_supports_stt(&model) {
+        return Err(ApiError::bad_request(
+            "model does not support audio transcription",
+            Some("model"),
+        ));
+    }
+    let response_format = request.response_format.as_deref().unwrap_or("json");
+    if !matches!(response_format, "json" | "verbose_json") {
+        return Err(ApiError::bad_request(
+            "response_format must be json or verbose_json",
+            Some("response_format"),
+        ));
+    }
+    let audio_seconds = audio_seconds_for_bytes(request.audio.len());
+    let usage = ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, audio_seconds)]);
+    let prompt_text = transcription_prompt_text(&request);
+    let receipt = state.meter_session(&model, &prompt_text, usage)?;
+    let text = deterministic_transcription_text(&request);
+    let mut value = json!({
+        "text": text,
+        "usage": receipt.receipt.body.usage,
+        "mayhem": {
+            "backend": "local-stt-shape",
+            "model": model.mayhem,
+            "receipt": receipt_summary(&receipt),
+        },
+    });
+    if response_format == "verbose_json" {
+        value["duration"] = json!(audio_seconds);
+        value["language"] = json!(request.language.unwrap_or_else(|| "und".to_owned()));
+    }
+    Ok(value)
+}
+
 fn model_supports_embeddings(model: &GatewayModel) -> bool {
     model.mayhem.model_class == "embedding"
         || model.mayhem.caps.output_modality.as_deref() == Some("embedding")
@@ -2416,6 +2727,242 @@ fn model_supports_embeddings(model: &GatewayModel) -> bool {
             .modality_set
             .iter()
             .any(|modality| modality == "embedding")
+}
+
+fn model_supports_image_generation(model: &GatewayModel) -> bool {
+    model.mayhem.model_class == "image-generation"
+        || model.mayhem.caps.image
+        || model.mayhem.caps.output_modality.as_deref() == Some("image")
+        || model
+            .mayhem
+            .caps
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "image")
+        || model
+            .mayhem
+            .adapter
+            .modality_set
+            .iter()
+            .any(|modality| modality == "image")
+}
+
+fn model_supports_tts(model: &GatewayModel) -> bool {
+    model.mayhem.model_class == "tts"
+        || model.mayhem.caps.output_modality.as_deref() == Some("audio")
+        || model
+            .mayhem
+            .caps
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "audio")
+}
+
+fn model_supports_stt(model: &GatewayModel) -> bool {
+    model.mayhem.model_class == "stt"
+}
+
+fn image_count(value: Option<u32>) -> Result<u32, ApiError> {
+    let count = value.unwrap_or(1);
+    if (1..=10).contains(&count) {
+        Ok(count)
+    } else {
+        Err(ApiError::bad_request("n must be 1..=10", Some("n")))
+    }
+}
+
+fn image_size(value: Option<&str>) -> Result<(u32, u32, String), ApiError> {
+    let size = value.unwrap_or("1024x1024");
+    let Some((width, height)) = size.split_once('x') else {
+        return Err(ApiError::bad_request(
+            "size must be WIDTHxHEIGHT",
+            Some("size"),
+        ));
+    };
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| ApiError::bad_request("size width must be an integer", Some("size")))?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| ApiError::bad_request("size height must be an integer", Some("size")))?;
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return Err(ApiError::bad_request(
+            "size dimensions must be 1..=4096",
+            Some("size"),
+        ));
+    }
+    Ok((width, height, format!("{width}x{height}")))
+}
+
+fn image_steps(value: Option<u64>) -> Result<u64, ApiError> {
+    let steps = value.unwrap_or(1);
+    if (1..=500).contains(&steps) {
+        Ok(steps)
+    } else {
+        Err(ApiError::bad_request(
+            "steps must be 1..=500",
+            Some("steps"),
+        ))
+    }
+}
+
+fn image_prompt_text(request: &ImageGenerationRequest, size: &str) -> String {
+    json!({
+        "kind": "image-generation",
+        "prompt": request.prompt,
+        "n": request.n.unwrap_or(1),
+        "size": size,
+        "steps": request.steps.unwrap_or(1),
+        "user": request.user,
+    })
+    .to_string()
+}
+
+fn deterministic_image_bytes(
+    model_id: &str,
+    prompt: &str,
+    index: u32,
+    width: u32,
+    height: u32,
+    steps: u64,
+) -> Vec<u8> {
+    let digest = blake3::hash(
+        format!("mayhem-image-v1:{model_id}:{prompt}:{index}:{width}:{height}:{steps}").as_bytes(),
+    );
+    let mut bytes = b"\x89PNG\r\n\x1a\nMAYHEM-IMAGE-V1\n".to_vec();
+    bytes.extend_from_slice(format!("{width}x{height};steps={steps};").as_bytes());
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes
+}
+
+fn speech_response_format(value: Option<&str>) -> Result<String, ApiError> {
+    let format = value.unwrap_or("mp3");
+    if matches!(format, "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm") {
+        Ok(format.to_owned())
+    } else {
+        Err(ApiError::bad_request(
+            "response_format must be one of mp3, opus, aac, flac, wav, pcm",
+            Some("response_format"),
+        ))
+    }
+}
+
+fn speech_content_type(format: &str) -> &'static str {
+    match format {
+        "wav" => "audio/wav",
+        "opus" => "audio/ogg",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "pcm" => "audio/L16",
+        _ => "audio/mpeg",
+    }
+}
+
+fn speech_speed(value: Option<f64>) -> Result<f64, ApiError> {
+    let speed = value.unwrap_or(1.0);
+    if (0.25..=4.0).contains(&speed) {
+        Ok(speed)
+    } else {
+        Err(ApiError::bad_request(
+            "speed must be between 0.25 and 4.0",
+            Some("speed"),
+        ))
+    }
+}
+
+fn speech_audio_seconds(input_characters: u64, speed: f64) -> u64 {
+    let base_seconds = ceil_div_u64(input_characters.max(1), 32);
+    ((base_seconds as f64) / speed).ceil().max(1.0) as u64
+}
+
+fn speech_prompt_text(request: &AudioSpeechRequest) -> String {
+    json!({
+        "kind": "audio-speech",
+        "input": request.input,
+        "voice": request.voice,
+        "response_format": request.response_format,
+        "speed": request.speed,
+    })
+    .to_string()
+}
+
+fn deterministic_audio_bytes(
+    format: &str,
+    model_id: &str,
+    input: &str,
+    voice: &str,
+    audio_seconds: u64,
+) -> Vec<u8> {
+    let digest = blake3::hash(
+        format!("mayhem-audio-v1:{model_id}:{input}:{voice}:{audio_seconds}:{format}").as_bytes(),
+    );
+    if format == "wav" {
+        return deterministic_wav_bytes(digest.as_bytes(), audio_seconds);
+    }
+    let mut bytes = format!("MAYHEM-AUDIO-{format}\nseconds={audio_seconds}\n").into_bytes();
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes
+}
+
+fn deterministic_wav_bytes(seed: &[u8; 32], audio_seconds: u64) -> Vec<u8> {
+    let sample_rate = 8_000_u32;
+    let seconds = audio_seconds.clamp(1, 5) as u32;
+    let samples = sample_rate.saturating_mul(seconds);
+    let data_len = samples.saturating_mul(2);
+    let mut bytes = Vec::with_capacity(44 + data_len as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36_u32.saturating_add(data_len)).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
+    for index in 0..samples as usize {
+        let sample = i16::from(seed[index % seed.len()]) - 128;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+fn audio_seconds_for_bytes(bytes: usize) -> u64 {
+    ceil_div_u64(bytes as u64, 16_000).max(1)
+}
+
+fn transcription_prompt_text(request: &AudioTranscriptionRequest) -> String {
+    json!({
+        "kind": "audio-transcription",
+        "filename": request.filename,
+        "bytes": request.audio.len(),
+        "language": request.language,
+        "prompt": request.prompt,
+        "audio_hash": blake3_hex(&request.audio),
+    })
+    .to_string()
+}
+
+fn deterministic_transcription_text(request: &AudioTranscriptionRequest) -> String {
+    let hint = request
+        .prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .unwrap_or("audio");
+    format!(
+        "Mayhem transcription for {hint} ({})",
+        blake3_hex(&request.audio)[..12].to_owned()
+    )
+}
+
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    if value == 0 || divisor == 0 {
+        0
+    } else {
+        value.div_ceil(divisor)
+    }
 }
 
 fn embedding_dimensions(requested: Option<usize>) -> Result<usize, ApiError> {
@@ -4025,6 +4572,14 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("receipt signing payload failed: {err}"),
+            param: None,
+        }
+    }
+
+    fn internal_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
             param: None,
         }
     }

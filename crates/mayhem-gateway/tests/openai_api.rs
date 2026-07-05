@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode},
     Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use mayhem_gateway::openai::{
     openai_router, ChatCompletionRequest, ChatMessage, ChatOutput, GatewayArtifactOutput,
     GatewayCanaryModelConfig, GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry,
@@ -413,6 +414,29 @@ async fn raw_request_with_headers(
     (parts.status, parts.headers, bytes)
 }
 
+async fn raw_bytes_request_with_headers(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Vec<u8>,
+    request_headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in request_headers {
+        builder = builder.header(*name, *value);
+    }
+    let response = app
+        .oneshot(builder.body(Body::from(body)).expect("request builds"))
+        .await
+        .expect("router response");
+    let (parts, body) = response.into_parts();
+    let bytes = to_bytes(body, usize::MAX)
+        .await
+        .expect("response body bytes")
+        .to_vec();
+    (parts.status, parts.headers, bytes)
+}
+
 async fn first_model_id() -> String {
     let (status, body) = json_request(test_app(), Method::GET, "/v1/models", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
@@ -576,6 +600,235 @@ async fn embeddings_endpoint_rejects_non_embedding_model() {
         .as_str()
         .expect("error message")
         .contains("does not support embeddings"));
+}
+
+#[tokio::test]
+async fn image_generation_endpoint_records_image_and_step_usage() {
+    let catalog = json!({
+        "models": [{
+            "model_id": "admin/image-fixture",
+            "model_class": "image-generation",
+            "caps": {
+                "tools": false,
+                "json": false,
+                "ctx_max": 4096,
+                "vision": false,
+                "image": true,
+                "output_modality": "image",
+                "output_modalities": ["image"]
+            },
+            "adapter": {
+                "request_shape_family": "openai_chat",
+                "chat_template_id": "generic_chatml",
+                "tool_call_strategy": "none",
+                "reasoning_passthrough": "strip",
+                "modality_set": ["image"],
+                "response_normalization": "openai_chat"
+            },
+            "price_ref_mu": {
+                "denom": "mu_usd",
+                "ver": 4,
+                "rate_map": [
+                    { "unit": "image", "per_unit_mu": 500, "granularity": 1 },
+                    { "unit": "step", "per_unit_mu": 2, "granularity": 1 }
+                ]
+            },
+            "attestation_tiers": { "T1": 1 }
+        }]
+    });
+    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/image-fixture",
+        "prompt": "a red cube",
+        "n": 2,
+        "size": "512x512",
+        "steps": 30,
+        "response_format": "b64_json"
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/images/generations", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().expect("image data").len(), 2);
+    let bytes = BASE64_STANDARD
+        .decode(body["data"][0]["b64_json"].as_str().expect("b64 image"))
+        .expect("image decodes");
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(body["usage"]["image"], 2);
+    assert_eq!(body["usage"]["step"], 60);
+    assert_eq!(body["mayhem"]["backend"], "local-image-shape");
+    let receipt = &state.receipts()[0].receipt.body;
+    assert_eq!(receipt.usage.get("image"), 2);
+    assert_eq!(receipt.usage.get("step"), 60);
+    assert_eq!(receipt.mu_owed_cum, 1_120);
+}
+
+#[tokio::test]
+async fn audio_speech_endpoint_returns_audio_and_records_tts_usage() {
+    let catalog = json!({
+        "models": [{
+            "model_id": "admin/tts-fixture",
+            "model_class": "tts",
+            "caps": {
+                "tools": false,
+                "json": false,
+                "ctx_max": 4096,
+                "vision": false,
+                "audio": true,
+                "output_modality": "audio",
+                "output_modalities": ["audio"]
+            },
+            "adapter": {
+                "request_shape_family": "openai_chat",
+                "chat_template_id": "generic_chatml",
+                "tool_call_strategy": "none",
+                "reasoning_passthrough": "strip",
+                "modality_set": ["audio"],
+                "response_normalization": "openai_chat"
+            },
+            "price_ref_mu": {
+                "denom": "mu_usd",
+                "ver": 5,
+                "rate_map": [
+                    { "unit": "input_character", "per_unit_mu": 1, "granularity": 1 },
+                    { "unit": "audio_second", "per_unit_mu": 100, "granularity": 1 }
+                ]
+            },
+            "attestation_tiers": { "T1": 1 }
+        }]
+    });
+    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+    let app = openai_router(state.clone());
+    let input = "hello speech";
+    let request = json!({
+        "model": "admin/tts-fixture",
+        "input": input,
+        "voice": "alloy",
+        "response_format": "wav"
+    });
+
+    let (status, headers, bytes) =
+        raw_request(app, Method::POST, "/v1/audio/speech", Some(request)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("audio/wav")
+    );
+    assert!(bytes.starts_with(b"RIFF"));
+    let expected_input_characters = input.chars().count().to_string();
+    assert_eq!(
+        headers
+            .get("x-mayhem-usage-input-character")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_input_characters.as_str())
+    );
+    assert_eq!(
+        headers
+            .get("x-mayhem-usage-audio-second")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let receipt = &state.receipts()[0].receipt.body;
+    assert_eq!(
+        receipt.usage.get("input_character"),
+        input.chars().count() as u64
+    );
+    assert_eq!(receipt.usage.get("audio_second"), 1);
+    assert_eq!(receipt.mu_owed_cum, input.chars().count() as u64 + 100);
+}
+
+#[tokio::test]
+async fn audio_transcription_endpoint_accepts_multipart_and_records_stt_usage() {
+    let catalog = json!({
+        "models": [{
+            "model_id": "admin/stt-fixture",
+            "model_class": "stt",
+            "caps": {
+                "tools": false,
+                "json": false,
+                "ctx_max": 4096,
+                "vision": false,
+                "audio": true,
+                "output_modality": "text",
+                "output_modalities": ["text"]
+            },
+            "adapter": {
+                "request_shape_family": "openai_chat",
+                "chat_template_id": "generic_chatml",
+                "tool_call_strategy": "none",
+                "reasoning_passthrough": "strip",
+                "modality_set": ["audio", "text"],
+                "response_normalization": "openai_chat"
+            },
+            "price_ref_mu": {
+                "denom": "mu_usd",
+                "ver": 6,
+                "rate_map": [
+                    { "unit": "audio_second", "per_unit_mu": 250, "granularity": 1 }
+                ]
+            },
+            "attestation_tiers": { "T1": 1 }
+        }]
+    });
+    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+    let app = openai_router(state.clone());
+    let boundary = "mayhem-test-boundary";
+    let audio = vec![7_u8; 16_000];
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nadmin/stt-fixture\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&audio);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let (status, headers, bytes) = raw_bytes_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/audio/transcriptions",
+        body,
+        &[(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .contains("application/json"));
+    let body: Value = serde_json::from_slice(&bytes).expect("transcription JSON");
+    assert!(body["text"]
+        .as_str()
+        .expect("transcription text")
+        .contains("Mayhem transcription"));
+    assert_eq!(body["duration"], 1);
+    assert_eq!(body["usage"]["audio_second"], 1);
+    assert_eq!(body["mayhem"]["backend"], "local-stt-shape");
+    let receipt = &state.receipts()[0].receipt.body;
+    assert_eq!(receipt.usage.get("audio_second"), 1);
+    assert_eq!(receipt.mu_owed_cum, 250);
 }
 
 #[tokio::test]

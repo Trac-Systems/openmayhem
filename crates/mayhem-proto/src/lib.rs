@@ -19,6 +19,8 @@ pub const USAGE_INPUT_TOKEN: &str = "input_token";
 pub const USAGE_OUTPUT_TOKEN: &str = "output_token";
 pub const USAGE_IMAGE: &str = "image";
 pub const USAGE_STEP: &str = "step";
+pub const USAGE_INPUT_CHARACTER: &str = "input_character";
+pub const USAGE_AUDIO_SECOND: &str = "audio_second";
 pub const TIER1_SOFTWARE_ATTESTATION_TIER: u8 = 1;
 pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
 pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
@@ -276,6 +278,10 @@ pub fn canonical_usage_unit(unit: &str) -> Option<&'static str> {
         | USAGE_OUTPUT_TOKEN => Some(USAGE_OUTPUT_TOKEN),
         "images" | USAGE_IMAGE => Some(USAGE_IMAGE),
         "steps" | USAGE_STEP => Some(USAGE_STEP),
+        "input_char" | "input_chars" | "input_character" | "input_characters" => {
+            Some(USAGE_INPUT_CHARACTER)
+        }
+        "audio_seconds" | USAGE_AUDIO_SECOND => Some(USAGE_AUDIO_SECOND),
         _ => None,
     }
 }
