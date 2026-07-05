@@ -609,3 +609,30 @@ test("operations: feature does not burn replay hash when contract returns an err
   t.is((await batch.get("feature_called_after_retry"))?.value ?? null, true);
   t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
 });
+
+test("operations: feature does not burn replay hash when contract returns undefined", async (t) => {
+  const adminWallet = new Wallet();
+  await adminWallet.generateKeyPair();
+  const nonce = makeHex32(34);
+  const dispatchValue = { a: 1 };
+  const signature = adminWallet.sign(`${JSON.stringify(dispatchValue)}${nonce}`);
+
+  const batch = makeBatch({ admin: adminWallet.publicKey });
+  const base = makeBase();
+  const contractInstance = { execute: async () => undefined };
+  const opObj = {
+    type: "feature",
+    key: "my_feature",
+    value: { dispatch: { value: dispatchValue, nonce, hash: signature } },
+  };
+  const node = makeNode(opObj);
+
+  const op = new FeatureOperation(new FeatureCheck(), {
+    wallet: adminWallet,
+    protocolInstance: makeProtocolStub({ featMaxBytes: 4096 }),
+    contractInstance,
+  });
+  await op.handle(opObj, batch, base, node);
+
+  t.is((await batch.get(`sh/${signature}`))?.value ?? null, null);
+});

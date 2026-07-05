@@ -314,7 +314,7 @@ class MayhemContract extends Contract {
     const self = this;
 
     this.addFeature('mayhem_feature', async function () {
-      await self.mayhemFeature();
+      return await self.mayhemFeature();
     });
 
     this.addSchema('noop', {

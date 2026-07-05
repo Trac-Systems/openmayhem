@@ -25,10 +25,9 @@ export class FeatureOperation {
             null === await batch.get(`sh/${op.value.dispatch.hash}`)){
             const verified = this.#wallet.verify(op.value.dispatch.hash, `${strDispatchValue}${op.value.dispatch.nonce}`, admin.value);
             if(true === verified) {
-                const err = this.#protocolInstance.getError(
-                    await this.#contractInstance.execute(op, batch)
-                );
-                if(null === err) {
+                const result = await this.#contractInstance.execute(op, batch);
+                const err = this.#protocolInstance.getError(result);
+                if(undefined !== result && null === err) {
                     await batch.put(`sh/${op.value.dispatch.hash}`, '');
                 }
                 //console.log(`Feature ${op.key} appended`);
