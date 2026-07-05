@@ -804,6 +804,11 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'tnk_settlement') {
+      const result = await this.applyTnkSettlementFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
   }
 
   async applyConsentFeature(key, value) {
@@ -942,6 +947,20 @@ class MayhemContract extends Contract {
       if (value.op === 'rate_oracle') return await this.rateOracle();
       if (value.op === 'tap_rate_oracle') return await this.tapRateOracle();
       return;
+    } finally {
+      this.tx = previousTx;
+    }
+  }
+
+  async applyTnkSettlementFeature(key, value) {
+    const expectedKey = await this.tnkSettlementFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      return await this.tnkSettlement();
     } finally {
       this.tx = previousTx;
     }
@@ -2992,6 +3011,397 @@ class MayhemContract extends Contract {
       return new Error('Invalid TAP rate timestamp.');
     }
     return null;
+  }
+
+  async tnkSettlement() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateTnkSettlementValue(this.value);
+    if (shapeError) return shapeError;
+
+    const outputs = this.normalizeTnkSettlementOutputs(this.value.outputs);
+    if (outputs instanceof Error) return outputs;
+    if (stableJson(outputs) !== stableJson(this.value.outputs)) {
+      return new Error('TNK settlement outputs must be canonical.');
+    }
+    const totals = this.tnkSettlementTotals(outputs, this.value.rate_tnk_usd_e6);
+    if (totals instanceof Error) return totals;
+    if (totals.provider_count !== this.value.provider_count) {
+      return new Error('TNK settlement provider count does not match outputs.');
+    }
+    if (totals.provider_mu !== this.value.provider_mu) {
+      return new Error('TNK settlement provider amount does not match outputs.');
+    }
+    if (totals.operator_fee_mu !== this.value.operator_fee_mu) {
+      return new Error('TNK settlement operator fee does not match outputs.');
+    }
+    if (totals.gross_mu !== this.value.gross_mu) {
+      return new Error('TNK settlement gross amount does not match outputs.');
+    }
+    if (totals.tnk_e18 !== this.value.tnk_e18) {
+      return new Error('TNK settlement TNK amount does not match outputs.');
+    }
+
+    const transferRoot = await this.tnkSettlementTransferRoot(outputs);
+    if (transferRoot !== this.value.transfer_root) {
+      return new Error('TNK settlement transfer root does not match outputs.');
+    }
+
+    const record = this.tnkSettlementRecord(outputs);
+    const key = `settle/tnk/${this.value.epoch}`;
+    const existing = await this.get(key);
+    if (existing) {
+      if (stableJson(existing) === stableJson(record)) {
+        return {
+          ok: true,
+          op: 'tnkSettlement',
+          epoch: this.value.epoch,
+          rail: 'tnk',
+          idempotent: true,
+          msb_tx_hash: this.value.msb_tx_hash,
+        };
+      }
+      return new Error('TNK settlement already exists for epoch.');
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    if (
+      applyState.updated_epoch !== this.value.epoch ||
+      applyState.last_apply_hash !== this.value.epoch_apply_hash
+    ) {
+      return new Error('TNK settlement epoch apply hash does not match current state.');
+    }
+
+    const rate = await this.guardianRequireFreshRate(this.value.at);
+    if (rate instanceof Error) return rate;
+    if (
+      rate.tnk_usd_e6 !== this.value.rate_tnk_usd_e6 ||
+      rate.source !== this.value.rate_source ||
+      rate.ts !== this.value.rate_ts
+    ) {
+      return new Error('TNK settlement rate does not match current oracle.');
+    }
+
+    const params = await this.activeParamsAt(this.value.at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    const earningUpdates = [];
+    for (const output of outputs.filter((entry) => entry.role === 'provider')) {
+      const provider = await this.get(`prov/${output.provider}`);
+      if (!provider || provider.status !== 'active') {
+        return new Error('TNK settlement provider is not active.');
+      }
+      const payoutError = await this.requireAdminSetPayoutTarget(provider);
+      if (payoutError) return payoutError;
+      if (provider.payout.method !== 'tnk') {
+        return new Error('TNK settlement provider payout target must be TNK.');
+      }
+      if (provider.payout.addr !== output.to) {
+        return new Error('TNK settlement provider payout target mismatch.');
+      }
+
+      const earning = await this.earningRecord(output.provider, 'tnk');
+      if (earning instanceof Error) return earning;
+      const earningError = this.guardianValidateEarningRecord(earning, output.provider, 'tnk');
+      if (earningError) return earningError;
+      const probeGate = await this.probeGateForEarning(output.provider, earning, params);
+      if (probeGate instanceof Error) return probeGate;
+      const refreshed = this.refreshEarningHoldback(
+        earning,
+        this.value.epoch,
+        this.lockedEarningEpochs(params),
+        probeGate
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const payable = this.safeSubMu(
+        this.safeSubMu(refreshed.total_mu, refreshed.held_mu),
+        refreshed.paid_cum_mu
+      );
+      if (payable instanceof Error) return payable;
+      if (payable <= 0) return new Error('TNK settlement provider has no payable earnings.');
+      if (output.mu !== payable) {
+        return new Error('TNK settlement provider amount does not match payable earnings.');
+      }
+      const paidCumMu = this.safeAddMu(refreshed.paid_cum_mu, output.mu);
+      if (paidCumMu instanceof Error) return paidCumMu;
+      const nextEarning = {
+        ...refreshed,
+        paid_cum_mu: paidCumMu,
+        updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
+        last_settlement_epoch: this.value.epoch,
+        last_settlement_msb_tx_hash: this.value.msb_tx_hash,
+      };
+      const nextError = this.guardianValidateEarningRecord(nextEarning, output.provider, 'tnk');
+      if (nextError) return nextError;
+      earningUpdates.push(nextEarning);
+    }
+
+    const fee = await this.feeCumRecord('tnk');
+    if (fee instanceof Error) return fee;
+    const feeError = this.guardianValidateFeeRecord(fee, 'tnk');
+    if (feeError) return feeError;
+    const payableFee = this.safeSubMu(fee.cum_mu, fee.swept_cum_mu);
+    if (payableFee instanceof Error) return payableFee;
+    if (payableFee !== this.value.operator_fee_mu) {
+      return new Error('TNK settlement operator fee does not match fee state.');
+    }
+    const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
+    if (payableFee === 0 && operatorOutputs.length !== 0) {
+      return new Error('TNK settlement has unexpected operator fee output.');
+    }
+    if (payableFee > 0) {
+      if (operatorOutputs.length !== 1) return new Error('TNK settlement missing operator fee output.');
+      if (operatorOutputs[0].to !== this.value.operator_to) {
+        return new Error('TNK settlement operator target mismatch.');
+      }
+    }
+    const sweptCumMu = this.safeAddMu(fee.swept_cum_mu, this.value.operator_fee_mu);
+    if (sweptCumMu instanceof Error) return sweptCumMu;
+    const nextFee = {
+      ...fee,
+      swept_cum_mu: sweptCumMu,
+      updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
+      last_settlement_epoch: this.value.epoch,
+      last_settlement_msb_tx_hash: this.value.msb_tx_hash,
+    };
+    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
+    if (nextFeeError) return nextFeeError;
+
+    for (const earning of earningUpdates) {
+      await this.put(this.earningKey(earning.provider, 'tnk'), earning);
+    }
+    await this.put(this.feeCumKey('tnk'), nextFee);
+    await this.put(key, record);
+    console.log('mayhem tnkSettlement', {
+      epoch: this.value.epoch,
+      provider_mu: this.value.provider_mu,
+      operator_fee_mu: this.value.operator_fee_mu,
+      gross_mu: this.value.gross_mu,
+      msb_tx_hash: this.value.msb_tx_hash,
+    });
+    return {
+      ok: true,
+      op: 'tnkSettlement',
+      epoch: this.value.epoch,
+      rail: 'tnk',
+      idempotent: false,
+      provider_mu: this.value.provider_mu,
+      operator_fee_mu: this.value.operator_fee_mu,
+      gross_mu: this.value.gross_mu,
+      msb_tx_hash: this.value.msb_tx_hash,
+      transfer_root: this.value.transfer_root,
+    };
+  }
+
+  validateTnkSettlementValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'epoch',
+        'at',
+        'rail',
+        'network',
+        'treasury_from',
+        'operator_to',
+        'epoch_apply_hash',
+        'rate_tnk_usd_e6',
+        'rate_source',
+        'rate_ts',
+        'msb_tx_hash',
+        'transfer_root',
+        'provider_count',
+        'provider_mu',
+        'operator_fee_mu',
+        'gross_mu',
+        'tnk_e18',
+        'outputs',
+      ],
+      'TNK settlement'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'tnk_settlement') return new Error('Invalid TNK settlement op.');
+    if (value.rail !== 'tnk') return new Error('TNK settlement rail must be tnk.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid TNK settlement epoch.');
+    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid TNK settlement timestamp.');
+    if (!this.isSafeKeyPart(value.network)) return new Error('Invalid TNK settlement network.');
+    if (!this.isSafeKeyPart(value.treasury_from)) return new Error('Invalid TNK treasury address.');
+    if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid TNK operator address.');
+    if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid TNK settlement apply hash.');
+    if (!this.isHexBytes(value.msb_tx_hash, 32)) {
+      return new Error('TNK settlement requires a real 64-hex MSB tx hash.');
+    }
+    if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid TNK settlement transfer root.');
+    if (!Number.isSafeInteger(value.rate_tnk_usd_e6) || value.rate_tnk_usd_e6 < 1) {
+      return new Error('Invalid TNK settlement rate.');
+    }
+    if (!RATE_SOURCES.has(value.rate_source)) return new Error('Unsupported TNK settlement rate source.');
+    if (!Number.isSafeInteger(value.rate_ts) || value.rate_ts < 0) {
+      return new Error('Invalid TNK settlement rate timestamp.');
+    }
+    for (const key of ['provider_count', 'provider_mu', 'operator_fee_mu', 'gross_mu']) {
+      if (!Number.isSafeInteger(value[key]) || value[key] < 0) {
+        return new Error('Invalid TNK settlement total.');
+      }
+    }
+    if (value.gross_mu <= 0) return new Error('TNK settlement gross amount must be positive.');
+    const gross = this.safeAddMu(value.provider_mu, value.operator_fee_mu);
+    if (gross instanceof Error) return gross;
+    if (gross !== value.gross_mu) return new Error('TNK settlement gross amount does not balance.');
+    const tnkE18 = this.parseTnkE18(value.tnk_e18);
+    if (tnkE18 instanceof Error) return tnkE18;
+    if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
+      return new Error('TNK settlement outputs are required.');
+    }
+    if (value.outputs.length > LEDGER_BATCH_SCHEMA_MAX) {
+      return new Error('TNK settlement output batch exceeds limit.');
+    }
+    return null;
+  }
+
+  normalizeTnkSettlementOutputs(outputs) {
+    if (!Array.isArray(outputs) || outputs.length === 0) {
+      return new Error('TNK settlement outputs are required.');
+    }
+    const providers = new Set();
+    const providerOutputs = [];
+    const operatorOutputs = [];
+    for (const output of outputs) {
+      if (!output || typeof output !== 'object' || Array.isArray(output)) {
+        return new Error('Invalid TNK settlement output.');
+      }
+      if (output.role === 'provider') {
+        const shapeError = this.validateExactObjectKeys(
+          output,
+          ['role', 'provider', 'to', 'mu', 'tnk_e18'],
+          'TNK settlement provider output'
+        );
+        if (shapeError) return shapeError;
+        if (!this.isHexBytes(output.provider, 32) || output.provider !== output.provider.toLowerCase()) {
+          return new Error('Invalid TNK settlement provider id.');
+        }
+        if (providers.has(output.provider)) return new Error('Duplicate TNK settlement provider output.');
+        providers.add(output.provider);
+        const normalized = this.normalizeTnkSettlementOutput(output);
+        if (normalized instanceof Error) return normalized;
+        providerOutputs.push(normalized);
+      } else if (output.role === 'operator_fee') {
+        const shapeError = this.validateExactObjectKeys(
+          output,
+          ['role', 'to', 'mu', 'tnk_e18'],
+          'TNK settlement operator output'
+        );
+        if (shapeError) return shapeError;
+        if (operatorOutputs.length > 0) return new Error('Duplicate TNK settlement operator output.');
+        const normalized = this.normalizeTnkSettlementOutput(output);
+        if (normalized instanceof Error) return normalized;
+        operatorOutputs.push(normalized);
+      } else {
+        return new Error('Invalid TNK settlement output role.');
+      }
+    }
+    providerOutputs.sort((left, right) => left.provider.localeCompare(right.provider));
+    return [...providerOutputs, ...operatorOutputs];
+  }
+
+  normalizeTnkSettlementOutput(output) {
+    if (!this.isSafeKeyPart(output.to)) return new Error('Invalid TNK settlement output address.');
+    if (!Number.isSafeInteger(output.mu) || output.mu <= 0) {
+      return new Error('Invalid TNK settlement output amount.');
+    }
+    const tnkE18 = this.parseTnkE18(output.tnk_e18);
+    if (tnkE18 instanceof Error) return tnkE18;
+    return output.role === 'provider'
+      ? {
+          role: 'provider',
+          provider: output.provider,
+          to: output.to,
+          mu: output.mu,
+          tnk_e18: output.tnk_e18,
+        }
+      : {
+          role: 'operator_fee',
+          to: output.to,
+          mu: output.mu,
+          tnk_e18: output.tnk_e18,
+        };
+  }
+
+  tnkSettlementTotals(outputs, rateTnkUsdE6) {
+    let providerMu = 0;
+    let operatorFeeMu = 0;
+    let tnkE18 = 0n;
+    let providerCount = 0;
+    for (const output of outputs) {
+      const expectedTnkE18 = this.muToTnkE18Ceil(output.mu, rateTnkUsdE6);
+      if (expectedTnkE18 instanceof Error) return expectedTnkE18;
+      if (output.tnk_e18 !== expectedTnkE18.toString()) {
+        return new Error('TNK settlement output amount does not match oracle rate.');
+      }
+      const parsed = this.parseTnkE18(output.tnk_e18);
+      if (parsed instanceof Error) return parsed;
+      tnkE18 += parsed;
+      if (output.role === 'provider') {
+        providerCount += 1;
+        providerMu = this.safeAddMu(providerMu, output.mu);
+        if (providerMu instanceof Error) return providerMu;
+      } else {
+        operatorFeeMu = this.safeAddMu(operatorFeeMu, output.mu);
+        if (operatorFeeMu instanceof Error) return operatorFeeMu;
+      }
+    }
+    const grossMu = this.safeAddMu(providerMu, operatorFeeMu);
+    if (grossMu instanceof Error) return grossMu;
+    return {
+      provider_count: providerCount,
+      provider_mu: providerMu,
+      operator_fee_mu: operatorFeeMu,
+      gross_mu: grossMu,
+      tnk_e18: tnkE18.toString(),
+    };
+  }
+
+  muToTnkE18Ceil(mu, rateTnkUsdE6) {
+    if (!Number.isSafeInteger(mu) || mu <= 0) return new Error('Invalid TNK settlement amount.');
+    if (!Number.isSafeInteger(rateTnkUsdE6) || rateTnkUsdE6 <= 0) {
+      return new Error('Invalid TNK/USD rate.');
+    }
+    const numerator = BigInt(mu) * TNK_E18;
+    const denominator = BigInt(rateTnkUsdE6);
+    return (numerator + denominator - 1n) / denominator;
+  }
+
+  async tnkSettlementTransferRoot(outputs) {
+    return await this.opaqueHash('mayhem-tnk-settlement-transfer-root-v1', outputs);
+  }
+
+  tnkSettlementRecord(outputs) {
+    return {
+      type: 'tnk_settlement',
+      op: 'tnk_settlement',
+      idempotency_key: `mayhem:tnk:settle:v1:${this.value.network}:mayhem:${this.value.epoch}:${this.value.epoch_apply_hash}`,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      rail: 'tnk',
+      network: this.value.network,
+      treasury_from: this.value.treasury_from,
+      operator_to: this.value.operator_to,
+      epoch_apply_hash: this.value.epoch_apply_hash,
+      rate_tnk_usd_e6: this.value.rate_tnk_usd_e6,
+      rate_source: this.value.rate_source,
+      rate_ts: this.value.rate_ts,
+      msb_tx_hash: this.value.msb_tx_hash,
+      transfer_root: this.value.transfer_root,
+      provider_count: this.value.provider_count,
+      provider_mu: this.value.provider_mu,
+      operator_fee_mu: this.value.operator_fee_mu,
+      gross_mu: this.value.gross_mu,
+      tnk_e18: this.value.tnk_e18,
+      outputs,
+    };
   }
 
   async depositTnk() {
@@ -5736,6 +6146,19 @@ class MayhemContract extends Contract {
       'hex'
     );
     return `rate/${kind}/${value.ts}/${digest}`;
+  }
+
+  async tnkSettlementFeatureKey(value) {
+    const shapeError = this.validateTnkSettlementValue(value);
+    if (shapeError) return shapeError;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-tnk-settlement-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    return `settle/tnk/${value.epoch}/${digest}`;
   }
 
   async epochCommitHash(value) {

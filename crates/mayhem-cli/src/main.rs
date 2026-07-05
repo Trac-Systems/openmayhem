@@ -262,6 +262,8 @@ enum AdminCommands {
     RateOracle(AdminRateOracleArgs),
     /// Post a fresh TAP/USD policy rate for TAP deposit conversion.
     TapRateOracle(AdminTapRateOracleArgs),
+    /// Record one real treasury-signed MSB batch settlement for TNK earnings.
+    TnkSettlement(AdminTnkSettlementArgs),
     /// Confirm a memo-bound TNK deposit into the canonical credit ledger.
     TnkDeposit(AdminTnkDepositArgs),
     /// Confirm a finalized TAP escrow Deposit event into the canonical credit ledger.
@@ -270,7 +272,7 @@ enum AdminCommands {
     FiatDeposit(AdminFiatDepositArgs),
     /// Record a fiat chargeback clawback and account freeze.
     FiatChargeback(AdminFiatChargebackArgs),
-    /// Retired: provider payouts are non-custodial TAP claims.
+    /// Retired: use rail-specific epoch settlement and claim flows.
     PayoutConfirm(AdminPayoutConfirmArgs),
     /// Anchor recomputed epoch roots permissionlessly.
     EpochCommit(AdminEpochCommitArgs),
@@ -2773,6 +2775,20 @@ struct AdminTapRateOracleArgs {
     /// Source observation timestamp in Unix seconds.
     #[arg(long)]
     ts: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminTnkSettlementArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Full tnk_settlement feature JSON produced by the settlement runner.
+    #[arg(long)]
+    settlement_json: Option<String>,
+
+    /// Path to full tnk_settlement feature JSON produced by the settlement runner.
+    #[arg(long, value_name = "PATH")]
+    settlement_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -9489,9 +9505,12 @@ async fn admin(command: AdminCommands) -> Result<()> {
             )
             .await;
         }
+        AdminCommands::TnkSettlement(args) => {
+            return run_admin_tnk_settlement_feature(args).await;
+        }
         AdminCommands::PayoutConfirm(_) => {
             bail!(
-                "payout-confirm is retired; provider payouts are non-custodial TAP claims from epoch earning roots"
+                "payout-confirm is retired; use TNK tnk-settlement batch evidence, TAP claim-proof tools, or fiat paygate settlement"
             );
         }
         _ => {}
@@ -9526,6 +9545,12 @@ async fn run_admin_rate_feature(
     run_admin_feature_command(args, feature_type, key, value).await
 }
 
+async fn run_admin_tnk_settlement_feature(args: &AdminTnkSettlementArgs) -> Result<()> {
+    let value = admin_tnk_settlement_payload(args)?;
+    let key = tnk_settlement_feature_key(&value)?;
+    run_admin_feature_command(&args.tx, "tnkSettlement", key, value).await
+}
+
 fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
     match command {
         AdminCommands::SetRules(args) => &args.tx,
@@ -9544,6 +9569,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::AuditorRegister(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
         AdminCommands::TapRateOracle(args) => &args.tx,
+        AdminCommands::TnkSettlement(args) => &args.tx,
         AdminCommands::TnkDeposit(args) => &args.tx,
         AdminCommands::TapDeposit(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
@@ -9598,6 +9624,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         }
         AdminCommands::RateOracle(_) | AdminCommands::TapRateOracle(_) => {
             bail!("rate oracle updates are free features, not paid admin txs")
+        }
+        AdminCommands::TnkSettlement(_) => {
+            bail!("TNK settlement updates are free features, not paid admin txs")
         }
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
         AdminCommands::TapDeposit(args) => Ok(("tapDeposit", admin_tap_deposit_payload(args))),
@@ -10160,6 +10189,19 @@ fn admin_tap_rate_oracle_payload(args: &AdminTapRateOracleArgs) -> Value {
     })
 }
 
+fn admin_tnk_settlement_payload(args: &AdminTnkSettlementArgs) -> Result<Value> {
+    let value = json_arg_or_file_object(
+        args.settlement_json.as_deref(),
+        args.settlement_file.as_ref(),
+        None,
+        "TNK settlement",
+    )?;
+    if value.get("op").and_then(Value::as_str) != Some("tnk_settlement") {
+        bail!("TNK settlement payload must have op=tnk_settlement");
+    }
+    Ok(value)
+}
+
 fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
     json!({
         "op": "tnk_deposit",
@@ -10223,7 +10265,7 @@ fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Result<Value
 
 fn admin_payout_confirm_payload(_args: &AdminPayoutConfirmArgs) -> Result<Value> {
     bail!(
-        "payout-confirm is retired; provider payouts are non-custodial TAP claims from epoch earning roots"
+        "payout-confirm is retired; use TNK tnk-settlement batch evidence, TAP claim-proof tools, or fiat paygate settlement"
     )
 }
 
@@ -10374,6 +10416,18 @@ fn rate_feature_key(value: &Value) -> Result<String> {
         "value": value,
     }));
     Ok(format!("rate/{kind}/{ts}/{digest}"))
+}
+
+fn tnk_settlement_feature_key(value: &Value) -> Result<String> {
+    let epoch = value
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .context("TNK settlement feature payload missing epoch")?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-tnk-settlement-feature-v1",
+        "value": value,
+    }));
+    Ok(format!("settle/tnk/{epoch}/{digest}"))
 }
 
 fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option<Value>> {
@@ -23248,6 +23302,61 @@ mod tests {
             .unwrap_err()
             .to_string(),
             "rate oracle updates are free features, not paid admin txs"
+        );
+
+        let settlement_payload = json!({
+            "op": "tnk_settlement",
+            "epoch": 7,
+            "at": 25_200,
+            "rail": "tnk",
+            "network": "testnet1",
+            "treasury_from": "testtrac1treasury",
+            "operator_to": "testtrac1operator",
+            "epoch_apply_hash": "a".repeat(64),
+            "rate_tnk_usd_e6": 50_000,
+            "rate_source": "gate-spot",
+            "rate_ts": 25_200,
+            "msb_tx_hash": "b".repeat(64),
+            "transfer_root": "c".repeat(64),
+            "provider_count": 0,
+            "provider_mu": 0,
+            "operator_fee_mu": 1,
+            "gross_mu": 1,
+            "tnk_e18": "20000000000000",
+            "outputs": [{
+                "role": "operator_fee",
+                "to": "testtrac1operator",
+                "mu": 1,
+                "tnk_e18": "20000000000000"
+            }]
+        });
+        assert_eq!(
+            admin_tnk_settlement_payload(&AdminTnkSettlementArgs {
+                tx: test_admin_tx_args(),
+                settlement_json: Some(settlement_payload.to_string()),
+                settlement_file: None,
+            })
+            .unwrap(),
+            settlement_payload
+        );
+        assert!(tnk_settlement_feature_key(&settlement_payload)
+            .unwrap()
+            .starts_with("settle/tnk/7/"));
+        assert_eq!(
+            tnk_settlement_feature_key(&settlement_payload)
+                .unwrap()
+                .len(),
+            "settle/tnk/7/".len() + 64
+        );
+        assert_eq!(
+            admin_command_payload(&AdminCommands::TnkSettlement(AdminTnkSettlementArgs {
+                tx: test_admin_tx_args(),
+                settlement_json: Some(settlement_payload.to_string()),
+                settlement_file: None,
+            }))
+            .unwrap_err()
+            .to_string(),
+            "TNK settlement updates are free features, not paid admin txs"
         );
 
         assert_eq!(

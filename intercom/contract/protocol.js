@@ -203,6 +203,7 @@ class MayhemProtocol extends Protocol {
       };
     }
     if (json?.op === 'rate_oracle' || json?.op === 'tap_rate_oracle') return null;
+    if (json?.op === 'tnk_settlement') return null;
     if (
       json?.op === 'deposit_tnk' ||
       json?.op === 'tnk_deposit' ||
@@ -259,7 +260,8 @@ class MayhemProtocol extends Protocol {
     console.log('- Feature { "feature": "mayhem", "key": "rate/tap/<ts>/<payload_hash>", "value": { "op": "tap_rate_oracle", "tap_usd_e6": 50000, "source": "uniswap-v2", "ts": 3600 } } | admin/oracle updates the TAP/USD policy rate for free.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk-intent/<memo>/<payload_hash>", "value": { "op": "deposit_tnk", "sender": "<pk>", "intent": { ... }, "sig": "<sig>" } } | user-signed TNK deposit intent for free.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk|tap|fiat/...", "value": { "op": "tnk_deposit|tap_deposit|fiat_deposit", ... } } | admin/oracle credits deposit evidence for free; deposits fold into ev/dep roots.');
-    console.log('- Provider payouts are non-custodial TAP claims from epoch earning roots; use the TAP claim-proof/calldata tools, not payout_confirm /tx commands.');
+    console.log('- Feature { "feature": "mayhem", "key": "settle/tnk/<epoch>/<payload_hash>", "value": { "op": "tnk_settlement", ... } } | admin/oracle records one real treasury-signed MSB batch settlement for TNK earnings and operator fee.');
+    console.log('- Provider payouts are rail-specific epoch settlements: TAP claims use claim-proof/calldata tools; TNK uses tnk_settlement batch evidence; never use payout_confirm /tx commands.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');
