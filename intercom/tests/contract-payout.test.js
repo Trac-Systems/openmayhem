@@ -295,7 +295,7 @@ test('MayhemContract payoutConfirm fails closed without current admin key', asyn
   const admin = await makeIdentity();
   const provider = await makeIdentity();
   const user = await makeIdentity();
-  const storage = new MemoryStorage();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
   const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
   const contract = new MayhemContract(protocol, {});
 
@@ -366,6 +366,7 @@ test('MayhemContract payoutConfirm fails closed without current admin key', asyn
     6
   );
   assert.equal(settled.ok, true, settled.message);
+  await storage.del('admin');
 
   const before = storage.snapshotBytes();
   const rejected = await execute(
@@ -376,7 +377,7 @@ test('MayhemContract payoutConfirm fails closed without current admin key', asyn
     admin.publicKey,
     7
   );
-  assert.match(rejected.message, /current admin key/i);
+  assert.match(rejected.message, /admin required/i);
   assert.equal(storage.snapshotBytes(), before);
   assert.equal(await storage.get('ev/pay/169'), null);
 });

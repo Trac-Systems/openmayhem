@@ -2969,7 +2969,7 @@ class MayhemContract extends Contract {
 
   async isAdmin(sender = this.address) {
     const admin = await this.get('admin');
-    return admin === null || admin === sender;
+    return typeof admin === 'string' && admin === sender;
   }
 
   async requireAdmin(sender = this.address) {

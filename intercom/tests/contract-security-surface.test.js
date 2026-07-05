@@ -112,221 +112,238 @@ async function setupSecuritySurface() {
   return { admin, provider, roomId, storage, contract };
 }
 
+const buildAdminOnlyAttempts = (provider, roomId) => [
+  ['setRules', { op: 'set_rules', ver: 2, hash: '6'.repeat(64) }],
+  [
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: 86_400,
+      values: { fee_bps: 1_000 },
+    },
+  ],
+  [
+    'setProviderPayout',
+    {
+      op: 'set_provider_payout',
+      provider: provider.publicKey,
+      payout_addr: 'provider-picked-target',
+      payout_method: 'tnk',
+    },
+  ],
+  [
+    'banProvider',
+    {
+      op: 'ban_provider',
+      provider: provider.publicKey,
+      reason_hash: '7'.repeat(64),
+    },
+  ],
+  [
+    'setModelRef',
+    {
+      op: 'set_model_ref',
+      model_id: 'provider/arbitrary-model@q4',
+      price_ref_mu: {
+        in_per_1k: 1,
+        out_per_1k: 1,
+      },
+    },
+  ],
+  [
+    'publishCatalog',
+    {
+      op: 'publish_catalog',
+      catalog_id: 'provider-catalog',
+      source_kind: 'huggingface',
+      catalog_url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json',
+      signature_url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig',
+      catalog_hash: '8'.repeat(64),
+      signature_hash: '9'.repeat(64),
+      key_id: 'provider-key',
+      public_key: 'a'.repeat(64),
+      model_count: 1,
+      artifact_count: 1,
+      canaries: [{
+        set_id: 'provider-canary',
+        url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/provider-canary.json',
+        hash: 'b'.repeat(64),
+      }],
+    },
+  ],
+  [
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: '8'.repeat(64),
+      model_id: 'provider/arbitrary-model@q4',
+    },
+  ],
+  [
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: enclaveId,
+      artifact_root: '9'.repeat(64),
+    },
+  ],
+  ['retireEnclave', { op: 'retire_enclave', enclave_id: enclaveId }],
+  [
+    'openRoom',
+    {
+      op: 'open_room',
+      enclave_id: enclaveId,
+      model_id: modelId,
+      nonce: 'provider-room',
+      label: 'provider-room',
+      policy: {},
+    },
+  ],
+  ['closeRoom', { op: 'close_room', room_id: roomId }],
+  [
+    'setPrice',
+    {
+      op: 'set_price',
+      enclave_id: enclaveId,
+      in_per_1k_mu: 18,
+      out_per_1k_mu: 55,
+      per_req_mu: 0,
+      min_session_mu: 100,
+      effective_at: 21_600,
+    },
+  ],
+  [
+    'recordReputationEvent',
+    {
+      op: 'record_reputation_event',
+      provider: provider.publicKey,
+      event_id: 'provider-forged-event',
+      kind: 'session_ok',
+      epoch: 1,
+      at: 3_600,
+      paid_mu: 100,
+      evidence_hash: 'a'.repeat(64),
+    },
+  ],
+  [
+    'anchorReputation',
+    {
+      op: 'anchor_reputation',
+      provider: provider.publicKey,
+      epoch: 1,
+      folded_at: 3_600,
+      events_head: 'b'.repeat(64),
+      r_bps: 9_000,
+      raw_milli: 20_000,
+      successful_sessions: 100,
+    },
+  ],
+  [
+    'epochApply',
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 3_600,
+      debits: [],
+      earnings: [{ provider: provider.publicKey, gross_mu: 1_000 }],
+    },
+  ],
+  [
+    'rateOracle',
+    {
+      op: 'rate_oracle',
+      tnk_usd_e6: 2_000_000,
+      source: 'gate-spot',
+      ts: 3_600,
+    },
+  ],
+  [
+    'tnkDeposit',
+    {
+      op: 'tnk_deposit',
+      memo_hash: 'memo-security',
+      tnk_e18: '1000000000000000000',
+      msb_tx_hash: 'msb-security',
+      epoch: 1,
+      at: 3_600,
+    },
+  ],
+  [
+    'fiatDeposit',
+    {
+      op: 'fiat_deposit',
+      rail: 'stripe',
+      who: provider.publicKey,
+      mu: 1_000_000,
+      ext_ref_hash: 'c'.repeat(64),
+      fiat_currency: 'usd',
+      fiat_amount_minor: 100,
+      epoch: 1,
+      at: 3_600,
+    },
+  ],
+  [
+    'fiatChargeback',
+    {
+      op: 'fiat_chargeback',
+      rail: 'stripe',
+      who: provider.publicKey,
+      mu: 1_000_000,
+      ext_ref_hash: 'c'.repeat(64),
+      dispute_ref_hash: 'd'.repeat(64),
+      fiat_currency: 'usd',
+      fiat_amount_minor: 100,
+      epoch: 1,
+      at: 3_600,
+    },
+  ],
+  [
+    'payoutConfirm',
+    {
+      op: 'payout_confirm',
+      kind: 'provider',
+      epoch: 1,
+      who: provider.publicKey,
+      mu: 100,
+      tnk_e18: '1000000000000000000',
+      msb_tx_hash: 'pay-security',
+      at: 3_600,
+    },
+  ],
+  [
+    'disputeResolve',
+    {
+      op: 'dispute_resolve',
+      dispute_id: 1,
+      outcome: 'provider_fault',
+      deposit_action: 'refund',
+      rationale_hash: 'c'.repeat(64),
+      slash: true,
+      at: 3_600,
+    },
+  ],
+];
+
+test('MayhemContract rejects admin ops before genesis admin is present', async () => {
+  const outsider = await makeIdentity();
+  const storage = new MemoryStorage();
+  const contract = new MayhemContract({ peer: { wallet: makeVerifier(outsider.wallet) } }, {});
+
+  let txNo = 1;
+  for (const [type, value] of buildAdminOnlyAttempts(outsider, 'missing-room')) {
+    const before = storage.snapshotBytes();
+    const result = await execute(contract, storage, type, value, outsider.publicKey, txNo);
+    assert.match(result.message, /admin required/i, `${type} should require genesis admin`);
+    assert.equal(storage.snapshotBytes(), before, `${type} must not mutate state before genesis admin`);
+    txNo += 1;
+  }
+});
+
 test('MayhemContract keeps providers out of canonical economy and control-plane ops', async () => {
   const { admin, provider, roomId, storage, contract } = await setupSecuritySurface();
   const providerSender = provider.publicKey;
-  const adminOnlyAttempts = [
-    ['setRules', { op: 'set_rules', ver: 2, hash: '6'.repeat(64) }],
-    [
-      'setParams',
-      {
-        op: 'set_params',
-        submitted_at: 0,
-        effective_at: 86_400,
-        values: { fee_bps: 1_000 },
-      },
-    ],
-    [
-      'setProviderPayout',
-      {
-        op: 'set_provider_payout',
-        provider: provider.publicKey,
-        payout_addr: 'provider-picked-target',
-        payout_method: 'tnk',
-      },
-    ],
-    [
-      'banProvider',
-      {
-        op: 'ban_provider',
-        provider: provider.publicKey,
-        reason_hash: '7'.repeat(64),
-      },
-    ],
-    [
-      'setModelRef',
-      {
-        op: 'set_model_ref',
-        model_id: 'provider/arbitrary-model@q4',
-        price_ref_mu: {
-          in_per_1k: 1,
-          out_per_1k: 1,
-        },
-      },
-    ],
-    [
-      'publishCatalog',
-      {
-        op: 'publish_catalog',
-        catalog_id: 'provider-catalog',
-        source_kind: 'huggingface',
-        catalog_url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json',
-        signature_url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig',
-        catalog_hash: '8'.repeat(64),
-        signature_hash: '9'.repeat(64),
-        key_id: 'provider-key',
-        public_key: 'a'.repeat(64),
-        model_count: 1,
-        artifact_count: 1,
-        canaries: [{
-          set_id: 'provider-canary',
-          url: 'https://huggingface.co/provider/fake-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries/provider-canary.json',
-          hash: 'b'.repeat(64),
-        }],
-      },
-    ],
-    [
-      'registerEnclave',
-      {
-        ...enclaveRegistration,
-        enclave_id: '8'.repeat(64),
-        model_id: 'provider/arbitrary-model@q4',
-      },
-    ],
-    [
-      'updateEnclave',
-      {
-        op: 'update_enclave',
-        enclave_id: enclaveId,
-        artifact_root: '9'.repeat(64),
-      },
-    ],
-    ['retireEnclave', { op: 'retire_enclave', enclave_id: enclaveId }],
-    [
-      'openRoom',
-      {
-        op: 'open_room',
-        enclave_id: enclaveId,
-        model_id: modelId,
-        nonce: 'provider-room',
-        label: 'provider-room',
-        policy: {},
-      },
-    ],
-    ['closeRoom', { op: 'close_room', room_id: roomId }],
-    [
-      'setPrice',
-      {
-        op: 'set_price',
-        enclave_id: enclaveId,
-        in_per_1k_mu: 18,
-        out_per_1k_mu: 55,
-        per_req_mu: 0,
-        min_session_mu: 100,
-        effective_at: 21_600,
-      },
-    ],
-    [
-      'recordReputationEvent',
-      {
-        op: 'record_reputation_event',
-        provider: provider.publicKey,
-        event_id: 'provider-forged-event',
-        kind: 'session_ok',
-        epoch: 1,
-        at: 3_600,
-        paid_mu: 100,
-        evidence_hash: 'a'.repeat(64),
-      },
-    ],
-    [
-      'anchorReputation',
-      {
-        op: 'anchor_reputation',
-        provider: provider.publicKey,
-        epoch: 1,
-        folded_at: 3_600,
-        events_head: 'b'.repeat(64),
-        r_bps: 9_000,
-        raw_milli: 20_000,
-        successful_sessions: 100,
-      },
-    ],
-    [
-      'epochApply',
-      {
-        op: 'epoch_apply',
-        epoch: 1,
-        at: 3_600,
-        debits: [],
-        earnings: [{ provider: provider.publicKey, gross_mu: 1_000 }],
-      },
-    ],
-    [
-      'rateOracle',
-      {
-        op: 'rate_oracle',
-        tnk_usd_e6: 2_000_000,
-        source: 'gate-spot',
-        ts: 3_600,
-      },
-    ],
-    [
-      'tnkDeposit',
-      {
-        op: 'tnk_deposit',
-        memo_hash: 'memo-security',
-        tnk_e18: '1000000000000000000',
-        msb_tx_hash: 'msb-security',
-        epoch: 1,
-        at: 3_600,
-      },
-    ],
-    [
-      'fiatDeposit',
-      {
-        op: 'fiat_deposit',
-        rail: 'stripe',
-        who: provider.publicKey,
-        mu: 1_000_000,
-        ext_ref_hash: 'c'.repeat(64),
-        fiat_currency: 'usd',
-        fiat_amount_minor: 100,
-        epoch: 1,
-        at: 3_600,
-      },
-    ],
-    [
-      'fiatChargeback',
-      {
-        op: 'fiat_chargeback',
-        rail: 'stripe',
-        who: provider.publicKey,
-        mu: 1_000_000,
-        ext_ref_hash: 'c'.repeat(64),
-        dispute_ref_hash: 'd'.repeat(64),
-        fiat_currency: 'usd',
-        fiat_amount_minor: 100,
-        epoch: 1,
-        at: 3_600,
-      },
-    ],
-    [
-      'payoutConfirm',
-      {
-        op: 'payout_confirm',
-        kind: 'provider',
-        epoch: 1,
-        who: provider.publicKey,
-        mu: 100,
-        tnk_e18: '1000000000000000000',
-        msb_tx_hash: 'pay-security',
-        at: 3_600,
-      },
-    ],
-    [
-      'disputeResolve',
-      {
-        op: 'dispute_resolve',
-        dispute_id: 1,
-        outcome: 'provider_fault',
-        deposit_action: 'refund',
-        rationale_hash: 'c'.repeat(64),
-        slash: true,
-        at: 3_600,
-      },
-    ],
-  ];
+  const adminOnlyAttempts = buildAdminOnlyAttempts(provider, roomId);
 
   let txNo = 6;
   for (const [type, value] of adminOnlyAttempts) {

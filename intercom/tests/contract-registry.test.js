@@ -580,7 +580,7 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
 test('MayhemContract provider serving price gate fails closed without current admin key', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
-  const storage = new MemoryStorage();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
   const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
   const contract = new MayhemContract(protocol, {});
 
@@ -624,6 +624,7 @@ test('MayhemContract provider serving price gate fails closed without current ad
     admin: admin.publicKey,
     txNo: 5,
   });
+  await storage.del('admin');
 
   const before = storage.snapshotBytes();
   const result = await execute(
