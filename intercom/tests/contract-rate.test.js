@@ -66,6 +66,14 @@ const rateOracle = (overrides = {}) => ({
   ...overrides,
 });
 
+const tapRateOracle = (overrides = {}) => ({
+  op: 'tap_rate_oracle',
+  tap_usd_e6: 2_000_000,
+  source: 'uniswap-v2',
+  ts: 1_000,
+  ...overrides,
+});
+
 test('MayhemContract rateOracle is admin controlled and monotonic', async () => {
   const { admin, outsider, storage, contract } = await setupRateContract();
 
@@ -122,6 +130,112 @@ test('MayhemContract rateOracle is admin controlled and monotonic', async () => 
     7
   );
   assert.match(older.message, /timestamp must not decrease/i);
+});
+
+test('MayhemContract tapRateOracle drives TAP deposits and fails closed when stale', async () => {
+  const { admin, outsider, storage, contract } = await setupRateContract();
+  const buyer = '0x3333333333333333333333333333333333333333';
+  const pool = '0x4444444444444444444444444444444444444444';
+  const tapDeposit = {
+    op: 'tap_deposit',
+    who: buyer,
+    tap_wei: oneTnkE18,
+    eth_tx_hash: `0x${'b'.repeat(64)}`,
+    log_index: 0,
+    block_number: 123,
+    pool_address: pool,
+    chain_id: 61_000,
+    epoch: 1,
+    at: 3_701,
+  };
+
+  const nonAdmin = await execute(
+    contract,
+    storage,
+    'tapRateOracle',
+    tapRateOracle(),
+    outsider.publicKey,
+    4
+  );
+  assert.match(nonAdmin.message, /admin required/i);
+
+  const badSource = await execute(
+    contract,
+    storage,
+    'tapRateOracle',
+    tapRateOracle({ source: 'provider-quote' }),
+    admin.publicKey,
+    5
+  );
+  assert.match(badSource.message, /unsupported TAP rate source/i);
+
+  const first = await execute(
+    contract,
+    storage,
+    'tapRateOracle',
+    tapRateOracle(),
+    admin.publicKey,
+    6
+  );
+  assert.deepEqual(first, {
+    ok: true,
+    op: 'tapRateOracle',
+    ts: 1_000,
+    source: 'uniswap-v2',
+  });
+  assert.deepEqual((await storage.get('tap/rate/latest')).value, {
+    denom: 'tap_usd_e6',
+    tap_usd_e6: 2_000_000,
+    source: 'uniswap-v2',
+    ts: 1_000,
+    updated_at: makeTxKey(6),
+    posted_by: admin.publicKey,
+    posted_by_role: 'admin',
+  });
+
+  const older = await execute(
+    contract,
+    storage,
+    'tapRateOracle',
+    tapRateOracle({ source: 'config', ts: 999 }),
+    admin.publicKey,
+    7
+  );
+  assert.match(older.message, /timestamp must not decrease/i);
+
+  const staleDeposit = await execute(
+    contract,
+    storage,
+    'tapDeposit',
+    tapDeposit,
+    admin.publicKey,
+    8
+  );
+  assert.match(staleDeposit.message, /TAP rate oracle is stale/i);
+  assert.equal(await storage.get(`bal/${buyer}`), null);
+
+  const freshDeposit = await execute(
+    contract,
+    storage,
+    'tapDeposit',
+    { ...tapDeposit, at: 1_900 },
+    admin.publicKey,
+    9
+  );
+  assert.equal(freshDeposit.ok, true, freshDeposit.message);
+  assert.equal(freshDeposit.mu, 2_000_000);
+  assert.equal(freshDeposit.rate_ts, 1_000);
+  assert.deepEqual((await storage.get(`bal/${buyer}`)).value, {
+    user: buyer,
+    denom: 'mu_usd',
+    mu: 2_000_000,
+    updated_epoch: 1,
+    updated_at: makeTxKey(9),
+    last_deposit_rail: 'tap',
+    last_deposit_rate_ts: 1_000,
+    last_deposit_rate_source: 'uniswap-v2',
+    last_deposit_tap_usd_e6: 2_000_000,
+  });
 });
 
 test('MayhemContract refuses TNK deposits and payouts when the rate is stale', async () => {

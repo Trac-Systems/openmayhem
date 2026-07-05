@@ -280,7 +280,6 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     op: 'tap_deposit',
     who: buyer,
     tap_wei: oneTnkE18,
-    tap_usd_e6: 2_000_000,
     eth_tx_hash: ethTxHash,
     log_index: 0,
     block_number: 123,
@@ -300,13 +299,28 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   );
   assert.match(nonAdmin.message, /admin required/i);
 
+  const rate = await execute(
+    ctx.contract,
+    ctx.storage,
+    'tapRateOracle',
+    {
+      op: 'tap_rate_oracle',
+      tap_usd_e6: 2_000_000,
+      source: 'uniswap-v2',
+      ts: 1_000,
+    },
+    ctx.admin.publicKey,
+    3
+  );
+  assert.equal(rate.ok, true, rate.message);
+
   const confirmed = await execute(
     ctx.contract,
     ctx.storage,
     'tapDeposit',
     value,
     ctx.admin.publicKey,
-    3
+    4
   );
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.op, 'tapDeposit');
@@ -315,6 +329,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.equal(confirmed.mu, 2_000_000);
   assert.equal(confirmed.eth_tx_hash, ethTxHash);
   assert.equal(confirmed.log_index, 0);
+  assert.equal(confirmed.rate_ts, 1_000);
   assert.equal(confirmed.deposit_root.length, 64);
 
   const seenKey = `dep/tap/${ethTxHash}/0`;
@@ -323,6 +338,8 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     who: buyer,
     tap_wei: oneTnkE18,
     tap_usd_e6: 2_000_000,
+    rate_ts: 1_000,
+    rate_source: 'uniswap-v2',
     mu: 2_000_000,
     eth_tx_hash: ethTxHash,
     log_index: 0,
@@ -331,7 +348,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     chain_id: 61_000,
     epoch: 1,
     at: 1_800,
-    credited_at: makeTxKey(3),
+    credited_at: makeTxKey(4),
     credited_by: ctx.admin.publicKey,
     credited_by_role: 'admin',
   });
@@ -340,8 +357,10 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     denom: 'mu_usd',
     mu: 2_000_000,
     updated_epoch: 1,
-    updated_at: makeTxKey(3),
+    updated_at: makeTxKey(4),
     last_deposit_rail: 'tap',
+    last_deposit_rate_ts: 1_000,
+    last_deposit_rate_source: 'uniswap-v2',
     last_deposit_tap_usd_e6: 2_000_000,
   });
   const root = (await ctx.storage.get('ev/dep/1')).value;
@@ -358,7 +377,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     'tapDeposit',
     value,
     ctx.admin.publicKey,
-    4
+    5
   );
   assert.equal(replay.ok, true, replay.message);
   assert.equal(replay.duplicate, true);

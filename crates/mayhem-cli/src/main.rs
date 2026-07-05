@@ -193,6 +193,8 @@ enum AdminCommands {
     AuditorRegister(AdminAuditorRegisterArgs),
     /// Post a fresh TNK/USD oracle rate for payment and payout conversions.
     RateOracle(AdminRateOracleArgs),
+    /// Post a fresh TAP/USD policy rate for TAP deposit conversion.
+    TapRateOracle(AdminTapRateOracleArgs),
     /// Confirm a memo-bound TNK deposit into the canonical credit ledger.
     TnkDeposit(AdminTnkDepositArgs),
     /// Confirm a finalized TAP escrow Deposit event into the canonical credit ledger.
@@ -1701,6 +1703,23 @@ impl AdminRateSource {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AdminTapRateSource {
+    UniswapV2,
+    Config,
+    Stale,
+}
+
+impl AdminTapRateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UniswapV2 => "uniswap-v2",
+            Self::Config => "config",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum AdminPayoutConfirmKind {
     Provider,
     FeeSweep,
@@ -2060,6 +2079,24 @@ struct AdminRateOracleArgs {
 }
 
 #[derive(Debug, Parser)]
+struct AdminTapRateOracleArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// TAP/USD policy rate in integer micro-USD per 1 TAP.
+    #[arg(long)]
+    tap_usd_e6: u64,
+
+    /// Oracle source label accepted by the contract.
+    #[arg(long, value_enum)]
+    source: AdminTapRateSource,
+
+    /// Source observation timestamp in Unix seconds.
+    #[arg(long)]
+    ts: u64,
+}
+
+#[derive(Debug, Parser)]
 struct AdminTnkDepositArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -2093,10 +2130,6 @@ struct AdminTapDepositArgs {
     /// Deposited TAP amount as 18-decimal integer wei string.
     #[arg(long)]
     tap_wei: String,
-
-    /// Admin policy TAP/USD rate in integer micro-USD per TAP.
-    #[arg(long)]
-    tap_usd_e6: u64,
 
     #[arg(long)]
     eth_tx_hash: String,
@@ -8447,6 +8480,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::BanProvider(args) => &args.tx,
         AdminCommands::AuditorRegister(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
+        AdminCommands::TapRateOracle(args) => &args.tx,
         AdminCommands::TnkDeposit(args) => &args.tx,
         AdminCommands::TapDeposit(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
@@ -8493,6 +8527,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             Ok(("auditorRegister", admin_auditor_register_payload(args)))
         }
         AdminCommands::RateOracle(args) => Ok(("rateOracle", admin_rate_oracle_payload(args))),
+        AdminCommands::TapRateOracle(args) => {
+            Ok(("tapRateOracle", admin_tap_rate_oracle_payload(args)))
+        }
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
         AdminCommands::TapDeposit(args) => Ok(("tapDeposit", admin_tap_deposit_payload(args))),
         AdminCommands::FiatDeposit(args) => Ok(("fiatDeposit", admin_fiat_deposit_payload(args)?)),
@@ -8888,6 +8925,15 @@ fn admin_rate_oracle_payload(args: &AdminRateOracleArgs) -> Value {
     })
 }
 
+fn admin_tap_rate_oracle_payload(args: &AdminTapRateOracleArgs) -> Value {
+    json!({
+        "op": "tap_rate_oracle",
+        "tap_usd_e6": args.tap_usd_e6,
+        "source": args.source.as_str(),
+        "ts": args.ts,
+    })
+}
+
 fn admin_tnk_deposit_payload(args: &AdminTnkDepositArgs) -> Value {
     json!({
         "op": "tnk_deposit",
@@ -8904,7 +8950,6 @@ fn admin_tap_deposit_payload(args: &AdminTapDepositArgs) -> Value {
         "op": "tap_deposit",
         "who": &args.who,
         "tap_wei": &args.tap_wei,
-        "tap_usd_e6": args.tap_usd_e6,
         "eth_tx_hash": &args.eth_tx_hash,
         "log_index": args.log_index,
         "block_number": args.block_number,
@@ -18448,6 +18493,21 @@ mod tests {
         );
 
         assert_eq!(
+            admin_tap_rate_oracle_payload(&AdminTapRateOracleArgs {
+                tx: test_admin_tx_args(),
+                tap_usd_e6: 50_000,
+                source: AdminTapRateSource::UniswapV2,
+                ts: 3_600,
+            }),
+            json!({
+                "op": "tap_rate_oracle",
+                "tap_usd_e6": 50_000,
+                "source": "uniswap-v2",
+                "ts": 3_600,
+            })
+        );
+
+        assert_eq!(
             admin_tnk_deposit_payload(&AdminTnkDepositArgs {
                 tx: test_admin_tx_args(),
                 memo_hash: "memo".to_owned(),
@@ -18471,7 +18531,6 @@ mod tests {
                 tx: test_admin_tx_args(),
                 who: "0x0000000000000000000000000000000000000001".to_owned(),
                 tap_wei: "1000000000000000000".to_owned(),
-                tap_usd_e6: 2_000_000,
                 eth_tx_hash: "0xabc".to_owned(),
                 log_index: 0,
                 block_number: 123,
@@ -18484,7 +18543,6 @@ mod tests {
                 "op": "tap_deposit",
                 "who": "0x0000000000000000000000000000000000000001",
                 "tap_wei": "1000000000000000000",
-                "tap_usd_e6": 2_000_000,
                 "eth_tx_hash": "0xabc",
                 "log_index": 0,
                 "block_number": 123,

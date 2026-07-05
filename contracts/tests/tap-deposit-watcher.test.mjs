@@ -61,6 +61,7 @@ test('tap deposit watcher scans KnowledgePool Deposit logs and builds admin comm
   assert.deepEqual(args.slice(0, 4), ['admin', 'tap-deposit', '--who', deposit.who]);
   assert.equal(args.includes('--wallet-password'), true);
   assert.equal(args.includes('secret'), true);
+  assert.equal(args.includes('--tap-usd-e6'), false);
 
   const command = buildAdminCommand(deposit, {
     epoch: 7,
@@ -70,6 +71,7 @@ test('tap deposit watcher scans KnowledgePool Deposit logs and builds admin comm
   });
   assert.match(command, /tap-deposit/);
   assert.match(command, /--eth-tx-hash/);
+  assert.doesNotMatch(command, /tap-usd-e6/);
   assert.doesNotMatch(command, /secret/);
   assert.doesNotMatch(command, /wallet-password/);
 });

@@ -108,18 +108,23 @@ export function tapDepositFromLog(log, {
   if (!Number.isSafeInteger(blockNumber) || blockNumber < 0) throw new Error('Deposit log has invalid block_number');
   const normalizedChainId = parsePositiveInt(chainId, 'chain_id');
   const tapWei = positiveDecimalBigInt(amount, 'tap_wei').toString();
-  const normalizedRate = parsePositiveInt(tapUsdE6, 'tap_usd_e6');
-  return {
+  const normalizedRate = tapUsdE6 === undefined || tapUsdE6 === null || tapUsdE6 === ''
+    ? null
+    : parsePositiveInt(tapUsdE6, 'tap_usd_e6');
+  const deposit = {
     who: normalizeAddress(buyer, 'buyer'),
     tap_wei: tapWei,
-    tap_usd_e6: normalizedRate,
-    mu: tapWeiToMu(tapWei, normalizedRate),
     eth_tx_hash: normalizeTxHash(log.transactionHash),
     log_index: logIndex,
     block_number: blockNumber,
     pool_address: normalizeAddress(poolAddress ?? log.address, 'pool_address'),
     chain_id: normalizedChainId,
   };
+  if (normalizedRate !== null) {
+    deposit.tap_usd_e6 = normalizedRate;
+    deposit.mu = tapWeiToMu(tapWei, normalizedRate);
+  }
+  return deposit;
 }
 
 export function tapDepositKey(deposit) {
@@ -144,8 +149,6 @@ export function buildAdminCommandArgs(deposit, {
     deposit.who,
     '--tap-wei',
     deposit.tap_wei,
-    '--tap-usd-e6',
-    String(deposit.tap_usd_e6),
     '--eth-tx-hash',
     deposit.eth_tx_hash,
     '--log-index',
@@ -210,21 +213,24 @@ export function tapDepositStateMatches(deposit, {
   const balanceMu = Number(balance?.mu);
   const rootMu = Number(depositRoot?.mu_total);
   const rootCount = Number(depositRoot?.count);
+  const expectedMu = Number(deposit?.mu);
+  const hasExpectedMu = Number.isSafeInteger(expectedMu) && expectedMu > 0;
   return seen !== null
     && seen?.eth_tx_hash === deposit.eth_tx_hash
     && Number(seen?.log_index) === deposit.log_index
     && seen?.who === deposit.who
-    && Number(seen?.mu) === deposit.mu
+    && seen?.tap_wei === deposit.tap_wei
+    && (!hasExpectedMu || Number(seen?.mu) === expectedMu)
     && balance?.user === deposit.who
     && balance?.denom === 'mu_usd'
     && Number.isSafeInteger(balanceMu)
-    && balanceMu >= deposit.mu
+    && (!hasExpectedMu || balanceMu >= expectedMu)
     && depositRoot?.type === 'deposit_root'
     && Number(depositRoot?.epoch) === Number(epoch)
     && Number.isSafeInteger(rootCount)
     && rootCount > 0
     && Number.isSafeInteger(rootMu)
-    && rootMu >= deposit.mu;
+    && (!hasExpectedMu || rootMu >= expectedMu);
 }
 
 export async function waitForTapDepositState(deposit, {
@@ -349,7 +355,9 @@ async function main() {
   if (!rpc) throw new Error('Missing --rpc or MAYHEM_TAP_ETH_RPC.');
   if (!poolAddress) throw new Error('Missing --pool or MAYHEM_TAP_POOL_ADDRESS.');
 
-  const tapUsdE6 = parsePositiveInt(args['tap-usd-e6'] || process.env.MAYHEM_TAP_USD_E6, '--tap-usd-e6');
+  const tapUsdE6 = args['tap-usd-e6'] || process.env.MAYHEM_TAP_USD_E6
+    ? parsePositiveInt(args['tap-usd-e6'] || process.env.MAYHEM_TAP_USD_E6, '--tap-usd-e6')
+    : undefined;
   const epoch = parsePositiveInt(args.epoch, '--epoch');
   const at = parseNonNegativeInt(args.at ?? Math.floor(Date.now() / 1000), '--at');
   const cursorPath = path.resolve(args.cursor || DEFAULT_CURSOR);

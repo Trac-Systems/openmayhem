@@ -12,6 +12,7 @@ const FIAT_DEPOSIT_RAILS = new Set(['stripe', 'coinbase']);
 const FIAT_CURRENCIES = new Set(['usd', 'eur']);
 const PRICE_DENOMINATION = 'mu_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
+const TAP_RATE_SOURCES = new Set(['uniswap-v2', 'config', 'stale']);
 const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
 const PROVIDER_LIFECYCLE_OPS = new Set([
   'register_provider',
@@ -621,6 +622,17 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('tapRateOracle', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        tap_usd_e6: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        source: { type: 'string', min: 1, max: 64 },
+        ts: { type: 'number', integer: true, min: 0 },
+      },
+    });
+
     this.addSchema('depositTnk', {
       value: {
         $$strict: true,
@@ -655,7 +667,6 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         who: { type: 'string', min: 1, max: 128 },
         tap_wei: { type: 'string', min: 1, max: 80 },
-        tap_usd_e6: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
         eth_tx_hash: { type: 'string', min: 1, max: 128 },
         log_index: { type: 'number', integer: true, min: 0, max: Number.MAX_SAFE_INTEGER },
         block_number: { type: 'number', integer: true, min: 0, max: Number.MAX_SAFE_INTEGER },
@@ -2545,6 +2556,30 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'rateOracle', ts: record.ts, source: record.source };
   }
 
+  async tapRateOracle() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    if (!TAP_RATE_SOURCES.has(this.value.source)) return new Error('Unsupported TAP rate source.');
+
+    const current = await this.get('tap/rate/latest');
+    if (current && this.value.ts < current.ts) {
+      return new Error('TAP rate timestamp must not decrease.');
+    }
+
+    const record = {
+      denom: 'tap_usd_e6',
+      tap_usd_e6: this.value.tap_usd_e6,
+      source: this.value.source,
+      ts: this.value.ts,
+      updated_at: this.tx,
+      posted_by: this.address,
+      posted_by_role: 'admin',
+    };
+    await this.put('tap/rate/latest', record);
+    console.log('mayhem tapRateOracle', record);
+    return { ok: true, op: 'tapRateOracle', ts: record.ts, source: record.source };
+  }
+
   async depositTnk() {
     const consentError = await this.requireConsent();
     if (consentError) return consentError;
@@ -2657,7 +2692,9 @@ class MayhemContract extends Contract {
 
     const tapWei = this.parseTapWei(this.value.tap_wei);
     if (tapWei instanceof Error) return tapWei;
-    const mu = this.tapWeiToMu(tapWei, this.value.tap_usd_e6);
+    const rate = await this.guardianRequireFreshTapRate(this.value.at);
+    if (rate instanceof Error) return rate;
+    const mu = this.tapWeiToMu(tapWei, rate.tap_usd_e6);
     if (mu instanceof Error) return mu;
     if (mu <= 0) return new Error('TAP deposit converts to zero mu.');
 
@@ -2689,7 +2726,9 @@ class MayhemContract extends Contract {
       user_hash: await this.opaqueHash('deposit-user', who),
       mu,
       tap_wei: this.value.tap_wei,
-      tap_usd_e6: this.value.tap_usd_e6,
+      tap_usd_e6: rate.tap_usd_e6,
+      rate_ts: rate.ts,
+      rate_source: rate.source,
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
       block_number: this.value.block_number,
@@ -2708,7 +2747,9 @@ class MayhemContract extends Contract {
       rail: 'tap',
       who,
       tap_wei: this.value.tap_wei,
-      tap_usd_e6: this.value.tap_usd_e6,
+      tap_usd_e6: rate.tap_usd_e6,
+      rate_ts: rate.ts,
+      rate_source: rate.source,
       mu,
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
@@ -2728,7 +2769,9 @@ class MayhemContract extends Contract {
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
       updated_at: this.tx,
       last_deposit_rail: 'tap',
-      last_deposit_tap_usd_e6: this.value.tap_usd_e6,
+      last_deposit_rate_ts: rate.ts,
+      last_deposit_rate_source: rate.source,
+      last_deposit_tap_usd_e6: rate.tap_usd_e6,
     };
     await this.put(seenKey, seen);
     await this.put(`bal/${who}`, record);
@@ -2737,7 +2780,8 @@ class MayhemContract extends Contract {
       who,
       mu,
       tap_wei: this.value.tap_wei,
-      tap_usd_e6: this.value.tap_usd_e6,
+      tap_usd_e6: rate.tap_usd_e6,
+      rate_ts: rate.ts,
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
       epoch: this.value.epoch,
@@ -2752,6 +2796,7 @@ class MayhemContract extends Contract {
       deposit_root: depositRoot.merkle_root,
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
+      rate_ts: rate.ts,
     };
   }
 
@@ -4949,10 +4994,34 @@ class MayhemContract extends Contract {
     return rate;
   }
 
+  async requireFreshTapRate(at) {
+    const rate = await this.get('tap/rate/latest');
+    if (!rate) return new Error('Fresh TAP rate oracle required.');
+    const admin = await this.get('admin');
+    if (admin === null) return new Error('Fresh TAP rate oracle requires a current admin key.');
+    if (rate.posted_by !== admin || rate.posted_by_role !== 'admin') {
+      return new Error('Fresh TAP rate oracle must be admin-posted.');
+    }
+    if (rate.ts > at) return new Error('TAP rate oracle timestamp is in the future.');
+    const params = await this.activeParamsAt(at, ['rate_staleness_seconds']);
+    if (at - rate.ts > params.rate_staleness_seconds) {
+      return new Error('TAP rate oracle is stale.');
+    }
+    return rate;
+  }
+
   async guardianRequireFreshRate(at) {
     const rate = await this.requireFreshRate(at);
     if (rate instanceof Error) {
       return new Error(`Guardian rate freshness invariant failed: ${rate.message}`);
+    }
+    return rate;
+  }
+
+  async guardianRequireFreshTapRate(at) {
+    const rate = await this.requireFreshTapRate(at);
+    if (rate instanceof Error) {
+      return new Error(`Guardian TAP rate freshness invariant failed: ${rate.message}`);
     }
     return rate;
   }
