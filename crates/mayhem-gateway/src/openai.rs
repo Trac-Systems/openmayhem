@@ -107,6 +107,7 @@ pub struct GatewayState {
     provider_table: Arc<Mutex<ProviderTable>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     failover_policy: GatewayFailoverPolicyConfig,
+    dev_session_shim: bool,
 }
 
 #[derive(Clone)]
@@ -685,6 +686,9 @@ pub struct GatewaySessionError {
 }
 
 #[derive(Debug)]
+struct NoProviderSessionBackend;
+
+#[derive(Debug)]
 struct LocalOpenAiShapeBackend;
 
 #[derive(Clone, Debug)]
@@ -818,7 +822,7 @@ impl GatewayState {
             probes: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(Vec::new())),
             receipt_config,
-            session_backend: Arc::new(LocalOpenAiShapeBackend),
+            session_backend: Arc::new(NoProviderSessionBackend),
             hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
             canaries: Arc::new(canaries),
             canary_policy: GatewayCanaryProbePolicy::default(),
@@ -828,6 +832,7 @@ impl GatewayState {
             provider_table: Arc::new(Mutex::new(provider_table)),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             failover_policy: GatewayFailoverPolicyConfig::default(),
+            dev_session_shim: false,
         }
     }
 
@@ -853,6 +858,12 @@ impl GatewayState {
 
     pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
         self.session_backend = backend;
+        self
+    }
+
+    pub fn with_dev_session_shim(mut self) -> Self {
+        self.session_backend = Arc::new(LocalOpenAiShapeBackend);
+        self.dev_session_shim = true;
         self
     }
 
@@ -1280,6 +1291,7 @@ async fn mayhem_status(State(state): State<SharedState>) -> Response {
         "version": 1,
         "contract_version": CONTRACT_VERSION,
         "backend": state.session_backend.name(),
+        "dev_session_shim": state.dev_session_shim,
         "models": state.models.len(),
         "sessions_active": 0,
         "sessions_paused": state.paused_session_count(),
@@ -2185,6 +2197,8 @@ enum ChatResponse {
 struct ResponseMayhemMeta<'a> {
     backend: &'a str,
     direct_session: bool,
+    billable: bool,
+    dev_session: bool,
     hedge: GatewayHedgeInvocation,
 }
 
@@ -2770,6 +2784,25 @@ impl GatewaySessionResult {
             token_ids: Vec::new(),
             quality: None,
         }
+    }
+}
+
+impl GatewaySessionBackend for NoProviderSessionBackend {
+    fn name(&self) -> &str {
+        "no-live-provider"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async {
+            Err(GatewaySessionError::new(
+                "no provider available: production gateway requires an active provider joined to an admin-created room",
+            ))
+        })
     }
 }
 
@@ -4201,25 +4234,32 @@ async fn build_chat_completion(
     let mayhem_meta = ResponseMayhemMeta {
         backend: &backend,
         direct_session,
+        billable: !state.dev_session_shim,
+        dev_session: state.dev_session_shim,
         hedge: invocation.hedge.clone(),
     };
-    let receipt = state.meter_chat_session(
-        &model,
-        &metering_request,
-        &metering_output,
-        &invocation,
-        provider_receipt.as_ref(),
-    )?;
-    state
-        .maybe_run_canary_probe_after_session(&model, &invocation)
-        .await;
+    let receipt = if state.dev_session_shim {
+        None
+    } else {
+        let receipt = state.meter_chat_session(
+            &model,
+            &metering_request,
+            &metering_output,
+            &invocation,
+            provider_receipt.as_ref(),
+        )?;
+        state
+            .maybe_run_canary_probe_after_session(&model, &invocation)
+            .await;
+        Some(receipt)
+    };
     if request.stream {
         Ok(ChatResponse::Sse(chat_stream_chunks(
             &id,
             created,
             &model.id,
             &output,
-            &receipt,
+            receipt.as_ref(),
             mayhem_meta,
             request
                 .stream_options
@@ -4232,7 +4272,7 @@ async fn build_chat_completion(
             created,
             &model,
             &output,
-            &receipt,
+            receipt.as_ref(),
             mayhem_meta,
         )))
     }
@@ -4293,6 +4333,12 @@ async fn run_chat_with_route_retry(
         }
         return Err(ApiError::bad_request(
             "no provider route is currently eligible",
+            Some("model"),
+        ));
+    }
+    if eligible_routes.is_empty() && !state.dev_session_shim {
+        return Err(ApiError::service_unavailable(
+            "no provider available: production gateway requires an active provider joined to an admin-created room",
             Some("model"),
         ));
     }
@@ -4779,6 +4825,12 @@ fn build_completion(
     state: &GatewayState,
     request: CompletionRequest,
 ) -> Result<ChatResponse, ApiError> {
+    if !state.dev_session_shim {
+        return Err(ApiError::service_unavailable(
+            "no provider available: legacy completions cannot use the local dev shim in production mode",
+            Some("model"),
+        ));
+    }
     let model = require_model(state, &request.model)?;
     let id = make_id("cmpl");
     let created = now_secs();
@@ -4789,8 +4841,6 @@ fn build_completion(
         .take(max_tokens as usize * 8)
         .collect::<String>();
     let usage = usage_for(&prompt, &text);
-    let receipt_usage = ReceiptUsage::text(usage.prompt_tokens, usage.completion_tokens);
-    let receipt = state.meter_session(&model, &prompt, receipt_usage)?;
     let chunk = json!({
         "id": id,
         "object": "text_completion",
@@ -4804,7 +4854,10 @@ fn build_completion(
         }],
         "usage": usage,
         "mayhem": {
-            "receipt": receipt_summary(&receipt),
+            "backend": "local-openai-shape",
+            "billable": false,
+            "dev_session": true,
+            "receipt": null,
         },
     });
     if request.stream {
@@ -6406,7 +6459,7 @@ fn chat_response_value(
     created: u64,
     model: &GatewayModel,
     output: &ChatOutput,
-    receipt: &StoredReceipt,
+    receipt: Option<&StoredReceipt>,
     mayhem_meta: ResponseMayhemMeta<'_>,
 ) -> Value {
     let message = if let Some(tool_call) = &output.tool_call {
@@ -6436,6 +6489,8 @@ fn chat_response_value(
         "mayhem": {
             "backend": mayhem_meta.backend,
             "direct_session": mayhem_meta.direct_session,
+            "billable": mayhem_meta.billable,
+            "dev_session": mayhem_meta.dev_session,
             "artifacts": artifact_summaries(&output.artifacts),
             "hedge": {
                 "requested": mayhem_meta.hedge.requested,
@@ -6445,7 +6500,7 @@ fn chat_response_value(
                 "winner_ttft_ms": mayhem_meta.hedge.winner_ttft_ms,
             },
             "model": model.mayhem,
-            "receipt": receipt_summary(receipt),
+            "receipt": receipt.map(receipt_summary),
         },
     })
 }
@@ -6455,7 +6510,7 @@ fn chat_stream_chunks(
     created: u64,
     model: &str,
     output: &ChatOutput,
-    receipt: &StoredReceipt,
+    receipt: Option<&StoredReceipt>,
     mayhem_meta: ResponseMayhemMeta<'_>,
     include_usage: bool,
 ) -> Vec<Value> {
@@ -6513,6 +6568,8 @@ fn chat_stream_chunks(
             "mayhem": {
                 "backend": mayhem_meta.backend,
                 "direct_session": mayhem_meta.direct_session,
+                "billable": mayhem_meta.billable,
+                "dev_session": mayhem_meta.dev_session,
                 "artifacts": artifact_summaries(&output.artifacts),
                 "hedge": {
                     "requested": mayhem_meta.hedge.requested,
@@ -6521,7 +6578,7 @@ fn chat_stream_chunks(
                     "winner_provider": mayhem_meta.hedge.winner_provider,
                     "winner_ttft_ms": mayhem_meta.hedge.winner_ttft_ms,
                 },
-                "receipt": receipt_summary(receipt),
+                "receipt": receipt.map(receipt_summary),
             },
         }));
     }

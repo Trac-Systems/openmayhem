@@ -486,11 +486,11 @@ impl GatewaySessionBackend for CanarySubstitutionBackend {
 }
 
 fn test_app() -> Router {
-    openai_router(GatewayState::from_embedded_catalog())
+    openai_router(GatewayState::from_embedded_catalog().with_dev_session_shim())
 }
 
 fn test_state_and_app() -> (GatewayState, Router) {
-    let state = GatewayState::from_embedded_catalog();
+    let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
     let app = openai_router(state.clone());
     (state, app)
 }
@@ -585,8 +585,40 @@ async fn first_model_id() -> String {
     body["data"][0]["id"].as_str().expect("model id").to_owned()
 }
 
-fn is_hex(value: &str) -> bool {
-    value.chars().all(|ch| ch.is_ascii_hexdigit())
+#[tokio::test]
+async fn production_gateway_without_live_provider_refuses_local_chat_shim() {
+    let state = GatewayState::from_embedded_catalog();
+    let app = openai_router(state.clone());
+    let (status, models) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let model = models["data"][0]["id"].as_str().expect("model id");
+    let request = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "Do not fabricate a local answer." }]
+    });
+
+    let (status, body) =
+        json_request(app.clone(), Method::POST, "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("no provider available"));
+    assert!(state.receipts().is_empty());
+
+    let request = json!({ "model": model, "prompt": "No deterministic completions either." });
+    let (status, body) = json_request(app.clone(), Method::POST, "/v1/completions", request).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("local dev shim"));
+    assert!(state.receipts().is_empty());
+
+    let (status, body) = json_request(app, Method::GET, "/mayhem/status", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["backend"], "no-live-provider");
+    assert_eq!(body["dev_session_shim"], false);
 }
 
 #[tokio::test]
@@ -1688,7 +1720,9 @@ async fn chat_completion_streams_openai_sse_chunks_with_usage() {
     assert!(body.contains("\"mayhem\":{"));
     assert!(body.contains("\"backend\":\"local-openai-shape\""));
     assert!(body.contains("\"direct_session\":false"));
-    assert!(body.contains("\"receipt\":{"));
+    assert!(body.contains("\"billable\":false"));
+    assert!(body.contains("\"dev_session\":true"));
+    assert!(body.contains("\"receipt\":null"));
     assert!(body.contains("data: [DONE]"));
 }
 
@@ -1735,12 +1769,12 @@ async fn chat_completion_streams_normalized_tool_call_delta() {
 }
 
 #[tokio::test]
-async fn streaming_chat_persists_dual_signed_receipt() {
+async fn streaming_dev_chat_is_unbillable_and_stores_no_receipt() {
     let (state, app) = test_state_and_app();
     let model = first_model_id().await;
     let request = json!({
         "model": model,
-        "messages": [{ "role": "user", "content": "Stream with receipt accounting." }],
+        "messages": [{ "role": "user", "content": "Stream without billable accounting." }],
         "stream": true,
         "stream_options": { "include_usage": true }
     });
@@ -1760,48 +1794,25 @@ async fn streaming_chat_persists_dual_signed_receipt() {
         .starts_with("text/event-stream"));
     let body = String::from_utf8(bytes).expect("SSE body is utf8");
     assert!(body.contains("\"mayhem\":{"));
-    assert!(body.contains("\"receipt\":{"));
-
-    let receipts = state.receipts();
-    assert_eq!(receipts.len(), 1);
-    let stored = &receipts[0];
-    assert!(stored.receipt.body.final_receipt);
-    assert_eq!(stored.receipt.body.price_ver, stored.voucher.body.price_ver);
-    assert_eq!(stored.receipt.body.price_ver, 1);
-    assert_eq!(
-        stored.receipt.body.session_id,
-        stored.voucher.body.session_id
-    );
-    assert_eq!(
-        stored.receipt_ack.session_id,
-        stored.receipt.body.session_id
-    );
-    assert_eq!(stored.receipt_ack.seq, stored.receipt.body.seq);
-    assert_eq!(stored.receipt_ack.user_sig, stored.receipt.user_sig);
-    assert!(stored.receipt.body.mu_owed_cum > 0);
-    assert!(stored.receipt.body.usage.output_tokens() > 0);
-    assert_eq!(stored.receipt.body.prompt_hash.len(), 64);
-    assert!(is_hex(&stored.receipt.body.prompt_hash));
-    assert_eq!(stored.voucher.user_sig.len(), 128);
-    assert!(is_hex(&stored.voucher.user_sig));
-    assert_eq!(stored.receipt.enclave_sig.len(), 128);
-    assert!(is_hex(&stored.receipt.enclave_sig));
-    assert_eq!(stored.receipt.user_sig.len(), 128);
-    assert!(is_hex(&stored.receipt.user_sig));
+    assert!(body.contains("\"billable\":false"));
+    assert!(body.contains("\"dev_session\":true"));
+    assert!(body.contains("\"receipt\":null"));
+    assert!(state.receipts().is_empty());
 
     let (status, body) = json_request(app, Method::GET, "/mayhem/receipts", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"].as_array().expect("receipt list").len(), 1);
+    assert_eq!(body["data"].as_array().expect("receipt list").len(), 0);
     assert_eq!(body["paused"].as_array().expect("paused list").len(), 0);
 }
 
 #[tokio::test]
 async fn refused_receipt_cosign_pauses_session_without_storing_receipt() {
-    let state = GatewayState::from_embedded_catalog().with_receipt_cosign_enabled(false);
+    let state = GatewayState::from_models(vec![routed_test_model()])
+        .with_session_backend(Arc::new(TestDirectSessionBackend))
+        .with_receipt_cosign_enabled(false);
     let app = openai_router(state.clone());
-    let model = first_model_id().await;
     let request = json!({
-        "model": model,
+        "model": "mayhem/routed-test",
         "messages": [{ "role": "user", "content": "This should pause." }],
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -1861,7 +1872,9 @@ async fn legacy_completions_return_text_completion_shape_and_stream() {
         .as_str()
         .expect("completion text")
         .contains("Mayhem completion"));
-    assert_eq!(body["mayhem"]["receipt"]["final"], true);
+    assert_eq!(body["mayhem"]["billable"], false);
+    assert_eq!(body["mayhem"]["dev_session"], true);
+    assert_eq!(body["mayhem"]["receipt"], Value::Null);
 
     let request = json!({ "model": first_model_id().await, "prompt": "Hello", "stream": true });
     let (status, headers, bytes) =
@@ -1874,9 +1887,11 @@ async fn legacy_completions_return_text_completion_shape_and_stream() {
         .starts_with("text/event-stream"));
     let body = String::from_utf8(bytes).expect("SSE body is utf8");
     assert!(body.contains("\"object\":\"text_completion\""));
-    assert!(body.contains("\"mayhem\":{\"receipt\""));
+    assert!(body.contains("\"billable\":false"));
+    assert!(body.contains("\"dev_session\":true"));
+    assert!(body.contains("\"receipt\":null"));
     assert!(body.contains("data: [DONE]"));
-    assert_eq!(state.receipts().len(), 2);
+    assert!(state.receipts().is_empty());
 }
 
 #[tokio::test]
@@ -1885,6 +1900,7 @@ async fn mayhem_local_endpoints_report_status_receipts_and_balance() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], true);
     assert_eq!(body["backend"], "local-openai-shape");
+    assert_eq!(body["dev_session_shim"], true);
 
     let (status, body) =
         json_request(test_app(), Method::GET, "/mayhem/receipts", Value::Null).await;
@@ -2015,7 +2031,7 @@ async fn dashboard_component_gallery_uses_local_design_system_and_font_asset() {
 
 #[tokio::test]
 async fn user_dashboard_renders_live_gateway_data() {
-    let state = GatewayState::from_embedded_catalog();
+    let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")

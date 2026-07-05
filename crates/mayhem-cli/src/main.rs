@@ -12837,7 +12837,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let (state, source, model_count, backend, wallet_public_key, balance_mu) = if args
         .dev_embedded_catalog
     {
-        let state = GatewayState::from_embedded_catalog();
+        let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
         (
             state,
             "dev-embedded-catalog".to_owned(),
@@ -12987,7 +12987,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         println!("Dashboard session expires in: {dashboard_session_expires_in_seconds}s");
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
-            println!("Backend: local OpenAI-shape smoke backend.");
+            println!("Backend: local OpenAI-shape smoke backend (unbillable dev output).");
         } else {
             println!(
                 "Model source: canonical contract state ({} models).",
