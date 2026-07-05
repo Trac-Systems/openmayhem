@@ -40,6 +40,13 @@ const makeEpochApply = (epoch, user, provider, grossMu) => ({
   earnings: [{ provider, gross_mu: grossMu }],
 });
 
+const mapPaidOps = (commands) => {
+  const protocol = new MayhemProtocol({}, {});
+  return commands
+    .map((command) => protocol.mapTxCommand(JSON.stringify(command)))
+    .filter(Boolean);
+};
+
 async function setupLedgerContract(identities = null) {
   const admin = identities?.admin ?? await makeIdentity();
   const provider = identities?.provider ?? await makeIdentity();
@@ -170,18 +177,88 @@ test('MayhemProtocol keeps payout claims off the paid tx route', () => {
 });
 
 test('MayhemProtocol keeps rate oracle updates off the paid tx route', () => {
-  const protocol = new MayhemProtocol({}, {});
-  const paidOps = [
+  const commands = [
     { op: 'epoch_commit', epoch: 1, at: 3_600, roots: {}, totals: {} },
     { op: 'rate_oracle', tnk_usd_e6: 50_000, source: 'gate-spot', ts: 3_600 },
     { op: 'rate_oracle', tnk_usd_e6: 51_000, source: 'mexc-spot', ts: 5_400 },
     { op: 'tap_rate_oracle', tap_usd_e6: 50_000, source: 'uniswap-v2', ts: 3_600 },
     { op: 'tap_rate_oracle', tap_usd_e6: 52_000, source: 'config', ts: 5_400 },
-  ]
-    .map((command) => protocol.mapTxCommand(JSON.stringify(command)))
-    .filter(Boolean);
+  ];
 
-  assert.deepEqual(paidOps.map((op) => op.type), ['epochCommit']);
+  assert.deepEqual(mapPaidOps(commands).map((op) => op.type), ['epochCommit']);
+});
+
+test('MayhemProtocol steady-state sponsorship stays at one paid tx per active epoch', () => {
+  const activeEpochs = 3;
+  const commands = [];
+
+  for (let epoch = 1; epoch <= activeEpochs; epoch += 1) {
+    commands.push({ op: 'epoch_commit', epoch, at: epoch * 3_600, roots: {}, totals: {} });
+    commands.push(makeEpochApply(epoch, `user-${epoch}`, `provider-${epoch}`, 1_000 + epoch));
+    commands.push({ op: 'rate_oracle', tnk_usd_e6: 50_000 + epoch, source: 'gate-spot', ts: epoch * 3_600 });
+    commands.push({ op: 'tap_rate_oracle', tap_usd_e6: 50_000 + epoch, source: 'uniswap-v2', ts: epoch * 3_600 });
+
+    for (let i = 0; i < 4; i += 1) {
+      commands.push({
+        op: 'deposit_tnk',
+        sender: `user-${epoch}-${i}`,
+        intent: { memo_hash: `memo-${epoch}-${i}` },
+        sig: 'sig',
+      });
+      commands.push({
+        op: 'tnk_deposit',
+        memo_hash: `memo-${epoch}-${i}`,
+        tnk_e18: '1000000000000000000',
+        msb_tx_hash: `${epoch}${i}`.padEnd(64, 'a'),
+        epoch,
+        at: epoch * 3_600 + i,
+      });
+      commands.push({
+        op: 'tap_deposit',
+        who: `0x${String(epoch).repeat(40).slice(0, 40)}`,
+        tap_wei: '1000000000000000000',
+        eth_tx_hash: `0x${`${epoch}${i}`.padEnd(64, 'b')}`,
+        log_index: i,
+        block_number: 100 + i,
+        pool_address: '0x2222222222222222222222222222222222222222',
+        chain_id: 61_000,
+        epoch,
+        at: epoch * 3_600 + i,
+      });
+      commands.push({
+        op: 'fiat_deposit',
+        rail: 'stripe',
+        who: `user-${epoch}-${i}`,
+        mu: 1_000_000,
+        ext_ref_hash: `${epoch}${i}`.padEnd(64, 'c'),
+        fiat_currency: 'usd',
+        fiat_amount_minor: 100,
+        epoch,
+        at: epoch * 3_600 + i,
+      });
+      commands.push({
+        op: 'payout_confirm',
+        epoch,
+        who: `provider-${epoch}-${i}`,
+        mu: 100 + i,
+        tnk_e18: '1000000000000000000',
+        msb_tx_hash: `${epoch}${i}`.padEnd(64, 'd'),
+        at: epoch * 3_600 + i,
+      });
+    }
+  }
+
+  const paidOps = mapPaidOps(commands);
+  assert.deepEqual(paidOps.map((op) => op.type), Array(activeEpochs).fill('epochCommit'));
+  assert.equal(paidOps.length, activeEpochs);
+
+  const paidByEpoch = new Map();
+  for (const op of paidOps) {
+    paidByEpoch.set(op.value.epoch, (paidByEpoch.get(op.value.epoch) ?? 0) + 1);
+  }
+  for (let epoch = 1; epoch <= activeEpochs; epoch += 1) {
+    assert.equal(paidByEpoch.get(epoch), 1, `epoch ${epoch} must have exactly one paid anchor`);
+  }
 });
 
 test('MayhemContract epochApply mutates credit, earning, and fee state in place', async () => {
