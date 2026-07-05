@@ -3,7 +3,6 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode},
     Router,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use mayhem_gateway::openai::{
     openai_router, validate_loopback_dashboard_bind, ChatCompletionRequest, ChatMessage,
     ChatOutput, GatewayArtifactOutput, GatewayCanaryModelConfig, GatewayCanaryProbePolicy,
@@ -681,7 +680,7 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
 }
 
 #[tokio::test]
-async fn embeddings_endpoint_returns_vectors_and_records_receipt() {
+async fn embeddings_endpoint_requires_real_engine_and_records_zero_charge() {
     let catalog = json!({
         "models": [{
             "model_id": "admin/embed-fixture",
@@ -723,37 +722,17 @@ async fn embeddings_endpoint_returns_vectors_and_records_receipt() {
 
     let (status, body) = json_request(app, Method::POST, "/v1/embeddings", request).await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["object"], "list");
-    assert_eq!(body["model"], "admin/embed-fixture");
-    assert_eq!(body["data"].as_array().expect("embedding data").len(), 2);
-    assert_eq!(body["data"][0]["object"], "embedding");
-    assert_eq!(
-        body["data"][0]["embedding"]
-            .as_array()
-            .expect("embedding vector")
-            .len(),
-        8
-    );
-    assert_eq!(body["usage"]["prompt_tokens"], 2);
-    assert_eq!(body["usage"]["total_tokens"], 2);
-    assert_eq!(body["mayhem"]["backend"], "local-embedding-shape");
-    assert_eq!(
-        body["mayhem"]["model"]["adapter"]["modality_set"][0],
-        "embedding"
-    );
-    let receipts = state.receipts();
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].receipt.body.model_id, "admin/embed-fixture");
-    assert_eq!(receipts[0].receipt.body.price_ver, 3);
-    assert_eq!(receipts[0].receipt.body.usage.input_tokens(), 2);
-    assert_eq!(receipts[0].receipt.body.usage.output_tokens(), 0);
-    assert_eq!(
-        receipts[0].receipt.body.prompt_hash,
-        body["mayhem"]["receipt"]["prompt_hash"]
-            .as_str()
-            .expect("prompt hash")
-    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["param"], "model");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("embeddings is not served"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("no charge recorded"));
+    assert!(state.receipts().is_empty());
 }
 
 #[tokio::test]
@@ -776,7 +755,7 @@ async fn embeddings_endpoint_rejects_non_embedding_model() {
 }
 
 #[tokio::test]
-async fn image_generation_endpoint_records_image_and_step_usage() {
+async fn image_generation_endpoint_requires_real_engine_and_records_zero_charge() {
     let catalog = json!({
         "models": [{
             "model_id": "admin/image-fixture",
@@ -822,23 +801,21 @@ async fn image_generation_endpoint_records_image_and_step_usage() {
 
     let (status, body) = json_request(app, Method::POST, "/v1/images/generations", request).await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"].as_array().expect("image data").len(), 2);
-    let bytes = BASE64_STANDARD
-        .decode(body["data"][0]["b64_json"].as_str().expect("b64 image"))
-        .expect("image decodes");
-    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-    assert_eq!(body["usage"]["image"], 2);
-    assert_eq!(body["usage"]["step"], 60);
-    assert_eq!(body["mayhem"]["backend"], "local-image-shape");
-    let receipt = &state.receipts()[0].receipt.body;
-    assert_eq!(receipt.usage.get("image"), 2);
-    assert_eq!(receipt.usage.get("step"), 60);
-    assert_eq!(receipt.mu_owed_cum, 1_120);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["param"], "model");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("image generation is not served"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("no charge recorded"));
+    assert!(state.receipts().is_empty());
 }
 
 #[tokio::test]
-async fn audio_speech_endpoint_returns_audio_and_records_tts_usage() {
+async fn audio_speech_endpoint_requires_real_engine_and_records_zero_charge() {
     let catalog = json!({
         "models": [{
             "model_id": "admin/tts-fixture",
@@ -884,38 +861,23 @@ async fn audio_speech_endpoint_returns_audio_and_records_tts_usage() {
     let (status, headers, bytes) =
         raw_request(app, Method::POST, "/v1/audio/speech", Some(request)).await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("audio/wav")
-    );
-    assert!(bytes.starts_with(b"RIFF"));
-    let expected_input_characters = input.chars().count().to_string();
-    assert_eq!(
-        headers
-            .get("x-mayhem-usage-input-character")
-            .and_then(|value| value.to_str().ok()),
-        Some(expected_input_characters.as_str())
-    );
-    assert_eq!(
-        headers
-            .get("x-mayhem-usage-audio-second")
-            .and_then(|value| value.to_str().ok()),
-        Some("1")
-    );
-    let receipt = &state.receipts()[0].receipt.body;
-    assert_eq!(
-        receipt.usage.get("input_character"),
-        input.chars().count() as u64
-    );
-    assert_eq!(receipt.usage.get("audio_second"), 1);
-    assert_eq!(receipt.mu_owed_cum, input.chars().count() as u64 + 100);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!headers.contains_key("x-mayhem-receipt-session-id"));
+    let body: Value = serde_json::from_slice(&bytes).expect("speech error JSON");
+    assert_eq!(body["error"]["param"], "model");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("audio speech is not served"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("no charge recorded"));
+    assert!(state.receipts().is_empty());
 }
 
 #[tokio::test]
-async fn audio_transcription_endpoint_accepts_multipart_and_records_stt_usage() {
+async fn audio_transcription_endpoint_requires_real_engine_and_records_zero_charge() {
     let catalog = json!({
         "models": [{
             "model_id": "admin/stt-fixture",
@@ -985,23 +947,23 @@ async fn audio_transcription_endpoint_accepts_multipart_and_records_stt_usage() 
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .contains("application/json"));
-    let body: Value = serde_json::from_slice(&bytes).expect("transcription JSON");
-    assert!(body["text"]
+    let body: Value = serde_json::from_slice(&bytes).expect("transcription error JSON");
+    assert_eq!(body["error"]["param"], "model");
+    assert!(body["error"]["message"]
         .as_str()
-        .expect("transcription text")
-        .contains("Mayhem transcription"));
-    assert_eq!(body["duration"], 1);
-    assert_eq!(body["usage"]["audio_second"], 1);
-    assert_eq!(body["mayhem"]["backend"], "local-stt-shape");
-    let receipt = &state.receipts()[0].receipt.body;
-    assert_eq!(receipt.usage.get("audio_second"), 1);
-    assert_eq!(receipt.mu_owed_cum, 250);
+        .expect("error message")
+        .contains("audio transcription is not served"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("no charge recorded"));
+    assert!(state.receipts().is_empty());
 }
 
 #[tokio::test]

@@ -42,12 +42,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{
-    engine::general_purpose::{
-        STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
-    },
-    Engine as _,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
@@ -56,8 +51,7 @@ use mayhem_proto::{
     session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
     AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
     SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_STEP,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -547,11 +541,6 @@ pub struct AudioSpeechRequest {
 #[derive(Debug)]
 struct AudioTranscriptionRequest {
     model: String,
-    audio: Vec<u8>,
-    filename: Option<String>,
-    response_format: Option<String>,
-    language: Option<String>,
-    prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2818,9 +2807,9 @@ impl GatewaySessionBackend for LocalOpenAiShapeBackend {
         _invocation: &'a GatewaySessionInvocation,
     ) -> GatewaySessionFuture<'a> {
         Box::pin(async move {
-            Ok(GatewaySessionResult::local_openai_shape(
-                deterministic_chat_output(model, request),
-            ))
+            Ok(GatewaySessionResult::local_openai_shape(dev_chat_output(
+                model, request,
+            )))
         })
     }
 }
@@ -4875,51 +4864,7 @@ fn build_embedding(state: &GatewayState, request: EmbeddingRequest) -> Result<Va
             Some("model"),
         ));
     }
-    if request
-        .encoding_format
-        .as_deref()
-        .is_some_and(|format| format != "float")
-    {
-        return Err(ApiError::bad_request(
-            "only encoding_format=float is supported for embeddings",
-            Some("encoding_format"),
-        ));
-    }
-    let dimensions = embedding_dimensions(request.dimensions)?;
-    let inputs = embedding_inputs(&request.input)?;
-    let prompt_tokens = embedding_prompt_tokens(&inputs);
-    let prompt_text = inputs.join("\n");
-    let receipt = state.meter_session(
-        &model,
-        &prompt_text,
-        ReceiptUsage::from_units([(USAGE_INPUT_TOKEN, prompt_tokens)]),
-    )?;
-    let data = inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            json!({
-                "object": "embedding",
-                "embedding": deterministic_embedding_vector(&model.id, input, dimensions),
-                "index": index,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Ok(json!({
-        "object": "list",
-        "data": data,
-        "model": model.id,
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "total_tokens": prompt_tokens,
-        },
-        "mayhem": {
-            "backend": "local-embedding-shape",
-            "model": model.mayhem,
-            "receipt": receipt_summary(&receipt),
-        },
-    }))
+    Err(modality_not_served("embeddings"))
 }
 
 fn build_image_generation(
@@ -4933,65 +4878,7 @@ fn build_image_generation(
             Some("model"),
         ));
     }
-    if request.prompt.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "prompt must not be empty",
-            Some("prompt"),
-        ));
-    }
-    let count = image_count(request.n)?;
-    let (width, height, size) = image_size(request.size.as_deref())?;
-    let steps = image_steps(request.steps)?;
-    let response_format = request.response_format.as_deref().unwrap_or("b64_json");
-    if !matches!(response_format, "b64_json" | "url") {
-        return Err(ApiError::bad_request(
-            "response_format must be b64_json or url",
-            Some("response_format"),
-        ));
-    }
-
-    let usage = ReceiptUsage::from_units([
-        (USAGE_IMAGE, u64::from(count)),
-        (USAGE_STEP, steps.saturating_mul(u64::from(count))),
-    ]);
-    let receipt = state.meter_session(&model, &image_prompt_text(&request, &size), usage)?;
-    let data = (0..count)
-        .map(|index| {
-            let bytes =
-                deterministic_image_bytes(&model.id, &request.prompt, index, width, height, steps);
-            let encoded = BASE64_STANDARD.encode(&bytes);
-            let artifact = json!({
-                "id": format!("image-{index}"),
-                "content_type": "image/png",
-                "bytes": bytes.len(),
-                "blake3": blake3_hex(&bytes),
-            });
-            if response_format == "url" {
-                json!({
-                    "url": format!("data:image/png;base64,{encoded}"),
-                    "revised_prompt": request.prompt,
-                    "mayhem": { "artifact": artifact },
-                })
-            } else {
-                json!({
-                    "b64_json": encoded,
-                    "revised_prompt": request.prompt,
-                    "mayhem": { "artifact": artifact },
-                })
-            }
-        })
-        .collect::<Vec<_>>();
-
-    Ok(json!({
-        "created": now_secs(),
-        "data": data,
-        "usage": receipt.receipt.body.usage,
-        "mayhem": {
-            "backend": "local-image-shape",
-            "model": model.mayhem,
-            "receipt": receipt_summary(&receipt),
-        },
-    }))
+    Err(modality_not_served("image generation"))
 }
 
 fn build_audio_speech(
@@ -5005,60 +4892,14 @@ fn build_audio_speech(
             Some("model"),
         ));
     }
-    let input = request.input.trim();
-    if input.is_empty() {
-        return Err(ApiError::bad_request(
-            "input must not be empty",
-            Some("input"),
-        ));
-    }
-    let format = speech_response_format(request.response_format.as_deref())?;
-    let speed = speech_speed(request.speed)?;
-    let input_characters = input.chars().count() as u64;
-    let audio_seconds = speech_audio_seconds(input_characters, speed);
-    let usage = ReceiptUsage::from_units([
-        (USAGE_INPUT_CHARACTER, input_characters),
-        (USAGE_AUDIO_SECOND, audio_seconds),
-    ]);
-    let receipt = state.meter_session(&model, &speech_prompt_text(&request), usage)?;
-    let bytes = deterministic_audio_bytes(
-        &format,
-        &model.id,
-        input,
-        request.voice.as_deref().unwrap_or("alloy"),
-        audio_seconds,
-    );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, speech_content_type(&format))
-        .header(
-            "x-mayhem-receipt-session-id",
-            receipt.receipt.body.session_id.as_str(),
-        )
-        .header(
-            "x-mayhem-mu-owed-cum",
-            receipt.receipt.body.mu_owed_cum.to_string(),
-        )
-        .header(
-            "x-mayhem-usage-input-character",
-            input_characters.to_string(),
-        )
-        .header("x-mayhem-usage-audio-second", audio_seconds.to_string())
-        .body(Body::from(bytes))
-        .map_err(|err| {
-            ApiError::internal_message(format!("building speech response failed: {err}"))
-        })
+    Err(modality_not_served("audio speech"))
 }
 
 async fn parse_audio_transcription_multipart(
     mut multipart: Multipart,
 ) -> Result<AudioTranscriptionRequest, ApiError> {
     let mut model = None;
-    let mut audio = None;
-    let mut filename = None;
-    let mut response_format = None;
-    let mut language = None;
-    let mut prompt = None;
+    let mut audio_present = false;
 
     while let Some(field) = multipart.next_field().await.map_err(|err| {
         ApiError::bad_request(format!("invalid multipart form: {err}"), Some("file"))
@@ -5071,48 +4912,46 @@ async fn parse_audio_transcription_multipart(
                 })?);
             }
             "file" => {
-                filename = field.file_name().map(str::to_owned);
                 let bytes = field.bytes().await.map_err(|err| {
                     ApiError::bad_request(format!("invalid file field: {err}"), Some("file"))
                 })?;
-                audio = Some(bytes.to_vec());
+                audio_present = !bytes.is_empty();
             }
             "response_format" => {
-                response_format = Some(field.text().await.map_err(|err| {
+                let _ = field.text().await.map_err(|err| {
                     ApiError::bad_request(
                         format!("invalid response_format field: {err}"),
                         Some("response_format"),
                     )
-                })?);
+                })?;
             }
             "language" => {
-                language = Some(field.text().await.map_err(|err| {
+                let _ = field.text().await.map_err(|err| {
                     ApiError::bad_request(
                         format!("invalid language field: {err}"),
                         Some("language"),
                     )
-                })?);
+                })?;
             }
             "prompt" => {
-                prompt = Some(field.text().await.map_err(|err| {
+                let _ = field.text().await.map_err(|err| {
                     ApiError::bad_request(format!("invalid prompt field: {err}"), Some("prompt"))
-                })?);
+                })?;
             }
             _ => {}
         }
     }
 
+    if !audio_present {
+        return Err(ApiError::bad_request(
+            "multipart form missing file",
+            Some("file"),
+        ));
+    }
     Ok(AudioTranscriptionRequest {
         model: model
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| ApiError::bad_request("multipart form missing model", Some("model")))?,
-        audio: audio
-            .filter(|bytes| !bytes.is_empty())
-            .ok_or_else(|| ApiError::bad_request("multipart form missing file", Some("file")))?,
-        filename,
-        response_format,
-        language,
-        prompt,
     })
 }
 
@@ -5127,32 +4966,14 @@ fn build_audio_transcription(
             Some("model"),
         ));
     }
-    let response_format = request.response_format.as_deref().unwrap_or("json");
-    if !matches!(response_format, "json" | "verbose_json") {
-        return Err(ApiError::bad_request(
-            "response_format must be json or verbose_json",
-            Some("response_format"),
-        ));
-    }
-    let audio_seconds = audio_seconds_for_bytes(request.audio.len());
-    let usage = ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, audio_seconds)]);
-    let prompt_text = transcription_prompt_text(&request);
-    let receipt = state.meter_session(&model, &prompt_text, usage)?;
-    let text = deterministic_transcription_text(&request);
-    let mut value = json!({
-        "text": text,
-        "usage": receipt.receipt.body.usage,
-        "mayhem": {
-            "backend": "local-stt-shape",
-            "model": model.mayhem,
-            "receipt": receipt_summary(&receipt),
-        },
-    });
-    if response_format == "verbose_json" {
-        value["duration"] = json!(audio_seconds);
-        value["language"] = json!(request.language.unwrap_or_else(|| "und".to_owned()));
-    }
-    Ok(value)
+    Err(modality_not_served("audio transcription"))
+}
+
+fn modality_not_served(kind: &'static str) -> ApiError {
+    ApiError::service_unavailable(
+        format!("{kind} is not served by this gateway yet; no charge recorded"),
+        Some("model"),
+    )
 }
 
 fn model_supports_embeddings(model: &GatewayModel) -> bool {
@@ -5246,308 +5067,6 @@ fn chat_input_modalities(messages: &[ChatMessage]) -> ChatInputModalities {
         }
     }
     modalities
-}
-
-fn image_count(value: Option<u32>) -> Result<u32, ApiError> {
-    let count = value.unwrap_or(1);
-    if (1..=10).contains(&count) {
-        Ok(count)
-    } else {
-        Err(ApiError::bad_request("n must be 1..=10", Some("n")))
-    }
-}
-
-fn image_size(value: Option<&str>) -> Result<(u32, u32, String), ApiError> {
-    let size = value.unwrap_or("1024x1024");
-    let Some((width, height)) = size.split_once('x') else {
-        return Err(ApiError::bad_request(
-            "size must be WIDTHxHEIGHT",
-            Some("size"),
-        ));
-    };
-    let width = width
-        .parse::<u32>()
-        .map_err(|_| ApiError::bad_request("size width must be an integer", Some("size")))?;
-    let height = height
-        .parse::<u32>()
-        .map_err(|_| ApiError::bad_request("size height must be an integer", Some("size")))?;
-    if width == 0 || height == 0 || width > 4096 || height > 4096 {
-        return Err(ApiError::bad_request(
-            "size dimensions must be 1..=4096",
-            Some("size"),
-        ));
-    }
-    Ok((width, height, format!("{width}x{height}")))
-}
-
-fn image_steps(value: Option<u64>) -> Result<u64, ApiError> {
-    let steps = value.unwrap_or(1);
-    if (1..=500).contains(&steps) {
-        Ok(steps)
-    } else {
-        Err(ApiError::bad_request(
-            "steps must be 1..=500",
-            Some("steps"),
-        ))
-    }
-}
-
-fn image_prompt_text(request: &ImageGenerationRequest, size: &str) -> String {
-    json!({
-        "kind": "image-generation",
-        "prompt": request.prompt,
-        "n": request.n.unwrap_or(1),
-        "size": size,
-        "steps": request.steps.unwrap_or(1),
-        "user": request.user,
-    })
-    .to_string()
-}
-
-fn deterministic_image_bytes(
-    model_id: &str,
-    prompt: &str,
-    index: u32,
-    width: u32,
-    height: u32,
-    steps: u64,
-) -> Vec<u8> {
-    let digest = blake3::hash(
-        format!("mayhem-image-v1:{model_id}:{prompt}:{index}:{width}:{height}:{steps}").as_bytes(),
-    );
-    let mut bytes = b"\x89PNG\r\n\x1a\nMAYHEM-IMAGE-V1\n".to_vec();
-    bytes.extend_from_slice(format!("{width}x{height};steps={steps};").as_bytes());
-    bytes.extend_from_slice(digest.as_bytes());
-    bytes
-}
-
-fn speech_response_format(value: Option<&str>) -> Result<String, ApiError> {
-    let format = value.unwrap_or("mp3");
-    if matches!(format, "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm") {
-        Ok(format.to_owned())
-    } else {
-        Err(ApiError::bad_request(
-            "response_format must be one of mp3, opus, aac, flac, wav, pcm",
-            Some("response_format"),
-        ))
-    }
-}
-
-fn speech_content_type(format: &str) -> &'static str {
-    match format {
-        "wav" => "audio/wav",
-        "opus" => "audio/ogg",
-        "aac" => "audio/aac",
-        "flac" => "audio/flac",
-        "pcm" => "audio/L16",
-        _ => "audio/mpeg",
-    }
-}
-
-fn speech_speed(value: Option<f64>) -> Result<f64, ApiError> {
-    let speed = value.unwrap_or(1.0);
-    if (0.25..=4.0).contains(&speed) {
-        Ok(speed)
-    } else {
-        Err(ApiError::bad_request(
-            "speed must be between 0.25 and 4.0",
-            Some("speed"),
-        ))
-    }
-}
-
-fn speech_audio_seconds(input_characters: u64, speed: f64) -> u64 {
-    let base_seconds = ceil_div_u64(input_characters.max(1), 32);
-    ((base_seconds as f64) / speed).ceil().max(1.0) as u64
-}
-
-fn speech_prompt_text(request: &AudioSpeechRequest) -> String {
-    json!({
-        "kind": "audio-speech",
-        "input": request.input,
-        "voice": request.voice,
-        "response_format": request.response_format,
-        "speed": request.speed,
-    })
-    .to_string()
-}
-
-fn deterministic_audio_bytes(
-    format: &str,
-    model_id: &str,
-    input: &str,
-    voice: &str,
-    audio_seconds: u64,
-) -> Vec<u8> {
-    let digest = blake3::hash(
-        format!("mayhem-audio-v1:{model_id}:{input}:{voice}:{audio_seconds}:{format}").as_bytes(),
-    );
-    if format == "wav" {
-        return deterministic_wav_bytes(digest.as_bytes(), audio_seconds);
-    }
-    let mut bytes = format!("MAYHEM-AUDIO-{format}\nseconds={audio_seconds}\n").into_bytes();
-    bytes.extend_from_slice(digest.as_bytes());
-    bytes
-}
-
-fn deterministic_wav_bytes(seed: &[u8; 32], audio_seconds: u64) -> Vec<u8> {
-    let sample_rate = 8_000_u32;
-    let seconds = audio_seconds.clamp(1, 5) as u32;
-    let samples = sample_rate.saturating_mul(seconds);
-    let data_len = samples.saturating_mul(2);
-    let mut bytes = Vec::with_capacity(44 + data_len as usize);
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36_u32.saturating_add(data_len)).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16_u32.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&sample_rate.to_le_bytes());
-    bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    bytes.extend_from_slice(&2_u16.to_le_bytes());
-    bytes.extend_from_slice(&16_u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data_len.to_le_bytes());
-    for index in 0..samples as usize {
-        let sample = i16::from(seed[index % seed.len()]) - 128;
-        bytes.extend_from_slice(&sample.to_le_bytes());
-    }
-    bytes
-}
-
-fn audio_seconds_for_bytes(bytes: usize) -> u64 {
-    ceil_div_u64(bytes as u64, 16_000).max(1)
-}
-
-fn transcription_prompt_text(request: &AudioTranscriptionRequest) -> String {
-    json!({
-        "kind": "audio-transcription",
-        "filename": request.filename,
-        "bytes": request.audio.len(),
-        "language": request.language,
-        "prompt": request.prompt,
-        "audio_hash": blake3_hex(&request.audio),
-    })
-    .to_string()
-}
-
-fn deterministic_transcription_text(request: &AudioTranscriptionRequest) -> String {
-    let hint = request
-        .prompt
-        .as_deref()
-        .filter(|prompt| !prompt.trim().is_empty())
-        .unwrap_or("audio");
-    format!(
-        "Mayhem transcription for {hint} ({})",
-        blake3_hex(&request.audio)[..12].to_owned()
-    )
-}
-
-fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
-    if value == 0 || divisor == 0 {
-        0
-    } else {
-        value.div_ceil(divisor)
-    }
-}
-
-fn embedding_dimensions(requested: Option<usize>) -> Result<usize, ApiError> {
-    let dimensions = requested.unwrap_or(32);
-    if (1..=3072).contains(&dimensions) {
-        Ok(dimensions)
-    } else {
-        Err(ApiError::bad_request(
-            "dimensions must be between 1 and 3072",
-            Some("dimensions"),
-        ))
-    }
-}
-
-fn embedding_inputs(value: &Value) -> Result<Vec<String>, ApiError> {
-    match value {
-        Value::String(text) => Ok(vec![text.clone()]),
-        Value::Array(items) if items.is_empty() => Err(ApiError::bad_request(
-            "input must contain at least one item",
-            Some("input"),
-        )),
-        Value::Array(items) if items.iter().all(Value::is_string) => Ok(items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect()),
-        Value::Array(items) if items.iter().all(embedding_token_value) => {
-            Ok(vec![embedding_token_array_to_text(items)?])
-        }
-        Value::Array(items) if items.iter().all(Value::is_array) => items
-            .iter()
-            .map(|item| {
-                let tokens = item.as_array().ok_or_else(|| {
-                    ApiError::bad_request("input token arrays must be arrays", Some("input"))
-                })?;
-                embedding_token_array_to_text(tokens)
-            })
-            .collect(),
-        _ => Err(ApiError::bad_request(
-            "input must be a string, an array of strings, token IDs, or token ID arrays",
-            Some("input"),
-        )),
-    }
-}
-
-fn embedding_token_value(value: &Value) -> bool {
-    value.as_i64().is_some() || value.as_u64().is_some()
-}
-
-fn embedding_token_array_to_text(tokens: &[Value]) -> Result<String, ApiError> {
-    if tokens.is_empty() {
-        return Err(ApiError::bad_request(
-            "token input arrays must not be empty",
-            Some("input"),
-        ));
-    }
-    let mut parts = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        if let Some(token) = token.as_i64() {
-            parts.push(token.to_string());
-        } else if let Some(token) = token.as_u64() {
-            parts.push(token.to_string());
-        } else {
-            return Err(ApiError::bad_request(
-                "token input arrays must contain only integers",
-                Some("input"),
-            ));
-        }
-    }
-    Ok(parts.join(" "))
-}
-
-fn embedding_prompt_tokens(inputs: &[String]) -> u64 {
-    inputs.iter().map(|input| rough_tokens(input).max(1)).sum()
-}
-
-fn deterministic_embedding_vector(model_id: &str, input: &str, dimensions: usize) -> Vec<f32> {
-    let mut values = (0..dimensions)
-        .map(|index| {
-            let digest =
-                blake3::hash(format!("mayhem-embedding-v1:{model_id}:{input}:{index}").as_bytes());
-            let bytes: [u8; 4] = digest.as_bytes()[..4]
-                .try_into()
-                .expect("blake3 digest has at least four bytes");
-            let raw = u32::from_le_bytes(bytes);
-            (((f64::from(raw) / f64::from(u32::MAX)) * 2.0) - 1.0) as f32
-        })
-        .collect::<Vec<_>>();
-    let norm = values
-        .iter()
-        .map(|value| f64::from(*value) * f64::from(*value))
-        .sum::<f64>()
-        .sqrt();
-    if norm > 0.0 {
-        for value in &mut values {
-            *value = (f64::from(*value) / norm) as f32;
-        }
-    }
-    values
 }
 
 pub fn embedding_cosine_similarity_bps(expected: &[f32], observed: &[f32]) -> Option<u32> {
@@ -6077,88 +5596,6 @@ impl GatewayState {
             user_sig: receipt_ack.user_sig,
         })
     }
-
-    fn meter_session(
-        &self,
-        model: &GatewayModel,
-        prompt_text: &str,
-        usage: ReceiptUsage,
-    ) -> Result<StoredReceipt, ApiError> {
-        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
-        let max_spend_mu = mu_owed_cum.max(1_000);
-        if max_spend_mu > self.receipt_config.balance_mu {
-            return Err(ApiError::payment_required(
-                "insufficient local balance for spend voucher",
-                Some("model"),
-            ));
-        }
-
-        let session_id = session_id_for(&model.id, prompt_text);
-        let enclave_id = enclave_id_for_model(&model.id);
-        let voucher_body = SpendVoucherBody {
-            session_id: session_id.clone(),
-            rail: self.receipt_config.rail.clone(),
-            enclave_id: enclave_id.clone(),
-            price_ver: model.mayhem.price_ref_mu.ver,
-            max_spend_mu,
-            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
-        };
-        let voucher_payload =
-            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
-        let voucher = SpendVoucher {
-            body: voucher_body,
-            user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
-        };
-
-        if !self.receipt_config.cosign_enabled {
-            self.pause_session(PausedSession {
-                session_id,
-                reason: "receipt co-signing refused; session paused".to_owned(),
-            });
-            return Err(ApiError::conflict(
-                "receipt co-signing refused; session paused",
-                None,
-            ));
-        }
-
-        let body = ReceiptBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
-            session_id: session_id.clone(),
-            seq: 1,
-            final_receipt: true,
-            rail: self.receipt_config.rail.clone(),
-            user: verifying_key_hex(&self.receipt_config.user_seed),
-            provider: verifying_key_hex(&self.receipt_config.provider_seed),
-            enclave_id,
-            model_id: model.id.clone(),
-            price_ver: model.mayhem.price_ref_mu.ver,
-            rules_ver: self.receipt_config.rules_ver,
-            usage,
-            mu_owed_cum,
-            prompt_hash: blake3_hex(prompt_text.as_bytes()),
-            ts: now_millis_u64(),
-        };
-        let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
-        let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
-        let receipt = SessionReceipt {
-            body,
-            enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
-            user_sig: user_sig.clone(),
-        };
-        let receipt_ack = ReceiptAck {
-            session_id: receipt.body.session_id.clone(),
-            seq: receipt.body.seq,
-            user_sig,
-        };
-        let stored = StoredReceipt {
-            rail: self.receipt_config.rail.clone(),
-            voucher,
-            receipt,
-            receipt_ack,
-        };
-        self.record_receipt(stored.clone());
-        Ok(stored)
-    }
 }
 
 fn frame_contract_version(frame: &Value) -> Option<u32> {
@@ -6387,7 +5824,7 @@ fn hedge_invocation_for_model(
     }
 }
 
-fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> ChatOutput {
+fn dev_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> ChatOutput {
     let prompt_text = request
         .messages
         .iter()
@@ -6405,7 +5842,7 @@ fn deterministic_chat_output(model: &GatewayModel, request: &ChatCompletionReque
     } else if let Some(name) = requested_tool_name(request) {
         let tool_call = ToolCallOutput {
             id: make_id("call"),
-            arguments: deterministic_tool_arguments(&name),
+            arguments: dev_tool_arguments(&name),
             name,
         };
         ChatOutput {
@@ -6999,7 +6436,7 @@ fn requested_tool_name(request: &ChatCompletionRequest) -> Option<String> {
     })
 }
 
-fn deterministic_tool_arguments(name: &str) -> String {
+fn dev_tool_arguments(name: &str) -> String {
     match name {
         "bash" => json!({ "command": "printf mayhem-opencode-tool-ok" }).to_string(),
         "write" => {
@@ -7240,14 +6677,6 @@ impl ApiError {
             param: None,
         }
     }
-
-    fn internal_message(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-            param: None,
-        }
-    }
 }
 
 impl IntoResponse for ApiError {
@@ -7480,10 +6909,9 @@ mod tests {
 
     #[test]
     fn embedding_canary_matches_exact_vector_and_cosine_tolerance() {
-        let expected = deterministic_embedding_vector("admin/embed-fixture", "fixed canary", 16);
-        let same = deterministic_embedding_vector("admin/embed-fixture", "fixed canary", 16);
-        let different =
-            deterministic_embedding_vector("admin/embed-fixture", "different canary", 16);
+        let expected = test_embedding_vector("admin/embed-fixture", "fixed canary", 16);
+        let same = test_embedding_vector("admin/embed-fixture", "fixed canary", 16);
+        let different = test_embedding_vector("admin/embed-fixture", "different canary", 16);
 
         assert_eq!(expected, same);
         assert_eq!(
@@ -7493,6 +6921,32 @@ mod tests {
         assert!(embedding_canary_matches(&expected, &same, 0));
         assert!(!embedding_canary_matches(&expected, &different, 1));
         assert_eq!(embedding_cosine_similarity_bps(&expected, &[]), None);
+    }
+
+    fn test_embedding_vector(model_id: &str, input: &str, dimensions: usize) -> Vec<f32> {
+        let mut values = (0..dimensions)
+            .map(|index| {
+                let digest = blake3::hash(
+                    format!("mayhem-embedding-test:{model_id}:{input}:{index}").as_bytes(),
+                );
+                let bytes: [u8; 4] = digest.as_bytes()[..4]
+                    .try_into()
+                    .expect("blake3 digest has at least four bytes");
+                let raw = u32::from_le_bytes(bytes);
+                (((f64::from(raw) / f64::from(u32::MAX)) * 2.0) - 1.0) as f32
+            })
+            .collect::<Vec<_>>();
+        let norm = values
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        if norm > 0.0 {
+            for value in &mut values {
+                *value = (f64::from(*value) / norm) as f32;
+            }
+        }
+        values
     }
 
     #[test]
