@@ -2484,7 +2484,7 @@ fn contract_snapshot_for_route(
         rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
         ref_rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
         probation: None,
-        caps: heartbeat_caps_from_model(&model.mayhem.caps),
+        caps: heartbeat_caps_for_route(model, candidate),
         attestation_head: Some(candidate.binary_hash.clone()),
     }
 }
@@ -2513,7 +2513,7 @@ fn heartbeat_for_route(
             ttft_ms: 150,
         },
         price_ver: candidate.price_ver,
-        caps: heartbeat_caps_from_model(&model.mayhem.caps),
+        caps: heartbeat_caps_for_route(model, candidate),
         att: HeartbeatAttestation {
             epoch: 0,
             head: candidate.binary_hash.clone(),
@@ -2536,6 +2536,37 @@ fn heartbeat_caps_from_model(caps: &ModelCaps) -> HeartbeatCaps {
         json: caps.json,
         ctx: caps.ctx,
         vision: caps.vision,
+    }
+}
+
+fn heartbeat_caps_for_route(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+) -> HeartbeatCaps {
+    let fallback = heartbeat_caps_from_model(&model.mayhem.caps);
+    HeartbeatCaps {
+        tools: candidate
+            .caps
+            .get("tools")
+            .and_then(Value::as_bool)
+            .unwrap_or(fallback.tools),
+        json: candidate
+            .caps
+            .get("json")
+            .and_then(Value::as_bool)
+            .unwrap_or(fallback.json),
+        ctx: candidate
+            .caps
+            .get("ctx")
+            .or_else(|| candidate.caps.get("ctx_max"))
+            .and_then(Value::as_u64)
+            .and_then(|ctx| u32::try_from(ctx).ok())
+            .unwrap_or(fallback.ctx),
+        vision: candidate
+            .caps
+            .get("vision")
+            .and_then(Value::as_bool)
+            .unwrap_or(fallback.vision),
     }
 }
 
@@ -4503,7 +4534,7 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
             .into_iter()
             .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
             .collect::<Vec<_>>();
-    if eligible_routes.len() <= 1 {
+    if eligible_routes.is_empty() {
         return eligible_routes;
     }
 
@@ -4534,6 +4565,16 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
             .into_iter()
             .map(|candidate| candidate.entry.key)
             .collect::<BTreeSet<_>>();
+    let eligible_routes = eligible_routes
+        .into_iter()
+        .filter(|candidate| {
+            let key = route_key(candidate);
+            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
+        })
+        .collect::<Vec<_>>();
+    if eligible_routes.len() <= 1 {
+        return eligible_routes;
+    }
     let mut rng = LcgBalancerRng::seeded(seed);
     let mut ordered = Vec::new();
     let mut selected_keys = BTreeSet::new();
@@ -7534,6 +7575,50 @@ mod tests {
         assert!(readmitted_order
             .iter()
             .any(|candidate| candidate.provider == cooled_provider));
+    }
+
+    #[test]
+    fn route_selection_honors_route_tool_caps_even_for_single_provider() {
+        let mut model = test_routed_model(1);
+        model.mayhem.route_candidates[0].caps = json!({
+            "tools": false,
+            "json": true,
+            "ctx": 8192,
+            "vision": false,
+        });
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let mut request = test_chat_request(&model.id);
+        request.tools = Some(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": { "type": "object" },
+            },
+        })]);
+
+        let selected =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert!(selected.is_empty());
+
+        let mut model = test_routed_model(2);
+        let dropped_provider = model.mayhem.route_candidates[0].provider.clone();
+        model.mayhem.route_candidates[0].caps = json!({
+            "tools": false,
+            "json": true,
+            "ctx": 8192,
+            "vision": false,
+        });
+        model.mayhem.route_candidates[1].caps = json!({
+            "tools": true,
+            "json": true,
+            "ctx": 8192,
+            "vision": false,
+        });
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let selected =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert_eq!(selected.len(), 1);
+        assert_ne!(selected[0].provider, dropped_provider);
     }
 
     #[test]

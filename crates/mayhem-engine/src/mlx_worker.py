@@ -91,7 +91,9 @@ def handle_generate(request_id, payload):
 
     grammar = payload.get("grammar")
     if grammar is not None:
-        return handle_grammar_generate(request_id, grammar, prompt_tokens, max_tokens)
+        raise ValueError(
+            "MLX backend does not support grammar-constrained tool calls; advertise caps.tools=false"
+        )
 
     import mlx.core as mx
     from mlx_lm import stream_generate
@@ -152,48 +154,6 @@ def handle_generate(request_id, payload):
             "total_tokens": len(prompt_tokens) + completion_tokens,
         },
         "finish_reason": normalize_finish_reason(finish_reason),
-    }
-
-
-def handle_grammar_generate(request_id, grammar, prompt_tokens, max_tokens):
-    if grammar.get("kind") != "tool_call":
-        raise ValueError("MLX backend currently supports tool_call grammar constraints")
-    tools = grammar.get("tools") or []
-    if not tools:
-        raise ValueError("tool-call grammar requires at least one tool")
-    name = str(tools[0].get("name", ""))
-    if not name:
-        raise ValueError("tool names cannot be empty")
-
-    text = json.dumps({"tool": name, "arguments": {}}, separators=(",", ":"))
-    tokens = encode_text(text)
-    finish_reason = "stop"
-    if len(tokens) > max_tokens:
-        tokens = tokens[:max_tokens]
-        text = decode_tokens(tokens)
-        finish_reason = "length"
-
-    for index, token in enumerate(tokens):
-        send(
-            {
-                "id": request_id,
-                "type": "token",
-                "chunk": {
-                    "index": index,
-                    "token_id": int(token),
-                    "text": decode_tokens([token]),
-                },
-            }
-        )
-
-    return {
-        "text": text,
-        "usage": {
-            "prompt_tokens": len(prompt_tokens),
-            "completion_tokens": len(tokens),
-            "total_tokens": len(prompt_tokens) + len(tokens),
-        },
-        "finish_reason": finish_reason,
     }
 
 

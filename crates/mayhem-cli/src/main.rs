@@ -10003,12 +10003,13 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
     let model_class = validate_admin_enclave_catalog_binding(args)?;
-    let caps = json_arg_or_file_object(
+    let mut caps = json_arg_or_file_object(
         args.caps_json.as_deref(),
         args.caps_file.as_ref(),
         None,
         "enclave caps",
     )?;
+    enforce_backend_caps(&args.backend, &mut caps)?;
     let mut payload = json!({
         "op": "register_enclave",
         "enclave_id": &args.enclave_id,
@@ -10032,6 +10033,24 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         payload["source_sha256"] = json!(source_sha256.to_ascii_lowercase());
     }
     Ok(payload)
+}
+
+fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
+    if !backend_supports_tool_calls(backend) {
+        if caps.get("tools").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "backend {backend} cannot advertise caps.tools=true; register this enclave with caps.tools=false until real constrained decoding is wired"
+            );
+        }
+        caps.as_object_mut()
+            .context("enclave caps must be a JSON object")?
+            .insert("tools".to_owned(), json!(false));
+    }
+    Ok(())
+}
+
+fn backend_supports_tool_calls(backend: &str) -> bool {
+    !matches!(backend, "mlx" | "trt-llm")
 }
 
 fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Result<String> {
@@ -21187,6 +21206,7 @@ async fn send_provider_heartbeat_round(
     join_rooms: bool,
 ) -> Result<Vec<Value>> {
     let mut sent = Vec::new();
+    let caps = provider_heartbeat_caps(ctx.selected);
     for room in ctx.rooms {
         if join_rooms {
             bridge
@@ -21223,10 +21243,10 @@ async fn send_provider_heartbeat_round(
                 .map(|price| price.ver)
                 .unwrap_or(0),
             "caps": {
-                "tools": ctx.selected.model.caps.tools,
-                "json": ctx.selected.model.caps.json,
-                "ctx": ctx.selected.model.caps.ctx_max,
-                "vision": ctx.selected.model.caps.vision,
+                "tools": caps.tools,
+                "json": caps.json,
+                "ctx": caps.ctx,
+                "vision": caps.vision,
             },
             "att": {
                 "epoch": ctx.attestation.report.boot_epoch,
@@ -21250,6 +21270,17 @@ async fn send_provider_heartbeat_round(
         }));
     }
     Ok(sent)
+}
+
+fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
+    let mut caps = gateway_caps_from_contract(&selected.enclave.caps);
+    if caps.ctx == 0 {
+        caps.ctx = u32::try_from(selected.model.caps.ctx_max).unwrap_or(u32::MAX);
+    }
+    if !backend_supports_tool_calls(&selected.enclave.backend) {
+        caps.tools = false;
+    }
+    caps
 }
 
 async fn serve_provider_sessions(
@@ -25461,6 +25492,22 @@ mod tests {
     }
 
     #[test]
+    fn admin_register_enclave_rejects_tool_caps_for_non_tool_backends() {
+        let mut caps = json!({ "tools": true, "json": true, "ctx": 8192 });
+        let err = enforce_backend_caps("mlx", &mut caps)
+            .expect_err("MLX must not advertise fake tool calls");
+        assert!(err.to_string().contains("caps.tools=true"), "{err:#}");
+
+        let mut caps = json!({ "json": true, "ctx": 8192 });
+        enforce_backend_caps("trt-llm", &mut caps).unwrap();
+        assert_eq!(caps["tools"], json!(false));
+
+        let mut caps = json!({ "tools": true, "json": true, "ctx": 8192 });
+        enforce_backend_caps("llama.cpp", &mut caps).unwrap();
+        assert_eq!(caps["tools"], json!(true));
+    }
+
+    #[test]
     fn admin_auditor_register_payload_accredits_auditor_key() {
         let (tx_type, payload) =
             admin_command_payload(&AdminCommands::AuditorRegister(AdminAuditorRegisterArgs {
@@ -27874,6 +27921,37 @@ mod tests {
     }
 
     #[test]
+    fn provider_heartbeat_caps_deadvertise_unsupported_tool_backends() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let verdict = test_hardware(FixtureProfile::CpuOnly)
+            .backend_verdicts
+            .into_iter()
+            .find(|verdict| verdict.backend == "llama.cpp")
+            .unwrap();
+        let artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        let mut selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "gguf-q4_k_m".to_owned(),
+            artifact,
+            verdict,
+            price: contract.prices.first().cloned(),
+        };
+        selected.enclave.caps = json!({ "tools": true, "json": true, "ctx": 4096 });
+
+        selected.enclave.backend = "llama.cpp".to_owned();
+        assert!(provider_heartbeat_caps(&selected).tools);
+
+        selected.enclave.backend = "mlx".to_owned();
+        assert!(!provider_heartbeat_caps(&selected).tools);
+
+        selected.enclave.backend = "trt-llm".to_owned();
+        assert!(!provider_heartbeat_caps(&selected).tools);
+    }
+
+    #[test]
     fn provider_candidates_skip_tp2_enclave_without_two_capable_gpus() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -27966,7 +28044,7 @@ mod tests {
             .await
             .expect_err("wrong local artifact root must be rejected");
         assert!(
-            format!("{err:#}").contains("artifact merkle root mismatch"),
+            format!("{err:#}").contains("local artifact root mismatch"),
             "{err:#}"
         );
 

@@ -68,23 +68,20 @@ fn mlx_dev_model_smoke_generates_constrains_and_canaries() -> TestResult {
     assert!(!output.text.trim().is_empty(), "model returned empty text");
     assert_usage(&output);
 
-    let constrained = backend.generate(
-        GenerateRequest::new("Return the lookup tool call.")
-            .with_max_new_tokens(96)
-            .with_grammar(GrammarSpec::ToolCall {
-                tools: vec![ToolSpec::new("lookup", json!({"type": "object"}))],
-            }),
-        &mut |_chunk| Ok(()),
-    )?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(constrained.text.trim()).unwrap_or_else(|err| {
-            panic!(
-                "constrained tool-call output was not JSON: {err}; output={:?}",
-                constrained.text
-            )
-        });
-    assert_eq!(parsed["tool"], json!("lookup"));
-    assert!(parsed["arguments"].is_object());
+    let err = backend
+        .generate(
+            GenerateRequest::new("Return the lookup tool call.")
+                .with_max_new_tokens(96)
+                .with_grammar(GrammarSpec::ToolCall {
+                    tools: vec![ToolSpec::new("lookup", json!({"type": "object"}))],
+                }),
+            &mut |_chunk| Ok(()),
+        )
+        .expect_err("MLX must not fake grammar-constrained tool calls");
+    assert!(
+        format!("{err}").contains("does not support grammar-constrained tool calls"),
+        "{err}"
+    );
 
     let mut canary_chunks = Vec::new();
     let canary = backend.generate(
