@@ -30,8 +30,8 @@ const DISPUTE_DEPOSIT_MU = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 1;
-export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 2;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 2;
+export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 3;
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const PARAM_DEFINITIONS = Object.freeze({
@@ -109,7 +109,7 @@ const RATE_MAP_MAX_ENTRIES = 16;
 const MODEL_CLASS_RATE_UNITS = Object.freeze({
   [DEFAULT_MODEL_CLASS]: new Set(['input_token', 'output_token']),
   embedding: new Set(['input_token', 'embedding']),
-  'image-generation': new Set(['image']),
+  'image-generation': new Set(['image', 'step']),
   'video-generation': new Set(['video_second', 'frame']),
   tts: new Set(['input_character', 'audio_second']),
   stt: new Set(['audio_second']),
@@ -4603,6 +4603,55 @@ class MayhemContract extends Contract {
     return totals;
   }
 
+  canonicalUsageUnit(unit) {
+    switch (unit) {
+      case 'in':
+      case 'in_tokens':
+      case 'input':
+      case 'input_tokens':
+      case 'prompt_tokens':
+      case 'input_token':
+        return 'input_token';
+      case 'out':
+      case 'out_tokens':
+      case 'output':
+      case 'output_tokens':
+      case 'completion_tokens':
+      case 'output_token':
+        return 'output_token';
+      case 'images':
+      case 'image':
+        return 'image';
+      case 'steps':
+      case 'step':
+        return 'step';
+      default:
+        return unit;
+    }
+  }
+
+  normalizeReceiptUsage(usageSource) {
+    if (!usageSource || typeof usageSource !== 'object' || Array.isArray(usageSource)) {
+      return new Error('Fraud proof receipt usage must be an object.');
+    }
+    const usage = {};
+    for (const [rawUnit, count] of Object.entries(usageSource)) {
+      if (typeof rawUnit !== 'string' || rawUnit.length === 0 || rawUnit.length > 64) {
+        return new Error('Invalid receipt usage unit.');
+      }
+      if (!Number.isSafeInteger(count) || count < 0) {
+        return new Error('Invalid receipt usage count.');
+      }
+      if (count === 0) continue;
+      const unit = this.canonicalUsageUnit(rawUnit);
+      if (!this.isSafeKeyPart(unit)) return new Error('Invalid receipt usage unit.');
+      const next = this.safeAddMu(usage[unit] ?? 0, count);
+      if (next instanceof Error) return next;
+      usage[unit] = next;
+    }
+    return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
+  }
+
   normalizeReceiptEnvelope(value, options = {}) {
     const targetSchemaVersion = options.targetSchemaVersion ?? SESSION_RECEIPT_SCHEMA_VERSION;
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -4616,11 +4665,6 @@ class MayhemContract extends Contract {
     if (!bodySource || typeof bodySource !== 'object' || Array.isArray(bodySource)) {
       return new Error('Fraud proof receipt body must be an object.');
     }
-    const usageSource = bodySource.usage;
-    if (!usageSource || typeof usageSource !== 'object' || Array.isArray(usageSource)) {
-      return new Error('Fraud proof receipt usage must be an object.');
-    }
-
     const finalReceipt = hasOwn(bodySource, 'final')
       ? bodySource.final
       : bodySource.final_receipt;
@@ -4635,10 +4679,7 @@ class MayhemContract extends Contract {
       model_id: bodySource.model_id,
       price_ver: bodySource.price_ver,
       rules_ver: bodySource.rules_ver,
-      usage: {
-        in: hasOwn(usageSource, 'in') ? usageSource.in : usageSource.in_tokens,
-        out: hasOwn(usageSource, 'out') ? usageSource.out : usageSource.out_tokens,
-      },
+      usage: cloneValue(bodySource.usage),
       mu_owed_cum: bodySource.mu_owed_cum,
       prompt_hash: bodySource.prompt_hash,
       ts: bodySource.ts,
@@ -4682,9 +4723,14 @@ class MayhemContract extends Contract {
     }
 
     const migrated = cloneValue(body);
+    const usage = this.normalizeReceiptUsage(migrated.usage);
+    if (usage instanceof Error) return usage;
+    migrated.usage = usage;
     while (migrated.schema_version < targetSchemaVersion) {
       if (migrated.schema_version === 1) {
         migrated.schema_version = 2;
+      } else if (migrated.schema_version === 2) {
+        migrated.schema_version = 3;
       } else {
         return new Error(
           `Unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}.`
@@ -4713,11 +4759,10 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
       return new Error('Invalid receipt rules version.');
     }
-    if (!Number.isSafeInteger(body.usage.in) || body.usage.in < 0) {
-      return new Error('Invalid receipt input usage.');
-    }
-    if (!Number.isSafeInteger(body.usage.out) || body.usage.out < 0) {
-      return new Error('Invalid receipt output usage.');
+    const usage = this.normalizeReceiptUsage(body.usage);
+    if (usage instanceof Error) return usage;
+    if (stableJson(usage) !== stableJson(body.usage)) {
+      return new Error('Receipt usage must be canonical.');
     }
     if (!Number.isSafeInteger(body.mu_owed_cum) || body.mu_owed_cum < 0) {
       return new Error('Invalid receipt cumulative amount.');
@@ -4744,15 +4789,11 @@ class MayhemContract extends Contract {
   }
 
   receiptLeafEnvelope(envelope) {
-    const leaf = {
+    return {
       body: cloneValue(envelope.body),
       enclave_sig: envelope.enclave_sig,
       user_sig: envelope.user_sig,
     };
-    if (envelope.signed_body && stableJson(envelope.signed_body) !== stableJson(envelope.body)) {
-      leaf.signed_body = cloneValue(envelope.signed_body);
-    }
-    return leaf;
   }
 
   async usageLeafHash(envelope) {

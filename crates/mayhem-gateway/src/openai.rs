@@ -18,10 +18,7 @@ use crate::{
         x_mayhem_hedge_requested, FailoverPolicy, SessionFailoverState, SessionPriceMu,
         DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
     },
-    pricing::{
-        normalize_rate_map, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
-        RateMapEntry, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
-    },
+    pricing::{normalize_rate_map, text_generation_rate_map, text_usage_mu, RateMapEntry},
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord, ProviderKey,
     ReputationEventKind,
 };
@@ -1737,10 +1734,7 @@ fn expected_provider_receipt<'a>(
     output: &ChatOutput,
     provider: &'a str,
 ) -> ExpectedProviderReceipt<'a> {
-    let usage = ReceiptUsage {
-        in_tokens: output.usage.prompt_tokens,
-        out_tokens: output.usage.completion_tokens,
-    };
+    let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
     ExpectedProviderReceipt {
         provider,
         mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
@@ -1856,10 +1850,12 @@ fn usage_from_session_delta(frame: &Value) -> Option<Usage> {
     let usage = frame.get("usage")?;
     let prompt_tokens = usage
         .get("in")
+        .or_else(|| usage.get("input_token"))
         .or_else(|| usage.get("prompt_tokens"))
         .and_then(Value::as_u64)?;
     let completion_tokens = usage
         .get("out")
+        .or_else(|| usage.get("output_token"))
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_u64)?;
     Some(Usage {
@@ -2028,10 +2024,7 @@ fn build_completion(
         .take(max_tokens as usize * 8)
         .collect::<String>();
     let usage = usage_for(&prompt, &text);
-    let receipt_usage = ReceiptUsage {
-        in_tokens: usage.prompt_tokens,
-        out_tokens: usage.completion_tokens,
-    };
+    let receipt_usage = ReceiptUsage::text(usage.prompt_tokens, usage.completion_tokens);
     let receipt = state.meter_session(&model, &prompt, receipt_usage)?;
     let chunk = json!({
         "id": id,
@@ -2385,10 +2378,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let prompt_text = chat_prompt_text(request);
-        let usage = ReceiptUsage {
-            in_tokens: output.usage.prompt_tokens,
-            out_tokens: output.usage.completion_tokens,
-        };
+        let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
         let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
         if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
             return Err(ApiError::payment_required(
@@ -2762,14 +2752,7 @@ fn hedge_invocation_for_model(
     let failover_state = SessionFailoverState::new(
         FailoverPolicy::default(),
         SessionPriceMu {
-            in_per_1k_mu: text_rate_per_1k_mu(
-                &model.mayhem.price_ref_mu.rate_map,
-                INPUT_TOKEN_UNIT,
-            ),
-            out_per_1k_mu: text_rate_per_1k_mu(
-                &model.mayhem.price_ref_mu.rate_map,
-                OUTPUT_TOKEN_UNIT,
-            ),
+            rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
         },
         0,
         0,
@@ -3365,10 +3348,10 @@ fn estimate_max_spend_mu(
     request: &ChatCompletionRequest,
     prompt_text: &str,
 ) -> u64 {
-    let usage = ReceiptUsage {
-        in_tokens: rough_tokens(prompt_text),
-        out_tokens: u64::from(request.max_tokens.unwrap_or(1024).max(1)),
-    };
+    let usage = ReceiptUsage::text(
+        rough_tokens(prompt_text),
+        u64::from(request.max_tokens.unwrap_or(1024).max(1)),
+    );
     calculate_mu_owed(&model.mayhem.price_ref_mu, &usage).max(1_000)
 }
 
@@ -3755,10 +3738,7 @@ mod tests {
         output: &ChatOutput,
         invocation: &GatewaySessionInvocation,
     ) -> ProviderSignedReceipt {
-        let usage = ReceiptUsage {
-            in_tokens: output.usage.prompt_tokens,
-            out_tokens: output.usage.completion_tokens,
-        };
+        let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
         let body = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: invocation.session_id.clone(),

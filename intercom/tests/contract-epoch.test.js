@@ -104,6 +104,51 @@ const receiptBundle = (user, provider, overrides = {}) => ({
   ...overrides,
 });
 
+test('epoch recompute canonicalizes metered usage maps', async () => {
+  const { provider, user } = await setupEpochContract();
+  const legacyText = receiptBundle(user, provider);
+  const canonicalText = receiptBundle(user, provider, {
+    receipts: [
+      {
+        ...legacyText.receipts[0],
+        schema_version: 2,
+        usage: { input_token: 100, output_token: 250 },
+      },
+    ],
+  });
+
+  assert.deepEqual((await recomputeEpoch(canonicalText)).roots, (await recomputeEpoch(legacyText)).roots);
+
+  const imageAliasBundle = receiptBundle(user, provider, {
+    receipts: [
+      {
+        ...legacyText.receipts[0],
+        schema_version: 2,
+        model_id: 'admin/image-small@fp16',
+        usage: { images: 2, steps: 60 },
+        mu_owed_cum: 1_120,
+      },
+    ],
+  });
+  const imageCanonicalBundle = receiptBundle(user, provider, {
+    receipts: [
+      {
+        ...legacyText.receipts[0],
+        schema_version: 2,
+        model_id: 'admin/image-small@fp16',
+        usage: { image: 2, step: 60 },
+        mu_owed_cum: 1_120,
+      },
+    ],
+  });
+  const imageAliasRoll = await recomputeEpoch(imageAliasBundle);
+  const imageCanonicalRoll = await recomputeEpoch(imageCanonicalBundle);
+
+  assert.deepEqual(imageAliasRoll.roots, imageCanonicalRoll.roots);
+  assert.equal(imageAliasRoll.totals.use_count, 1);
+  assert.equal(imageAliasRoll.totals.use_mu, 1_120);
+});
+
 const signedReceipt = (user, provider, enclave, overrides = {}) => {
   const body = {
     schema_version: 1,

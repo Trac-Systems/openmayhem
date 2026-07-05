@@ -467,7 +467,7 @@ async fn chat_completion_can_use_direct_session_backend() {
         .expect("assistant content")
         .contains("direct session response"));
     assert_eq!(state.receipts().len(), 1);
-    assert_eq!(state.receipts()[0].receipt.body.usage.out_tokens, 4);
+    assert_eq!(state.receipts()[0].receipt.body.usage.output_tokens(), 4);
     assert_eq!(state.receipts()[0].receipt.body.provider, "55".repeat(32));
     assert_eq!(
         state.receipts()[0].receipt.body.enclave_id,
@@ -1032,7 +1032,7 @@ async fn streaming_chat_persists_dual_signed_receipt() {
     assert_eq!(stored.receipt_ack.seq, stored.receipt.body.seq);
     assert_eq!(stored.receipt_ack.user_sig, stored.receipt.user_sig);
     assert!(stored.receipt.body.mu_owed_cum > 0);
-    assert!(stored.receipt.body.usage.out_tokens > 0);
+    assert!(stored.receipt.body.usage.output_tokens() > 0);
     assert_eq!(stored.receipt.body.prompt_hash.len(), 64);
     assert!(is_hex(&stored.receipt.body.prompt_hash));
     assert_eq!(stored.voucher.user_sig.len(), 128);

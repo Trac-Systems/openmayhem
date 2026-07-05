@@ -16935,7 +16935,7 @@ async fn send_provider_session_output(
                     "d": "",
                     "tool": tool,
                     "fin": output.finish_reason,
-                    "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
+                    "usage": { "input_token": output.prompt_tokens, "output_token": output.completion_tokens },
                     "token_ids": &output.token_ids,
                 }),
             )
@@ -16981,7 +16981,7 @@ async fn send_provider_session_output(
                     "d": "",
                     "tool": null,
                     "fin": output.finish_reason,
-                    "usage": { "in": output.prompt_tokens, "out": output.completion_tokens },
+                    "usage": { "input_token": output.prompt_tokens, "output_token": output.completion_tokens },
                     "token_ids": &output.token_ids,
                 }),
             )
@@ -17190,10 +17190,7 @@ fn provider_session_receipt(
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
-    let usage = ReceiptUsage {
-        in_tokens: output.prompt_tokens,
-        out_tokens: output.completion_tokens,
-    };
+    let usage = ReceiptUsage::text(output.prompt_tokens, output.completion_tokens);
     let receipt_body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: active.session_id.clone(),
@@ -20587,8 +20584,8 @@ mod tests {
         assert_eq!(receipt.body.model_id, terms.model_id);
         assert_eq!(receipt.body.price_ver, terms.price_ver);
         assert_eq!(receipt.body.rules_ver, terms.rules_ver);
-        assert_eq!(receipt.body.usage.in_tokens, 3);
-        assert_eq!(receipt.body.usage.out_tokens, 4);
+        assert_eq!(receipt.body.usage.input_tokens(), 3);
+        assert_eq!(receipt.body.usage.output_tokens(), 4);
         assert_eq!(receipt.body.mu_owed_cum, 1);
         assert_eq!(
             receipt.body.prompt_hash,

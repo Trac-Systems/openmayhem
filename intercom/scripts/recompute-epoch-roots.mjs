@@ -53,6 +53,78 @@ function addAmount(map, key, amount, label) {
   map.set(key, next);
 }
 
+function canonicalUsageUnit(unit) {
+  switch (unit) {
+    case 'in':
+    case 'in_tokens':
+    case 'input':
+    case 'input_tokens':
+    case 'prompt_tokens':
+    case 'input_token':
+      return 'input_token';
+    case 'out':
+    case 'out_tokens':
+    case 'output':
+    case 'output_tokens':
+    case 'completion_tokens':
+    case 'output_token':
+      return 'output_token';
+    case 'images':
+    case 'image':
+      return 'image';
+    case 'steps':
+    case 'step':
+      return 'step';
+    default:
+      return unit;
+  }
+}
+
+function normalizeReceiptUsage(usageSource) {
+  if (!usageSource || typeof usageSource !== 'object' || Array.isArray(usageSource)) {
+    throw new Error('receipt usage must be an object');
+  }
+  const usage = {};
+  for (const [rawUnit, count] of Object.entries(usageSource)) {
+    if (typeof rawUnit !== 'string' || rawUnit.length === 0 || rawUnit.length > 64) {
+      throw new Error('receipt usage unit is invalid');
+    }
+    const unit = canonicalUsageUnit(rawUnit);
+    if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(unit)) {
+      throw new Error('receipt usage unit is invalid');
+    }
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error('receipt usage count must be a non-negative safe integer');
+    }
+    if (count === 0) continue;
+    const next = (usage[unit] ?? 0) + count;
+    safeAmount(next, 'receipt usage count', { allowZero: true });
+    usage[unit] = next;
+  }
+  return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function migrateReceiptBody(body, targetSchemaVersion = 2) {
+  if (!Number.isSafeInteger(body.schema_version) || body.schema_version < 1) {
+    throw new Error('receipt schema_version is unsupported');
+  }
+  if (body.schema_version > targetSchemaVersion) {
+    throw new Error(`unsupported receipt schema migration ${body.schema_version} -> ${targetSchemaVersion}`);
+  }
+  const migrated = {
+    ...body,
+    usage: normalizeReceiptUsage(body.usage),
+  };
+  while (migrated.schema_version < targetSchemaVersion) {
+    if (migrated.schema_version === 1) {
+      migrated.schema_version = 2;
+    } else {
+      throw new Error(`unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}`);
+    }
+  }
+  return migrated;
+}
+
 function receiptEnvelope(entry) {
   const receipt = entry.receipt ?? entry;
   const bodySource = receipt.body ?? receipt;
@@ -63,10 +135,21 @@ function receiptEnvelope(entry) {
     voucher: _voucher,
     ...body
   } = bodySource;
-  return {
-    body,
+  const migratedBody = migrateReceiptBody(body);
+  const envelope = {
+    body: migratedBody,
     enclave_sig: receipt.enclave_sig ?? entry.enclave_sig ?? null,
     user_sig: receipt.user_sig ?? entry.user_sig ?? null,
+  };
+  if (stableJson(body) !== stableJson(migratedBody)) envelope.signed_body = stableValue(body);
+  return envelope;
+}
+
+function receiptLeafEnvelope(envelope) {
+  return {
+    body: stableValue(envelope.body),
+    enclave_sig: envelope.enclave_sig,
+    user_sig: envelope.user_sig,
   };
 }
 
@@ -149,7 +232,7 @@ export async function recomputeEpoch(bundle) {
     sessions.add(body.session_id);
     addAmount(debitMap, body.user, settleMu, 'debit');
     addAmount(grossEarningMap, body.provider, settleMu, 'earning');
-    usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', envelope));
+    usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', receiptLeafEnvelope(envelope)));
   }
 
   const earningEntries = [];

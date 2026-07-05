@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,13 +8,17 @@ pub const CRATE_NAME: &str = "mayhem-proto";
 pub const CONTRACT_VERSION: u32 = 1;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 1;
-pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 3;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
 pub const DEFAULT_MODEL_CLASS: &str = "text-generation";
+pub const USAGE_INPUT_TOKEN: &str = "input_token";
+pub const USAGE_OUTPUT_TOKEN: &str = "output_token";
+pub const USAGE_IMAGE: &str = "image";
+pub const USAGE_STEP: &str = "step";
 pub const TIER1_SOFTWARE_ATTESTATION_TIER: u8 = 1;
 pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
 pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
@@ -165,12 +169,115 @@ pub struct SpendVoucher {
     pub user_sig: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReceiptUsage {
-    #[serde(rename = "in")]
-    pub in_tokens: u64,
-    #[serde(rename = "out")]
-    pub out_tokens: u64,
+    units: BTreeMap<String, u64>,
+}
+
+impl ReceiptUsage {
+    pub fn new(units: BTreeMap<String, u64>) -> Self {
+        Self::from_units(units)
+    }
+
+    pub fn from_units<I, K>(units: I) -> Self
+    where
+        I: IntoIterator<Item = (K, u64)>,
+        K: Into<String>,
+    {
+        let mut normalized = BTreeMap::new();
+        for (unit, count) in units {
+            if count == 0 {
+                continue;
+            }
+            let unit = unit.into();
+            let unit = canonical_usage_unit(&unit)
+                .unwrap_or(unit.as_str())
+                .to_owned();
+            let next = normalized
+                .get(&unit)
+                .copied()
+                .unwrap_or(0u64)
+                .saturating_add(count);
+            normalized.insert(unit, next);
+        }
+        Self { units: normalized }
+    }
+
+    pub fn text(in_tokens: u64, out_tokens: u64) -> Self {
+        Self::from_units([
+            (USAGE_INPUT_TOKEN, in_tokens),
+            (USAGE_OUTPUT_TOKEN, out_tokens),
+        ])
+    }
+
+    pub fn units(&self) -> &BTreeMap<String, u64> {
+        &self.units
+    }
+
+    pub fn get(&self, unit: &str) -> u64 {
+        canonical_usage_unit(unit)
+            .and_then(|unit| self.units.get(unit).copied())
+            .unwrap_or_else(|| self.units.get(unit).copied().unwrap_or(0))
+    }
+
+    pub fn input_tokens(&self) -> u64 {
+        self.get(USAGE_INPUT_TOKEN)
+    }
+
+    pub fn output_tokens(&self) -> u64 {
+        self.get(USAGE_OUTPUT_TOKEN)
+    }
+
+    pub fn saturating_delta(previous: &Self, current: &Self) -> Self {
+        let mut units = BTreeMap::new();
+        for (unit, count) in current.units() {
+            let previous_count = previous.get(unit);
+            let delta = count.saturating_sub(previous_count);
+            if delta > 0 {
+                units.insert(unit.clone(), delta);
+            }
+        }
+        Self { units }
+    }
+
+    pub fn is_monotonic_from(&self, previous: &Self) -> bool {
+        previous
+            .units()
+            .iter()
+            .all(|(unit, previous_count)| self.get(unit) >= *previous_count)
+    }
+}
+
+impl Serialize for ReceiptUsage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.units.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReceiptUsage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let units = BTreeMap::<String, u64>::deserialize(deserializer)?;
+        Ok(Self::new(units))
+    }
+}
+
+pub fn canonical_usage_unit(unit: &str) -> Option<&'static str> {
+    match unit {
+        "in" | "in_tokens" | "input" | "input_tokens" | "prompt_tokens" | USAGE_INPUT_TOKEN => {
+            Some(USAGE_INPUT_TOKEN)
+        }
+        "out" | "out_tokens" | "output" | "output_tokens" | "completion_tokens"
+        | USAGE_OUTPUT_TOKEN => Some(USAGE_OUTPUT_TOKEN),
+        "images" | USAGE_IMAGE => Some(USAGE_IMAGE),
+        "steps" | USAGE_STEP => Some(USAGE_STEP),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -237,7 +344,11 @@ pub fn migrate_receipt_body_to_schema(
 
     while migrated.schema_version < target_schema_version {
         match migrated.schema_version {
-            1 => migrated.schema_version = 2,
+            1 => {
+                migrated.usage = ReceiptUsage::new(migrated.usage.units().clone());
+                migrated.schema_version = 2;
+            }
+            2 => migrated.schema_version = 3,
             from => {
                 return Err(ReceiptSchemaMigrationError::Unsupported {
                     from,
@@ -570,10 +681,7 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             rules_ver: 1,
-            usage: ReceiptUsage {
-                in_tokens: 3,
-                out_tokens: 5,
-            },
+            usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,
@@ -588,6 +696,22 @@ mod tests {
 
     #[test]
     fn receipt_schema_migration_accepts_v1_for_v2_nodes() {
+        let legacy_usage: ReceiptUsage =
+            serde_json::from_value(serde_json::json!({ "in": 3, "out_tokens": 5 })).unwrap();
+        assert_eq!(legacy_usage, ReceiptUsage::text(3, 5));
+        assert_eq!(
+            serde_json::to_value(&legacy_usage).unwrap(),
+            serde_json::json!({ "input_token": 3, "output_token": 5 })
+        );
+        let mixed_alias_usage: ReceiptUsage = serde_json::from_value(serde_json::json!({
+            "in": 3,
+            "input_token": 2,
+            "out_tokens": 5,
+            "completion_tokens": 7
+        }))
+        .unwrap();
+        assert_eq!(mixed_alias_usage, ReceiptUsage::text(5, 12));
+
         let receipt = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
@@ -599,10 +723,7 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             rules_ver: 1,
-            usage: ReceiptUsage {
-                in_tokens: 3,
-                out_tokens: 5,
-            },
+            usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,
@@ -621,12 +742,18 @@ mod tests {
         assert_eq!(
             migrate_receipt_body_to_schema(&unsupported, NEXT_SESSION_RECEIPT_SCHEMA_VERSION)
                 .unwrap_err(),
-            ReceiptSchemaMigrationError::Unsupported { from: 99, to: 2 }
+            ReceiptSchemaMigrationError::Unsupported {
+                from: 99,
+                to: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
+            }
         );
 
         assert_eq!(
             migrate_receipt_body_to_schema(&migrated, SESSION_RECEIPT_SCHEMA_VERSION).unwrap_err(),
-            ReceiptSchemaMigrationError::Unsupported { from: 2, to: 1 }
+            ReceiptSchemaMigrationError::Unsupported {
+                from: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
+                to: SESSION_RECEIPT_SCHEMA_VERSION,
+            }
         );
     }
 
@@ -667,10 +794,7 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             rules_ver: 1,
-            usage: ReceiptUsage {
-                in_tokens: 3,
-                out_tokens: 5,
-            },
+            usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,

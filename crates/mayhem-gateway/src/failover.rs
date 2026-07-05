@@ -4,7 +4,7 @@ use mayhem_proto::{CheckpointPolicy, ReceiptUsage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ProviderKey;
+use crate::{text_generation_rate_map, usage_map_mu, ProviderKey, RateMapEntry};
 
 pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = 3_000;
 pub const DEFAULT_MAX_OPEN_ATTEMPTS: u8 = 4;
@@ -21,10 +21,9 @@ pub struct FailoverPolicy {
     pub hedge_enabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionPriceMu {
-    pub in_per_1k_mu: u64,
-    pub out_per_1k_mu: u64,
+    pub rate_map: Vec<RateMapEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,14 +148,14 @@ impl Default for FailoverPolicy {
 }
 
 impl SessionPriceMu {
-    pub fn mu_for_usage(self, usage: &ReceiptUsage) -> u64 {
-        let raw = u128::from(usage.in_tokens) * u128::from(self.in_per_1k_mu)
-            + u128::from(usage.out_tokens) * u128::from(self.out_per_1k_mu);
-        if raw == 0 {
-            0
-        } else {
-            raw.div_ceil(1000).min(u128::from(u64::MAX)) as u64
+    pub fn text(in_per_1k_mu: u64, out_per_1k_mu: u64) -> Self {
+        Self {
+            rate_map: text_generation_rate_map(in_per_1k_mu, out_per_1k_mu),
         }
+    }
+
+    pub fn mu_for_usage(&self, usage: &ReceiptUsage) -> u64 {
+        usage_map_mu(&self.rate_map, usage)
     }
 }
 
@@ -172,10 +171,7 @@ impl SessionFailoverState {
             price,
             input_tokens,
             delivered_output_tokens: 0,
-            last_receipted_usage: ReceiptUsage {
-                in_tokens: 0,
-                out_tokens: 0,
-            },
+            last_receipted_usage: ReceiptUsage::default(),
             last_receipted_mu: 0,
             next_receipt_seq: 1,
             open_attempts: 0,
@@ -191,10 +187,7 @@ impl SessionFailoverState {
     }
 
     pub fn current_usage(&self) -> ReceiptUsage {
-        ReceiptUsage {
-            in_tokens: self.input_tokens,
-            out_tokens: self.delivered_output_tokens,
-        }
+        ReceiptUsage::text(self.input_tokens, self.delivered_output_tokens)
     }
 
     pub fn open_attempts(&self) -> u8 {
@@ -294,11 +287,11 @@ impl SessionFailoverState {
     pub fn checkpoint_due(&self, now_millis: u64) -> bool {
         let current = self.current_usage();
         let output_delta = current
-            .out_tokens
-            .saturating_sub(self.last_receipted_usage.out_tokens);
+            .output_tokens()
+            .saturating_sub(self.last_receipted_usage.output_tokens());
         let input_delta = current
-            .in_tokens
-            .saturating_sub(self.last_receipted_usage.in_tokens);
+            .input_tokens()
+            .saturating_sub(self.last_receipted_usage.input_tokens());
         if output_delta == 0 && input_delta == 0 {
             return false;
         }
@@ -341,8 +334,9 @@ impl SessionFailoverState {
                 actual: checkpoint.seq,
             });
         }
-        if checkpoint.usage.in_tokens < self.last_receipted_usage.in_tokens
-            || checkpoint.usage.out_tokens < self.last_receipted_usage.out_tokens
+        if !checkpoint
+            .usage
+            .is_monotonic_from(&self.last_receipted_usage)
         {
             return Err(FailoverError::ReceiptUsageRegression);
         }
@@ -479,10 +473,7 @@ pub fn x_mayhem_hedge_requested(value: Option<&str>) -> bool {
 }
 
 fn usage_delta(previous: &ReceiptUsage, current: &ReceiptUsage) -> ReceiptUsage {
-    ReceiptUsage {
-        in_tokens: current.in_tokens.saturating_sub(previous.in_tokens),
-        out_tokens: current.out_tokens.saturating_sub(previous.out_tokens),
-    }
+    ReceiptUsage::saturating_delta(previous, current)
 }
 
 #[cfg(test)]
@@ -498,10 +489,7 @@ mod tests {
     }
 
     fn price() -> SessionPriceMu {
-        SessionPriceMu {
-            in_per_1k_mu: 10,
-            out_per_1k_mu: 100,
-        }
+        SessionPriceMu::text(10, 100)
     }
 
     #[test]
@@ -570,14 +558,8 @@ mod tests {
             .expect("delta accepted")
             .expect("checkpoint due");
         assert_eq!(checkpoint.seq, 1);
-        assert_eq!(
-            checkpoint.usage,
-            ReceiptUsage {
-                in_tokens: 1_000,
-                out_tokens: 8,
-            }
-        );
-        assert_eq!(checkpoint.uncheckpointed_usage.out_tokens, 8);
+        assert_eq!(checkpoint.usage, ReceiptUsage::text(1_000, 8));
+        assert_eq!(checkpoint.uncheckpointed_usage.output_tokens(), 8);
         state
             .record_receipt_cosigned(&checkpoint, 101)
             .expect("checkpoint receipt accepted");
@@ -601,20 +583,17 @@ mod tests {
         assert!(!redispatch.partial_receipt.final_receipt);
         assert_eq!(
             redispatch.partial_receipt.usage,
-            ReceiptUsage {
-                in_tokens: 1_000,
-                out_tokens: 10,
-            }
+            ReceiptUsage::text(1_000, 10)
         );
         assert_eq!(
             redispatch.partial_receipt.uncheckpointed_usage,
-            ReceiptUsage {
-                in_tokens: 0,
-                out_tokens: 2,
-            }
+            ReceiptUsage::text(0, 2)
         );
         assert!(
-            redispatch.partial_receipt.uncheckpointed_usage.out_tokens
+            redispatch
+                .partial_receipt
+                .uncheckpointed_usage
+                .output_tokens()
                 <= state.policy().checkpoint_every.tokens
         );
         state
@@ -626,23 +605,14 @@ mod tests {
             .record_delta(&second, 5, 15_600)
             .expect("second provider delta accepted");
         let final_receipt = state.receipt_checkpoint(true, "final", 15_700);
-        assert_eq!(
-            final_receipt.usage,
-            ReceiptUsage {
-                in_tokens: 1_000,
-                out_tokens: 15,
-            }
-        );
+        assert_eq!(final_receipt.usage, ReceiptUsage::text(1_000, 15));
         assert_eq!(
             final_receipt.mu_owed_cum,
             price().mu_for_usage(&final_receipt.usage)
         );
 
         let duplicated_prompt_charge = redispatch.partial_receipt.mu_owed_cum
-            + price().mu_for_usage(&ReceiptUsage {
-                in_tokens: 1_000,
-                out_tokens: 5,
-            });
+            + price().mu_for_usage(&ReceiptUsage::text(1_000, 5));
         assert!(final_receipt.mu_owed_cum < duplicated_prompt_charge);
     }
 

@@ -146,13 +146,13 @@ test('receipt verifier accepts v1 and v2 receipt signing payloads', async () => 
   }
 });
 
-test('receipt schema migration accepts v1 receipts for v2 nodes', async () => {
+test('receipt schema migration normalizes legacy usage maps', async () => {
   const user = await makeIdentity();
   const provider = await makeIdentity();
   const enclave = await makeIdentity();
   const contract = new MayhemContract({ peer: { wallet: makeVerifier(enclave.wallet) } }, {});
   const body = {
-    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+    schema_version: 1,
     session_id: 'session-schema-migration',
     seq: 1,
     final: true,
@@ -162,7 +162,7 @@ test('receipt schema migration accepts v1 receipts for v2 nodes', async () => {
     model_id: 'model/schema-migration',
     price_ver: 1,
     rules_ver: 1,
-    usage: { in: 10, out: 20 },
+    usage: { in: 10, out_tokens: 20 },
     mu_owed_cum: 100,
     prompt_hash: 'a'.repeat(64),
     ts: 1_000,
@@ -180,6 +180,7 @@ test('receipt schema migration accepts v1 receipts for v2 nodes', async () => {
   });
   assert.equal(migrated instanceof Error, false, migrated.message);
   assert.equal(migrated.body.schema_version, NEXT_SESSION_RECEIPT_SCHEMA_VERSION);
+  assert.deepEqual(migrated.body.usage, { input_token: 10, output_token: 20 });
   assert.deepEqual(migrated.signed_body, body);
   assert.equal(contract.verifyReceiptEnvelope(migrated), true);
 

@@ -1,8 +1,8 @@
-use mayhem_proto::ReceiptUsage;
+use mayhem_proto::{ReceiptUsage, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN};
 use serde::{Deserialize, Serialize};
 
-pub const INPUT_TOKEN_UNIT: &str = "input_token";
-pub const OUTPUT_TOKEN_UNIT: &str = "output_token";
+pub const INPUT_TOKEN_UNIT: &str = USAGE_INPUT_TOKEN;
+pub const OUTPUT_TOKEN_UNIT: &str = USAGE_OUTPUT_TOKEN;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct RateMapEntry {
@@ -52,11 +52,24 @@ pub fn text_rate_per_1k_mu(rate_map: &[RateMapEntry], unit: &str) -> u64 {
 }
 
 pub fn text_usage_mu(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> u64 {
+    usage_map_mu(rate_map, usage)
+}
+
+pub fn usage_map_mu(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> u64 {
+    let counts = usage
+        .units()
+        .iter()
+        .map(|(unit, count)| (unit.as_str(), *count))
+        .collect::<Vec<_>>();
+    usage_units_mu(rate_map, &counts)
+}
+
+pub fn text_units_mu(rate_map: &[RateMapEntry], in_tokens: u64, out_tokens: u64) -> u64 {
     usage_units_mu(
         rate_map,
         &[
-            (INPUT_TOKEN_UNIT, usage.in_tokens),
-            (OUTPUT_TOKEN_UNIT, usage.out_tokens),
+            (INPUT_TOKEN_UNIT, in_tokens),
+            (OUTPUT_TOKEN_UNIT, out_tokens),
         ],
     )
 }
@@ -125,5 +138,46 @@ fn ceil_div_u128(value: u128, divisor: u128) -> u128 {
         0
     } else {
         value.div_ceil(divisor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mayhem_proto::{ReceiptUsage, USAGE_IMAGE, USAGE_STEP};
+
+    #[test]
+    fn text_rate_map_matches_legacy_two_token_charge() {
+        let rate_map = text_generation_rate_map(20, 60);
+        let usage = ReceiptUsage::text(100, 250);
+
+        assert_eq!(usage_map_mu(&rate_map, &usage), 17);
+    }
+
+    #[test]
+    fn image_usage_aliases_settle_against_canonical_units() {
+        let usage: ReceiptUsage = serde_json::from_value(serde_json::json!({
+            "images": 2,
+            "steps": 60
+        }))
+        .unwrap();
+        let rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_mu: 500,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_STEP.to_owned(),
+                per_unit_mu: 2,
+                granularity: 1,
+            },
+        ];
+
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({ "image": 2, "step": 60 })
+        );
+        assert_eq!(usage_map_mu(&rate_map, &usage), 1_120);
     }
 }

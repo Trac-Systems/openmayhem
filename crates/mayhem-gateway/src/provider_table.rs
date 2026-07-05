@@ -557,10 +557,7 @@ pub fn estimate_request_price_mu(
     contract: &ContractProviderSnapshot,
     request: &RequestRequirements,
 ) -> u64 {
-    let usage = ReceiptUsage {
-        in_tokens: request.input_tokens,
-        out_tokens: request.output_tokens,
-    };
+    let usage = ReceiptUsage::text(request.input_tokens, request.output_tokens);
     text_usage_mu(&contract.rate_map, &usage)
 }
 
@@ -568,10 +565,7 @@ pub fn estimate_reference_request_price_mu(
     contract: &ContractProviderSnapshot,
     request: &RequestRequirements,
 ) -> u64 {
-    let usage = ReceiptUsage {
-        in_tokens: request.input_tokens,
-        out_tokens: request.output_tokens,
-    };
+    let usage = ReceiptUsage::text(request.input_tokens, request.output_tokens);
     text_usage_mu(&contract.ref_rate_map, &usage)
 }
 
