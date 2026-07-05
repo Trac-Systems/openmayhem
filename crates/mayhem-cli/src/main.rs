@@ -150,6 +150,17 @@ enum Commands {
     Earnings(EarningsArgs),
     /// Show provider reputation plus earning/holdback state.
     Reputation(ReputationArgs),
+    /// Inspect and persist local Mayhem CLI configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+    /// Remove local Mayhem state under --home after confirmation.
+    Reset(ResetArgs),
+    /// Remove local Mayhem state under --home after confirmation.
+    Uninstall(ResetArgs),
+    /// Wire or repair opencode for the local Mayhem gateway.
+    Opencode(OpencodeArgs),
     /// Auditor probe commands.
     Auditor {
         #[command(subcommand)]
@@ -207,6 +218,14 @@ enum ProviderRoomsCommands {
 enum FraudProofCommands {
     /// Submit an over-credit fraud proof against an epoch commit.
     Submit(FraudProofSubmitArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommands {
+    /// Print the whole config or one key.
+    Get(ConfigGetArgs),
+    /// Persist one config key.
+    Set(ConfigSetArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -582,6 +601,94 @@ struct ReputationArgs {
     provider: Option<String>,
 
     /// Print machine-readable reputation.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ConfigGetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Config key, e.g. network.rpc_url or rpc_url. Omit to print the whole config.
+    #[arg(long)]
+    key: Option<String>,
+
+    /// Print a machine-readable config report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ConfigSetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Config key, e.g. network.rpc_url, gateway_url, sc_bridge_url, or provider.engine_backend.
+    #[arg(long)]
+    key: String,
+
+    /// String value to persist.
+    #[arg(long)]
+    value: String,
+
+    /// Print a machine-readable config report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ResetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Required confirmation for removing local state.
+    #[arg(long)]
+    yes: bool,
+
+    /// Print a machine-readable removal report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct OpencodeArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Path to opencode.json. Defaults to MAYHEM_OPENCODE_CONFIG or ~/.config/opencode/opencode.json.
+    #[arg(long, value_name = "PATH")]
+    opencode_config: Option<PathBuf>,
+
+    /// Refresh Mayhem model entries from the running gateway /v1/models.
+    #[arg(long)]
+    sync_models: bool,
+
+    /// Run the opencode smoke after wiring.
+    #[arg(long)]
+    run_smoke: bool,
+
+    /// Model id to smoke. Defaults to the first tool-capable gateway model.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Path to the opencode binary. Defaults to <home>/bin/opencode or PATH.
+    #[arg(long, value_name = "PATH")]
+    opencode_bin: Option<PathBuf>,
+
+    /// Maximum seconds for gateway/opencode checks.
+    #[arg(long, default_value_t = 60)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable opencode report.
     #[arg(long)]
     json: bool,
 }
@@ -3358,6 +3465,13 @@ async fn main() -> Result<()> {
         Commands::Payouts(args) => payouts(args).await,
         Commands::Earnings(args) => earnings(args).await,
         Commands::Reputation(args) => reputation(args).await,
+        Commands::Config { command } => match command {
+            ConfigCommands::Get(args) => config_get(args),
+            ConfigCommands::Set(args) => config_set(args),
+        },
+        Commands::Reset(args) => reset(args, "reset"),
+        Commands::Uninstall(args) => reset(args, "uninstall"),
+        Commands::Opencode(args) => opencode(args).await,
         Commands::Auditor { command } => match command {
             AuditorCommands::Canary(args) => auditor_canary(args).await,
         },
@@ -12164,6 +12278,212 @@ fn print_reputation_report(report: &Value) {
     );
 }
 
+fn config_get(args: ConfigGetArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let config = read_config_toml_value(&path)?;
+    let key = args.key.as_deref().map(canonical_config_key).transpose()?;
+    let value = key.and_then(|key| toml_get_path(&config, key));
+    let value_json = value
+        .map(serde_json::to_value)
+        .transpose()?
+        .unwrap_or(Value::Null);
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "path": path,
+        "key": key,
+        "value": value_json,
+        "config": serde_json::to_value(&config)?,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_config_get_report(&report, &config)?;
+    }
+    Ok(())
+}
+
+fn config_set(args: ConfigSetArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let key = canonical_config_key(&args.key)?;
+    let mut config = read_config_toml_value(&path)?;
+    toml_set_string(&mut config, key, args.value.clone())?;
+    write_config_toml_value(&path, &config)?;
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "path": path,
+        "key": key,
+        "value": args.value,
+        "config": serde_json::to_value(&config)?,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Set {} = {} in {}",
+            report["key"].as_str().unwrap_or(""),
+            report["value"].as_str().unwrap_or(""),
+            report["path"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn reset(args: ResetArgs, action: &'static str) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    if !args.yes {
+        bail!(
+            "refusing to {action} {}; pass --yes to remove local Mayhem state",
+            home.display()
+        );
+    }
+    let removed = remove_local_state_path(&home)?;
+    let report = json!({
+        "ok": true,
+        "action": action,
+        "home": home,
+        "removed": removed,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if removed {
+        println!(
+            "{} OK: removed {}",
+            action,
+            report["home"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "{} OK: no local state existed at {}",
+            action,
+            report["home"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+async fn opencode(args: OpencodeArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let opencode_config_path = args
+        .opencode_config
+        .clone()
+        .map(absolutize)
+        .transpose()?
+        .unwrap_or(default_opencode_config_path()?);
+
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let models = if args.sync_models || args.run_smoke {
+        Some(fetch_gateway_models(&client, &gateway_root).await?)
+    } else {
+        None
+    };
+    let merge = merge_mayhem_opencode_config(
+        &opencode_config_path,
+        &gateway_root,
+        models.as_deref(),
+        args.sync_models,
+    )?;
+    let run = if args.run_smoke {
+        let selected = select_test_model(
+            models
+                .as_deref()
+                .context("gateway models must be fetched before opencode smoke")?,
+            args.model.as_deref(),
+        )?;
+        let opencode_bin = resolve_opencode_bin(&home, args.opencode_bin.as_deref());
+        serde_json::to_value(
+            run_opencode_smoke(&opencode_bin, &opencode_config_path, &selected.id, timeout).await?,
+        )?
+    } else {
+        json!({ "skipped": true })
+    };
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "gateway_url": gateway_root,
+        "models_fetched": models.as_ref().map(Vec::len),
+        "opencode": {
+            "config": merge,
+            "run": run,
+        },
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_opencode_report(&report);
+    }
+    Ok(())
+}
+
+fn print_config_get_report(report: &Value, config: &toml::Value) -> Result<()> {
+    println!("Config: {}", report["path"].as_str().unwrap_or(""));
+    if let Some(key) = report["key"].as_str() {
+        if report["value"].is_null() {
+            println!("{key} is not set");
+        } else {
+            println!("{key} = {}", report["value"]);
+        }
+    } else {
+        let text = toml::to_string_pretty(config)?;
+        if text.trim().is_empty() {
+            println!("(empty)");
+        } else {
+            print!("{text}");
+        }
+    }
+    Ok(())
+}
+
+fn print_opencode_report(report: &Value) {
+    println!("opencode wired.");
+    println!("Gateway: {}", report["gateway_url"].as_str().unwrap_or(""));
+    println!(
+        "Config: {}",
+        report["opencode"]["config"]["path"].as_str().unwrap_or("")
+    );
+    println!(
+        "Provider: {} ({})",
+        report["opencode"]["config"]["provider_id"]
+            .as_str()
+            .unwrap_or(""),
+        report["opencode"]["config"]["base_url"]
+            .as_str()
+            .unwrap_or("")
+    );
+    if let Some(models) = report["models_fetched"].as_u64() {
+        println!("Gateway models fetched: {models}");
+    }
+    if report["opencode"]["run"]["skipped"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        println!("Smoke: skipped");
+    } else {
+        println!(
+            "Smoke: ok ({})",
+            report["opencode"]["run"]["model"].as_str().unwrap_or("")
+        );
+    }
+}
+
 async fn mayhem_test(args: TestArgs) -> Result<()> {
     if args.timeout_seconds == 0 {
         bail!("--timeout-seconds must be positive");
@@ -20895,6 +21215,102 @@ fn read_mayhem_config(home: &Path) -> Result<Option<MayhemConfig>> {
     Ok(Some(config))
 }
 
+fn config_path_for_home(home: &Path) -> PathBuf {
+    home.join("config.toml")
+}
+
+fn read_config_toml_value(path: &Path) -> Result<toml::Value> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    let value: toml::Value =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if !value.is_table() {
+        bail!("{} must contain a TOML table", path.display());
+    }
+    Ok(value)
+}
+
+fn write_config_toml_value(path: &Path, value: &toml::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, toml::to_string_pretty(value)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn canonical_config_key(key: &str) -> Result<&'static str> {
+    let normalized = key.trim().replace('-', "_");
+    match normalized.as_str() {
+        "home" | "mayhem_home" => {
+            bail!("home selects the config location and is not stored inside config.toml")
+        }
+        "rpc_url" | "network.rpc_url" => Ok("network.rpc_url"),
+        "gateway_url" | "network.gateway_url" => Ok("network.gateway_url"),
+        "paygate_url" | "network.paygate_url" => Ok("network.paygate_url"),
+        "sc_bridge_url" | "network.sc_bridge_url" => Ok("network.sc_bridge_url"),
+        "sc_bridge_token" | "network.sc_bridge_token" => Ok("network.sc_bridge_token"),
+        "tnk_treasury_address" | "network.tnk_treasury_address" => {
+            Ok("network.tnk_treasury_address")
+        }
+        "keypair_path" | "identity.keypair_path" => Ok("identity.keypair_path"),
+        "store_name" | "identity.store_name" => Ok("identity.store_name"),
+        "engine_backend" | "provider.engine_backend" => Ok("provider.engine_backend"),
+        "role" | "role.mode" => Ok("role.mode"),
+        "" => bail!("config key must not be empty"),
+        _ => bail!("unsupported config key {key}; supported keys are rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, identity.keypair_path, identity.store_name, provider.engine_backend, and role.mode"),
+    }
+}
+
+fn toml_get_path<'a>(value: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    let mut cursor = value;
+    for segment in key.split('.') {
+        cursor = cursor.as_table()?.get(segment)?;
+    }
+    Some(cursor)
+}
+
+fn toml_set_string(value: &mut toml::Value, key: &str, new_value: String) -> Result<()> {
+    let segments = key.split('.').collect::<Vec<_>>();
+    let Some((last, parents)) = segments.split_last() else {
+        bail!("config key must not be empty");
+    };
+    let mut table = value
+        .as_table_mut()
+        .context("config root must contain a TOML table")?;
+    for segment in parents {
+        let entry = table
+            .entry((*segment).to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if !entry.is_table() {
+            bail!("{segment} exists in config.toml but is not a table");
+        }
+        table = entry.as_table_mut().expect("checked table");
+    }
+    table.insert((*last).to_owned(), toml::Value::String(new_value));
+    Ok(())
+}
+
+fn remove_local_state_path(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() && !file_type.is_symlink() {
+        fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
+    } else {
+        fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(true)
+}
+
 fn read_rules_doc(path: Option<&Path>) -> Result<RulesDoc> {
     let path = match path {
         Some(path) => absolutize(path.to_path_buf())?,
@@ -21745,6 +22161,153 @@ mod tests {
         };
         assert_eq!(args.provider.as_deref(), Some("provider-a"));
         assert!(args.json);
+    }
+
+    #[test]
+    fn ops_cli_parses_config_reset_uninstall_and_opencode() {
+        let get = Cli::try_parse_from([
+            "mayhem",
+            "config",
+            "get",
+            "--home",
+            "/tmp/mayhem-config",
+            "--key",
+            "rpc_url",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Config { command } = get.command else {
+            panic!("expected config command");
+        };
+        let ConfigCommands::Get(args) = command else {
+            panic!("expected config get command");
+        };
+        assert_eq!(args.home.as_deref(), Some(Path::new("/tmp/mayhem-config")));
+        assert_eq!(args.key.as_deref(), Some("rpc_url"));
+        assert!(args.json);
+
+        let set = Cli::try_parse_from([
+            "mayhem",
+            "config",
+            "set",
+            "--key",
+            "sc-bridge-url",
+            "--value",
+            "ws://127.0.0.1:8001",
+        ])
+        .unwrap();
+        let Commands::Config { command } = set.command else {
+            panic!("expected config command");
+        };
+        let ConfigCommands::Set(args) = command else {
+            panic!("expected config set command");
+        };
+        assert_eq!(args.key, "sc-bridge-url");
+        assert_eq!(args.value, "ws://127.0.0.1:8001");
+
+        let reset =
+            Cli::try_parse_from(["mayhem", "reset", "--home", "/tmp/mayhem-reset", "--yes"])
+                .unwrap();
+        let Commands::Reset(args) = reset.command else {
+            panic!("expected reset command");
+        };
+        assert!(args.yes);
+
+        let uninstall = Cli::try_parse_from([
+            "mayhem",
+            "uninstall",
+            "--home",
+            "/tmp/mayhem-reset",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Uninstall(args) = uninstall.command else {
+            panic!("expected uninstall command");
+        };
+        assert!(args.yes);
+        assert!(args.json);
+
+        let opencode = Cli::try_parse_from([
+            "mayhem",
+            "opencode",
+            "--gateway-url",
+            "http://127.0.0.1:11435",
+            "--opencode-config",
+            "/tmp/mayhem-opencode/opencode.json",
+            "--sync-models",
+            "--run-smoke",
+            "--model",
+            "model-a",
+            "--timeout-seconds",
+            "2",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Opencode(args) = opencode.command else {
+            panic!("expected opencode command");
+        };
+        assert_eq!(args.gateway_url.as_deref(), Some("http://127.0.0.1:11435"));
+        assert_eq!(
+            args.opencode_config.as_deref(),
+            Some(Path::new("/tmp/mayhem-opencode/opencode.json"))
+        );
+        assert!(args.sync_models);
+        assert!(args.run_smoke);
+        assert_eq!(args.model.as_deref(), Some("model-a"));
+        assert_eq!(args.timeout_seconds, 2);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn config_set_persists_aliases_and_rejects_home() {
+        let home = test_temp_dir("mayhem-config-set");
+        fs::create_dir_all(&home).unwrap();
+        let args = ConfigSetArgs {
+            home: Some(home.clone()),
+            key: "rpc_url".to_owned(),
+            value: "http://127.0.0.1:49223/v1".to_owned(),
+            json: false,
+        };
+        config_set(args).unwrap();
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        assert_eq!(
+            toml_get_path(&config, "network.rpc_url").and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:49223/v1")
+        );
+        assert_eq!(
+            canonical_config_key("sc-bridge-token").unwrap(),
+            "network.sc_bridge_token"
+        );
+        assert!(canonical_config_key("home").is_err());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn reset_requires_confirmation_and_removes_home() {
+        let home = test_temp_dir("mayhem-reset");
+        fs::create_dir_all(home.join("nested")).unwrap();
+        fs::write(home.join("nested").join("state.json"), "{}").unwrap();
+        assert!(reset(
+            ResetArgs {
+                home: Some(home.clone()),
+                yes: false,
+                json: false,
+            },
+            "reset",
+        )
+        .is_err());
+        assert!(home.exists());
+        reset(
+            ResetArgs {
+                home: Some(home.clone()),
+                yes: true,
+                json: false,
+            },
+            "reset",
+        )
+        .unwrap();
+        assert!(!home.exists());
     }
 
     #[test]
