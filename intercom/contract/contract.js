@@ -37,6 +37,8 @@ export const SESSION_RECEIPT_SCHEMA_VERSION = 2;
 export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 3;
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
+const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
+const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 const PARAM_DEFINITIONS = Object.freeze({
   probation_successful_sessions: { default: 50, min: 0, max: 1_000_000 },
   probation_seconds: { default: PROBATION_SECONDS, min: 0, max: 365 * 24 * 60 * 60 },
@@ -3514,9 +3516,8 @@ class MayhemContract extends Contract {
   async tapDeposit() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
-    if (!this.isSafeKeyPart(this.value.who)) return new Error('Invalid TAP deposit recipient.');
-    if (!this.isSafeKeyPart(this.value.eth_tx_hash)) return new Error('Invalid Ethereum tx hash.');
-    if (!this.isSafeKeyPart(this.value.pool_address)) return new Error('Invalid TAP pool address.');
+    const shapeError = this.validateTapDepositValue(this.value);
+    if (shapeError) return shapeError;
 
     const tapWei = this.parseTapWei(this.value.tap_wei);
     if (tapWei instanceof Error) return tapWei;
@@ -3528,7 +3529,9 @@ class MayhemContract extends Contract {
 
     const who = this.value.who.toLowerCase();
     const ethTxHash = this.value.eth_tx_hash.toLowerCase();
+    const blockHash = this.value.block_hash.toLowerCase();
     const poolAddress = this.value.pool_address.toLowerCase();
+    const eventSignature = this.value.event_signature.toLowerCase();
     const seenKey = `dep/tap/${ethTxHash}/${this.value.log_index}`;
     const existing = await this.get(seenKey);
     if (existing !== null) {
@@ -3562,8 +3565,14 @@ class MayhemContract extends Contract {
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
       block_number: this.value.block_number,
+      block_hash: blockHash,
       chain_id: this.value.chain_id,
       pool_address_hash: await this.opaqueHash('deposit-pool', poolAddress),
+      finalized_block_number: this.value.finalized_block_number,
+      confirmation_depth: this.value.confirmation_depth,
+      confirmation_policy: this.value.confirmation_policy,
+      event_signature: eventSignature,
+      watcher_id: this.value.watcher_id,
     });
     const depositRoot = await this.nextDepositRoot({
       epoch: this.value.epoch,
@@ -3584,8 +3593,14 @@ class MayhemContract extends Contract {
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
       block_number: this.value.block_number,
+      block_hash: blockHash,
       pool_address: poolAddress,
       chain_id: this.value.chain_id,
+      finalized_block_number: this.value.finalized_block_number,
+      confirmation_depth: this.value.confirmation_depth,
+      confirmation_policy: this.value.confirmation_policy,
+      event_signature: eventSignature,
+      watcher_id: this.value.watcher_id,
       epoch: this.value.epoch,
       at: this.value.at,
       credited_at: this.tx,
@@ -3629,6 +3644,64 @@ class MayhemContract extends Contract {
       log_index: this.value.log_index,
       rate_ts: rate.ts,
     };
+  }
+
+  validateTapDepositValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'who',
+        'tap_wei',
+        'eth_tx_hash',
+        'log_index',
+        'block_number',
+        'block_hash',
+        'pool_address',
+        'chain_id',
+        'finalized_block_number',
+        'confirmation_depth',
+        'confirmation_policy',
+        'event_signature',
+        'watcher_id',
+        'epoch',
+        'at',
+      ],
+      'TAP deposit'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'tap_deposit') return new Error('Invalid TAP deposit op.');
+    if (!this.isSafeKeyPart(value.who)) return new Error('Invalid TAP deposit recipient.');
+    if (!this.isEthHexBytes(value.eth_tx_hash, 32)) return new Error('Invalid Ethereum tx hash.');
+    if (!Number.isSafeInteger(value.log_index) || value.log_index < 0) {
+      return new Error('Invalid TAP deposit log index.');
+    }
+    if (!Number.isSafeInteger(value.block_number) || value.block_number < 0) {
+      return new Error('Invalid TAP deposit block number.');
+    }
+    if (!this.isEthHexBytes(value.block_hash, 32)) return new Error('Invalid TAP deposit block hash.');
+    if (!this.isSafeKeyPart(value.pool_address)) return new Error('Invalid TAP pool address.');
+    if (!Number.isSafeInteger(value.chain_id) || value.chain_id < 1) return new Error('Invalid TAP chain id.');
+    if (!Number.isSafeInteger(value.finalized_block_number) || value.finalized_block_number < value.block_number) {
+      return new Error('Invalid TAP finalized block number.');
+    }
+    if (!Number.isSafeInteger(value.confirmation_depth) || value.confirmation_depth < 0) {
+      return new Error('Invalid TAP confirmation depth.');
+    }
+    if (value.confirmation_depth !== value.finalized_block_number - value.block_number) {
+      return new Error('TAP confirmation depth does not match finalized block.');
+    }
+    if (!this.isSafeKeyPart(value.confirmation_policy)) return new Error('Invalid TAP confirmation policy.');
+    if (!this.isEthHexBytes(value.event_signature, 32)) return new Error('Invalid TAP event signature.');
+    if (value.event_signature.toLowerCase() !== TAP_DEPOSIT_EVENT_SIGNATURE) {
+      return new Error('TAP deposit event signature mismatch.');
+    }
+    if (value.watcher_id !== TAP_DEPOSIT_WATCHER_ID) return new Error('Invalid TAP deposit watcher id.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid TAP deposit epoch.');
+    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid TAP deposit timestamp.');
+    const tapWei = this.parseTapWei(value.tap_wei);
+    if (tapWei instanceof Error) return tapWei;
+    return null;
   }
 
   async fiatDeposit() {
@@ -6330,6 +6403,12 @@ class MayhemContract extends Contract {
     return typeof value === 'string' &&
       value.length === bytes * 2 &&
       /^[0-9a-fA-F]+$/.test(value);
+  }
+
+  isEthHexBytes(value, bytes) {
+    return typeof value === 'string' &&
+      value.length === bytes * 2 + 2 &&
+      /^0x[0-9a-fA-F]+$/.test(value);
   }
 
   async reputationEventHead(previousHead, event) {

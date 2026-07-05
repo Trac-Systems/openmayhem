@@ -17,6 +17,22 @@ import {
 const rulesHash = '5'.repeat(64);
 const oneTnkE18 = '1000000000000000000';
 const halfTnkE18 = '500000000000000000';
+const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
+const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
+
+function tapWatcherEvidence(overrides = {}) {
+  const blockNumber = overrides.block_number ?? 123;
+  const finalizedBlockNumber = overrides.finalized_block_number ?? blockNumber + 12;
+  return {
+    block_hash: `0x${'b'.repeat(64)}`,
+    finalized_block_number: finalizedBlockNumber,
+    confirmation_depth: finalizedBlockNumber - blockNumber,
+    confirmation_policy: 'depth-12',
+    event_signature: TAP_DEPOSIT_EVENT_SIGNATURE,
+    watcher_id: TAP_DEPOSIT_WATCHER_ID,
+    ...overrides,
+  };
+}
 
 async function setupDepositContract(identities = null) {
   const admin = identities?.admin ?? await makeIdentity();
@@ -282,10 +298,36 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     chain_id: 61_000,
     epoch: 1,
     at: 1_800,
+    ...tapWatcherEvidence(),
   };
 
   const nonAdmin = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.outsider.publicKey);
   assert.match(nonAdmin.message, /admin required/i);
+  const missingEvidence = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      op: 'tap_deposit',
+      who: buyer,
+      tap_wei: oneTnkE18,
+      eth_tx_hash: `0x${'d'.repeat(64)}`,
+      log_index: 1,
+      block_number: 124,
+      pool_address: pool,
+      chain_id: 61_000,
+      epoch: 1,
+      at: 1_800,
+    },
+    ctx.admin.publicKey
+  );
+  assert.match(missingEvidence.message, /missing block_hash/i);
+  const badEventSignature = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    { ...value, eth_tx_hash: `0x${'e'.repeat(64)}`, event_signature: `0x${'0'.repeat(64)}` },
+    ctx.admin.publicKey
+  );
+  assert.match(badEventSignature.message, /event signature mismatch/i);
 
   const rate = await executeRateFeature(
     ctx.contract,
@@ -324,8 +366,14 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     eth_tx_hash: ethTxHash,
     log_index: 0,
     block_number: 123,
+    block_hash: `0x${'b'.repeat(64)}`,
     pool_address: pool,
     chain_id: 61_000,
+    finalized_block_number: 135,
+    confirmation_depth: 12,
+    confirmation_policy: 'depth-12',
+    event_signature: TAP_DEPOSIT_EVENT_SIGNATURE,
+    watcher_id: TAP_DEPOSIT_WATCHER_ID,
     epoch: 1,
     at: 1_800,
     credited_at: confirmedKey,

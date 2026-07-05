@@ -4,6 +4,10 @@ Mayhem lets you use admin-approved AI enclaves through a local OpenAI-compatible
 
 The contract is the public evidence ledger. It records canonical catalog anchors, admin-created enclaves and rooms, provider opt-ins, prices, rules, balances, receipts, disputes, and settlement roots. The actual prompts and model responses travel over direct provider sessions, not through the ledger.
 
+Deposit credits are admin-oracle evidence from watchers/paygate, not arbitrary
+provider or user writes. The trust boundary and key separation are documented in
+[docs/design/deposit-trust-boundary.md](docs/design/deposit-trust-boundary.md).
+
 > [!TIP]
 > If you are not comfortable installing developer tools by hand, open this repository in a frontier AI assistant and ask it to guide you through a real Mayhem install for your OS. Have it read this README, run the commands with you, explain each prompt before you approve it, and keep the terminal copy/paste paths and URLs visible. This is the normal install flow with an assistant beside you, not a separate simplified app.
 

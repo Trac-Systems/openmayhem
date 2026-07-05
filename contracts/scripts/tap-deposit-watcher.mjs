@@ -10,6 +10,8 @@ const scriptPath = fileURLToPath(import.meta.url);
 const DEFAULT_CURSOR = path.resolve('.mayhem-local', 'tap-deposit-watcher.json');
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const MAX_UNSUBMITTED_DEPOSITS = 1000;
+export const TAP_DEPOSIT_EVENT_SIGNATURE = ethers.id('Deposit(address,uint256)');
+export const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 
 export const POOL_ABI = [
   'event Deposit(address indexed buyer, uint256 amount)',
@@ -77,6 +79,12 @@ function normalizeTxHash(value) {
   return hash;
 }
 
+function normalizeBlockHash(value) {
+  const hash = String(value ?? '').trim().toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(hash)) throw new Error('block_hash must be a 32-byte 0x hex string');
+  return hash;
+}
+
 function positiveDecimalBigInt(value, label) {
   try {
     const parsed = BigInt(String(value ?? '').trim());
@@ -99,6 +107,10 @@ export function tapDepositFromLog(log, {
   chainId,
   poolAddress,
   tapUsdE6,
+  finalizedBlockNumber,
+  confirmationDepth,
+  confirmationPolicy = 'depth',
+  watcherId = TAP_DEPOSIT_WATCHER_ID,
 } = {}) {
   const buyer = log.args?.buyer ?? log.args?.[0];
   const amount = log.args?.amount ?? log.args?.[1];
@@ -106,6 +118,11 @@ export function tapDepositFromLog(log, {
   const blockNumber = Number(log.blockNumber);
   if (!Number.isSafeInteger(logIndex) || logIndex < 0) throw new Error('Deposit log has invalid log_index');
   if (!Number.isSafeInteger(blockNumber) || blockNumber < 0) throw new Error('Deposit log has invalid block_number');
+  const safeFinalizedBlockNumber = parseNonNegativeInt(finalizedBlockNumber ?? blockNumber, 'finalized_block_number');
+  const safeConfirmationDepth = parseNonNegativeInt(
+    confirmationDepth ?? Math.max(0, safeFinalizedBlockNumber - blockNumber),
+    'confirmation_depth'
+  );
   const normalizedChainId = parsePositiveInt(chainId, 'chain_id');
   const tapWei = positiveDecimalBigInt(amount, 'tap_wei').toString();
   const normalizedRate = tapUsdE6 === undefined || tapUsdE6 === null || tapUsdE6 === ''
@@ -117,8 +134,14 @@ export function tapDepositFromLog(log, {
     eth_tx_hash: normalizeTxHash(log.transactionHash),
     log_index: logIndex,
     block_number: blockNumber,
+    block_hash: normalizeBlockHash(log.blockHash),
     pool_address: normalizeAddress(poolAddress ?? log.address, 'pool_address'),
     chain_id: normalizedChainId,
+    finalized_block_number: safeFinalizedBlockNumber,
+    confirmation_depth: safeConfirmationDepth,
+    confirmation_policy: String(confirmationPolicy),
+    event_signature: TAP_DEPOSIT_EVENT_SIGNATURE,
+    watcher_id: String(watcherId),
   };
   if (normalizedRate !== null) {
     deposit.tap_usd_e6 = normalizedRate;
@@ -155,10 +178,22 @@ export function buildAdminCommandArgs(deposit, {
     String(deposit.log_index),
     '--block-number',
     String(deposit.block_number),
+    '--block-hash',
+    deposit.block_hash,
     '--pool-address',
     deposit.pool_address,
     '--chain-id',
     String(deposit.chain_id),
+    '--finalized-block-number',
+    String(deposit.finalized_block_number),
+    '--confirmation-depth',
+    String(deposit.confirmation_depth),
+    '--confirmation-policy',
+    deposit.confirmation_policy,
+    '--event-signature',
+    deposit.event_signature,
+    '--watcher-id',
+    deposit.watcher_id,
     '--epoch',
     String(epoch),
     '--at',
@@ -220,6 +255,12 @@ export function tapDepositStateMatches(deposit, {
     && Number(seen?.log_index) === deposit.log_index
     && seen?.who === deposit.who
     && seen?.tap_wei === deposit.tap_wei
+    && seen?.block_hash === deposit.block_hash
+    && Number(seen?.finalized_block_number) === Number(deposit.finalized_block_number)
+    && Number(seen?.confirmation_depth) === Number(deposit.confirmation_depth)
+    && seen?.confirmation_policy === deposit.confirmation_policy
+    && seen?.event_signature === deposit.event_signature
+    && seen?.watcher_id === deposit.watcher_id
     && (!hasExpectedMu || Number(seen?.mu) === expectedMu)
     && balance?.user === deposit.who
     && balance?.denom === 'mu_usd'
@@ -315,6 +356,11 @@ export async function scanTapDeposits({
   const safeTo = await safeToBlock(provider, { toBlock, confirmations, blockTag });
   const from = parseNonNegativeInt(fromBlock, '--from-block', 0);
   if (safeTo < from) return { deposits: [], from, to: from - 1 };
+  const confirmationPolicy = blockTag === 'finalized'
+    ? 'finalized-tag'
+    : toBlock !== undefined && toBlock !== null && toBlock !== ''
+      ? 'explicit-to-block'
+      : `depth-${parseNonNegativeInt(confirmations, '--confirmations', 12)}`;
 
   const deposits = [];
   const window = Math.max(1, parsePositiveInt(chunkSize, '--chunk-size', 5000));
@@ -326,6 +372,9 @@ export async function scanTapDeposits({
         chainId: normalizedChainId,
         poolAddress: poolAddress ?? event.address ?? await pool.getAddress(),
         tapUsdE6,
+        finalizedBlockNumber: safeTo,
+        confirmationDepth: Math.max(0, safeTo - Number(event.blockNumber)),
+        confirmationPolicy,
       }));
     }
   }

@@ -2887,10 +2887,28 @@ struct AdminTapDepositArgs {
     block_number: u64,
 
     #[arg(long)]
+    block_hash: String,
+
+    #[arg(long)]
     pool_address: String,
 
     #[arg(long)]
     chain_id: u64,
+
+    #[arg(long)]
+    finalized_block_number: u64,
+
+    #[arg(long)]
+    confirmation_depth: u64,
+
+    #[arg(long)]
+    confirmation_policy: String,
+
+    #[arg(long)]
+    event_signature: String,
+
+    #[arg(long)]
+    watcher_id: String,
 
     #[arg(long)]
     epoch: u64,
@@ -10553,8 +10571,14 @@ fn admin_tap_deposit_payload(args: &AdminTapDepositArgs) -> Value {
         "eth_tx_hash": &args.eth_tx_hash,
         "log_index": args.log_index,
         "block_number": args.block_number,
+        "block_hash": &args.block_hash,
         "pool_address": &args.pool_address,
         "chain_id": args.chain_id,
+        "finalized_block_number": args.finalized_block_number,
+        "confirmation_depth": args.confirmation_depth,
+        "confirmation_policy": &args.confirmation_policy,
+        "event_signature": &args.event_signature,
+        "watcher_id": &args.watcher_id,
         "epoch": args.epoch,
         "at": args.at,
     })
@@ -24597,8 +24621,15 @@ mod tests {
                 eth_tx_hash: "0xabc".to_owned(),
                 log_index: 0,
                 block_number: 123,
+                block_hash: "0xblockhash".to_owned(),
                 pool_address: "0x0000000000000000000000000000000000000abc".to_owned(),
                 chain_id: 61_000,
+                finalized_block_number: 135,
+                confirmation_depth: 12,
+                confirmation_policy: "depth-12".to_owned(),
+                event_signature:
+                    "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c".to_owned(),
+                watcher_id: "tap-deposit-watcher-v1".to_owned(),
                 epoch: 7,
                 at: 25_200,
             }),
@@ -24609,8 +24640,14 @@ mod tests {
                 "eth_tx_hash": "0xabc",
                 "log_index": 0,
                 "block_number": 123,
+                "block_hash": "0xblockhash",
                 "pool_address": "0x0000000000000000000000000000000000000abc",
                 "chain_id": 61_000,
+                "finalized_block_number": 135,
+                "confirmation_depth": 12,
+                "confirmation_policy": "depth-12",
+                "event_signature": "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c",
+                "watcher_id": "tap-deposit-watcher-v1",
                 "epoch": 7,
                 "at": 25_200,
             })

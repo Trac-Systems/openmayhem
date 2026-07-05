@@ -16,6 +16,8 @@ import {
 
 const rulesHash = '6'.repeat(64);
 const oneTnkE18 = '1000000000000000000';
+const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
+const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 
 const providerRegistration = {
   op: 'register_provider',
@@ -180,8 +182,14 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     eth_tx_hash: `0x${'b'.repeat(64)}`,
     log_index: 0,
     block_number: 123,
+    block_hash: `0x${'c'.repeat(64)}`,
     pool_address: pool,
     chain_id: 61_000,
+    finalized_block_number: 135,
+    confirmation_depth: 12,
+    confirmation_policy: 'depth-12',
+    event_signature: TAP_DEPOSIT_EVENT_SIGNATURE,
+    watcher_id: TAP_DEPOSIT_WATCHER_ID,
     epoch: 1,
     at: 3_701,
   };
