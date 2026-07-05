@@ -106,6 +106,7 @@ enum Commands {
         command: DepositCommands,
     },
     /// Cash out claimable TAP distribution entries without giving Mayhem custody.
+    #[command(visible_alias = "claim")]
     Withdraw(WithdrawArgs),
     /// Open a paid participant dispute over a session.
     Dispute(DisputeArgs),
@@ -527,6 +528,10 @@ struct BalanceArgs {
     /// Public key to inspect. Defaults to the local wallet public key.
     #[arg(long)]
     who: Option<String>,
+
+    /// Ledger rail to inspect.
+    #[arg(long, value_enum, default_value_t = GatewayLedgerRail::Fiat)]
+    rail: GatewayLedgerRail,
 
     /// Print a machine-readable balance report.
     #[arg(long)]
@@ -1250,6 +1255,10 @@ struct DepositStatusArgs {
     /// Account to inspect. Defaults to the local Mayhem wallet public key.
     #[arg(long)]
     who: Option<String>,
+
+    /// Ledger rail to inspect. Defaults to tnk for --memo-hash, tap for --eth-tx-hash, otherwise fiat.
+    #[arg(long, value_enum)]
+    rail: Option<GatewayLedgerRail>,
 
     /// TNK deposit memo hash to check for a pending intent.
     #[arg(long)]
@@ -11198,7 +11207,9 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     };
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let before_balance = read_balance_record(&rpc, &who, "fiat").await?;
+    let rail = deposit_status_rail(&args);
+    let rail_name = rail.as_str();
+    let before_balance = read_balance_record(&rpc, &who, rail_name).await?;
     let before_mu = before_balance
         .get("mu")
         .and_then(Value::as_u64)
@@ -11209,6 +11220,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
             wait_for_credit(
                 &rpc,
                 &who,
+                rail_name,
                 before_mu,
                 args.target_mu.expect("--wait checked target_mu"),
                 Duration::from_secs(args.timeout_seconds),
@@ -11219,7 +11231,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     } else {
         None
     };
-    let balance = read_balance_record(&rpc, &who, "fiat").await?;
+    let balance = read_balance_record(&rpc, &who, rail_name).await?;
     let current_mu = balance
         .get("mu")
         .and_then(Value::as_u64)
@@ -11246,6 +11258,7 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         "status": status,
         "rpc_url": rpc_url,
         "who": who,
+        "rail": rail_name,
         "target_mu": args.target_mu,
         "balance": balance,
         "credit": credit_wait.as_ref().map(|status| json!({
@@ -11280,6 +11293,19 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn deposit_status_rail(args: &DepositStatusArgs) -> GatewayLedgerRail {
+    if let Some(rail) = args.rail {
+        return rail;
+    }
+    if args.eth_tx_hash.is_some() {
+        GatewayLedgerRail::Tap
+    } else if args.memo_hash.is_some() {
+        GatewayLedgerRail::Tnk
+    } else {
+        GatewayLedgerRail::Fiat
+    }
 }
 
 async fn withdraw(args: WithdrawArgs) -> Result<()> {
@@ -11680,6 +11706,7 @@ fn print_deposit_status_report(report: &Value) -> Result<()> {
         report["status"].as_str().unwrap_or("")
     );
     println!("Account: {}", report["who"].as_str().unwrap_or(""));
+    println!("Rail: {}", report["rail"].as_str().unwrap_or(""));
     println!(
         "Balance: {} mu_usd ({})",
         report["balance"]["mu"].as_u64().unwrap_or(0),
@@ -11884,6 +11911,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         let status = wait_for_credit(
             rpc,
             &wallet.public_key,
+            "tnk",
             before_mu,
             target_mu,
             Duration::from_secs(args.timeout_seconds),
@@ -12058,6 +12086,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         wait_for_credit(
             &rpc,
             &wallet.public_key,
+            rail.balance_rail(),
             before_mu,
             target_mu,
             Duration::from_secs(args.timeout_seconds),
@@ -12421,7 +12450,8 @@ async fn balance(args: BalanceArgs) -> Result<()> {
         .public_key
     };
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let balance_record = read_balance_record(&rpc, &who, "fiat").await?;
+    let rail = args.rail.as_str();
+    let balance_record = read_balance_record(&rpc, &who, rail).await?;
     let mu = balance_record
         .get("mu")
         .and_then(Value::as_u64)
@@ -12431,6 +12461,7 @@ async fn balance(args: BalanceArgs) -> Result<()> {
         "ok": true,
         "rpc_url": rpc_url,
         "who": who,
+        "rail": rail,
         "balance": balance_record,
         "credit": {
             "denom": "mu_usd",
@@ -14934,6 +14965,7 @@ fn print_balance_report(report: &Value) {
     let mu = report["credit"]["mu"].as_u64().unwrap_or(0);
     println!("Mayhem balance");
     println!("Public key: {}", report["who"].as_str().unwrap_or(""));
+    println!("Rail: {}", report["rail"].as_str().unwrap_or(""));
     println!(
         "Credit: {} USD ({} mu_usd)",
         report["credit"]["usd"].as_str().unwrap_or("0.00"),
@@ -16568,6 +16600,7 @@ async fn open_checkout_url(url: &str, disabled: bool) -> bool {
 async fn wait_for_credit(
     rpc: &PeerRpcClient,
     who: &str,
+    rail: &str,
     before_mu: u64,
     target_mu: u64,
     timeout: Duration,
@@ -16575,7 +16608,7 @@ async fn wait_for_credit(
 ) -> Result<PayCreditStatus> {
     let started = Instant::now();
     loop {
-        let current_mu = read_user_balance_mu(rpc, who, "fiat").await?;
+        let current_mu = read_user_balance_mu(rpc, who, rail).await?;
         if current_mu >= target_mu {
             return Ok(PayCreditStatus {
                 credited: true,
@@ -23489,6 +23522,8 @@ mod tests {
             "user-a",
             "--memo-hash",
             "aa",
+            "--rail",
+            "tnk",
             "--target-mu",
             "1000",
             "--json",
@@ -23502,6 +23537,7 @@ mod tests {
         };
         assert_eq!(args.who.as_deref(), Some("user-a"));
         assert_eq!(args.memo_hash.as_deref(), Some("aa"));
+        assert_eq!(args.rail, Some(GatewayLedgerRail::Tnk));
         assert_eq!(args.target_mu, Some(1000));
 
         let withdraw = Cli::try_parse_from([
@@ -26993,10 +27029,10 @@ mod tests {
 
     #[test]
     fn balance_record_defaults_missing_contract_key_to_zero_mu_usd() {
-        let record = normalize_balance_record("user", "fiat", None).unwrap();
+        let record = normalize_balance_record("user", "tnk", None).unwrap();
 
         assert_eq!(record["user"], "user");
-        assert_eq!(record["rail"], "fiat");
+        assert_eq!(record["rail"], "tnk");
         assert_eq!(record["denom"], "mu_usd");
         assert_eq!(record["mu"], 0);
         assert_eq!(record["updated_epoch"], 0);
