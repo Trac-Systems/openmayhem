@@ -26400,7 +26400,13 @@ where
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("wallet helper failed: {}", stderr.trim());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "wallet helper failed (status {}): stderr={} stdout={}",
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        );
     }
 
     serde_json::from_slice(&output.stdout).context("parsing wallet helper JSON output")

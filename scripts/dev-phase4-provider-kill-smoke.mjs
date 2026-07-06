@@ -72,17 +72,20 @@ Environment:
   MAYHEM_P43_REMOTE_ROOT     Remote checkout/staging root (default: ~/mayhem-macmini-p33)
   MAYHEM_P43_MODEL           Catalog model id (default: ${DEFAULT_MODEL})
   MAYHEM_P43_PROVIDER_MODE   real or shim (default: real)
+  MAYHEM_P43_AGENT_LOOP      Run E13 multi-model/stickiness smoke instead of provider-kill smoke (default: 0)
+  MAYHEM_P43_SECONDARY_MODEL Secondary smoke-only model id for E13 (default: <model>-e13-helper)
   MAYHEM_P43_ARTIFACT        Real provider artifact path (default: ${DEFAULT_ARTIFACT})
   MAYHEM_P43_DELTA_DELAY_MS  Delay after early content deltas (default: 2500)
   MAYHEM_P43_DELTA_DELAY_COUNT Number of early content deltas to delay (default: 12 real, 1 shim)
   MAYHEM_P43_CHAT_MAX_TOKENS Streaming failover max_tokens (default: 128)
+  MAYHEM_P43_SESSION_OPEN_TIMEOUT_SECONDS Direct-session open timeout (default: 60 real E13, 30 shim E13, 3 provider-kill)
   MAYHEM_P43_RECEIPT_CHECKPOINT_TOKENS Receipt checkpoint token window (default: 32)
   MAYHEM_P43_RECEIPT_CHECKPOINT_MS Receipt checkpoint wall-clock window (default: 30000)
   MAYHEM_P43_LOCAL_DHT_HOST  Local LAN IP advertised to the Mac mini DHT peer
-  MAYHEM_P43_PEER_DHT_BOOTSTRAP Explicit peer DHT bootstrap list
-  MAYHEM_P43_USE_LOCAL_DHT   Start/use a temporary local HyperDHT bootstrap (default: 0)
-  MAYHEM_P43_USE_REMOTE_DHT  Start/use a temporary Mac mini HyperDHT bootstrap (default: 1)
-  MAYHEM_P43_USE_PUBLIC_DHT  Use default/public peer DHT bootstrap instead of private DHT (default: 0)
+  MAYHEM_P43_PEER_DHT_BOOTSTRAP Explicit peer DHT bootstrap list (debug override only)
+  MAYHEM_P43_USE_LOCAL_DHT   Start/use a temporary local HyperDHT bootstrap (debug override, default: 0)
+  MAYHEM_P43_USE_REMOTE_DHT  Start/use a temporary Mac mini HyperDHT bootstrap (debug override, default: 0)
+  MAYHEM_P43_USE_PUBLIC_DHT  Use default/public peer DHT bootstrap (default: 1)
   MAYHEM_P43_PROBE_SESSION_OPEN Also preflight throwaway direct sessions before gateway start (default: 0)
   MAYHEM_P43_KEEP_REMOTE     Keep remote run logs after cleanup (default: 1)
   MAYHEM_P43_KEEP_LOCAL      Keep local run evidence after cleanup (default: 1)
@@ -124,6 +127,12 @@ function envPositiveInt(name, fallback) {
     fail(`${name} must be a positive integer`);
   }
   return value;
+}
+
+function envFlag(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  return /^(1|true|yes)$/i.test(raw);
 }
 
 function safePathComponent(value) {
@@ -558,6 +567,8 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
     'Keep going until the token budget is exhausted; do not summarize or stop early.',
   ].join(' '),
   fileStem = 'gateway-provider-kill-stream',
+  metadata = null,
+  user = null,
 } = {}) {
   const rawPath = path.join(runDir, `${fileStem}.sse`);
   const summaryPath = path.join(runDir, `${fileStem}.json`);
@@ -577,16 +588,19 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
   let firstContentAt = null;
   let doneAt = null;
   try {
+    const body = {
+      model: modelId,
+      stream: true,
+      temperature: 0.4,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (metadata && Object.keys(metadata).length > 0) body.metadata = metadata;
+    if (user) body.user = user;
     const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: modelId,
-        stream: true,
-        temperature: 0.4,
-        max_tokens: maxTokens,
-        messages: [{ role: 'user', content: prompt }],
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     responseHeadersAt = Date.now();
@@ -662,6 +676,8 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
     ok: true,
     model: modelId,
     prompt,
+    metadata,
+    user,
     max_tokens: maxTokens,
     content: content.trim(),
     content_chars: content.trim().length,
@@ -1052,6 +1068,24 @@ function receiptIsFinal(entry) {
   return body.final === true || body.final_receipt === true;
 }
 
+async function fetchStoredReceipts(gatewayUrl) {
+  const receipts = await (await fetch(`${gatewayUrl}/mayhem/receipts`)).json();
+  return Array.isArray(receipts.data) ? receipts.data : [];
+}
+
+function newFinalReceiptForModel(beforeCount, receipts, modelId) {
+  const finals = receipts
+    .slice(beforeCount)
+    .filter((entry) => {
+      const body = storedReceiptBody(entry);
+      return receiptIsFinal(entry) && body.model_id === modelId;
+    });
+  if (finals.length !== 1) {
+    fail(`expected exactly one new final receipt for ${modelId}, got ${finals.length}`);
+  }
+  return { entry: finals[0], body: storedReceiptBody(finals[0]) };
+}
+
 function providerLogOutputTailProof(text, checkpointedOutputTokens) {
   let maxBufferedTokenIndex = -1;
   const tokenPattern = /live buffering token #(\d+)/g;
@@ -1351,6 +1385,11 @@ async function main() {
   const mayhemBin = path.join(ROOT, 'target/debug/mayhem');
   const mayhemEnclaveBin = path.join(ROOT, 'target/debug/mayhem-enclave');
   const modelId = process.env.MAYHEM_P43_MODEL || DEFAULT_MODEL;
+  const agentLoopMode = envFlag('MAYHEM_P43_AGENT_LOOP');
+  const secondaryModelId = process.env.MAYHEM_P43_SECONDARY_MODEL || `${modelId}-e13-helper`;
+  if (agentLoopMode && secondaryModelId === modelId) {
+    fail('MAYHEM_P43_SECONDARY_MODEL must differ from MAYHEM_P43_MODEL');
+  }
   const providerMode = (process.env.MAYHEM_P43_PROVIDER_MODE || 'real').trim();
   if (!['real', 'shim'].includes(providerMode)) fail('MAYHEM_P43_PROVIDER_MODE must be real or shim');
   const delayMs = Number.parseInt(process.env.MAYHEM_P43_DELTA_DELAY_MS || '2500', 10);
@@ -1405,6 +1444,13 @@ async function main() {
   artifact.artifact_root_kind = 'blake3_merkle_v1';
   artifact.weights_bytes = artifactMerkle.total_bytes;
   artifact.source_sha256 = artifactSha256;
+  let secondaryModel = null;
+  if (agentLoopMode) {
+    secondaryModel = structuredClone(model);
+    secondaryModel.model_id = secondaryModelId;
+    secondaryModel.family = `${secondaryModel.family || 'mayhem'}-e13-helper`;
+    catalog.models.push(secondaryModel);
+  }
   const tempCatalogDir = path.join(runDir, 'catalog');
   await fsp.mkdir(tempCatalogDir, { recursive: true });
   const tempCatalogPath = path.join(tempCatalogDir, 'models.json');
@@ -1543,8 +1589,8 @@ async function main() {
 
   const explicitPeerDhtBootstrap = (process.env.MAYHEM_P43_PEER_DHT_BOOTSTRAP || '').trim();
   const useLocalDht = /^(1|true|yes)$/i.test(process.env.MAYHEM_P43_USE_LOCAL_DHT || '');
-  const usePublicDht = /^(1|true|yes)$/i.test(process.env.MAYHEM_P43_USE_PUBLIC_DHT || '');
-  const useRemoteDht = !useLocalDht && !usePublicDht && /^(1|true|yes)?$/i.test(process.env.MAYHEM_P43_USE_REMOTE_DHT || '1');
+  const usePublicDht = /^(1|true|yes)$/i.test(process.env.MAYHEM_P43_USE_PUBLIC_DHT || '1');
+  const useRemoteDht = !useLocalDht && !usePublicDht && /^(1|true|yes)$/i.test(process.env.MAYHEM_P43_USE_REMOTE_DHT || '');
   let localPeerDht = null;
   let peerDhtBootstrap = explicitPeerDhtBootstrap;
   if (!peerDhtBootstrap && useLocalDht) {
@@ -1587,7 +1633,7 @@ async function main() {
   } else if (peerDhtBootstrap) {
     log(`using explicit peer DHT bootstrap ${peerDhtBootstrap}`);
   } else {
-    log(`using default peer DHT bootstrap from ${localPeerDhtHost(remote.host)}`);
+    log('using built-in public/default HyperDHT bootstrap nodes (no peer DHT override)');
   }
 
   log('starting local Pear dev-net');
@@ -1643,6 +1689,20 @@ async function main() {
     binaryHash,
   });
   const roomId = (await b3(Buffer.from(`${enclaveId}${adminPubkey[1]}${roomNonce}`, 'utf8'))).toString('hex').slice(0, 32);
+  const secondaryRoomNonce = `p4.3-e13-${tag}`;
+  const secondaryEnclaveId = agentLoopMode
+    ? await catalogEnclaveId({
+      adminPubkey: adminPubkey[1],
+      modelId: secondaryModelId,
+      artifactRoot: artifactMerkle.root,
+      artifactSidecarRoots,
+      manifestHash,
+      binaryHash,
+    })
+    : null;
+  const secondaryRoomId = agentLoopMode
+    ? (await b3(Buffer.from(`${secondaryEnclaveId}${adminPubkey[1]}${secondaryRoomNonce}`, 'utf8'))).toString('hex').slice(0, 32)
+    : null;
 
   log('seeding admin-created enclave, price, and room');
   const adminHome = path.join(runDir, 'admin-home');
@@ -1702,6 +1762,43 @@ async function main() {
     '--nonce', roomNonce,
     '--label', 'phase4-provider-kill',
   ]);
+  if (agentLoopMode) {
+    adminRun('admin-set-model-ref-secondary', [
+      'set-model-ref',
+      '--model', secondaryModelId,
+      '--rate-map-json', rateMapJson,
+    ]);
+    adminRun('admin-register-enclave-secondary', [
+      'register-enclave',
+      '--enclave-id', secondaryEnclaveId,
+      '--model', secondaryModelId,
+      '--backend', 'llama.cpp',
+      '--artifact-root', artifactMerkle.root,
+      '--artifact-root-kind', artifact.artifact_root_kind,
+      '--artifact-repo', artifact.source.repo,
+      '--artifact-revision', artifact.source.revision,
+      '--artifact-path', artifact.path,
+      '--source-sha256', artifactSha256,
+      '--catalog-path', tempCatalogPath,
+      '--dev-skip-catalog-verify',
+      '--manifest-hash', manifestHash,
+      '--binary-hash', binaryHash,
+      '--caps-json', '{"chat":true,"tools":true,"json":true,"ctx":8192}',
+    ]);
+    adminRun('admin-set-price-secondary', [
+      'set-price',
+      '--enclave-id', secondaryEnclaveId,
+      '--rate-map-json', rateMapJson,
+      '--effective-at', '0',
+    ]);
+    adminRun('admin-open-room-secondary', [
+      'open-room',
+      '--enclave-id', secondaryEnclaveId,
+      '--model', secondaryModelId,
+      '--nonce', secondaryRoomNonce,
+      '--label', 'phase4-e13-agent-loop-helper',
+    ]);
+  }
   const gatewayCreditMu = 10_000_000;
   const fiatDepositRef = (await b3(Buffer.from(`phase4-fiat-credit:${tag}:${userPubkey[1]}`, 'utf8'))).toString('hex');
   adminRun('admin-fiat-deposit', [
@@ -1762,7 +1859,17 @@ async function main() {
     await startRemoteProvider({ ...providerCommon, label: 'a' }),
     await startRemoteProvider({ ...providerCommon, label: 'b' }),
   ];
-  const providerPubkeys = providers.map((provider) => provider.pubkey);
+  const secondaryProvider = agentLoopMode
+    ? await startRemoteProvider({
+      ...providerCommon,
+      label: 'c',
+      enclaveId: secondaryEnclaveId,
+      delayMs: 0,
+    })
+    : null;
+  const allProviders = secondaryProvider ? [...providers, secondaryProvider] : providers;
+  const providerPubkeys = allProviders.map((provider) => provider.pubkey);
+  const primaryProviderPubkeys = providers.map((provider) => provider.pubkey);
 
   const remoteClientBridge = await startRemoteClientBridge({
     label: 'client',
@@ -1809,6 +1916,10 @@ async function main() {
   const gatewayHome = path.join(runDir, 'gateway-home');
   const receiptCheckpointTokens = envPositiveInt('MAYHEM_P43_RECEIPT_CHECKPOINT_TOKENS', 32);
   const receiptCheckpointMs = envPositiveInt('MAYHEM_P43_RECEIPT_CHECKPOINT_MS', 30000);
+  const sessionOpenTimeoutSeconds = envPositiveInt(
+    'MAYHEM_P43_SESSION_OPEN_TIMEOUT_SECONDS',
+    agentLoopMode ? (providerMode === 'real' ? 60 : 30) : 3
+  );
   await fsp.mkdir(path.join(gatewayHome, 'stores'), { recursive: true });
   const gatewayStore = path.join(ROOT, 'intercom/stores/mayhem-devnet-joiner-a');
   const gatewayStoreLink = path.join(gatewayHome, 'stores/main');
@@ -1822,7 +1933,7 @@ async function main() {
       '--rpc-url', adminRpcUrl,
       '--sc-bridge-url', userScBridge.url,
       '--sc-bridge-token', scToken,
-      '--session-open-timeout-seconds', '3',
+      '--session-open-timeout-seconds', String(sessionOpenTimeoutSeconds),
       '--session-ttft-timeout-seconds', providerMode === 'real' ? '300' : '60',
       '--session-frame-timeout-seconds', '15',
       '--receipt-checkpoint-tokens', String(receiptCheckpointTokens),
@@ -1836,10 +1947,189 @@ async function main() {
   );
   cleanupState.localChildren.push(gateway);
   await waitHttp(`${gatewayUrl}/mayhem/status`, 120_000, 'local gateway', async () => gateway.exitCode === null);
-  const routeInfo = await waitForGatewayRoutes(gatewayUrl, modelId, providerPubkeys, 120_000);
+  const routeInfo = await waitForGatewayRoutes(gatewayUrl, modelId, primaryProviderPubkeys, 120_000);
+  const secondaryRouteInfo = agentLoopMode
+    ? await waitForGatewayRoutes(gatewayUrl, secondaryModelId, [secondaryProvider.pubkey], 120_000)
+    : null;
+
+  const chatMaxTokens = envPositiveInt('MAYHEM_P43_CHAT_MAX_TOKENS', agentLoopMode ? 32 : 128);
+  if (agentLoopMode) {
+    log('running E13 multi-model conversation affinity smoke');
+    const conversationId = process.env.MAYHEM_P43_CONVERSATION_ID || `e13-agent-loop-${tag}`;
+    const agentUser = process.env.MAYHEM_P43_AGENT_USER || `e13-user-${tag}`;
+    async function runAgentTurn(name, turnModelId, prompt) {
+      const before = await fetchStoredReceipts(gatewayUrl);
+      const stream = await runStreamingChatSmoke(gatewayUrl, turnModelId, runDir, {
+        timeoutMs: providerMode === 'real' ? 240_000 : 90_000,
+        maxTokens: chatMaxTokens,
+        prompt,
+        fileStem: `e13-${name}`,
+        metadata: { conversation_id: conversationId },
+        user: agentUser,
+      });
+      const after = await fetchStoredReceipts(gatewayUrl);
+      const { entry, body } = newFinalReceiptForModel(before.length, after, turnModelId);
+      return {
+        name,
+        model_id: turnModelId,
+        provider: body.provider,
+        enclave_id: body.enclave_id,
+        session_id: body.session_id,
+        rail: body.rail,
+        price_ver: body.price_ver,
+        usage: body.usage,
+        mu_owed_cum: body.mu_owed_cum,
+        receipt_seq: body.seq,
+        receipt_index: after.indexOf(entry),
+        receipts_before: before.length,
+        receipts_after: after.length,
+        stream,
+      };
+    }
+
+    const primaryFirst = await runAgentTurn(
+      'primary-1',
+      modelId,
+      'Agent turn one. Answer with one concise sentence using the word mayhem and the color red.'
+    );
+    const primarySecond = await runAgentTurn(
+      'primary-2',
+      modelId,
+      'Agent turn two in the same conversation. Answer with one concise sentence using mayhem and the color green.'
+    );
+    const helperTurn = await runAgentTurn(
+      'helper-model',
+      secondaryModelId,
+      'Switch models for one helper step. Answer with one concise sentence using mayhem and the color yellow.'
+    );
+
+    const stickyProvider = allProviders.find((provider) => provider.pubkey === primaryFirst.provider);
+    if (!stickyProvider) fail(`sticky provider ${primaryFirst.provider} was not one of the live providers`);
+    log(`killing sticky primary provider ${stickyProvider.label} before final primary turn`);
+    await ssh(remote, passFile, `kill -9 ${Number(stickyProvider.providerPid)} >/dev/null 2>&1 || true`);
+    await sleep(1_000);
+    const primaryAfterKill = await runAgentTurn(
+      'primary-after-kill',
+      modelId,
+      'Agent turn three after the sticky provider died. Answer with one concise sentence using mayhem and the color purple.'
+    );
+
+    const turns = [primaryFirst, primarySecond, helperTurn, primaryAfterKill];
+    const sessionIds = new Set(turns.map((turn) => turn.session_id));
+    const finalReceipts = await fetchStoredReceipts(gatewayUrl);
+    const assertions = {
+      same_model_affinity: primarySecond.provider === primaryFirst.provider,
+      helper_uses_secondary_provider: helperTurn.provider === secondaryProvider.pubkey,
+      helper_did_not_use_primary_provider: !primaryProviderPubkeys.includes(helperTurn.provider),
+      post_kill_switched_provider:
+        primaryAfterKill.provider !== primaryFirst.provider &&
+        primaryProviderPubkeys.includes(primaryAfterKill.provider),
+      all_turns_final_receipted: turns.every((turn) => turn.receipt_seq >= 1),
+      sessions_are_distinct: sessionIds.size === turns.length,
+      rails_are_fiat: turns.every((turn) => turn.rail === 'fiat'),
+      gateway_process_stayed_running: gateway.exitCode === null,
+    };
+    for (const [name, ok] of Object.entries(assertions)) {
+      if (!ok) fail(`E13 assertion failed: ${name}`);
+    }
+
+    const report = {
+      ok: true,
+      mode: 'e13-agent-loop',
+      tag,
+      run_dir: path.relative(ROOT, runDir),
+      local: {
+        gateway_url: gatewayUrl,
+        admin_rpc_url: adminRpcUrl,
+        user_sc_bridge_label: userScBridge.label,
+        user_sc_bridge_url: userScBridge.url,
+        user_sc_bridge_remote_url: userScBridge.remote?.scBridgeUrl || null,
+        user_sc_bridge_tunnel_log: userScBridge.tunnel_log || null,
+        subnet_channel: subnetChannel,
+        peer_dht_bootstrap: peerDhtBootstrap,
+      },
+      remote: {
+        host: remote.host,
+        root: remoteRoot,
+        run_dir: remoteRun,
+        client_bridge: userScBridge.remote ? {
+          label: userScBridge.remote.label,
+          pubkey: userScBridge.remote.pubkey,
+          peer_pid: userScBridge.remote.peerPid,
+          peer_log: userScBridge.remote.peerLog,
+        } : null,
+      },
+      admin: {
+        pubkey: adminPubkey[1],
+        rules_hash: rulesHash,
+        primary: { model_id: modelId, enclave_id: enclaveId, room_nonce: roomNonce, room_id: roomId },
+        secondary: {
+          model_id: secondaryModelId,
+          enclave_id: secondaryEnclaveId,
+          room_nonce: secondaryRoomNonce,
+          room_id: secondaryRoomId,
+        },
+        reports: Object.fromEntries(Object.entries(adminReports).map(([key, value]) => [key, {
+          submitted: value.submitted,
+          tx_type: value.tx_type,
+          command: value.command,
+        }])),
+      },
+      enclave: {
+        artifact_name: artifactName,
+        artifact_root: artifactMerkle.root,
+        artifact_chunks: artifactMerkle.chunks,
+        artifact_bytes: artifactMerkle.total_bytes,
+        artifact_sha256: artifactSha256,
+        manifest_hash: manifestHash,
+        binary_hash: binaryHash,
+        binary_sha256: binarySha256,
+      },
+      providers: allProviders.map((provider) => ({
+        label: provider.label,
+        pubkey: provider.pubkey,
+        peer_pid: provider.peerPid,
+        provider_pid: provider.providerPid,
+        provider_log: provider.providerLog,
+        self_test: provider.startup.self_test,
+        rooms: provider.startup.rooms,
+        features: provider.startup.features,
+      })),
+      route_candidates: {
+        primary: routeInfo.routes,
+        secondary: secondaryRouteInfo.routes,
+      },
+      conversation: {
+        conversation_id: conversationId,
+        user: agentUser,
+        sticky_provider: {
+          label: stickyProvider.label,
+          pubkey: stickyProvider.pubkey,
+          provider_pid: stickyProvider.providerPid,
+        },
+        turns,
+      },
+      receipts: {
+        stored_count: finalReceipts.length,
+        final_count: finalReceipts.filter(receiptIsFinal).length,
+      },
+      assertions,
+    };
+    const reportPath = path.join(runDir, 'report.json');
+    writeJson(reportPath, report);
+    console.log(JSON.stringify(report, null, 2));
+    await cleanup({
+      remote,
+      passFile,
+      remotePids: cleanupState.remotePids,
+      localChildren: cleanupState.localChildren,
+      devnetLog,
+      remoteRun,
+    });
+    return;
+  }
 
   log('starting streaming gateway request, then killing the first provider after checkpoint ack');
-  const chatMaxTokens = envPositiveInt('MAYHEM_P43_CHAT_MAX_TOKENS', 128);
   const requestStartedAt = Date.now();
   let streamCompleted = false;
   const killPromise = waitAndKillAfterCheckpointAck(
