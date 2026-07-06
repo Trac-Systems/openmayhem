@@ -6591,6 +6591,7 @@ struct LiveDirectChatSession {
     state: SharedState,
     model: GatewayModel,
     request: ChatCompletionRequest,
+    options: GatewayRequestOptions,
     invocation: GatewaySessionInvocation,
     route: Option<GatewayRouteCandidate>,
     attempt_started: Instant,
@@ -6679,6 +6680,7 @@ async fn prepare_live_direct_chat_session(
                     state,
                     model,
                     request,
+                    options,
                     invocation,
                     route: route.cloned(),
                     attempt_started,
@@ -6871,36 +6873,141 @@ async fn run_live_direct_chat_sse(
             let _ = send_sse_done(&tx).await;
         }
         Err(err) => {
-            if let Some(partial) = err.partial.as_ref() {
-                let _ = session.state.record_partial_provider_receipt(
-                    &session.model,
-                    &session.request,
-                    &session.invocation,
-                    partial,
-                );
+            let recovered = if err.retryable && err.partial.is_some() {
+                recover_live_direct_chat_after_partial(&mut session, &tx, err).await
+            } else {
+                Err(err)
+            };
+            match recovered {
+                Ok(()) => {
+                    let _ = send_sse_done(&tx).await;
+                }
+                Err(err) => {
+                    record_route_observation(
+                        &session.state,
+                        session.route.as_ref(),
+                        observation_sample_from_error(session.attempt_started.elapsed()),
+                    );
+                    let _ = session
+                        .bridge
+                        .session_send(
+                            &session.provider,
+                            &session.invocation.session_id,
+                            json!({
+                                "t": "s.close",
+                                "v": 1,
+                                "session_id": session.invocation.session_id,
+                                "reason": "stream_error",
+                            }),
+                        )
+                        .await;
+                    let _ = send_sse_error(&tx, &err.message).await;
+                    let _ = send_sse_done(&tx).await;
+                }
             }
-            record_route_observation(
-                &session.state,
-                session.route.as_ref(),
-                observation_sample_from_error(session.attempt_started.elapsed()),
-            );
-            let _ = session
-                .bridge
-                .session_send(
-                    &session.provider,
-                    &session.invocation.session_id,
-                    json!({
-                        "t": "s.close",
-                        "v": 1,
-                        "session_id": session.invocation.session_id,
-                        "reason": "stream_error",
-                    }),
-                )
-                .await;
-            let _ = send_sse_error(&tx, &err.message).await;
-            let _ = send_sse_done(&tx).await;
         }
     }
+}
+
+async fn recover_live_direct_chat_after_partial(
+    session: &mut LiveDirectChatSession,
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    mut err: GatewaySessionError,
+) -> Result<(), GatewaySessionError> {
+    let partial = err
+        .partial
+        .take()
+        .map(|partial| *partial)
+        .ok_or_else(|| GatewaySessionError::new(err.message.clone()))?;
+    session
+        .state
+        .record_partial_provider_receipt(
+            &session.model,
+            &session.request,
+            &session.invocation,
+            &partial,
+        )
+        .map_err(|err| GatewaySessionError::new(err.message))?;
+    if let Some(route) = session.route.as_ref() {
+        session.state.cool_route_provider(route, now_millis_u64());
+    }
+    record_route_observation(
+        &session.state,
+        session.route.as_ref(),
+        observation_sample_from_error(session.attempt_started.elapsed()),
+    );
+    let _ = session
+        .bridge
+        .session_send(
+            &session.provider,
+            &session.invocation.session_id,
+            json!({
+                "t": "s.close",
+                "v": 1,
+                "session_id": session.invocation.session_id,
+                "reason": "redispatch",
+            }),
+        )
+        .await;
+
+    let partials = vec![partial];
+    let retry_request = redispatch_request_with_partials(&session.request, &partials);
+    let GatewaySessionRun {
+        result,
+        invocation,
+        metering_request,
+        metering_output,
+    } = run_chat_with_route_retry(
+        &session.state,
+        &session.model,
+        &retry_request,
+        session.options,
+    )
+    .await
+    .map_err(|err| GatewaySessionError::new(err.message))?;
+    let receipt = session
+        .state
+        .meter_chat_session(
+            &session.model,
+            &metering_request,
+            &metering_output,
+            &invocation,
+            result.provider_receipt.as_ref(),
+        )
+        .map_err(|err| GatewaySessionError::new(err.message))?;
+    session
+        .state
+        .maybe_run_canary_probe_after_session(&session.model, &invocation)
+        .await;
+
+    let mut output = result.output.clone();
+    if output.tool_call.is_none() {
+        let content = output.content.take().unwrap_or_default();
+        output.content = Some(strip_live_streamed_prefix(
+            &content,
+            &partial_text(&partials),
+        ));
+    }
+    add_partial_usage_to_output(&mut output, &partials);
+    let mayhem_meta = ResponseMayhemMeta {
+        backend: &result.backend,
+        direct_session: result.direct_session,
+        billable: !session.state.dev_session_shim,
+        dev_session: session.state.dev_session_shim,
+        hedge: invocation.hedge.clone(),
+    };
+    let _ = send_live_chat_tail(
+        tx,
+        &session.id,
+        session.created,
+        &session.model.id,
+        &output,
+        Some(&receipt),
+        mayhem_meta,
+        session.include_usage,
+    )
+    .await;
+    Ok(())
 }
 
 async fn run_live_direct_chat_sse_inner(
@@ -7302,6 +7409,135 @@ async fn run_live_direct_chat_sse_inner(
         let _ = send_sse_value(tx, usage_chunk).await;
     }
     Ok(())
+}
+
+async fn send_live_chat_tail(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    id: &str,
+    created: u64,
+    model_id: &str,
+    output: &ChatOutput,
+    receipt: Option<&StoredReceipt>,
+    mayhem_meta: ResponseMayhemMeta<'_>,
+    include_usage: bool,
+) -> bool {
+    if let Some(tool_call) = &output.tool_call {
+        if !send_sse_value(
+            tx,
+            chat_chunk(
+                id,
+                created,
+                model_id,
+                json!({ "tool_calls": [tool_call_value(tool_call)] }),
+                None,
+                None,
+            ),
+        )
+        .await
+        {
+            return false;
+        }
+    } else if let Some(content) = &output.content {
+        for part in stream_parts(content) {
+            if !send_sse_value(
+                tx,
+                chat_chunk(
+                    id,
+                    created,
+                    model_id,
+                    json!({ "content": part }),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            {
+                return false;
+            }
+        }
+    }
+
+    let mut finish_chunk = chat_chunk(
+        id,
+        created,
+        model_id,
+        json!({}),
+        Some(output.finish_reason.as_str()),
+        None,
+    );
+    if !output.artifacts.is_empty() {
+        finish_chunk["mayhem"] = json!({
+            "artifacts": artifact_summaries(&output.artifacts),
+        });
+    }
+    if !send_sse_value(tx, finish_chunk).await {
+        return false;
+    }
+    if include_usage {
+        let usage_chunk = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_id,
+            "choices": [],
+            "usage": output.usage,
+            "mayhem": {
+                "backend": mayhem_meta.backend,
+                "direct_session": mayhem_meta.direct_session,
+                "billable": mayhem_meta.billable,
+                "dev_session": mayhem_meta.dev_session,
+                "artifacts": artifact_summaries(&output.artifacts),
+                "hedge": {
+                    "requested": mayhem_meta.hedge.requested,
+                    "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
+                    "actual_probe_count": mayhem_meta.hedge.actual_probe_count,
+                    "winner_provider": mayhem_meta.hedge.winner_provider,
+                    "winner_ttft_ms": mayhem_meta.hedge.winner_ttft_ms,
+                },
+                "receipt": receipt.map(receipt_summary),
+            },
+        });
+        return send_sse_value(tx, usage_chunk).await;
+    }
+    true
+}
+
+fn strip_live_streamed_prefix(candidate: &str, streamed_prefix: &str) -> String {
+    if candidate.is_empty() || streamed_prefix.is_empty() {
+        return candidate.to_owned();
+    }
+    if let Some(stripped) = candidate.strip_prefix(streamed_prefix) {
+        return stripped.to_owned();
+    }
+    let max_overlap = candidate.len().min(streamed_prefix.len());
+    for overlap in (1..=max_overlap).rev() {
+        if !candidate.is_char_boundary(overlap) {
+            continue;
+        }
+        let start = streamed_prefix.len().saturating_sub(overlap);
+        if !streamed_prefix.is_char_boundary(start) {
+            continue;
+        }
+        if streamed_prefix[start..] == candidate[..overlap] {
+            return candidate[overlap..].to_owned();
+        }
+    }
+    candidate.to_owned()
+}
+
+fn add_partial_usage_to_output(output: &mut ChatOutput, partials: &[GatewaySessionPartial]) {
+    let partial_completion = partials
+        .iter()
+        .map(|partial| partial.output.usage.completion_tokens)
+        .sum::<u64>();
+    output.usage.completion_tokens = output
+        .usage
+        .completion_tokens
+        .saturating_add(partial_completion);
+    output.usage.total_tokens = output
+        .usage
+        .prompt_tokens
+        .saturating_add(output.usage.completion_tokens);
 }
 
 async fn send_sse_value(
@@ -11691,6 +11927,17 @@ mod tests {
         assert_eq!(watchdog.throughput_floor_violation(1, 999), None);
         assert_eq!(watchdog.throughput_floor_violation(1, 1_000), Some(1.0));
         assert_eq!(watchdog.throughput_floor_violation(5, 1_000), None);
+    }
+
+    #[test]
+    fn live_stream_recovery_strips_already_sent_prefix_without_eating_new_text() {
+        assert_eq!(strip_live_streamed_prefix("hello world", "hello "), "world");
+        assert_eq!(strip_live_streamed_prefix("world", "hello "), "world");
+        assert_eq!(strip_live_streamed_prefix("lo world", "hello"), " world");
+        assert_eq!(
+            strip_live_streamed_prefix("fresh continuation", "hello "),
+            "fresh continuation"
+        );
     }
 
     #[test]
