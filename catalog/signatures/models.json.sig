@@ -4,6 +4,6 @@
   "signed_path": "catalog/models.json",
   "key_id": "mayhem-catalog-tracnetwork-v1",
   "public_key": "aa0a2667d74e31c984a5e4ba34c4bd334f001a640b4ecf807d6812e14e817f24",
-  "blake3": "c1fec7a06d5e9bc30e1e6d482744fe0f99cdbcc4da5ccd024002c1cc362d46ef",
-  "sig": "e255039acb049990e22f6f23001276e24cf0a0b4e4d382e9e61438266cd0e81e2fe9f5513166442327d572e657c74c9ce031fc3b75bd2d79db7c4f9a64defa07"
+  "blake3": "9e0da502c9649ec6449152e987a651aeb13cb45993a3dc24803620411bc4bf7e",
+  "sig": "d247aa108adef5851f9fb7e9210c3e4dd606096bb2d3bbc45a03cf6aa5d0190201b6dfe2236d9a44a9c5b6195580e67c7f7b2af3b719c94deeda5541eac25002"
 }

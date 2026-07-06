@@ -288,6 +288,8 @@ pub struct GenerateRequest {
     pub height: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_scale: Option<f32>,
     #[serde(default)]
     pub ignore_eos: bool,
 }
@@ -346,6 +348,7 @@ impl GenerateRequest {
             width: None,
             height: None,
             steps: None,
+            cfg_scale: None,
             ignore_eos: false,
         }
     }
@@ -889,14 +892,15 @@ mod stable_diffusion_cpp_backend {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        validate_load_config, verify_artifact, ArtifactChunk, ArtifactFormat, ArtifactSink,
-        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
-        LoadedModelInfo, Result, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
+        stable_diffusion_payload_path, validate_load_config, verify_artifact, ArtifactChunk,
+        ArtifactFormat, ArtifactSink, EngineBackend, EngineError, FinishReason, GenerateOutput,
+        GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenSink, Tokenization,
+        UsageCounters, DEFAULT_SEED,
     };
 
     const DEFAULT_IMAGE_WIDTH: u32 = 512;
     const DEFAULT_IMAGE_HEIGHT: u32 = 512;
-    const DEFAULT_IMAGE_STEPS: u32 = 4;
+    const DEFAULT_IMAGE_STEPS: u32 = 1;
     const MAX_IMAGE_COUNT: u32 = 4;
 
     #[derive(Debug)]
@@ -991,7 +995,12 @@ mod stable_diffusion_cpp_backend {
                 .unwrap_or(DEFAULT_IMAGE_HEIGHT)
                 .clamp(64, 2048);
             let steps = request.steps.unwrap_or(DEFAULT_IMAGE_STEPS).clamp(1, 150);
+            let cfg_scale = request.cfg_scale.unwrap_or(1.0).clamp(0.0, 50.0);
             let seed_base = request.seed.unwrap_or(DEFAULT_SEED);
+            let model_path = stable_diffusion_payload_path(&config.artifact.path)?;
+            let backend = env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
 
             for image_index in 0..image_count {
                 let output_path = stable_diffusion_output_path(image_index);
@@ -999,28 +1008,35 @@ mod stable_diffusion_cpp_backend {
                     fs::remove_file(&output_path)?;
                 }
                 let seed = seed_base.wrapping_add(image_index);
-                let output = Command::new(&self.binary)
+                let mut command = Command::new(&self.binary);
+                command
                     .arg("-m")
-                    .arg(&config.artifact.path)
+                    .arg(&model_path)
                     .arg("-p")
                     .arg(&request.prompt)
                     .arg("-o")
                     .arg(&output_path)
                     .arg("--steps")
                     .arg(steps.to_string())
+                    .arg("--cfg-scale")
+                    .arg(cfg_scale.to_string())
                     .arg("--seed")
                     .arg(seed.to_string())
                     .arg("--width")
                     .arg(width.to_string())
                     .arg("--height")
                     .arg(height.to_string())
-                    .output()
-                    .map_err(|err| {
-                        EngineError::StableDiffusionCpp(format!(
-                            "starting {} failed: {err}",
-                            self.binary.display()
-                        ))
-                    })?;
+                    .arg("--rng")
+                    .arg("cpu");
+                if let Some(backend) = &backend {
+                    command.arg("--backend").arg(backend);
+                }
+                let output = command.output().map_err(|err| {
+                    EngineError::StableDiffusionCpp(format!(
+                        "starting {} failed: {err}",
+                        self.binary.display()
+                    ))
+                })?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
                     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -1094,13 +1110,19 @@ mod stable_diffusion_tests {
             &sd_cli,
             r#"#!/bin/sh
 out=""
+cfg=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-o" ]; then
     shift
     out="$1"
   fi
+  if [ "$1" = "--cfg-scale" ]; then
+    shift
+    cfg="$1"
+  fi
   shift
 done
+[ "$cfg" = "1.25" ] || exit 23
 printf '\211PNG\r\n\032\n' > "$out"
 "#,
         )
@@ -1118,6 +1140,7 @@ printf '\211PNG\r\n\032\n' > "$out"
         request.width = Some(64);
         request.height = Some(64);
         request.steps = Some(2);
+        request.cfg_scale = Some(1.25);
         request.seed = Some(7);
         let mut artifacts = Vec::new();
         let mut token_sink = NoopTokenSink;
@@ -1134,6 +1157,45 @@ printf '\211PNG\r\n\032\n' > "$out"
         assert_eq!(artifacts[0].bytes, b"\x89PNG\r\n\x1a\n");
         assert!(artifacts[0].final_chunk);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_diffusion_cpp_backend_real_model_smoke_when_enabled() {
+        if std::env::var_os("MAYHEM_RUN_STABLE_DIFFUSION_CPP_REAL").is_none() {
+            return;
+        }
+        let binary = std::env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_BIN")
+            .map(PathBuf::from)
+            .expect("MAYHEM_STABLE_DIFFUSION_CPP_BIN must point to sd-cli");
+        let model = std::env::var_os("MAYHEM_STABLE_DIFFUSION_MODEL")
+            .map(PathBuf::from)
+            .expect("MAYHEM_STABLE_DIFFUSION_MODEL must point to a checkpoint");
+
+        let mut backend = StableDiffusionCppBackend::with_binary(binary);
+        backend
+            .load(LoadConfig::stable_diffusion_checkpoint(model))
+            .unwrap();
+        let mut request = GenerateRequest::new("a blue glass sphere on a white table");
+        request.artifact_count = Some(1);
+        request.width = Some(512);
+        request.height = Some(512);
+        request.steps = Some(1);
+        request.cfg_scale = Some(1.0);
+        request.seed = Some(11);
+
+        let mut artifacts = Vec::new();
+        let mut token_sink = NoopTokenSink;
+        backend
+            .generate_with_artifacts(request, &mut token_sink, &mut |chunk| {
+                artifacts.push(chunk);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].content_type, "image/png");
+        assert!(artifacts[0].bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(artifacts[0].bytes.len() > 1024);
     }
 
     fn stable_empty_safetensors() -> Vec<u8> {

@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -141,6 +142,111 @@ impl GatewaySessionBackend for ImageGenerationDirectSessionBackend {
     ) -> GatewayImageGenerationFuture<'a> {
         Box::pin(async move {
             let image = b"\x89PNG mayhem image".to_vec();
+            let usage = image_usage_for_test(request);
+            let provider_receipt =
+                signed_image_provider_receipt(model, request, invocation, &usage)?;
+            Ok(GatewayImageGenerationResult {
+                output: ImageGenerationOutput {
+                    artifacts: vec![GatewayArtifactOutput {
+                        id: "image-1".to_owned(),
+                        content_type: "image/png".to_owned(),
+                        blake3: blake3::hash(&image).to_hex().to_string(),
+                        bytes: image,
+                    }],
+                    usage,
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: Some(provider_receipt),
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RealSdCliImageGenerationBackend;
+
+impl GatewaySessionBackend for RealSdCliImageGenerationBackend {
+    fn name(&self) -> &str {
+        "test-real-sd-cli"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_image_generation<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ImageGenerationRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let count = request.n.unwrap_or(1).clamp(1, 4);
+            if count != 1 {
+                return Err(GatewaySessionError::new(
+                    "real sd-cli test backend only supports n=1",
+                ));
+            }
+            let binary = std::env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_BIN")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    GatewaySessionError::new("MAYHEM_STABLE_DIFFUSION_CPP_BIN is required")
+                })?;
+            let model_path = std::env::var_os("MAYHEM_STABLE_DIFFUSION_MODEL")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    GatewaySessionError::new("MAYHEM_STABLE_DIFFUSION_MODEL is required")
+                })?;
+            let tempdir = tempfile::tempdir()
+                .map_err(|err| GatewaySessionError::new(format!("tempdir failed: {err}")))?;
+            let output_path = tempdir.path().join("image.png");
+            let (width, height) = image_size_for_test(request);
+            let mut command = tokio::process::Command::new(binary);
+            command
+                .arg("-m")
+                .arg(model_path)
+                .arg("-p")
+                .arg(&request.prompt)
+                .arg("-o")
+                .arg(&output_path)
+                .arg("--steps")
+                .arg(image_steps_for_test(request).to_string())
+                .arg("--cfg-scale")
+                .arg(image_cfg_scale_for_test(request).to_string())
+                .arg("--seed")
+                .arg(request.seed.unwrap_or(42).to_string())
+                .arg("--width")
+                .arg(width.to_string())
+                .arg("--height")
+                .arg(height.to_string())
+                .arg("--rng")
+                .arg("cpu")
+                .arg("--disable-image-metadata");
+            if let Some(backend) = std::env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND") {
+                if !backend.is_empty() {
+                    command.arg("--backend").arg(backend);
+                }
+            }
+            let output = command.output().await.map_err(|err| {
+                GatewaySessionError::new(format!("starting real sd-cli failed: {err}"))
+            })?;
+            if !output.status.success() {
+                return Err(GatewaySessionError::new(format!(
+                    "real sd-cli exited with {}; stderr={:?}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            let image = std::fs::read(&output_path).map_err(|err| {
+                GatewaySessionError::new(format!("reading real sd-cli output failed: {err}"))
+            })?;
             let usage = image_usage_for_test(request);
             let provider_receipt =
                 signed_image_provider_receipt(model, request, invocation, &usage)?;
@@ -845,6 +951,7 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
         "n": 1,
         "size": "64x64",
         "steps": 3,
+        "cfg_scale": 1.25,
         "seed": 9,
         "response_format": "b64_json"
     });
@@ -878,6 +985,49 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.usage.get(USAGE_IMAGE), 1);
     assert_eq!(receipt.body.usage.get(USAGE_STEP), 3);
     assert_eq!(receipt.body.mu_owed_cum, 506);
+}
+
+#[tokio::test]
+async fn image_generation_endpoint_real_sd_cli_records_receipt_when_enabled() {
+    if std::env::var_os("MAYHEM_RUN_STABLE_DIFFUSION_CPP_REAL").is_none() {
+        return;
+    }
+    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+        .with_session_backend(Arc::new(RealSdCliImageGenerationBackend));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/image-fixture",
+        "prompt": "a red cube on a white table, simple studio photo",
+        "n": 1,
+        "size": "512x512",
+        "steps": 1,
+        "cfg_scale": 1.0,
+        "seed": 7,
+        "response_format": "b64_json"
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/images/generations", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let encoded = body["data"][0]["b64_json"]
+        .as_str()
+        .expect("b64_json image");
+    let image = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("image is base64");
+    assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(image.len() > 1024);
+    assert_eq!(body["usage"][USAGE_IMAGE], 1);
+    assert_eq!(body["usage"][USAGE_STEP], 1);
+    assert_eq!(body["mayhem"]["backend"], "test-real-sd-cli");
+    assert_eq!(body["mayhem"]["receipt"]["rail"], "fiat");
+
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.body.usage.get(USAGE_IMAGE), 1);
+    assert_eq!(receipt.body.usage.get(USAGE_STEP), 1);
+    assert_eq!(receipt.body.mu_owed_cum, 502);
 }
 
 #[tokio::test]
@@ -1727,11 +1877,30 @@ fn signed_image_provider_receipt(
 
 fn image_usage_for_test(request: &ImageGenerationRequest) -> ReceiptUsage {
     let images = u64::from(request.n.unwrap_or(1).clamp(1, 4));
-    let steps = request.steps.unwrap_or(4).clamp(1, 150);
+    let steps = image_steps_for_test(request);
     ReceiptUsage::from_units([
         (USAGE_IMAGE, images),
         (USAGE_STEP, images.saturating_mul(steps)),
     ])
+}
+
+fn image_steps_for_test(request: &ImageGenerationRequest) -> u64 {
+    request.steps.unwrap_or(1).clamp(1, 150)
+}
+
+fn image_cfg_scale_for_test(request: &ImageGenerationRequest) -> f32 {
+    request.cfg_scale.unwrap_or(1.0).clamp(0.0, 50.0)
+}
+
+fn image_size_for_test(request: &ImageGenerationRequest) -> (u32, u32) {
+    let size = request.size.as_deref().unwrap_or("512x512");
+    let Some((width, height)) = size.split_once('x') else {
+        return (512, 512);
+    };
+    (
+        width.parse::<u32>().unwrap_or(512),
+        height.parse::<u32>().unwrap_or(512),
+    )
 }
 
 fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
@@ -1740,7 +1909,8 @@ fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
         "prompt": &request.prompt,
         "n": request.n.unwrap_or(1).clamp(1, 4),
         "size": request.size.as_deref().unwrap_or("512x512"),
-        "steps": request.steps.unwrap_or(4).clamp(1, 150),
+        "steps": image_steps_for_test(request),
+        "cfg_scale": image_cfg_scale_for_test(request),
         "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
         "seed": request.seed,
     }))

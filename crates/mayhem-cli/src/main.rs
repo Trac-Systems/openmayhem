@@ -23376,12 +23376,18 @@ fn provider_image_generation_request_from_body(
     let steps = body
         .get("steps")
         .and_then(Value::as_u64)
-        .unwrap_or(4)
+        .unwrap_or(1)
         .clamp(1, 150);
+    let cfg_scale = body
+        .get("cfg_scale")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0)
+        .clamp(0.0, 50.0) as f32;
     let (width, height) = provider_image_generation_size(body)?;
     let mut request = GenerateRequest::new(prompt);
     request.artifact_count = Some(image_count);
     request.steps = Some(u32::try_from(steps).context("image_generation steps overflowed u32")?);
+    request.cfg_scale = Some(cfg_scale);
     request.width = Some(width);
     request.height = Some(height);
     if let Some(seed) = body.get("seed").and_then(Value::as_u64) {
@@ -32248,6 +32254,7 @@ mod tests {
                     denom: "mu_usd".to_owned(),
                     in_per_1k: 1,
                     out_per_1k: 2,
+                    rate_map: Vec::new(),
                 },
             }],
         }

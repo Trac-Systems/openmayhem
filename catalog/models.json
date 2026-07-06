@@ -573,6 +573,106 @@
         "in_per_1k": 4,
         "out_per_1k": 12
       }
+    },
+    {
+      "model_id": "concedo/sdxs-512-tinysd-distilled@gguf-q8_0",
+      "model_class": "image-generation",
+      "family": "sdxs-512",
+      "params_b": 0.4,
+      "tier": "launch",
+      "min_app_version": "0.1.0",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "concedo/sdxs-512-tinySDdistilled-GGUF",
+          "revision": "3144d898d61492f8382ffcabec055733fc5b2a0e",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "stable-diffusion.cpp convert",
+            "method": "sdxs-512 tinySD distilled q8_0 gguf",
+            "input_sha256": "6cca5bfd11b588cdfb4602018c7e623d24c95fdfdc5ab2d4b9e6978b3186980f",
+            "output_sha256": "409ab23582ee074c6b9d5395784fc0741b0599fb9d138686c69087c71678eb6a"
+          }
+        ],
+        "license": "openrail++",
+        "license_sha256": "59de90c565e234f3544cc4f1fea0a239e495fe979b49333c478cb8952dd1ebd1"
+      },
+      "artifacts": {
+        "gguf-q8_0": {
+          "engine": "stable-diffusion.cpp",
+          "source": {
+            "kind": "huggingface",
+            "repo": "concedo/sdxs-512-tinySDdistilled-GGUF",
+            "revision": "3144d898d61492f8382ffcabec055733fc5b2a0e",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "sdxs-512-tinySDdistilled_Q8_0.gguf",
+          "artifact_root": "43faa2e6cfff4bd5673d2f805c70efe06b60d2d4d090035d97b6d643e7f732f3",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 682847200,
+          "source_sha256": "409ab23582ee074c6b9d5395784fc0741b0599fb9d138686c69087c71678eb6a",
+          "download_check": true
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 512,
+        "vision": false,
+        "image": true,
+        "output_modality": "image",
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 2,
+        "min_vram_gb_full_offload": 0,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "stable-diffusion.cpp"
+        ]
+      },
+      "adapter": {
+        "request_shape_family": "openai_images",
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "image"
+        ],
+        "response_normalization": "openai_images"
+      },
+      "canary": {
+        "set_id": "canary-image-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "seed_perceptual_hash",
+        "verification_tolerance_bps": 8500,
+        "perceptual_hashes": {
+          "gguf-q8_0": {
+            "red-cube-studio-seed7": "e0e0d8d8d8f83e56"
+          }
+        }
+      },
+      "price_ref_mu": {
+        "denom": "mu_usd",
+        "rate_map": [
+          {
+            "unit": "image",
+            "per_unit_mu": 500,
+            "granularity": 1
+          },
+          {
+            "unit": "step",
+            "per_unit_mu": 2,
+            "granularity": 1
+          }
+        ]
+      }
     }
   ]
 }

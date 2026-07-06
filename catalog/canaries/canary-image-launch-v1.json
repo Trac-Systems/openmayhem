@@ -1,0 +1,14 @@
+{
+  "set_id": "canary-image-launch-v1",
+  "description": "Launch image-generation canary prompts for small diffusion artifacts.",
+  "prompts": [
+    {
+      "id": "red-cube-studio-seed7",
+      "prompt": "a red cube on a white table, simple studio photo",
+      "size": "512x512",
+      "steps": 1,
+      "cfg_scale": 1,
+      "seed": 7
+    }
+  ]
+}

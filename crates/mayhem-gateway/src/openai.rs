@@ -532,6 +532,8 @@ pub struct ImageGenerationRequest {
     #[serde(default)]
     pub steps: Option<u64>,
     #[serde(default)]
+    pub cfg_scale: Option<f32>,
+    #[serde(default)]
     pub seed: Option<i64>,
     #[serde(default)]
     pub user: Option<String>,
@@ -3938,6 +3940,7 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
         "n": image_generation_count(request),
         "size": request.size.as_deref().unwrap_or("512x512"),
         "steps": image_generation_steps(request),
+        "cfg_scale": image_generation_cfg_scale(request),
         "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
     });
     set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
@@ -8513,6 +8516,7 @@ fn validate_image_generation_request(request: &ImageGenerationRequest) -> Result
     let _ = parse_image_generation_size(request)?;
     let _ = image_generation_count(request);
     let _ = image_generation_steps(request);
+    let _ = image_generation_cfg_scale(request);
     match request.response_format.as_deref().unwrap_or("b64_json") {
         "b64_json" | "url" => Ok(()),
         _ => Err(ApiError::bad_request(
@@ -8527,7 +8531,11 @@ fn image_generation_count(request: &ImageGenerationRequest) -> u32 {
 }
 
 fn image_generation_steps(request: &ImageGenerationRequest) -> u64 {
-    request.steps.unwrap_or(4).clamp(1, 150)
+    request.steps.unwrap_or(1).clamp(1, 150)
+}
+
+fn image_generation_cfg_scale(request: &ImageGenerationRequest) -> f32 {
+    request.cfg_scale.unwrap_or(1.0).clamp(0.0, 50.0)
 }
 
 fn parse_image_generation_size(request: &ImageGenerationRequest) -> Result<(u32, u32), ApiError> {
