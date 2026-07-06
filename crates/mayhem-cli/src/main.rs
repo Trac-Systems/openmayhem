@@ -31,8 +31,8 @@ use mayhem_enclave::{
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
-    GenerateRequest, GrammarSpec, LoadConfig, MediaInput, ModelArtifact, SpeechRequest, ToolSpec,
-    MTMD_MEDIA_MARKER,
+    GenerateRequest, GrammarSpec, LoadConfig, MediaInput, ModelArtifact, SpeechRequest, TokenChunk,
+    ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
     heartbeat_signing_payload, normalize_rate_map,
@@ -18844,11 +18844,22 @@ enum ProviderSessionDecision {
 
 trait ProviderSessionResponder {
     fn mode(&self) -> &'static str;
+    fn supports_live_text_streaming(&self) -> bool {
+        false
+    }
     fn respond(
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
     ) -> Result<ProviderSessionOutput>;
+    fn respond_streaming(
+        &mut self,
+        terms: &ProviderSessionTerms,
+        body: &Value,
+        _stream: Option<&mut ProviderSessionLiveStream<'_>>,
+    ) -> Result<ProviderSessionOutput> {
+        self.respond(terms, body)
+    }
 }
 
 struct DeterministicProviderSessionResponder;
@@ -18876,12 +18887,25 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         "mayhem-engine"
     }
 
+    fn supports_live_text_streaming(&self) -> bool {
+        true
+    }
+
     fn respond(
         &mut self,
         terms: &ProviderSessionTerms,
         body: &Value,
     ) -> Result<ProviderSessionOutput> {
-        provider_engine_session_response(self.backend.as_mut(), &terms.adapter, body)
+        provider_engine_session_response(self.backend.as_mut(), &terms.adapter, body, None)
+    }
+
+    fn respond_streaming(
+        &mut self,
+        terms: &ProviderSessionTerms,
+        body: &Value,
+        stream: Option<&mut ProviderSessionLiveStream<'_>>,
+    ) -> Result<ProviderSessionOutput> {
+        provider_engine_session_response(self.backend.as_mut(), &terms.adapter, body, stream)
     }
 }
 
@@ -22790,7 +22814,19 @@ async fn handle_provider_session_frame(
             provider_session_debug(format!(
                 "building response for session {session_id} request {request_id}"
             ));
-            let output = match responder.respond(terms, &body) {
+            let mut live_stream = responder.supports_live_text_streaming().then(|| {
+                ProviderSessionLiveStream::new(
+                    bridge,
+                    &active,
+                    request_id,
+                    terms,
+                    &body,
+                    runtime.runtime_keypair,
+                )
+            });
+            let response = responder.respond_streaming(terms, &body, live_stream.as_mut());
+            let live_stream_state = live_stream.and_then(ProviderSessionLiveStream::into_state);
+            let output = match response {
                 Ok(output) => output,
                 Err(err) => {
                     provider_session_debug(format!(
@@ -22827,6 +22863,7 @@ async fn handle_provider_session_frame(
                 &body,
                 &output,
                 runtime.runtime_keypair,
+                live_stream_state,
             )
             .await
             {
@@ -22891,6 +22928,129 @@ async fn handle_provider_session_frame(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProviderSessionLiveStreamState {
+    next_index: u64,
+    receipt_seq: u64,
+    last_checkpoint_tokens: u64,
+}
+
+struct ProviderSessionLiveStream<'a> {
+    bridge: &'a mut ScBridgeClient,
+    active: &'a ActiveProviderSession,
+    request_id: &'a str,
+    terms: &'a ProviderSessionTerms,
+    body: &'a Value,
+    runtime_keypair: &'a RuntimeKeypair,
+    next_index: u64,
+    receipt_seq: u64,
+    last_checkpoint_tokens: u64,
+    delivered_tokens: u64,
+    streamed_any: bool,
+}
+
+impl<'a> ProviderSessionLiveStream<'a> {
+    fn new(
+        bridge: &'a mut ScBridgeClient,
+        active: &'a ActiveProviderSession,
+        request_id: &'a str,
+        terms: &'a ProviderSessionTerms,
+        body: &'a Value,
+        runtime_keypair: &'a RuntimeKeypair,
+    ) -> Self {
+        Self {
+            bridge,
+            active,
+            request_id,
+            terms,
+            body,
+            runtime_keypair,
+            next_index: 0,
+            receipt_seq: 1,
+            last_checkpoint_tokens: 0,
+            delivered_tokens: 0,
+            streamed_any: false,
+        }
+    }
+
+    fn on_token(&mut self, chunk: TokenChunk, prompt_tokens: u64) -> Result<()> {
+        provider_session_debug(format!(
+            "live streaming token s.delta #{} for session {} request {}",
+            self.next_index, self.active.session_id, self.request_id
+        ));
+        let frame = json!({
+            "t": "s.delta",
+            "rid": self.request_id,
+            "i": self.next_index,
+            "d": chunk.text,
+            "token_id": chunk.token_id,
+            "tool": null,
+            "fin": null,
+        });
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.bridge
+                    .session_send(&self.active.remote, &self.active.session_id, frame)
+                    .await
+                    .context("sending live token s.delta")
+            })
+        })?;
+        self.next_index = self.next_index.saturating_add(1);
+        self.delivered_tokens = self.delivered_tokens.saturating_add(1);
+        self.streamed_any = true;
+
+        if provider_session_checkpoint_due(
+            self.delivered_tokens,
+            u64::MAX,
+            self.last_checkpoint_tokens,
+            provider_session_checkpoint_tokens(self.active),
+        ) {
+            let usage = ReceiptUsage::text(prompt_tokens, self.delivered_tokens);
+            let receipt = provider_session_receipt_for_usage(
+                self.terms,
+                self.active,
+                self.body,
+                usage,
+                self.receipt_seq,
+                false,
+                self.runtime_keypair,
+            )
+            .context("building live provider session checkpoint receipt")?;
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    send_provider_session_receipt_frame(
+                        self.bridge,
+                        self.active,
+                        self.request_id,
+                        &receipt,
+                        "checkpoint",
+                    )
+                    .await?;
+                    wait_for_provider_receipt_ack(
+                        self.bridge,
+                        self.active,
+                        &receipt,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .context("waiting for live checkpoint receipt ack")
+                })
+            })?;
+            self.last_checkpoint_tokens = self.delivered_tokens;
+            self.receipt_seq = self.receipt_seq.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn into_state(self) -> Option<ProviderSessionLiveStreamState> {
+        self.streamed_any.then_some(ProviderSessionLiveStreamState {
+            next_index: self.next_index,
+            receipt_seq: self.receipt_seq,
+            last_checkpoint_tokens: self.last_checkpoint_tokens,
+        })
+    }
+}
+
 async fn send_provider_session_output(
     bridge: &mut ScBridgeClient,
     active: &ActiveProviderSession,
@@ -22899,12 +23059,22 @@ async fn send_provider_session_output(
     body: &Value,
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
+    live_stream_state: Option<ProviderSessionLiveStreamState>,
 ) -> Result<ProviderSignedSessionReceipt> {
-    let mut index = 0_u64;
-    let mut receipt_seq = 1_u64;
+    let mut index = live_stream_state
+        .as_ref()
+        .map(|state| state.next_index)
+        .unwrap_or(0);
+    let mut receipt_seq = live_stream_state
+        .as_ref()
+        .map(|state| state.receipt_seq)
+        .unwrap_or(1);
     let checkpoint_tokens = provider_session_checkpoint_tokens(active);
-    let mut last_checkpoint_tokens = 0_u64;
-    if output.tool.is_none() {
+    let mut last_checkpoint_tokens = live_stream_state
+        .as_ref()
+        .map(|state| state.last_checkpoint_tokens)
+        .unwrap_or(0);
+    if output.tool.is_none() && live_stream_state.is_none() {
         let mut delivered_content = String::new();
         for part in provider_stream_parts(&output.content) {
             provider_session_debug(format!(
@@ -24397,6 +24567,7 @@ fn provider_engine_session_response(
     backend: &mut dyn EngineBackend,
     adapter: &catalog::CatalogAdapter,
     body: &Value,
+    mut live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
 ) -> Result<ProviderSessionOutput> {
     if body.get("kind").and_then(Value::as_str) == Some("audio_transcription") {
         let request = provider_audio_transcription_request_from_body(body)?;
@@ -24509,10 +24680,22 @@ fn provider_engine_session_response(
     let request = provider_engine_request_from_body(body, adapter)?;
     let mut token_ids = Vec::new();
     let mut artifact_chunks = Vec::new();
+    let prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
     let output = backend
         .generate_with_artifacts(
             request,
             &mut |chunk: mayhem_engine::TokenChunk| {
+                if tool_mode.is_none() {
+                    if let Some(stream) = live_stream.as_deref_mut() {
+                        stream
+                            .on_token(chunk.clone(), prompt_tokens)
+                            .map_err(|err| {
+                                mayhem_engine::EngineError::InvalidConfig(format!(
+                                    "provider live stream failed: {err:#}"
+                                ))
+                            })?;
+                    }
+                }
                 token_ids.push(chunk.token_id);
                 Ok(())
             },
@@ -24535,7 +24718,6 @@ fn provider_engine_session_response(
     } else {
         None
     };
-    let prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
     let completion_tokens = u64::from(output.usage.completion_tokens);
     Ok(ProviderSessionOutput {
         usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
@@ -30151,6 +30333,7 @@ mod tests {
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
+            None,
         )
         .unwrap();
 
@@ -30179,6 +30362,7 @@ mod tests {
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
+            None,
         )
         .unwrap();
 
@@ -30220,6 +30404,7 @@ mod tests {
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
+            None,
         )
         .unwrap();
 
@@ -30251,6 +30436,7 @@ mod tests {
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
+            None,
         )
         .unwrap();
 
@@ -30288,6 +30474,7 @@ mod tests {
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
+            None,
         )
         .unwrap();
 
@@ -30326,6 +30513,7 @@ mod tests {
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
+            None,
         )
         .unwrap();
 
@@ -30388,6 +30576,7 @@ mod tests {
             &mut backend,
             &catalog::CatalogAdapter::default(),
             &body,
+            None,
         )
         .expect_err("tool mode requires valid tool-call JSON");
 
@@ -30422,7 +30611,7 @@ mod tests {
             }],
             "tool_choice": "auto"
         });
-        let output = provider_engine_session_response(&mut backend, &adapter, &body).unwrap();
+        let output = provider_engine_session_response(&mut backend, &adapter, &body, None).unwrap();
 
         assert_eq!(output.finish_reason, "tool_calls");
         assert_eq!(output.content, "");
