@@ -17,15 +17,28 @@ const require = createRequire(import.meta.url);
 const { blake3 } = require(path.join(ROOT, 'intercom/node_modules/@tracsystems/blake3'));
 
 const DEFAULT_MODEL = 'qwen/qwen3.5-4b-gguf-q4_k_m-dev';
+const DEFAULT_ARTIFACT = path.join(
+  os.homedir(),
+  '.mayhem/cache/huggingface/lmstudio-community/Qwen3.5-4B-GGUF/f9f88ac3e234be915e23811a6d28ea287bdb927e/Qwen3.5-4B-Q4_K_M.gguf'
+);
 const CHUNK_SIZE = 8 * 1024 * 1024;
+const SSH_KEY = (process.env.MAYHEM_P43_SSH_KEY || '').trim();
 const SSH_OPTS = [
   '-F', '/dev/null',
   '-o', 'IdentitiesOnly=yes',
-  '-o', 'PreferredAuthentications=password,keyboard-interactive',
-  '-o', 'PubkeyAuthentication=no',
+  ...(SSH_KEY
+    ? [
+      '-i', path.resolve(SSH_KEY),
+      '-o', 'PreferredAuthentications=publickey,password,keyboard-interactive',
+      '-o', 'PubkeyAuthentication=yes',
+    ]
+    : [
+      '-o', 'PreferredAuthentications=password,keyboard-interactive',
+      '-o', 'PubkeyAuthentication=no',
+    ]),
   '-o', 'PasswordAuthentication=yes',
   '-o', 'KbdInteractiveAuthentication=yes',
-  '-o', 'NumberOfPasswordPrompts=3',
+  '-o', 'NumberOfPasswordPrompts=1',
   '-o', 'StrictHostKeyChecking=no',
   '-o', `UserKnownHostsFile=${path.join(ROOT, '.mayhem-local/macmini-known-hosts')}`,
 ];
@@ -58,12 +71,19 @@ Environment:
   MAYHEM_P43_MACMINI_FILE    Mac mini credential file (default: ../gpd/macmini.txt)
   MAYHEM_P43_REMOTE_ROOT     Remote checkout/staging root (default: ~/mayhem-macmini-p33)
   MAYHEM_P43_MODEL           Catalog model id (default: ${DEFAULT_MODEL})
-  MAYHEM_P43_DELTA_DELAY_MS  Delay after first content delta in each provider (default: 2500)
+  MAYHEM_P43_PROVIDER_MODE   real or shim (default: real)
+  MAYHEM_P43_ARTIFACT        Real provider artifact path (default: ${DEFAULT_ARTIFACT})
+  MAYHEM_P43_DELTA_DELAY_MS  Delay after early content deltas (default: 2500)
+  MAYHEM_P43_DELTA_DELAY_COUNT Number of early content deltas to delay (default: 12 real, 1 shim)
+  MAYHEM_P43_CHAT_MAX_TOKENS Streaming failover max_tokens (default: 128)
+  MAYHEM_P43_RECEIPT_CHECKPOINT_TOKENS Receipt checkpoint token window (default: 32)
+  MAYHEM_P43_RECEIPT_CHECKPOINT_MS Receipt checkpoint wall-clock window (default: 30000)
   MAYHEM_P43_LOCAL_DHT_HOST  Local LAN IP advertised to the Mac mini DHT peer
   MAYHEM_P43_PEER_DHT_BOOTSTRAP Explicit peer DHT bootstrap list
   MAYHEM_P43_USE_LOCAL_DHT   Start/use a temporary local HyperDHT bootstrap (default: 0)
   MAYHEM_P43_USE_REMOTE_DHT  Start/use a temporary Mac mini HyperDHT bootstrap (default: 1)
   MAYHEM_P43_USE_PUBLIC_DHT  Use default/public peer DHT bootstrap instead of private DHT (default: 0)
+  MAYHEM_P43_PROBE_SESSION_OPEN Also preflight throwaway direct sessions before gateway start (default: 0)
   MAYHEM_P43_KEEP_REMOTE     Keep remote run logs after cleanup (default: 1)
   MAYHEM_P43_KEEP_LOCAL      Keep local run evidence after cleanup (default: 1)
 `);
@@ -85,8 +105,38 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+function textRateMapJson(inPer1kMu, outPer1kMu) {
+  return JSON.stringify([
+    { unit: 'input_token', per_unit_mu: Number(inPer1kMu), granularity: 1000 },
+    { unit: 'output_token', per_unit_mu: Number(outPer1kMu), granularity: 1000 },
+  ]);
+}
+
 function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function envPositiveInt(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    fail(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function safePathComponent(value) {
+  return String(value).replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+function providerSidecarCacheFile(artifactName, name, sidecar) {
+  return [
+    `root-${safePathComponent(sidecar.artifact_root)}`,
+    `sha-${safePathComponent(sidecar.source_sha256)}`,
+    safePathComponent(artifactName),
+    safePathComponent(name),
+  ].join('-');
 }
 
 function parseFirstJsonObject(text) {
@@ -285,8 +335,21 @@ async function merkleRoot(file, chunkSize = CHUNK_SIZE) {
   };
 }
 
-async function catalogEnclaveId({ adminPubkey, modelId, artifactRoot, manifestHash, binaryHash }) {
-  return (await b3(Buffer.from(`${adminPubkey}${modelId}${artifactRoot}${manifestHash}${binaryHash}`, 'utf8'))).toString('hex');
+async function catalogEnclaveId({
+  adminPubkey,
+  modelId,
+  artifactRoot,
+  artifactSidecarRoots = {},
+  manifestHash,
+  binaryHash,
+}) {
+  const sidecarParts = Object.entries(artifactSidecarRoots)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .flatMap(([name, root]) => [name, root]);
+  return (await b3(Buffer.from(
+    [adminPubkey, modelId, artifactRoot, ...sidecarParts, manifestHash, binaryHash].join(''),
+    'utf8'
+  ))).toString('hex');
 }
 
 async function preauthorizeLocalApps(apps, logFile) {
@@ -413,25 +476,39 @@ async function waitBridgePeerConnect(url, token, provider, timeoutMs, label = 'b
 async function pickBridgeForProviders(candidates, token, providers, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   const errors = [];
+  let nextProgressLog = Date.now() + 10_000;
+  const probeSessionOpen = /^(1|true|yes)$/i.test(process.env.MAYHEM_P43_PROBE_SESSION_OPEN || '');
   while (Date.now() < deadline) {
     for (const candidate of candidates) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
       try {
         const ready = [];
         for (const provider of providers) {
+          const peerConnectTimeoutMs = Math.min(10_000, Math.max(1_000, deadline - Date.now()));
           ready.push(await waitBridgePeerConnect(
             candidate.url,
             token,
             provider,
-            Math.min(20_000, Math.max(1_000, deadline - Date.now())),
+            peerConnectTimeoutMs,
             candidate.label
           ));
-          ready.push(await waitBridgeSessionOpen(candidate.url, token, provider, 10_000, candidate.label));
+          if (probeSessionOpen) {
+            const sessionOpenTimeoutMs = Math.min(5_000, Math.max(1_000, deadline - Date.now()));
+            ready.push(await waitBridgeSessionOpen(candidate.url, token, provider, sessionOpenTimeoutMs, candidate.label));
+          }
         }
         return { ...candidate, ready };
       } catch (err) {
         errors.push(`${candidate.label}: ${err?.message || err}`);
+        if (errors.length > 50) errors.splice(0, errors.length - 50);
       }
     }
+    if (Date.now() >= nextProgressLog) {
+      log(`SC-Bridge selection still probing; last error: ${errors.at(-1) || 'none yet'}`);
+      nextProgressLog = Date.now() + 10_000;
+    }
+    await sleep(750);
   }
   throw new Error(`no local SC-Bridge could open both providers; last errors: ${errors.slice(-candidates.length).join(' | ')}`);
 }
@@ -447,7 +524,7 @@ async function waitForFilePattern(file, pattern, timeoutMs, label, processCheck)
     if (processCheck && !(await processCheck())) {
       fail(`${label} exited before readiness. Log: ${file}`);
     }
-    await sleep(500);
+    await sleep(1_000);
   }
   fail(`timed out waiting for ${label}; last log tail:\n${last.split('\n').slice(-40).join('\n')}`);
 }
@@ -469,6 +546,140 @@ async function waitHttp(url, timeoutMs, label, processCheck) {
     await sleep(500);
   }
   fail(`timed out waiting for ${label} at ${url}: ${lastErr}`);
+}
+
+async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
+  timeoutMs = 240_000,
+  maxTokens = 128,
+  prompt = [
+    'Write a long deterministic failover response.',
+    'Use short numbered lines.',
+    'Each line must include mayhem and a different plain word.',
+    'Keep going until the token budget is exhausted; do not summarize or stop early.',
+  ].join(' '),
+  fileStem = 'gateway-provider-kill-stream',
+} = {}) {
+  const rawPath = path.join(runDir, `${fileStem}.sse`);
+  const summaryPath = path.join(runDir, `${fileStem}.json`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('streaming chat timed out')), timeoutMs);
+  let raw = '';
+  let content = '';
+  let dataEvents = 0;
+  let jsonEvents = 0;
+  let doneSeen = false;
+  let errorEvent = null;
+  const startedAt = Date.now();
+  let responseHeadersAt = null;
+  let firstChunkAt = null;
+  let firstDataAt = null;
+  let firstJsonAt = null;
+  let firstContentAt = null;
+  let doneAt = null;
+  try {
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: modelId,
+        stream: true,
+        temperature: 0.4,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: controller.signal,
+    });
+    responseHeadersAt = Date.now();
+    if (!response.ok) {
+      const text = await response.text();
+      fail(`streaming failover chat returned HTTP ${response.status}: ${text}`);
+    }
+    if (!response.body) fail('streaming failover chat response had no body');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const handleLine = (line) => {
+      if (!line.startsWith('data:')) return;
+      const data = line.slice(5).trim();
+      if (!data) return;
+      dataEvents += 1;
+      if (firstDataAt === null) firstDataAt = Date.now();
+      if (data === '[DONE]') {
+        doneSeen = true;
+        doneAt = Date.now();
+        return;
+      }
+      let value;
+      try {
+        value = JSON.parse(data);
+      } catch {
+        return;
+      }
+      jsonEvents += 1;
+      if (firstJsonAt === null) firstJsonAt = Date.now();
+      if (value.error) {
+        errorEvent = value.error;
+        return;
+      }
+      const choice = Array.isArray(value.choices) ? value.choices[0] : null;
+      const delta = choice?.delta?.content;
+      const message = choice?.message?.content;
+      if (typeof delta === 'string') {
+        if (delta.length > 0 && firstContentAt === null) firstContentAt = Date.now();
+        content += delta;
+      } else if (typeof message === 'string') {
+        if (message.length > 0 && firstContentAt === null) firstContentAt = Date.now();
+        content += message;
+      }
+    };
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (firstChunkAt === null) firstChunkAt = Date.now();
+      const chunk = decoder.decode(value, { stream: true });
+      raw += chunk;
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) handleLine(line);
+    }
+    const tail = decoder.decode();
+    if (tail) {
+      raw += tail;
+      buffer += tail;
+    }
+    if (buffer) handleLine(buffer);
+  } finally {
+    clearTimeout(timer);
+  }
+  fs.writeFileSync(rawPath, raw);
+  if (errorEvent) fail(`streaming failover chat emitted SSE error: ${JSON.stringify(errorEvent)}`);
+  if (dataEvents === 0) fail('streaming failover chat produced no SSE data events');
+  if (!doneSeen) fail(`streaming failover chat did not emit [DONE]; raw saved at ${rawPath}`);
+  if (!content.trim()) fail(`streaming failover chat produced no model content; raw saved at ${rawPath}`);
+  const completedAt = doneAt || Date.now();
+  const summary = {
+    ok: true,
+    model: modelId,
+    prompt,
+    max_tokens: maxTokens,
+    content: content.trim(),
+    content_chars: content.trim().length,
+    data_events: dataEvents,
+    json_events: jsonEvents,
+    done_seen: doneSeen,
+    timing_ms: {
+      response_headers: responseHeadersAt === null ? null : responseHeadersAt - startedAt,
+      first_chunk: firstChunkAt === null ? null : firstChunkAt - startedAt,
+      first_data: firstDataAt === null ? null : firstDataAt - startedAt,
+      first_json: firstJsonAt === null ? null : firstJsonAt - startedAt,
+      first_content: firstContentAt === null ? null : firstContentAt - startedAt,
+      total: completedAt - startedAt,
+    },
+    raw_path: path.relative(ROOT, rawPath),
+  };
+  writeJson(summaryPath, summary);
+  return { ...summary, summary_path: path.relative(ROOT, summaryPath) };
 }
 
 async function freePort() {
@@ -494,16 +705,25 @@ function parseMacmini(file) {
   };
 }
 
+function sshProgram(passFile) {
+  return SSH_KEY
+    ? { command: 'ssh', args: [...SSH_OPTS] }
+    : { command: 'sshpass', args: ['-f', passFile, 'ssh', ...SSH_OPTS] };
+}
+
 function sshBase(passFile, remote) {
-  return ['-f', passFile, 'ssh', ...SSH_OPTS, `${remote.user}@${remote.host}`];
+  const base = sshProgram(passFile);
+  return [base.command, ...base.args, `${remote.user}@${remote.host}`];
 }
 
 async function ssh(remote, passFile, command, options = {}) {
-  return run('sshpass', [...sshBase(passFile, remote), command], options);
+  const [program, ...args] = sshBase(passFile, remote);
+  return run(program, [...args, command], options);
 }
 
 async function rsyncTo(remote, passFile, localPath, remotePath, options = {}) {
-  const rsh = ['sshpass', '-f', passFile, 'ssh', ...SSH_OPTS].map(sh).join(' ');
+  const base = sshProgram(passFile);
+  const rsh = [base.command, ...base.args].map(sh).join(' ');
   return run(
     'rsync',
     ['-a', '--partial', '--inplace', '-e', rsh, localPath, `${remote.user}@${remote.host}:${remotePath}`],
@@ -541,15 +761,12 @@ async function sshStreamTo(remote, passFile, localPath, remotePath, options = {}
   const output = [];
   const errput = [];
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      'sshpass',
-      ['-f', passFile, 'ssh', ...SSH_OPTS, `${remote.user}@${remote.host}`, remoteCommand],
-      {
-        cwd: ROOT,
-        env: options.env || process.env,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }
-    );
+    const [program, ...args] = sshBase(passFile, remote);
+    const child = spawn(program, [...args, remoteCommand], {
+      cwd: ROOT,
+      env: options.env || process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     children.push(child);
     const input = fs.createReadStream(localPath);
     const timer = options.timeoutMs
@@ -607,6 +824,68 @@ async function remoteSha256(remote, passFile, remotePath) {
 async function remotePidAlive(remote, passFile, pid) {
   const result = await ssh(remote, passFile, `kill -0 ${Number(pid)} >/dev/null 2>&1 && echo alive || true`);
   return result.stdout.trim() === 'alive';
+}
+
+async function waitRemoteLogPattern(remote, passFile, file, pattern, timeoutMs, label, pid = null) {
+  const deadline = Date.now() + timeoutMs;
+  let last = '';
+  while (Date.now() < deadline) {
+    last = (await ssh(
+      remote,
+      passFile,
+      `test -f ${sh(file)} && tail -n 120 ${sh(file)} || true`,
+      { timeoutMs: 10_000 }
+    )).stdout;
+    if (pattern.test(last)) return last;
+    if (pid && !(await remotePidAlive(remote, passFile, pid))) {
+      fail(`${label} exited before readiness. Log: ${file}`);
+    }
+    await sleep(500);
+  }
+  fail(`timed out waiting for ${label}; last log tail:\n${last.split('\n').slice(-40).join('\n')}`);
+}
+
+async function cleanupLocalSmokeProcesses({ allP43 = false, tag = null } = {}) {
+  const patterns = [];
+  if (allP43) {
+    patterns.push('[m]ayhem-p43-');
+    patterns.push('[.]mayhem-local/p4[.]3-provider-kill');
+  } else if (tag) {
+    const safeTag = String(tag).replace(/[^\w.-]/g, '');
+    if (safeTag) {
+      patterns.push(`[m]ayhem-p43-.*${safeTag}`);
+      patterns.push(`[.]mayhem-local/p4[.]3-provider-kill/${safeTag}`);
+    }
+  }
+  if (!patterns.length) return;
+  for (const pattern of patterns) {
+    await run('pkill', ['-TERM', '-f', pattern], { timeoutMs: 5_000 }).catch(() => {});
+  }
+  await sleep(1_000);
+  for (const pattern of patterns) {
+    await run('pkill', ['-KILL', '-f', pattern], { timeoutMs: 5_000 }).catch(() => {});
+  }
+}
+
+async function cleanupRemoteSmokeProcesses(remote, passFile, { remoteRun = null, allP43 = false } = {}) {
+  if (!remote || !passFile || !fs.existsSync(passFile)) return;
+  const patterns = [];
+  if (allP43) {
+    patterns.push('[m]ayhem-p43-');
+    patterns.push('[.]mayhem-local/p4[.]3-provider-kill');
+  } else if (remoteRun) {
+    const tag = path.posix.basename(remoteRun).replace(/[^\w.-]/g, '');
+    if (tag) {
+      patterns.push(`[m]ayhem-p43-.*${tag}`);
+      patterns.push(`[.]mayhem-local/p4[.]3-provider-kill/${tag}`);
+    }
+  }
+  if (!patterns.length) return;
+  const term = patterns.map((pattern) => `pkill -TERM -f ${sh(pattern)} >/dev/null 2>&1 || true`);
+  const kill = patterns.map((pattern) => `pkill -KILL -f ${sh(pattern)} >/dev/null 2>&1 || true`);
+  await ssh(remote, passFile, [...term, 'sleep 1', ...kill].join('; '), { timeoutMs: 20_000 }).catch((err) => {
+    log(`remote stale p4.3 cleanup warning: ${err?.message || err}`);
+  });
 }
 
 async function remoteFreePort(remote, passFile) {
@@ -678,34 +957,132 @@ async function waitForGatewayRoutes(gatewayUrl, modelId, providerPubkeys, timeou
   throw new Error(`gateway did not expose both provider routes: ${JSON.stringify(last)}`);
 }
 
-async function waitAndKillFirstDelta(remote, passFile, providers, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  const pattern = /delaying after content s\.delta #0|sending content s\.delta #0/;
-  let last = {};
-  while (Date.now() < deadline) {
-    for (const provider of providers) {
-      const text = (await ssh(
-        remote,
-        passFile,
-        `test -f ${sh(provider.providerLog)} && tail -n 80 ${sh(provider.providerLog)} || true`
-      )).stdout;
-      last[provider.label] = text.split('\n').slice(-10).join('\n');
-      if (pattern.test(text)) {
-        const killedAt = Date.now();
-        await ssh(remote, passFile, `kill -9 ${Number(provider.providerPid)} >/dev/null 2>&1 || true`);
-        return {
-          label: provider.label,
-          provider: provider.pubkey,
-          provider_pid: provider.providerPid,
-          provider_log: provider.providerLog,
-          killed_at_ms: killedAt,
-          trigger: 'first_content_delta',
-        };
+async function waitAndKillAfterCheckpointAck(remote, passFile, providers, timeoutMs) {
+  const checkpointPattern = /sending checkpoint s\.receipt seq (\d+)/;
+  const postCheckpointProgressPattern =
+    /live buffering token #\d+|live streaming s\.delta #\d+|sending checkpoint s\.receipt seq [2-9]\d*|sending final s\.delta/;
+  const last = {};
+  const checkpointSeen = new Map();
+  const watchers = [];
+  let settled = false;
+
+  return new Promise((resolve, reject) => {
+    const finish = (err, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      for (const child of watchers) {
+        if (child.exitCode === null) child.kill('SIGTERM');
       }
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(
+        `no provider reached checkpointed post-receipt progress before timeout; last lines=${JSON.stringify(last, null, 2)}`
+      ));
+    }, timeoutMs);
+
+    for (const provider of providers) {
+      const [program, ...args] = sshBase(passFile, remote);
+      const child = spawn(program, [...args, `tail -n 0 -F ${sh(provider.providerLog)}`], {
+        cwd: ROOT,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      children.push(child);
+      cleanupState.localChildren.push(child);
+      watchers.push(child);
+
+      let buffer = '';
+      const handleLine = async (line) => {
+        if (settled || !line.trim()) return;
+        last[provider.label] = line;
+        const checkpoint = line.match(checkpointPattern);
+        if (checkpoint) {
+          checkpointSeen.set(provider.label, Number.parseInt(checkpoint[1], 10));
+          return;
+        }
+        if (!checkpointSeen.has(provider.label) || !postCheckpointProgressPattern.test(line)) return;
+        const killedAt = Date.now();
+        try {
+          await ssh(remote, passFile, `kill -9 ${Number(provider.providerPid)} >/dev/null 2>&1 || true`);
+          finish(null, {
+            label: provider.label,
+            provider: provider.pubkey,
+            provider_pid: provider.providerPid,
+            provider_log: provider.providerLog,
+            killed_at_ms: killedAt,
+            trigger: 'post_checkpoint_progress_after_receipt',
+            checkpoint_seq: checkpointSeen.get(provider.label),
+            trigger_line: line,
+          });
+        } catch (err) {
+          finish(err);
+        }
+      };
+
+      child.stdout.on('data', (data) => {
+        buffer += data.toString('utf8');
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          handleLine(line).catch((err) => finish(err));
+        }
+      });
+      child.stderr.on('data', (data) => {
+        last[`${provider.label}:stderr`] = data.toString('utf8').trim();
+      });
+      child.on('error', (err) => finish(err));
+      child.on('close', (code, signal) => {
+        if (!settled && code !== 0 && signal !== 'SIGTERM') {
+          finish(new Error(`provider log watcher for ${provider.label} exited ${code ?? signal}`));
+        }
+      });
     }
-    await sleep(100);
+  });
+}
+
+function storedReceiptBody(entry) {
+  return entry?.receipt?.body || entry?.receipt || entry || {};
+}
+
+function receiptIsFinal(entry) {
+  const body = storedReceiptBody(entry);
+  return body.final === true || body.final_receipt === true;
+}
+
+function providerLogOutputTailProof(text, checkpointedOutputTokens) {
+  let maxBufferedTokenIndex = -1;
+  const tokenPattern = /live buffering token #(\d+)/g;
+  let tokenMatch;
+  while ((tokenMatch = tokenPattern.exec(text))) {
+    const value = Number.parseInt(tokenMatch[1], 10);
+    if (Number.isSafeInteger(value) && value > maxBufferedTokenIndex) {
+      maxBufferedTokenIndex = value;
+    }
   }
-  throw new Error(`no provider emitted first content delta before timeout; last tails=${JSON.stringify(last, null, 2)}`);
+
+  const checkpointSeqs = [];
+  const checkpointPattern = /sending checkpoint s\.receipt seq (\d+)/g;
+  let checkpointMatch;
+  while ((checkpointMatch = checkpointPattern.exec(text))) {
+    const value = Number.parseInt(checkpointMatch[1], 10);
+    if (Number.isSafeInteger(value)) checkpointSeqs.push(value);
+  }
+
+  const observedOutputTokens = maxBufferedTokenIndex >= 0 ? maxBufferedTokenIndex + 1 : null;
+  const uncheckpointedOutputTokens = observedOutputTokens === null
+    ? null
+    : Math.max(0, observedOutputTokens - checkpointedOutputTokens);
+  return {
+    observed_output_tokens: observedOutputTokens,
+    max_buffered_token_index: maxBufferedTokenIndex,
+    checkpoint_sequences: checkpointSeqs,
+    latest_checkpoint_seq: checkpointSeqs.at(-1) || null,
+    checkpointed_output_tokens: checkpointedOutputTokens,
+    uncheckpointed_output_tokens: uncheckpointedOutputTokens,
+  };
 }
 
 async function startRemoteProvider({
@@ -722,6 +1099,7 @@ async function startRemoteProvider({
   remoteWalletHelper,
   remoteCatalog,
   remoteArtifact,
+  remoteDownloadsDir,
   adminRpcTunnelPort,
   rulesHash,
   channel,
@@ -730,6 +1108,7 @@ async function startRemoteProvider({
   scToken,
   enclaveId,
   delayMs,
+  providerMode,
 }) {
   log(`starting remote Pear provider peer ${label}`);
   const remoteScPort = await remoteFreePort(remote, passFile);
@@ -772,8 +1151,15 @@ async function startRemoteProvider({
   ].join(' && ');
   const remotePeerPid = (await ssh(remote, passFile, remotePeerCmd)).stdout.trim();
   cleanupState.remotePids.push(remotePeerPid);
-  const remoteWaitCmd = `for i in $(seq 1 900); do grep -q 'Sidechannel: ready' ${sh(remotePeerLog)} && exit 0; kill -0 ${remotePeerPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
-  await ssh(remote, passFile, remoteWaitCmd, { timeoutMs: 480_000 });
+  await waitRemoteLogPattern(
+    remote,
+    passFile,
+    remotePeerLog,
+    /Sidechannel: ready/,
+    360_000,
+    `remote provider peer ${label}`,
+    remotePeerPid
+  );
 
   const providerHome = path.posix.join(remoteRun, `provider-${label}-home`);
   const providerSetupLog = path.posix.join(remoteLogs, `provider-${label}-setup.log`);
@@ -802,6 +1188,7 @@ async function startRemoteProvider({
     `--sc-bridge-token ${sh(scToken)}`,
     `--catalog-path ${sh(remoteCatalog)}`,
     `--artifact ${sh(remoteArtifact)}`,
+    `--downloads-dir ${sh(remoteDownloadsDir)}`,
     '--engine-backend llama.cpp',
     '--skip-disk-bench',
     `--chunk-size ${CHUNK_SIZE}`,
@@ -809,15 +1196,23 @@ async function startRemoteProvider({
     '--serve-sessions-seconds 900',
     '--print-json',
     '--dev-skip-catalog-verify',
-    '--dev-session-shim',
   ];
+  if (providerMode === 'shim') providerFlags.push('--dev-session-shim');
+  const deltaDelayEnv = delayMs > 0
+    ? [
+      `MAYHEM_PROVIDER_SESSION_DELTA_DELAY_MS=${Number(delayMs)}`,
+      `MAYHEM_PROVIDER_SESSION_DELTA_DELAY_COUNT=${envPositiveInt(
+        'MAYHEM_P43_DELTA_DELAY_COUNT',
+        providerMode === 'real' ? 12 : 1
+      )}`,
+    ]
+    : [];
   const providerCmd = [
     prepareHome,
     `cd ${sh(remoteRoot)}`,
     [
       `MAYHEM_PROVIDER_SESSION_DEBUG=1`,
-      `MAYHEM_PROVIDER_SESSION_DELTA_DELAY_MS=${Number(delayMs)}`,
-      `MAYHEM_PROVIDER_SESSION_DELTA_DELAY_COUNT=1`,
+      ...deltaDelayEnv,
       `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)}`,
       `MAYHEM_NODE_BIN=${sh(remoteNode)}`,
       `nohup ${sh(remoteMayhem)} provider start ${providerFlags.join(' ')} > ${sh(providerLog)} 2>&1 & echo $!`,
@@ -827,7 +1222,7 @@ async function startRemoteProvider({
   cleanupState.remotePids.push(providerPid);
   const providerWaitCmd = `for i in $(seq 1 1200); do grep -q '"self_test"' ${sh(providerLog)} && exit 0; kill -0 ${providerPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
   await ssh(remote, passFile, providerWaitCmd, { timeoutMs: 610_000 });
-  const startupText = (await ssh(remote, passFile, `sed -n '1,260p' ${sh(providerLog)}`)).stdout;
+  const startupText = (await ssh(remote, passFile, `cat ${sh(providerLog)}`)).stdout;
   const startupReport = parseFirstJsonObject(startupText);
   if (!startupReport?.provider) fail(`provider ${label} startup report missing provider pubkey; see ${providerLog}`);
   return {
@@ -841,6 +1236,103 @@ async function startRemoteProvider({
     scBridgeUrl: `ws://127.0.0.1:${remoteScPort}`,
     rpcUrl: `http://127.0.0.1:${remoteRpcPort}/v1`,
     startup: startupReport,
+  };
+}
+
+async function startRemoteClientBridge({
+  label,
+  remote,
+  passFile,
+  remoteRoot,
+  remoteRun,
+  remoteLogs,
+  remotePear,
+  channel,
+  bootstrap,
+  peerDhtBootstrap,
+  scToken,
+}) {
+  log(`starting remote Pear client SC-Bridge peer ${label}`);
+  const remoteScPort = await remoteFreePort(remote, passFile);
+  const remoteStore = `mayhem-p43-${label}-${path.basename(remoteRun)}`;
+  const remoteMsbStore = `${remoteStore}-msb`;
+  const remotePeerLog = path.posix.join(remoteLogs, `${label}-peer.log`);
+  const remotePeerArgs = [
+    '--network local',
+    `--peer-store-name ${sh(remoteStore)}`,
+    `--msb-store-name ${sh(remoteMsbStore)}`,
+    `--subnet-channel ${sh(channel)}`,
+    `--subnet-bootstrap ${sh(bootstrap)}`,
+  ];
+  if (peerDhtBootstrap) remotePeerArgs.push(`--peer-dht-bootstrap ${sh(peerDhtBootstrap)}`);
+  remotePeerArgs.push(
+    '--headless 1',
+    '--peer-interactive 0',
+    '--peer-replicate 1',
+    '--peer-replicate-flush-timeout-ms 5000',
+    '--sidechannel-quiet 1',
+    '--sc-bridge 1',
+    '--sc-bridge-host 127.0.0.1',
+    `--sc-bridge-port ${remoteScPort}`,
+    `--sc-bridge-token ${sh(scToken)}`,
+    '--sc-bridge-cli 1',
+    '--session-debug 1',
+    '--session-max-frame-bytes 262144',
+    '--session-rate-bytes-per-second 1000000',
+    '--session-rate-burst-bytes 1000000'
+  );
+  const remotePeerCmd = [
+    `cd ${sh(path.posix.join(remoteRoot, 'intercom'))}`,
+    `nohup ${sh(remotePear)} run . ${remotePeerArgs.join(' ')} > ${sh(remotePeerLog)} 2>&1 & echo $!`,
+  ].join(' && ');
+  const remotePeerPid = (await ssh(remote, passFile, remotePeerCmd)).stdout.trim();
+  cleanupState.remotePids.push(remotePeerPid);
+  await waitRemoteLogPattern(
+    remote,
+    passFile,
+    remotePeerLog,
+    /Sidechannel: ready/,
+    360_000,
+    `remote client bridge ${label}`,
+    remotePeerPid
+  );
+  const startupText = (await ssh(remote, passFile, `cat ${sh(remotePeerLog)}`)).stdout;
+  const pubkey = startupText.match(/Peer pubkey \(hex\):\s+([0-9a-f]{64})/);
+  if (!pubkey) fail(`remote client bridge ${label} missing peer pubkey; see ${remotePeerLog}`);
+  return {
+    label,
+    pubkey: pubkey[1],
+    peerPid: remotePeerPid,
+    peerLog: remotePeerLog,
+    scBridgeUrl: `ws://127.0.0.1:${remoteScPort}`,
+  };
+}
+
+async function openRemoteScBridgeTunnel({ remote, passFile, remoteScBridgeUrl, logsDir, label }) {
+  const remotePort = new URL(remoteScBridgeUrl).port;
+  const localPort = await freePort();
+  const localUrl = `ws://127.0.0.1:${localPort}`;
+  const tunnelLog = path.join(logsDir, `${label}-sc-bridge-tunnel.log`);
+  const tunnelBase = sshProgram(passFile);
+  const tunnel = spawnLogged(
+    tunnelBase.command,
+    [
+      ...tunnelBase.args,
+      '-N',
+      '-L', `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`,
+      `${remote.user}@${remote.host}`,
+    ],
+    tunnelLog
+  );
+  cleanupState.localChildren.push(tunnel);
+  await sleep(1500);
+  if (tunnel.exitCode !== null) fail(`SC-Bridge tunnel exited early; see ${tunnelLog}`);
+  return {
+    label,
+    url: localUrl,
+    tunnel,
+    tunnel_log: tunnelLog,
+    remote_url: remoteScBridgeUrl,
   };
 }
 
@@ -859,19 +1351,37 @@ async function main() {
   const mayhemBin = path.join(ROOT, 'target/debug/mayhem');
   const mayhemEnclaveBin = path.join(ROOT, 'target/debug/mayhem-enclave');
   const modelId = process.env.MAYHEM_P43_MODEL || DEFAULT_MODEL;
+  const providerMode = (process.env.MAYHEM_P43_PROVIDER_MODE || 'real').trim();
+  if (!['real', 'shim'].includes(providerMode)) fail('MAYHEM_P43_PROVIDER_MODE must be real or shim');
   const delayMs = Number.parseInt(process.env.MAYHEM_P43_DELTA_DELAY_MS || '2500', 10);
   if (!Number.isSafeInteger(delayMs) || delayMs < 0) fail('MAYHEM_P43_DELTA_DELAY_MS must be a non-negative integer');
-  const artifactPath = path.join(runDir, 'p43-shim-artifact.bin');
-  fs.writeFileSync(
-    artifactPath,
-    `mayhem phase4 provider-kill deterministic artifact\n${tag}\n`,
-    { mode: 0o644 }
-  );
+  let artifactPath = path.resolve(process.env.MAYHEM_P43_ARTIFACT || DEFAULT_ARTIFACT);
+  if (providerMode === 'shim' && !process.env.MAYHEM_P43_ARTIFACT) {
+    artifactPath = path.join(runDir, 'p43-shim-artifact.bin');
+    fs.writeFileSync(
+      artifactPath,
+      `mayhem phase4 provider-kill deterministic artifact\n${tag}\n`,
+      { mode: 0o644 }
+    );
+  }
+  if (!fs.existsSync(artifactPath)) fail(`artifact missing: ${artifactPath}`);
   const macminiFile = path.resolve(ROOT, process.env.MAYHEM_P43_MACMINI_FILE || '../gpd/macmini.txt');
 
   log(`run dir: ${path.relative(ROOT, runDir)}`);
+  log(`provider mode: ${providerMode}`);
   log('building mayhem CLI/gateway/enclave crates');
-  runSync('cargo', ['build', '-q', '-p', 'mayhem-cli', '-p', 'mayhem-gateway', '-p', 'mayhem-enclave']);
+  const cargoEnv = { ...process.env };
+  if (providerMode === 'real') {
+    cargoEnv.CARGO_PROFILE_DEV_OPT_LEVEL =
+      cargoEnv.MAYHEM_P43_CARGO_OPT_LEVEL ||
+      cargoEnv.CARGO_PROFILE_DEV_OPT_LEVEL ||
+      '3';
+    cargoEnv.CARGO_PROFILE_DEV_DEBUG = cargoEnv.CARGO_PROFILE_DEV_DEBUG || '0';
+    log(`using Cargo dev opt-level ${cargoEnv.CARGO_PROFILE_DEV_OPT_LEVEL} for real-provider hashing/generation`);
+  }
+  runSync('cargo', ['build', '-q', '-p', 'mayhem-cli', '-p', 'mayhem-gateway', '-p', 'mayhem-enclave'], {
+    env: cargoEnv,
+  });
   if (!fs.existsSync(mayhemBin)) fail(`missing ${mayhemBin} after cargo build`);
   if (!fs.existsSync(mayhemEnclaveBin)) fail(`missing ${mayhemEnclaveBin} after cargo build`);
 
@@ -885,6 +1395,9 @@ async function main() {
   const catalog = readJson(path.join(ROOT, 'catalog/models.json'));
   const model = catalog.models.find((entry) => entry.model_id === modelId);
   if (!model) fail(`catalog model not found: ${modelId}`);
+  const inPer1kMu = model.price_ref_mu?.in_per_1k || 18;
+  const outPer1kMu = model.price_ref_mu?.out_per_1k || 55;
+  const rateMapJson = textRateMapJson(inPer1kMu, outPer1kMu);
   const artifactEntry = Object.entries(model.artifacts).find(([, artifact]) => artifact.engine === 'llama.cpp');
   if (!artifactEntry) fail(`model ${modelId} has no llama.cpp artifact`);
   const [artifactName, artifact] = artifactEntry;
@@ -902,7 +1415,7 @@ async function main() {
   const localTmpDir = path.join(ROOT, '.mayhem-local/tmp');
   await fsp.mkdir(localTmpDir, { recursive: true });
   const passFile = path.join(localTmpDir, `macmini-p43-${tag}-${process.pid}.pass`);
-  fs.writeFileSync(passFile, remote.pass, { mode: 0o600 });
+  fs.writeFileSync(passFile, `${remote.pass}\n`, { mode: 0o600 });
   sensitiveFiles.push(passFile);
   cleanupState.remote = remote;
   cleanupState.passFile = passFile;
@@ -911,16 +1424,33 @@ async function main() {
   log('checking Mac mini SSH and remote runtime');
   const remoteHome = (await ssh(remote, passFile, 'printf "%s\\n" "$HOME"')).stdout.trim();
   const remoteRootEnv = process.env.MAYHEM_P43_REMOTE_ROOT || '~/mayhem-macmini-p33';
-  const remoteRoot = remoteRootEnv.startsWith('~/')
-    ? path.posix.join(remoteHome, remoteRootEnv.slice(2))
-    : remoteRootEnv.replace('$HOME', remoteHome);
-  const remoteRun = path.posix.join(remoteRoot, '.mayhem-local/p4.3-provider-kill', tag);
+	  const remoteRoot = remoteRootEnv.startsWith('~/')
+	    ? path.posix.join(remoteHome, remoteRootEnv.slice(2))
+	    : remoteRootEnv.replace('$HOME', remoteHome);
+	  if (process.env.MAYHEM_P43_SKIP_STALE_CLEANUP !== '1') {
+	    log('cleaning stale local p4.3 smoke peers');
+	    await cleanupLocalSmokeProcesses({ allP43: true });
+	    log('cleaning stale remote p4.3 smoke peers');
+	    await cleanupRemoteSmokeProcesses(remote, passFile, { allP43: true });
+	  }
+	  const remoteRun = path.posix.join(remoteRoot, '.mayhem-local/p4.3-provider-kill', tag);
   const remoteLogs = path.posix.join(remoteRun, 'logs');
   cleanupState.remoteRun = remoteRun;
   const remoteCatalog = path.posix.join(remoteRun, 'catalog/models.json');
-  const remoteArtifact = path.posix.join(remoteRun, 'artifacts', path.basename(artifactPath));
+  const remoteArtifact = providerMode === 'real'
+    ? path.posix.join(remoteRoot, '.mayhem-cache/artifacts', path.basename(artifactPath))
+    : path.posix.join(remoteRun, 'artifacts', path.basename(artifactPath));
+  const remoteDownloadsDir = path.posix.join(remoteRoot, '.mayhem-cache/artifacts');
+  const localArtifactDir = path.dirname(artifactPath);
+  const artifactSidecars = Object.entries(artifact.sidecars || {}).map(([name, sidecar]) => ({
+    name,
+    sidecar,
+    local_path: path.resolve(localArtifactDir, sidecar.path),
+    remote_path: path.posix.join(remoteDownloadsDir, providerSidecarCacheFile(artifactName, name, sidecar)),
+  }));
   const remoteMayhem = path.posix.join(remoteRoot, 'target/debug/mayhem');
   const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
+  const remoteRules = path.posix.join(remoteRoot, 'RULES.md');
   const remoteIntercomMain = path.posix.join(remoteRoot, 'intercom/src/main.js');
   const remoteScBridgeFeature = path.posix.join(remoteRoot, 'intercom/features/sc-bridge/index.js');
   const remoteDirectSessionFeature = path.posix.join(remoteRoot, 'intercom/features/direct-session/index.js');
@@ -946,7 +1476,7 @@ async function main() {
     [
       `test -x ${sh(remotePear)}`,
       `test -d ${sh(path.posix.join(remoteRoot, 'intercom/node_modules'))}`,
-      `mkdir -p ${sh(path.posix.join(remoteRoot, 'target/debug'))} ${sh(path.posix.dirname(remoteArtifact))} ${sh(path.posix.dirname(remoteCatalog))} ${sh(path.posix.dirname(remoteWalletHelper))} ${sh(path.posix.dirname(remoteIntercomMain))} ${sh(path.posix.dirname(remoteScBridgeFeature))} ${sh(path.posix.dirname(remoteDirectSessionFeature))} ${sh(remoteLogs)}`,
+      `mkdir -p ${sh(path.posix.join(remoteRoot, 'target/debug'))} ${sh(path.posix.dirname(remoteArtifact))} ${sh(path.posix.dirname(remoteCatalog))} ${sh(path.posix.dirname(remoteWalletHelper))} ${sh(path.posix.dirname(remoteRules))} ${sh(path.posix.dirname(remoteIntercomMain))} ${sh(path.posix.dirname(remoteScBridgeFeature))} ${sh(path.posix.dirname(remoteDirectSessionFeature))} ${sh(remoteLogs)}`,
     ].join(' && ')
   );
 
@@ -974,10 +1504,35 @@ async function main() {
     { logFile: path.join(logsDir, 'remote-firewall.log') }
   );
 
-  log('copying temporary catalog, artifact, and Intercom feature patches to Mac mini');
+  log('copying temporary catalog, rules, and Intercom feature patches to Mac mini');
   await scpTo(remote, passFile, tempCatalogPath, remoteCatalog, { logFile: path.join(logsDir, 'scp-catalog.log') });
-  await scpTo(remote, passFile, artifactPath, remoteArtifact, { logFile: path.join(logsDir, 'scp-artifact.log') });
+  const remoteArtifactSha = await remoteSha256(remote, passFile, remoteArtifact);
+  if (remoteArtifactSha !== artifactSha256) {
+    log(`copying ${providerMode} artifact to Mac mini`);
+    await scpTo(remote, passFile, artifactPath, remoteArtifact, {
+      logFile: path.join(logsDir, 'scp-artifact.log'),
+      timeoutMs: providerMode === 'real' ? 900_000 : 180_000,
+    });
+  } else {
+    log('Mac mini already has matching provider artifact');
+  }
+  for (const sidecar of artifactSidecars) {
+    if (!fs.existsSync(sidecar.local_path)) {
+      log(`sidecar ${sidecar.name} not staged locally at ${sidecar.local_path}; provider may download it`);
+      continue;
+    }
+    const localSidecarSha = sha256File(sidecar.local_path);
+    const remoteSidecarSha = await remoteSha256(remote, passFile, sidecar.remote_path);
+    if (remoteSidecarSha !== localSidecarSha) {
+      log(`copying sidecar ${sidecar.name} to Mac mini provider cache`);
+      await scpTo(remote, passFile, sidecar.local_path, sidecar.remote_path, {
+        logFile: path.join(logsDir, `scp-sidecar-${sidecar.name}.log`),
+        timeoutMs: providerMode === 'real' ? 600_000 : 180_000,
+      });
+    }
+  }
   await scpTo(remote, passFile, path.join(ROOT, 'crates/mayhem-cli/src/wallet-helper.mjs'), remoteWalletHelper, { logFile: path.join(logsDir, 'scp-wallet-helper.log') });
+  await scpTo(remote, passFile, path.join(ROOT, 'RULES.md'), remoteRules, { logFile: path.join(logsDir, 'scp-rules.log') });
   await scpTo(remote, passFile, path.join(ROOT, 'intercom/src/main.js'), remoteIntercomMain, { logFile: path.join(logsDir, 'scp-intercom-main.log') });
   await scpTo(remote, passFile, path.join(ROOT, 'intercom/features/sc-bridge/index.js'), remoteScBridgeFeature, { logFile: path.join(logsDir, 'scp-sc-bridge.log') });
   await scpTo(remote, passFile, path.join(ROOT, 'intercom/features/direct-session/index.js'), remoteDirectSessionFeature, { logFile: path.join(logsDir, 'scp-direct-session.log') });
@@ -1066,17 +1621,24 @@ async function main() {
     fail(`could not parse dev-net output in ${devnetLog}`);
   }
   const adminPeerLog = path.join(devnetLogs[1], 'admin.log');
+  const joinerPeerLog = path.join(devnetLogs[1], 'joiner-a.log');
   const adminPubkey = fs.readFileSync(adminPeerLog, 'utf8').match(/Peer pubkey \(hex\):\s+([0-9a-f]{64})/);
   if (!adminPubkey) fail(`could not parse admin pubkey from ${adminPeerLog}`);
+  const userPubkey = fs.readFileSync(joinerPeerLog, 'utf8').match(/Peer pubkey \(hex\):\s+([0-9a-f]{64})/);
+  if (!userPubkey) fail(`could not parse user pubkey from ${joinerPeerLog}`);
   const adminRpcUrl = adminWs[2];
   const adminRpcPort = new URL(adminRpcUrl).port;
   const scToken = token[1];
 
   const roomNonce = `p4.3-${tag}`;
+  const artifactSidecarRoots = Object.fromEntries(
+    Object.entries(artifact.sidecars || {}).map(([name, sidecar]) => [name, sidecar.artifact_root])
+  );
   const enclaveId = await catalogEnclaveId({
     adminPubkey: adminPubkey[1],
     modelId,
     artifactRoot: artifactMerkle.root,
+    artifactSidecarRoots,
     manifestHash,
     binaryHash,
   });
@@ -1105,12 +1667,11 @@ async function main() {
     '--effective-at', '86400',
     '--values-json', '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_mu":0,"rate_staleness_seconds":86400}',
   ]);
-  adminRun('admin-set-model-ref', [
-    'set-model-ref',
-    '--model', modelId,
-    '--in-per-1k-mu', String(model.price_ref_mu?.in_per_1k || 18),
-    '--out-per-1k-mu', String(model.price_ref_mu?.out_per_1k || 55),
-  ]);
+    adminRun('admin-set-model-ref', [
+      'set-model-ref',
+      '--model', modelId,
+      '--rate-map-json', rateMapJson,
+    ]);
   adminRun('admin-register-enclave', [
     'register-enclave',
     '--enclave-id', enclaveId,
@@ -1128,13 +1689,12 @@ async function main() {
     '--binary-hash', binaryHash,
     '--caps-json', '{"chat":true,"tools":true,"json":true,"ctx":8192}',
   ]);
-  adminRun('admin-set-price', [
-    'set-price',
-    '--enclave-id', enclaveId,
-    '--in-per-1k-mu', String(model.price_ref_mu?.in_per_1k || 18),
-    '--out-per-1k-mu', String(model.price_ref_mu?.out_per_1k || 55),
-    '--effective-at', '0',
-  ]);
+    adminRun('admin-set-price', [
+      'set-price',
+      '--enclave-id', enclaveId,
+      '--rate-map-json', rateMapJson,
+      '--effective-at', '0',
+    ]);
   adminRun('admin-open-room', [
     'open-room',
     '--enclave-id', enclaveId,
@@ -1142,16 +1702,28 @@ async function main() {
     '--nonce', roomNonce,
     '--label', 'phase4-provider-kill',
   ]);
+  const gatewayCreditMu = 10_000_000;
+  const fiatDepositRef = (await b3(Buffer.from(`phase4-fiat-credit:${tag}:${userPubkey[1]}`, 'utf8'))).toString('hex');
+  adminRun('admin-fiat-deposit', [
+    'fiat-deposit',
+    '--rail', 'stripe',
+    '--who', userPubkey[1],
+    '--mu', String(gatewayCreditMu),
+    '--ext-ref-hash', fiatDepositRef,
+    '--fiat-currency', 'usd',
+    '--fiat-amount-minor', '1000',
+    '--epoch', '1',
+    '--at', '0',
+  ]);
 
   log('opening SSH reverse tunnel for remote provider contract RPC');
   const remoteAdminRpcTunnelPort = await remoteFreePort(remote, passFile);
   const tunnelLog = path.join(logsDir, 'ssh-reverse-tunnel.log');
+  const tunnelBase = sshProgram(passFile);
   const tunnel = spawnLogged(
-    'sshpass',
+    tunnelBase.command,
     [
-      '-f', passFile,
-      'ssh',
-      ...SSH_OPTS,
+      ...tunnelBase.args,
       '-N',
       '-R', `127.0.0.1:${remoteAdminRpcTunnelPort}:127.0.0.1:${adminRpcPort}`,
       `${remote.user}@${remote.host}`,
@@ -1175,6 +1747,7 @@ async function main() {
     remoteWalletHelper,
     remoteCatalog,
     remoteArtifact,
+    remoteDownloadsDir,
     adminRpcTunnelPort: remoteAdminRpcTunnelPort,
     rulesHash,
     channel: channel[1],
@@ -1183,6 +1756,7 @@ async function main() {
     scToken,
     enclaveId,
     delayMs,
+    providerMode,
   };
   const providers = [
     await startRemoteProvider({ ...providerCommon, label: 'a' }),
@@ -1190,9 +1764,36 @@ async function main() {
   ];
   const providerPubkeys = providers.map((provider) => provider.pubkey);
 
-  log('selecting local SC-Bridge with direct connectivity to both providers');
+  const remoteClientBridge = await startRemoteClientBridge({
+    label: 'client',
+    remote,
+    passFile,
+    remoteRoot,
+    remoteRun,
+    remoteLogs,
+    remotePear,
+    channel: channel[1],
+    bootstrap: bootstrap[1],
+    peerDhtBootstrap,
+    scToken,
+  });
+  const remoteClientTunnel = await openRemoteScBridgeTunnel({
+    remote,
+    passFile,
+    remoteScBridgeUrl: remoteClientBridge.scBridgeUrl,
+    logsDir,
+    label: 'client',
+  });
+
+  log('selecting SC-Bridge with direct connectivity to both providers');
   const userScBridge = await pickBridgeForProviders(
     [
+      {
+        label: 'macmini-client',
+        url: remoteClientTunnel.url,
+        remote: remoteClientBridge,
+        tunnel_log: remoteClientTunnel.tunnel_log,
+      },
       { label: 'joiner-a', url: joinerWs[1] },
       { label: 'admin', url: adminWs[1] },
     ],
@@ -1206,7 +1807,13 @@ async function main() {
   const gatewayUrl = `http://127.0.0.1:${gatewayPort}`;
   const gatewayLog = path.join(logsDir, 'gateway.log');
   const gatewayHome = path.join(runDir, 'gateway-home');
-  await fsp.mkdir(gatewayHome, { recursive: true });
+  const receiptCheckpointTokens = envPositiveInt('MAYHEM_P43_RECEIPT_CHECKPOINT_TOKENS', 32);
+  const receiptCheckpointMs = envPositiveInt('MAYHEM_P43_RECEIPT_CHECKPOINT_MS', 30000);
+  await fsp.mkdir(path.join(gatewayHome, 'stores'), { recursive: true });
+  const gatewayStore = path.join(ROOT, 'intercom/stores/mayhem-devnet-joiner-a');
+  const gatewayStoreLink = path.join(gatewayHome, 'stores/main');
+  await fsp.rm(gatewayStoreLink, { recursive: true, force: true });
+  await fsp.symlink(gatewayStore, gatewayStoreLink);
   const gateway = spawnLogged(
     mayhemBin,
     [
@@ -1216,7 +1823,12 @@ async function main() {
       '--sc-bridge-url', userScBridge.url,
       '--sc-bridge-token', scToken,
       '--session-open-timeout-seconds', '3',
+      '--session-ttft-timeout-seconds', providerMode === 'real' ? '300' : '60',
       '--session-frame-timeout-seconds', '15',
+      '--receipt-checkpoint-tokens', String(receiptCheckpointTokens),
+      '--receipt-checkpoint-ms', String(receiptCheckpointMs),
+      '--dev-catalog-path', tempCatalogPath,
+      '--dev-skip-catalog-verify',
       '--bind', `127.0.0.1:${gatewayPort}`,
       '--json',
     ],
@@ -1226,67 +1838,77 @@ async function main() {
   await waitHttp(`${gatewayUrl}/mayhem/status`, 120_000, 'local gateway', async () => gateway.exitCode === null);
   const routeInfo = await waitForGatewayRoutes(gatewayUrl, modelId, providerPubkeys, 120_000);
 
-  log('starting gateway request, then killing the first provider that emits a content delta');
-  const requestBody = {
-    model: modelId,
-    messages: [{ role: 'user', content: 'p4 recovery' }],
-    max_tokens: 16,
-    stream: false,
-  };
+  log('starting streaming gateway request, then killing the first provider after checkpoint ack');
+  const chatMaxTokens = envPositiveInt('MAYHEM_P43_CHAT_MAX_TOKENS', 128);
   const requestStartedAt = Date.now();
-  const responsePromise = fetch(`${gatewayUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(requestBody),
-  }).then(async (response) => {
-    const text = await response.text();
-    let body = null;
-    try {
-      body = JSON.parse(text);
-    } catch {}
-    return {
-      status: response.status,
-      ok: response.ok,
-      body,
-      text,
-      completed_at_ms: Date.now(),
-    };
+  let streamCompleted = false;
+  const killPromise = waitAndKillAfterCheckpointAck(
+    remote,
+    passFile,
+    providers,
+    providerMode === 'real' ? 240_000 : 45_000
+  );
+  await sleep(500);
+  const streamPromise = runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
+    timeoutMs: providerMode === 'real' ? 360_000 : 90_000,
+    maxTokens: chatMaxTokens,
+  }).finally(() => {
+    streamCompleted = true;
   });
-  const kill = await waitAndKillFirstDelta(remote, passFile, providers, 25_000);
-  const response = await Promise.race([
-    responsePromise,
-    sleep(45_000).then(() => {
-      throw new Error('gateway request timed out after provider kill');
+  const kill = await Promise.race([
+    killPromise,
+    streamPromise.then(() => {
+      throw new Error('streaming gateway request completed before a checkpointed provider kill was observed');
     }),
   ]);
-  if (!response.ok) {
-    fail(`gateway request failed after provider kill: status=${response.status} body=${response.text}`);
+  const stream = await streamPromise;
+  if (!streamCompleted) {
+    fail('internal error: stream did not settle after provider kill');
   }
-  const recoveryMs = response.completed_at_ms - kill.killed_at_ms;
-  if (recoveryMs >= 20_000) {
-    fail(`P4.3 recovery took ${recoveryMs}ms, expected < 20000ms`);
-  }
+  const recoveryMs = requestStartedAt + stream.timing_ms.total - kill.killed_at_ms;
 
   const receipts = await (await fetch(`${gatewayUrl}/mayhem/receipts`)).json();
   const receiptsPath = path.join(runDir, 'gateway-receipts.json');
   writeJson(receiptsPath, receipts);
   const storedReceipts = Array.isArray(receipts.data) ? receipts.data : [];
-  if (storedReceipts.length !== 1) {
-    fail(`expected exactly one stored receipt after failover, got ${storedReceipts.length}`);
+  if (storedReceipts.length < 2) {
+    fail(`expected checkpoint + final receipts after failover, got ${storedReceipts.length}`);
   }
-  const receiptBody = storedReceipts[0]?.receipt?.body || storedReceipts[0]?.receipt || {};
+  const killedReceipts = storedReceipts.filter((receipt) => storedReceiptBody(receipt).provider === kill.provider);
+  const killedFinalReceipts = killedReceipts.filter(receiptIsFinal);
+  if (killedReceipts.length !== 1) {
+    fail(`expected exactly one killed-provider checkpoint receipt, got ${killedReceipts.length}`);
+  }
+  if (killedFinalReceipts.length !== 0) {
+    fail(`killed provider produced ${killedFinalReceipts.length} final receipt(s)`);
+  }
+  const killedReceiptBody = storedReceiptBody(killedReceipts[0]);
+  const killedReceiptSeq = Number(killedReceiptBody.seq ?? 0);
+  if (!Number.isSafeInteger(killedReceiptSeq) || killedReceiptSeq < 1) {
+    fail(`killed provider checkpoint has invalid seq ${killedReceiptBody.seq}`);
+  }
+  const killedOutputTokens = Number(killedReceiptBody.usage?.output_token ?? killedReceiptBody.usage?.completion_tokens ?? 0);
+  const killedProviderLogText = (await ssh(remote, passFile, `cat ${sh(kill.provider_log)}`)).stdout;
+  const killedProviderTail = providerLogOutputTailProof(killedProviderLogText, killedOutputTokens);
+  if (killedProviderTail.observed_output_tokens === null) {
+    fail(`could not prove killed-provider output tail from ${kill.provider_log}`);
+  }
+  if (killedOutputTokens > killedProviderTail.observed_output_tokens) {
+    fail(`killed provider checkpoint output ${killedOutputTokens} exceeds provider-observed output ${killedProviderTail.observed_output_tokens}`);
+  }
+  if (killedProviderTail.uncheckpointed_output_tokens > receiptCheckpointTokens) {
+    fail(`killed provider uncheckpointed output tail ${killedProviderTail.uncheckpointed_output_tokens} exceeds checkpoint window ${receiptCheckpointTokens}`);
+  }
+  const finalReceipts = storedReceipts.filter(receiptIsFinal);
+  if (finalReceipts.length !== 1) {
+    fail(`expected exactly one final fallback receipt, got ${finalReceipts.length}`);
+  }
+  const receiptBody = storedReceiptBody(finalReceipts[0]);
   if (receiptBody.provider === kill.provider) {
-    fail('stored receipt belongs to killed provider; failover double-billed the dead route');
+    fail('final receipt belongs to killed provider; failover did not switch routes');
   }
   if (!providerPubkeys.includes(receiptBody.provider)) {
-    fail(`stored receipt provider ${receiptBody.provider} is not one of the two canonical providers`);
-  }
-  const killedReceiptCount = storedReceipts.filter((receipt) => {
-    const body = receipt?.receipt?.body || receipt?.receipt || {};
-    return body.provider === kill.provider;
-  }).length;
-  if (killedReceiptCount !== 0) {
-    fail(`killed provider produced ${killedReceiptCount} stored receipt(s)`);
+    fail(`final receipt provider ${receiptBody.provider} is not one of the two canonical providers`);
   }
 
   const report = {
@@ -1295,17 +1917,25 @@ async function main() {
     run_dir: path.relative(ROOT, runDir),
     local: {
       gateway_url: gatewayUrl,
-      admin_rpc_url: adminRpcUrl,
-      user_sc_bridge_label: userScBridge.label,
-      user_sc_bridge_url: userScBridge.url,
-      subnet_channel: subnetChannel,
-      peer_dht_bootstrap: peerDhtBootstrap,
-    },
-    remote: {
-      host: remote.host,
-      root: remoteRoot,
-      run_dir: remoteRun,
-    },
+        admin_rpc_url: adminRpcUrl,
+        user_sc_bridge_label: userScBridge.label,
+        user_sc_bridge_url: userScBridge.url,
+        user_sc_bridge_remote_url: userScBridge.remote?.scBridgeUrl || null,
+        user_sc_bridge_tunnel_log: userScBridge.tunnel_log || null,
+        subnet_channel: subnetChannel,
+        peer_dht_bootstrap: peerDhtBootstrap,
+      },
+      remote: {
+        host: remote.host,
+        root: remoteRoot,
+        run_dir: remoteRun,
+        client_bridge: userScBridge.remote ? {
+          label: userScBridge.remote.label,
+          pubkey: userScBridge.remote.pubkey,
+          peer_pid: userScBridge.remote.peerPid,
+          peer_log: userScBridge.remote.peerLog,
+        } : null,
+      },
     admin: {
       pubkey: adminPubkey[1],
       room_nonce: roomNonce,
@@ -1341,43 +1971,53 @@ async function main() {
       features: provider.startup.features,
     })),
     route_candidates: routeInfo.routes,
-    kill,
-    request: {
-      started_at_ms: requestStartedAt,
-      completed_at_ms: response.completed_at_ms,
-      recovery_ms: recoveryMs,
-      response_status: response.status,
-      response_id: response.body?.id || null,
-      response_provider: receiptBody.provider,
-      response_session: receiptBody.session_id || null,
-    },
-    receipts: {
-      path: receiptsPath,
-      stored_count: storedReceipts.length,
-      killed_provider_receipts: killedReceiptCount,
-      latest: receiptBody,
-      checkpoint_every: storedReceipts[0]?.voucher?.body?.checkpoint_every || null,
-    },
-    assertions: {
-      provider_killed_with_sigkill: true,
-      recovery_under_20s: recoveryMs < 20_000,
-      one_stored_receipt: storedReceipts.length === 1,
-      killed_provider_receipts_zero: killedReceiptCount === 0,
-      fallback_provider_receipted: receiptBody.provider !== kill.provider,
-    },
-  };
+      kill,
+      request: {
+        started_at_ms: requestStartedAt,
+        completed_at_ms: requestStartedAt + stream.timing_ms.total,
+        recovery_ms: recoveryMs,
+        stream,
+        response_provider: receiptBody.provider,
+        response_session: receiptBody.session_id || null,
+      },
+      receipts: {
+        path: receiptsPath,
+        stored_count: storedReceipts.length,
+        killed_provider_receipts: killedReceipts.length,
+        killed_provider_final_receipts: killedFinalReceipts.length,
+        killed_checkpoint: killedReceiptBody,
+        killed_checkpoint_seq: killedReceiptSeq,
+        killed_checkpoint_output_tokens: killedOutputTokens,
+        killed_provider_tail: killedProviderTail,
+        final: receiptBody,
+        checkpoint_every:
+          storedReceipts[0]?.voucher?.checkpoint_every ||
+          storedReceipts[0]?.voucher?.body?.checkpoint_every ||
+          null,
+      },
+      assertions: {
+        provider_killed_with_sigkill: true,
+        stream_done_seen: stream.done_seen === true,
+        checkpointed_killed_receipt: killedReceipts.length === 1 && killedFinalReceipts.length === 0,
+        killed_uncheckpointed_tail_within_window:
+          killedProviderTail.uncheckpointed_output_tokens !== null &&
+          killedProviderTail.uncheckpointed_output_tokens <= receiptCheckpointTokens,
+        exactly_one_final_receipt: finalReceipts.length === 1,
+        fallback_provider_receipted: receiptBody.provider !== kill.provider,
+      },
+    };
   const reportPath = path.join(runDir, 'report.json');
   writeJson(reportPath, report);
   console.log(JSON.stringify(report, null, 2));
 
-  await cleanup({
-    remote,
-    passFile,
-    remotePids: cleanupState.remotePids,
-      localChildren: [gateway, tunnel, devnet, localPeerDht],
-    devnetLog,
-    remoteRun,
-  });
+    await cleanup({
+      remote,
+      passFile,
+      remotePids: cleanupState.remotePids,
+      localChildren: cleanupState.localChildren,
+      devnetLog,
+      remoteRun,
+    });
 }
 
 async function cleanup({ remote, passFile, remotePids, localChildren, devnetLog, remoteRun }) {
@@ -1390,14 +2030,16 @@ async function cleanup({ remote, passFile, remotePids, localChildren, devnetLog,
   for (const child of children) {
     if (child && child.exitCode === null) child.kill('SIGTERM');
   }
-  for (const pid of remotePids || []) {
-    if (remote && passFile && fs.existsSync(passFile) && pid) {
-      try {
-        await ssh(remote, passFile, `kill ${Number(pid)} >/dev/null 2>&1 || true`);
-      } catch {}
-    }
-  }
-  if (devnetLog && fs.existsSync(devnetLog)) {
+	  for (const pid of remotePids || []) {
+	    if (remote && passFile && fs.existsSync(passFile) && pid) {
+	      try {
+	        await ssh(remote, passFile, `pkill -TERM -P ${Number(pid)} >/dev/null 2>&1 || true`);
+	        await ssh(remote, passFile, `kill ${Number(pid)} >/dev/null 2>&1 || true`);
+	      } catch {}
+	    }
+	  }
+	  await cleanupRemoteSmokeProcesses(remote, passFile, { remoteRun });
+	  if (devnetLog && fs.existsSync(devnetLog)) {
     const text = fs.readFileSync(devnetLog, 'utf8');
     const match = text.match(/Peers are still running\. Stop them with: kill ([0-9\s]+)/);
     if (match) {
