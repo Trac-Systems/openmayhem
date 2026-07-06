@@ -24535,11 +24535,10 @@ fn provider_engine_session_response(
     } else {
         None
     };
+    let prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
+    let completion_tokens = u64::from(output.usage.completion_tokens);
     Ok(ProviderSessionOutput {
-        usage: ReceiptUsage::text(
-            u64::from(output.usage.prompt_tokens),
-            u64::from(output.usage.completion_tokens),
-        ),
+        usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
         content: if tool.is_some() {
             String::new()
         } else {
@@ -24553,8 +24552,8 @@ fn provider_engine_session_response(
         } else {
             output.finish_reason.to_string()
         },
-        prompt_tokens: u64::from(output.usage.prompt_tokens),
-        completion_tokens: u64::from(output.usage.completion_tokens),
+        prompt_tokens,
+        completion_tokens,
         token_ids,
     })
 }
@@ -30158,8 +30157,10 @@ mod tests {
         assert_eq!(output.content, "engine says hi");
         assert!(output.tool.is_none());
         assert_eq!(output.finish_reason, "stop");
-        assert_eq!(output.prompt_tokens, 4);
+        assert_eq!(output.prompt_tokens, 1);
         assert_eq!(output.completion_tokens, 2);
+        assert_eq!(output.usage.input_tokens(), 1);
+        assert_eq!(output.usage.output_tokens(), 2);
         let request = backend.last_request.expect("engine request");
         assert!(request.prompt.contains("user: hello"));
         assert_eq!(request.max_new_tokens, 8);
