@@ -247,6 +247,7 @@ fn report_from_profile(profile: HardwareProfile) -> HardwareReport {
 
 fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
     vec![
+        vllm_verdict(profile),
         trt_llm_verdict(profile),
         mlx_verdict(profile),
         llama_cpp_verdict(profile),
@@ -254,6 +255,96 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         whisper_cpp_verdict(profile),
         piper_verdict(profile),
     ]
+}
+
+fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    let nvidia = profile
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
+        .collect::<Vec<_>>();
+    if nvidia.is_empty() {
+        return insufficient("vllm", "no NVIDIA GPU detected");
+    }
+
+    let total_vram = nvidia
+        .iter()
+        .filter_map(|gpu| gpu.memory_bytes)
+        .sum::<u64>();
+    let best_cc = nvidia
+        .iter()
+        .filter_map(|gpu| gpu.compute_capability.as_deref())
+        .filter_map(parse_compute_capability)
+        .fold(None, |best: Option<(u32, u32)>, cc| {
+            Some(best.map_or(cc, |best| best.max(cc)))
+        });
+    let Some(cc) = best_cc else {
+        return BackendVerdict {
+            backend: "vllm".to_owned(),
+            status: VerdictStatus::PartialOffload,
+            reason: Some("NVIDIA GPU detected but compute capability is unknown".to_owned()),
+            est_tok_s: Some(30.0),
+            n_layers_gpu: None,
+            max_sessions: 2,
+            kv_cache_bytes_budget: total_vram / 4,
+        };
+    };
+    if cc < (7, 0) {
+        return insufficient(
+            "vllm",
+            "NVIDIA compute capability is below the launch vLLM floor",
+        );
+    }
+
+    let tensor_parallel = nvidia.first().is_some_and(|first| {
+        nvidia.len() >= 2
+            && nvidia.iter().all(|gpu| {
+                gpu.name == first.name
+                    && gpu.compute_capability == first.compute_capability
+                    && gpu.memory_bytes == first.memory_bytes
+            })
+    });
+    if total_vram >= 16 * GIB {
+        BackendVerdict {
+            backend: "vllm".to_owned(),
+            status: VerdictStatus::FullOffload,
+            reason: Some(if tensor_parallel {
+                "NVIDIA CUDA GPU set supports vLLM continuous batching and tensor parallelism"
+                    .to_owned()
+            } else {
+                "NVIDIA CUDA GPU supports vLLM continuous batching".to_owned()
+            }),
+            est_tok_s: Some(if cc >= (10, 0) {
+                if tensor_parallel {
+                    300.0
+                } else {
+                    180.0
+                }
+            } else if cc >= (8, 9) {
+                120.0
+            } else {
+                70.0
+            }),
+            n_layers_gpu: None,
+            max_sessions: if tensor_parallel { 16 } else { 8 },
+            kv_cache_bytes_budget: total_vram / 2,
+        }
+    } else if total_vram >= 8 * GIB {
+        BackendVerdict {
+            backend: "vllm".to_owned(),
+            status: VerdictStatus::PartialOffload,
+            reason: Some(
+                "NVIDIA CUDA GPU can run small vLLM launch artifacts with limited concurrency"
+                    .to_owned(),
+            ),
+            est_tok_s: Some(45.0),
+            n_layers_gpu: None,
+            max_sessions: 2,
+            kv_cache_bytes_budget: total_vram / 3,
+        }
+    } else {
+        insufficient("vllm", "less than 8 GiB dedicated NVIDIA VRAM available")
+    }
 }
 
 fn trt_llm_verdict(profile: &HardwareProfile) -> BackendVerdict {
@@ -1380,9 +1471,15 @@ mod tests {
     }
 
     #[test]
-    fn blackwell_fixture_prefers_trt_llm_with_nvfp4_and_tensor_parallel() {
+    fn blackwell_fixture_prefers_vllm_with_nvfp4_and_tensor_parallel() {
         let report = fixture_report(FixtureProfile::LinuxNvidia);
-        assert_eq!(report.selected_backend.as_deref(), Some("trt-llm"));
+        assert_eq!(report.selected_backend.as_deref(), Some("vllm"));
+        let vllm = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "vllm")
+            .unwrap();
+        assert_eq!(vllm.status, VerdictStatus::FullOffload);
         let trt = report
             .backend_verdicts
             .iter()

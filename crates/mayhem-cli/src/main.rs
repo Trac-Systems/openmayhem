@@ -8126,6 +8126,11 @@ fn catalog_artifact_stage_command(
             artifact_base,
             artifact_path,
         )?),
+        "vllm" => Ok(catalog_artifact_stage_vllm_command(
+            source_dir,
+            &artifact.path,
+            artifact_path,
+        )?),
         other => bail!("unsupported artifact engine {other} for staging"),
     }
 }
@@ -8211,6 +8216,27 @@ fn catalog_artifact_stage_trt_command(
         shell_single_quote(&engine_dir.display().to_string()),
         shell_single_quote(qformat),
         shell_single_quote(&checkpoint_dir.display().to_string()),
+        shell_single_quote(&artifact_path.display().to_string()),
+        shell_single_quote(&artifact_path.display().to_string())
+    );
+    let mut command =
+        catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
+    command.shell = script;
+    Ok(command)
+}
+
+fn catalog_artifact_stage_vllm_command(
+    source_dir: &Path,
+    source_path: &str,
+    artifact_path: &Path,
+) -> Result<CatalogCanaryPlanCommand> {
+    let source_file = source_dir.join(source_path);
+    let script = format!(
+        "mkdir -p {} && test -s {} || {{ echo \"vLLM source safetensors not found: {}\" >&2; exit 1; }} && cp -f {} {} && test -s {}",
+        shell_single_quote(&artifact_path.parent().unwrap_or_else(|| Path::new(".")).display().to_string()),
+        shell_single_quote(&source_file.display().to_string()),
+        source_file.display(),
+        shell_single_quote(&source_file.display().to_string()),
         shell_single_quote(&artifact_path.display().to_string()),
         shell_single_quote(&artifact_path.display().to_string())
     );
@@ -8600,6 +8626,17 @@ fn validate_calibration_args_for_artifact(
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<()> {
     if artifact.engine == "trt-llm" {
+        return Ok(());
+    }
+    if artifact.engine == "vllm" {
+        if args.trt_engine_dir.is_some()
+            || args.trt_require_engine_dir
+            || args.trt_kv_cache_dtype.is_some()
+        {
+            bail!(
+                "TensorRT engine/KV-cache calibration options require a trt-llm artifact, got vllm"
+            );
+        }
         return Ok(());
     }
     if args.trt_engine_dir.is_some()
@@ -9819,7 +9856,7 @@ fn catalog_canary_matrix_report(
             }
             let calibration_status = match artifact.engine.as_str() {
                 "llama.cpp" | "mlx" => "local-calibration-supported",
-                "trt-llm" => "hardware-gated-calibration",
+                "trt-llm" | "vllm" => "hardware-gated-calibration",
                 other => {
                     entry_errors.push(format!("unsupported calibration engine {other}"));
                     "unsupported-calibration-engine"
@@ -9909,6 +9946,7 @@ fn catalog_calibration_backend(
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
+        "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
@@ -9963,6 +10001,15 @@ fn catalog_calibration_backend(
             backend
                 .load(config)
                 .context("loading TensorRT-LLM canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "vllm" => {
+            config.vllm_tensor_parallel = Some(args.trt_tensor_parallel.unwrap_or(1));
+            let mut backend =
+                mayhem_engine::VllmBackend::new().context("initializing vLLM backend")?;
+            backend
+                .load(config)
+                .context("loading vLLM canary calibration artifact")?;
             Ok(Box::new(backend))
         }
         "whisper.cpp" | "piper" => {
@@ -21346,11 +21393,14 @@ fn build_provider_candidates(
             ));
             continue;
         }
-        if enclave.backend == "trt-llm" {
+        if matches!(enclave.backend.as_str(), "trt-llm" | "vllm") {
             let Ok(tp_degree) = enclave_tp_degree(&enclave.caps) else {
                 rejections.push(provider_rejection(
                     enclave,
-                    "trt-llm enclave caps are missing a valid tp_degree".to_owned(),
+                    format!(
+                        "{} enclave caps are missing a valid tp_degree",
+                        enclave.backend
+                    ),
                     compatible_catalog_artifact_suggestion(model, hardware, None),
                 ));
                 continue;
@@ -21685,6 +21735,7 @@ fn select_provider_candidate(
 
 fn backend_rank(backend: &str) -> u8 {
     match backend {
+        "vllm" => 4,
         "trt-llm" => 3,
         "mlx" => 2,
         "llama.cpp" => 1,
@@ -23850,6 +23901,16 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "vllm" => {
+            let mut backend = mayhem_engine::VllmBackend::new()
+                .context("initializing vLLM provider session engine")?;
+            backend
+                .load(load_config)
+                .context("loading vLLM provider session engine")?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         "stable-diffusion.cpp" => {
             let mut backend = mayhem_engine::StableDiffusionCppBackend::new()
                 .context("initializing stable-diffusion.cpp provider session engine")?;
@@ -23902,12 +23963,15 @@ fn provider_engine_load_config(
         let layout = materialize_trt_llm_artifacts(selected, artifact_paths)?;
         artifact_path_buf = layout.checkpoint_dir;
         materialized_trt_engine_dir = Some(layout.engine_dir);
+    } else if selected.artifact.engine == "vllm" {
+        artifact_path_buf = materialize_vllm_artifacts(selected, artifact_paths)?;
     }
     let artifact_path = artifact_path_buf.as_path();
     let artifact = match selected.artifact.engine.as_str() {
         "llama.cpp" => ModelArtifact::gguf(artifact_path),
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
+        "vllm" => ModelArtifact::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
         "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
         "piper" => ModelArtifact::piper_voice(artifact_path),
@@ -23922,6 +23986,7 @@ fn provider_engine_load_config(
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
+        "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
@@ -23963,12 +24028,111 @@ fn provider_engine_load_config(
             trt_kv_cache_dtype_for_artifact(&selected.artifact_name, &selected.artifact);
         config.trt_require_engine_dir = true;
     }
+    if selected.artifact.engine == "vllm" {
+        config.vllm_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
+        if let Some(max_batch_size) = enclave_max_batch_size(&selected.enclave.caps)? {
+            config.batch_size = max_batch_size;
+        }
+        if let Some(max_num_tokens) = enclave_max_num_tokens(&selected.enclave.caps)? {
+            config.ubatch_size = max_num_tokens.max(config.ctx_size);
+        }
+        config.vllm_dtype = selected
+            .enclave
+            .caps
+            .get("vllm_dtype")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
     Ok(config)
 }
 
 struct TrtLlmMaterializedLayout {
     checkpoint_dir: PathBuf,
     engine_dir: PathBuf,
+}
+
+const VLLM_REQUIRED_SIDECARS: &[(&str, &str)] = &[
+    ("vllm_config", "config.json"),
+    ("vllm_tokenizer_json", "tokenizer.json"),
+    ("vllm_tokenizer_config", "tokenizer_config.json"),
+];
+
+const VLLM_OPTIONAL_SIDECARS: &[(&str, &str)] = &[
+    ("vllm_generation_config", "generation_config.json"),
+    ("vllm_special_tokens_map", "special_tokens_map.json"),
+    ("vllm_tokenizer_model", "tokenizer.model"),
+    ("vllm_merges", "merges.txt"),
+    ("vllm_vocab", "vocab.json"),
+];
+
+fn materialize_vllm_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    let checkpoint_dir =
+        vllm_checkpoint_cache_dir(&artifact_paths.primary, &selected.artifact_name);
+    fs::create_dir_all(&checkpoint_dir).with_context(|| {
+        format!(
+            "creating vLLM checkpoint layout {}",
+            checkpoint_dir.display()
+        )
+    })?;
+    let payload_name = catalog_path_file_name(&selected.artifact.path, "vLLM primary artifact")?;
+    link_or_copy_file(&artifact_paths.primary, &checkpoint_dir.join(payload_name))?;
+    for (sidecar, filename) in VLLM_REQUIRED_SIDECARS {
+        materialize_vllm_sidecar(
+            selected,
+            artifact_paths,
+            sidecar,
+            &checkpoint_dir,
+            filename,
+            true,
+        )?;
+    }
+    for (sidecar, filename) in VLLM_OPTIONAL_SIDECARS {
+        materialize_vllm_sidecar(
+            selected,
+            artifact_paths,
+            sidecar,
+            &checkpoint_dir,
+            filename,
+            false,
+        )?;
+    }
+    Ok(checkpoint_dir)
+}
+
+fn materialize_vllm_sidecar(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+    sidecar: &str,
+    target_dir: &Path,
+    filename: &str,
+    required: bool,
+) -> Result<()> {
+    let destination = target_dir.join(filename);
+    if destination.is_file() {
+        return Ok(());
+    }
+    let Some(source) = artifact_paths.sidecars.get(sidecar) else {
+        if required {
+            bail!(
+                "vLLM artifact {}/{} requires admin catalog sidecar {} -> {}",
+                selected.model.model_id,
+                selected.artifact_name,
+                sidecar,
+                filename
+            );
+        }
+        return Ok(());
+    };
+    link_or_copy_file(source, &destination).with_context(|| {
+        format!(
+            "materializing vLLM sidecar {} at {}",
+            sidecar,
+            destination.display()
+        )
+    })
 }
 
 fn materialize_trt_llm_artifacts(
@@ -24130,7 +24294,7 @@ fn provider_attestation_runtime_config(
             selected.model.caps.ctx_max, selected.model.model_id
         )
     })?;
-    let tp_degree = if selected.artifact.engine == "trt-llm" {
+    let tp_degree = if matches!(selected.artifact.engine.as_str(), "trt-llm" | "vllm") {
         enclave_tp_degree(&selected.enclave.caps)?
     } else {
         1
@@ -24170,6 +24334,19 @@ fn trt_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBu
             .unwrap_or_else(|| PathBuf::from("."))
     };
     base.join(".trtllm-checkpoints")
+        .join(safe_path_component(artifact_name))
+}
+
+fn vllm_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
+    let base = if artifact_path.is_dir() {
+        artifact_path.to_path_buf()
+    } else {
+        artifact_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    base.join(".vllm-checkpoints")
         .join(safe_path_component(artifact_name))
 }
 
@@ -30943,6 +31120,137 @@ mod tests {
     }
 
     #[test]
+    fn provider_engine_load_config_wires_vllm_admin_artifact_layout() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        let mut vllm_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        vllm_artifact.engine = "vllm".to_owned();
+        vllm_artifact.path = "model.safetensors".to_owned();
+        vllm_artifact.min_compute_cap = Some("8.0".to_owned());
+        vllm_artifact.notes = Some("admin-pinned vLLM safetensors checkpoint".to_owned());
+        catalog.models[0].requirements.backends = vec!["vllm".to_owned()];
+
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].backend = "vllm".to_owned();
+        contract.enclaves[0].artifact_source.path = "model.safetensors".to_owned();
+        contract.enclaves[0].caps = json!({
+            "tools": true,
+            "json": true,
+            "ctx": 8192,
+            "tp_degree": 2,
+            "max_batch_size": 3,
+            "max_num_tokens": 16384,
+            "vllm_dtype": "float16"
+        });
+        for (name, path) in [
+            ("vllm_config", "config.json"),
+            ("vllm_tokenizer_json", "tokenizer.json"),
+            ("vllm_tokenizer_config", "tokenizer_config.json"),
+            ("vllm_generation_config", "generation_config.json"),
+        ] {
+            vllm_artifact.sidecars.insert(
+                name.to_owned(),
+                catalog::CatalogArtifactSidecar {
+                    source: catalog::SourceRef {
+                        kind: "huggingface".to_owned(),
+                        repo: "test/model".to_owned(),
+                        revision: "1".repeat(40),
+                        publisher_key: None,
+                    },
+                    path: path.to_owned(),
+                    artifact_root: "bc".repeat(32),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 12,
+                    source_sha256: "cd".repeat(32),
+                },
+            );
+            contract.enclaves[0].artifact_sidecars.insert(
+                name.to_owned(),
+                LedgerArtifactSidecar {
+                    source: LedgerArtifactSource {
+                        kind: "huggingface".to_owned(),
+                        repo: "test/model".to_owned(),
+                        revision: "1".repeat(40),
+                        path: path.to_owned(),
+                    },
+                    path: path.to_owned(),
+                    artifact_root: "bc".repeat(32),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 12,
+                    source_sha256: "cd".repeat(32),
+                },
+            );
+        }
+        catalog.models[0]
+            .artifacts
+            .insert("vllm-fp16".to_owned(), vllm_artifact);
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let args = test_provider_start_args();
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        let temp = test_temp_dir("mayhem-vllm-layout");
+        let primary = temp.join("model.safetensors");
+        fs::write(&primary, b"checkpoint").unwrap();
+        let sidecar_paths = BTreeMap::from([
+            ("vllm_config".to_owned(), temp.join("config.json")),
+            (
+                "vllm_tokenizer_json".to_owned(),
+                temp.join("tokenizer.json"),
+            ),
+            (
+                "vllm_tokenizer_config".to_owned(),
+                temp.join("tokenizer_config.json"),
+            ),
+            (
+                "vllm_generation_config".to_owned(),
+                temp.join("generation_config.json"),
+            ),
+        ]);
+        for path in sidecar_paths.values() {
+            fs::write(path, b"sidecar").unwrap();
+        }
+        let artifact_paths = ProviderArtifactPaths {
+            primary: primary.clone(),
+            sidecars: sidecar_paths,
+        };
+        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+        let checkpoint_dir = temp.join(".vllm-checkpoints/vllm-fp16");
+
+        assert_eq!(selected.artifact_name, "vllm-fp16");
+        assert_eq!(
+            config.artifact.format,
+            mayhem_engine::ArtifactFormat::VllmSafetensors
+        );
+        assert_eq!(config.artifact.path, checkpoint_dir);
+        assert!(config.artifact.path.join("model.safetensors").is_file());
+        assert!(config.artifact.path.join("config.json").is_file());
+        assert!(config.artifact.path.join("tokenizer.json").is_file());
+        assert!(config.artifact.path.join("tokenizer_config.json").is_file());
+        assert!(config
+            .artifact
+            .path
+            .join("generation_config.json")
+            .is_file());
+        assert_eq!(config.vllm_tensor_parallel, Some(2));
+        assert_eq!(config.batch_size, 3);
+        assert_eq!(config.ubatch_size, 16384);
+        assert_eq!(config.vllm_dtype.as_deref(), Some("float16"));
+        assert_eq!(
+            provider_attestation_runtime_config(&selected).unwrap(),
+            AttestationRuntimeConfig {
+                model_class: DEFAULT_MODEL_CLASS.to_owned(),
+                backend: "vllm".to_owned(),
+                ctx: 8192,
+                tp_degree: 2,
+                max_batch_size: Some(3),
+                max_num_tokens: Some(16384),
+            }
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_engine_load_config_wires_admin_vision_projector_sidecar() {
         let root = "aa".repeat(32);
         let sidecar_root = "bc".repeat(32);
@@ -31136,6 +31444,9 @@ mod tests {
 
         selected.enclave.backend = "trt-llm".to_owned();
         assert!(!provider_heartbeat_caps(&selected).tools);
+
+        selected.enclave.backend = "vllm".to_owned();
+        assert!(provider_heartbeat_caps(&selected).tools);
     }
 
     #[test]

@@ -17,7 +17,7 @@ ed25519-dalek = "2"
 flate2 = "1"
 mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-enclave = { path = "../mayhem-enclave" }
-mayhem-engine = { path = "../mayhem-engine", features = ["mlx", "trt-llm"] }
+mayhem-engine = { path = "../mayhem-engine", features = ["mlx", "trt-llm", "vllm"] }
 mayhem-gateway = { path = "../mayhem-gateway" }
 mayhem-hwprobe = { path = "../mayhem-hwprobe" }
 mayhem-proto = { path = "../mayhem-proto" }

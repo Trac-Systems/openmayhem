@@ -1231,6 +1231,7 @@ fn validate_artifact(
         "llama.cpp"
             | "mlx"
             | "trt-llm"
+            | "vllm"
             | "diffusers"
             | "stable-diffusion.cpp"
             | "comfyui"
@@ -1300,10 +1301,25 @@ fn validate_artifact(
             ));
         }
     }
-    if artifact.engine == "trt-llm" && artifact.min_compute_cap.is_none() {
+    if matches!(artifact.engine.as_str(), "trt-llm" | "vllm") && artifact.min_compute_cap.is_none()
+    {
         errors.push(format!(
-            "{model_id}/{name} trt-llm artifact needs min_compute_cap"
+            "{model_id}/{name} {} artifact needs min_compute_cap",
+            artifact.engine
         ));
+    }
+    if artifact.engine == "vllm" {
+        for required in [
+            "vllm_config",
+            "vllm_tokenizer_json",
+            "vllm_tokenizer_config",
+        ] {
+            if !artifact.sidecars.contains_key(required) {
+                errors.push(format!(
+                    "{model_id}/{name} vllm artifact needs sidecar {required}"
+                ));
+            }
+        }
     }
     for (sidecar_name, sidecar) in &artifact.sidecars {
         validate_artifact_sidecar(model_id, name, tier, sidecar_name, sidecar, errors);

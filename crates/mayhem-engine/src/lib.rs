@@ -45,6 +45,8 @@ pub enum EngineError {
     Mlx(String),
     #[error("TensorRT-LLM backend error: {0}")]
     TrtLlm(String),
+    #[error("vLLM backend error: {0}")]
+    Vllm(String),
     #[error("stable-diffusion.cpp backend error: {0}")]
     StableDiffusionCpp(String),
     #[error("whisper.cpp backend error: {0}")]
@@ -93,6 +95,7 @@ pub enum ArtifactFormat {
     Gguf,
     MlxSafetensors,
     TensorRtLlmCheckpoint,
+    VllmSafetensors,
     StableDiffusionCheckpoint,
     WhisperGgml,
     PiperVoice,
@@ -105,6 +108,7 @@ impl ArtifactFormat {
             Self::Gguf => b"GGUF",
             Self::MlxSafetensors => b"",
             Self::TensorRtLlmCheckpoint => b"",
+            Self::VllmSafetensors => b"",
             Self::StableDiffusionCheckpoint => b"",
             Self::WhisperGgml => b"",
             Self::PiperVoice => b"",
@@ -117,6 +121,7 @@ impl ArtifactFormat {
             Self::Gguf => "GGUF",
             Self::MlxSafetensors => "MLX safetensors",
             Self::TensorRtLlmCheckpoint => "TensorRT-LLM checkpoint",
+            Self::VllmSafetensors => "vLLM safetensors",
             Self::StableDiffusionCheckpoint => "stable-diffusion checkpoint",
             Self::WhisperGgml => "whisper.cpp ggml model",
             Self::PiperVoice => "Piper voice",
@@ -154,6 +159,14 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::TensorRtLlmCheckpoint,
+            sha256: None,
+        }
+    }
+
+    pub fn vllm_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::VllmSafetensors,
             sha256: None,
         }
     }
@@ -222,6 +235,10 @@ pub struct LoadConfig {
     pub trt_kv_cache_dtype: Option<String>,
     #[serde(default)]
     pub trt_require_engine_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_tensor_parallel: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_dtype: Option<String>,
     #[serde(default = "default_true")]
     pub use_mmap: bool,
     #[serde(default)]
@@ -246,6 +263,13 @@ impl LoadConfig {
     pub fn trt_llm_checkpoint(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::trt_llm_checkpoint(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn vllm_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::vllm_safetensors(path),
             ..Self::default()
         }
     }
@@ -287,6 +311,8 @@ impl Default for LoadConfig {
             trt_tensor_parallel: None,
             trt_kv_cache_dtype: None,
             trt_require_engine_dir: false,
+            vllm_tensor_parallel: None,
+            vllm_dtype: None,
             use_mmap: true,
             use_mlock: false,
         }
@@ -733,6 +759,11 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             }
             payload
         }
+        ArtifactFormat::VllmSafetensors => {
+            let payload = vllm_safetensors_payload_path(&artifact.path)?;
+            verify_safetensors_header_as(&payload, artifact.format.label())?;
+            payload
+        }
         ArtifactFormat::StableDiffusionCheckpoint => {
             let payload = stable_diffusion_payload_path(&artifact.path)?;
             if payload.extension().is_some_and(|ext| ext == "safetensors") {
@@ -904,6 +935,46 @@ fn trt_llm_payload_path(path: &Path) -> Result<PathBuf> {
     candidates.into_iter().next().ok_or_else(|| {
         EngineError::InvalidConfig(format!(
             "TensorRT-LLM artifact directory {} contains no .safetensors, .engine, or .plan payload",
+            path.display()
+        ))
+    })
+}
+
+fn vllm_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    }
+
+    let config = path.join("config.json");
+    if config.is_file() {
+        let config_value: Value = serde_json::from_reader(File::open(&config)?)?;
+        if !config_value.is_object() {
+            return Err(EngineError::InvalidConfig(format!(
+                "vLLM checkpoint config {} is not a JSON object",
+                config.display()
+            )));
+        }
+    }
+
+    for name in ["model.safetensors", "model-00001-of-00001.safetensors"] {
+        let candidate = path.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    let mut candidates = std::fs::read_dir(path)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().ok_or_else(|| {
+        EngineError::InvalidConfig(format!(
+            "vLLM artifact directory {} contains no .safetensors payload",
             path.display()
         ))
     })
@@ -1137,6 +1208,9 @@ pub use mlx_backend::MlxBackend;
 
 #[cfg(feature = "trt-llm")]
 pub use trt_llm_backend::TrtLlmBackend;
+
+#[cfg(feature = "vllm")]
+pub use vllm_backend::VllmBackend;
 
 pub use piper_backend::PiperBackend;
 pub use stable_diffusion_cpp_backend::StableDiffusionCppBackend;
@@ -2909,6 +2983,433 @@ mod mlx_backend {
     }
 }
 
+#[cfg(feature = "vllm")]
+mod vllm_backend {
+    use super::{
+        validate_load_config, verify_artifact, vllm_safetensors_payload_path, ArtifactFormat,
+        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+    };
+    use serde::de::DeserializeOwned;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use std::cell::{Cell, RefCell};
+    use std::env;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    const WORKER: &str = include_str!("vllm_worker.py");
+    const PYTHON_ENV: &str = "MAYHEM_VLLM_PYTHON";
+    const REQUEST_TIMEOUT_ENV: &str = "MAYHEM_VLLM_REQUEST_TIMEOUT_SECS";
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+    pub struct VllmBackend {
+        python: PathBuf,
+        worker: RefCell<Option<VllmWorker>>,
+        loaded: Option<LoadedModelInfo>,
+        next_id: Cell<u64>,
+    }
+
+    impl VllmBackend {
+        pub fn new() -> Result<Self> {
+            let python = env::var_os(PYTHON_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("python3"));
+            Self::with_python(python)
+        }
+
+        pub fn with_python(python: impl Into<PathBuf>) -> Result<Self> {
+            Ok(Self {
+                python: python.into(),
+                worker: RefCell::new(None),
+                loaded: None,
+                next_id: Cell::new(1),
+            })
+        }
+
+        fn call<T>(&self, op: &str, payload: Value) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            self.call_streaming(op, payload, &mut |_| Ok(()))
+        }
+
+        fn call_streaming<T>(
+            &self,
+            op: &str,
+            payload: Value,
+            sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let id = self.next_id.get();
+            self.next_id.set(id.saturating_add(1));
+            let mut worker = self.worker.borrow_mut();
+            if worker.is_none() {
+                *worker = Some(VllmWorker::spawn(&self.python)?);
+            }
+            let worker = worker.as_mut().ok_or_else(|| {
+                EngineError::Vllm("failed to start vLLM backend worker".to_owned())
+            })?;
+            worker.send(id, op, payload)?;
+
+            loop {
+                let message = worker.read_message()?;
+                if message.id != id {
+                    return Err(EngineError::Vllm(format!(
+                        "worker response id {} did not match request id {id}",
+                        message.id
+                    )));
+                }
+
+                if message.kind == "token" {
+                    let chunk = message.chunk.ok_or_else(|| {
+                        EngineError::Vllm("worker token message missing chunk".to_owned())
+                    })?;
+                    sink(chunk)?;
+                    continue;
+                }
+
+                if message.ok.unwrap_or(false) {
+                    let result = message.result.unwrap_or(Value::Null);
+                    return Ok(serde_json::from_value(result)?);
+                }
+
+                return Err(EngineError::Vllm(
+                    message
+                        .error
+                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
+                ));
+            }
+        }
+    }
+
+    impl EngineBackend for VllmBackend {
+        fn backend_id(&self) -> &'static str {
+            "vllm"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::VllmSafetensors {
+                return Err(EngineError::InvalidConfig(format!(
+                    "vLLM backend requires vLLM safetensors artifacts, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+
+            let model_path = vllm_model_path(&config.artifact.path)?;
+            let info: WorkerLoadInfo =
+                self.call("load", vllm_load_payload(&config, &model_path))?;
+            let loaded = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact,
+                ctx_size: config.ctx_size,
+                n_ctx_train: if info.n_ctx_train == 0 {
+                    config.ctx_size
+                } else {
+                    info.n_ctx_train
+                },
+                n_vocab: info.n_vocab,
+            };
+            self.loaded = Some(loaded.clone());
+            Ok(loaded)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            self.call("tokenize", json!({ "text": text }))
+        }
+
+        fn generate(
+            &mut self,
+            request: GenerateRequest,
+            sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            if request.max_new_tokens == 0 {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    usage: UsageCounters::default(),
+                    finish_reason: FinishReason::Length,
+                });
+            }
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+
+            self.call_streaming("generate", serde_json::to_value(request)?, &mut |chunk| {
+                sink.on_token(chunk)
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerLoadInfo {
+        #[serde(default)]
+        n_ctx_train: u32,
+        #[serde(default)]
+        n_vocab: i32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerMessage {
+        id: u64,
+        #[serde(default = "default_message_kind", rename = "type")]
+        kind: String,
+        #[serde(default)]
+        ok: Option<bool>,
+        #[serde(default)]
+        result: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        chunk: Option<TokenChunk>,
+    }
+
+    struct VllmWorker {
+        child: Child,
+        stdin: ChildStdin,
+        stdout_rx: Receiver<WorkerRead>,
+        reader: Option<JoinHandle<()>>,
+        request_timeout: Duration,
+        terminated: bool,
+    }
+
+    impl VllmWorker {
+        fn spawn(python: &Path) -> Result<Self> {
+            Self::spawn_with_timeout(python, request_timeout())
+        }
+
+        fn spawn_with_timeout(python: &Path, request_timeout: Duration) -> Result<Self> {
+            let mut command = Command::new(python);
+            command
+                .arg("-u")
+                .arg("-c")
+                .arg(WORKER)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            let mut child = command.spawn().map_err(|err| {
+                EngineError::Vllm(format!(
+                    "spawning vLLM Python worker with {} failed: {err}",
+                    python.display()
+                ))
+            })?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| EngineError::Vllm("opening worker stdin failed".to_owned()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| EngineError::Vllm("opening worker stdout failed".to_owned()))?;
+            let (stdout_tx, stdout_rx) = mpsc::channel();
+            let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
+            Ok(Self {
+                child,
+                stdin,
+                stdout_rx,
+                reader: Some(reader),
+                request_timeout,
+                terminated: false,
+            })
+        }
+
+        fn send(&mut self, id: u64, op: &str, payload: Value) -> Result<()> {
+            let message = json!({
+                "id": id,
+                "op": op,
+                "payload": payload,
+            });
+            serde_json::to_writer(&mut self.stdin, &message)?;
+            self.stdin.write_all(b"\n")?;
+            self.stdin.flush()?;
+            Ok(())
+        }
+
+        fn read_message(&mut self) -> Result<WorkerMessage> {
+            let line = match self.stdout_rx.recv_timeout(self.request_timeout) {
+                Ok(WorkerRead::Line(line)) => line,
+                Ok(WorkerRead::Eof) => {
+                    return Err(EngineError::Vllm(
+                        "vLLM backend worker exited before replying".to_owned(),
+                    ));
+                }
+                Ok(WorkerRead::Error(error)) => return Err(EngineError::Vllm(error)),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.terminate();
+                    return Err(EngineError::Vllm(format!(
+                        "vLLM backend worker timed out after {}s waiting for a response",
+                        self.request_timeout.as_secs()
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(EngineError::Vllm(
+                        "vLLM backend worker stdout reader stopped".to_owned(),
+                    ));
+                }
+            };
+            Ok(serde_json::from_str(line.trim_end())?)
+        }
+
+        fn terminate(&mut self) {
+            if self.terminated {
+                return;
+            }
+            terminate_worker_process(&mut self.child);
+            self.terminated = true;
+        }
+    }
+
+    enum WorkerRead {
+        Line(String),
+        Eof,
+        Error(String),
+    }
+
+    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::Sender<WorkerRead>) {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(WorkerRead::Eof);
+                    return;
+                }
+                Ok(_) => {
+                    if sender.send(WorkerRead::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = sender.send(WorkerRead::Error(format!(
+                        "reading vLLM backend worker stdout failed: {err}"
+                    )));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn request_timeout() -> Duration {
+        env::var(REQUEST_TIMEOUT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    fn terminate_worker_process(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+
+    impl Drop for VllmWorker {
+        fn drop(&mut self) {
+            let _ = self.send(0, "shutdown", Value::Null);
+            if wait_for_child_exit(&mut self.child, Duration::from_secs(3)) {
+                self.terminated = true;
+            } else {
+                self.terminate();
+            }
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    fn vllm_model_path(path: &Path) -> Result<PathBuf> {
+        if path.is_dir() {
+            return Ok(path.to_path_buf());
+        }
+        let payload = vllm_safetensors_payload_path(path)?;
+        payload
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| EngineError::InvalidConfig("vLLM weights path has no parent".to_owned()))
+    }
+
+    fn vllm_load_payload(config: &LoadConfig, model_path: &Path) -> Value {
+        json!({
+            "path": model_path,
+            "ctx_size": config.ctx_size,
+            "max_batch_size": config.batch_size.max(1),
+            "max_num_tokens": config.ubatch_size.max(config.ctx_size).max(1),
+            "tensor_parallel": config.vllm_tensor_parallel.unwrap_or(1),
+            "dtype": config.vllm_dtype,
+        })
+    }
+
+    fn default_message_kind() -> String {
+        "response".to_owned()
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)]
+    mod tests {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn vllm_worker_read_timeout_kills_silent_child() {
+            let path =
+                env::temp_dir().join(format!("mayhem-silent-vllm-worker-{}", std::process::id()));
+            fs::write(&path, "#!/bin/sh\nexec sleep 20\n").expect("write fake worker");
+            let mut perms = fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&path, perms).expect("chmod fake worker");
+
+            let mut worker =
+                VllmWorker::spawn_with_timeout(&path, Duration::from_secs(1)).expect("spawn");
+            worker
+                .send(1, "load", Value::Null)
+                .expect("send request to fake worker");
+            let start = Instant::now();
+            let err = worker.read_message().expect_err("silent worker times out");
+            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(format!("{err}").contains("timed out after 1s"), "{err}");
+
+            let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn vllm_load_payload_carries_capacity_knobs() {
+            let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            config.ctx_size = 1024;
+            config.batch_size = 4;
+            config.ubatch_size = 512;
+            config.vllm_tensor_parallel = Some(2);
+            config.vllm_dtype = Some("float16".to_owned());
+
+            let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
+            assert_eq!(payload["ctx_size"], json!(1024));
+            assert_eq!(payload["max_batch_size"], json!(4));
+            assert_eq!(payload["max_num_tokens"], json!(1024));
+            assert_eq!(payload["tensor_parallel"], json!(2));
+            assert_eq!(payload["dtype"], json!("float16"));
+        }
+    }
+}
+
 #[cfg(feature = "trt-llm")]
 mod trt_llm_backend {
     use super::{
@@ -3595,6 +4096,38 @@ mod tests {
         );
         assert_eq!(config.trt_tensor_parallel, Some(2));
         std::fs::remove_dir_all(dir).expect("remove temp trt dir");
+    }
+
+    #[test]
+    fn verifies_vllm_safetensors_payloads() {
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "vllm"
+        ));
+        std::fs::create_dir_all(&dir).expect("temp vllm dir");
+        std::fs::write(dir.join("config.json"), br#"{"architectures":["TestLM"]}"#)
+            .expect("write config");
+        let path = dir.join("model.safetensors");
+        let header = br#"{"__metadata__":{}}"#;
+        let mut file = File::create(&path).expect("temp safetensors");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("write header length");
+        file.write_all(header).expect("write header");
+        file.write_all(b"weights").expect("write body");
+        drop(file);
+
+        verify_artifact(&ModelArtifact::vllm_safetensors(&path))
+            .expect("valid vLLM safetensors file");
+        verify_artifact(&ModelArtifact::vllm_safetensors(&dir)).expect("valid vLLM checkpoint dir");
+
+        let mut config = LoadConfig::vllm_safetensors(&dir);
+        config.vllm_tensor_parallel = Some(2);
+        config.vllm_dtype = Some("float16".to_owned());
+        assert_eq!(config.artifact.format, ArtifactFormat::VllmSafetensors);
+        assert_eq!(config.vllm_tensor_parallel, Some(2));
+        assert_eq!(config.vllm_dtype.as_deref(), Some("float16"));
+        std::fs::remove_dir_all(dir).expect("remove temp vllm dir");
     }
 
     #[cfg(feature = "llama-cpp")]
