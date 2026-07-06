@@ -42,7 +42,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+    },
+    Engine as _,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::stream;
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
@@ -51,7 +56,7 @@ use mayhem_proto::{
     session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
     AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
     SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_IMAGE, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -514,7 +519,7 @@ pub struct EmbeddingRequest {
     pub user: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ImageGenerationRequest {
     pub model: String,
     pub prompt: String,
@@ -526,6 +531,8 @@ pub struct ImageGenerationRequest {
     pub response_format: Option<String>,
     #[serde(default)]
     pub steps: Option<u64>,
+    #[serde(default)]
+    pub seed: Option<i64>,
     #[serde(default)]
     pub user: Option<String>,
 }
@@ -559,6 +566,10 @@ pub type GatewaySessionFuture<'a> =
 
 pub type GatewayEmbeddingFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GatewayEmbeddingResult, GatewaySessionError>> + Send + 'a>>;
+
+pub type GatewayImageGenerationFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<GatewayImageGenerationResult, GatewaySessionError>> + Send + 'a>,
+>;
 
 pub type GatewayHedgeProbeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GatewayHedgeProbeResult, GatewaySessionError>> + Send + 'a>>;
@@ -599,6 +610,20 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
             )))
         })
     }
+
+    fn run_image_generation<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ImageGenerationRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayImageGenerationFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support image generation",
+                self.name()
+            )))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -614,6 +639,15 @@ pub struct GatewaySessionResult {
 #[derive(Clone, Debug)]
 pub struct GatewayEmbeddingResult {
     pub output: EmbeddingOutput,
+    pub backend: String,
+    pub direct_session: bool,
+    pub provider_receipt: Option<ProviderSignedReceipt>,
+    pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayImageGenerationResult {
+    pub output: ImageGenerationOutput,
     pub backend: String,
     pub direct_session: bool,
     pub provider_receipt: Option<ProviderSignedReceipt>,
@@ -738,6 +772,12 @@ pub struct ChatOutput {
 pub struct EmbeddingOutput {
     pub embeddings: Vec<Vec<f32>>,
     pub usage: Usage,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageGenerationOutput {
+    pub artifacts: Vec<GatewayArtifactOutput>,
+    pub usage: ReceiptUsage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1160,9 +1200,14 @@ async fn create_embedding(
 
 async fn create_image_generation(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(request): Json<ImageGenerationRequest>,
 ) -> Response {
-    match build_image_generation(&state, request) {
+    let options = match GatewayRequestOptions::from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    match build_image_generation(&state, request, options).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => err.into_response(),
     }
@@ -2260,6 +2305,13 @@ struct DirectEmbeddingSessionCollected {
     quality: Option<GatewaySessionQuality>,
 }
 
+#[derive(Clone, Debug)]
+struct DirectImageGenerationSessionCollected {
+    output: ImageGenerationOutput,
+    provider_receipt: ProviderSignedReceipt,
+    quality: Option<GatewaySessionQuality>,
+}
+
 struct GatewaySessionRun {
     result: GatewaySessionResult,
     invocation: GatewaySessionInvocation,
@@ -2272,6 +2324,13 @@ struct GatewayEmbeddingRun {
     invocation: GatewaySessionInvocation,
     metering_inputs: Vec<String>,
     metering_output: EmbeddingOutput,
+}
+
+struct GatewayImageGenerationRun {
+    result: GatewayImageGenerationResult,
+    invocation: GatewaySessionInvocation,
+    metering_request: ImageGenerationRequest,
+    metering_output: ImageGenerationOutput,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2958,6 +3017,18 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
                 .await
         })
     }
+
+    fn run_image_generation<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ImageGenerationRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayImageGenerationFuture<'a> {
+        Box::pin(async move {
+            self.run_image_generation_over_bridge(model, request, invocation)
+                .await
+        })
+    }
 }
 
 impl ScBridgeGatewaySessionBackend {
@@ -3433,6 +3504,193 @@ impl ScBridgeGatewaySessionBackend {
             quality: collected.quality,
         })
     }
+
+    async fn run_image_generation_over_bridge(
+        &self,
+        model: &GatewayModel,
+        request: &ImageGenerationRequest,
+        invocation: &GatewaySessionInvocation,
+    ) -> Result<GatewayImageGenerationResult, GatewaySessionError> {
+        let provider = invocation
+            .provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(provider, invocation.failover.open_timeout())
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting direct peer {} for image session {} failed: {err}",
+                    provider, invocation.session_id
+                ))
+            })?;
+        let opened = bridge
+            .session_open(provider, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening direct image session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        if opened.get("direct").and_then(Value::as_bool) != Some(true)
+            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(GatewaySessionError::retryable(format!(
+                "image session {} was not opened as a direct non-relayed channel",
+                invocation.session_id
+            )));
+        }
+
+        let now = now_millis_u64();
+        let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
+        let open_frame = json!({
+            "t": "s.open",
+            "v": 1,
+            "contract_version": invocation.contract_version,
+            "session_id": invocation.session_id.clone(),
+            "rail": invocation.rail.clone(),
+            "user": invocation.user_pubkey.clone(),
+            "enclave_id": invocation.enclave_id.clone(),
+            "price_ver": invocation.price_ver,
+            "rules_ver": invocation.rules_ver,
+            "voucher": invocation.spend_voucher.clone(),
+            "att_nonce": att_nonce,
+            "ts": now,
+            "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+            "sig": invocation.spend_voucher.user_sig.clone(),
+        });
+        let open_head = session_frame_head(&open_frame)
+            .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
+        bridge
+            .session_send(provider, &invocation.session_id, open_frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.open for image session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+
+        let accept = next_session_frame(
+            &mut bridge,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+            &["s.accept", "s.reject"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+            let code = accept
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            let reason = accept
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason provided");
+            return Err(GatewaySessionError::retryable(format!(
+                "provider rejected image session {} with {code}: {reason}",
+                invocation.session_id
+            )));
+        }
+        let accept_info = validate_direct_session_accept(
+            &accept,
+            invocation,
+            &open_head,
+            &att_nonce,
+            now / 1000,
+        )?;
+
+        let request_body = direct_session_image_generation_request_body(request);
+        let request_id = blake3_hex(
+            format!(
+                "rid:{}:{}",
+                invocation.session_id,
+                stable_json_value(&request_body)
+            )
+            .as_bytes(),
+        )
+        .chars()
+        .take(32)
+        .collect::<String>();
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.req",
+                    "rid": request_id,
+                    "body": request_body,
+                }),
+            )
+            .await?;
+
+        let collected = collect_direct_session_image_generation_output(
+            &mut bridge,
+            &invocation.session_id,
+            &request_id,
+            invocation.failover,
+            request,
+            &accept_info.enclave_pubkey,
+        )
+        .await?;
+        let receipt_ack = direct_session_image_generation_receipt_ack(
+            request,
+            &collected.output,
+            invocation,
+            &collected.provider_receipt,
+            provider,
+            model,
+        )?;
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.receipt_ack",
+                    "v": 1,
+                    "session_id": receipt_ack.session_id,
+                    "seq": receipt_ack.seq,
+                    "user_sig": receipt_ack.user_sig,
+                }),
+            )
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending image s.receipt_ack for session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        let _ = bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.close",
+                    "v": 1,
+                    "session_id": invocation.session_id,
+                    "reason": "done",
+                }),
+            )
+            .await;
+
+        Ok(GatewayImageGenerationResult {
+            output: collected.output,
+            backend: self.name().to_owned(),
+            direct_session: true,
+            provider_receipt: Some(collected.provider_receipt),
+            quality: collected.quality,
+        })
+    }
 }
 
 fn validate_direct_session_accept(
@@ -3670,6 +3928,19 @@ fn direct_session_embedding_request_body(request: &EmbeddingRequest) -> Value {
         "dimensions",
         request.dimensions.map(|value| json!(value)),
     );
+    body
+}
+
+fn direct_session_image_generation_request_body(request: &ImageGenerationRequest) -> Value {
+    let mut body = json!({
+        "kind": "image_generation",
+        "prompt": &request.prompt,
+        "n": image_generation_count(request),
+        "size": request.size.as_deref().unwrap_or("512x512"),
+        "steps": image_generation_steps(request),
+        "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+    });
+    set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
     body
 }
 
@@ -4109,6 +4380,103 @@ async fn collect_direct_session_embedding_output(
     })
 }
 
+async fn collect_direct_session_image_generation_output(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    request_id: &str,
+    failover: GatewayFailoverInvocation,
+    request: &ImageGenerationRequest,
+    enclave_pubkey: &str,
+) -> Result<DirectImageGenerationSessionCollected, GatewaySessionError> {
+    let mut finish_seen = false;
+    let mut usage = None;
+    let mut provider_receipt = None;
+    let mut artifact_builders = BTreeMap::new();
+    let started_at_millis = now_millis_u64();
+    let mut watchdog = DirectSessionWatchdog::new(
+        started_at_millis,
+        failover.ttft_timeout(),
+        failover.stall_timeout(),
+        None,
+        None,
+    );
+
+    while !finish_seen || provider_receipt.is_none() {
+        let remaining_millis = watchdog
+            .next_wait_millis(now_millis_u64())
+            .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
+        let frame = next_session_frame(
+            bridge,
+            session_id,
+            Duration::from_millis(remaining_millis),
+            &["s.delta", "s.receipt", "s.error", "s.close"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                watchdog.record_delta(now_millis_u64());
+                collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
+                if frame.get("fin").and_then(Value::as_str).is_some() {
+                    finish_seen = true;
+                    usage = receipt_usage_from_session_delta(&frame);
+                }
+            }
+            Some("s.receipt") => {
+                provider_receipt = Some(provider_signed_receipt_from_frame(
+                    &frame,
+                    session_id,
+                    enclave_pubkey,
+                )?);
+            }
+            Some("s.error") => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_error");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider returned s.error");
+                return Err(GatewaySessionError::new(format!(
+                    "provider returned {code} on image session {session_id}: {message}"
+                )));
+            }
+            Some("s.close") => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed image session {session_id} before completion: {reason}"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let quality =
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: None,
+            });
+    let artifacts = finish_session_artifacts(artifact_builders)?;
+    if artifacts.is_empty() {
+        return Err(GatewaySessionError::new(format!(
+            "provider image session {session_id} finished without image artifacts"
+        )));
+    }
+    let usage =
+        usage.unwrap_or_else(|| image_generation_usage_for_observed(request, artifacts.len()));
+    Ok(DirectImageGenerationSessionCollected {
+        output: ImageGenerationOutput { artifacts, usage },
+        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        quality,
+    })
+}
+
 fn embeddings_from_session_delta(
     frame: &Value,
 ) -> Result<Option<Vec<Vec<f32>>>, GatewaySessionError> {
@@ -4430,6 +4798,28 @@ fn direct_session_embedding_receipt_ack(
     })
 }
 
+fn direct_session_image_generation_receipt_ack(
+    request: &ImageGenerationRequest,
+    output: &ImageGenerationOutput,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    provider: &str,
+    model: &GatewayModel,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new(
+            "receipt co-signing refused; session paused",
+        ));
+    }
+    let expected = expected_image_generation_provider_receipt(model, request, output, provider);
+    validate_provider_receipt(model, invocation, provider_receipt, expected)?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "provider image receipt ack signing payload failed: {err}"
+        ))
+    })
+}
+
 fn direct_session_partial_receipt_ack(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
@@ -4476,6 +4866,23 @@ fn expected_embedding_provider_receipt<'a>(
         final_receipt: true,
         mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
         prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
+        usage,
+    }
+}
+
+fn expected_image_generation_provider_receipt<'a>(
+    model: &GatewayModel,
+    request: &ImageGenerationRequest,
+    output: &ImageGenerationOutput,
+    provider: &'a str,
+) -> ExpectedProviderReceipt<'a> {
+    let usage = output.usage.clone();
+    ExpectedProviderReceipt {
+        provider,
+        seq: 1,
+        final_receipt: true,
+        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        prompt_hash: image_generation_prompt_hash(request),
         usage,
     }
 }
@@ -4626,6 +5033,10 @@ fn usage_from_session_delta(frame: &Value) -> Option<Usage> {
     })
 }
 
+fn receipt_usage_from_session_delta(frame: &Value) -> Option<ReceiptUsage> {
+    serde_json::from_value(frame.get("usage")?.clone()).ok()
+}
+
 async fn run_embedding_with_route_retry(
     state: &GatewayState,
     model: &GatewayModel,
@@ -4722,6 +5133,142 @@ async fn run_embedding_with_route_retry(
                     result,
                     invocation,
                     metering_inputs: inputs.to_vec(),
+                    metering_output,
+                });
+            }
+            Err(err) if err.retryable => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                last_retryable_error = Some(err.message);
+            }
+            Err(err) => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                return Err(ApiError::bad_gateway(err.message, Some("model")));
+            }
+        }
+    }
+
+    Err(ApiError::bad_gateway(
+        format!(
+            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+        ),
+        Some("model"),
+    ))
+}
+
+async fn run_image_generation_with_route_retry(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ImageGenerationRequest,
+    options: GatewayRequestOptions,
+) -> Result<GatewayImageGenerationRun, ApiError> {
+    let eligible_routes =
+        ordered_route_candidates_for_image_generation(state, model, request, options.min_att_tier);
+    if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        let rail = state.receipt_config.rail.clone();
+        let rail_candidates = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .accepted_rails
+                    .iter()
+                    .any(|candidate_rail| candidate_rail == &rail)
+            })
+            .collect::<Vec<_>>();
+        if rail_candidates.is_empty() {
+            return Err(ApiError::payment_required(
+                format!("no provider accepts the {rail} payment rail"),
+                Some("model"),
+            ));
+        }
+        let att_candidates = rail_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                options
+                    .min_att_tier
+                    .map(|min_tier| candidate.att_tier >= min_tier)
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        if att_candidates.is_empty() {
+            return Err(ApiError::bad_request(
+                "no provider route satisfies X-Mayhem-Min-Att-Tier",
+                Some("X-Mayhem-Min-Att-Tier"),
+            ));
+        }
+        let now_millis = now_millis_u64();
+        if att_candidates
+            .iter()
+            .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
+        {
+            return Err(ApiError::service_unavailable(
+                "all otherwise eligible provider routes are cooling off after a retryable failure",
+                Some("model"),
+            ));
+        }
+        return Err(ApiError::bad_request(
+            "no provider route is currently eligible",
+            Some("model"),
+        ));
+    }
+    if eligible_routes.is_empty() && !state.dev_session_shim {
+        return Err(ApiError::service_unavailable(
+            "no provider available: production gateway requires an active provider joined to an admin-created room",
+            Some("model"),
+        ));
+    }
+
+    let attempt_count = if eligible_routes.is_empty() {
+        1
+    } else {
+        eligible_routes
+            .len()
+            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
+    };
+    let mut last_retryable_error = None;
+
+    for attempt_index in 0..attempt_count {
+        let route = eligible_routes.get(attempt_index).copied();
+        let invocation =
+            state.prepare_image_generation_invocation_for_route(model, request, route, options)?;
+        let attempt_started = Instant::now();
+        match state
+            .session_backend
+            .run_image_generation(model, request, &invocation)
+            .await
+        {
+            Ok(result) => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_image_generation_success(
+                        &result,
+                        attempt_started.elapsed(),
+                    ),
+                );
+                let metering_request = request.clone();
+                let metering_output = result.output.clone();
+                return Ok(GatewayImageGenerationRun {
+                    result,
+                    invocation,
+                    metering_request,
                     metering_output,
                 });
             }
@@ -5053,6 +5600,22 @@ fn ordered_route_candidates_for_embedding<'a>(
     ordered_route_candidates_for_embedding_with_seed(state, model, inputs, min_att_tier, seed)
 }
 
+fn ordered_route_candidates_for_image_generation<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &ImageGenerationRequest,
+    min_att_tier: Option<u8>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = image_generation_route_selection_seed(model, request, now_millis_u64());
+    ordered_route_candidates_for_image_generation_with_seed(
+        state,
+        model,
+        request,
+        min_att_tier,
+        seed,
+    )
+}
+
 async fn run_hedge_probes_if_requested(
     state: &GatewayState,
     model: &GatewayModel,
@@ -5260,6 +5823,93 @@ fn ordered_route_candidates_for_embedding_with_seed<'a>(
     ordered
 }
 
+fn ordered_route_candidates_for_image_generation_with_seed<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &ImageGenerationRequest,
+    min_att_tier: Option<u8>,
+    seed: u64,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let now_millis = now_millis_u64();
+    let eligible_routes =
+        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+            .into_iter()
+            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
+            .collect::<Vec<_>>();
+    if eligible_routes.is_empty() {
+        return eligible_routes;
+    }
+
+    state.refresh_provider_table_routes(model);
+    let requirements = request_requirements_for_image_generation(state, model, request, now_millis);
+    let route_by_key = eligible_routes
+        .iter()
+        .map(|candidate| (route_key(candidate), *candidate))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining_entries = {
+        let table = state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned");
+        table
+            .entries(now_millis)
+            .into_iter()
+            .filter(|entry| route_by_key.contains_key(&entry.key))
+            .collect::<Vec<_>>()
+    };
+    let weights = SelectionWeights::default();
+    let table_entry_keys = remaining_entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
+    let table_eligible_keys =
+        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
+            .into_iter()
+            .map(|candidate| candidate.entry.key)
+            .collect::<BTreeSet<_>>();
+    let eligible_routes = eligible_routes
+        .into_iter()
+        .filter(|candidate| {
+            let key = route_key(candidate);
+            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
+        })
+        .collect::<Vec<_>>();
+    if eligible_routes.len() <= 1 {
+        return eligible_routes;
+    }
+    let mut rng = LcgBalancerRng::seeded(seed);
+    let mut ordered = Vec::new();
+    let mut selected_keys = BTreeSet::new();
+
+    while !remaining_entries.is_empty() {
+        let Some(selection) = crate::provider_table::select_weighted_p2c(
+            &remaining_entries,
+            &requirements,
+            &weights,
+            &mut rng,
+        ) else {
+            break;
+        };
+        let key = selection.selected.entry.key;
+        if let Some(candidate) = route_by_key.get(&key).copied() {
+            ordered.push(candidate);
+            selected_keys.insert(key.clone());
+        }
+        remaining_entries.retain(|entry| entry.key != key);
+    }
+
+    for candidate in eligible_routes {
+        let key = route_key(candidate);
+        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
+            continue;
+        }
+        if selected_keys.insert(key) {
+            ordered.push(candidate);
+        }
+    }
+    ordered
+}
+
 impl GatewayState {
     fn refresh_provider_table_routes(&self, model: &GatewayModel) {
         let now = now_millis_u64();
@@ -5349,6 +5999,27 @@ fn request_requirements_for_embedding(
     }
 }
 
+fn request_requirements_for_image_generation(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ImageGenerationRequest,
+    now_millis: u64,
+) -> RequestRequirements {
+    let input_tokens = rough_tokens(&request.prompt);
+    RequestRequirements {
+        current_rules_ver: state.receipt_config.rules_ver,
+        requires_tools: false,
+        requires_json: false,
+        requires_vision: false,
+        min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
+        input_tokens,
+        output_tokens: 0,
+        now_millis,
+        max_price_mu: Some(estimate_image_generation_max_spend_mu(model, request)),
+        ..RequestRequirements::default()
+    }
+}
+
 fn route_selection_seed(
     model: &GatewayModel,
     request: &ChatCompletionRequest,
@@ -5369,6 +6040,21 @@ fn embedding_route_selection_seed(model: &GatewayModel, inputs: &[String], now_m
     let mut hasher = blake3::Hasher::new();
     hasher.update(model.id.as_bytes());
     hasher.update(embedding_prompt_text(inputs).as_bytes());
+    hasher.update(&now_millis.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn image_generation_route_selection_seed(
+    model: &GatewayModel,
+    request: &ImageGenerationRequest,
+    now_millis: u64,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.id.as_bytes());
+    hasher.update(image_generation_prompt_text(request).as_bytes());
     hasher.update(&now_millis.to_le_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
@@ -5415,6 +6101,20 @@ fn observation_sample_from_success(
 
 fn observation_sample_from_embedding_success(
     result: &GatewayEmbeddingResult,
+    elapsed: Duration,
+) -> ProviderObservationSample {
+    ProviderObservationSample {
+        ttft_ms: result
+            .quality
+            .map(|quality| quality.ttft_ms)
+            .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
+        tok_s: None,
+        error: false,
+    }
+}
+
+fn observation_sample_from_image_generation_success(
+    result: &GatewayImageGenerationResult,
     elapsed: Duration,
 ) -> ProviderObservationSample {
     ProviderObservationSample {
@@ -5680,9 +6380,10 @@ async fn build_embedding(
     }))
 }
 
-fn build_image_generation(
+async fn build_image_generation(
     state: &GatewayState,
     request: ImageGenerationRequest,
+    options: GatewayRequestOptions,
 ) -> Result<Value, ApiError> {
     let model = require_model(state, &request.model)?;
     if !model_supports_image_generation(&model) {
@@ -5691,7 +6392,68 @@ fn build_image_generation(
             Some("model"),
         ));
     }
-    Err(modality_not_served("image generation"))
+    validate_image_generation_request(&request)?;
+    let id = make_id("img");
+    let created = now_secs();
+    let GatewayImageGenerationRun {
+        result:
+            GatewayImageGenerationResult {
+                output,
+                backend,
+                direct_session,
+                provider_receipt,
+                quality,
+            },
+        invocation,
+        metering_request,
+        metering_output,
+    } = run_image_generation_with_route_retry(state, &model, &request, options).await?;
+    let expected_count = usize::try_from(image_generation_count(&request)).unwrap_or(usize::MAX);
+    if output.artifacts.len() != expected_count {
+        return Err(ApiError::bad_gateway(
+            format!(
+                "provider returned {} image artifact(s), expected {expected_count}",
+                output.artifacts.len()
+            ),
+            Some("model"),
+        ));
+    }
+    let receipt = if state.dev_session_shim {
+        None
+    } else {
+        let receipt = state.meter_image_generation_session(
+            &model,
+            &metering_request,
+            &metering_output,
+            &invocation,
+            provider_receipt.as_ref(),
+        )?;
+        Some(receipt_summary(&receipt))
+    };
+    let data = image_generation_response_data(
+        &output.artifacts,
+        request.response_format.as_deref().unwrap_or("b64_json"),
+    )?;
+    Ok(json!({
+        "id": id,
+        "object": "images.response",
+        "created": created,
+        "model": model.id,
+        "data": data,
+        "usage": output.usage,
+        "mayhem": {
+            "backend": backend,
+            "direct_session": direct_session,
+            "billable": !state.dev_session_shim,
+            "dev_session": state.dev_session_shim,
+            "quality": quality.map(|quality| json!({
+                "ttft_ms": quality.ttft_ms,
+                "tok_s": quality.tok_s,
+            })),
+            "artifacts": artifact_summaries(&output.artifacts),
+            "receipt": receipt,
+        },
+    }))
 }
 
 fn build_audio_speech(
@@ -6317,6 +7079,82 @@ impl GatewayState {
         })
     }
 
+    fn prepare_image_generation_invocation_for_route(
+        &self,
+        model: &GatewayModel,
+        request: &ImageGenerationRequest,
+        route: Option<&GatewayRouteCandidate>,
+        options: GatewayRequestOptions,
+    ) -> Result<GatewaySessionInvocation, ApiError> {
+        let prompt_text = image_generation_prompt_text(request);
+        let failover = self.failover_thresholds_for_model(model, options);
+        let session_id = session_id_for(&model.id, &prompt_text);
+        let enclave_id = route
+            .map(|candidate| candidate.enclave_id.clone())
+            .unwrap_or_else(|| enclave_id_for_model(&model.id));
+        let price_ver = route
+            .map(|candidate| candidate.price_ver)
+            .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let attestation = route.map(|candidate| GatewaySessionAttestation {
+            contract: EnclaveContractRecord {
+                enclave_id: candidate.enclave_id.clone(),
+                admin_pubkey: candidate.admin_pubkey.clone(),
+                model_id: model.id.clone(),
+                model_class: model.mayhem.model_class.clone(),
+                artifact_root: candidate.artifact_root.clone(),
+                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
+                manifest_hash: candidate.manifest_hash.clone(),
+                binary_hash: candidate.binary_hash.clone(),
+                att_tier: candidate.att_tier,
+                caps: candidate.caps.clone(),
+            },
+            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
+            trusted_nvidia_gb10_device_jwks: self
+                .hardware_quote_trust
+                .nvidia_gb10_device_jwks
+                .clone(),
+            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
+            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+        });
+        let max_spend_mu = estimate_image_generation_max_spend_mu(model, request);
+        if max_spend_mu > self.receipt_config.balance_mu {
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            rail: self.receipt_config.rail.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver,
+            max_spend_mu,
+            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+        };
+        let voucher_payload =
+            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
+        Ok(GatewaySessionInvocation {
+            contract_version: CONTRACT_VERSION,
+            session_id,
+            rail: self.receipt_config.rail.clone(),
+            user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
+            provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            enclave_id,
+            price_ver,
+            rules_ver: self.receipt_config.rules_ver,
+            spend_voucher: SpendVoucher {
+                body: voucher_body,
+                user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
+            },
+            attestation,
+            hedge: GatewayHedgeInvocation::default(),
+            failover,
+            receipt_cosign_enabled: self.receipt_config.cosign_enabled,
+            receipt_user_seed: self.receipt_config.user_seed,
+        })
+    }
+
     fn failover_thresholds_for_model(
         &self,
         model: &GatewayModel,
@@ -6480,6 +7318,94 @@ impl GatewayState {
                 usage,
                 mu_owed_cum,
                 prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
+                ts: now_millis_u64(),
+            };
+            let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
+            let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
+            SessionReceipt {
+                body,
+                enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                user_sig,
+            }
+        };
+        let user_sig = receipt.user_sig.clone();
+        let receipt_ack = ReceiptAck {
+            session_id: receipt.body.session_id.clone(),
+            seq: receipt.body.seq,
+            user_sig,
+        };
+        let stored = StoredReceipt {
+            rail: invocation.rail.clone(),
+            voucher: invocation.spend_voucher.clone(),
+            receipt,
+            receipt_ack,
+        };
+        self.record_receipt(stored.clone());
+        Ok(stored)
+    }
+
+    fn meter_image_generation_session(
+        &self,
+        model: &GatewayModel,
+        request: &ImageGenerationRequest,
+        output: &ImageGenerationOutput,
+        invocation: &GatewaySessionInvocation,
+        provider_receipt: Option<&ProviderSignedReceipt>,
+    ) -> Result<StoredReceipt, ApiError> {
+        let usage = output.usage.clone();
+        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            return Err(ApiError::payment_required(
+                "session usage exceeded signed spend voucher",
+                Some("model"),
+            ));
+        }
+
+        if !self.receipt_config.cosign_enabled {
+            self.pause_session(PausedSession {
+                session_id: invocation.session_id.clone(),
+                reason: "receipt co-signing refused; session paused".to_owned(),
+            });
+            return Err(ApiError::conflict(
+                "receipt co-signing refused; session paused",
+                None,
+            ));
+        }
+
+        let provider = invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let receipt = if let Some(provider_receipt) = provider_receipt {
+            self.cosign_provider_receipt(
+                model,
+                invocation,
+                provider_receipt,
+                ExpectedProviderReceipt {
+                    provider: &provider,
+                    seq: 1,
+                    final_receipt: true,
+                    usage: usage.clone(),
+                    mu_owed_cum,
+                    prompt_hash: image_generation_prompt_hash(request),
+                },
+            )?
+        } else {
+            let body = ReceiptBody {
+                schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+                session_id: invocation.session_id.clone(),
+                seq: 1,
+                final_receipt: true,
+                rail: invocation.rail.clone(),
+                user: invocation.user_pubkey.clone(),
+                provider,
+                enclave_id: invocation.enclave_id.clone(),
+                model_id: model.id.clone(),
+                price_ver: invocation.price_ver,
+                rules_ver: invocation.rules_ver,
+                usage,
+                mu_owed_cum,
+                prompt_hash: image_generation_prompt_hash(request),
                 ts: now_millis_u64(),
             };
             let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
@@ -7037,6 +7963,47 @@ fn artifact_summaries(artifacts: &[GatewayArtifactOutput]) -> Vec<Value> {
         .collect()
 }
 
+fn image_generation_response_data(
+    artifacts: &[GatewayArtifactOutput],
+    response_format: &str,
+) -> Result<Vec<Value>, ApiError> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            if !artifact.content_type.starts_with("image/") {
+                return Err(ApiError::bad_gateway(
+                    format!(
+                        "provider artifact {} has non-image content type {}",
+                        artifact.id, artifact.content_type
+                    ),
+                    Some("model"),
+                ));
+            }
+            let encoded = BASE64_STANDARD.encode(&artifact.bytes);
+            match response_format {
+                "url" => Ok(json!({
+                    "url": format!("data:{};base64,{encoded}", artifact.content_type),
+                    "revised_prompt": null,
+                    "mayhem": {
+                        "artifact_id": artifact.id,
+                        "content_type": artifact.content_type,
+                        "blake3": artifact.blake3,
+                    },
+                })),
+                _ => Ok(json!({
+                    "b64_json": encoded,
+                    "revised_prompt": null,
+                    "mayhem": {
+                        "artifact_id": artifact.id,
+                        "content_type": artifact.content_type,
+                        "blake3": artifact.blake3,
+                    },
+                })),
+            }
+        })
+        .collect()
+}
+
 fn tool_call_value(tool_call: &ToolCallOutput) -> Value {
     json!({
         "id": tool_call.id,
@@ -7528,6 +8495,85 @@ fn embedding_prompt_text(inputs: &[String]) -> String {
     .to_string()
 }
 
+fn image_generation_prompt_text(request: &ImageGenerationRequest) -> String {
+    stable_json_value(&direct_session_image_generation_request_body(request)).to_string()
+}
+
+fn image_generation_prompt_hash(request: &ImageGenerationRequest) -> String {
+    stable_value_hash(&direct_session_image_generation_request_body(request))
+}
+
+fn validate_image_generation_request(request: &ImageGenerationRequest) -> Result<(), ApiError> {
+    if request.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "prompt must not be empty",
+            Some("prompt"),
+        ));
+    }
+    let _ = parse_image_generation_size(request)?;
+    let _ = image_generation_count(request);
+    let _ = image_generation_steps(request);
+    match request.response_format.as_deref().unwrap_or("b64_json") {
+        "b64_json" | "url" => Ok(()),
+        _ => Err(ApiError::bad_request(
+            "only response_format=b64_json or response_format=url is supported",
+            Some("response_format"),
+        )),
+    }
+}
+
+fn image_generation_count(request: &ImageGenerationRequest) -> u32 {
+    request.n.unwrap_or(1).clamp(1, 4)
+}
+
+fn image_generation_steps(request: &ImageGenerationRequest) -> u64 {
+    request.steps.unwrap_or(4).clamp(1, 150)
+}
+
+fn parse_image_generation_size(request: &ImageGenerationRequest) -> Result<(u32, u32), ApiError> {
+    let size = request.size.as_deref().unwrap_or("512x512");
+    let (width, height) = size
+        .split_once('x')
+        .ok_or_else(|| ApiError::bad_request("size must be WIDTHxHEIGHT", Some("size")))?;
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| ApiError::bad_request("size width is not a positive integer", Some("size")))?;
+    let height = height.parse::<u32>().map_err(|_| {
+        ApiError::bad_request("size height is not a positive integer", Some("size"))
+    })?;
+    if width == 0 || height == 0 {
+        return Err(ApiError::bad_request(
+            "size dimensions must be greater than zero",
+            Some("size"),
+        ));
+    }
+    Ok((width, height))
+}
+
+fn image_generation_usage_for_request(request: &ImageGenerationRequest) -> ReceiptUsage {
+    image_generation_usage_for_count(
+        u64::from(image_generation_count(request)),
+        image_generation_steps(request),
+    )
+}
+
+fn image_generation_usage_for_observed(
+    request: &ImageGenerationRequest,
+    observed_artifacts: usize,
+) -> ReceiptUsage {
+    image_generation_usage_for_count(
+        u64::try_from(observed_artifacts).unwrap_or(u64::MAX),
+        image_generation_steps(request),
+    )
+}
+
+fn image_generation_usage_for_count(image_count: u64, steps: u64) -> ReceiptUsage {
+    ReceiptUsage::from_units([
+        (USAGE_IMAGE, image_count),
+        (USAGE_STEP, image_count.saturating_mul(steps)),
+    ])
+}
+
 fn embedding_input_token_count(inputs: &[String]) -> u64 {
     inputs
         .iter()
@@ -7643,6 +8689,17 @@ fn estimate_max_spend_mu(
 fn estimate_embedding_max_spend_mu(model: &GatewayModel, inputs: &[String]) -> u64 {
     let usage = ReceiptUsage::text(embedding_input_token_count(inputs), 0);
     calculate_mu_owed(&model.mayhem.price_ref_mu, &usage).max(1_000)
+}
+
+fn estimate_image_generation_max_spend_mu(
+    model: &GatewayModel,
+    request: &ImageGenerationRequest,
+) -> u64 {
+    calculate_mu_owed(
+        &model.mayhem.price_ref_mu,
+        &image_generation_usage_for_request(request),
+    )
+    .max(1_000)
 }
 
 fn rough_tokens(text: &str) -> u64 {

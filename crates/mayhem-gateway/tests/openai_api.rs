@@ -3,18 +3,26 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode},
     Router,
 };
+use base64::Engine as _;
+use ed25519_dalek::{Signer, SigningKey};
 use mayhem_gateway::openai::{
     openai_router, validate_loopback_dashboard_bind, ChatCompletionRequest, ChatMessage,
     ChatOutput, EmbeddingOutput, EmbeddingRequest, GatewayArtifactOutput, GatewayCanaryModelConfig,
     GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
-    GatewayEmbeddingResult, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
-    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
-    GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, ShapeAdapterInfo, ToolCallOutput, Usage,
+    GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
+    GatewayModel, GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError,
+    GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult, GatewayState,
+    ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps, PriceRefMu,
+    ProviderSignedReceipt, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
-    aggregate_canary_fingerprints, text_generation_rate_map, token_fingerprint, ReputationEventKind,
+    aggregate_canary_fingerprints, text_generation_rate_map, text_usage_mu, token_fingerprint,
+    ReputationEventKind,
 };
-use mayhem_proto::{catalog_enclave_id, CatalogEnclaveIdentity, DEFAULT_MODEL_CLASS};
+use mayhem_proto::{
+    catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_IMAGE, USAGE_STEP,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -102,6 +110,53 @@ impl GatewaySessionBackend for EmbeddingDirectSessionBackend {
                 backend: self.name().to_owned(),
                 direct_session: true,
                 provider_receipt: None,
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ImageGenerationDirectSessionBackend;
+
+impl GatewaySessionBackend for ImageGenerationDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-image-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_image_generation<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ImageGenerationRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let image = b"\x89PNG mayhem image".to_vec();
+            let usage = image_usage_for_test(request);
+            let provider_receipt =
+                signed_image_provider_receipt(model, request, invocation, &usage)?;
+            Ok(GatewayImageGenerationResult {
+                output: ImageGenerationOutput {
+                    artifacts: vec![GatewayArtifactOutput {
+                        id: "image-1".to_owned(),
+                        content_type: "image/png".to_owned(),
+                        blake3: blake3::hash(&image).to_hex().to_string(),
+                        bytes: image,
+                    }],
+                    usage,
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: Some(provider_receipt),
                 quality: None,
             })
         })
@@ -780,63 +835,49 @@ async fn embeddings_endpoint_rejects_non_embedding_model() {
 }
 
 #[tokio::test]
-async fn image_generation_endpoint_requires_real_engine_and_records_zero_charge() {
-    let catalog = json!({
-        "models": [{
-            "model_id": "admin/image-fixture",
-            "model_class": "image-generation",
-            "caps": {
-                "tools": false,
-                "json": false,
-                "ctx_max": 4096,
-                "vision": false,
-                "image": true,
-                "output_modality": "image",
-                "output_modalities": ["image"]
-            },
-            "adapter": {
-                "request_shape_family": "openai_chat",
-                "chat_template_id": "generic_chatml",
-                "tool_call_strategy": "none",
-                "reasoning_passthrough": "strip",
-                "modality_set": ["image"],
-                "response_normalization": "openai_chat"
-            },
-            "price_ref_mu": {
-                "denom": "mu_usd",
-                "ver": 4,
-                "rate_map": [
-                    { "unit": "image", "per_unit_mu": 500, "granularity": 1 },
-                    { "unit": "step", "per_unit_mu": 2, "granularity": 1 }
-                ]
-            },
-            "attestation_tiers": { "T1": 1 }
-        }]
-    });
-    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
+    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+        .with_session_backend(Arc::new(ImageGenerationDirectSessionBackend));
     let app = openai_router(state.clone());
     let request = json!({
         "model": "admin/image-fixture",
         "prompt": "a red cube",
-        "n": 2,
-        "size": "512x512",
-        "steps": 30,
+        "n": 1,
+        "size": "64x64",
+        "steps": 3,
+        "seed": 9,
         "response_format": "b64_json"
     });
 
     let (status, body) = json_request(app, Method::POST, "/v1/images/generations", request).await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"]["param"], "model");
-    assert!(body["error"]["message"]
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "images.response");
+    assert_eq!(body["model"], "admin/image-fixture");
+    assert_eq!(body["data"].as_array().expect("image data").len(), 1);
+    let encoded = body["data"][0]["b64_json"]
         .as_str()
-        .expect("error message")
-        .contains("image generation is not served"));
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("no charge recorded"));
-    assert!(state.receipts().is_empty());
+        .expect("b64_json image");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("image is base64"),
+        b"\x89PNG mayhem image"
+    );
+    assert_eq!(body["usage"][USAGE_IMAGE], 1);
+    assert_eq!(body["usage"][USAGE_STEP], 3);
+    assert_eq!(body["mayhem"]["backend"], "test-image-direct-session");
+    assert_eq!(body["mayhem"]["direct_session"], true);
+    assert_eq!(body["mayhem"]["receipt"]["rail"], "fiat");
+
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.body.model_id, "admin/image-fixture");
+    assert_eq!(receipt.body.price_ver, 4);
+    assert_eq!(receipt.body.usage.get(USAGE_IMAGE), 1);
+    assert_eq!(receipt.body.usage.get(USAGE_STEP), 3);
+    assert_eq!(receipt.body.mu_owed_cum, 506);
 }
 
 #[tokio::test]
@@ -1598,6 +1639,136 @@ fn routed_embedding_test_model() -> GatewayModel {
         });
     }
     model
+}
+
+fn routed_image_generation_test_model() -> GatewayModel {
+    let mut model = routed_test_model_with_providers(&["55".repeat(32)]);
+    model.id = "admin/image-fixture".to_owned();
+    model.mayhem.model_class = "image-generation".to_owned();
+    model.mayhem.price_ref_mu = PriceRefMu {
+        denom: "mu_usd".to_owned(),
+        ver: 4,
+        rate_map: vec![
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_mu: 500,
+                granularity: 1,
+            },
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_STEP.to_owned(),
+                per_unit_mu: 2,
+                granularity: 1,
+            },
+        ],
+    };
+    model.mayhem.caps = ModelCaps {
+        tools: false,
+        json: false,
+        ctx: 4096,
+        vision: false,
+        image: true,
+        video: false,
+        audio: false,
+        output_modality: Some("image".to_owned()),
+        output_modalities: vec!["image".to_owned()],
+    };
+    model.mayhem.adapter.modality_set = vec!["image".to_owned()];
+    model.mayhem.adapter.request_shape_family = "openai_images".to_owned();
+    model.mayhem.adapter.response_normalization = "openai_images".to_owned();
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.price_ver = 4;
+        candidate.caps = serde_json::json!({
+            "ctx_max": 4096,
+            "image": true,
+            "output_modality": "image",
+            "output_modalities": ["image"]
+        });
+    }
+    model
+}
+
+fn signed_image_provider_receipt(
+    model: &GatewayModel,
+    request: &ImageGenerationRequest,
+    invocation: &GatewaySessionInvocation,
+    usage: &ReceiptUsage,
+) -> Result<ProviderSignedReceipt, GatewaySessionError> {
+    let enclave_seed = [88_u8; 32];
+    let enclave_key = SigningKey::from_bytes(&enclave_seed);
+    let provider = invocation
+        .provider_pubkey
+        .clone()
+        .unwrap_or_else(|| "55".repeat(32));
+    let body = ReceiptBody {
+        schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+        session_id: invocation.session_id.clone(),
+        seq: 1,
+        final_receipt: true,
+        rail: invocation.rail.clone(),
+        user: invocation.user_pubkey.clone(),
+        provider,
+        enclave_id: invocation.enclave_id.clone(),
+        model_id: model.id.clone(),
+        price_ver: invocation.price_ver,
+        rules_ver: invocation.rules_ver,
+        usage: usage.clone(),
+        mu_owed_cum: text_usage_mu(&model.mayhem.price_ref_mu.rate_map, usage),
+        prompt_hash: image_prompt_hash_for_test(request),
+        ts: 1_782_950_400_000,
+    };
+    let payload = receipt_signing_bytes(&body)
+        .map_err(|err| GatewaySessionError::new(format!("receipt payload failed: {err}")))?;
+    Ok(ProviderSignedReceipt {
+        body,
+        enclave_sig: hex::encode(enclave_key.sign(&payload).to_bytes()),
+        enclave_pubkey: hex::encode(enclave_key.verifying_key().to_bytes()),
+    })
+}
+
+fn image_usage_for_test(request: &ImageGenerationRequest) -> ReceiptUsage {
+    let images = u64::from(request.n.unwrap_or(1).clamp(1, 4));
+    let steps = request.steps.unwrap_or(4).clamp(1, 150);
+    ReceiptUsage::from_units([
+        (USAGE_IMAGE, images),
+        (USAGE_STEP, images.saturating_mul(steps)),
+    ])
+}
+
+fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
+    stable_value_hash_for_test(&json!({
+        "kind": "image_generation",
+        "prompt": &request.prompt,
+        "n": request.n.unwrap_or(1).clamp(1, 4),
+        "size": request.size.as_deref().unwrap_or("512x512"),
+        "steps": request.steps.unwrap_or(4).clamp(1, 150),
+        "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
+        "seed": request.seed,
+    }))
+}
+
+fn stable_value_hash_for_test(value: &Value) -> String {
+    blake3::hash(stable_json_value_for_test(value).to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn stable_json_value_for_test(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(stable_json_value_for_test).collect()),
+        Value::Object(map) => {
+            let mut stable = serde_json::Map::new();
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                if value.is_null() {
+                    continue;
+                }
+                stable.insert(key.clone(), stable_json_value_for_test(value));
+            }
+            Value::Object(stable)
+        }
+        other => other.clone(),
+    }
 }
 
 fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {

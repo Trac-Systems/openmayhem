@@ -45,6 +45,8 @@ pub enum EngineError {
     Mlx(String),
     #[error("TensorRT-LLM backend error: {0}")]
     TrtLlm(String),
+    #[error("stable-diffusion.cpp backend error: {0}")]
+    StableDiffusionCpp(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -87,6 +89,7 @@ pub enum ArtifactFormat {
     Gguf,
     MlxSafetensors,
     TensorRtLlmCheckpoint,
+    StableDiffusionCheckpoint,
 }
 
 impl ArtifactFormat {
@@ -95,6 +98,7 @@ impl ArtifactFormat {
             Self::Gguf => b"GGUF",
             Self::MlxSafetensors => b"",
             Self::TensorRtLlmCheckpoint => b"",
+            Self::StableDiffusionCheckpoint => b"",
         }
     }
 
@@ -103,6 +107,7 @@ impl ArtifactFormat {
             Self::Gguf => "GGUF",
             Self::MlxSafetensors => "MLX safetensors",
             Self::TensorRtLlmCheckpoint => "TensorRT-LLM checkpoint",
+            Self::StableDiffusionCheckpoint => "stable-diffusion checkpoint",
         }
     }
 }
@@ -136,6 +141,14 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::TensorRtLlmCheckpoint,
+            sha256: None,
+        }
+    }
+
+    pub fn stable_diffusion_checkpoint(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::StableDiffusionCheckpoint,
             sha256: None,
         }
     }
@@ -194,6 +207,13 @@ impl LoadConfig {
     pub fn trt_llm_checkpoint(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::trt_llm_checkpoint(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn stable_diffusion_checkpoint(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::stable_diffusion_checkpoint(path),
             ..Self::default()
         }
     }
@@ -260,6 +280,14 @@ pub struct GenerateRequest {
     pub top_p: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u32>,
     #[serde(default)]
     pub ignore_eos: bool,
 }
@@ -314,6 +342,10 @@ impl GenerateRequest {
             temperature: None,
             top_p: None,
             seed: None,
+            artifact_count: None,
+            width: None,
+            height: None,
+            steps: None,
             ignore_eos: false,
         }
     }
@@ -592,6 +624,15 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             }
             payload
         }
+        ArtifactFormat::StableDiffusionCheckpoint => {
+            let payload = stable_diffusion_payload_path(&artifact.path)?;
+            if payload.extension().is_some_and(|ext| ext == "safetensors") {
+                verify_safetensors_header_as(&payload, artifact.format.label())?;
+            } else if payload.extension().is_some_and(|ext| ext == "gguf") {
+                verify_magic_header(&payload, &ArtifactFormat::Gguf)?;
+            }
+            payload
+        }
     };
 
     if let Some(expected) = &artifact.sha256 {
@@ -748,6 +789,43 @@ fn trt_llm_payload_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+fn stable_diffusion_payload_path(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    }
+
+    for name in [
+        "model.safetensors",
+        "model.gguf",
+        "sd-turbo.safetensors",
+        "diffusion_pytorch_model.safetensors",
+    ] {
+        let candidate = path.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    let mut candidates = std::fs::read_dir(path)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| matches!(ext.to_str(), Some("safetensors" | "gguf" | "ckpt")))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().ok_or_else(|| {
+        EngineError::InvalidConfig(format!(
+            "stable-diffusion artifact directory {} contains no .safetensors, .gguf, or .ckpt payload",
+            path.display()
+        ))
+    })
+}
+
 fn file_sha256_hex(path: &PathBuf) -> Result<String> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -800,6 +878,271 @@ pub use mlx_backend::MlxBackend;
 
 #[cfg(feature = "trt-llm")]
 pub use trt_llm_backend::TrtLlmBackend;
+
+pub use stable_diffusion_cpp_backend::StableDiffusionCppBackend;
+
+mod stable_diffusion_cpp_backend {
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        validate_load_config, verify_artifact, ArtifactChunk, ArtifactFormat, ArtifactSink,
+        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
+    };
+
+    const DEFAULT_IMAGE_WIDTH: u32 = 512;
+    const DEFAULT_IMAGE_HEIGHT: u32 = 512;
+    const DEFAULT_IMAGE_STEPS: u32 = 4;
+    const MAX_IMAGE_COUNT: u32 = 4;
+
+    #[derive(Debug)]
+    pub struct StableDiffusionCppBackend {
+        binary: PathBuf,
+        loaded: Option<LoadedModelInfo>,
+        config: Option<LoadConfig>,
+    }
+
+    impl StableDiffusionCppBackend {
+        pub fn new() -> Result<Self> {
+            let binary = env::var_os("MAYHEM_STABLE_DIFFUSION_CPP_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("sd-cli"));
+            Ok(Self::with_binary(binary))
+        }
+
+        pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
+            Self {
+                binary: binary.into(),
+                loaded: None,
+                config: None,
+            }
+        }
+
+        fn config(&self) -> Result<&LoadConfig> {
+            self.config.as_ref().ok_or(EngineError::NotLoaded)
+        }
+    }
+
+    impl EngineBackend for StableDiffusionCppBackend {
+        fn backend_id(&self) -> &'static str {
+            "stable-diffusion.cpp"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::StableDiffusionCheckpoint {
+                return Err(EngineError::InvalidConfig(format!(
+                    "stable-diffusion.cpp backend requires stable-diffusion checkpoints, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+            let info = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact.clone(),
+                ctx_size: config.ctx_size,
+                n_ctx_train: 0,
+                n_vocab: 0,
+            };
+            self.loaded = Some(info.clone());
+            self.config = Some(config);
+            Ok(info)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            Ok(Tokenization {
+                token_ids: text
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(index, _)| i32::try_from(index).unwrap_or(i32::MAX))
+                    .collect(),
+            })
+        }
+
+        fn generate(
+            &mut self,
+            _request: GenerateRequest,
+            _sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            Err(EngineError::InvalidConfig(
+                "stable-diffusion.cpp backend emits image artifacts; use generate_with_artifacts"
+                    .to_owned(),
+            ))
+        }
+
+        fn generate_with_artifacts(
+            &mut self,
+            request: GenerateRequest,
+            _token_sink: &mut dyn TokenSink,
+            artifact_sink: &mut dyn ArtifactSink,
+        ) -> Result<GenerateOutput> {
+            let config = self.config()?.clone();
+            let image_count = request
+                .artifact_count
+                .unwrap_or(1)
+                .clamp(1, MAX_IMAGE_COUNT);
+            let width = request.width.unwrap_or(DEFAULT_IMAGE_WIDTH).clamp(64, 2048);
+            let height = request
+                .height
+                .unwrap_or(DEFAULT_IMAGE_HEIGHT)
+                .clamp(64, 2048);
+            let steps = request.steps.unwrap_or(DEFAULT_IMAGE_STEPS).clamp(1, 150);
+            let seed_base = request.seed.unwrap_or(DEFAULT_SEED);
+
+            for image_index in 0..image_count {
+                let output_path = stable_diffusion_output_path(image_index);
+                if output_path.exists() {
+                    fs::remove_file(&output_path)?;
+                }
+                let seed = seed_base.wrapping_add(image_index);
+                let output = Command::new(&self.binary)
+                    .arg("-m")
+                    .arg(&config.artifact.path)
+                    .arg("-p")
+                    .arg(&request.prompt)
+                    .arg("-o")
+                    .arg(&output_path)
+                    .arg("--steps")
+                    .arg(steps.to_string())
+                    .arg("--seed")
+                    .arg(seed.to_string())
+                    .arg("--width")
+                    .arg(width.to_string())
+                    .arg("--height")
+                    .arg(height.to_string())
+                    .output()
+                    .map_err(|err| {
+                        EngineError::StableDiffusionCpp(format!(
+                            "starting {} failed: {err}",
+                            self.binary.display()
+                        ))
+                    })?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    return Err(EngineError::StableDiffusionCpp(format!(
+                        "{} exited with {}; stderr={stderr:?}; stdout={stdout:?}",
+                        self.binary.display(),
+                        output.status
+                    )));
+                }
+                let bytes = fs::read(&output_path).map_err(|err| {
+                    EngineError::StableDiffusionCpp(format!(
+                        "{} did not create readable output {}: {err}",
+                        self.binary.display(),
+                        output_path.display()
+                    ))
+                })?;
+                if bytes.is_empty() {
+                    return Err(EngineError::StableDiffusionCpp(format!(
+                        "{} created empty output {}",
+                        self.binary.display(),
+                        output_path.display()
+                    )));
+                }
+                artifact_sink.on_artifact_chunk(ArtifactChunk {
+                    artifact_id: format!("image-{}", image_index + 1),
+                    index: 0,
+                    content_type: "image/png".to_owned(),
+                    bytes,
+                    final_chunk: true,
+                })?;
+                let _ = fs::remove_file(&output_path);
+            }
+
+            Ok(GenerateOutput {
+                text: String::new(),
+                usage: UsageCounters::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    fn stable_diffusion_output_path(image_index: u32) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        env::temp_dir().join(format!(
+            "mayhem-sd-{}-{millis}-{image_index}.png",
+            std::process::id()
+        ))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stable_diffusion_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn stable_diffusion_cpp_backend_emits_generated_image_artifact() {
+        let root =
+            std::env::temp_dir().join(format!("mayhem-engine-sd-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("model.safetensors");
+        fs::write(&model, stable_empty_safetensors()).unwrap();
+        let sd_cli = root.join("sd-cli");
+        fs::write(
+            &sd_cli,
+            r#"#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    out="$1"
+  fi
+  shift
+done
+printf '\211PNG\r\n\032\n' > "$out"
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&sd_cli).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&sd_cli, permissions).unwrap();
+
+        let mut backend = StableDiffusionCppBackend::with_binary(&sd_cli);
+        backend
+            .load(LoadConfig::stable_diffusion_checkpoint(&model))
+            .unwrap();
+        let mut request = GenerateRequest::new("a red square");
+        request.artifact_count = Some(1);
+        request.width = Some(64);
+        request.height = Some(64);
+        request.steps = Some(2);
+        request.seed = Some(7);
+        let mut artifacts = Vec::new();
+        let mut token_sink = NoopTokenSink;
+        backend
+            .generate_with_artifacts(request, &mut token_sink, &mut |chunk| {
+                artifacts.push(chunk);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id, "image-1");
+        assert_eq!(artifacts[0].content_type, "image/png");
+        assert_eq!(artifacts[0].bytes, b"\x89PNG\r\n\x1a\n");
+        assert!(artifacts[0].final_chunk);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn stable_empty_safetensors() -> Vec<u8> {
+        let header = b"{}";
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes
+    }
+}
 
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_backend {

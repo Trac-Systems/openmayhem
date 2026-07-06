@@ -52,6 +52,7 @@ use mayhem_proto::{
     supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
     AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage,
     SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
+    USAGE_IMAGE, USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18345,8 +18346,7 @@ struct ProviderSessionTerms {
     adapter: catalog::CatalogAdapter,
     room_ids: Vec<String>,
     price_ver: u64,
-    in_per_1k_mu: u64,
-    out_per_1k_mu: u64,
+    rate_map: Vec<RateMapEntry>,
     rules_ver: u64,
     ctx: u64,
 }
@@ -22117,7 +22117,7 @@ async fn send_provider_session_output(
                 "tool": output.tool.as_ref(),
                 "embeddings": output.embeddings.as_ref(),
                 "fin": output.finish_reason,
-                "usage": { "input_token": output.prompt_tokens, "output_token": output.completion_tokens },
+                "usage": output.usage,
                 "token_ids": &output.token_ids,
                 "artifacts": provider_session_artifact_summaries(&output.artifacts),
             }),
@@ -22415,7 +22415,7 @@ fn provider_session_receipt(
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
-    let usage = ReceiptUsage::text(output.prompt_tokens, output.completion_tokens);
+    let usage = output.usage.clone();
     let receipt_body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: active.session_id.clone(),
@@ -22441,10 +22441,7 @@ fn provider_session_receipt(
 }
 
 fn provider_session_mu_owed(terms: &ProviderSessionTerms, usage: &ReceiptUsage) -> u64 {
-    text_usage_mu(
-        &text_generation_rate_map(terms.in_per_1k_mu, terms.out_per_1k_mu),
-        usage,
-    )
+    text_usage_mu(&terms.rate_map, usage)
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
@@ -22456,6 +22453,9 @@ fn provider_session_prompt_hash(body: &Value) -> String {
 fn provider_session_prompt_text(body: &Value) -> String {
     if body.get("kind").and_then(Value::as_str) == Some("embedding") {
         return provider_embedding_prompt_text(body);
+    }
+    if body.get("kind").and_then(Value::as_str) == Some("image_generation") {
+        return stable_json_value(body).to_string();
     }
     body.get("messages")
         .and_then(Value::as_array)
@@ -22616,6 +22616,16 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "stable-diffusion.cpp" => {
+            let mut backend = mayhem_engine::StableDiffusionCppBackend::new()
+                .context("initializing stable-diffusion.cpp provider session engine")?;
+            backend
+                .load(load_config)
+                .context("loading stable-diffusion.cpp provider session engine")?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         other => bail!(
             "provider session engine for {other} is not wired locally yet; do not serve this enclave until its admin-approved engine adapter is available"
         ),
@@ -22637,6 +22647,7 @@ fn provider_engine_load_config(
         "llama.cpp" => ModelArtifact::gguf(artifact_path),
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
+        "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
     };
     let artifact = if let Some(sha256) = &selected.artifact.source_sha256 {
@@ -22648,6 +22659,7 @@ fn provider_engine_load_config(
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
+        "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
     };
     config.artifact = artifact;
@@ -22757,8 +22769,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         adapter: ctx.selected.model.adapter.clone(),
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
-        in_per_1k_mu: text_rate_per_1k_mu(&price.rate_map, INPUT_TOKEN_UNIT),
-        out_per_1k_mu: text_rate_per_1k_mu(&price.rate_map, OUTPUT_TOKEN_UNIT),
+        rate_map: price.rate_map.clone(),
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.model.caps.ctx_max,
     })
@@ -23225,6 +23236,7 @@ struct ProviderSessionOutput {
     prompt_tokens: u64,
     completion_tokens: u64,
     token_ids: Vec<i32>,
+    usage: ReceiptUsage,
 }
 
 fn provider_engine_session_response(
@@ -23232,6 +23244,43 @@ fn provider_engine_session_response(
     adapter: &catalog::CatalogAdapter,
     body: &Value,
 ) -> Result<ProviderSessionOutput> {
+    if body.get("kind").and_then(Value::as_str) == Some("image_generation") {
+        let (request, image_count, steps) = provider_image_generation_request_from_body(body)?;
+        let mut artifact_chunks = Vec::new();
+        let output = backend
+            .generate_with_artifacts(
+                request,
+                &mut |_chunk: mayhem_engine::TokenChunk| Ok(()),
+                &mut |chunk: ArtifactChunk| {
+                    artifact_chunks.push(chunk);
+                    Ok(())
+                },
+            )
+            .context("generating provider session image artifact with mayhem-engine")?;
+        let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
+        if artifacts.is_empty() {
+            bail!("provider image generation engine produced no image artifacts");
+        }
+        let usage = provider_image_generation_usage(artifacts.len() as u64, steps);
+        if artifacts.len() as u32 != image_count {
+            bail!(
+                "provider image generation engine produced {} artifact(s), expected {image_count}",
+                artifacts.len()
+            );
+        }
+        return Ok(ProviderSessionOutput {
+            content: String::new(),
+            tool: None,
+            embeddings: None,
+            artifacts,
+            finish_reason: output.finish_reason.to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage,
+        });
+    }
+
     if body.get("kind").and_then(Value::as_str) == Some("embedding") {
         let inputs = provider_embedding_input_texts_from_body(body)?;
         let dimensions = body
@@ -23251,6 +23300,7 @@ fn provider_engine_session_response(
             prompt_tokens: u64::from(output.usage.prompt_tokens),
             completion_tokens: 0,
             token_ids: Vec::new(),
+            usage: ReceiptUsage::text(u64::from(output.usage.prompt_tokens), 0),
         });
     }
 
@@ -23285,6 +23335,10 @@ fn provider_engine_session_response(
         None
     };
     Ok(ProviderSessionOutput {
+        usage: ReceiptUsage::text(
+            u64::from(output.usage.prompt_tokens),
+            u64::from(output.usage.completion_tokens),
+        ),
         content: if tool.is_some() {
             String::new()
         } else {
@@ -23302,6 +23356,65 @@ fn provider_engine_session_response(
         completion_tokens: u64::from(output.usage.completion_tokens),
         token_ids,
     })
+}
+
+fn provider_image_generation_request_from_body(
+    body: &Value,
+) -> Result<(GenerateRequest, u32, u64)> {
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .context("image_generation request missing prompt")?
+        .to_owned();
+    let image_count = body
+        .get("n")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let image_count = u32::try_from(image_count).context("image_generation n overflowed u32")?;
+    let steps = body
+        .get("steps")
+        .and_then(Value::as_u64)
+        .unwrap_or(4)
+        .clamp(1, 150);
+    let (width, height) = provider_image_generation_size(body)?;
+    let mut request = GenerateRequest::new(prompt);
+    request.artifact_count = Some(image_count);
+    request.steps = Some(u32::try_from(steps).context("image_generation steps overflowed u32")?);
+    request.width = Some(width);
+    request.height = Some(height);
+    if let Some(seed) = body.get("seed").and_then(Value::as_u64) {
+        request.seed = Some(u32::try_from(seed).context("image_generation seed exceeds u32")?);
+    }
+    Ok((request, image_count, steps))
+}
+
+fn provider_image_generation_size(body: &Value) -> Result<(u32, u32)> {
+    let size = body
+        .get("size")
+        .and_then(Value::as_str)
+        .unwrap_or("512x512");
+    let (width, height) = size
+        .split_once('x')
+        .context("image_generation size must be WIDTHxHEIGHT")?;
+    let width = width
+        .parse::<u32>()
+        .context("image_generation width is not a positive integer")?;
+    let height = height
+        .parse::<u32>()
+        .context("image_generation height is not a positive integer")?;
+    if width == 0 || height == 0 {
+        bail!("image_generation dimensions must be greater than zero");
+    }
+    Ok((width, height))
+}
+
+fn provider_image_generation_usage(image_count: u64, steps: u64) -> ReceiptUsage {
+    ReceiptUsage::from_units([
+        (USAGE_IMAGE, image_count),
+        (USAGE_STEP, image_count.saturating_mul(steps)),
+    ])
 }
 
 fn provider_session_artifacts_from_chunks(
@@ -23753,6 +23866,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
     {
         let content = format!("Tool result received: {tool_result}");
         return ProviderSessionOutput {
+            usage: ReceiptUsage::text(prompt_tokens, rough_text_tokens(&content)),
             completion_tokens: rough_text_tokens(&content),
             token_ids: content.bytes().map(i32::from).collect(),
             content,
@@ -23766,6 +23880,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
     let prompt_lower = prompt.to_lowercase();
     if prompt.contains(OPENCODE_TEST_MARKER) || prompt_lower.contains("bash tool") {
         return ProviderSessionOutput {
+            usage: ReceiptUsage::text(prompt_tokens, 1),
             content: String::new(),
             tool: Some(json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": "bash", "prompt": prompt }))),
@@ -23782,6 +23897,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
     }
     if let Some(tool_name) = provider_requested_tool_name(body) {
         return ProviderSessionOutput {
+            usage: ReceiptUsage::text(prompt_tokens, 1),
             content: String::new(),
             tool: Some(json!({
                 "id": format!("call-{}", stable_value_hash(&json!({ "tool": tool_name, "prompt": prompt }))),
@@ -23811,6 +23927,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         )
     };
     ProviderSessionOutput {
+        usage: ReceiptUsage::text(prompt_tokens, rough_text_tokens(&content)),
         completion_tokens: rough_text_tokens(&content),
         token_ids: content.bytes().map(i32::from).collect(),
         content,
@@ -28001,6 +28118,7 @@ mod tests {
             prompt_tokens: 3,
             completion_tokens: 4,
             token_ids: vec![1, 2, 3, 4],
+            usage: ReceiptUsage::text(3, 4),
         };
         let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
         let receipt =
@@ -28057,6 +28175,7 @@ mod tests {
             prompt_tokens: 2,
             completion_tokens: 3,
             token_ids: vec![1, 2, 3],
+            usage: ReceiptUsage::text(2, 3),
         };
         let receipt = provider_session_receipt(
             &terms,
@@ -28425,6 +28544,45 @@ mod tests {
         assert_eq!(output.artifacts[0].id, "image-1");
         assert_eq!(output.artifacts[0].content_type, "image/png");
         assert_eq!(output.artifacts[0].bytes, b"\x89PNG");
+    }
+
+    #[test]
+    fn provider_engine_session_response_uses_image_generation_usage_units() {
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+            artifact_id: "image-1".to_owned(),
+            index: 0,
+            content_type: "image/png".to_owned(),
+            bytes: b"\x89PNG".to_vec(),
+            final_chunk: true,
+        }]);
+        let body = json!({
+            "kind": "image_generation",
+            "prompt": "draw a red square",
+            "n": 1,
+            "size": "64x64",
+            "steps": 3,
+            "seed": 9
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.usage.get(USAGE_IMAGE), 1);
+        assert_eq!(output.usage.get(USAGE_STEP), 3);
+        assert_eq!(output.prompt_tokens, 0);
+        assert_eq!(output.completion_tokens, 0);
+        let request = backend.last_request.expect("image generation request");
+        assert_eq!(request.prompt, "draw a red square");
+        assert_eq!(request.artifact_count, Some(1));
+        assert_eq!(request.width, Some(64));
+        assert_eq!(request.height, Some(64));
+        assert_eq!(request.steps, Some(3));
+        assert_eq!(request.seed, Some(9));
     }
 
     #[test]
@@ -31583,8 +31741,7 @@ mod tests {
             adapter: catalog::CatalogAdapter::default(),
             room_ids: vec!["aa".repeat(16)],
             price_ver: 1,
-            in_per_1k_mu: 1,
-            out_per_1k_mu: 2,
+            rate_map: text_generation_rate_map(1, 2),
             rules_ver: 3,
             ctx: 8192,
         }
