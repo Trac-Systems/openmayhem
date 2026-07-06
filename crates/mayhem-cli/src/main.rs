@@ -22851,9 +22851,35 @@ async fn handle_provider_session_frame(
                 )
             });
             let response = responder.respond_streaming(terms, &body, live_stream.as_mut());
-            let live_stream_state = live_stream.and_then(ProviderSessionLiveStream::into_state);
             let output = match response {
-                Ok(output) => output,
+                Ok(output) => {
+                    if let Some(stream) = live_stream.as_mut() {
+                        if let Err(err) = stream.finish() {
+                            provider_session_debug(format!(
+                                "flushing live response failed for session {session_id}: {err:#}"
+                            ));
+                            send_provider_session_error(
+                                bridge,
+                                &active.remote,
+                                &active.session_id,
+                                request_id,
+                                "provider_response_failed",
+                                &err.to_string(),
+                            )
+                            .await?;
+                            send_provider_session_close(
+                                bridge,
+                                &active.remote,
+                                &active.session_id,
+                                "err:provider_response_failed",
+                            )
+                            .await?;
+                            sessions.remove(&session_id);
+                            return Ok(());
+                        }
+                    }
+                    output
+                }
                 Err(err) => {
                     provider_session_debug(format!(
                         "response failed for session {session_id}: {err:#}"
@@ -22878,6 +22904,7 @@ async fn handle_provider_session_frame(
                     return Ok(());
                 }
             };
+            let live_stream_state = live_stream.and_then(ProviderSessionLiveStream::into_state);
             provider_session_debug(format!(
                 "sending response for session {session_id} request {request_id}"
             ));
@@ -22923,9 +22950,14 @@ async fn handle_provider_session_frame(
             provider_session_debug(format!(
                 "waiting for receipt ack on session {session_id} request {request_id}"
             ));
-            if wait_for_provider_receipt_ack(bridge, &active, &receipt, Duration::from_secs(5))
-                .await
-                .is_err()
+            if wait_for_provider_receipt_ack(
+                bridge,
+                &active,
+                &receipt,
+                provider_session_receipt_ack_timeout(&active),
+            )
+            .await
+            .is_err()
             {
                 provider_session_debug(format!(
                     "receipt ack timeout on session {session_id} request {request_id}"
@@ -22973,6 +23005,8 @@ struct ProviderSessionLiveStream<'a> {
     last_checkpoint_tokens: u64,
     delivered_tokens: u64,
     streamed_any: bool,
+    pending_text: String,
+    pending_token_ids: Vec<i32>,
 }
 
 impl<'a> ProviderSessionLiveStream<'a> {
@@ -22996,41 +23030,36 @@ impl<'a> ProviderSessionLiveStream<'a> {
             last_checkpoint_tokens: 0,
             delivered_tokens: 0,
             streamed_any: false,
+            pending_text: String::new(),
+            pending_token_ids: Vec::new(),
         }
     }
 
     fn on_token(&mut self, chunk: TokenChunk, prompt_tokens: u64) -> Result<()> {
         provider_session_debug(format!(
-            "live streaming token s.delta #{} for session {} request {}",
-            self.next_index, self.active.session_id, self.request_id
+            "live buffering token #{} for session {} request {}",
+            self.delivered_tokens, self.active.session_id, self.request_id
         ));
-        let frame = json!({
-            "t": "s.delta",
-            "rid": self.request_id,
-            "i": self.next_index,
-            "d": chunk.text,
-            "token_id": chunk.token_id,
-            "tool": null,
-            "fin": null,
-        });
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.bridge
-                    .session_send(&self.active.remote, &self.active.session_id, frame)
-                    .await
-                    .context("sending live token s.delta")
-            })
-        })?;
-        self.next_index = self.next_index.saturating_add(1);
+        self.pending_text.push_str(&chunk.text);
+        self.pending_token_ids.push(chunk.token_id);
         self.delivered_tokens = self.delivered_tokens.saturating_add(1);
         self.streamed_any = true;
 
-        if provider_session_checkpoint_due(
+        let checkpoint_due = provider_session_checkpoint_due(
             self.delivered_tokens,
             u64::MAX,
             self.last_checkpoint_tokens,
             provider_session_checkpoint_tokens(self.active),
-        ) {
+        );
+        if self.next_index == 0
+            || u64::try_from(self.pending_token_ids.len()).unwrap_or(u64::MAX)
+                >= provider_session_delta_batch_tokens()
+            || checkpoint_due
+        {
+            self.flush_pending_delta()?;
+        }
+
+        if checkpoint_due {
             let usage = ReceiptUsage::text(prompt_tokens, self.delivered_tokens);
             let receipt = provider_session_receipt_for_usage(
                 self.terms,
@@ -23056,7 +23085,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                         self.bridge,
                         self.active,
                         &receipt,
-                        Duration::from_secs(5),
+                        provider_session_receipt_ack_timeout(self.active),
                     )
                     .await
                     .context("waiting for live checkpoint receipt ack")
@@ -23065,6 +23094,44 @@ impl<'a> ProviderSessionLiveStream<'a> {
             self.last_checkpoint_tokens = self.delivered_tokens;
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.flush_pending_delta()
+    }
+
+    fn flush_pending_delta(&mut self) -> Result<()> {
+        if self.pending_text.is_empty() && self.pending_token_ids.is_empty() {
+            return Ok(());
+        }
+        provider_session_debug(format!(
+            "live streaming s.delta #{} ({} token(s)) for session {} request {}",
+            self.next_index,
+            self.pending_token_ids.len(),
+            self.active.session_id,
+            self.request_id
+        ));
+        let frame = json!({
+            "t": "s.delta",
+            "rid": self.request_id,
+            "i": self.next_index,
+            "d": &self.pending_text,
+            "token_ids_delta": &self.pending_token_ids,
+            "tool": null,
+            "fin": null,
+        });
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.bridge
+                    .session_send(&self.active.remote, &self.active.session_id, frame)
+                    .await
+                    .context("sending live token s.delta")
+            })
+        })?;
+        self.pending_text.clear();
+        self.pending_token_ids.clear();
+        self.next_index = self.next_index.saturating_add(1);
         Ok(())
     }
 
@@ -23151,9 +23218,14 @@ async fn send_provider_session_output(
                     "checkpoint",
                 )
                 .await?;
-                wait_for_provider_receipt_ack(bridge, active, &receipt, Duration::from_secs(5))
-                    .await
-                    .context("waiting for checkpoint receipt ack")?;
+                wait_for_provider_receipt_ack(
+                    bridge,
+                    active,
+                    &receipt,
+                    provider_session_receipt_ack_timeout(active),
+                )
+                .await
+                .context("waiting for checkpoint receipt ack")?;
                 last_checkpoint_tokens = delivered_tokens;
                 receipt_seq = receipt_seq.saturating_add(1);
             }
@@ -23213,6 +23285,24 @@ async fn send_provider_session_output(
 
 fn provider_session_checkpoint_tokens(active: &ActiveProviderSession) -> u64 {
     active.checkpoint_every.tokens.max(1)
+}
+
+fn provider_session_delta_batch_tokens() -> u64 {
+    std::env::var("MAYHEM_PROVIDER_SESSION_DELTA_BATCH_TOKENS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(8)
+}
+
+fn provider_session_receipt_ack_timeout(active: &ActiveProviderSession) -> Duration {
+    Duration::from_millis(
+        active
+            .checkpoint_every
+            .ms
+            .saturating_add(5_000)
+            .max(120_000),
+    )
 }
 
 fn provider_session_checkpoint_due(
@@ -23423,6 +23513,14 @@ async fn wait_for_provider_receipt_ack(
                 let frame = event.get("frame").cloned().unwrap_or(Value::Null);
                 match frame.get("t").and_then(Value::as_str) {
                     Some("s.receipt_ack") => {
+                        let ack_seq = provider_session_receipt_ack_seq(&frame)?;
+                        if ack_seq < receipt.body.seq {
+                            provider_session_debug(format!(
+                                "ignoring stale receipt ack seq {ack_seq} while waiting for seq {} on session {}",
+                                receipt.body.seq, active.session_id
+                            ));
+                            continue;
+                        }
                         return provider_session_receipt_ack_from_frame(&frame, active, receipt);
                     }
                     Some("s.close") => {
@@ -23442,6 +23540,13 @@ async fn wait_for_provider_receipt_ack(
     }
 }
 
+fn provider_session_receipt_ack_seq(frame: &Value) -> Result<u64> {
+    frame
+        .get("seq")
+        .and_then(Value::as_u64)
+        .context("receipt ack missing seq")
+}
+
 fn provider_session_receipt_ack_from_frame(
     frame: &Value,
     active: &ActiveProviderSession,
@@ -23455,10 +23560,7 @@ fn provider_session_receipt_ack_from_frame(
     }
     let ack = ReceiptAck {
         session_id: active.session_id.clone(),
-        seq: frame
-            .get("seq")
-            .and_then(Value::as_u64)
-            .context("receipt ack missing seq")?,
+        seq: provider_session_receipt_ack_seq(frame)?,
         user_sig: frame
             .get("user_sig")
             .and_then(Value::as_str)
@@ -30037,6 +30139,27 @@ mod tests {
         assert!(!provider_session_checkpoint_due(3, 10, 2, 2));
         assert!(provider_session_checkpoint_due(4, 10, 2, 2));
         assert!(!provider_session_checkpoint_due(10, 10, 8, 2));
+        let mut active = ActiveProviderSession {
+            remote: "peer-a".to_owned(),
+            user_pubkey: "66".repeat(32),
+            session_id: "aa".repeat(32),
+            rail: "fiat".to_owned(),
+            checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+        };
+        assert_eq!(
+            provider_session_receipt_ack_timeout(&active),
+            Duration::from_secs(120)
+        );
+        active.checkpoint_every.ms = 30_000;
+        assert_eq!(
+            provider_session_receipt_ack_timeout(&active),
+            Duration::from_secs(120)
+        );
+        active.checkpoint_every.ms = 180_000;
+        assert_eq!(
+            provider_session_receipt_ack_timeout(&active),
+            Duration::from_secs(185)
+        );
     }
 
     #[test]

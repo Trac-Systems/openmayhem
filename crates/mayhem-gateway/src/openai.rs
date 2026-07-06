@@ -2377,6 +2377,10 @@ fn new_dashboard_token() -> String {
 }
 
 type SseEventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+const LIVE_SSE_MIN_EVENT_BUFFER: usize = 512;
+const LIVE_SSE_MAX_EVENT_BUFFER: usize = 16_384;
+const LIVE_SSE_DEFAULT_MAX_TOKENS: usize = 1024;
+const DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS: u64 = 5_000;
 
 enum ChatResponse {
     Json(Value),
@@ -3410,20 +3414,22 @@ impl ScBridgeGatewaySessionBackend {
                     let receipt_ack = direct_session_partial_receipt_ack(
                         request, invocation, partial, provider, model,
                     )?;
-                    let _ = bridge
-                        .session_send(
-                            provider,
-                            &invocation.session_id,
-                            json!({
-                                "t": "s.receipt_ack",
-                                "v": 1,
-                                "session_id": receipt_ack.session_id,
-                                "seq": receipt_ack.seq,
-                                "user_sig": receipt_ack.user_sig,
-                                "reason": partial.reason.as_str(),
-                            }),
-                        )
-                        .await;
+                    let _ = send_direct_session_frame_with_peer_reconnect(
+                        &mut bridge,
+                        provider,
+                        &invocation.session_id,
+                        json!({
+                            "t": "s.receipt_ack",
+                            "v": 1,
+                            "session_id": receipt_ack.session_id,
+                            "seq": receipt_ack.seq,
+                            "user_sig": receipt_ack.user_sig,
+                            "reason": partial.reason.as_str(),
+                        }),
+                        invocation.failover.open_timeout(),
+                        "sending partial s.receipt_ack",
+                    )
+                    .await;
                     let _ = bridge
                         .session_send(
                             provider,
@@ -3448,25 +3454,21 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.receipt_ack",
-                    "v": 1,
-                    "session_id": receipt_ack.session_id,
-                    "seq": receipt_ack.seq,
-                    "user_sig": receipt_ack.user_sig,
-                }),
-            )
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending s.receipt_ack for session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
-                ))
-            })?;
+        send_direct_session_frame_with_peer_reconnect(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+            }),
+            invocation.failover.open_timeout(),
+            "sending s.receipt_ack",
+        )
+        .await?;
         let _ = bridge
             .session_send(
                 provider,
@@ -3637,25 +3639,21 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.receipt_ack",
-                    "v": 1,
-                    "session_id": receipt_ack.session_id,
-                    "seq": receipt_ack.seq,
-                    "user_sig": receipt_ack.user_sig,
-                }),
-            )
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending embedding s.receipt_ack for session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
-                ))
-            })?;
+        send_direct_session_frame_with_peer_reconnect(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+            }),
+            invocation.failover.open_timeout(),
+            "sending embedding s.receipt_ack",
+        )
+        .await?;
         let _ = bridge
             .session_send(
                 provider,
@@ -3824,25 +3822,21 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.receipt_ack",
-                    "v": 1,
-                    "session_id": receipt_ack.session_id,
-                    "seq": receipt_ack.seq,
-                    "user_sig": receipt_ack.user_sig,
-                }),
-            )
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending image s.receipt_ack for session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
-                ))
-            })?;
+        send_direct_session_frame_with_peer_reconnect(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+            }),
+            invocation.failover.open_timeout(),
+            "sending image s.receipt_ack",
+        )
+        .await?;
         let _ = bridge
             .session_send(
                 provider,
@@ -4001,25 +3995,21 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.receipt_ack",
-                    "v": 1,
-                    "session_id": receipt_ack.session_id,
-                    "seq": receipt_ack.seq,
-                    "user_sig": receipt_ack.user_sig,
-                }),
-            )
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending audio speech s.receipt_ack for session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
-                ))
-            })?;
+        send_direct_session_frame_with_peer_reconnect(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+            }),
+            invocation.failover.open_timeout(),
+            "sending audio speech s.receipt_ack",
+        )
+        .await?;
         let _ = bridge
             .session_send(
                 provider,
@@ -4178,25 +4168,21 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.receipt_ack",
-                    "v": 1,
-                    "session_id": receipt_ack.session_id,
-                    "seq": receipt_ack.seq,
-                    "user_sig": receipt_ack.user_sig,
-                }),
-            )
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending audio transcription s.receipt_ack for session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
-                ))
-            })?;
+        send_direct_session_frame_with_peer_reconnect(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+            }),
+            invocation.failover.open_timeout(),
+            "sending audio transcription s.receipt_ack",
+        )
+        .await?;
         let _ = bridge
             .session_send(
                 provider,
@@ -4748,6 +4734,8 @@ async fn collect_direct_session_output(
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame) {
                     token_ids = ids;
+                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
+                    token_ids.extend(ids);
                 } else if let Some(token_id) = token_id_from_session_delta(&frame) {
                     token_ids.push(token_id);
                 }
@@ -4767,6 +4755,7 @@ async fn collect_direct_session_output(
                         model,
                     )
                     .await?
+                    .is_some()
                     {
                         latest_checkpoint_receipt = Some(receipt);
                     } else {
@@ -4836,6 +4825,7 @@ async fn collect_direct_session_output(
                         model,
                     )
                     .await?
+                    .is_some()
                     {
                         latest_checkpoint_receipt = Some(receipt);
                     } else {
@@ -5414,6 +5404,45 @@ fn direct_session_checkpoint_partial(
     }
 }
 
+async fn send_direct_session_frame_with_peer_reconnect(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    session_id: &str,
+    frame: Value,
+    open_timeout: Duration,
+    action: &str,
+) -> Result<(), GatewaySessionError> {
+    match bridge
+        .session_send(provider, session_id, frame.clone())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if bridge_error_missing_direct_connection(&err) => {
+            bridge.peer_connect(provider, open_timeout).await.map_err(|connect_err| {
+                GatewaySessionError::retryable(format!(
+                    "{action} for session {session_id} to provider {provider} failed after direct connection was missing; reconnect failed: {connect_err}"
+                ))
+            })?;
+            bridge
+                .session_send(provider, session_id, frame)
+                .await
+                .map_err(|send_err| {
+                    GatewaySessionError::retryable(format!(
+                        "{action} for session {session_id} to provider {provider} failed after peer reconnect: {send_err}"
+                    ))
+                })?;
+            Ok(())
+        }
+        Err(err) => Err(GatewaySessionError::retryable(format!(
+            "{action} for session {session_id} to provider {provider} failed: {err}"
+        ))),
+    }
+}
+
+fn bridge_error_missing_direct_connection(error: &BridgeError) -> bool {
+    error.to_string().contains("No direct connection")
+}
+
 async fn maybe_ack_direct_session_checkpoint_receipt(
     bridge: &mut ScBridgeClient,
     provider: &str,
@@ -5427,7 +5456,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     watchdog: &DirectSessionWatchdog,
     now_millis: u64,
     model: &GatewayModel,
-) -> Result<bool, GatewaySessionError> {
+) -> Result<Option<Value>, GatewaySessionError> {
     let observed_usage = observed_chat_usage(request, content, token_ids);
     let claimed_prompt_tokens = receipt.body.usage.input_tokens();
     let claimed_output_tokens = receipt.body.usage.output_tokens();
@@ -5437,7 +5466,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
         ));
     }
     if claimed_output_tokens > observed_usage.completion_tokens {
-        return Ok(false);
+        return Ok(None);
     }
     if claimed_output_tokens < observed_usage.completion_tokens {
         return Err(GatewaySessionError::new(
@@ -5456,21 +5485,24 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     );
     let receipt_ack =
         direct_session_partial_receipt_ack(request, invocation, &partial, provider, model)?;
-    bridge
-        .session_send(
-            provider,
-            session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-                "reason": "checkpoint",
-            }),
-        )
-        .await?;
-    Ok(true)
+    let ack_frame = json!({
+        "t": "s.receipt_ack",
+        "v": 1,
+        "session_id": receipt_ack.session_id,
+        "seq": receipt_ack.seq,
+        "user_sig": receipt_ack.user_sig,
+        "reason": "checkpoint",
+    });
+    send_direct_session_frame_with_peer_reconnect(
+        bridge,
+        provider,
+        session_id,
+        ack_frame.clone(),
+        invocation.failover.open_timeout(),
+        "sending checkpoint s.receipt_ack",
+    )
+    .await?;
+    Ok(Some(ack_frame))
 }
 
 fn usage_from_receipt_usage(usage: &ReceiptUsage) -> Usage {
@@ -5485,6 +5517,15 @@ fn usage_from_receipt_usage(usage: &ReceiptUsage) -> Usage {
 
 fn token_ids_from_session_delta(frame: &Value) -> Option<Vec<i32>> {
     let ids = frame.get("token_ids")?.as_array()?;
+    Some(
+        ids.iter()
+            .filter_map(|value| value.as_i64().and_then(|id| i32::try_from(id).ok()))
+            .collect(),
+    )
+}
+
+fn token_ids_delta_from_session_delta(frame: &Value) -> Option<Vec<i32>> {
+    let ids = frame.get("token_ids_delta")?.as_array()?;
     Some(
         ids.iter()
             .filter_map(|value| value.as_i64().and_then(|id| i32::try_from(id).ok()))
@@ -6947,13 +6988,26 @@ async fn open_live_direct_chat_session(
 }
 
 fn live_direct_chat_sse_stream(session: LiveDirectChatSession) -> SseEventStream {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
+    let capacity = live_sse_event_buffer_capacity(&session.request);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(capacity);
     tokio::spawn(async move {
         run_live_direct_chat_sse(session, tx).await;
     });
     Box::pin(stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|event| (event, rx))
     }))
+}
+
+fn live_sse_event_buffer_capacity(request: &ChatCompletionRequest) -> usize {
+    let max_tokens = request
+        .max_tokens
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LIVE_SSE_DEFAULT_MAX_TOKENS);
+    max_tokens
+        .saturating_mul(2)
+        .saturating_add(64)
+        .clamp(LIVE_SSE_MIN_EVENT_BUFFER, LIVE_SSE_MAX_EVENT_BUFFER)
 }
 
 async fn run_live_direct_chat_sse(
@@ -7129,6 +7183,7 @@ async fn run_live_direct_chat_sse_inner(
     let mut claimed_usage = None;
     let mut final_provider_receipt = None;
     let mut latest_checkpoint_receipt = None;
+    let mut latest_checkpoint_ack_frame: Option<Value> = None;
     let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
@@ -7146,10 +7201,15 @@ async fn run_live_direct_chat_sse_inner(
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, &session.invocation.session_id))?;
+        let wait_millis = if latest_checkpoint_ack_frame.is_some() {
+            remaining_millis.min(DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS)
+        } else {
+            remaining_millis
+        };
         let frame = match next_session_frame(
             &mut session.bridge,
             &session.invocation.session_id,
-            Duration::from_millis(remaining_millis),
+            Duration::from_millis(wait_millis),
             &["s.delta", "s.receipt", "s.error", "s.close"],
         )
         .await
@@ -7157,6 +7217,20 @@ async fn run_live_direct_chat_sse_inner(
             Ok(frame) => frame,
             Err(err) if err.message.starts_with("timed out waiting") => {
                 let now = now_millis_u64();
+                if let Some(ack_frame) = latest_checkpoint_ack_frame.clone() {
+                    if watchdog.next_wait_millis(now).is_ok() {
+                        send_direct_session_frame_with_peer_reconnect(
+                            &mut session.bridge,
+                            &session.provider,
+                            &session.invocation.session_id,
+                            ack_frame,
+                            session.invocation.failover.open_timeout(),
+                            "resending checkpoint s.receipt_ack",
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
                 let timeout = watchdog.timeout_error(&session.invocation.session_id, now);
                 if let Some(partial) = interrupted_direct_session_partial(
                     &content,
@@ -7182,6 +7256,7 @@ async fn run_live_direct_chat_sse_inner(
                     == Some(session.request_id.as_str()) =>
             {
                 let now = now_millis_u64();
+                latest_checkpoint_ack_frame = None;
                 watchdog.record_delta(now);
                 if let Some(delta) = frame.get("d").and_then(Value::as_str) {
                     content.push_str(delta);
@@ -7204,11 +7279,13 @@ async fn run_live_direct_chat_sse_inner(
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame) {
                     token_ids = ids;
+                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
+                    token_ids.extend(ids);
                 } else if let Some(token_id) = token_id_from_session_delta(&frame) {
                     token_ids.push(token_id);
                 }
                 if let Some(receipt) = pending_checkpoint_receipt.take() {
-                    if maybe_ack_direct_session_checkpoint_receipt(
+                    if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
                         &mut session.bridge,
                         &session.provider,
                         &session.invocation.session_id,
@@ -7225,6 +7302,7 @@ async fn run_live_direct_chat_sse_inner(
                     .await?
                     {
                         latest_checkpoint_receipt = Some(receipt);
+                        latest_checkpoint_ack_frame = Some(ack_frame);
                     } else {
                         pending_checkpoint_receipt = Some(receipt);
                     }
@@ -7297,7 +7375,7 @@ async fn run_live_direct_chat_sse_inner(
                         ));
                     }
                     let now = now_millis_u64();
-                    if maybe_ack_direct_session_checkpoint_receipt(
+                    if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
                         &mut session.bridge,
                         &session.provider,
                         &session.invocation.session_id,
@@ -7314,6 +7392,7 @@ async fn run_live_direct_chat_sse_inner(
                     .await?
                     {
                         latest_checkpoint_receipt = Some(receipt);
+                        latest_checkpoint_ack_frame = Some(ack_frame);
                     } else {
                         pending_checkpoint_receipt = Some(receipt);
                     }
@@ -7411,26 +7490,21 @@ async fn run_live_direct_chat_sse_inner(
         &session.provider,
         &session.model,
     )?;
-    session
-        .bridge
-        .session_send(
-            &session.provider,
-            &session.invocation.session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-            }),
-        )
-        .await
-        .map_err(|err| {
-            GatewaySessionError::retryable(format!(
-                "sending s.receipt_ack for session {} to provider {} failed: {err}",
-                session.invocation.session_id, session.provider
-            ))
-        })?;
+    send_direct_session_frame_with_peer_reconnect(
+        &mut session.bridge,
+        &session.provider,
+        &session.invocation.session_id,
+        json!({
+            "t": "s.receipt_ack",
+            "v": 1,
+            "session_id": receipt_ack.session_id,
+            "seq": receipt_ack.seq,
+            "user_sig": receipt_ack.user_sig,
+        }),
+        session.invocation.failover.open_timeout(),
+        "sending s.receipt_ack",
+    )
+    .await?;
     let _ = session
         .bridge
         .session_send(
@@ -12695,6 +12769,41 @@ mod tests {
             stop: None,
             max_tokens: None,
         }
+    }
+
+    #[test]
+    fn live_sse_event_buffer_scales_with_token_budget() {
+        let mut request = test_chat_request("mayhem/test-model");
+        assert_eq!(
+            live_sse_event_buffer_capacity(&request),
+            LIVE_SSE_DEFAULT_MAX_TOKENS * 2 + 64
+        );
+
+        request.max_tokens = Some(32);
+        assert_eq!(
+            live_sse_event_buffer_capacity(&request),
+            LIVE_SSE_MIN_EVENT_BUFFER
+        );
+
+        request.max_tokens = Some(2048);
+        assert_eq!(live_sse_event_buffer_capacity(&request), 4160);
+
+        request.max_tokens = Some(u32::MAX);
+        assert_eq!(
+            live_sse_event_buffer_capacity(&request),
+            LIVE_SSE_MAX_EVENT_BUFFER
+        );
+    }
+
+    #[test]
+    fn session_delta_token_ids_support_full_and_delta_lists() {
+        let full = json!({ "token_ids": [1, 2, 3] });
+        assert_eq!(token_ids_from_session_delta(&full), Some(vec![1, 2, 3]));
+        assert_eq!(token_ids_delta_from_session_delta(&full), None);
+
+        let delta = json!({ "token_ids_delta": [4, 5] });
+        assert_eq!(token_ids_from_session_delta(&delta), None);
+        assert_eq!(token_ids_delta_from_session_delta(&delta), Some(vec![4, 5]));
     }
 
     fn test_routed_model(provider_count: u8) -> GatewayModel {

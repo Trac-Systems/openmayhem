@@ -577,6 +577,47 @@ async function settleGatewayReceiptEpoch({
   };
 }
 
+async function fetchGatewayReceipts(gatewayUrl) {
+  const response = await fetch(`${gatewayUrl}/mayhem/receipts`);
+  if (!response.ok) {
+    fail(`gateway receipt fetch failed with HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+function gatewayReceiptBody(entry) {
+  return entry?.receipt?.body || entry?.receipt || entry || null;
+}
+
+function gatewayReceiptKey(entry) {
+  const body = gatewayReceiptBody(entry);
+  return [
+    body?.session_id || 'missing-session',
+    body?.seq ?? 'missing-seq',
+    body?.final_receipt ?? body?.final ?? 'missing-final',
+  ].join(':');
+}
+
+function gatewayReceiptKeySet(receipts) {
+  return new Set((Array.isArray(receipts?.data) ? receipts.data : []).map(gatewayReceiptKey));
+}
+
+function gatewayNewReceipts(receipts, previousKeys) {
+  return (Array.isArray(receipts?.data) ? receipts.data : []).filter(
+    (entry) => !previousKeys.has(gatewayReceiptKey(entry))
+  );
+}
+
+function gatewayReceiptIsFinal(entry) {
+  const body = gatewayReceiptBody(entry);
+  return body?.final === true || body?.final_receipt === true;
+}
+
+function gatewayReceiptOutputTokens(entry) {
+  const usage = gatewayReceiptBody(entry)?.usage || {};
+  return Number(usage.output_token ?? usage.completion_tokens ?? 0);
+}
+
 async function preauthorizeLocalApps(apps, logFile) {
   if (process.platform !== 'darwin') return;
   const socketfilterfw = '/usr/libexec/ApplicationFirewall/socketfilterfw';
@@ -993,7 +1034,26 @@ function sshBase(passFile, remote) {
 }
 
 async function ssh(remote, passFile, command, options = {}) {
-  return run('sshpass', [...sshBase(passFile, remote), command], options);
+  const attempts = Number.isSafeInteger(options.attempts) ? options.attempts : 1;
+  let lastError = null;
+  const runOptions = { ...options };
+  delete runOptions.attempts;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await run('sshpass', [...sshBase(passFile, remote), command], runOptions);
+    } catch (err) {
+      lastError = err;
+      if (attempt >= attempts || !sshErrorIsRetryable(err)) break;
+      log(`ssh retry ${attempt}/${attempts}: ${err?.message || err}`);
+      await sleep(1_000 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function sshErrorIsRetryable(err) {
+  const message = String(err?.message || err);
+  return /exited (255|2)|Connection timed out|timed out during banner exchange|kex_exchange_identification|Connection reset/i.test(message);
 }
 
 async function scpTo(remote, passFile, localPath, remotePath, options = {}) {
@@ -1131,7 +1191,7 @@ async function waitReverseTunnel(remote, passFile, url, tunnel, tunnelLog, label
       fail(`${label} reverse tunnel exited early; see ${tunnelLog}`);
     }
     try {
-      await ssh(remote, passFile, `/usr/bin/python3 -c ${sh(script)}`, { timeoutMs: 10_000 });
+      await ssh(remote, passFile, `/usr/bin/python3 -c ${sh(script)}`, { timeoutMs: 10_000, attempts: 3 });
       return;
     } catch (err) {
       lastErr = err?.message || String(err);
@@ -1381,7 +1441,7 @@ async function main() {
     remotePeerDhtPid = (await ssh(remote, passFile, remotePeerDhtCmd)).stdout.trim();
     cleanupState.remotePids.push(remotePeerDhtPid);
     const remotePeerDhtWait = `for i in $(seq 1 120); do grep -q 'Fully started Hyperswarm DHT bootstrap node' ${sh(remotePeerDhtLog)} && exit 0; kill -0 ${remotePeerDhtPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
-    await ssh(remote, passFile, remotePeerDhtWait, { timeoutMs: 75_000 });
+    await ssh(remote, passFile, remotePeerDhtWait, { timeoutMs: 75_000, attempts: 3 });
   } else if (peerDhtBootstrap) {
     log(`using explicit peer DHT bootstrap ${peerDhtBootstrap}`);
   } else {
@@ -1571,7 +1631,7 @@ async function main() {
   cleanupState.remotePids.push(remotePeerPid);
   const remotePeerReady = async () => remotePidAlive(remote, passFile, remotePeerPid);
   const remoteWaitCmd = `for i in $(seq 1 900); do grep -q 'Sidechannel: ready' ${sh(remotePeerLog)} && exit 0; kill -0 ${remotePeerPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
-  await ssh(remote, passFile, remoteWaitCmd, { timeoutMs: 480_000 });
+  await ssh(remote, passFile, remoteWaitCmd, { timeoutMs: 480_000, attempts: 3 });
   if (localPeerDht && localPeerDht.exitCode !== null) {
     fail(`local peer DHT bootstrap exited before provider discovery; see ${path.join(logsDir, 'local-peer-dht.log')}`);
   }
@@ -1656,7 +1716,10 @@ async function main() {
   );
   const providerWaitIterations = Math.ceil(providerStartTimeoutSeconds * 2);
   const providerWaitCmd = `for i in $(seq 1 ${providerWaitIterations}); do grep -q '"self_test"' ${sh(remoteProviderLog)} && exit 0; kill -0 ${remoteProviderPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
-  await ssh(remote, passFile, providerWaitCmd, { timeoutMs: providerStartTimeoutSeconds * 1_000 + 10_000 });
+  await ssh(remote, passFile, providerWaitCmd, {
+    timeoutMs: providerStartTimeoutSeconds * 1_000 + 10_000,
+    attempts: 3,
+  });
   const providerStartupText = (await ssh(remote, passFile, `cat ${sh(remoteProviderLog)}`)).stdout;
   const providerStartupReport = parseFirstJsonObject(providerStartupText);
   const providerPubkey = providerStartupReport?.provider;
@@ -1731,12 +1794,23 @@ async function main() {
     timeoutMs: chatTimeoutSeconds * 1_000,
     maxTokens: chatMaxTokens,
   });
+  const receiptsBeforeLong = await fetchGatewayReceipts(gatewayUrl);
+  const receiptKeysBeforeLong = gatewayReceiptKeySet(receiptsBeforeLong);
+  if (!Array.isArray(receiptsBeforeLong.data) || receiptsBeforeLong.data.length === 0) {
+    fail('streaming chat completed but no gateway receipt was recorded before the long probe');
+  }
   let longChatStream = null;
+  let longReceiptMinOutputTokens = null;
   if (envFlag('MAYHEM_PHASE3_LONG_STREAM')) {
     log('running long streaming chat memory probe through the gateway');
+    const longChatMaxTokens = envPositiveInt('MAYHEM_PHASE3_LONG_CHAT_MAX_TOKENS', 2048);
+    longReceiptMinOutputTokens = envPositiveInt(
+      'MAYHEM_PHASE3_LONG_RECEIPT_MIN_OUTPUT_TOKENS',
+      Math.min(longChatMaxTokens, 1024)
+    );
     longChatStream = await runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, {
       timeoutMs: envPositiveInt('MAYHEM_PHASE3_LONG_CHAT_TIMEOUT_SECONDS', chatTimeoutSeconds) * 1_000,
-      maxTokens: envPositiveInt('MAYHEM_PHASE3_LONG_CHAT_MAX_TOKENS', 2048),
+      maxTokens: longChatMaxTokens,
       prompt: [
         'Write a long deterministic stress response for a streaming transport test.',
         'Use short numbered lines.',
@@ -1797,7 +1871,7 @@ async function main() {
       'opencode skipped; set MAYHEM_PHASE3_RUN_OPENCODE=1 to run the tool-call smoke\n'
     );
   }
-  const receipts = await (await fetch(`${gatewayUrl}/mayhem/receipts`)).json();
+  const receipts = await fetchGatewayReceipts(gatewayUrl);
   const receiptsPath = path.join(runDir, 'gateway-receipts.json');
   writeJson(receiptsPath, receipts);
   const modelsJson = await (await fetch(`${gatewayUrl}/v1/models`)).json();
@@ -1807,9 +1881,33 @@ async function main() {
   const providerLogText = (await ssh(remote, passFile, `cat ${sh(remoteProviderLog)}`)).stdout;
   const providerReport = parseFirstJsonObject(providerLogText);
   const selectedModel = modelsJson.data?.find((entry) => entry.id === modelId) || null;
-  const latestReceipt = Array.isArray(receipts.data) ? receipts.data.at(-1) : null;
-  const receiptBody = latestReceipt?.receipt?.body || latestReceipt?.receipt || latestReceipt || null;
+  let latestReceipt = Array.isArray(receipts.data) ? receipts.data.at(-1) : null;
+  let receiptBody = gatewayReceiptBody(latestReceipt);
   if (!latestReceipt) fail('streaming chat completed but no gateway receipt was recorded');
+  let longReceiptBody = null;
+  if (longChatStream) {
+    const newReceipts = gatewayNewReceipts(receipts, receiptKeysBeforeLong);
+    if (newReceipts.length === 0) {
+      fail('long streaming chat completed but no new gateway receipt was recorded');
+    }
+    const finalLongReceipts = newReceipts.filter(gatewayReceiptIsFinal);
+    if (finalLongReceipts.length === 0) {
+      const newestNewBody = gatewayReceiptBody(newReceipts.at(-1));
+      fail(
+        `long streaming chat ended without a final new receipt; latest new seq=${newestNewBody?.seq ?? 'unknown'}`
+      );
+    }
+    const finalLongReceipt = finalLongReceipts.at(-1);
+    const outputTokens = gatewayReceiptOutputTokens(finalLongReceipt);
+    if (outputTokens < longReceiptMinOutputTokens) {
+      fail(
+        `long streaming final receipt output_token ${outputTokens} is below required ${longReceiptMinOutputTokens}`
+      );
+    }
+    latestReceipt = finalLongReceipt;
+    receiptBody = gatewayReceiptBody(latestReceipt);
+    longReceiptBody = receiptBody;
+  }
   log('settling the streamed receipt through epoch commit/apply');
   const epochSettlement = await settleGatewayReceiptEpoch({
     mayhemBin,
@@ -1840,6 +1938,7 @@ async function main() {
         tokens: receiptCheckpointTokens,
         ms: receiptCheckpointMs,
       },
+      long_receipt_min_output_tokens: longReceiptMinOutputTokens,
     },
     remote: {
       host: remote.host,
@@ -1891,7 +1990,9 @@ async function main() {
       models: modelsPath,
       selected_model: selectedModel,
       receipts: receiptsPath,
+      receipts_before_long_count: Array.isArray(receiptsBeforeLong.data) ? receiptsBeforeLong.data.length : 0,
       latest_receipt: receiptBody,
+      long_receipt: longReceiptBody,
       epoch_settlement: epochSettlement,
     },
     opencode: {

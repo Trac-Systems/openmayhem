@@ -8,6 +8,7 @@ const SESSION_CHANNEL_PREFIX = 'mx/s/';
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 const DEFAULT_RATE_BYTES_PER_SECOND = 1_000_000;
 const DEFAULT_RATE_BURST_BYTES = 1_000_000;
+const DEFAULT_SEND_DRAIN_TIMEOUT_MS = 30_000;
 
 const normalizeKeyHex = (value) => {
   if (!value) return null;
@@ -46,6 +47,11 @@ class DirectSession extends Feature {
       DEFAULT_RATE_BYTES_PER_SECOND
     );
     this.rateBurstBytes = safeIntegerOr(config.rateBurstBytes, DEFAULT_RATE_BURST_BYTES);
+    this.sendDrainTimeoutMs = safeIntegerOr(
+      config.sendDrainTimeoutMs,
+      DEFAULT_SEND_DRAIN_TIMEOUT_MS,
+      { min: 1 }
+    );
     this.sessions = new Map();
     this.pairedConnections = new WeakSet();
     this.onFrame = typeof config.onFrame === 'function' ? config.onFrame : null;
@@ -72,6 +78,7 @@ class DirectSession extends Feature {
       maxFrameBytes: this.maxFrameBytes,
       rateBytesPerSecond: this.rateBytesPerSecond,
       rateBurstBytes: this.rateBurstBytes,
+      sendDrainTimeoutMs: this.sendDrainTimeoutMs,
       sessionCount: this.sessions.size,
       sessions: Array.from(this.sessions.values()).map((session) => ({
         session_id: session.sessionId,
@@ -143,6 +150,7 @@ class DirectSession extends Feature {
     if (!ok && this.debug) {
       console.log(`[direct-session:${session.session_id}] send accepted with backpressure`);
     }
+    if (!ok) await this._waitForDrain(record);
     return this._sessionInfo(record);
   }
 
@@ -221,6 +229,7 @@ class DirectSession extends Feature {
     const mux = this._muxForConnection(connection);
     if (!mux) throw new Error('Direct connection does not have a Protomux session.');
     const id = b4a.from(sessionId, 'hex');
+    let record = null;
     const channel = mux.createChannel({
       protocol: SESSION_PROTOCOL,
       id,
@@ -229,12 +238,16 @@ class DirectSession extends Feature {
       },
       onclose: () => {
         if (this.debug) console.log(`[direct-session:${sessionId}] close ${remote}`);
+        if (record) this._rejectDrainWaiters(record, new Error(`Session ${sessionId} closed.`));
         this.sessions.delete(key);
+      },
+      ondrain: () => {
+        if (record) this._resolveDrainWaiters(record);
       },
     });
     if (!channel) throw new Error(`Session ${sessionId} could not be opened.`);
 
-    const record = {
+    record = {
       sessionId,
       remote,
       connection,
@@ -242,6 +255,7 @@ class DirectSession extends Feature {
       message: null,
       sendLimiter: this._newLimiter(),
       receiveLimiter: this._newLimiter(),
+      drainWaiters: new Set(),
     };
     const message = channel.addMessage({
       encoding: c.json,
@@ -325,6 +339,37 @@ class DirectSession extends Feature {
     if (bytes > limiter.tokens) return false;
     limiter.tokens -= bytes;
     return true;
+  }
+
+  _waitForDrain(session) {
+    if (session.channel?.drained === true) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          session.drainWaiters.delete(waiter);
+          reject(new Error(`Session ${session.sessionId} send drain timed out.`));
+        }, this.sendDrainTimeoutMs),
+      };
+      session.drainWaiters.add(waiter);
+    });
+  }
+
+  _resolveDrainWaiters(session) {
+    for (const waiter of session.drainWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve();
+    }
+    session.drainWaiters.clear();
+  }
+
+  _rejectDrainWaiters(session, err) {
+    for (const waiter of session.drainWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(err);
+    }
+    session.drainWaiters.clear();
   }
 
   _sessionInfo(session) {
