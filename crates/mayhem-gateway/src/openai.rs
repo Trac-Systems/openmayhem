@@ -49,7 +49,7 @@ use base64::{
     Engine as _,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use futures_util::stream;
+use futures_util::{stream, Stream};
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
     default_model_class, migrate_receipt_body, receipt_signing_bytes, session_accept_signing_bytes,
@@ -597,6 +597,9 @@ pub type GatewayHedgeProbeFuture<'a> =
 
 pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
+    fn bridge_stream_config(&self) -> Option<ScBridgeGatewaySessionConfig> {
+        None
+    }
     fn hedge_probe<'a>(
         &'a self,
         _model: &'a GatewayModel,
@@ -1251,9 +1254,10 @@ async fn create_chat_completion(
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
-    match build_chat_completion(&state, request, options).await {
+    match build_chat_completion(state.clone(), request, options).await {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+        Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
         Err(err) => err.into_response(),
     }
 }
@@ -1265,6 +1269,7 @@ async fn create_completion(
     match build_completion(&state, request) {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+        Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
         Err(err) => err.into_response(),
     }
 }
@@ -2363,9 +2368,12 @@ fn new_dashboard_token() -> String {
     BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
+type SseEventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+
 enum ChatResponse {
     Json(Value),
     Sse(Vec<Value>),
+    SseStream(SseEventStream),
 }
 
 #[derive(Clone)]
@@ -3113,6 +3121,10 @@ impl ScBridgeGatewaySessionBackend {
 impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
     fn name(&self) -> &str {
         "sc-bridge-direct-session"
+    }
+
+    fn bridge_stream_config(&self) -> Option<ScBridgeGatewaySessionConfig> {
+        Some(self.config.clone())
     }
 
     fn hedge_probe<'a>(
@@ -5604,7 +5616,13 @@ fn direct_session_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected = expected_provider_receipt(model, request, output, provider);
+    let expected =
+        expected_provider_receipt(model, request, output, provider, provider_receipt.body.seq);
+    if expected.mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+        return Err(GatewaySessionError::new(
+            "provider receipt exceeds signed spend voucher",
+        ));
+    }
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -5718,6 +5736,12 @@ fn direct_session_partial_receipt_ack(
         partial.output.usage.prompt_tokens,
         partial.output.usage.completion_tokens,
     );
+    let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+    if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+        return Err(GatewaySessionError::new(
+            "provider partial receipt exceeds signed spend voucher",
+        ));
+    }
     validate_provider_receipt(
         model,
         invocation,
@@ -5726,7 +5750,7 @@ fn direct_session_partial_receipt_ack(
             provider,
             seq: body.seq,
             final_receipt: false,
-            mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+            mu_owed_cum,
             usage,
             prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
         },
@@ -5811,11 +5835,12 @@ fn expected_provider_receipt<'a>(
     request: &ChatCompletionRequest,
     output: &ChatOutput,
     provider: &'a str,
+    seq: u64,
 ) -> ExpectedProviderReceipt<'a> {
     let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
     ExpectedProviderReceipt {
         provider,
-        seq: 1,
+        seq,
         final_receipt: true,
         mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
         prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
@@ -6455,11 +6480,11 @@ fn no_eligible_route_error(
 }
 
 async fn build_chat_completion(
-    state: &GatewayState,
+    state: SharedState,
     request: ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<ChatResponse, ApiError> {
-    let model = require_model(state, &request.model)?;
+    let model = require_model(&state, &request.model)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request(
             "messages must contain at least one item",
@@ -6487,6 +6512,20 @@ async fn build_chat_completion(
 
     let id = make_id("chatcmpl");
     let created = now_secs();
+    if request.stream && !state.dev_session_shim {
+        if let Some(config) = state.session_backend.bridge_stream_config() {
+            return build_live_chat_completion(
+                state.clone(),
+                model,
+                request,
+                options,
+                id,
+                created,
+                config,
+            )
+            .await;
+        }
+    }
     let GatewaySessionRun {
         result:
             GatewaySessionResult {
@@ -6500,7 +6539,7 @@ async fn build_chat_completion(
         invocation,
         metering_request,
         metering_output,
-    } = run_chat_with_route_retry(state, &model, &request, options).await?;
+    } = run_chat_with_route_retry(&state, &model, &request, options).await?;
     let mayhem_meta = ResponseMayhemMeta {
         backend: &backend,
         direct_session,
@@ -6546,6 +6585,756 @@ async fn build_chat_completion(
             mayhem_meta,
         )))
     }
+}
+
+struct LiveDirectChatSession {
+    state: SharedState,
+    model: GatewayModel,
+    request: ChatCompletionRequest,
+    invocation: GatewaySessionInvocation,
+    route: Option<GatewayRouteCandidate>,
+    attempt_started: Instant,
+    bridge: ScBridgeClient,
+    provider: String,
+    request_id: String,
+    enclave_pubkey: String,
+    id: String,
+    created: u64,
+    include_usage: bool,
+    backend: String,
+}
+
+async fn build_live_chat_completion(
+    state: SharedState,
+    model: GatewayModel,
+    request: ChatCompletionRequest,
+    options: GatewayRequestOptions,
+    id: String,
+    created: u64,
+    config: ScBridgeGatewaySessionConfig,
+) -> Result<ChatResponse, ApiError> {
+    let session =
+        prepare_live_direct_chat_session(state, model, request, options, id, created, config)
+            .await?;
+    Ok(ChatResponse::SseStream(live_direct_chat_sse_stream(
+        session,
+    )))
+}
+
+async fn prepare_live_direct_chat_session(
+    state: SharedState,
+    model: GatewayModel,
+    request: ChatCompletionRequest,
+    options: GatewayRequestOptions,
+    id: String,
+    created: u64,
+    config: ScBridgeGatewaySessionConfig,
+) -> Result<LiveDirectChatSession, ApiError> {
+    let mut eligible_route_refs =
+        ordered_route_candidates_for_request(&state, &model, &request, options.min_att_tier);
+    if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
+        return Err(no_eligible_route_error(
+            &state,
+            &model,
+            options.min_att_tier,
+        ));
+    }
+    if eligible_route_refs.is_empty() {
+        return Err(ApiError::service_unavailable(
+            "no provider available: production gateway requires an active provider joined to an admin-created room",
+            Some("model"),
+        ));
+    }
+    let hedge_probe =
+        run_hedge_probes_if_requested(&state, &model, &request, &eligible_route_refs, options)
+            .await?;
+    if let Some(winner) = hedge_probe.winner.as_ref() {
+        if let Some(winner_index) = eligible_route_refs
+            .iter()
+            .position(|route| route.provider == winner.provider)
+        {
+            let winner_route = eligible_route_refs.remove(winner_index);
+            eligible_route_refs.insert(0, winner_route);
+        }
+    }
+    let eligible_routes = eligible_route_refs.into_iter().cloned().collect::<Vec<_>>();
+
+    let attempt_count = eligible_routes
+        .len()
+        .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS));
+    let mut last_retryable_error = None;
+    for attempt_index in 0..attempt_count {
+        let route = eligible_routes.get(attempt_index);
+        let invocation =
+            state.prepare_chat_invocation_for_route(&model, &request, route, options)?;
+        let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
+        let attempt_started = Instant::now();
+        match open_live_direct_chat_session(&config, &request, &invocation).await {
+            Ok((bridge, provider, request_id, enclave_pubkey)) => {
+                let include_usage = request
+                    .stream_options
+                    .as_ref()
+                    .is_some_and(|options| options.include_usage);
+                return Ok(LiveDirectChatSession {
+                    state,
+                    model,
+                    request,
+                    invocation,
+                    route: route.cloned(),
+                    attempt_started,
+                    bridge,
+                    provider,
+                    request_id,
+                    enclave_pubkey,
+                    id,
+                    created,
+                    include_usage,
+                    backend: "sc-bridge-direct-session".to_owned(),
+                });
+            }
+            Err(err) if err.retryable => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    &state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                last_retryable_error = Some(err.message);
+            }
+            Err(err) => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    &state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                return Err(ApiError::bad_gateway(err.message, Some("model")));
+            }
+        }
+    }
+
+    Err(ApiError::bad_gateway(
+        format!(
+            "all {attempt_count} route attempt(s) failed before streaming; last error: {}",
+            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+        ),
+        Some("model"),
+    ))
+}
+
+async fn open_live_direct_chat_session(
+    config: &ScBridgeGatewaySessionConfig,
+    request: &ChatCompletionRequest,
+    invocation: &GatewaySessionInvocation,
+) -> Result<(ScBridgeClient, String, String, String), GatewaySessionError> {
+    let provider = invocation
+        .provider_pubkey
+        .as_deref()
+        .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+    let mut bridge =
+        ScBridgeClient::connect(ScBridgeConfig::new(&config.url, config.token.clone())?).await?;
+    bridge
+        .session_subscribe([invocation.session_id.as_str()])
+        .await?;
+    bridge
+        .peer_connect(provider, invocation.failover.open_timeout())
+        .await
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "connecting direct peer {} for session {} failed: {err}",
+                provider, invocation.session_id
+            ))
+        })?;
+    let opened = bridge
+        .session_open(provider, &invocation.session_id)
+        .await
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "opening direct session {} to provider {} failed: {err}",
+                invocation.session_id, provider
+            ))
+        })?;
+    if opened.get("direct").and_then(Value::as_bool) != Some(true)
+        || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(GatewaySessionError::retryable(format!(
+            "session {} was not opened as a direct non-relayed channel",
+            invocation.session_id
+        )));
+    }
+
+    let now = now_millis_u64();
+    let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
+    let open_frame = json!({
+        "t": "s.open",
+        "v": 1,
+        "contract_version": invocation.contract_version,
+        "session_id": invocation.session_id.clone(),
+        "rail": invocation.rail.clone(),
+        "user": invocation.user_pubkey.clone(),
+        "enclave_id": invocation.enclave_id.clone(),
+        "price_ver": invocation.price_ver,
+        "rules_ver": invocation.rules_ver,
+        "voucher": invocation.spend_voucher.clone(),
+        "att_nonce": att_nonce,
+        "ts": now,
+        "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+        "sig": invocation.spend_voucher.user_sig.clone(),
+    });
+    let open_head = session_frame_head(&open_frame)
+        .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
+    bridge
+        .session_send(provider, &invocation.session_id, open_frame)
+        .await
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "sending s.open for session {} to provider {} failed: {err}",
+                invocation.session_id, provider
+            ))
+        })?;
+
+    let accept = next_session_frame(
+        &mut bridge,
+        &invocation.session_id,
+        invocation.failover.open_timeout(),
+        &["s.accept", "s.reject"],
+    )
+    .await
+    .map_err(GatewaySessionError::into_retryable)?;
+    if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+        let code = accept
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        let reason = accept
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("no reason provided");
+        return Err(GatewaySessionError::retryable(format!(
+            "provider rejected session {} with {code}: {reason}",
+            invocation.session_id
+        )));
+    }
+    let accept_info =
+        validate_direct_session_accept(&accept, invocation, &open_head, &att_nonce, now / 1000)?;
+    let request_id = blake3_hex(
+        format!(
+            "rid:{}:{}",
+            invocation.session_id,
+            serde_json::to_string(&request.messages).unwrap_or_default()
+        )
+        .as_bytes(),
+    )
+    .chars()
+    .take(32)
+    .collect::<String>();
+    bridge
+        .session_send(
+            provider,
+            &invocation.session_id,
+            json!({
+                "t": "s.req",
+                "rid": request_id,
+                "body": direct_session_request_body(request),
+            }),
+        )
+        .await?;
+    Ok((
+        bridge,
+        provider.to_owned(),
+        request_id,
+        accept_info.enclave_pubkey,
+    ))
+}
+
+fn live_direct_chat_sse_stream(session: LiveDirectChatSession) -> SseEventStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
+    tokio::spawn(async move {
+        run_live_direct_chat_sse(session, tx).await;
+    });
+    Box::pin(stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|event| (event, rx))
+    }))
+}
+
+async fn run_live_direct_chat_sse(
+    mut session: LiveDirectChatSession,
+    tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+) {
+    let result = run_live_direct_chat_sse_inner(&mut session, &tx).await;
+    match result {
+        Ok(()) => {
+            let _ = send_sse_done(&tx).await;
+        }
+        Err(err) => {
+            if let Some(partial) = err.partial.as_ref() {
+                let _ = session.state.record_partial_provider_receipt(
+                    &session.model,
+                    &session.request,
+                    &session.invocation,
+                    partial,
+                );
+            }
+            record_route_observation(
+                &session.state,
+                session.route.as_ref(),
+                observation_sample_from_error(session.attempt_started.elapsed()),
+            );
+            let _ = session
+                .bridge
+                .session_send(
+                    &session.provider,
+                    &session.invocation.session_id,
+                    json!({
+                        "t": "s.close",
+                        "v": 1,
+                        "session_id": session.invocation.session_id,
+                        "reason": "stream_error",
+                    }),
+                )
+                .await;
+            let _ = send_sse_error(&tx, &err.message).await;
+            let _ = send_sse_done(&tx).await;
+        }
+    }
+}
+
+async fn run_live_direct_chat_sse_inner(
+    session: &mut LiveDirectChatSession,
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+) -> Result<(), GatewaySessionError> {
+    if !send_sse_value(
+        tx,
+        chat_chunk(
+            &session.id,
+            session.created,
+            &session.model.id,
+            json!({ "role": "assistant" }),
+            None,
+            None,
+        ),
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    let mut content = String::new();
+    let mut tool_call = None;
+    let mut finish_reason = None;
+    let mut claimed_usage = None;
+    let mut final_provider_receipt = None;
+    let mut latest_checkpoint_receipt = None;
+    let mut token_ids = Vec::new();
+    let mut artifact_builders = BTreeMap::new();
+    let started_at_millis = now_millis_u64();
+    let failover = session.invocation.failover;
+    let mut watchdog = DirectSessionWatchdog::new(
+        started_at_millis,
+        failover.ttft_timeout(),
+        failover.stall_timeout(),
+        None,
+        failover.min_tok_s,
+    );
+
+    while finish_reason.is_none() || final_provider_receipt.is_none() {
+        let remaining_millis = watchdog
+            .next_wait_millis(now_millis_u64())
+            .map_err(|kind| direct_session_timeout_error(kind, &session.invocation.session_id))?;
+        let frame = match next_session_frame(
+            &mut session.bridge,
+            &session.invocation.session_id,
+            Duration::from_millis(remaining_millis),
+            &["s.delta", "s.receipt", "s.error", "s.close"],
+        )
+        .await
+        {
+            Ok(frame) => frame,
+            Err(err) if err.message.starts_with("timed out waiting") => {
+                let now = now_millis_u64();
+                let timeout = watchdog.timeout_error(&session.invocation.session_id, now);
+                if let Some(partial) = interrupted_direct_session_partial(
+                    &content,
+                    tool_call.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now,
+                    "mid_stream_timeout",
+                ) {
+                    return Err(GatewaySessionError::retryable_partial(
+                        timeout.message,
+                        partial,
+                    ));
+                }
+                return Err(timeout);
+            }
+            Err(err) => return Err(err),
+        };
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta")
+                if frame.get("rid").and_then(Value::as_str)
+                    == Some(session.request_id.as_str()) =>
+            {
+                let now = now_millis_u64();
+                watchdog.record_delta(now);
+                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
+                    content.push_str(delta);
+                    if !delta.is_empty()
+                        && !send_sse_value(
+                            tx,
+                            chat_chunk(
+                                &session.id,
+                                session.created,
+                                &session.model.id,
+                                json!({ "content": delta }),
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
+                if let Some(ids) = token_ids_from_session_delta(&frame) {
+                    token_ids = ids;
+                } else if let Some(token_id) = token_id_from_session_delta(&frame) {
+                    token_ids.push(token_id);
+                }
+                if tool_call.is_none() {
+                    if let Some(next_tool_call) = tool_call_from_session_delta(&frame) {
+                        if !send_sse_value(
+                            tx,
+                            chat_chunk(
+                                &session.id,
+                                session.created,
+                                &session.model.id,
+                                json!({ "tool_calls": [tool_call_value(&next_tool_call)] }),
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
+                        tool_call = Some(next_tool_call);
+                    }
+                }
+                collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
+                if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
+                    finish_reason = Some(fin.to_owned());
+                    claimed_usage = usage_from_session_delta(&frame);
+                }
+                if finish_reason.is_none() {
+                    let output_tokens = streamed_output_token_count(&content, &token_ids);
+                    if let Some(tok_s) = watchdog.throughput_floor_violation(output_tokens, now) {
+                        let err = direct_session_throughput_floor_error(
+                            &session.invocation.session_id,
+                            tok_s,
+                            failover.min_tok_s.expect("floor checked"),
+                        );
+                        if let Some(partial) = interrupted_direct_session_partial(
+                            &content,
+                            tool_call.clone(),
+                            latest_checkpoint_receipt.as_ref(),
+                            &token_ids,
+                            &watchdog,
+                            now,
+                            "throughput_floor",
+                        ) {
+                            return Err(GatewaySessionError::retryable_partial(err, partial));
+                        }
+                        return Err(GatewaySessionError::retryable(err));
+                    }
+                }
+            }
+            Some("s.receipt") => {
+                let receipt = provider_signed_receipt_from_frame(
+                    &frame,
+                    &session.invocation.session_id,
+                    &session.enclave_pubkey,
+                )?;
+                if receipt.body.final_receipt {
+                    final_provider_receipt = Some(receipt);
+                } else {
+                    let now = now_millis_u64();
+                    let partial = direct_session_checkpoint_partial(
+                        &session.request,
+                        &content,
+                        tool_call.clone(),
+                        receipt.clone(),
+                        &token_ids,
+                        &watchdog,
+                        now,
+                    );
+                    let receipt_ack = direct_session_partial_receipt_ack(
+                        &session.request,
+                        &session.invocation,
+                        &partial,
+                        &session.provider,
+                        &session.model,
+                    )?;
+                    session
+                        .bridge
+                        .session_send(
+                            &session.provider,
+                            &session.invocation.session_id,
+                            json!({
+                                "t": "s.receipt_ack",
+                                "v": 1,
+                                "session_id": receipt_ack.session_id,
+                                "seq": receipt_ack.seq,
+                                "user_sig": receipt_ack.user_sig,
+                                "reason": "checkpoint",
+                            }),
+                        )
+                        .await?;
+                    latest_checkpoint_receipt = Some(receipt);
+                }
+            }
+            Some("s.error") => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_error");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider returned s.error");
+                let err = format!(
+                    "provider returned {code} on session {}: {message}",
+                    session.invocation.session_id
+                );
+                if let Some(partial) = interrupted_direct_session_partial(
+                    &content,
+                    tool_call.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now_millis_u64(),
+                    "mid_stream_error",
+                ) {
+                    return Err(GatewaySessionError::retryable_partial(err, partial));
+                }
+                return Err(GatewaySessionError::new(err));
+            }
+            Some("s.close") => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if finish_reason.is_none() {
+                    let err = format!(
+                        "provider closed session {} before final delta: {reason}",
+                        session.invocation.session_id
+                    );
+                    if let Some(partial) = interrupted_direct_session_partial(
+                        &content,
+                        tool_call.clone(),
+                        latest_checkpoint_receipt.as_ref(),
+                        &token_ids,
+                        &watchdog,
+                        now_millis_u64(),
+                        "mid_stream_close",
+                    ) {
+                        return Err(GatewaySessionError::retryable_partial(err, partial));
+                    }
+                    return Err(GatewaySessionError::new(err));
+                }
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed session {} before s.receipt: {reason}",
+                    session.invocation.session_id
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let usage = observed_chat_usage(&session.request, &content, &token_ids);
+    if let Some(claimed) = claimed_usage {
+        if claimed != usage {
+            return Err(GatewaySessionError::new(format!(
+                "provider reported usage {:?} did not match gateway-observed usage {:?}",
+                claimed, usage
+            )));
+        }
+    }
+    let completed_at_millis = now_millis_u64();
+    let quality = watchdog.first_delta_at_millis.map(|first_delta_at_millis| {
+        let elapsed_millis = completed_at_millis.saturating_sub(started_at_millis).max(1);
+        GatewaySessionQuality {
+            ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+            tok_s: Some((usage.completion_tokens as f64) * 1000.0 / (elapsed_millis as f64)),
+        }
+    });
+    let artifacts = finish_session_artifacts(artifact_builders)?;
+    let output = ChatOutput {
+        content: tool_call.is_none().then_some(content),
+        tool_call,
+        artifacts,
+        finish_reason: finish_reason.expect("loop ended with final delta"),
+        usage,
+    };
+    let provider_receipt = final_provider_receipt.expect("loop ended with provider receipt");
+    let receipt_ack = direct_session_receipt_ack(
+        &session.request,
+        &output,
+        &session.invocation,
+        &provider_receipt,
+        &session.provider,
+        &session.model,
+    )?;
+    session
+        .bridge
+        .session_send(
+            &session.provider,
+            &session.invocation.session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+            }),
+        )
+        .await
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "sending s.receipt_ack for session {} to provider {} failed: {err}",
+                session.invocation.session_id, session.provider
+            ))
+        })?;
+    let _ = session
+        .bridge
+        .session_send(
+            &session.provider,
+            &session.invocation.session_id,
+            json!({
+                "t": "s.close",
+                "v": 1,
+                "session_id": session.invocation.session_id,
+                "reason": "done",
+            }),
+        )
+        .await;
+
+    let result = GatewaySessionResult {
+        output: output.clone(),
+        backend: session.backend.clone(),
+        direct_session: true,
+        provider_receipt: Some(provider_receipt.clone()),
+        token_ids,
+        quality,
+    };
+    let receipt = session
+        .state
+        .meter_chat_session(
+            &session.model,
+            &session.request,
+            &output,
+            &session.invocation,
+            Some(&provider_receipt),
+        )
+        .map_err(|err| GatewaySessionError::new(err.message))?;
+    record_route_observation(
+        &session.state,
+        session.route.as_ref(),
+        observation_sample_from_success(&result, session.attempt_started.elapsed()),
+    );
+    session
+        .state
+        .maybe_run_canary_probe_after_session(&session.model, &session.invocation)
+        .await;
+
+    let mut finish_chunk = chat_chunk(
+        &session.id,
+        session.created,
+        &session.model.id,
+        json!({}),
+        Some(output.finish_reason.as_str()),
+        None,
+    );
+    if !output.artifacts.is_empty() {
+        finish_chunk["mayhem"] = json!({
+            "artifacts": artifact_summaries(&output.artifacts),
+        });
+    }
+    if !send_sse_value(tx, finish_chunk).await {
+        return Ok(());
+    }
+    if session.include_usage {
+        let mayhem_meta = ResponseMayhemMeta {
+            backend: &session.backend,
+            direct_session: true,
+            billable: true,
+            dev_session: false,
+            hedge: session.invocation.hedge.clone(),
+        };
+        let usage_chunk = json!({
+            "id": session.id,
+            "object": "chat.completion.chunk",
+            "created": session.created,
+            "model": session.model.id,
+            "choices": [],
+            "usage": output.usage,
+            "mayhem": {
+                "backend": mayhem_meta.backend,
+                "direct_session": mayhem_meta.direct_session,
+                "billable": mayhem_meta.billable,
+                "dev_session": mayhem_meta.dev_session,
+                "artifacts": artifact_summaries(&output.artifacts),
+                "hedge": {
+                    "requested": mayhem_meta.hedge.requested,
+                    "planned_probe_count": mayhem_meta.hedge.planned_probe_count,
+                    "actual_probe_count": mayhem_meta.hedge.actual_probe_count,
+                    "winner_provider": mayhem_meta.hedge.winner_provider,
+                    "winner_ttft_ms": mayhem_meta.hedge.winner_ttft_ms,
+                },
+                "receipt": receipt_summary(&receipt),
+            },
+        });
+        let _ = send_sse_value(tx, usage_chunk).await;
+    }
+    Ok(())
+}
+
+async fn send_sse_value(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    value: Value,
+) -> bool {
+    tx.send(Ok(sse_event_from_value(value))).await.is_ok()
+}
+
+async fn send_sse_error(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    message: &str,
+) -> bool {
+    send_sse_value(
+        tx,
+        json!({
+            "error": {
+                "message": message,
+                "type": "mayhem_stream_error",
+            },
+        }),
+    )
+    .await
+}
+
+async fn send_sse_done(tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>) -> bool {
+    tx.send(Ok(Event::default().data("[DONE]"))).await.is_ok()
+}
+
+fn sse_event_from_value(value: Value) -> Event {
+    Event::default()
+        .json_data(value)
+        .unwrap_or_else(|_| Event::default().data("{}"))
 }
 
 async fn run_chat_with_route_retry(
@@ -8842,13 +9631,14 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let receipt = if let Some(provider_receipt) = provider_receipt {
+            let seq = provider_receipt.body.seq;
             self.cosign_provider_receipt(
                 model,
                 invocation,
                 provider_receipt,
                 ExpectedProviderReceipt {
                     provider: &provider,
-                    seq: 1,
+                    seq,
                     final_receipt: true,
                     usage: usage.clone(),
                     mu_owed_cum,
@@ -9099,6 +9889,13 @@ impl GatewayState {
             partial.output.usage.prompt_tokens,
             partial.output.usage.completion_tokens,
         );
+        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            return Err(ApiError::payment_required(
+                "provider partial receipt exceeds signed spend voucher",
+                Some("model"),
+            ));
+        }
         let receipt = self.cosign_provider_receipt(
             model,
             invocation,
@@ -9107,7 +9904,7 @@ impl GatewayState {
                 provider: &provider,
                 seq: body.seq,
                 final_receipt: false,
-                mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+                mu_owed_cum,
                 usage,
                 prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
             },
@@ -9860,6 +10657,15 @@ fn sse_response(chunks: Vec<Value>) -> Response {
         })
         .chain(std::iter::once(Ok(Event::default().data("[DONE]"))));
     let mut response = Sse::new(stream::iter(events)).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+fn sse_stream_response(events: SseEventStream) -> Response {
+    let mut response = Sse::new(events).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-cache"),
@@ -11152,6 +11958,29 @@ mod tests {
         )
         .expect("direct session ack signs the accepted receipt");
         assert_eq!(live_ack, stored.receipt_ack);
+
+        let checkpointed_final =
+            test_provider_receipt_with_finality(&model, &request, &output, &invocation, 3, true);
+        let checkpointed_ack = direct_session_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &checkpointed_final,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect("checkpointed final receipt seq should be accepted");
+        assert_eq!(checkpointed_ack.seq, 3);
+        let checkpointed_stored = state
+            .meter_chat_session(
+                &model,
+                &request,
+                &output,
+                &invocation,
+                Some(&checkpointed_final),
+            )
+            .expect("checkpointed final receipt should be co-signed");
+        assert_eq!(checkpointed_stored.receipt.body.seq, 3);
 
         let mut wrong_amount = provider_receipt.clone();
         wrong_amount.body.mu_owed_cum = wrong_amount.body.mu_owed_cum.saturating_add(1);
