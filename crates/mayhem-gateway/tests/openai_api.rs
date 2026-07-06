@@ -1600,6 +1600,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 "T1".to_owned(),
                 "Tier 1 - software self-attestation; economic/trust only".to_owned(),
             )]),
+            min_app_version: None,
             caps: ModelCaps {
                 tools: true,
                 json: true,

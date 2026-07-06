@@ -84,6 +84,8 @@ pub(crate) struct CatalogModel {
     pub(crate) family: String,
     pub(crate) params_b: f64,
     pub(crate) tier: String,
+    #[serde(default)]
+    pub(crate) min_app_version: Option<String>,
     pub(crate) provenance: Provenance,
     pub(crate) artifacts: BTreeMap<String, CatalogArtifact>,
     pub(crate) caps: CatalogCaps,
@@ -508,6 +510,14 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
     }
     if model.params_b <= 0.0 {
         errors.push(format!("{} params_b must be positive", model.model_id));
+    }
+    if let Some(min_app_version) = &model.min_app_version {
+        if semver::Version::parse(min_app_version.trim()).is_err() {
+            errors.push(format!(
+                "{} min_app_version must be a semantic version like 0.1.0",
+                model.model_id
+            ));
+        }
     }
     validate_source(
         &model.model_id,
@@ -1523,6 +1533,41 @@ mod tests {
     }
 
     #[test]
+    fn model_min_app_version_must_be_semver_when_present() {
+        let mut model = verification_test_model(
+            "admin/model@4bit",
+            DEFAULT_MODEL_CLASS,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
+                )]),
+                perceptual_hashes: BTreeMap::new(),
+            },
+        );
+        model.min_app_version = Some("0.1.0".to_owned());
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(
+            !errors.iter().any(|error| error.contains("min_app_version")),
+            "{errors:?}"
+        );
+
+        model.min_app_version = Some("next".to_owned());
+        errors.clear();
+        validate_model(&model, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("min_app_version must be a semantic version")));
+    }
+
+    #[test]
     fn launch_source_metadata_requires_merkle_root_and_source_sha() {
         let mut model = CatalogModel {
             model_id: "admin/model@4bit".to_owned(),
@@ -1530,6 +1575,7 @@ mod tests {
             family: "admin".to_owned(),
             params_b: 4.0,
             tier: "launch".to_owned(),
+            min_app_version: None,
             provenance: Provenance {
                 source: SourceRef {
                     kind: "huggingface".to_owned(),
@@ -1763,6 +1809,7 @@ mod tests {
             family: "fixture".to_owned(),
             params_b: 1.0,
             tier: "launch".to_owned(),
+            min_app_version: None,
             provenance: Provenance {
                 source: SourceRef {
                     kind: "huggingface".to_owned(),

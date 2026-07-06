@@ -1447,6 +1447,7 @@ dependencies = [
  "mayhem-hwprobe",
  "mayhem-proto",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

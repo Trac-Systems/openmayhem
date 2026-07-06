@@ -157,6 +157,8 @@ pub struct MayhemModelInfo {
     pub attestation_tiers: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attestation_tier_labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_app_version: Option<String>,
     pub caps: ModelCaps,
     #[serde(default)]
     pub adapter: ShapeAdapterInfo,
@@ -770,6 +772,7 @@ impl GatewayState {
                     "T1".to_owned(),
                     1,
                 )])),
+                min_app_version: None,
                 caps: ModelCaps {
                     tools: true,
                     json: true,
@@ -6176,6 +6179,10 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
             attestation_tier_labels: attestation_tier_labels_from_catalog_value(model)
                 .unwrap_or_else(|| attestation_tier_labels_for_counts(&tiers)),
             attestation_tiers: tiers,
+            min_app_version: model
+                .get("min_app_version")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             caps: ModelCaps {
                 tools: caps.get("tools").and_then(Value::as_bool).unwrap_or(false),
                 json: caps.get("json").and_then(Value::as_bool).unwrap_or(false),
@@ -7208,6 +7215,7 @@ mod tests {
                     "T1".to_owned(),
                     1,
                 )])),
+                min_app_version: None,
                 caps: ModelCaps {
                     tools: true,
                     json: true,

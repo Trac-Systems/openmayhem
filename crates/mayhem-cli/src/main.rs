@@ -4193,6 +4193,7 @@ struct CatalogListModel {
     family: String,
     params_b: f64,
     tier: String,
+    min_app_version: Option<String>,
     license: String,
     price_ref_mu: CatalogListPrice,
     caps: CatalogListCaps,
@@ -4380,6 +4381,7 @@ fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
         family: model.family.clone(),
         params_b: model.params_b,
         tier: model.tier.clone(),
+        min_app_version: model.min_app_version.clone(),
         license: model.provenance.license.clone(),
         price_ref_mu: CatalogListPrice {
             denom: model.price_ref_mu.denom.clone(),
@@ -4439,6 +4441,9 @@ fn print_catalog_list_report(report: &CatalogListReport) {
             model.price_ref_mu.denom,
             format_rate_map(&model.price_ref_mu.rate_map)
         );
+        if let Some(min_app_version) = model.min_app_version.as_deref() {
+            println!("  min app version: Mayhem >= {min_app_version}");
+        }
         let output = if model.caps.output_modalities.is_empty() {
             model
                 .caps
@@ -12853,106 +12858,125 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         None => None,
     };
-    let (state, source, model_count, backend, wallet_public_key, balance_mu) = if args
-        .dev_embedded_catalog
-    {
-        let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
-        (
-            state,
-            "dev-embedded-catalog".to_owned(),
-            None,
-            "local-openai-shape".to_owned(),
-            None,
-            None,
-        )
-    } else {
-        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
-        let rpc = PeerRpcClient::new(&rpc_url)?;
-        let wallet_password = args.wallet_password.clone().unwrap_or_default();
-        let wallet = resolve_cli_wallet_with_keypair(
-            &home,
-            config.as_ref(),
-            args.keypair.as_deref(),
-            &args.peer_store_name,
-            &wallet_password,
-        )
-        .await?;
-        let keypair_path = PathBuf::from(&wallet.keypair_path);
-        let user_seed = wallet_signing_seed(&keypair_path, &wallet_password, &wallet.public_key)
-            .await
-            .with_context(|| {
-                format!(
-                    "loading spend-voucher signing seed for wallet {}",
-                    wallet.public_key
-                )
-            })?;
-        let balance_mu = read_user_balance_mu(&rpc, &wallet.public_key, args.rail.as_str()).await?;
-        let contract = read_contract_catalog(&rpc).await?;
-        let models = gateway_models_from_contract(&contract)?;
-        let model_count = models.len();
-        let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
-            .await?
-            .into_iter()
-            .map(earning_view)
-            .map(|view| {
-                view.and_then(|view| {
-                    serde_json::to_value(view).context("serializing provider earning view")
+    let (state, source, model_count, backend, wallet_public_key, balance_mu, blocked_version_gates) =
+        if args.dev_embedded_catalog {
+            let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
+            (
+                state,
+                "dev-embedded-catalog".to_owned(),
+                None,
+                "local-openai-shape".to_owned(),
+                None,
+                None,
+                Vec::new(),
+            )
+        } else {
+            let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+            let rpc = PeerRpcClient::new(&rpc_url)?;
+            let catalog_client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .context("building catalog release HTTP client")?;
+            let release = read_catalog_release_anchor(&rpc).await?;
+            let catalog_files =
+                fetch_catalog_release_files(&catalog_client, &home, &release).await?;
+            let catalog_doc =
+                catalog::load_document(&catalog_files.catalog_path).with_context(|| {
+                    format!(
+                        "loading verified ledger catalog {}",
+                        catalog_files.catalog_path.display()
+                    )
+                })?;
+            let wallet_password = args.wallet_password.clone().unwrap_or_default();
+            let wallet = resolve_cli_wallet_with_keypair(
+                &home,
+                config.as_ref(),
+                args.keypair.as_deref(),
+                &args.peer_store_name,
+                &wallet_password,
+            )
+            .await?;
+            let keypair_path = PathBuf::from(&wallet.keypair_path);
+            let user_seed =
+                wallet_signing_seed(&keypair_path, &wallet_password, &wallet.public_key)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "loading spend-voucher signing seed for wallet {}",
+                            wallet.public_key
+                        )
+                    })?;
+            let balance_mu =
+                read_user_balance_mu(&rpc, &wallet.public_key, args.rail.as_str()).await?;
+            let contract = read_contract_catalog(&rpc).await?;
+            let models = gateway_models_from_contract(&contract)?;
+            let (models, blocked_version_gates) =
+                filter_gateway_models_by_app_version(models, &catalog_doc)?;
+            let model_count = models.len();
+            let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
+                .await?
+                .into_iter()
+                .map(earning_view)
+                .map(|view| {
+                    view.and_then(|view| {
+                        serde_json::to_value(view).context("serializing provider earning view")
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
-            Some(&home),
-            args.sc_bridge_url.as_deref(),
-            args.sc_bridge_token.as_deref(),
-        )?;
-        if args.session_open_timeout_seconds == Some(0) {
-            bail!("--session-open-timeout-seconds must be positive");
-        }
-        if args.session_frame_timeout_seconds == Some(0) {
-            bail!("--session-frame-timeout-seconds must be positive");
-        }
-        if args.session_ttft_timeout_seconds == Some(0) {
-            bail!("--session-ttft-timeout-seconds must be positive");
-        }
-        if args
-            .min_tok_s
-            .is_some_and(|value| !value.is_finite() || value <= 0.0)
-        {
-            bail!("--min-tok-s must be a positive finite number");
-        }
-        let mut session_config =
-            ScBridgeGatewaySessionConfig::new(sc_bridge_url.clone(), sc_bridge_token);
-        if let Some(seconds) = args.session_open_timeout_seconds {
-            session_config.open_timeout = Duration::from_secs(seconds);
-        }
-        if let Some(seconds) = args.session_ttft_timeout_seconds {
-            session_config.ttft_timeout = Duration::from_secs(seconds);
-        }
-        if let Some(seconds) = args.session_frame_timeout_seconds {
-            session_config.frame_timeout = Duration::from_secs(seconds);
-        }
-        session_config.min_tok_s = args.min_tok_s;
-        let failover_policy = mayhem_gateway::openai::GatewayFailoverPolicyConfig {
-            open_timeout_ms: Some(duration_millis_u64(session_config.open_timeout)),
-            ttft_timeout_ms: Some(duration_millis_u64(session_config.ttft_timeout)),
-            stall_timeout_ms: Some(duration_millis_u64(session_config.frame_timeout)),
-            min_tok_s: session_config.min_tok_s,
+                .collect::<Result<Vec<_>>>()?;
+            let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
+                Some(&home),
+                args.sc_bridge_url.as_deref(),
+                args.sc_bridge_token.as_deref(),
+            )?;
+            if args.session_open_timeout_seconds == Some(0) {
+                bail!("--session-open-timeout-seconds must be positive");
+            }
+            if args.session_frame_timeout_seconds == Some(0) {
+                bail!("--session-frame-timeout-seconds must be positive");
+            }
+            if args.session_ttft_timeout_seconds == Some(0) {
+                bail!("--session-ttft-timeout-seconds must be positive");
+            }
+            if args
+                .min_tok_s
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+            {
+                bail!("--min-tok-s must be a positive finite number");
+            }
+            let mut session_config =
+                ScBridgeGatewaySessionConfig::new(sc_bridge_url.clone(), sc_bridge_token);
+            if let Some(seconds) = args.session_open_timeout_seconds {
+                session_config.open_timeout = Duration::from_secs(seconds);
+            }
+            if let Some(seconds) = args.session_ttft_timeout_seconds {
+                session_config.ttft_timeout = Duration::from_secs(seconds);
+            }
+            if let Some(seconds) = args.session_frame_timeout_seconds {
+                session_config.frame_timeout = Duration::from_secs(seconds);
+            }
+            session_config.min_tok_s = args.min_tok_s;
+            let failover_policy = mayhem_gateway::openai::GatewayFailoverPolicyConfig {
+                open_timeout_ms: Some(duration_millis_u64(session_config.open_timeout)),
+                ttft_timeout_ms: Some(duration_millis_u64(session_config.ttft_timeout)),
+                stall_timeout_ms: Some(duration_millis_u64(session_config.frame_timeout)),
+                min_tok_s: session_config.min_tok_s,
+            };
+            let backend = ScBridgeGatewaySessionBackend::new(session_config);
+            (
+                GatewayState::from_models(models)
+                    .with_provider_earnings(provider_earnings)
+                    .with_failover_policy(failover_policy)
+                    .with_receipt_user_seed(user_seed)
+                    .with_receipt_balance_mu(balance_mu)
+                    .with_session_backend(Arc::new(backend)),
+                format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
+                Some(model_count),
+                format!("sc-bridge-direct-session:{sc_bridge_url}"),
+                Some(wallet.public_key),
+                Some(balance_mu),
+                blocked_version_gates,
+            )
         };
-        let backend = ScBridgeGatewaySessionBackend::new(session_config);
-        (
-            GatewayState::from_models(models)
-                .with_provider_earnings(provider_earnings)
-                .with_failover_policy(failover_policy)
-                .with_receipt_user_seed(user_seed)
-                .with_receipt_balance_mu(balance_mu)
-                .with_session_backend(Arc::new(backend)),
-            format!("contract:{rpc_url}"),
-            Some(model_count),
-            format!("sc-bridge-direct-session:{sc_bridge_url}"),
-            Some(wallet.public_key),
-            Some(balance_mu),
-        )
-    };
     let state = match apple_app_attest_jwks {
         Some(jwks) => state.with_apple_app_attest_jwks(jwks),
         None => state,
@@ -12989,6 +13013,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             "balance_source": format!("bal/{}/{}", public_key, args.rail.as_str()),
         })),
         "models": model_count,
+        "version_gates": &blocked_version_gates,
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
         "nvidia_gb10_device_jwks": args.nvidia_gb10_device_jwks_file.is_some(),
         "nvidia_nras_jwks": args.nvidia_nras_jwks_file.is_some(),
@@ -13012,6 +13037,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 "Model source: canonical contract state ({} models).",
                 model_count.unwrap_or(0)
             );
+            if !blocked_version_gates.is_empty() {
+                println!(
+                    "Hidden by app-version gate: {} model(s); run `mayhem update` for newer catalog entries.",
+                    blocked_version_gates.len()
+                );
+                for gate in &blocked_version_gates {
+                    println!("  {}", gate.message);
+                }
+            }
             println!("Backend: {backend}");
             if let Some(public_key) = wallet_public_key.as_deref() {
                 println!("Wallet: {public_key}");
@@ -20318,6 +20352,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     &attestation_tiers,
                 ),
                 attestation_tiers,
+                min_app_version: None,
                 caps: caps_by_model
                     .remove(&model_id)
                     .unwrap_or_else(empty_gateway_caps),
@@ -20335,6 +20370,117 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         );
     }
     Ok(models)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct ModelVersionGate {
+    model_id: String,
+    min_app_version: String,
+    installed_app_version: String,
+    message: String,
+}
+
+fn installed_app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn model_app_version_gate(
+    model_id: &str,
+    min_app_version: Option<&str>,
+) -> Result<Option<ModelVersionGate>> {
+    let Some(min_app_version) = min_app_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let installed = installed_app_version();
+    if app_version_satisfies_min(installed, min_app_version)? {
+        return Ok(None);
+    }
+    let message = upgrade_required_message(model_id, min_app_version, installed);
+    Ok(Some(ModelVersionGate {
+        model_id: model_id.to_owned(),
+        min_app_version: min_app_version.to_owned(),
+        installed_app_version: installed.to_owned(),
+        message,
+    }))
+}
+
+fn app_version_satisfies_min(installed: &str, min_app_version: &str) -> Result<bool> {
+    let installed = parse_app_version(installed, "installed Mayhem")?;
+    let min_app_version = parse_app_version(min_app_version, "catalog min_app_version")?;
+    Ok(installed >= min_app_version)
+}
+
+fn parse_app_version(value: &str, label: &str) -> Result<semver::Version> {
+    let trimmed = value.trim();
+    semver::Version::parse(trimmed)
+        .with_context(|| format!("{label} must be a semantic version like 0.1.0, got {trimmed:?}"))
+}
+
+fn upgrade_required_message(
+    model_id: &str,
+    min_app_version: &str,
+    installed_app_version: &str,
+) -> String {
+    format!(
+        "upgrade required: model {model_id} requires Mayhem >= {min_app_version}; installed {installed_app_version}; run `mayhem update`"
+    )
+}
+
+fn version_gate_summary(action: &str, gates: &[ModelVersionGate]) -> String {
+    if gates.len() == 1 {
+        return format!(
+            "{}; this node cannot {action} it until upgraded",
+            gates[0].message
+        );
+    }
+    let installed = gates
+        .first()
+        .map(|gate| gate.installed_app_version.clone())
+        .unwrap_or_else(|| installed_app_version().to_owned());
+    let details = gates
+        .iter()
+        .map(|gate| format!("{} >= {}", gate.model_id, gate.min_app_version))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "upgrade required: {} models require a newer Mayhem before this node can {action}: {details}; installed {installed}; run `mayhem update`",
+        gates.len()
+    )
+}
+
+fn filter_gateway_models_by_app_version(
+    models: Vec<GatewayModel>,
+    catalog_doc: &catalog::CatalogDocument,
+) -> Result<(Vec<GatewayModel>, Vec<ModelVersionGate>)> {
+    let min_versions = catalog_doc
+        .models
+        .iter()
+        .filter_map(|model| {
+            model
+                .min_app_version
+                .as_ref()
+                .map(|version| (model.model_id.as_str(), version.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut allowed = Vec::new();
+    let mut blocked = Vec::new();
+    for mut model in models {
+        if let Some(min_app_version) = min_versions.get(model.id.as_str()).copied() {
+            model.mayhem.min_app_version = Some(min_app_version.to_owned());
+            if let Some(gate) = model_app_version_gate(&model.id, Some(min_app_version))? {
+                blocked.push(gate);
+                continue;
+            }
+        }
+        allowed.push(model);
+    }
+    if allowed.is_empty() && !blocked.is_empty() {
+        bail!("{}", version_gate_summary("route", &blocked));
+    }
+    Ok((allowed, blocked))
 }
 
 fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64) {
@@ -20478,6 +20624,7 @@ fn build_provider_candidates(
 ) -> Result<Vec<ProviderCandidate>> {
     let requested_backend = requested_backend(args, hardware)?;
     let mut candidates = Vec::new();
+    let mut version_gates = BTreeMap::new();
     for enclave in contract.enclaves.iter().filter(|enclave| {
         enclave.status == "active" && admin_role_marker_ok(enclave.created_by_role.as_deref())
     }) {
@@ -20497,6 +20644,21 @@ fn build_provider_candidates(
             continue;
         };
         if enclave.model_class != model.model_class {
+            continue;
+        }
+        if let Some(gate) =
+            model_app_version_gate(&model.model_id, model.min_app_version.as_deref())?
+        {
+            if args
+                .enclave
+                .as_deref()
+                .is_some_and(|requested| requested_provider_enclave_matches(requested, enclave))
+            {
+                bail!("{}", gate.message);
+            }
+            version_gates
+                .entry(gate.model_id.clone())
+                .or_insert_with(|| gate);
             continue;
         }
         let Some(verdict) = hardware
@@ -20545,11 +20707,23 @@ fn build_provider_candidates(
         });
     }
     if candidates.is_empty() {
+        if !version_gates.is_empty() {
+            let gates = version_gates.into_values().collect::<Vec<_>>();
+            bail!("{}", version_gate_summary("serve", &gates));
+        }
         bail!(
             "no feasible active admin-created enclaves with a current mu_usd admin price found in contract state; providers can only join priced enclaves the admin already registered"
         );
     }
     Ok(candidates)
+}
+
+fn requested_provider_enclave_matches(requested: &str, enclave: &LedgerEnclave) -> bool {
+    if is_32_byte_hex(requested) {
+        enclave.enclave_id == requested
+    } else {
+        enclave.model_id == requested
+    }
 }
 
 fn ledger_enclave_matches_catalog_artifact(
@@ -26585,6 +26759,24 @@ mod tests {
     }
 
     #[test]
+    fn provider_candidates_refuse_models_above_installed_app_version() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].min_app_version = Some("9999.0.0".to_owned());
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let args = test_provider_start_args();
+        let contract = test_contract(&root);
+
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .expect_err("provider should refuse too-new catalog models");
+        let message = err.to_string();
+        assert!(message.contains("upgrade required"));
+        assert!(message.contains("test/model@4bit"));
+        assert!(message.contains("Mayhem >= 9999.0.0"));
+        assert!(message.contains("mayhem update"));
+    }
+
+    #[test]
     fn provider_candidates_reject_ledger_catalog_source_mismatch() {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
@@ -26752,6 +26944,33 @@ mod tests {
         let err = gateway_models_from_contract(&wrong_same_model_enclave)
             .expect_err("same-model wrong-enclave roomserve should hide model");
         assert!(format!("{err:#}").contains("no canonical contract-backed models"));
+    }
+
+    #[test]
+    fn gateway_model_version_gates_use_signed_catalog_requirements() {
+        let root = "aa".repeat(32);
+        let contract = test_contract(&root);
+        let mut catalog = test_catalog(&root);
+
+        catalog.models[0].min_app_version = Some(installed_app_version().to_owned());
+        let models = gateway_models_from_contract(&contract).unwrap();
+        let (allowed, blocked) = filter_gateway_models_by_app_version(models, &catalog).unwrap();
+        assert_eq!(allowed.len(), 1);
+        assert!(blocked.is_empty());
+        assert_eq!(
+            allowed[0].mayhem.min_app_version.as_deref(),
+            Some(installed_app_version())
+        );
+
+        catalog.models[0].min_app_version = Some("9999.0.0".to_owned());
+        let models = gateway_models_from_contract(&contract).unwrap();
+        let err = filter_gateway_models_by_app_version(models, &catalog)
+            .expect_err("gateway should refuse when every routable model is too new");
+        let message = err.to_string();
+        assert!(message.contains("upgrade required"));
+        assert!(message.contains("route"));
+        assert!(message.contains("Mayhem >= 9999.0.0"));
+        assert!(message.contains("mayhem update"));
     }
 
     #[test]
@@ -28944,6 +29163,7 @@ mod tests {
         let mut launch = catalog.models[0].clone();
         launch.model_id = "test/launch@4bit".to_owned();
         launch.tier = "launch".to_owned();
+        launch.min_app_version = Some(installed_app_version().to_owned());
         catalog.models.push(launch);
 
         let report = catalog_list_report(
@@ -28960,6 +29180,10 @@ mod tests {
         assert_eq!(report.model_count, 1);
         assert_eq!(report.artifact_count, 1);
         assert_eq!(report.models[0].model_id, "test/launch@4bit");
+        assert_eq!(
+            report.models[0].min_app_version.as_deref(),
+            Some(installed_app_version())
+        );
         assert_eq!(
             report.models[0].canary_verification_method,
             "token_fingerprint"
@@ -31272,6 +31496,7 @@ mod tests {
                 family: "test".to_owned(),
                 params_b: 1.0,
                 tier: "dev".to_owned(),
+                min_app_version: None,
                 provenance: catalog::Provenance {
                     source: catalog::SourceRef {
                         kind: "huggingface".to_owned(),
