@@ -72,10 +72,15 @@ Environment:
   MAYHEM_PHASE3_SESSION_OPEN_TIMEOUT_SECONDS Gateway direct-session open timeout (default: 90 real, 45 shim)
   MAYHEM_PHASE3_SESSION_TTFT_TIMEOUT_SECONDS Gateway first-token timeout (default: 300 real, 60 shim)
   MAYHEM_PHASE3_SESSION_FRAME_TIMEOUT_SECONDS Gateway frame idle timeout (default: 300 real, 60 shim)
+  MAYHEM_PHASE3_RECEIPT_CHECKPOINT_TOKENS Provider receipt checkpoint window (default: 8192)
+  MAYHEM_PHASE3_RECEIPT_CHECKPOINT_MS Provider receipt checkpoint wall-clock window (default: 30000)
   MAYHEM_PHASE3_CHAT_TIMEOUT_SECONDS Curl-compatible chat timeout (default: 420 real, 120 shim)
   MAYHEM_PHASE3_CHAT_MAX_TOKENS Curl-compatible chat max_tokens (default: 32)
   MAYHEM_PHASE3_CHAT_ATTEMPTS Curl-compatible chat attempts after provider is ready (default: 3)
   MAYHEM_PHASE3_CHAT_RETRY_DELAY_SECONDS Delay between chat retries (default: 35; gateway cooloff is 30s)
+  MAYHEM_PHASE3_LONG_STREAM    Also run a long streaming memory probe (default: 0)
+  MAYHEM_PHASE3_LONG_CHAT_MAX_TOKENS Long streaming probe max_tokens (default: 2048)
+  MAYHEM_PHASE3_LONG_MEMORY_MAX_DELTA_KIB Max gateway RSS delta during long probe (default: 131072)
   MAYHEM_PHASE3_LOCAL_JOINERS Local dev-net joiners to start, 1 or 2 (default: 2)
   MAYHEM_PHASE3_OPENCODE_BIN   opencode binary path/name (default: opencode)
   MAYHEM_PHASE3_LOCAL_DHT_HOST  Local LAN IP advertised to the Mac mini DHT peer
@@ -155,15 +160,77 @@ function envPositiveInt(name, fallback) {
   return value;
 }
 
-async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 240_000, maxTokens = 32 } = {}) {
-  const rawPath = path.join(runDir, 'gateway-chat-stream.sse');
-  const summaryPath = path.join(runDir, 'gateway-chat-stream.json');
-  const prompt = [
+function envFlag(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  return /^(1|true|yes)$/i.test(raw);
+}
+
+function sampleRssKiB(pid) {
+  if (!pid) return null;
+  const result = spawnSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  const value = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function startRssSampler(pid, { intervalMs = 1000, label = 'process' } = {}) {
+  const startedAt = Date.now();
+  const samples = [];
+  const sample = () => {
+    const rssKiB = sampleRssKiB(pid);
+    if (rssKiB !== null) {
+      samples.push({ t_ms: Date.now() - startedAt, rss_kib: rssKiB });
+    }
+  };
+  sample();
+  const timer = setInterval(sample, intervalMs);
+  return {
+    stop() {
+      clearInterval(timer);
+      sample();
+      if (samples.length === 0) return { label, pid, samples: 0 };
+      const values = samples.map((entry) => entry.rss_kib);
+      const first = values[0];
+      const last = values.at(-1);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      return {
+        label,
+        pid,
+        samples: samples.length,
+        first_rss_kib: first,
+        last_rss_kib: last,
+        min_rss_kib: min,
+        max_rss_kib: max,
+        max_delta_from_first_kib: max - first,
+        max_minus_min_kib: max - min,
+        path_note: 'RSS sampled with ps -o rss=',
+      };
+    },
+  };
+}
+
+async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
+  timeoutMs = 240_000,
+  maxTokens = 32,
+  prompt = [
     'Write one short sentence proving this is a live model response.',
     'Include the word mayhem and name a color that is not blue.',
-  ].join(' ');
+  ].join(' '),
+  fileStem = 'gateway-chat-stream',
+  memoryPid = null,
+  memoryLabel = 'gateway',
+  memorySampleIntervalMs = 1000,
+  memoryMaxDeltaKiB = null,
+} = {}) {
+  const rawPath = path.join(runDir, `${fileStem}.sse`);
+  const summaryPath = path.join(runDir, `${fileStem}.json`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('streaming chat timed out')), timeoutMs);
+  const rssSampler = memoryPid
+    ? startRssSampler(memoryPid, { intervalMs: memorySampleIntervalMs, label: memoryLabel })
+    : null;
   let raw = '';
   let content = '';
   let dataEvents = 0;
@@ -176,6 +243,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
   let firstJsonAt = null;
   let firstContentAt = null;
   let doneAt = null;
+  let memory = null;
   try {
     const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -247,6 +315,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
     if (buffer) handleLine(buffer);
   } finally {
     clearTimeout(timer);
+    if (rssSampler) memory = rssSampler.stop();
   }
   fs.writeFileSync(rawPath, raw);
   if (dataEvents === 0) fail('streaming chat produced no SSE data events');
@@ -272,7 +341,17 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
     },
     raw_path: path.relative(ROOT, rawPath),
   };
+  if (memory) summary.memory = memory;
   writeJson(summaryPath, summary);
+  if (
+    memory &&
+    memoryMaxDeltaKiB !== null &&
+    memory.max_delta_from_first_kib > memoryMaxDeltaKiB
+  ) {
+    fail(
+      `${fileStem} exceeded gateway RSS delta bound: ${memory.max_delta_from_first_kib} KiB > ${memoryMaxDeltaKiB} KiB`
+    );
+  }
   return { ...summary, summary_path: path.relative(ROOT, summaryPath) };
 }
 
@@ -1609,6 +1688,8 @@ async function main() {
     'MAYHEM_PHASE3_SESSION_FRAME_TIMEOUT_SECONDS',
     mode === 'real' ? 300 : 60
   );
+  const receiptCheckpointTokens = envPositiveInt('MAYHEM_PHASE3_RECEIPT_CHECKPOINT_TOKENS', 8192);
+  const receiptCheckpointMs = envPositiveInt('MAYHEM_PHASE3_RECEIPT_CHECKPOINT_MS', 30000);
   const chatTimeoutSeconds = envPositiveInt(
     'MAYHEM_PHASE3_CHAT_TIMEOUT_SECONDS',
     mode === 'real' ? 420 : 120
@@ -1625,6 +1706,8 @@ async function main() {
       '--session-open-timeout-seconds', String(sessionOpenTimeoutSeconds),
       '--session-ttft-timeout-seconds', String(sessionTtftTimeoutSeconds),
       '--session-frame-timeout-seconds', String(sessionFrameTimeoutSeconds),
+      '--receipt-checkpoint-tokens', String(receiptCheckpointTokens),
+      '--receipt-checkpoint-ms', String(receiptCheckpointMs),
       '--dev-catalog-path', tempCatalogPath,
       '--dev-skip-catalog-verify',
       '--bind', `127.0.0.1:${gatewayPort}`,
@@ -1648,6 +1731,24 @@ async function main() {
     timeoutMs: chatTimeoutSeconds * 1_000,
     maxTokens: chatMaxTokens,
   });
+  let longChatStream = null;
+  if (envFlag('MAYHEM_PHASE3_LONG_STREAM')) {
+    log('running long streaming chat memory probe through the gateway');
+    longChatStream = await runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, {
+      timeoutMs: envPositiveInt('MAYHEM_PHASE3_LONG_CHAT_TIMEOUT_SECONDS', chatTimeoutSeconds) * 1_000,
+      maxTokens: envPositiveInt('MAYHEM_PHASE3_LONG_CHAT_MAX_TOKENS', 2048),
+      prompt: [
+        'Write a long deterministic stress response for a streaming transport test.',
+        'Use short numbered lines.',
+        'Each line must include mayhem and a different plain word.',
+        'Keep going until the token budget is exhausted; do not summarize or stop early.',
+      ].join(' '),
+      fileStem: 'gateway-chat-long-stream',
+      memoryPid: gateway.pid,
+      memoryLabel: 'local-gateway',
+      memoryMaxDeltaKiB: envPositiveInt('MAYHEM_PHASE3_LONG_MEMORY_MAX_DELTA_KIB', 131072),
+    });
+  }
 
   const runOpencode = /^(1|true|yes)$/i.test(process.env.MAYHEM_PHASE3_RUN_OPENCODE || '');
   const configHome = path.join(runDir, 'xdg-config');
@@ -1735,6 +1836,10 @@ async function main() {
       user_sc_bridge_url: userScBridge.url,
       subnet_channel: subnetChannel,
       peer_dht_bootstrap: peerDhtBootstrap,
+      receipt_checkpoint_every: {
+        tokens: receiptCheckpointTokens,
+        ms: receiptCheckpointMs,
+      },
     },
     remote: {
       host: remote.host,
@@ -1782,6 +1887,7 @@ async function main() {
     },
     gateway: {
       chat_stream: chatStream,
+      long_chat_stream: longChatStream,
       models: modelsPath,
       selected_model: selectedModel,
       receipts: receiptsPath,

@@ -1011,6 +1011,14 @@ impl GatewayState {
         self
     }
 
+    pub fn with_receipt_checkpoint_every(mut self, checkpoint_every: CheckpointPolicy) -> Self {
+        self.receipt_config.checkpoint_every = CheckpointPolicy {
+            tokens: checkpoint_every.tokens.max(1),
+            ms: checkpoint_every.ms,
+        };
+        self
+    }
+
     pub fn with_session_backend(mut self, backend: Arc<dyn GatewaySessionBackend>) -> Self {
         self.session_backend = backend;
         self
@@ -4685,6 +4693,7 @@ async fn collect_direct_session_output(
     let mut claimed_usage = None;
     let mut final_provider_receipt = None;
     let mut latest_checkpoint_receipt = None;
+    let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
     let started_at_millis = now_millis_u64();
@@ -4742,6 +4751,28 @@ async fn collect_direct_session_output(
                 } else if let Some(token_id) = token_id_from_session_delta(&frame) {
                     token_ids.push(token_id);
                 }
+                if let Some(receipt) = pending_checkpoint_receipt.take() {
+                    if maybe_ack_direct_session_checkpoint_receipt(
+                        bridge,
+                        provider,
+                        session_id,
+                        request,
+                        invocation,
+                        &content,
+                        tool_call.clone(),
+                        &receipt,
+                        &token_ids,
+                        &watchdog,
+                        now,
+                        model,
+                    )
+                    .await?
+                    {
+                        latest_checkpoint_receipt = Some(receipt);
+                    } else {
+                        pending_checkpoint_receipt = Some(receipt);
+                    }
+                }
                 if tool_call.is_none() {
                     tool_call = tool_call_from_session_delta(&frame);
                 }
@@ -4777,36 +4808,39 @@ async fn collect_direct_session_output(
                 let receipt =
                     provider_signed_receipt_from_frame(&frame, session_id, enclave_pubkey)?;
                 if receipt.body.final_receipt {
+                    if pending_checkpoint_receipt.is_some() {
+                        return Err(GatewaySessionError::new(
+                            "provider sent final receipt before pending checkpoint was acknowledged",
+                        ));
+                    }
                     final_provider_receipt = Some(receipt);
                 } else {
+                    if pending_checkpoint_receipt.is_some() {
+                        return Err(GatewaySessionError::new(
+                            "provider sent checkpoint receipt before previous checkpoint was acknowledged",
+                        ));
+                    }
                     let now = now_millis_u64();
-                    let partial = direct_session_checkpoint_partial(
+                    if maybe_ack_direct_session_checkpoint_receipt(
+                        bridge,
+                        provider,
+                        session_id,
                         request,
+                        invocation,
                         &content,
                         tool_call.clone(),
-                        receipt.clone(),
+                        &receipt,
                         &token_ids,
                         &watchdog,
                         now,
-                    );
-                    let receipt_ack = direct_session_partial_receipt_ack(
-                        request, invocation, &partial, provider, model,
-                    )?;
-                    bridge
-                        .session_send(
-                            provider,
-                            session_id,
-                            json!({
-                                "t": "s.receipt_ack",
-                                "v": 1,
-                                "session_id": receipt_ack.session_id,
-                                "seq": receipt_ack.seq,
-                                "user_sig": receipt_ack.user_sig,
-                                "reason": "checkpoint",
-                            }),
-                        )
-                        .await?;
-                    latest_checkpoint_receipt = Some(receipt);
+                        model,
+                    )
+                    .await?
+                    {
+                        latest_checkpoint_receipt = Some(receipt);
+                    } else {
+                        pending_checkpoint_receipt = Some(receipt);
+                    }
                 }
             }
             Some("s.error") => {
@@ -5378,6 +5412,65 @@ fn direct_session_checkpoint_partial(
         reason: "checkpoint".to_owned(),
         redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
     }
+}
+
+async fn maybe_ack_direct_session_checkpoint_receipt(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    session_id: &str,
+    request: &ChatCompletionRequest,
+    invocation: &GatewaySessionInvocation,
+    content: &str,
+    tool_call: Option<ToolCallOutput>,
+    receipt: &ProviderSignedReceipt,
+    token_ids: &[i32],
+    watchdog: &DirectSessionWatchdog,
+    now_millis: u64,
+    model: &GatewayModel,
+) -> Result<bool, GatewaySessionError> {
+    let observed_usage = observed_chat_usage(request, content, token_ids);
+    let claimed_prompt_tokens = receipt.body.usage.input_tokens();
+    let claimed_output_tokens = receipt.body.usage.output_tokens();
+    if claimed_prompt_tokens != observed_usage.prompt_tokens {
+        return Err(GatewaySessionError::new(
+            "provider partial receipt prompt usage mismatch",
+        ));
+    }
+    if claimed_output_tokens > observed_usage.completion_tokens {
+        return Ok(false);
+    }
+    if claimed_output_tokens < observed_usage.completion_tokens {
+        return Err(GatewaySessionError::new(
+            "provider partial receipt trails gateway-observed output",
+        ));
+    }
+
+    let partial = direct_session_checkpoint_partial(
+        request,
+        content,
+        tool_call,
+        receipt.clone(),
+        token_ids,
+        watchdog,
+        now_millis,
+    );
+    let receipt_ack =
+        direct_session_partial_receipt_ack(request, invocation, &partial, provider, model)?;
+    bridge
+        .session_send(
+            provider,
+            session_id,
+            json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": receipt_ack.session_id,
+                "seq": receipt_ack.seq,
+                "user_sig": receipt_ack.user_sig,
+                "reason": "checkpoint",
+            }),
+        )
+        .await?;
+    Ok(true)
 }
 
 fn usage_from_receipt_usage(usage: &ReceiptUsage) -> Usage {
@@ -7036,6 +7129,7 @@ async fn run_live_direct_chat_sse_inner(
     let mut claimed_usage = None;
     let mut final_provider_receipt = None;
     let mut latest_checkpoint_receipt = None;
+    let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
     let started_at_millis = now_millis_u64();
@@ -7113,6 +7207,28 @@ async fn run_live_direct_chat_sse_inner(
                 } else if let Some(token_id) = token_id_from_session_delta(&frame) {
                     token_ids.push(token_id);
                 }
+                if let Some(receipt) = pending_checkpoint_receipt.take() {
+                    if maybe_ack_direct_session_checkpoint_receipt(
+                        &mut session.bridge,
+                        &session.provider,
+                        &session.invocation.session_id,
+                        &session.request,
+                        &session.invocation,
+                        &content,
+                        tool_call.clone(),
+                        &receipt,
+                        &token_ids,
+                        &watchdog,
+                        now,
+                        &session.model,
+                    )
+                    .await?
+                    {
+                        latest_checkpoint_receipt = Some(receipt);
+                    } else {
+                        pending_checkpoint_receipt = Some(receipt);
+                    }
+                }
                 if tool_call.is_none() {
                     if let Some(next_tool_call) = tool_call_from_session_delta(&frame) {
                         if !send_sse_value(
@@ -7168,41 +7284,39 @@ async fn run_live_direct_chat_sse_inner(
                     &session.enclave_pubkey,
                 )?;
                 if receipt.body.final_receipt {
+                    if pending_checkpoint_receipt.is_some() {
+                        return Err(GatewaySessionError::new(
+                            "provider sent final receipt before pending checkpoint was acknowledged",
+                        ));
+                    }
                     final_provider_receipt = Some(receipt);
                 } else {
+                    if pending_checkpoint_receipt.is_some() {
+                        return Err(GatewaySessionError::new(
+                            "provider sent checkpoint receipt before previous checkpoint was acknowledged",
+                        ));
+                    }
                     let now = now_millis_u64();
-                    let partial = direct_session_checkpoint_partial(
+                    if maybe_ack_direct_session_checkpoint_receipt(
+                        &mut session.bridge,
+                        &session.provider,
+                        &session.invocation.session_id,
                         &session.request,
+                        &session.invocation,
                         &content,
                         tool_call.clone(),
-                        receipt.clone(),
+                        &receipt,
                         &token_ids,
                         &watchdog,
                         now,
-                    );
-                    let receipt_ack = direct_session_partial_receipt_ack(
-                        &session.request,
-                        &session.invocation,
-                        &partial,
-                        &session.provider,
                         &session.model,
-                    )?;
-                    session
-                        .bridge
-                        .session_send(
-                            &session.provider,
-                            &session.invocation.session_id,
-                            json!({
-                                "t": "s.receipt_ack",
-                                "v": 1,
-                                "session_id": receipt_ack.session_id,
-                                "seq": receipt_ack.seq,
-                                "user_sig": receipt_ack.user_sig,
-                                "reason": "checkpoint",
-                            }),
-                        )
-                        .await?;
-                    latest_checkpoint_receipt = Some(receipt);
+                    )
+                    .await?
+                    {
+                        latest_checkpoint_receipt = Some(receipt);
+                    } else {
+                        pending_checkpoint_receipt = Some(receipt);
+                    }
                 }
             }
             Some("s.error") => {
@@ -11996,6 +12110,23 @@ mod tests {
         assert_eq!(invocation.rail, "tnk");
         assert_eq!(invocation.user_pubkey, verifying_key_hex(&user_seed));
         assert_eq!(invocation.receipt_user_seed, user_seed);
+
+        let checkpointed = GatewayState::from_models(vec![model.clone()])
+            .with_receipt_user_seed(user_seed)
+            .with_receipt_balance_mu(2_000_000)
+            .with_receipt_checkpoint_every(CheckpointPolicy {
+                tokens: 32,
+                ms: 2500,
+            })
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                None,
+                GatewayRequestOptions::default(),
+            )
+            .expect("configured checkpoint policy should be accepted");
+        assert_eq!(checkpointed.spend_voucher.body.checkpoint_every.tokens, 32);
+        assert_eq!(checkpointed.spend_voucher.body.checkpoint_every.ms, 2500);
 
         let low_balance = GatewayState::from_models(vec![model.clone()])
             .with_receipt_user_seed(user_seed)

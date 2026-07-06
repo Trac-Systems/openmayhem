@@ -76,6 +76,8 @@ const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
 const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
 const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
+const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
+const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_LENGTH_MILLIS: u64 = 3_600_000;
 const DEFAULT_RELEASE_FEED_URL: &str =
@@ -769,6 +771,14 @@ struct UseArgs {
     /// Minimum sustained provider throughput before the gateway reroutes.
     #[arg(long)]
     min_tok_s: Option<f64>,
+
+    /// Provider receipt checkpoint window in output tokens. Bounds unpaid streamed output.
+    #[arg(long)]
+    receipt_checkpoint_tokens: Option<u64>,
+
+    /// Provider receipt checkpoint wall-clock window in milliseconds.
+    #[arg(long)]
+    receipt_checkpoint_ms: Option<u64>,
 
     /// Disable automatic catalog canary probes after served sessions.
     #[arg(long)]
@@ -13212,6 +13222,17 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             bail!("--dev-catalog-path is required when using local dev catalog options");
         }
     }
+    if args.receipt_checkpoint_tokens == Some(0) {
+        bail!("--receipt-checkpoint-tokens must be positive");
+    }
+    let receipt_checkpoint_every = CheckpointPolicy {
+        tokens: args
+            .receipt_checkpoint_tokens
+            .unwrap_or(DEFAULT_RECEIPT_CHECKPOINT_TOKENS),
+        ms: args
+            .receipt_checkpoint_ms
+            .unwrap_or(DEFAULT_RECEIPT_CHECKPOINT_MS),
+    };
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
@@ -13463,6 +13484,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         Some(jwks) => state.with_nvidia_offline_jwks(jwks),
         None => state,
     };
+    let state = state.with_receipt_checkpoint_every(receipt_checkpoint_every.clone());
     let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state.with_receipt_rail(args.rail.as_str());
     let dashboard_url = state.dashboard_url(&gateway_url);
@@ -13483,6 +13505,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             "balance_mu": balance_mu.unwrap_or(0),
             "balance_source": format!("bal/{}/{}", public_key, args.rail.as_str()),
         })),
+        "receipt_checkpoint_every": {
+            "tokens": receipt_checkpoint_every.tokens,
+            "ms": receipt_checkpoint_every.ms,
+        },
         "models": model_count,
         "version_gates": &blocked_version_gates,
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
@@ -31799,6 +31825,10 @@ mod tests {
             "1",
             "--canary-probe-epoch",
             "7",
+            "--receipt-checkpoint-tokens",
+            "32",
+            "--receipt-checkpoint-ms",
+            "2500",
         ])
         .unwrap();
         match cli.command {
@@ -31813,6 +31843,8 @@ mod tests {
                 assert_eq!(args.canary_probe_min_interval_sessions, Some(1));
                 assert_eq!(args.canary_probe_max_interval_sessions, Some(1));
                 assert_eq!(args.canary_probe_epoch, Some(7));
+                assert_eq!(args.receipt_checkpoint_tokens, Some(32));
+                assert_eq!(args.receipt_checkpoint_ms, Some(2500));
             }
             other => panic!("expected use command, got {other:?}"),
         }
