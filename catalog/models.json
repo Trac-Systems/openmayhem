@@ -673,6 +673,205 @@
           }
         ]
       }
+    },
+    {
+      "model_id": "openai/whisper-tiny-en@ggml",
+      "model_class": "stt",
+      "family": "whisper-tiny-en",
+      "params_b": 0.039,
+      "tier": "launch",
+      "min_app_version": "0.1.0",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "ggerganov/whisper.cpp",
+          "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "whisper.cpp ggml release artifact",
+            "method": "ggml-tiny.en.bin",
+            "input_sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+            "output_sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f"
+          }
+        ],
+        "license": "mit",
+        "license_sha256": "78198e7ab262449ad56e4ca48e10a36f98dda6fd5a377875dd7425afcca2312b"
+      },
+      "artifacts": {
+        "ggml-tiny-en": {
+          "engine": "whisper.cpp",
+          "source": {
+            "kind": "huggingface",
+            "repo": "ggerganov/whisper.cpp",
+            "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "ggml-tiny.en.bin",
+          "artifact_root": "4f97709add9236fca671e0de5fc929dd7ac53e3f99312b57b282445dcdfb6220",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 77704715,
+          "source_sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+          "download_check": true
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "audio": true,
+        "output_modality": "text",
+        "output_modalities": [
+          "text"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 1,
+        "min_vram_gb_full_offload": 0,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "whisper.cpp"
+        ]
+      },
+      "adapter": {
+        "request_shape_family": "openai_audio_transcriptions",
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "audio",
+          "text"
+        ],
+        "response_normalization": "openai_audio_transcriptions"
+      },
+      "canary": {
+        "set_id": "canary-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "attestation_of_compute"
+      },
+      "price_ref_mu": {
+        "denom": "mu_usd",
+        "rate_map": [
+          {
+            "unit": "audio_second",
+            "per_unit_mu": 250,
+            "granularity": 1
+          }
+        ]
+      }
+    },
+    {
+      "model_id": "rhasspy/piper-en-us-lessac-low@onnx",
+      "model_class": "tts",
+      "family": "piper-en-us-lessac-low",
+      "params_b": 0.03,
+      "tier": "launch",
+      "min_app_version": "0.1.0",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "rhasspy/piper-voices",
+          "revision": "e21c7de8d4eab79b902f0d61e662b3f21664b8d2",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "piper voice release artifact",
+            "method": "en_US-lessac-low onnx",
+            "input_sha256": "f7d01dde371555732c4c314111ac79672b1a5ce2fc19266ab42178fd8df7f375",
+            "output_sha256": "f7d01dde371555732c4c314111ac79672b1a5ce2fc19266ab42178fd8df7f375"
+          }
+        ],
+        "license": "mit",
+        "license_sha256": "78198e7ab262449ad56e4ca48e10a36f98dda6fd5a377875dd7425afcca2312b"
+      },
+      "artifacts": {
+        "onnx-lessac-low": {
+          "engine": "piper",
+          "source": {
+            "kind": "huggingface",
+            "repo": "rhasspy/piper-voices",
+            "revision": "e21c7de8d4eab79b902f0d61e662b3f21664b8d2",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "en/en_US/lessac/low/en_US-lessac-low.onnx",
+          "artifact_root": "974ef38e64679edd5b84c1b7f3a0739b85f9d9cba31aa7b6f7050786e532d8aa",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 63201294,
+          "source_sha256": "f7d01dde371555732c4c314111ac79672b1a5ce2fc19266ab42178fd8df7f375",
+          "download_check": true,
+          "sidecars": {
+            "piper_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "rhasspy/piper-voices",
+                "revision": "e21c7de8d4eab79b902f0d61e662b3f21664b8d2",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "en/en_US/lessac/low/en_US-lessac-low.onnx.json",
+              "artifact_root": "8ea5dc12aeffb480c643b0f3a846ce5555a743e6d6c7fa4b3efcae058010e0f7",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4882,
+              "source_sha256": "45754dfdebb3b8661c3fc564713772deec6e064feeb5b4e9594857dc7305193a"
+            }
+          }
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 512,
+        "vision": false,
+        "audio": true,
+        "output_modality": "audio",
+        "output_modalities": [
+          "audio"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 1,
+        "min_vram_gb_full_offload": 0,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "piper"
+        ]
+      },
+      "adapter": {
+        "request_shape_family": "openai_audio_speech",
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "audio"
+        ],
+        "response_normalization": "openai_audio_speech"
+      },
+      "canary": {
+        "set_id": "canary-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "attestation_of_compute"
+      },
+      "price_ref_mu": {
+        "denom": "mu_usd",
+        "rate_map": [
+          {
+            "unit": "input_character",
+            "per_unit_mu": 1,
+            "granularity": 1
+          },
+          {
+            "unit": "audio_second",
+            "per_unit_mu": 100,
+            "granularity": 1
+          }
+        ]
+      }
     }
   ]
 }

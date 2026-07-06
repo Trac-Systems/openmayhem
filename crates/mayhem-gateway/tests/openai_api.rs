@@ -6,14 +6,16 @@ use axum::{
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use mayhem_gateway::openai::{
-    openai_router, validate_loopback_dashboard_bind, ChatCompletionRequest, ChatMessage,
-    ChatOutput, EmbeddingOutput, EmbeddingRequest, GatewayArtifactOutput, GatewayCanaryModelConfig,
-    GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
-    GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
-    GatewayModel, GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError,
-    GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult, GatewayState,
-    ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps, PriceRefMu,
-    ProviderSignedReceipt, ShapeAdapterInfo, ToolCallOutput, Usage,
+    openai_router, validate_loopback_dashboard_bind, AudioSpeechOutput, AudioSpeechRequest,
+    AudioTranscriptionOutput, AudioTranscriptionRequest, ChatCompletionRequest, ChatMessage,
+    ChatOutput, EmbeddingOutput, EmbeddingRequest, GatewayArtifactOutput, GatewayAudioSpeechFuture,
+    GatewayAudioSpeechResult, GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult,
+    GatewayCanaryModelConfig, GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry,
+    GatewayEmbeddingFuture, GatewayEmbeddingResult, GatewayImageGenerationFuture,
+    GatewayImageGenerationResult, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
+    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
+    GatewayState, ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps,
+    PriceRefMu, ProviderSignedReceipt, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, text_generation_rate_map, text_usage_mu, token_fingerprint,
@@ -21,7 +23,8 @@ use mayhem_gateway::{
 };
 use mayhem_proto::{
     catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_IMAGE, USAGE_STEP,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde_json::{json, Value};
 use std::{
@@ -153,6 +156,94 @@ impl GatewaySessionBackend for ImageGenerationDirectSessionBackend {
                         blake3: blake3::hash(&image).to_hex().to_string(),
                         bytes: image,
                     }],
+                    usage,
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: Some(provider_receipt),
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AudioSpeechDirectSessionBackend;
+
+impl GatewaySessionBackend for AudioSpeechDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-audio-speech-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_audio_speech<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a AudioSpeechRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayAudioSpeechFuture<'a> {
+        Box::pin(async move {
+            let audio = tiny_wav_bytes(16_000);
+            let usage = audio_speech_usage_for_test(request, &audio);
+            let provider_receipt =
+                signed_audio_speech_provider_receipt(model, request, invocation, &usage)?;
+            Ok(GatewayAudioSpeechResult {
+                output: AudioSpeechOutput {
+                    artifacts: vec![GatewayArtifactOutput {
+                        id: "speech-1".to_owned(),
+                        content_type: "audio/wav".to_owned(),
+                        blake3: blake3::hash(&audio).to_hex().to_string(),
+                        bytes: audio,
+                    }],
+                    usage,
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: Some(provider_receipt),
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AudioTranscriptionDirectSessionBackend;
+
+impl GatewaySessionBackend for AudioTranscriptionDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-audio-transcription-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_audio_transcription<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a AudioTranscriptionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayAudioTranscriptionFuture<'a> {
+        Box::pin(async move {
+            let usage = audio_transcription_usage_for_test(request);
+            let provider_receipt =
+                signed_audio_transcription_provider_receipt(model, request, invocation, &usage)?;
+            Ok(GatewayAudioTranscriptionResult {
+                output: AudioTranscriptionOutput {
+                    text: "hello mayhem".to_owned(),
                     usage,
                 },
                 backend: self.name().to_owned(),
@@ -1031,104 +1122,50 @@ async fn image_generation_endpoint_real_sd_cli_records_receipt_when_enabled() {
 }
 
 #[tokio::test]
-async fn audio_speech_endpoint_requires_real_engine_and_records_zero_charge() {
-    let catalog = json!({
-        "models": [{
-            "model_id": "admin/tts-fixture",
-            "model_class": "tts",
-            "caps": {
-                "tools": false,
-                "json": false,
-                "ctx_max": 4096,
-                "vision": false,
-                "audio": true,
-                "output_modality": "audio",
-                "output_modalities": ["audio"]
-            },
-            "adapter": {
-                "request_shape_family": "openai_chat",
-                "chat_template_id": "generic_chatml",
-                "tool_call_strategy": "none",
-                "reasoning_passthrough": "strip",
-                "modality_set": ["audio"],
-                "response_normalization": "openai_chat"
-            },
-            "price_ref_mu": {
-                "denom": "mu_usd",
-                "ver": 5,
-                "rate_map": [
-                    { "unit": "input_character", "per_unit_mu": 1, "granularity": 1 },
-                    { "unit": "audio_second", "per_unit_mu": 100, "granularity": 1 }
-                ]
-            },
-            "attestation_tiers": { "T1": 1 }
-        }]
-    });
-    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+async fn audio_speech_endpoint_uses_routed_engine_and_records_receipt() {
+    let state = GatewayState::from_models(vec![routed_audio_speech_test_model()])
+        .with_session_backend(Arc::new(AudioSpeechDirectSessionBackend));
     let app = openai_router(state.clone());
-    let input = "hello speech";
     let request = json!({
         "model": "admin/tts-fixture",
-        "input": input,
-        "voice": "alloy",
+        "input": "hello speech",
+        "voice": "launch",
         "response_format": "wav"
     });
 
     let (status, headers, bytes) =
         raw_request(app, Method::POST, "/v1/audio/speech", Some(request)).await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(!headers.contains_key("x-mayhem-receipt-session-id"));
-    let body: Value = serde_json::from_slice(&bytes).expect("speech error JSON");
-    assert_eq!(body["error"]["param"], "model");
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("audio speech is not served"));
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("no charge recorded"));
-    assert!(state.receipts().is_empty());
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .contains("audio/wav"));
+    assert_eq!(
+        headers
+            .get("x-mayhem-backend")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-audio-speech-direct-session")
+    );
+    assert!(bytes.starts_with(b"RIFF"));
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.body.model_id, "admin/tts-fixture");
+    assert_eq!(receipt.body.price_ver, 5);
+    assert_eq!(receipt.body.usage.get(USAGE_INPUT_CHARACTER), 12);
+    assert_eq!(receipt.body.usage.get(USAGE_AUDIO_SECOND), 1);
+    assert_eq!(receipt.body.mu_owed_cum, 112);
 }
 
 #[tokio::test]
-async fn audio_transcription_endpoint_requires_real_engine_and_records_zero_charge() {
-    let catalog = json!({
-        "models": [{
-            "model_id": "admin/stt-fixture",
-            "model_class": "stt",
-            "caps": {
-                "tools": false,
-                "json": false,
-                "ctx_max": 4096,
-                "vision": false,
-                "audio": true,
-                "output_modality": "text",
-                "output_modalities": ["text"]
-            },
-            "adapter": {
-                "request_shape_family": "openai_chat",
-                "chat_template_id": "generic_chatml",
-                "tool_call_strategy": "none",
-                "reasoning_passthrough": "strip",
-                "modality_set": ["audio", "text"],
-                "response_normalization": "openai_chat"
-            },
-            "price_ref_mu": {
-                "denom": "mu_usd",
-                "ver": 6,
-                "rate_map": [
-                    { "unit": "audio_second", "per_unit_mu": 250, "granularity": 1 }
-                ]
-            },
-            "attestation_tiers": { "T1": 1 }
-        }]
-    });
-    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+async fn audio_transcription_endpoint_uses_routed_engine_and_records_receipt() {
+    let state = GatewayState::from_models(vec![routed_audio_transcription_test_model()])
+        .with_session_backend(Arc::new(AudioTranscriptionDirectSessionBackend));
     let app = openai_router(state.clone());
     let boundary = "mayhem-test-boundary";
-    let audio = vec![7_u8; 16_000];
+    let audio = tiny_wav_bytes(32_000);
     let mut body = Vec::new();
     body.extend_from_slice(
         format!(
@@ -1138,7 +1175,7 @@ async fn audio_transcription_endpoint_requires_real_engine_and_records_zero_char
     );
     body.extend_from_slice(
         format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n"
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n"
         )
         .as_bytes(),
     );
@@ -1163,23 +1200,27 @@ async fn audio_transcription_endpoint_requires_real_engine_and_records_zero_char
     )
     .await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status, StatusCode::OK);
     assert!(headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .contains("application/json"));
-    let body: Value = serde_json::from_slice(&bytes).expect("transcription error JSON");
-    assert_eq!(body["error"]["param"], "model");
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("audio transcription is not served"));
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("no charge recorded"));
-    assert!(state.receipts().is_empty());
+    let body: Value = serde_json::from_slice(&bytes).expect("transcription JSON");
+    assert_eq!(body["text"], "hello mayhem");
+    assert_eq!(body["usage"][USAGE_AUDIO_SECOND], 2);
+    assert_eq!(
+        body["mayhem"]["backend"],
+        "test-audio-transcription-direct-session"
+    );
+    assert_eq!(body["mayhem"]["receipt"]["rail"], "fiat");
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.body.model_id, "admin/stt-fixture");
+    assert_eq!(receipt.body.price_ver, 6);
+    assert_eq!(receipt.body.usage.get(USAGE_AUDIO_SECOND), 2);
+    assert_eq!(receipt.body.mu_owed_cum, 500);
 }
 
 #[tokio::test]
@@ -1837,6 +1878,91 @@ fn routed_image_generation_test_model() -> GatewayModel {
     model
 }
 
+fn routed_audio_speech_test_model() -> GatewayModel {
+    let mut model = routed_test_model_with_providers(&["56".repeat(32)]);
+    model.id = "admin/tts-fixture".to_owned();
+    model.mayhem.model_class = "tts".to_owned();
+    model.mayhem.price_ref_mu = PriceRefMu {
+        denom: "mu_usd".to_owned(),
+        ver: 5,
+        rate_map: vec![
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_mu: 1,
+                granularity: 1,
+            },
+            mayhem_gateway::RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_mu: 100,
+                granularity: 1,
+            },
+        ],
+    };
+    model.mayhem.caps = ModelCaps {
+        tools: false,
+        json: false,
+        ctx: 4096,
+        vision: false,
+        image: false,
+        video: false,
+        audio: true,
+        output_modality: Some("audio".to_owned()),
+        output_modalities: vec!["audio".to_owned()],
+    };
+    model.mayhem.adapter.modality_set = vec!["audio".to_owned()];
+    model.mayhem.adapter.request_shape_family = "openai_audio_speech".to_owned();
+    model.mayhem.adapter.response_normalization = "openai_audio_speech".to_owned();
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.price_ver = 5;
+        candidate.caps = serde_json::json!({
+            "ctx_max": 4096,
+            "audio": true,
+            "output_modality": "audio",
+            "output_modalities": ["audio"]
+        });
+    }
+    model
+}
+
+fn routed_audio_transcription_test_model() -> GatewayModel {
+    let mut model = routed_test_model_with_providers(&["57".repeat(32)]);
+    model.id = "admin/stt-fixture".to_owned();
+    model.mayhem.model_class = "stt".to_owned();
+    model.mayhem.price_ref_mu = PriceRefMu {
+        denom: "mu_usd".to_owned(),
+        ver: 6,
+        rate_map: vec![mayhem_gateway::RateMapEntry {
+            unit: USAGE_AUDIO_SECOND.to_owned(),
+            per_unit_mu: 250,
+            granularity: 1,
+        }],
+    };
+    model.mayhem.caps = ModelCaps {
+        tools: false,
+        json: false,
+        ctx: 4096,
+        vision: false,
+        image: false,
+        video: false,
+        audio: true,
+        output_modality: Some("text".to_owned()),
+        output_modalities: vec!["text".to_owned()],
+    };
+    model.mayhem.adapter.modality_set = vec!["audio".to_owned(), "text".to_owned()];
+    model.mayhem.adapter.request_shape_family = "openai_audio_transcriptions".to_owned();
+    model.mayhem.adapter.response_normalization = "openai_audio_transcriptions".to_owned();
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.price_ver = 6;
+        candidate.caps = serde_json::json!({
+            "ctx_max": 4096,
+            "audio": true,
+            "output_modality": "text",
+            "output_modalities": ["text"]
+        });
+    }
+    model
+}
+
 fn signed_image_provider_receipt(
     model: &GatewayModel,
     request: &ImageGenerationRequest,
@@ -1875,6 +2001,72 @@ fn signed_image_provider_receipt(
     })
 }
 
+fn signed_audio_speech_provider_receipt(
+    model: &GatewayModel,
+    request: &AudioSpeechRequest,
+    invocation: &GatewaySessionInvocation,
+    usage: &ReceiptUsage,
+) -> Result<ProviderSignedReceipt, GatewaySessionError> {
+    signed_provider_receipt_for_test(
+        model,
+        invocation,
+        usage,
+        audio_speech_prompt_hash_for_test(request),
+    )
+}
+
+fn signed_audio_transcription_provider_receipt(
+    model: &GatewayModel,
+    request: &AudioTranscriptionRequest,
+    invocation: &GatewaySessionInvocation,
+    usage: &ReceiptUsage,
+) -> Result<ProviderSignedReceipt, GatewaySessionError> {
+    signed_provider_receipt_for_test(
+        model,
+        invocation,
+        usage,
+        audio_transcription_prompt_hash_for_test(request),
+    )
+}
+
+fn signed_provider_receipt_for_test(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    usage: &ReceiptUsage,
+    prompt_hash: String,
+) -> Result<ProviderSignedReceipt, GatewaySessionError> {
+    let enclave_seed = [88_u8; 32];
+    let enclave_key = SigningKey::from_bytes(&enclave_seed);
+    let provider = invocation
+        .provider_pubkey
+        .clone()
+        .unwrap_or_else(|| "55".repeat(32));
+    let body = ReceiptBody {
+        schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+        session_id: invocation.session_id.clone(),
+        seq: 1,
+        final_receipt: true,
+        rail: invocation.rail.clone(),
+        user: invocation.user_pubkey.clone(),
+        provider,
+        enclave_id: invocation.enclave_id.clone(),
+        model_id: model.id.clone(),
+        price_ver: invocation.price_ver,
+        rules_ver: invocation.rules_ver,
+        usage: usage.clone(),
+        mu_owed_cum: text_usage_mu(&model.mayhem.price_ref_mu.rate_map, usage),
+        prompt_hash,
+        ts: 1_782_950_400_000,
+    };
+    let payload = receipt_signing_bytes(&body)
+        .map_err(|err| GatewaySessionError::new(format!("receipt payload failed: {err}")))?;
+    Ok(ProviderSignedReceipt {
+        body,
+        enclave_sig: hex::encode(enclave_key.sign(&payload).to_bytes()),
+        enclave_pubkey: hex::encode(enclave_key.verifying_key().to_bytes()),
+    })
+}
+
 fn image_usage_for_test(request: &ImageGenerationRequest) -> ReceiptUsage {
     let images = u64::from(request.n.unwrap_or(1).clamp(1, 4));
     let steps = image_steps_for_test(request);
@@ -1882,6 +2074,26 @@ fn image_usage_for_test(request: &ImageGenerationRequest) -> ReceiptUsage {
         (USAGE_IMAGE, images),
         (USAGE_STEP, images.saturating_mul(steps)),
     ])
+}
+
+fn audio_speech_usage_for_test(request: &AudioSpeechRequest, audio: &[u8]) -> ReceiptUsage {
+    ReceiptUsage::from_units([
+        (
+            USAGE_INPUT_CHARACTER,
+            u64::try_from(request.input.chars().count()).unwrap(),
+        ),
+        (
+            USAGE_AUDIO_SECOND,
+            wav_duration_seconds_ceil_for_test(audio).unwrap(),
+        ),
+    ])
+}
+
+fn audio_transcription_usage_for_test(request: &AudioTranscriptionRequest) -> ReceiptUsage {
+    ReceiptUsage::from_units([(
+        USAGE_AUDIO_SECOND,
+        wav_duration_seconds_ceil_for_test(&request.audio).unwrap(),
+    )])
 }
 
 fn image_steps_for_test(request: &ImageGenerationRequest) -> u64 {
@@ -1914,6 +2126,64 @@ fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
         "response_format": request.response_format.as_deref().unwrap_or("b64_json"),
         "seed": request.seed,
     }))
+}
+
+fn audio_speech_prompt_hash_for_test(request: &AudioSpeechRequest) -> String {
+    stable_value_hash_for_test(&json!({
+        "kind": "audio_speech",
+        "input": &request.input,
+        "response_format": request.response_format.as_deref().unwrap_or("wav"),
+        "voice": request.voice.as_deref(),
+        "speed": request.speed,
+    }))
+}
+
+fn audio_transcription_prompt_hash_for_test(request: &AudioTranscriptionRequest) -> String {
+    stable_value_hash_for_test(&json!({
+        "kind": "audio_transcription",
+        "audio": {
+            "encoding": "hex",
+            "content_type": request.content_type.as_deref().unwrap_or("audio/wav"),
+            "filename": request.filename.as_deref().unwrap_or("audio.wav"),
+            "data": hex::encode(&request.audio),
+        },
+        "audio_seconds": wav_duration_seconds_ceil_for_test(&request.audio).unwrap(),
+        "response_format": request.response_format.as_deref().unwrap_or("json"),
+        "language": request.language.as_deref(),
+        "prompt": request.prompt.as_deref(),
+    }))
+}
+
+fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
+    let sample_rate = 16_000u32;
+    let channels = 1u16;
+    let bits_per_sample = 16u16;
+    let bytes_per_sample = u32::from(channels) * u32::from(bits_per_sample) / 8;
+    let data_len = sample_count * bytes_per_sample;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * bytes_per_sample).to_le_bytes());
+    bytes.extend_from_slice(&(bytes_per_sample as u16).to_le_bytes());
+    bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
+    bytes.resize(44 + data_len as usize, 0);
+    bytes
+}
+
+fn wav_duration_seconds_ceil_for_test(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as u64;
+    let byte_rate = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as u64;
+    Some(data_len.div_ceil(byte_rate).max(1))
 }
 
 fn stable_value_hash_for_test(value: &Value) -> String {

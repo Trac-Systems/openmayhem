@@ -30,8 +30,9 @@ use mayhem_enclave::{
     Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
-    ArtifactChunk, EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, MediaInput,
-    ModelArtifact, ToolSpec, MTMD_MEDIA_MARKER,
+    ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
+    GenerateRequest, GrammarSpec, LoadConfig, MediaInput, ModelArtifact, SpeechRequest, ToolSpec,
+    MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
     heartbeat_signing_payload, normalize_rate_map,
@@ -52,7 +53,7 @@ use mayhem_proto::{
     supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
     AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage,
     SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
-    USAGE_IMAGE, USAGE_STEP,
+    USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -9577,6 +9578,8 @@ fn catalog_calibration_backend(
         "llama.cpp" => LoadConfig::gguf(artifact_path),
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
+        "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
+        "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
     };
     config.ctx_size = args.ctx_size.max(1);
@@ -9630,6 +9633,11 @@ fn catalog_calibration_backend(
                 .load(config)
                 .context("loading TensorRT-LLM canary calibration artifact")?;
             Ok(Box::new(backend))
+        }
+        "whisper.cpp" | "piper" => {
+            bail!(
+                "audio engines are not token canary calibration backends; use I3-D4 audio-specific probes"
+            )
         }
         _ => unreachable!("unsupported engines returned above"),
     }
@@ -22457,6 +22465,12 @@ fn provider_session_prompt_text(body: &Value) -> String {
     if body.get("kind").and_then(Value::as_str) == Some("image_generation") {
         return stable_json_value(body).to_string();
     }
+    if matches!(
+        body.get("kind").and_then(Value::as_str),
+        Some("audio_transcription" | "audio_speech")
+    ) {
+        return stable_json_value(body).to_string();
+    }
     body.get("messages")
         .and_then(Value::as_array)
         .map(|messages| {
@@ -22626,6 +22640,26 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "whisper.cpp" => {
+            let mut backend = mayhem_engine::WhisperCppBackend::new()
+                .context("initializing whisper.cpp provider session engine")?;
+            backend
+                .load(load_config)
+                .context("loading whisper.cpp provider session engine")?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
+        "piper" => {
+            let mut backend = mayhem_engine::PiperBackend::new()
+                .context("initializing piper provider session engine")?;
+            backend
+                .load(load_config)
+                .context("loading piper provider session engine")?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         other => bail!(
             "provider session engine for {other} is not wired locally yet; do not serve this enclave until its admin-approved engine adapter is available"
         ),
@@ -22648,6 +22682,8 @@ fn provider_engine_load_config(
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
+        "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
+        "piper" => ModelArtifact::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
     };
     let artifact = if let Some(sha256) = &selected.artifact.source_sha256 {
@@ -22660,6 +22696,8 @@ fn provider_engine_load_config(
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
+        "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
+        "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
     };
     config.artifact = artifact;
@@ -22673,6 +22711,16 @@ fn provider_engine_load_config(
             .context("downloaded mmproj sidecar is missing from selected catalog artifact")?;
         config.vision_projector =
             Some(ModelArtifact::gguf(mmproj_path).with_sha256(sidecar.source_sha256.clone()));
+    }
+    if let Some(piper_config_path) = artifact_paths.sidecars.get("piper_config") {
+        let sidecar =
+            selected.artifact.sidecars.get("piper_config").context(
+                "downloaded piper_config sidecar is missing from selected catalog artifact",
+            )?;
+        config.piper_config = Some(
+            ModelArtifact::piper_config(piper_config_path)
+                .with_sha256(sidecar.source_sha256.clone()),
+        );
     }
     if selected.artifact.engine == "trt-llm" {
         config.trt_engine_dir = Some(trt_engine_cache_dir(artifact_path, &selected.artifact_name));
@@ -23244,6 +23292,53 @@ fn provider_engine_session_response(
     adapter: &catalog::CatalogAdapter,
     body: &Value,
 ) -> Result<ProviderSessionOutput> {
+    if body.get("kind").and_then(Value::as_str) == Some("audio_transcription") {
+        let request = provider_audio_transcription_request_from_body(body)?;
+        let audio_seconds = request.audio_seconds;
+        let output = backend
+            .transcribe(request.engine)
+            .context("transcribing provider session audio with mayhem-engine")?;
+        return Ok(ProviderSessionOutput {
+            content: output.text,
+            tool: None,
+            embeddings: None,
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: provider_audio_transcription_usage(audio_seconds),
+        });
+    }
+
+    if body.get("kind").and_then(Value::as_str) == Some("audio_speech") {
+        let request = provider_speech_request_from_body(body)?;
+        let input_characters = u64::try_from(request.input.chars().count())
+            .context("audio_speech input character count overflowed u64")?;
+        let mut artifact_chunks = Vec::new();
+        let output = backend
+            .synthesize_speech(request, &mut |chunk: ArtifactChunk| {
+                artifact_chunks.push(chunk);
+                Ok(())
+            })
+            .context("synthesizing provider session speech with mayhem-engine")?;
+        let artifacts = provider_session_artifacts_from_chunks(artifact_chunks)?;
+        if artifacts.is_empty() {
+            bail!("provider speech engine produced no audio artifact");
+        }
+        return Ok(ProviderSessionOutput {
+            content: String::new(),
+            tool: None,
+            embeddings: None,
+            artifacts,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: provider_audio_speech_usage(input_characters, output.audio_seconds),
+        });
+    }
+
     if body.get("kind").and_then(Value::as_str) == Some("image_generation") {
         let (request, image_count, steps) = provider_image_generation_request_from_body(body)?;
         let mut artifact_chunks = Vec::new();
@@ -23358,6 +23453,80 @@ fn provider_engine_session_response(
     })
 }
 
+struct ProviderAudioTranscriptionRequest {
+    engine: EngineAudioTranscriptionRequest,
+    audio_seconds: u64,
+}
+
+fn provider_audio_transcription_request_from_body(
+    body: &Value,
+) -> Result<ProviderAudioTranscriptionRequest> {
+    let audio = body
+        .get("audio")
+        .context("audio_transcription request missing audio")?;
+    let encoding = audio
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("hex");
+    if encoding != "hex" {
+        bail!("audio_transcription audio.encoding must be hex");
+    }
+    let bytes_hex = audio
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("audio_transcription audio.data missing")?;
+    let bytes = hex_decode_vec(bytes_hex, "audio_transcription audio.data")?;
+    let audio_seconds = body
+        .get("audio_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| wav_duration_seconds_ceil(&bytes).unwrap_or(1));
+    Ok(ProviderAudioTranscriptionRequest {
+        engine: EngineAudioTranscriptionRequest {
+            audio: bytes,
+            content_type: audio
+                .get("content_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            language: body
+                .get("language")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            prompt: body
+                .get("prompt")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        },
+        audio_seconds,
+    })
+}
+
+fn provider_speech_request_from_body(body: &Value) -> Result<SpeechRequest> {
+    let input = body
+        .get("input")
+        .and_then(Value::as_str)
+        .filter(|input| !input.trim().is_empty())
+        .context("audio_speech request missing input")?
+        .to_owned();
+    Ok(SpeechRequest {
+        input,
+        voice: body
+            .get("voice")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        response_format: Some(
+            body.get("response_format")
+                .and_then(Value::as_str)
+                .unwrap_or("wav")
+                .to_owned(),
+        ),
+        speed: body.get("speed").and_then(Value::as_f64),
+    })
+}
+
 fn provider_image_generation_request_from_body(
     body: &Value,
 ) -> Result<(GenerateRequest, u32, u64)> {
@@ -23420,6 +23589,17 @@ fn provider_image_generation_usage(image_count: u64, steps: u64) -> ReceiptUsage
     ReceiptUsage::from_units([
         (USAGE_IMAGE, image_count),
         (USAGE_STEP, image_count.saturating_mul(steps)),
+    ])
+}
+
+fn provider_audio_transcription_usage(audio_seconds: u64) -> ReceiptUsage {
+    ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, audio_seconds)])
+}
+
+fn provider_audio_speech_usage(input_characters: u64, audio_seconds: u64) -> ReceiptUsage {
+    ReceiptUsage::from_units([
+        (USAGE_INPUT_CHARACTER, input_characters),
+        (USAGE_AUDIO_SECOND, audio_seconds),
     ])
 }
 
@@ -24168,6 +24348,20 @@ fn hex_decode_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N]>
     Ok(out)
 }
 
+fn hex_decode_vec(value: &str, label: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        bail!("{label} must be even-length hex");
+    }
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for index in (0..bytes.len()).step_by(2) {
+        let high = hex_nibble(bytes[index]).with_context(|| format!("{label} is not hex"))?;
+        let low = hex_nibble(bytes[index + 1]).with_context(|| format!("{label} is not hex"))?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -24175,6 +24369,60 @@ fn hex_nibble(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    let mut sample_rate = None;
+    let mut channels = None;
+    let mut bits_per_sample = None;
+    let mut data_len = None;
+    while offset.saturating_add(8) <= bytes.len() {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.saturating_add(chunk_len).min(bytes.len());
+        if chunk_id == b"fmt " && chunk_len >= 16 && chunk_end <= bytes.len() {
+            channels = Some(u16::from_le_bytes([
+                bytes[chunk_start + 2],
+                bytes[chunk_start + 3],
+            ]));
+            sample_rate = Some(u32::from_le_bytes([
+                bytes[chunk_start + 4],
+                bytes[chunk_start + 5],
+                bytes[chunk_start + 6],
+                bytes[chunk_start + 7],
+            ]));
+            bits_per_sample = Some(u16::from_le_bytes([
+                bytes[chunk_start + 14],
+                bytes[chunk_start + 15],
+            ]));
+        } else if chunk_id == b"data" {
+            data_len = Some(chunk_len);
+        }
+        let padded = chunk_len + (chunk_len % 2);
+        offset = chunk_start.saturating_add(padded);
+    }
+    let sample_rate = u64::from(sample_rate?);
+    let channels = u64::from(channels?);
+    let bits_per_sample = u64::from(bits_per_sample?);
+    let data_len = u64::try_from(data_len?).ok()?;
+    let bytes_per_second = sample_rate
+        .saturating_mul(channels)
+        .saturating_mul(bits_per_sample)
+        .checked_div(8)?;
+    if bytes_per_second == 0 {
+        return None;
+    }
+    Some(data_len.div_ceil(bytes_per_second).max(1))
 }
 
 fn safe_path_component(value: &str) -> String {
@@ -25006,9 +25254,13 @@ mod tests {
     struct FakeEngineBackend {
         output: mayhem_engine::GenerateOutput,
         embedding_output: mayhem_engine::EmbeddingOutput,
+        transcription_output: mayhem_engine::AudioTranscriptionOutput,
+        speech_audio_seconds: u64,
         artifact_chunks: Vec<ArtifactChunk>,
         last_request: Option<GenerateRequest>,
         last_embedding_request: Option<mayhem_engine::EmbeddingRequest>,
+        last_transcription_request: Option<EngineAudioTranscriptionRequest>,
+        last_speech_request: Option<SpeechRequest>,
     }
 
     impl FakeEngineBackend {
@@ -25023,9 +25275,16 @@ mod tests {
                     embeddings: vec![vec![0.1, 0.2, 0.3]],
                     usage: mayhem_engine::UsageCounters::new(3, 0),
                 },
+                transcription_output: mayhem_engine::AudioTranscriptionOutput {
+                    text: "hello mayhem".to_owned(),
+                    audio_seconds: 2,
+                },
+                speech_audio_seconds: 3,
                 artifact_chunks: Vec::new(),
                 last_request: None,
                 last_embedding_request: None,
+                last_transcription_request: None,
+                last_speech_request: None,
             }
         }
 
@@ -25088,6 +25347,51 @@ mod tests {
             self.last_embedding_request = Some(request);
             Ok(self.embedding_output.clone())
         }
+
+        fn transcribe(
+            &mut self,
+            request: EngineAudioTranscriptionRequest,
+        ) -> mayhem_engine::Result<mayhem_engine::AudioTranscriptionOutput> {
+            self.last_transcription_request = Some(request);
+            Ok(self.transcription_output.clone())
+        }
+
+        fn synthesize_speech(
+            &mut self,
+            request: SpeechRequest,
+            artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+        ) -> mayhem_engine::Result<mayhem_engine::SpeechOutput> {
+            self.last_speech_request = Some(request);
+            for chunk in self.artifact_chunks.clone() {
+                artifact_sink.on_artifact_chunk(chunk)?;
+            }
+            Ok(mayhem_engine::SpeechOutput {
+                audio_seconds: self.speech_audio_seconds,
+            })
+        }
+    }
+
+    fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
+        let sample_rate = 16_000u32;
+        let channels = 1u16;
+        let bits_per_sample = 16u16;
+        let bytes_per_sample = u32::from(channels) * u32::from(bits_per_sample) / 8;
+        let data_len = sample_count * bytes_per_sample;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * bytes_per_sample).to_le_bytes());
+        bytes.extend_from_slice(&(bytes_per_sample as u16).to_le_bytes());
+        bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(44 + data_len as usize, 0);
+        bytes
     }
 
     #[test]
@@ -28592,6 +28896,79 @@ mod tests {
     }
 
     #[test]
+    fn provider_engine_session_response_uses_audio_transcription_usage_units() {
+        let mut backend = FakeEngineBackend::new("unused text");
+        let wav = tiny_wav_bytes(16_000);
+        let body = json!({
+            "kind": "audio_transcription",
+            "audio": {
+                "encoding": "hex",
+                "content_type": "audio/wav",
+                "filename": "hello.wav",
+                "data": hex_encode(&wav)
+            },
+            "audio_seconds": 2,
+            "language": "en"
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(output.content, "hello mayhem");
+        assert!(output.artifacts.is_empty());
+        assert_eq!(output.usage.get(USAGE_AUDIO_SECOND), 2);
+        assert_eq!(output.prompt_tokens, 0);
+        assert_eq!(output.completion_tokens, 0);
+        let request = backend
+            .last_transcription_request
+            .expect("audio transcription request");
+        assert_eq!(request.audio, wav);
+        assert_eq!(request.content_type.as_deref(), Some("audio/wav"));
+        assert_eq!(request.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn provider_engine_session_response_uses_audio_speech_usage_units() {
+        let wav = tiny_wav_bytes(24_000);
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+            artifact_id: "speech-1".to_owned(),
+            index: 0,
+            content_type: "audio/wav".to_owned(),
+            bytes: wav.clone(),
+            final_chunk: true,
+        }]);
+        let body = json!({
+            "kind": "audio_speech",
+            "input": "hello",
+            "voice": "launch",
+            "response_format": "wav",
+            "speed": 1.0
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(output.content, "");
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.artifacts[0].content_type, "audio/wav");
+        assert_eq!(output.artifacts[0].bytes, wav);
+        assert_eq!(output.usage.get(USAGE_INPUT_CHARACTER), 5);
+        assert_eq!(output.usage.get(USAGE_AUDIO_SECOND), 3);
+        let request = backend.last_speech_request.expect("speech request");
+        assert_eq!(request.input, "hello");
+        assert_eq!(request.voice.as_deref(), Some("launch"));
+        assert_eq!(request.response_format.as_deref(), Some("wav"));
+    }
+
+    #[test]
     fn provider_session_artifact_delta_frames_are_chunked_and_addressed() {
         let artifact = ProviderSessionArtifact {
             id: "image-1".to_owned(),
@@ -28848,6 +29225,99 @@ mod tests {
         );
         assert_eq!(projector.format, mayhem_engine::ArtifactFormat::Gguf);
         assert_eq!(projector.sha256.as_deref(), Some(sidecar_sha.as_str()));
+    }
+
+    #[test]
+    fn provider_engine_load_config_wires_admin_piper_config_sidecar() {
+        let root = "aa".repeat(32);
+        let sidecar_root = "bc".repeat(32);
+        let sidecar_sha = "cd".repeat(32);
+        let mut model = test_catalog(&root).models.remove(0);
+        model.model_id = "test/tts@piper".to_owned();
+        model.model_class = "tts".to_owned();
+        model.requirements.backends = vec!["piper".to_owned()];
+        let mut artifact = model.artifacts.remove("gguf-q4_k_m").unwrap();
+        artifact.engine = "piper".to_owned();
+        artifact.path = "voice.onnx".to_owned();
+        artifact.source_sha256 = Some("ef".repeat(32));
+        artifact.sidecars.insert(
+            "piper_config".to_owned(),
+            catalog::CatalogArtifactSidecar {
+                source: catalog::SourceRef {
+                    kind: "huggingface".to_owned(),
+                    repo: "test/tts".to_owned(),
+                    revision: "1".repeat(40),
+                    publisher_key: None,
+                },
+                path: "voice.onnx.json".to_owned(),
+                artifact_root: sidecar_root.clone(),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 12,
+                source_sha256: sidecar_sha.clone(),
+            },
+        );
+        let mut enclave = test_contract(&root).enclaves.remove(0);
+        enclave.model_id = model.model_id.clone();
+        enclave.model_class = "tts".to_owned();
+        enclave.backend = "piper".to_owned();
+        enclave.artifact_source.path = "voice.onnx".to_owned();
+        enclave.source_sha256 = artifact.source_sha256.clone();
+        enclave.artifact_sidecars.insert(
+            "piper_config".to_owned(),
+            LedgerArtifactSidecar {
+                source: LedgerArtifactSource {
+                    kind: "huggingface".to_owned(),
+                    repo: "test/tts".to_owned(),
+                    revision: "1".repeat(40),
+                    path: "voice.onnx.json".to_owned(),
+                },
+                path: "voice.onnx.json".to_owned(),
+                artifact_root: sidecar_root,
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 12,
+                source_sha256: sidecar_sha.clone(),
+            },
+        );
+        let selected = ProviderCandidate {
+            enclave,
+            model,
+            artifact_name: "onnx-lessac-low".to_owned(),
+            artifact,
+            verdict: BackendVerdict {
+                backend: "piper".to_owned(),
+                status: VerdictStatus::CpuOnly,
+                reason: None,
+                est_tok_s: None,
+                n_layers_gpu: Some(0),
+                max_sessions: 1,
+                kv_cache_bytes_budget: 0,
+            },
+            price: None,
+        };
+        let artifact_paths = ProviderArtifactPaths {
+            primary: PathBuf::from("/tmp/admin-approved-voice"),
+            sidecars: BTreeMap::from([(
+                "piper_config".to_owned(),
+                PathBuf::from("/tmp/admin-approved-voice-config"),
+            )]),
+        };
+
+        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+
+        assert_eq!(
+            config.artifact.format,
+            mayhem_engine::ArtifactFormat::PiperVoice
+        );
+        let piper_config = config.piper_config.expect("piper config sidecar");
+        assert_eq!(
+            piper_config.path,
+            PathBuf::from("/tmp/admin-approved-voice-config")
+        );
+        assert_eq!(
+            piper_config.format,
+            mayhem_engine::ArtifactFormat::PiperConfig
+        );
+        assert_eq!(piper_config.sha256.as_deref(), Some(sidecar_sha.as_str()));
     }
 
     #[test]

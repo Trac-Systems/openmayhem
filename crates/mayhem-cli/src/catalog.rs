@@ -7,8 +7,8 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use mayhem_proto::{
-    default_model_class, DEFAULT_MODEL_CLASS, USAGE_IMAGE, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP,
+    default_model_class, DEFAULT_MODEL_CLASS, USAGE_AUDIO_SECOND, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -715,6 +715,8 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
     let required_units: &[&str] = match model.model_class.as_str() {
         "image-generation" => &[USAGE_IMAGE, USAGE_STEP],
         "embedding" => &[USAGE_INPUT_TOKEN],
+        "stt" => &[USAGE_AUDIO_SECOND],
+        "tts" => &[USAGE_INPUT_CHARACTER, USAGE_AUDIO_SECOND],
         _ => &[USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN],
     };
     for unit in required_units {
@@ -1010,7 +1012,11 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     let adapter = &model.adapter;
     if !matches!(
         adapter.request_shape_family.as_str(),
-        "openai_chat" | "openai_embeddings" | "openai_images"
+        "openai_chat"
+            | "openai_embeddings"
+            | "openai_images"
+            | "openai_audio_speech"
+            | "openai_audio_transcriptions"
     ) {
         errors.push(format!(
             "{} adapter.request_shape_family is unsupported: {}",
@@ -1038,6 +1044,30 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     if adapter.request_shape_family == "openai_images" && model.model_class != "image-generation" {
         errors.push(format!(
             "{} adapter.request_shape_family openai_images is only allowed for model_class image-generation",
+            model.model_id
+        ));
+    }
+    if model.model_class == "tts" && adapter.request_shape_family != "openai_audio_speech" {
+        errors.push(format!(
+            "{} tts model must use adapter.request_shape_family openai_audio_speech",
+            model.model_id
+        ));
+    }
+    if adapter.request_shape_family == "openai_audio_speech" && model.model_class != "tts" {
+        errors.push(format!(
+            "{} adapter.request_shape_family openai_audio_speech is only allowed for model_class tts",
+            model.model_id
+        ));
+    }
+    if model.model_class == "stt" && adapter.request_shape_family != "openai_audio_transcriptions" {
+        errors.push(format!(
+            "{} stt model must use adapter.request_shape_family openai_audio_transcriptions",
+            model.model_id
+        ));
+    }
+    if adapter.request_shape_family == "openai_audio_transcriptions" && model.model_class != "stt" {
+        errors.push(format!(
+            "{} adapter.request_shape_family openai_audio_transcriptions is only allowed for model_class stt",
             model.model_id
         ));
     }
@@ -1100,7 +1130,11 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     }
     if !matches!(
         adapter.response_normalization.as_str(),
-        "openai_chat" | "openai_embeddings" | "openai_images"
+        "openai_chat"
+            | "openai_embeddings"
+            | "openai_images"
+            | "openai_audio_speech"
+            | "openai_audio_transcriptions"
     ) {
         errors.push(format!(
             "{} adapter.response_normalization is unsupported: {}",
@@ -1130,6 +1164,32 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     {
         errors.push(format!(
             "{} adapter.response_normalization openai_images is only allowed for model_class image-generation",
+            model.model_id
+        ));
+    }
+    if model.model_class == "tts" && adapter.response_normalization != "openai_audio_speech" {
+        errors.push(format!(
+            "{} tts model must use adapter.response_normalization openai_audio_speech",
+            model.model_id
+        ));
+    }
+    if adapter.response_normalization == "openai_audio_speech" && model.model_class != "tts" {
+        errors.push(format!(
+            "{} adapter.response_normalization openai_audio_speech is only allowed for model_class tts",
+            model.model_id
+        ));
+    }
+    if model.model_class == "stt" && adapter.response_normalization != "openai_audio_transcriptions"
+    {
+        errors.push(format!(
+            "{} stt model must use adapter.response_normalization openai_audio_transcriptions",
+            model.model_id
+        ));
+    }
+    if adapter.response_normalization == "openai_audio_transcriptions" && model.model_class != "stt"
+    {
+        errors.push(format!(
+            "{} adapter.response_normalization openai_audio_transcriptions is only allowed for model_class stt",
             model.model_id
         ));
     }
@@ -2241,6 +2301,12 @@ mod tests {
             "image-generation" => "image",
             _ => "text",
         };
+        let request_shape_family = match model_class {
+            "embedding" => "openai_embeddings",
+            "image-generation" => "openai_images",
+            _ => "openai_chat",
+        };
+        let response_normalization = request_shape_family;
         CatalogModel {
             model_id: model_id.to_owned(),
             model_class: model_class.to_owned(),
@@ -2306,6 +2372,8 @@ mod tests {
             },
             adapter: CatalogAdapter {
                 modality_set: vec![output_modality.to_owned()],
+                request_shape_family: request_shape_family.to_owned(),
+                response_normalization: response_normalization.to_owned(),
                 tool_call_strategy: if model_class == DEFAULT_MODEL_CLASS {
                     "mayhem_json".to_owned()
                 } else {

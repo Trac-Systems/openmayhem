@@ -56,7 +56,8 @@ use mayhem_proto::{
     session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
     AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
     SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_IMAGE, USAGE_STEP,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -539,7 +540,7 @@ pub struct ImageGenerationRequest {
     pub user: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AudioSpeechRequest {
     pub model: String,
     pub input: String,
@@ -551,9 +552,15 @@ pub struct AudioSpeechRequest {
     pub speed: Option<f64>,
 }
 
-#[derive(Debug)]
-struct AudioTranscriptionRequest {
-    model: String,
+#[derive(Clone, Debug)]
+pub struct AudioTranscriptionRequest {
+    pub model: String,
+    pub audio: Vec<u8>,
+    pub content_type: Option<String>,
+    pub filename: Option<String>,
+    pub response_format: Option<String>,
+    pub language: Option<String>,
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -571,6 +578,18 @@ pub type GatewayEmbeddingFuture<'a> =
 
 pub type GatewayImageGenerationFuture<'a> = Pin<
     Box<dyn Future<Output = Result<GatewayImageGenerationResult, GatewaySessionError>> + Send + 'a>,
+>;
+
+pub type GatewayAudioSpeechFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<GatewayAudioSpeechResult, GatewaySessionError>> + Send + 'a>,
+>;
+
+pub type GatewayAudioTranscriptionFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<GatewayAudioTranscriptionResult, GatewaySessionError>>
+            + Send
+            + 'a,
+    >,
 >;
 
 pub type GatewayHedgeProbeFuture<'a> =
@@ -626,6 +645,34 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
             )))
         })
     }
+
+    fn run_audio_speech<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a AudioSpeechRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayAudioSpeechFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support audio speech",
+                self.name()
+            )))
+        })
+    }
+
+    fn run_audio_transcription<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a AudioTranscriptionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayAudioTranscriptionFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support audio transcription",
+                self.name()
+            )))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -650,6 +697,24 @@ pub struct GatewayEmbeddingResult {
 #[derive(Clone, Debug)]
 pub struct GatewayImageGenerationResult {
     pub output: ImageGenerationOutput,
+    pub backend: String,
+    pub direct_session: bool,
+    pub provider_receipt: Option<ProviderSignedReceipt>,
+    pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayAudioSpeechResult {
+    pub output: AudioSpeechOutput,
+    pub backend: String,
+    pub direct_session: bool,
+    pub provider_receipt: Option<ProviderSignedReceipt>,
+    pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayAudioTranscriptionResult {
+    pub output: AudioTranscriptionOutput,
     pub backend: String,
     pub direct_session: bool,
     pub provider_receipt: Option<ProviderSignedReceipt>,
@@ -779,6 +844,18 @@ pub struct EmbeddingOutput {
 #[derive(Clone, Debug)]
 pub struct ImageGenerationOutput {
     pub artifacts: Vec<GatewayArtifactOutput>,
+    pub usage: ReceiptUsage,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioSpeechOutput {
+    pub artifacts: Vec<GatewayArtifactOutput>,
+    pub usage: ReceiptUsage,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioTranscriptionOutput {
+    pub text: String,
     pub usage: ReceiptUsage,
 }
 
@@ -1217,9 +1294,14 @@ async fn create_image_generation(
 
 async fn create_audio_speech(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(request): Json<AudioSpeechRequest>,
 ) -> Response {
-    match build_audio_speech(&state, request) {
+    let options = match GatewayRequestOptions::from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    match build_audio_speech(&state, request, options).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
@@ -1227,13 +1309,21 @@ async fn create_audio_speech(
 
 async fn create_audio_transcription(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
+    let options = match GatewayRequestOptions::from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
     match parse_audio_transcription_multipart(multipart)
         .await
-        .and_then(|request| build_audio_transcription(&state, request))
+        .and_then(|request| Ok((request, options)))
     {
-        Ok(value) => Json(value).into_response(),
+        Ok((request, options)) => match build_audio_transcription(&state, request, options).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => err.into_response(),
+        },
         Err(err) => err.into_response(),
     }
 }
@@ -2314,6 +2404,20 @@ struct DirectImageGenerationSessionCollected {
     quality: Option<GatewaySessionQuality>,
 }
 
+#[derive(Clone, Debug)]
+struct DirectAudioSpeechSessionCollected {
+    output: AudioSpeechOutput,
+    provider_receipt: ProviderSignedReceipt,
+    quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+struct DirectAudioTranscriptionSessionCollected {
+    output: AudioTranscriptionOutput,
+    provider_receipt: ProviderSignedReceipt,
+    quality: Option<GatewaySessionQuality>,
+}
+
 struct GatewaySessionRun {
     result: GatewaySessionResult,
     invocation: GatewaySessionInvocation,
@@ -2333,6 +2437,20 @@ struct GatewayImageGenerationRun {
     invocation: GatewaySessionInvocation,
     metering_request: ImageGenerationRequest,
     metering_output: ImageGenerationOutput,
+}
+
+struct GatewayAudioSpeechRun {
+    result: GatewayAudioSpeechResult,
+    invocation: GatewaySessionInvocation,
+    metering_request: AudioSpeechRequest,
+    metering_output: AudioSpeechOutput,
+}
+
+struct GatewayAudioTranscriptionRun {
+    result: GatewayAudioTranscriptionResult,
+    invocation: GatewaySessionInvocation,
+    metering_request: AudioTranscriptionRequest,
+    metering_output: AudioTranscriptionOutput,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3031,6 +3149,30 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
                 .await
         })
     }
+
+    fn run_audio_speech<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a AudioSpeechRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayAudioSpeechFuture<'a> {
+        Box::pin(async move {
+            self.run_audio_speech_over_bridge(model, request, invocation)
+                .await
+        })
+    }
+
+    fn run_audio_transcription<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a AudioTranscriptionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayAudioTranscriptionFuture<'a> {
+        Box::pin(async move {
+            self.run_audio_transcription_over_bridge(model, request, invocation)
+                .await
+        })
+    }
 }
 
 impl ScBridgeGatewaySessionBackend {
@@ -3693,6 +3835,360 @@ impl ScBridgeGatewaySessionBackend {
             quality: collected.quality,
         })
     }
+
+    async fn run_audio_speech_over_bridge(
+        &self,
+        model: &GatewayModel,
+        request: &AudioSpeechRequest,
+        invocation: &GatewaySessionInvocation,
+    ) -> Result<GatewayAudioSpeechResult, GatewaySessionError> {
+        let provider = invocation
+            .provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(provider, invocation.failover.open_timeout())
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting direct peer {} for audio speech session {} failed: {err}",
+                    provider, invocation.session_id
+                ))
+            })?;
+        let opened = bridge
+            .session_open(provider, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening direct audio speech session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        if opened.get("direct").and_then(Value::as_bool) != Some(true)
+            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(GatewaySessionError::retryable(format!(
+                "audio speech session {} was not opened as a direct non-relayed channel",
+                invocation.session_id
+            )));
+        }
+
+        let now = now_millis_u64();
+        let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
+        let open_frame = json!({
+            "t": "s.open",
+            "v": 1,
+            "contract_version": invocation.contract_version,
+            "session_id": invocation.session_id.clone(),
+            "rail": invocation.rail.clone(),
+            "user": invocation.user_pubkey.clone(),
+            "enclave_id": invocation.enclave_id.clone(),
+            "price_ver": invocation.price_ver,
+            "rules_ver": invocation.rules_ver,
+            "voucher": invocation.spend_voucher.clone(),
+            "att_nonce": att_nonce,
+            "ts": now,
+            "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+            "sig": invocation.spend_voucher.user_sig.clone(),
+        });
+        let open_head = session_frame_head(&open_frame)
+            .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
+        bridge
+            .session_send(provider, &invocation.session_id, open_frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.open for audio speech session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+
+        let accept = next_session_frame(
+            &mut bridge,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+            &["s.accept", "s.reject"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+            let code = accept
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            let reason = accept
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason provided");
+            return Err(GatewaySessionError::retryable(format!(
+                "provider rejected audio speech session {} with {code}: {reason}",
+                invocation.session_id
+            )));
+        }
+        let accept_info = validate_direct_session_accept(
+            &accept,
+            invocation,
+            &open_head,
+            &att_nonce,
+            now / 1000,
+        )?;
+
+        let request_body = direct_session_audio_speech_request_body(request);
+        let request_id = request_id_for_body(&invocation.session_id, &request_body);
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.req",
+                    "rid": request_id,
+                    "body": request_body,
+                }),
+            )
+            .await?;
+
+        let collected = collect_direct_session_audio_speech_output(
+            &mut bridge,
+            &invocation.session_id,
+            &request_id,
+            invocation.failover,
+            request,
+            &accept_info.enclave_pubkey,
+        )
+        .await?;
+        let receipt_ack = direct_session_audio_speech_receipt_ack(
+            request,
+            &collected.output,
+            invocation,
+            &collected.provider_receipt,
+            provider,
+            model,
+        )?;
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.receipt_ack",
+                    "v": 1,
+                    "session_id": receipt_ack.session_id,
+                    "seq": receipt_ack.seq,
+                    "user_sig": receipt_ack.user_sig,
+                }),
+            )
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending audio speech s.receipt_ack for session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        let _ = bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.close",
+                    "v": 1,
+                    "session_id": invocation.session_id,
+                    "reason": "done",
+                }),
+            )
+            .await;
+
+        Ok(GatewayAudioSpeechResult {
+            output: collected.output,
+            backend: self.name().to_owned(),
+            direct_session: true,
+            provider_receipt: Some(collected.provider_receipt),
+            quality: collected.quality,
+        })
+    }
+
+    async fn run_audio_transcription_over_bridge(
+        &self,
+        model: &GatewayModel,
+        request: &AudioTranscriptionRequest,
+        invocation: &GatewaySessionInvocation,
+    ) -> Result<GatewayAudioTranscriptionResult, GatewaySessionError> {
+        let provider = invocation
+            .provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(provider, invocation.failover.open_timeout())
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting direct peer {} for audio transcription session {} failed: {err}",
+                    provider, invocation.session_id
+                ))
+            })?;
+        let opened = bridge
+            .session_open(provider, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening direct audio transcription session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        if opened.get("direct").and_then(Value::as_bool) != Some(true)
+            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(GatewaySessionError::retryable(format!(
+                "audio transcription session {} was not opened as a direct non-relayed channel",
+                invocation.session_id
+            )));
+        }
+
+        let now = now_millis_u64();
+        let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
+        let open_frame = json!({
+            "t": "s.open",
+            "v": 1,
+            "contract_version": invocation.contract_version,
+            "session_id": invocation.session_id.clone(),
+            "rail": invocation.rail.clone(),
+            "user": invocation.user_pubkey.clone(),
+            "enclave_id": invocation.enclave_id.clone(),
+            "price_ver": invocation.price_ver,
+            "rules_ver": invocation.rules_ver,
+            "voucher": invocation.spend_voucher.clone(),
+            "att_nonce": att_nonce,
+            "ts": now,
+            "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+            "sig": invocation.spend_voucher.user_sig.clone(),
+        });
+        let open_head = session_frame_head(&open_frame)
+            .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
+        bridge
+            .session_send(provider, &invocation.session_id, open_frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.open for audio transcription session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+
+        let accept = next_session_frame(
+            &mut bridge,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+            &["s.accept", "s.reject"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+            let code = accept
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            let reason = accept
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason provided");
+            return Err(GatewaySessionError::retryable(format!(
+                "provider rejected audio transcription session {} with {code}: {reason}",
+                invocation.session_id
+            )));
+        }
+        let accept_info = validate_direct_session_accept(
+            &accept,
+            invocation,
+            &open_head,
+            &att_nonce,
+            now / 1000,
+        )?;
+
+        let request_body = direct_session_audio_transcription_request_body(request);
+        let request_id = request_id_for_body(&invocation.session_id, &request_body);
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.req",
+                    "rid": request_id,
+                    "body": request_body,
+                }),
+            )
+            .await?;
+
+        let collected = collect_direct_session_audio_transcription_output(
+            &mut bridge,
+            &invocation.session_id,
+            &request_id,
+            invocation.failover,
+            request,
+            &accept_info.enclave_pubkey,
+        )
+        .await?;
+        let receipt_ack = direct_session_audio_transcription_receipt_ack(
+            request,
+            &collected.output,
+            invocation,
+            &collected.provider_receipt,
+            provider,
+            model,
+        )?;
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.receipt_ack",
+                    "v": 1,
+                    "session_id": receipt_ack.session_id,
+                    "seq": receipt_ack.seq,
+                    "user_sig": receipt_ack.user_sig,
+                }),
+            )
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending audio transcription s.receipt_ack for session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        let _ = bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.close",
+                    "v": 1,
+                    "session_id": invocation.session_id,
+                    "reason": "done",
+                }),
+            )
+            .await;
+
+        Ok(GatewayAudioTranscriptionResult {
+            output: collected.output,
+            backend: self.name().to_owned(),
+            direct_session: true,
+            provider_receipt: Some(collected.provider_receipt),
+            quality: collected.quality,
+        })
+    }
 }
 
 fn validate_direct_session_accept(
@@ -3945,6 +4441,53 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
     });
     set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
     body
+}
+
+fn direct_session_audio_speech_request_body(request: &AudioSpeechRequest) -> Value {
+    let mut body = json!({
+        "kind": "audio_speech",
+        "input": &request.input,
+        "response_format": audio_speech_response_format(request),
+    });
+    set_optional_json(
+        &mut body,
+        "voice",
+        request.voice.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(&mut body, "speed", request.speed.map(|value| json!(value)));
+    body
+}
+
+fn direct_session_audio_transcription_request_body(request: &AudioTranscriptionRequest) -> Value {
+    let mut body = json!({
+        "kind": "audio_transcription",
+        "audio": {
+            "encoding": "hex",
+            "content_type": request.content_type.as_deref().unwrap_or("audio/wav"),
+            "filename": request.filename.as_deref().unwrap_or("audio.wav"),
+            "data": hex_encode(&request.audio),
+        },
+        "audio_seconds": audio_transcription_seconds(request),
+        "response_format": request.response_format.as_deref().unwrap_or("json"),
+    });
+    set_optional_json(
+        &mut body,
+        "language",
+        request.language.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "prompt",
+        request.prompt.as_ref().map(|value| json!(value)),
+    );
+    body
+}
+
+fn request_id_for_body(session_id: &str, body: &Value) -> String {
+    blake3_hex(format!("rid:{session_id}:{}", stable_json_value(body)).as_bytes())
+        .chars()
+        .take(32)
+        .collect()
 }
 
 fn set_optional_json(body: &mut Value, key: &str, value: Option<Value>) {
@@ -4480,6 +5023,202 @@ async fn collect_direct_session_image_generation_output(
     })
 }
 
+async fn collect_direct_session_audio_speech_output(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    request_id: &str,
+    failover: GatewayFailoverInvocation,
+    request: &AudioSpeechRequest,
+    enclave_pubkey: &str,
+) -> Result<DirectAudioSpeechSessionCollected, GatewaySessionError> {
+    let mut finish_seen = false;
+    let mut usage = None;
+    let mut provider_receipt = None;
+    let mut artifact_builders = BTreeMap::new();
+    let started_at_millis = now_millis_u64();
+    let mut watchdog = DirectSessionWatchdog::new(
+        started_at_millis,
+        failover.ttft_timeout(),
+        failover.stall_timeout(),
+        None,
+        None,
+    );
+
+    while !finish_seen || provider_receipt.is_none() {
+        let remaining_millis = watchdog
+            .next_wait_millis(now_millis_u64())
+            .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
+        let frame = next_session_frame(
+            bridge,
+            session_id,
+            Duration::from_millis(remaining_millis),
+            &["s.delta", "s.receipt", "s.error", "s.close"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                watchdog.record_delta(now_millis_u64());
+                collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
+                if frame.get("fin").and_then(Value::as_str).is_some() {
+                    finish_seen = true;
+                    usage = receipt_usage_from_session_delta(&frame);
+                }
+            }
+            Some("s.receipt") => {
+                provider_receipt = Some(provider_signed_receipt_from_frame(
+                    &frame,
+                    session_id,
+                    enclave_pubkey,
+                )?);
+            }
+            Some("s.error") => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_error");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider returned s.error");
+                return Err(GatewaySessionError::new(format!(
+                    "provider returned {code} on audio speech session {session_id}: {message}"
+                )));
+            }
+            Some("s.close") => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed audio speech session {session_id} before completion: {reason}"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let quality =
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: None,
+            });
+    let artifacts = finish_session_artifacts(artifact_builders)?;
+    if artifacts.is_empty() {
+        return Err(GatewaySessionError::new(format!(
+            "provider audio speech session {session_id} finished without audio artifacts"
+        )));
+    }
+    let usage = usage.unwrap_or_else(|| audio_speech_usage_for_observed(request, &artifacts));
+    Ok(DirectAudioSpeechSessionCollected {
+        output: AudioSpeechOutput { artifacts, usage },
+        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        quality,
+    })
+}
+
+async fn collect_direct_session_audio_transcription_output(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    request_id: &str,
+    failover: GatewayFailoverInvocation,
+    request: &AudioTranscriptionRequest,
+    enclave_pubkey: &str,
+) -> Result<DirectAudioTranscriptionSessionCollected, GatewaySessionError> {
+    let mut content = String::new();
+    let mut finish_seen = false;
+    let mut usage = None;
+    let mut provider_receipt = None;
+    let started_at_millis = now_millis_u64();
+    let mut watchdog = DirectSessionWatchdog::new(
+        started_at_millis,
+        failover.ttft_timeout(),
+        failover.stall_timeout(),
+        None,
+        None,
+    );
+
+    while !finish_seen || provider_receipt.is_none() {
+        let remaining_millis = watchdog
+            .next_wait_millis(now_millis_u64())
+            .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
+        let frame = next_session_frame(
+            bridge,
+            session_id,
+            Duration::from_millis(remaining_millis),
+            &["s.delta", "s.receipt", "s.error", "s.close"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                watchdog.record_delta(now_millis_u64());
+                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
+                    content.push_str(delta);
+                }
+                if frame.get("fin").and_then(Value::as_str).is_some() {
+                    finish_seen = true;
+                    usage = receipt_usage_from_session_delta(&frame);
+                }
+            }
+            Some("s.receipt") => {
+                provider_receipt = Some(provider_signed_receipt_from_frame(
+                    &frame,
+                    session_id,
+                    enclave_pubkey,
+                )?);
+            }
+            Some("s.error") => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_error");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider returned s.error");
+                return Err(GatewaySessionError::new(format!(
+                    "provider returned {code} on audio transcription session {session_id}: {message}"
+                )));
+            }
+            Some("s.close") => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed audio transcription session {session_id} before completion: {reason}"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let text = content.trim().to_owned();
+    if text.is_empty() {
+        return Err(GatewaySessionError::new(format!(
+            "provider audio transcription session {session_id} finished with empty transcript"
+        )));
+    }
+    let quality =
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: None,
+            });
+    Ok(DirectAudioTranscriptionSessionCollected {
+        output: AudioTranscriptionOutput {
+            text,
+            usage: usage.unwrap_or_else(|| audio_transcription_usage_for_request(request)),
+        },
+        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        quality,
+    })
+}
+
 fn embeddings_from_session_delta(
     frame: &Value,
 ) -> Result<Option<Vec<Vec<f32>>>, GatewaySessionError> {
@@ -4823,6 +5562,50 @@ fn direct_session_image_generation_receipt_ack(
     })
 }
 
+fn direct_session_audio_speech_receipt_ack(
+    request: &AudioSpeechRequest,
+    output: &AudioSpeechOutput,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    provider: &str,
+    model: &GatewayModel,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new(
+            "receipt co-signing refused; session paused",
+        ));
+    }
+    let expected = expected_audio_speech_provider_receipt(model, request, output, provider);
+    validate_provider_receipt(model, invocation, provider_receipt, expected)?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "provider audio speech receipt ack signing payload failed: {err}"
+        ))
+    })
+}
+
+fn direct_session_audio_transcription_receipt_ack(
+    request: &AudioTranscriptionRequest,
+    output: &AudioTranscriptionOutput,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    provider: &str,
+    model: &GatewayModel,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new(
+            "receipt co-signing refused; session paused",
+        ));
+    }
+    let expected = expected_audio_transcription_provider_receipt(model, request, output, provider);
+    validate_provider_receipt(model, invocation, provider_receipt, expected)?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "provider audio transcription receipt ack signing payload failed: {err}"
+        ))
+    })
+}
+
 fn direct_session_partial_receipt_ack(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
@@ -4886,6 +5669,40 @@ fn expected_image_generation_provider_receipt<'a>(
         final_receipt: true,
         mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
         prompt_hash: image_generation_prompt_hash(request),
+        usage,
+    }
+}
+
+fn expected_audio_speech_provider_receipt<'a>(
+    model: &GatewayModel,
+    request: &AudioSpeechRequest,
+    output: &AudioSpeechOutput,
+    provider: &'a str,
+) -> ExpectedProviderReceipt<'a> {
+    let usage = output.usage.clone();
+    ExpectedProviderReceipt {
+        provider,
+        seq: 1,
+        final_receipt: true,
+        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        prompt_hash: audio_speech_prompt_hash(request),
+        usage,
+    }
+}
+
+fn expected_audio_transcription_provider_receipt<'a>(
+    model: &GatewayModel,
+    request: &AudioTranscriptionRequest,
+    output: &AudioTranscriptionOutput,
+    provider: &'a str,
+) -> ExpectedProviderReceipt<'a> {
+    let usage = output.usage.clone();
+    ExpectedProviderReceipt {
+        provider,
+        seq: 1,
+        final_receipt: true,
+        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        prompt_hash: audio_transcription_prompt_hash(request),
         usage,
     }
 }
@@ -5309,6 +6126,235 @@ async fn run_image_generation_with_route_retry(
     ))
 }
 
+async fn run_audio_speech_with_route_retry(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &AudioSpeechRequest,
+    options: GatewayRequestOptions,
+) -> Result<GatewayAudioSpeechRun, ApiError> {
+    let eligible_routes =
+        ordered_route_candidates_for_audio_speech(state, model, request, options.min_att_tier);
+    if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        return Err(no_eligible_route_error(state, model, options.min_att_tier));
+    }
+    if eligible_routes.is_empty() && !state.dev_session_shim {
+        return Err(ApiError::service_unavailable(
+            "no provider available: production gateway requires an active provider joined to an admin-created room",
+            Some("model"),
+        ));
+    }
+
+    let attempt_count = if eligible_routes.is_empty() {
+        1
+    } else {
+        eligible_routes
+            .len()
+            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
+    };
+    let mut last_retryable_error = None;
+    for attempt_index in 0..attempt_count {
+        let route = eligible_routes.get(attempt_index).copied();
+        let invocation =
+            state.prepare_audio_speech_invocation_for_route(model, request, route, options)?;
+        let attempt_started = Instant::now();
+        match state
+            .session_backend
+            .run_audio_speech(model, request, &invocation)
+            .await
+        {
+            Ok(result) => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_audio_speech_success(
+                        &result,
+                        attempt_started.elapsed(),
+                    ),
+                );
+                let metering_request = request.clone();
+                let metering_output = result.output.clone();
+                return Ok(GatewayAudioSpeechRun {
+                    result,
+                    invocation,
+                    metering_request,
+                    metering_output,
+                });
+            }
+            Err(err) if err.retryable => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                last_retryable_error = Some(err.message);
+            }
+            Err(err) => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                return Err(ApiError::bad_gateway(err.message, Some("model")));
+            }
+        }
+    }
+    Err(ApiError::bad_gateway(
+        format!(
+            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+        ),
+        Some("model"),
+    ))
+}
+
+async fn run_audio_transcription_with_route_retry(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &AudioTranscriptionRequest,
+    options: GatewayRequestOptions,
+) -> Result<GatewayAudioTranscriptionRun, ApiError> {
+    let eligible_routes = ordered_route_candidates_for_audio_transcription(
+        state,
+        model,
+        request,
+        options.min_att_tier,
+    );
+    if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        return Err(no_eligible_route_error(state, model, options.min_att_tier));
+    }
+    if eligible_routes.is_empty() && !state.dev_session_shim {
+        return Err(ApiError::service_unavailable(
+            "no provider available: production gateway requires an active provider joined to an admin-created room",
+            Some("model"),
+        ));
+    }
+
+    let attempt_count = if eligible_routes.is_empty() {
+        1
+    } else {
+        eligible_routes
+            .len()
+            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
+    };
+    let mut last_retryable_error = None;
+    for attempt_index in 0..attempt_count {
+        let route = eligible_routes.get(attempt_index).copied();
+        let invocation = state
+            .prepare_audio_transcription_invocation_for_route(model, request, route, options)?;
+        let attempt_started = Instant::now();
+        match state
+            .session_backend
+            .run_audio_transcription(model, request, &invocation)
+            .await
+        {
+            Ok(result) => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_audio_transcription_success(
+                        &result,
+                        attempt_started.elapsed(),
+                    ),
+                );
+                let metering_request = request.clone();
+                let metering_output = result.output.clone();
+                return Ok(GatewayAudioTranscriptionRun {
+                    result,
+                    invocation,
+                    metering_request,
+                    metering_output,
+                });
+            }
+            Err(err) if err.retryable => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                last_retryable_error = Some(err.message);
+            }
+            Err(err) => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                return Err(ApiError::bad_gateway(err.message, Some("model")));
+            }
+        }
+    }
+    Err(ApiError::bad_gateway(
+        format!(
+            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+        ),
+        Some("model"),
+    ))
+}
+
+fn no_eligible_route_error(
+    state: &GatewayState,
+    model: &GatewayModel,
+    min_att_tier: Option<u8>,
+) -> ApiError {
+    let rail = state.receipt_config.rail.clone();
+    let rail_candidates = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .accepted_rails
+                .iter()
+                .any(|candidate_rail| candidate_rail == &rail)
+        })
+        .collect::<Vec<_>>();
+    if rail_candidates.is_empty() {
+        return ApiError::payment_required(
+            format!("no provider accepts the {rail} payment rail"),
+            Some("model"),
+        );
+    }
+    let att_candidates = rail_candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            min_att_tier
+                .map(|min_tier| candidate.att_tier >= min_tier)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if att_candidates.is_empty() {
+        return ApiError::bad_request(
+            "no provider route satisfies X-Mayhem-Min-Att-Tier",
+            Some("X-Mayhem-Min-Att-Tier"),
+        );
+    }
+    let now_millis = now_millis_u64();
+    if att_candidates
+        .iter()
+        .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
+    {
+        return ApiError::service_unavailable(
+            "all otherwise eligible provider routes are cooling off after a retryable failure",
+            Some("model"),
+        );
+    }
+    ApiError::bad_request("no provider route is currently eligible", Some("model"))
+}
+
 async fn build_chat_completion(
     state: &GatewayState,
     request: ChatCompletionRequest,
@@ -5619,6 +6665,42 @@ fn ordered_route_candidates_for_image_generation<'a>(
     )
 }
 
+fn ordered_route_candidates_for_audio_speech<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &AudioSpeechRequest,
+    min_att_tier: Option<u8>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = audio_speech_route_selection_seed(model, request, now_millis_u64());
+    let now_millis = now_millis_u64();
+    ordered_route_candidates_for_requirements_with_seed(
+        state,
+        model,
+        min_att_tier,
+        seed,
+        request_requirements_for_audio_speech(state, model, request, now_millis),
+        now_millis,
+    )
+}
+
+fn ordered_route_candidates_for_audio_transcription<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &AudioTranscriptionRequest,
+    min_att_tier: Option<u8>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = audio_transcription_route_selection_seed(model, request, now_millis_u64());
+    let now_millis = now_millis_u64();
+    ordered_route_candidates_for_requirements_with_seed(
+        state,
+        model,
+        min_att_tier,
+        seed,
+        request_requirements_for_audio_transcription(state, model, request, now_millis),
+        now_millis,
+    )
+}
+
 async fn run_hedge_probes_if_requested(
     state: &GatewayState,
     model: &GatewayModel,
@@ -5913,6 +6995,90 @@ fn ordered_route_candidates_for_image_generation_with_seed<'a>(
     ordered
 }
 
+fn ordered_route_candidates_for_requirements_with_seed<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    min_att_tier: Option<u8>,
+    seed: u64,
+    requirements: RequestRequirements,
+    now_millis: u64,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let eligible_routes =
+        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+            .into_iter()
+            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
+            .collect::<Vec<_>>();
+    if eligible_routes.is_empty() {
+        return eligible_routes;
+    }
+
+    state.refresh_provider_table_routes(model);
+    let route_by_key = eligible_routes
+        .iter()
+        .map(|candidate| (route_key(candidate), *candidate))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining_entries = {
+        let table = state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned");
+        table
+            .entries(now_millis)
+            .into_iter()
+            .filter(|entry| route_by_key.contains_key(&entry.key))
+            .collect::<Vec<_>>()
+    };
+    let weights = SelectionWeights::default();
+    let table_entry_keys = remaining_entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
+    let table_eligible_keys =
+        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
+            .into_iter()
+            .map(|candidate| candidate.entry.key)
+            .collect::<BTreeSet<_>>();
+    let eligible_routes = eligible_routes
+        .into_iter()
+        .filter(|candidate| {
+            let key = route_key(candidate);
+            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
+        })
+        .collect::<Vec<_>>();
+    if eligible_routes.len() <= 1 {
+        return eligible_routes;
+    }
+    let mut rng = LcgBalancerRng::seeded(seed);
+    let mut ordered = Vec::new();
+    let mut selected_keys = BTreeSet::new();
+    while !remaining_entries.is_empty() {
+        let Some(selection) = crate::provider_table::select_weighted_p2c(
+            &remaining_entries,
+            &requirements,
+            &weights,
+            &mut rng,
+        ) else {
+            break;
+        };
+        let key = selection.selected.entry.key;
+        if let Some(candidate) = route_by_key.get(&key).copied() {
+            ordered.push(candidate);
+            selected_keys.insert(key.clone());
+        }
+        remaining_entries.retain(|entry| entry.key != key);
+    }
+    for candidate in eligible_routes {
+        let key = route_key(candidate);
+        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
+            continue;
+        }
+        if selected_keys.insert(key) {
+            ordered.push(candidate);
+        }
+    }
+    ordered
+}
+
 impl GatewayState {
     fn refresh_provider_table_routes(&self, model: &GatewayModel) {
         let now = now_millis_u64();
@@ -6023,6 +7189,47 @@ fn request_requirements_for_image_generation(
     }
 }
 
+fn request_requirements_for_audio_speech(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &AudioSpeechRequest,
+    now_millis: u64,
+) -> RequestRequirements {
+    let input_tokens = rough_tokens(&request.input);
+    RequestRequirements {
+        current_rules_ver: state.receipt_config.rules_ver,
+        requires_tools: false,
+        requires_json: false,
+        requires_vision: false,
+        min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
+        input_tokens,
+        output_tokens: 0,
+        now_millis,
+        max_price_mu: Some(estimate_audio_speech_max_spend_mu(model, request)),
+        ..RequestRequirements::default()
+    }
+}
+
+fn request_requirements_for_audio_transcription(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &AudioTranscriptionRequest,
+    now_millis: u64,
+) -> RequestRequirements {
+    RequestRequirements {
+        current_rules_ver: state.receipt_config.rules_ver,
+        requires_tools: false,
+        requires_json: false,
+        requires_vision: false,
+        min_ctx: 1,
+        input_tokens: audio_transcription_seconds(request),
+        output_tokens: 0,
+        now_millis,
+        max_price_mu: Some(estimate_audio_transcription_max_spend_mu(model, request)),
+        ..RequestRequirements::default()
+    }
+}
+
 fn route_selection_seed(
     model: &GatewayModel,
     request: &ChatCompletionRequest,
@@ -6058,6 +7265,36 @@ fn image_generation_route_selection_seed(
     let mut hasher = blake3::Hasher::new();
     hasher.update(model.id.as_bytes());
     hasher.update(image_generation_prompt_text(request).as_bytes());
+    hasher.update(&now_millis.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn audio_speech_route_selection_seed(
+    model: &GatewayModel,
+    request: &AudioSpeechRequest,
+    now_millis: u64,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.id.as_bytes());
+    hasher.update(audio_speech_prompt_hash(request).as_bytes());
+    hasher.update(&now_millis.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn audio_transcription_route_selection_seed(
+    model: &GatewayModel,
+    request: &AudioTranscriptionRequest,
+    now_millis: u64,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.id.as_bytes());
+    hasher.update(audio_transcription_prompt_hash(request).as_bytes());
     hasher.update(&now_millis.to_le_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
@@ -6118,6 +7355,34 @@ fn observation_sample_from_embedding_success(
 
 fn observation_sample_from_image_generation_success(
     result: &GatewayImageGenerationResult,
+    elapsed: Duration,
+) -> ProviderObservationSample {
+    ProviderObservationSample {
+        ttft_ms: result
+            .quality
+            .map(|quality| quality.ttft_ms)
+            .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
+        tok_s: None,
+        error: false,
+    }
+}
+
+fn observation_sample_from_audio_speech_success(
+    result: &GatewayAudioSpeechResult,
+    elapsed: Duration,
+) -> ProviderObservationSample {
+    ProviderObservationSample {
+        ttft_ms: result
+            .quality
+            .map(|quality| quality.ttft_ms)
+            .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
+        tok_s: None,
+        error: false,
+    }
+}
+
+fn observation_sample_from_audio_transcription_success(
+    result: &GatewayAudioTranscriptionResult,
     elapsed: Duration,
 ) -> ProviderObservationSample {
     ProviderObservationSample {
@@ -6459,9 +7724,10 @@ async fn build_image_generation(
     }))
 }
 
-fn build_audio_speech(
+async fn build_audio_speech(
     state: &GatewayState,
     request: AudioSpeechRequest,
+    options: GatewayRequestOptions,
 ) -> Result<Response, ApiError> {
     let model = require_model(state, &request.model)?;
     if !model_supports_tts(&model) {
@@ -6470,14 +7736,90 @@ fn build_audio_speech(
             Some("model"),
         ));
     }
-    Err(modality_not_served("audio speech"))
+    validate_audio_speech_request(&request)?;
+    let GatewayAudioSpeechRun {
+        result:
+            GatewayAudioSpeechResult {
+                output,
+                backend,
+                direct_session,
+                provider_receipt,
+                quality,
+            },
+        invocation,
+        metering_request,
+        metering_output,
+    } = run_audio_speech_with_route_retry(state, &model, &request, options).await?;
+    let receipt = if state.dev_session_shim {
+        None
+    } else {
+        let receipt = state.meter_audio_speech_session(
+            &model,
+            &metering_request,
+            &metering_output,
+            &invocation,
+            provider_receipt.as_ref(),
+        )?;
+        Some(receipt_summary(&receipt))
+    };
+    let artifact = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.content_type == "audio/wav")
+        .or_else(|| output.artifacts.first())
+        .ok_or_else(|| {
+            ApiError::bad_gateway("provider returned no audio artifact", Some("model"))
+        })?;
+    let mut response = Body::from(artifact.bytes.clone()).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&artifact.content_type).map_err(|err| {
+            ApiError::bad_gateway(format!("invalid audio content type: {err}"), None)
+        })?,
+    );
+    response.headers_mut().insert(
+        "x-mayhem-backend",
+        HeaderValue::from_str(&backend)
+            .map_err(|err| ApiError::bad_gateway(format!("invalid backend header: {err}"), None))?,
+    );
+    response.headers_mut().insert(
+        "x-mayhem-direct-session",
+        HeaderValue::from_static(if direct_session { "true" } else { "false" }),
+    );
+    response.headers_mut().insert(
+        "x-mayhem-usage",
+        HeaderValue::from_str(&serde_json::to_string(&output.usage).map_err(ApiError::internal)?)
+            .map_err(|err| ApiError::bad_gateway(format!("invalid usage header: {err}"), None))?,
+    );
+    if let Some(receipt) = receipt {
+        response.headers_mut().insert(
+            "x-mayhem-receipt",
+            HeaderValue::from_str(&receipt.to_string()).map_err(|err| {
+                ApiError::bad_gateway(format!("invalid receipt header: {err}"), None)
+            })?,
+        );
+    }
+    if let Some(quality) = quality {
+        response.headers_mut().insert(
+            "x-mayhem-ttft-ms",
+            HeaderValue::from_str(&quality.ttft_ms.to_string()).map_err(|err| {
+                ApiError::bad_gateway(format!("invalid quality header: {err}"), None)
+            })?,
+        );
+    }
+    Ok(response)
 }
 
 async fn parse_audio_transcription_multipart(
     mut multipart: Multipart,
 ) -> Result<AudioTranscriptionRequest, ApiError> {
     let mut model = None;
-    let mut audio_present = false;
+    let mut audio = None;
+    let mut content_type = None;
+    let mut filename = None;
+    let mut response_format = None;
+    let mut language = None;
+    let mut prompt = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|err| {
         ApiError::bad_request(format!("invalid multipart form: {err}"), Some("file"))
@@ -6490,52 +7832,58 @@ async fn parse_audio_transcription_multipart(
                 })?);
             }
             "file" => {
+                content_type = field.content_type().map(str::to_owned);
+                filename = field.file_name().map(str::to_owned);
                 let bytes = field.bytes().await.map_err(|err| {
                     ApiError::bad_request(format!("invalid file field: {err}"), Some("file"))
                 })?;
-                audio_present = !bytes.is_empty();
+                if !bytes.is_empty() {
+                    audio = Some(bytes.to_vec());
+                }
             }
             "response_format" => {
-                let _ = field.text().await.map_err(|err| {
+                response_format = Some(field.text().await.map_err(|err| {
                     ApiError::bad_request(
                         format!("invalid response_format field: {err}"),
                         Some("response_format"),
                     )
-                })?;
+                })?);
             }
             "language" => {
-                let _ = field.text().await.map_err(|err| {
+                language = Some(field.text().await.map_err(|err| {
                     ApiError::bad_request(
                         format!("invalid language field: {err}"),
                         Some("language"),
                     )
-                })?;
+                })?);
             }
             "prompt" => {
-                let _ = field.text().await.map_err(|err| {
+                prompt = Some(field.text().await.map_err(|err| {
                     ApiError::bad_request(format!("invalid prompt field: {err}"), Some("prompt"))
-                })?;
+                })?);
             }
             _ => {}
         }
     }
 
-    if !audio_present {
-        return Err(ApiError::bad_request(
-            "multipart form missing file",
-            Some("file"),
-        ));
-    }
     Ok(AudioTranscriptionRequest {
         model: model
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| ApiError::bad_request("multipart form missing model", Some("model")))?,
+        audio: audio
+            .ok_or_else(|| ApiError::bad_request("multipart form missing file", Some("file")))?,
+        content_type,
+        filename,
+        response_format,
+        language,
+        prompt,
     })
 }
 
-fn build_audio_transcription(
+async fn build_audio_transcription(
     state: &GatewayState,
     request: AudioTranscriptionRequest,
+    options: GatewayRequestOptions,
 ) -> Result<Value, ApiError> {
     let model = require_model(state, &request.model)?;
     if !model_supports_stt(&model) {
@@ -6544,14 +7892,53 @@ fn build_audio_transcription(
             Some("model"),
         ));
     }
-    Err(modality_not_served("audio transcription"))
-}
-
-fn modality_not_served(kind: &'static str) -> ApiError {
-    ApiError::service_unavailable(
-        format!("{kind} is not served by this gateway yet; no charge recorded"),
-        Some("model"),
-    )
+    let response_format = request.response_format.as_deref().unwrap_or("json");
+    if response_format != "json" {
+        return Err(ApiError::bad_request(
+            "only response_format=json is supported",
+            Some("response_format"),
+        ));
+    }
+    let GatewayAudioTranscriptionRun {
+        result:
+            GatewayAudioTranscriptionResult {
+                output,
+                backend,
+                direct_session,
+                provider_receipt,
+                quality,
+            },
+        invocation,
+        metering_request,
+        metering_output,
+    } = run_audio_transcription_with_route_retry(state, &model, &request, options).await?;
+    let receipt = if state.dev_session_shim {
+        None
+    } else {
+        let receipt = state.meter_audio_transcription_session(
+            &model,
+            &metering_request,
+            &metering_output,
+            &invocation,
+            provider_receipt.as_ref(),
+        )?;
+        Some(receipt_summary(&receipt))
+    };
+    Ok(json!({
+        "text": output.text,
+        "usage": output.usage,
+        "mayhem": {
+            "backend": backend,
+            "direct_session": direct_session,
+            "billable": !state.dev_session_shim,
+            "dev_session": state.dev_session_shim,
+            "quality": quality.map(|quality| json!({
+                "ttft_ms": quality.ttft_ms,
+                "tok_s": quality.tok_s,
+            })),
+            "receipt": receipt,
+        },
+    }))
 }
 
 fn model_supports_embeddings(model: &GatewayModel) -> bool {
@@ -7158,6 +8545,158 @@ impl GatewayState {
         })
     }
 
+    fn prepare_audio_speech_invocation_for_route(
+        &self,
+        model: &GatewayModel,
+        request: &AudioSpeechRequest,
+        route: Option<&GatewayRouteCandidate>,
+        options: GatewayRequestOptions,
+    ) -> Result<GatewaySessionInvocation, ApiError> {
+        let prompt_text = audio_speech_prompt_hash(request);
+        let failover = self.failover_thresholds_for_model(model, options);
+        let session_id = session_id_for(&model.id, &prompt_text);
+        let enclave_id = route
+            .map(|candidate| candidate.enclave_id.clone())
+            .unwrap_or_else(|| enclave_id_for_model(&model.id));
+        let price_ver = route
+            .map(|candidate| candidate.price_ver)
+            .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let attestation = route.map(|candidate| GatewaySessionAttestation {
+            contract: EnclaveContractRecord {
+                enclave_id: candidate.enclave_id.clone(),
+                admin_pubkey: candidate.admin_pubkey.clone(),
+                model_id: model.id.clone(),
+                model_class: model.mayhem.model_class.clone(),
+                artifact_root: candidate.artifact_root.clone(),
+                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
+                manifest_hash: candidate.manifest_hash.clone(),
+                binary_hash: candidate.binary_hash.clone(),
+                att_tier: candidate.att_tier,
+                caps: candidate.caps.clone(),
+            },
+            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
+            trusted_nvidia_gb10_device_jwks: self
+                .hardware_quote_trust
+                .nvidia_gb10_device_jwks
+                .clone(),
+            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
+            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+        });
+        let max_spend_mu = estimate_audio_speech_max_spend_mu(model, request);
+        if max_spend_mu > self.receipt_config.balance_mu {
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            rail: self.receipt_config.rail.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver,
+            max_spend_mu,
+            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+        };
+        let voucher_payload =
+            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
+        Ok(GatewaySessionInvocation {
+            contract_version: CONTRACT_VERSION,
+            session_id,
+            rail: self.receipt_config.rail.clone(),
+            user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
+            provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            enclave_id,
+            price_ver,
+            rules_ver: self.receipt_config.rules_ver,
+            spend_voucher: SpendVoucher {
+                body: voucher_body,
+                user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
+            },
+            attestation,
+            hedge: GatewayHedgeInvocation::default(),
+            failover,
+            receipt_cosign_enabled: self.receipt_config.cosign_enabled,
+            receipt_user_seed: self.receipt_config.user_seed,
+        })
+    }
+
+    fn prepare_audio_transcription_invocation_for_route(
+        &self,
+        model: &GatewayModel,
+        request: &AudioTranscriptionRequest,
+        route: Option<&GatewayRouteCandidate>,
+        options: GatewayRequestOptions,
+    ) -> Result<GatewaySessionInvocation, ApiError> {
+        let prompt_text = audio_transcription_prompt_hash(request);
+        let failover = self.failover_thresholds_for_model(model, options);
+        let session_id = session_id_for(&model.id, &prompt_text);
+        let enclave_id = route
+            .map(|candidate| candidate.enclave_id.clone())
+            .unwrap_or_else(|| enclave_id_for_model(&model.id));
+        let price_ver = route
+            .map(|candidate| candidate.price_ver)
+            .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let attestation = route.map(|candidate| GatewaySessionAttestation {
+            contract: EnclaveContractRecord {
+                enclave_id: candidate.enclave_id.clone(),
+                admin_pubkey: candidate.admin_pubkey.clone(),
+                model_id: model.id.clone(),
+                model_class: model.mayhem.model_class.clone(),
+                artifact_root: candidate.artifact_root.clone(),
+                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
+                manifest_hash: candidate.manifest_hash.clone(),
+                binary_hash: candidate.binary_hash.clone(),
+                att_tier: candidate.att_tier,
+                caps: candidate.caps.clone(),
+            },
+            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
+            trusted_nvidia_gb10_device_jwks: self
+                .hardware_quote_trust
+                .nvidia_gb10_device_jwks
+                .clone(),
+            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
+            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+        });
+        let max_spend_mu = estimate_audio_transcription_max_spend_mu(model, request);
+        if max_spend_mu > self.receipt_config.balance_mu {
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            rail: self.receipt_config.rail.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver,
+            max_spend_mu,
+            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+        };
+        let voucher_payload =
+            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
+        Ok(GatewaySessionInvocation {
+            contract_version: CONTRACT_VERSION,
+            session_id,
+            rail: self.receipt_config.rail.clone(),
+            user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
+            provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            enclave_id,
+            price_ver,
+            rules_ver: self.receipt_config.rules_ver,
+            spend_voucher: SpendVoucher {
+                body: voucher_body,
+                user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
+            },
+            attestation,
+            hedge: GatewayHedgeInvocation::default(),
+            failover,
+            receipt_cosign_enabled: self.receipt_config.cosign_enabled,
+            receipt_user_seed: self.receipt_config.user_seed,
+        })
+    }
+
     fn failover_thresholds_for_model(
         &self,
         model: &GatewayModel,
@@ -7474,6 +9013,182 @@ impl GatewayState {
             session_id: receipt.body.session_id.clone(),
             seq: receipt.body.seq,
             user_sig: receipt.user_sig.clone(),
+        };
+        let stored = StoredReceipt {
+            rail: invocation.rail.clone(),
+            voucher: invocation.spend_voucher.clone(),
+            receipt,
+            receipt_ack,
+        };
+        self.record_receipt(stored.clone());
+        Ok(stored)
+    }
+
+    fn meter_audio_speech_session(
+        &self,
+        model: &GatewayModel,
+        request: &AudioSpeechRequest,
+        output: &AudioSpeechOutput,
+        invocation: &GatewaySessionInvocation,
+        provider_receipt: Option<&ProviderSignedReceipt>,
+    ) -> Result<StoredReceipt, ApiError> {
+        let usage = output.usage.clone();
+        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            return Err(ApiError::payment_required(
+                "session usage exceeded signed spend voucher",
+                Some("model"),
+            ));
+        }
+
+        if !self.receipt_config.cosign_enabled {
+            self.pause_session(PausedSession {
+                session_id: invocation.session_id.clone(),
+                reason: "receipt co-signing refused; session paused".to_owned(),
+            });
+            return Err(ApiError::conflict(
+                "receipt co-signing refused; session paused",
+                None,
+            ));
+        }
+
+        let provider = invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let receipt = if let Some(provider_receipt) = provider_receipt {
+            self.cosign_provider_receipt(
+                model,
+                invocation,
+                provider_receipt,
+                ExpectedProviderReceipt {
+                    provider: &provider,
+                    seq: 1,
+                    final_receipt: true,
+                    usage: usage.clone(),
+                    mu_owed_cum,
+                    prompt_hash: audio_speech_prompt_hash(request),
+                },
+            )?
+        } else {
+            let body = ReceiptBody {
+                schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+                session_id: invocation.session_id.clone(),
+                seq: 1,
+                final_receipt: true,
+                rail: invocation.rail.clone(),
+                user: invocation.user_pubkey.clone(),
+                provider,
+                enclave_id: invocation.enclave_id.clone(),
+                model_id: model.id.clone(),
+                price_ver: invocation.price_ver,
+                rules_ver: invocation.rules_ver,
+                usage,
+                mu_owed_cum,
+                prompt_hash: audio_speech_prompt_hash(request),
+                ts: now_millis_u64(),
+            };
+            let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
+            let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
+            SessionReceipt {
+                body,
+                enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                user_sig,
+            }
+        };
+        let user_sig = receipt.user_sig.clone();
+        let receipt_ack = ReceiptAck {
+            session_id: receipt.body.session_id.clone(),
+            seq: receipt.body.seq,
+            user_sig,
+        };
+        let stored = StoredReceipt {
+            rail: invocation.rail.clone(),
+            voucher: invocation.spend_voucher.clone(),
+            receipt,
+            receipt_ack,
+        };
+        self.record_receipt(stored.clone());
+        Ok(stored)
+    }
+
+    fn meter_audio_transcription_session(
+        &self,
+        model: &GatewayModel,
+        request: &AudioTranscriptionRequest,
+        output: &AudioTranscriptionOutput,
+        invocation: &GatewaySessionInvocation,
+        provider_receipt: Option<&ProviderSignedReceipt>,
+    ) -> Result<StoredReceipt, ApiError> {
+        let usage = output.usage.clone();
+        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            return Err(ApiError::payment_required(
+                "session usage exceeded signed spend voucher",
+                Some("model"),
+            ));
+        }
+
+        if !self.receipt_config.cosign_enabled {
+            self.pause_session(PausedSession {
+                session_id: invocation.session_id.clone(),
+                reason: "receipt co-signing refused; session paused".to_owned(),
+            });
+            return Err(ApiError::conflict(
+                "receipt co-signing refused; session paused",
+                None,
+            ));
+        }
+
+        let provider = invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let receipt = if let Some(provider_receipt) = provider_receipt {
+            self.cosign_provider_receipt(
+                model,
+                invocation,
+                provider_receipt,
+                ExpectedProviderReceipt {
+                    provider: &provider,
+                    seq: 1,
+                    final_receipt: true,
+                    usage: usage.clone(),
+                    mu_owed_cum,
+                    prompt_hash: audio_transcription_prompt_hash(request),
+                },
+            )?
+        } else {
+            let body = ReceiptBody {
+                schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+                session_id: invocation.session_id.clone(),
+                seq: 1,
+                final_receipt: true,
+                rail: invocation.rail.clone(),
+                user: invocation.user_pubkey.clone(),
+                provider,
+                enclave_id: invocation.enclave_id.clone(),
+                model_id: model.id.clone(),
+                price_ver: invocation.price_ver,
+                rules_ver: invocation.rules_ver,
+                usage,
+                mu_owed_cum,
+                prompt_hash: audio_transcription_prompt_hash(request),
+                ts: now_millis_u64(),
+            };
+            let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
+            let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
+            SessionReceipt {
+                body,
+                enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                user_sig,
+            }
+        };
+        let user_sig = receipt.user_sig.clone();
+        let receipt_ack = ReceiptAck {
+            session_id: receipt.body.session_id.clone(),
+            seq: receipt.body.seq,
+            user_sig,
         };
         let stored = StoredReceipt {
             rail: invocation.rail.clone(),
@@ -8317,10 +10032,74 @@ fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn stable_value_hash(value: &Value) -> String {
     blake3::hash(stable_json_value(value).to_string().as_bytes())
         .to_hex()
         .to_string()
+}
+
+fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    let mut sample_rate = None;
+    let mut channels = None;
+    let mut bits_per_sample = None;
+    let mut data_len = None;
+    while offset.saturating_add(8) <= bytes.len() {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.saturating_add(chunk_len).min(bytes.len());
+        if chunk_id == b"fmt " && chunk_len >= 16 && chunk_end <= bytes.len() {
+            channels = Some(u16::from_le_bytes([
+                bytes[chunk_start + 2],
+                bytes[chunk_start + 3],
+            ]));
+            sample_rate = Some(u32::from_le_bytes([
+                bytes[chunk_start + 4],
+                bytes[chunk_start + 5],
+                bytes[chunk_start + 6],
+                bytes[chunk_start + 7],
+            ]));
+            bits_per_sample = Some(u16::from_le_bytes([
+                bytes[chunk_start + 14],
+                bytes[chunk_start + 15],
+            ]));
+        } else if chunk_id == b"data" {
+            data_len = Some(chunk_len);
+        }
+        let padded = chunk_len + (chunk_len % 2);
+        offset = chunk_start.saturating_add(padded);
+    }
+    let sample_rate = u64::from(sample_rate?);
+    let channels = u64::from(channels?);
+    let bits_per_sample = u64::from(bits_per_sample?);
+    let data_len = u64::try_from(data_len?).ok()?;
+    let bytes_per_second = sample_rate
+        .saturating_mul(channels)
+        .saturating_mul(bits_per_sample)
+        .checked_div(8)?;
+    if bytes_per_second == 0 {
+        return None;
+    }
+    Some(data_len.div_ceil(bytes_per_second).max(1))
 }
 
 fn stable_json_value(value: &Value) -> Value {
@@ -8506,6 +10285,14 @@ fn image_generation_prompt_hash(request: &ImageGenerationRequest) -> String {
     stable_value_hash(&direct_session_image_generation_request_body(request))
 }
 
+fn audio_speech_prompt_hash(request: &AudioSpeechRequest) -> String {
+    stable_value_hash(&direct_session_audio_speech_request_body(request))
+}
+
+fn audio_transcription_prompt_hash(request: &AudioTranscriptionRequest) -> String {
+    stable_value_hash(&direct_session_audio_transcription_request_body(request))
+}
+
 fn validate_image_generation_request(request: &ImageGenerationRequest) -> Result<(), ApiError> {
     if request.prompt.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -8580,6 +10367,77 @@ fn image_generation_usage_for_count(image_count: u64, steps: u64) -> ReceiptUsag
         (USAGE_IMAGE, image_count),
         (USAGE_STEP, image_count.saturating_mul(steps)),
     ])
+}
+
+fn validate_audio_speech_request(request: &AudioSpeechRequest) -> Result<(), ApiError> {
+    if request.input.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "input must not be empty",
+            Some("input"),
+        ));
+    }
+    if !matches!(audio_speech_response_format(request), "wav") {
+        return Err(ApiError::bad_request(
+            "only response_format=wav is supported by the launch TTS backend",
+            Some("response_format"),
+        ));
+    }
+    if request
+        .speed
+        .is_some_and(|speed| !speed.is_finite() || speed <= 0.0 || speed > 4.0)
+    {
+        return Err(ApiError::bad_request(
+            "speed must be in the range (0, 4]",
+            Some("speed"),
+        ));
+    }
+    Ok(())
+}
+
+fn audio_speech_response_format(request: &AudioSpeechRequest) -> &str {
+    request.response_format.as_deref().unwrap_or("wav")
+}
+
+fn audio_speech_usage_for_request(request: &AudioSpeechRequest) -> ReceiptUsage {
+    ReceiptUsage::from_units([
+        (
+            USAGE_INPUT_CHARACTER,
+            u64::try_from(request.input.chars().count()).unwrap_or(u64::MAX),
+        ),
+        (USAGE_AUDIO_SECOND, estimate_audio_speech_seconds(request)),
+    ])
+}
+
+fn estimate_audio_speech_seconds(request: &AudioSpeechRequest) -> u64 {
+    u64::try_from(request.input.chars().count())
+        .unwrap_or(u64::MAX)
+        .div_ceil(12)
+        .max(1)
+}
+
+fn audio_speech_usage_for_observed(
+    request: &AudioSpeechRequest,
+    artifacts: &[GatewayArtifactOutput],
+) -> ReceiptUsage {
+    let input_characters = u64::try_from(request.input.chars().count()).unwrap_or(u64::MAX);
+    let audio_seconds = artifacts
+        .iter()
+        .filter(|artifact| artifact.content_type == "audio/wav")
+        .map(|artifact| wav_duration_seconds_ceil(&artifact.bytes).unwrap_or(1))
+        .fold(0_u64, u64::saturating_add)
+        .max(1);
+    ReceiptUsage::from_units([
+        (USAGE_INPUT_CHARACTER, input_characters),
+        (USAGE_AUDIO_SECOND, audio_seconds),
+    ])
+}
+
+fn audio_transcription_usage_for_request(request: &AudioTranscriptionRequest) -> ReceiptUsage {
+    ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, audio_transcription_seconds(request))])
+}
+
+fn audio_transcription_seconds(request: &AudioTranscriptionRequest) -> u64 {
+    wav_duration_seconds_ceil(&request.audio).unwrap_or(1)
 }
 
 fn embedding_input_token_count(inputs: &[String]) -> u64 {
@@ -8706,6 +10564,25 @@ fn estimate_image_generation_max_spend_mu(
     calculate_mu_owed(
         &model.mayhem.price_ref_mu,
         &image_generation_usage_for_request(request),
+    )
+    .max(1_000)
+}
+
+fn estimate_audio_speech_max_spend_mu(model: &GatewayModel, request: &AudioSpeechRequest) -> u64 {
+    calculate_mu_owed(
+        &model.mayhem.price_ref_mu,
+        &audio_speech_usage_for_request(request),
+    )
+    .max(1_000)
+}
+
+fn estimate_audio_transcription_max_spend_mu(
+    model: &GatewayModel,
+    request: &AudioTranscriptionRequest,
+) -> u64 {
+    calculate_mu_owed(
+        &model.mayhem.price_ref_mu,
+        &audio_transcription_usage_for_request(request),
     )
     .max(1_000)
 }

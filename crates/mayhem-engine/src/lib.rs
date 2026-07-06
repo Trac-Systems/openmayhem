@@ -47,6 +47,10 @@ pub enum EngineError {
     TrtLlm(String),
     #[error("stable-diffusion.cpp backend error: {0}")]
     StableDiffusionCpp(String),
+    #[error("whisper.cpp backend error: {0}")]
+    WhisperCpp(String),
+    #[error("piper backend error: {0}")]
+    Piper(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -90,6 +94,9 @@ pub enum ArtifactFormat {
     MlxSafetensors,
     TensorRtLlmCheckpoint,
     StableDiffusionCheckpoint,
+    WhisperGgml,
+    PiperVoice,
+    PiperConfig,
 }
 
 impl ArtifactFormat {
@@ -99,6 +106,9 @@ impl ArtifactFormat {
             Self::MlxSafetensors => b"",
             Self::TensorRtLlmCheckpoint => b"",
             Self::StableDiffusionCheckpoint => b"",
+            Self::WhisperGgml => b"",
+            Self::PiperVoice => b"",
+            Self::PiperConfig => b"",
         }
     }
 
@@ -108,6 +118,9 @@ impl ArtifactFormat {
             Self::MlxSafetensors => "MLX safetensors",
             Self::TensorRtLlmCheckpoint => "TensorRT-LLM checkpoint",
             Self::StableDiffusionCheckpoint => "stable-diffusion checkpoint",
+            Self::WhisperGgml => "whisper.cpp ggml model",
+            Self::PiperVoice => "Piper voice",
+            Self::PiperConfig => "Piper config",
         }
     }
 }
@@ -153,6 +166,30 @@ impl ModelArtifact {
         }
     }
 
+    pub fn whisper_ggml(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::WhisperGgml,
+            sha256: None,
+        }
+    }
+
+    pub fn piper_voice(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::PiperVoice,
+            sha256: None,
+        }
+    }
+
+    pub fn piper_config(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::PiperConfig,
+            sha256: None,
+        }
+    }
+
     #[must_use]
     pub fn with_sha256(mut self, sha256: impl Into<String>) -> Self {
         self.sha256 = Some(sha256.into());
@@ -165,6 +202,8 @@ pub struct LoadConfig {
     pub artifact: ModelArtifact,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_projector: Option<ModelArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub piper_config: Option<ModelArtifact>,
     #[serde(default = "default_context_size")]
     pub ctx_size: u32,
     #[serde(default = "default_batch_size")]
@@ -217,6 +256,20 @@ impl LoadConfig {
             ..Self::default()
         }
     }
+
+    pub fn whisper_ggml(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::whisper_ggml(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn piper_voice(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::piper_voice(path),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for LoadConfig {
@@ -224,6 +277,7 @@ impl Default for LoadConfig {
         Self {
             artifact: ModelArtifact::gguf(PathBuf::new()),
             vision_projector: None,
+            piper_config: None,
             ctx_size: DEFAULT_CONTEXT_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
             ubatch_size: DEFAULT_UBATCH_SIZE,
@@ -429,6 +483,39 @@ pub struct EmbeddingOutput {
     pub usage: UsageCounters,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioTranscriptionRequest {
+    pub audio: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AudioTranscriptionOutput {
+    pub text: String,
+    pub audio_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpeechRequest {
+    pub input: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpeechOutput {
+    pub audio_seconds: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageCounters {
     pub prompt_tokens: u32,
@@ -527,6 +614,25 @@ pub trait EngineBackend {
     fn embed(&mut self, _request: EmbeddingRequest) -> Result<EmbeddingOutput> {
         Err(EngineError::InvalidConfig(format!(
             "{} backend does not support embeddings",
+            self.backend_id()
+        )))
+    }
+    fn transcribe(
+        &mut self,
+        _request: AudioTranscriptionRequest,
+    ) -> Result<AudioTranscriptionOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support audio transcription",
+            self.backend_id()
+        )))
+    }
+    fn synthesize_speech(
+        &mut self,
+        _request: SpeechRequest,
+        _artifact_sink: &mut dyn ArtifactSink,
+    ) -> Result<SpeechOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support speech synthesis",
             self.backend_id()
         )))
     }
@@ -635,6 +741,17 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
                 verify_magic_header(&payload, &ArtifactFormat::Gguf)?;
             }
             payload
+        }
+        ArtifactFormat::WhisperGgml => whisper_ggml_payload_path(&artifact.path)?,
+        ArtifactFormat::PiperVoice => piper_voice_model_path(&artifact.path)?,
+        ArtifactFormat::PiperConfig => {
+            if !artifact.path.is_file() {
+                return Err(EngineError::InvalidConfig(format!(
+                    "Piper config {} is not a file",
+                    artifact.path.display()
+                )));
+            }
+            artifact.path.clone()
         }
     };
 
@@ -829,6 +946,91 @@ fn stable_diffusion_payload_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+fn whisper_ggml_payload_path(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    }
+
+    for name in ["ggml-tiny.en.bin", "ggml-tiny.bin", "model.bin"] {
+        let candidate = path.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    let mut candidates = std::fs::read_dir(path)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "bin"))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next().ok_or_else(|| {
+        EngineError::InvalidConfig(format!(
+            "whisper.cpp artifact directory {} contains no .bin payload",
+            path.display()
+        ))
+    })
+}
+
+#[derive(Clone, Debug)]
+struct PiperVoicePaths {
+    model: PathBuf,
+    config: PathBuf,
+}
+
+fn piper_voice_paths(path: &Path) -> Result<PiperVoicePaths> {
+    let model = piper_voice_model_path(path)?;
+    piper_voice_paths_from_model(model)
+}
+
+fn piper_voice_model_path(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        Ok(path.to_path_buf())
+    } else if path.is_dir() {
+        for name in ["model.onnx", "voice.onnx"] {
+            let candidate = path.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        let mut candidates = std::fs::read_dir(path)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "onnx"))
+            .collect::<Vec<_>>();
+        candidates.sort();
+        Ok(candidates.into_iter().next().ok_or_else(|| {
+            EngineError::InvalidConfig(format!(
+                "Piper voice directory {} contains no .onnx model",
+                path.display()
+            ))
+        })?)
+    } else {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    }
+}
+
+fn piper_voice_paths_from_model(model: PathBuf) -> Result<PiperVoicePaths> {
+    let onnx_json = model.with_extension("onnx.json");
+    let stem_json = model.with_extension("json");
+    let config = if onnx_json.is_file() {
+        onnx_json
+    } else if stem_json.is_file() {
+        stem_json
+    } else {
+        return Err(EngineError::InvalidConfig(format!(
+            "Piper voice {} is missing config sidecar (expected {} or {})",
+            model.display(),
+            onnx_json.display(),
+            stem_json.display()
+        )));
+    };
+    Ok(PiperVoicePaths { model, config })
+}
+
 fn file_sha256_hex(path: &PathBuf) -> Result<String> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -844,6 +1046,60 @@ fn file_sha256_hex(path: &PathBuf) -> Result<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn wav_duration_seconds_ceil(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12usize;
+    let mut sample_rate = None;
+    let mut channels = None;
+    let mut bits_per_sample = None;
+    let mut data_len = None;
+    while offset.saturating_add(8) <= bytes.len() {
+        let chunk_id = &bytes[offset..offset + 4];
+        let chunk_len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.saturating_add(chunk_len).min(bytes.len());
+        if chunk_id == b"fmt " && chunk_len >= 16 && chunk_end <= bytes.len() {
+            channels = Some(u16::from_le_bytes([
+                bytes[chunk_start + 2],
+                bytes[chunk_start + 3],
+            ]));
+            sample_rate = Some(u32::from_le_bytes([
+                bytes[chunk_start + 4],
+                bytes[chunk_start + 5],
+                bytes[chunk_start + 6],
+                bytes[chunk_start + 7],
+            ]));
+            bits_per_sample = Some(u16::from_le_bytes([
+                bytes[chunk_start + 14],
+                bytes[chunk_start + 15],
+            ]));
+        } else if chunk_id == b"data" {
+            data_len = Some(chunk_len);
+        }
+        let padded = chunk_len + (chunk_len % 2);
+        offset = chunk_start.saturating_add(padded);
+    }
+    let sample_rate = u64::from(sample_rate?);
+    let channels = u64::from(channels?);
+    let bits_per_sample = u64::from(bits_per_sample?);
+    let data_len = u64::try_from(data_len?).ok()?;
+    let bytes_per_second = sample_rate
+        .saturating_mul(channels)
+        .saturating_mul(bits_per_sample)
+        .checked_div(8)?;
+    if bytes_per_second == 0 {
+        return None;
+    }
+    Some(data_len.div_ceil(bytes_per_second).max(1))
 }
 
 fn default_context_size() -> u32 {
@@ -882,7 +1138,416 @@ pub use mlx_backend::MlxBackend;
 #[cfg(feature = "trt-llm")]
 pub use trt_llm_backend::TrtLlmBackend;
 
+pub use piper_backend::PiperBackend;
 pub use stable_diffusion_cpp_backend::StableDiffusionCppBackend;
+pub use whisper_cpp_backend::WhisperCppBackend;
+
+mod whisper_cpp_backend {
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        validate_load_config, verify_artifact, wav_duration_seconds_ceil,
+        whisper_ggml_payload_path, ArtifactFormat, AudioTranscriptionOutput,
+        AudioTranscriptionRequest, EngineBackend, EngineError, GenerateOutput, GenerateRequest,
+        LoadConfig, LoadedModelInfo, Result, TokenSink, Tokenization,
+    };
+
+    static WHISPER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    pub struct WhisperCppBackend {
+        binary: PathBuf,
+        loaded: Option<LoadedModelInfo>,
+        config: Option<LoadConfig>,
+    }
+
+    impl WhisperCppBackend {
+        pub fn new() -> Result<Self> {
+            let binary = env::var_os("MAYHEM_WHISPER_CPP_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("whisper-cli"));
+            Ok(Self::with_binary(binary))
+        }
+
+        pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
+            Self {
+                binary: binary.into(),
+                loaded: None,
+                config: None,
+            }
+        }
+
+        fn config(&self) -> Result<&LoadConfig> {
+            self.config.as_ref().ok_or(EngineError::NotLoaded)
+        }
+    }
+
+    impl EngineBackend for WhisperCppBackend {
+        fn backend_id(&self) -> &'static str {
+            "whisper.cpp"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::WhisperGgml {
+                return Err(EngineError::InvalidConfig(format!(
+                    "whisper.cpp backend requires whisper ggml models, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+            let info = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact.clone(),
+                ctx_size: config.ctx_size,
+                n_ctx_train: 0,
+                n_vocab: 0,
+            };
+            self.loaded = Some(info.clone());
+            self.config = Some(config);
+            Ok(info)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            Ok(Tokenization {
+                token_ids: text
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(index, _)| i32::try_from(index).unwrap_or(i32::MAX))
+                    .collect(),
+            })
+        }
+
+        fn generate(
+            &mut self,
+            _request: GenerateRequest,
+            _sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            Err(EngineError::InvalidConfig(
+                "whisper.cpp backend transcribes audio; use transcribe".to_owned(),
+            ))
+        }
+
+        fn transcribe(
+            &mut self,
+            request: AudioTranscriptionRequest,
+        ) -> Result<AudioTranscriptionOutput> {
+            if request.audio.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "audio transcription input cannot be empty".to_owned(),
+                ));
+            }
+            let config = self.config()?.clone();
+            let model_path = whisper_ggml_payload_path(&config.artifact.path)?;
+            let input_path = whisper_input_path(request.content_type.as_deref());
+            let output_base = whisper_output_base_path();
+            fs::write(&input_path, &request.audio)?;
+
+            let mut command = Command::new(&self.binary);
+            command
+                .arg("-m")
+                .arg(&model_path)
+                .arg("-f")
+                .arg(&input_path)
+                .arg("-otxt")
+                .arg("-of")
+                .arg(&output_base)
+                .arg("-nt");
+            if let Some(language) = request
+                .language
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                command.arg("-l").arg(language);
+            }
+            if let Some(prompt) = request.prompt.as_deref().filter(|value| !value.is_empty()) {
+                command.arg("--prompt").arg(prompt);
+            }
+            let output = command.output().map_err(|err| {
+                EngineError::WhisperCpp(format!("starting {} failed: {err}", self.binary.display()))
+            })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let _ = fs::remove_file(&input_path);
+                return Err(EngineError::WhisperCpp(format!(
+                    "{} exited with {}; stderr={stderr:?}; stdout={stdout:?}",
+                    self.binary.display(),
+                    output.status
+                )));
+            }
+            let transcript_path = output_base.with_extension("txt");
+            let text = fs::read_to_string(&transcript_path)
+                .map_err(|err| {
+                    EngineError::WhisperCpp(format!(
+                        "{} did not create transcript {}: {err}",
+                        self.binary.display(),
+                        transcript_path.display()
+                    ))
+                })?
+                .trim()
+                .to_owned();
+            let _ = fs::remove_file(&input_path);
+            let _ = fs::remove_file(&transcript_path);
+            if text.is_empty() {
+                return Err(EngineError::WhisperCpp(
+                    "whisper.cpp produced an empty transcript".to_owned(),
+                ));
+            }
+            Ok(AudioTranscriptionOutput {
+                text,
+                audio_seconds: wav_duration_seconds_ceil(&request.audio).unwrap_or(1),
+            })
+        }
+    }
+
+    fn whisper_input_path(content_type: Option<&str>) -> PathBuf {
+        let extension = match content_type.unwrap_or("audio/wav") {
+            "audio/mpeg" | "audio/mp3" => "mp3",
+            "audio/flac" => "flac",
+            "audio/ogg" => "ogg",
+            _ => "wav",
+        };
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = WHISPER_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "mayhem-whisper-{}-{nanos}-{seq}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    fn whisper_output_base_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = WHISPER_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "mayhem-whisper-out-{}-{nanos}-{seq}",
+            std::process::id()
+        ))
+    }
+}
+
+mod piper_backend {
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        piper_voice_model_path, piper_voice_paths, validate_load_config, verify_artifact,
+        wav_duration_seconds_ceil, ArtifactChunk, ArtifactFormat, ArtifactSink, EngineBackend,
+        EngineError, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, PiperVoicePaths,
+        Result, SpeechOutput, SpeechRequest, TokenSink, Tokenization,
+    };
+
+    static PIPER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    pub struct PiperBackend {
+        binary: PathBuf,
+        loaded: Option<LoadedModelInfo>,
+        config: Option<LoadConfig>,
+    }
+
+    impl PiperBackend {
+        pub fn new() -> Result<Self> {
+            let binary = env::var_os("MAYHEM_PIPER_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("piper"));
+            Ok(Self::with_binary(binary))
+        }
+
+        pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
+            Self {
+                binary: binary.into(),
+                loaded: None,
+                config: None,
+            }
+        }
+
+        fn config(&self) -> Result<&LoadConfig> {
+            self.config.as_ref().ok_or(EngineError::NotLoaded)
+        }
+    }
+
+    impl EngineBackend for PiperBackend {
+        fn backend_id(&self) -> &'static str {
+            "piper"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::PiperVoice {
+                return Err(EngineError::InvalidConfig(format!(
+                    "piper backend requires Piper voice artifacts, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+            if let Some(piper_config) = &config.piper_config {
+                if piper_config.format != ArtifactFormat::PiperConfig {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "piper config sidecar must use PiperConfig format, got {:?}",
+                        piper_config.format
+                    )));
+                }
+                verify_artifact(piper_config)?;
+            } else {
+                piper_voice_paths(&config.artifact.path)?;
+            }
+            let info = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact.clone(),
+                ctx_size: config.ctx_size,
+                n_ctx_train: 0,
+                n_vocab: 0,
+            };
+            self.loaded = Some(info.clone());
+            self.config = Some(config);
+            Ok(info)
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            Ok(Tokenization {
+                token_ids: text.chars().map(|ch| ch as i32).collect(),
+            })
+        }
+
+        fn generate(
+            &mut self,
+            _request: GenerateRequest,
+            _sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            Err(EngineError::InvalidConfig(
+                "piper backend synthesizes speech; use synthesize_speech".to_owned(),
+            ))
+        }
+
+        fn synthesize_speech(
+            &mut self,
+            request: SpeechRequest,
+            artifact_sink: &mut dyn ArtifactSink,
+        ) -> Result<SpeechOutput> {
+            if request.input.trim().is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "speech synthesis input cannot be empty".to_owned(),
+                ));
+            }
+            let format = request
+                .response_format
+                .as_deref()
+                .unwrap_or("wav")
+                .to_ascii_lowercase();
+            if format != "wav" {
+                return Err(EngineError::InvalidConfig(format!(
+                    "piper backend currently emits wav audio, got response_format={format}"
+                )));
+            }
+            let config = self.config()?.clone();
+            let voice = if let Some(piper_config) = &config.piper_config {
+                PiperVoicePaths {
+                    model: piper_voice_model_path(&config.artifact.path)?,
+                    config: piper_config.path.clone(),
+                }
+            } else {
+                piper_voice_paths(&config.artifact.path)?
+            };
+            let input_path = piper_input_path();
+            let output_path = piper_output_path();
+            fs::write(&input_path, &request.input)?;
+
+            let mut command = Command::new(&self.binary);
+            command
+                .arg("-m")
+                .arg(&voice.model)
+                .arg("-c")
+                .arg(&voice.config)
+                .arg("-i")
+                .arg(&input_path)
+                .arg("-f")
+                .arg(&output_path);
+            if let Some(speed) = request
+                .speed
+                .filter(|value| value.is_finite() && *value > 0.0)
+            {
+                let length_scale = (1.0 / speed).clamp(0.25, 4.0);
+                command.arg("--length-scale").arg(length_scale.to_string());
+            }
+            let output = command.output().map_err(|err| {
+                EngineError::Piper(format!("starting {} failed: {err}", self.binary.display()))
+            })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let _ = fs::remove_file(&input_path);
+                return Err(EngineError::Piper(format!(
+                    "{} exited with {}; stderr={stderr:?}; stdout={stdout:?}",
+                    self.binary.display(),
+                    output.status
+                )));
+            }
+            let bytes = fs::read(&output_path).map_err(|err| {
+                EngineError::Piper(format!(
+                    "{} did not create readable output {}: {err}",
+                    self.binary.display(),
+                    output_path.display()
+                ))
+            })?;
+            let _ = fs::remove_file(&input_path);
+            let _ = fs::remove_file(&output_path);
+            if bytes.len() < 44 || !bytes.starts_with(b"RIFF") {
+                return Err(EngineError::Piper(
+                    "piper produced invalid or empty wav output".to_owned(),
+                ));
+            }
+            let audio_seconds = wav_duration_seconds_ceil(&bytes).unwrap_or(1);
+            artifact_sink.on_artifact_chunk(ArtifactChunk {
+                artifact_id: "speech-1".to_owned(),
+                index: 0,
+                content_type: "audio/wav".to_owned(),
+                bytes,
+                final_chunk: true,
+            })?;
+            Ok(SpeechOutput { audio_seconds })
+        }
+    }
+
+    fn piper_input_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = PIPER_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "mayhem-piper-{}-{nanos}-{seq}.txt",
+            std::process::id()
+        ))
+    }
+
+    fn piper_output_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = PIPER_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "mayhem-piper-{}-{nanos}-{seq}.wav",
+            std::process::id()
+        ))
+    }
+}
 
 mod stable_diffusion_cpp_backend {
     use std::env;
@@ -1202,6 +1867,224 @@ printf '\211PNG\r\n\032\n' > "$out"
         let header = b"{}";
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend_from_slice(header);
+        bytes
+    }
+}
+
+#[cfg(all(test, unix))]
+mod audio_backend_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn whisper_cpp_backend_transcribes_with_cli_output() {
+        let root =
+            std::env::temp_dir().join(format!("mayhem-engine-whisper-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("ggml-tiny.en.bin");
+        fs::write(&model, b"ggml-whisper-fixture").unwrap();
+        let whisper_cli = root.join("whisper-cli");
+        fs::write(
+            &whisper_cli,
+            r#"#!/bin/sh
+out=""
+lang=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    out="$1"
+  elif [ "$1" = "-l" ]; then
+    shift
+    lang="$1"
+  fi
+  shift
+done
+[ "$lang" = "en" ] || exit 24
+printf 'hello mayhem\n' > "$out.txt"
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&whisper_cli).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&whisper_cli, permissions).unwrap();
+
+        let mut backend = WhisperCppBackend::with_binary(&whisper_cli);
+        backend.load(LoadConfig::whisper_ggml(&model)).unwrap();
+        let output = backend
+            .transcribe(AudioTranscriptionRequest {
+                audio: tiny_wav_bytes(32_000),
+                content_type: Some("audio/wav".to_owned()),
+                language: Some("en".to_owned()),
+                prompt: None,
+            })
+            .unwrap();
+
+        assert_eq!(output.text, "hello mayhem");
+        assert_eq!(output.audio_seconds, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn piper_backend_emits_wav_artifact() {
+        let root =
+            std::env::temp_dir().join(format!("mayhem-engine-piper-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
+        let model = root.join("voice.onnx");
+        let config = root.join("config").join("voice-config.json");
+        let fixture = root.join("fixture.wav");
+        fs::write(&model, b"onnx fixture").unwrap();
+        fs::write(&config, br#"{"audio":{"sample_rate":16000}}"#).unwrap();
+        fs::write(&fixture, tiny_wav_bytes(16_000)).unwrap();
+        let piper = root.join("piper");
+        fs::write(
+            &piper,
+            format!(
+                r#"#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-f" ]; then
+    shift
+    out="$1"
+  fi
+  shift
+done
+cp "{}" "$out"
+"#,
+                fixture.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&piper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&piper, permissions).unwrap();
+
+        let mut backend = PiperBackend::with_binary(&piper);
+        let mut load_config = LoadConfig::piper_voice(&model);
+        load_config.piper_config = Some(ModelArtifact::piper_config(&config));
+        backend.load(load_config).unwrap();
+        let mut artifacts = Vec::new();
+        let output = backend
+            .synthesize_speech(
+                SpeechRequest {
+                    input: "hello".to_owned(),
+                    voice: Some("launch".to_owned()),
+                    response_format: Some("wav".to_owned()),
+                    speed: Some(1.0),
+                },
+                &mut |chunk| {
+                    artifacts.push(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.audio_seconds, 1);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id, "speech-1");
+        assert_eq!(artifacts[0].content_type, "audio/wav");
+        assert!(artifacts[0].bytes.starts_with(b"RIFF"));
+        assert!(artifacts[0].final_chunk);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn whisper_cpp_backend_real_model_smoke_when_enabled() {
+        if std::env::var_os("MAYHEM_RUN_AUDIO_REAL").is_none() {
+            return;
+        }
+        let binary = std::env::var_os("MAYHEM_WHISPER_CPP_BIN")
+            .map(PathBuf::from)
+            .expect("MAYHEM_WHISPER_CPP_BIN must point to whisper-cli");
+        let model = std::env::var_os("MAYHEM_WHISPER_MODEL")
+            .map(PathBuf::from)
+            .expect("MAYHEM_WHISPER_MODEL must point to ggml-tiny.en.bin");
+        let audio = std::env::var_os("MAYHEM_WHISPER_AUDIO")
+            .map(PathBuf::from)
+            .expect("MAYHEM_WHISPER_AUDIO must point to a real wav file");
+
+        let mut backend = WhisperCppBackend::with_binary(binary);
+        backend.load(LoadConfig::whisper_ggml(model)).unwrap();
+        let output = backend
+            .transcribe(AudioTranscriptionRequest {
+                audio: fs::read(audio).unwrap(),
+                content_type: Some("audio/wav".to_owned()),
+                language: Some("en".to_owned()),
+                prompt: None,
+            })
+            .unwrap();
+
+        assert!(
+            output.text.to_ascii_lowercase().contains("hello")
+                && output.text.to_ascii_lowercase().contains("world"),
+            "unexpected transcript: {:?}",
+            output.text
+        );
+        assert!(output.audio_seconds >= 1);
+    }
+
+    #[test]
+    fn piper_backend_real_model_smoke_when_enabled() {
+        if std::env::var_os("MAYHEM_RUN_AUDIO_REAL").is_none() {
+            return;
+        }
+        let binary = std::env::var_os("MAYHEM_PIPER_BIN")
+            .map(PathBuf::from)
+            .expect("MAYHEM_PIPER_BIN must point to piper");
+        let model = std::env::var_os("MAYHEM_PIPER_MODEL")
+            .map(PathBuf::from)
+            .expect("MAYHEM_PIPER_MODEL must point to a Piper .onnx voice");
+
+        let mut backend = PiperBackend::with_binary(binary);
+        backend.load(LoadConfig::piper_voice(model)).unwrap();
+        let mut artifacts = Vec::new();
+        let output = backend
+            .synthesize_speech(
+                SpeechRequest {
+                    input: "hello mayhem".to_owned(),
+                    voice: None,
+                    response_format: Some("wav".to_owned()),
+                    speed: Some(1.0),
+                },
+                &mut |chunk| {
+                    artifacts.push(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(output.audio_seconds >= 1);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].content_type, "audio/wav");
+        assert!(artifacts[0].bytes.starts_with(b"RIFF"));
+        assert!(artifacts[0].bytes.len() > 1024);
+    }
+
+    fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
+        let sample_rate = 16_000u32;
+        let channels = 1u16;
+        let bits_per_sample = 16u16;
+        let bytes_per_sample = u32::from(channels) * u32::from(bits_per_sample) / 8;
+        let data_len = sample_count * bytes_per_sample;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * bytes_per_sample).to_le_bytes());
+        bytes.extend_from_slice(&(bytes_per_sample as u16).to_le_bytes());
+        bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(44 + data_len as usize, 0);
         bytes
     }
 }
