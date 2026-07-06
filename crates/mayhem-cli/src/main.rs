@@ -18853,6 +18853,23 @@ struct HeartbeatContext<'a> {
     attestation_head: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProviderLoadSnapshot {
+    active_slots: u64,
+    queue_depth: u64,
+    est_wait_ms: u64,
+}
+
+impl ProviderLoadSnapshot {
+    fn from_sessions(sessions: &HashMap<String, ActiveProviderSession>) -> Self {
+        Self {
+            active_slots: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+            queue_depth: 0,
+            est_wait_ms: 0,
+        }
+    }
+}
+
 struct ProviderSessionContext<'a> {
     args: &'a ProviderStartArgs,
     keypair_path: &'a Path,
@@ -22507,7 +22524,16 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
     let mut sent = Vec::new();
     let count = u64::from(ctx.args.heartbeat_count.max(1));
     for seq in 0..count {
-        sent.extend(send_provider_heartbeat_round(&mut bridge, &ctx, seq, seq == 0).await?);
+        sent.extend(
+            send_provider_heartbeat_round(
+                &mut bridge,
+                &ctx,
+                seq,
+                seq == 0,
+                ProviderLoadSnapshot::default(),
+            )
+            .await?,
+        );
     }
     Ok(sent)
 }
@@ -22517,6 +22543,7 @@ async fn send_provider_heartbeat_round(
     ctx: &HeartbeatContext<'_>,
     seq: u64,
     join_rooms: bool,
+    load: ProviderLoadSnapshot,
 ) -> Result<Vec<Value>> {
     let mut sent = Vec::new();
     let caps = provider_heartbeat_caps(ctx.selected);
@@ -22536,14 +22563,14 @@ async fn send_provider_heartbeat_round(
             "enclave_id": ctx.selected.enclave.enclave_id,
             "model_id": ctx.selected.enclave.model_id,
             "room_id": room.room_id,
-            "sat": 0.0,
+            "sat": provider_saturation(load.active_slots, ctx.selected.verdict.max_sessions),
             "slots": {
-                "active": 0,
+                "active": load.active_slots,
                 "max": ctx.selected.verdict.max_sessions,
             },
             "q": {
-                "depth": 0,
-                "est_wait_ms": 0,
+                "depth": load.queue_depth,
+                "est_wait_ms": load.est_wait_ms,
             },
             "perf": {
                 "tok_s": ctx.selected.verdict.est_tok_s,
@@ -22583,6 +22610,13 @@ async fn send_provider_heartbeat_round(
         }));
     }
     Ok(sent)
+}
+
+fn provider_saturation(active_slots: u64, max_sessions: u32) -> f64 {
+    if max_sessions == 0 {
+        return 0.0;
+    }
+    (active_slots as f64 / f64::from(max_sessions)).min(1.0)
 }
 
 fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
@@ -22663,6 +22697,7 @@ async fn serve_provider_sessions(
                 &heartbeat_ctx,
                 heartbeat_seq,
                 !heartbeat_rooms_joined,
+                ProviderLoadSnapshot::from_sessions(&sessions),
             )
             .await?;
             heartbeat_rooms_joined = true;
@@ -31447,6 +31482,31 @@ mod tests {
 
         selected.enclave.backend = "vllm".to_owned();
         assert!(provider_heartbeat_caps(&selected).tools);
+    }
+
+    #[test]
+    fn provider_load_snapshot_counts_reserved_sessions() {
+        let mut sessions = HashMap::new();
+        for id in ["s1", "s2"] {
+            sessions.insert(
+                id.to_owned(),
+                ActiveProviderSession {
+                    remote: format!("remote-{id}"),
+                    rail: "fiat".to_owned(),
+                    user_pubkey: "aa".repeat(32),
+                    session_id: id.to_owned(),
+                    checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                },
+            );
+        }
+
+        let snapshot = ProviderLoadSnapshot::from_sessions(&sessions);
+
+        assert_eq!(snapshot.active_slots, 2);
+        assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(snapshot.est_wait_ms, 0);
+        assert_eq!(provider_saturation(snapshot.active_slots, 4), 0.5);
+        assert_eq!(provider_saturation(snapshot.active_slots, 0), 0.0);
     }
 
     #[test]
