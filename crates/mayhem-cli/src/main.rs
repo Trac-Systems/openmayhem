@@ -817,6 +817,26 @@ struct UseArgs {
     /// Development smoke only: use the embedded catalog instead of contract-backed canonical models.
     #[arg(long)]
     dev_embedded_catalog: bool,
+
+    /// Development smoke only: use a local catalog fixture while keeping contract-backed routing.
+    #[arg(long, value_name = "PATH", hide = true)]
+    dev_catalog_path: Option<PathBuf>,
+
+    /// Development smoke only: path to detached signature for --dev-catalog-path.
+    #[arg(long, value_name = "PATH", hide = true)]
+    dev_signature_path: Option<PathBuf>,
+
+    /// Development smoke only: catalog public-key directory for --dev-catalog-path.
+    #[arg(long, value_name = "PATH", hide = true)]
+    dev_keys_dir: Option<PathBuf>,
+
+    /// Development smoke only: canary set directory for --dev-catalog-path.
+    #[arg(long, value_name = "PATH", hide = true)]
+    dev_canaries_dir: Option<PathBuf>,
+
+    /// Development smoke only: trust --dev-catalog-path without detached signature verification.
+    #[arg(long, hide = true)]
+    dev_skip_catalog_verify: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -13176,6 +13196,22 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
+    let uses_dev_local_catalog = args.dev_catalog_path.is_some()
+        || args.dev_signature_path.is_some()
+        || args.dev_keys_dir.is_some()
+        || args.dev_canaries_dir.is_some()
+        || args.dev_skip_catalog_verify;
+    if args.dev_embedded_catalog && uses_dev_local_catalog {
+        bail!("--dev-embedded-catalog cannot be combined with local dev catalog options");
+    }
+    if uses_dev_local_catalog {
+        if !cfg!(debug_assertions) {
+            bail!("local dev catalog options are only available in debug builds");
+        }
+        if args.dev_catalog_path.is_none() {
+            bail!("--dev-catalog-path is required when using local dev catalog options");
+        }
+    }
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
@@ -13237,29 +13273,89 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         } else {
             let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
             let rpc = PeerRpcClient::new(&rpc_url)?;
-            let catalog_client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .context("building catalog release HTTP client")?;
-            let release = read_catalog_release_anchor(&rpc).await?;
-            let catalog_files =
-                fetch_catalog_release_files(&catalog_client, &home, &release).await?;
-            let catalog_doc =
-                catalog::load_document(&catalog_files.catalog_path).with_context(|| {
-                    format!(
-                        "loading verified ledger catalog {}",
-                        catalog_files.catalog_path.display()
+            let (catalog_doc, catalog_json, catalog_source) =
+                if let Some(dev_catalog_path) = args.dev_catalog_path.clone() {
+                    let catalog_path = absolutize(dev_catalog_path)?;
+                    let catalog_hash = if args.dev_skip_catalog_verify {
+                        blake3_file_hex(&catalog_path)?
+                    } else {
+                        let signature_path =
+                            args.dev_signature_path.clone().map(Ok).unwrap_or_else(|| {
+                                repo_path("catalog/signatures/models.json.sig")
+                            })?;
+                        let signature_path = absolutize(signature_path)?;
+                        let keys_dir = args
+                            .dev_keys_dir
+                            .clone()
+                            .map(Ok)
+                            .unwrap_or_else(|| repo_path("catalog/keys"))?;
+                        let keys_dir = absolutize(keys_dir)?;
+                        let canaries_dir = args
+                            .dev_canaries_dir
+                            .clone()
+                            .map(Ok)
+                            .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+                        let canaries_dir = absolutize(canaries_dir)?;
+                        let report = catalog::verify(catalog::VerifyOptions {
+                            catalog_path: catalog_path.clone(),
+                            signature_path,
+                            keys_dir,
+                            canaries_dir,
+                            check_dev_downloads: false,
+                            check_launch_sources: false,
+                            hf_token_file: None,
+                        })?;
+                        if !report.ok {
+                            bail!("local dev catalog verification failed");
+                        }
+                        report.catalog_hash
+                    };
+                    let catalog_doc = catalog::load_document(&catalog_path).with_context(|| {
+                        format!("loading local dev catalog {}", catalog_path.display())
+                    })?;
+                    let catalog_json = fs::read_to_string(&catalog_path).with_context(|| {
+                        format!("reading local dev catalog {}", catalog_path.display())
+                    })?;
+                    let trust = if args.dev_skip_catalog_verify {
+                        "dev-local-unverified"
+                    } else {
+                        "dev-local-signed"
+                    };
+                    (
+                        catalog_doc,
+                        catalog_json,
+                        format!("contract:{rpc_url}; catalog:{trust}:{catalog_hash}"),
                     )
-                })?;
-            let catalog_json =
-                fs::read_to_string(&catalog_files.catalog_path).with_context(|| {
-                    format!(
-                        "reading verified ledger catalog {}",
-                        catalog_files.catalog_path.display()
+                } else {
+                    let catalog_client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                        .context("building catalog release HTTP client")?;
+                    let release = read_catalog_release_anchor(&rpc).await?;
+                    let catalog_files =
+                        fetch_catalog_release_files(&catalog_client, &home, &release).await?;
+                    let catalog_doc = catalog::load_document(&catalog_files.catalog_path)
+                        .with_context(|| {
+                            format!(
+                                "loading verified ledger catalog {}",
+                                catalog_files.catalog_path.display()
+                            )
+                        })?;
+                    let catalog_json = fs::read_to_string(&catalog_files.catalog_path)
+                        .with_context(|| {
+                            format!(
+                                "reading verified ledger catalog {}",
+                                catalog_files.catalog_path.display()
+                            )
+                        })?;
+                    (
+                        catalog_doc,
+                        catalog_json,
+                        format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
                     )
-                })?;
+                };
             let canary_registry = GatewayState::canary_registry_from_catalog_json(&catalog_json)
-                .context("loading canary registry from verified ledger catalog")?;
+                .context("loading canary registry from gateway catalog")?;
             let wallet_password = args.wallet_password.clone().unwrap_or_default();
             let wallet = resolve_cli_wallet_with_keypair(
                 &home,
@@ -13343,7 +13439,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                     .with_receipt_user_seed(user_seed)
                     .with_receipt_balance_mu(balance_mu)
                     .with_session_backend(Arc::new(backend)),
-                format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
+                catalog_source,
                 Some(model_count),
                 format!("sc-bridge-direct-session:{sc_bridge_url}"),
                 Some(wallet.public_key),

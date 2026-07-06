@@ -169,6 +169,13 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
   let dataEvents = 0;
   let jsonEvents = 0;
   let doneSeen = false;
+  const startedAt = Date.now();
+  let responseHeadersAt = null;
+  let firstChunkAt = null;
+  let firstDataAt = null;
+  let firstJsonAt = null;
+  let firstContentAt = null;
+  let doneAt = null;
   try {
     const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -182,6 +189,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
       }),
       signal: controller.signal,
     });
+    responseHeadersAt = Date.now();
     if (!response.ok) {
       const text = await response.text();
       fail(`streaming chat returned HTTP ${response.status}: ${text}`);
@@ -195,8 +203,10 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
       const data = line.slice(5).trim();
       if (!data) return;
       dataEvents += 1;
+      if (firstDataAt === null) firstDataAt = Date.now();
       if (data === '[DONE]') {
         doneSeen = true;
+        doneAt = Date.now();
         return;
       }
       let value;
@@ -206,15 +216,22 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
         return;
       }
       jsonEvents += 1;
+      if (firstJsonAt === null) firstJsonAt = Date.now();
       const choice = Array.isArray(value.choices) ? value.choices[0] : null;
       const delta = choice?.delta?.content;
       const message = choice?.message?.content;
-      if (typeof delta === 'string') content += delta;
-      else if (typeof message === 'string') content += message;
+      if (typeof delta === 'string') {
+        if (delta.length > 0 && firstContentAt === null) firstContentAt = Date.now();
+        content += delta;
+      } else if (typeof message === 'string') {
+        if (message.length > 0 && firstContentAt === null) firstContentAt = Date.now();
+        content += message;
+      }
     };
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      if (firstChunkAt === null) firstChunkAt = Date.now();
       const chunk = decoder.decode(value, { stream: true });
       raw += chunk;
       buffer += chunk;
@@ -234,6 +251,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
   fs.writeFileSync(rawPath, raw);
   if (dataEvents === 0) fail('streaming chat produced no SSE data events');
   if (!content.trim()) fail(`streaming chat produced no model content; raw saved at ${rawPath}`);
+  const completedAt = doneAt || Date.now();
   const summary = {
     ok: true,
     model: modelId,
@@ -244,6 +262,14 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs = 
     data_events: dataEvents,
     json_events: jsonEvents,
     done_seen: doneSeen,
+    timing_ms: {
+      response_headers: responseHeadersAt === null ? null : responseHeadersAt - startedAt,
+      first_chunk: firstChunkAt === null ? null : firstChunkAt - startedAt,
+      first_data: firstDataAt === null ? null : firstDataAt - startedAt,
+      first_json: firstJsonAt === null ? null : firstJsonAt - startedAt,
+      first_content: firstContentAt === null ? null : firstContentAt - startedAt,
+      total: completedAt - startedAt,
+    },
     raw_path: path.relative(ROOT, rawPath),
   };
   writeJson(summaryPath, summary);
@@ -1599,6 +1625,8 @@ async function main() {
       '--session-open-timeout-seconds', String(sessionOpenTimeoutSeconds),
       '--session-ttft-timeout-seconds', String(sessionTtftTimeoutSeconds),
       '--session-frame-timeout-seconds', String(sessionFrameTimeoutSeconds),
+      '--dev-catalog-path', tempCatalogPath,
+      '--dev-skip-catalog-verify',
       '--bind', `127.0.0.1:${gatewayPort}`,
       '--json',
     ],
