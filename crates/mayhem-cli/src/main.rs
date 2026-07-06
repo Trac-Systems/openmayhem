@@ -51,9 +51,10 @@ use mayhem_hwprobe::{
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
     supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
-    AttestationRuntimeConfig, CatalogEnclaveIdentity, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
-    USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    AttestationRuntimeConfig, CatalogEnclaveIdentity, CheckpointPolicy, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18715,6 +18716,7 @@ struct ActiveProviderSession {
     user_pubkey: String,
     session_id: String,
     rail: String,
+    checkpoint_every: CheckpointPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -22585,6 +22587,8 @@ async fn handle_provider_session_frame(
             match decision {
                 ProviderSessionDecision::Accept => {
                     provider_session_debug(format!("sending s.accept for session {session_id}"));
+                    let checkpoint_every = provider_session_frame_checkpoint_policy(&frame)
+                        .context("accepted s.open missing checkpoint policy")?;
                     sessions.insert(
                         session_id.clone(),
                         ActiveProviderSession {
@@ -22596,6 +22600,7 @@ async fn handle_provider_session_frame(
                                 .unwrap_or_default()
                                 .to_owned(),
                             session_id: session_id.clone(),
+                            checkpoint_every,
                         },
                     );
                     let ts = unix_epoch_millis()?;
@@ -22800,7 +22805,11 @@ async fn send_provider_session_output(
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     let mut index = 0_u64;
+    let mut receipt_seq = 1_u64;
+    let checkpoint_tokens = provider_session_checkpoint_tokens(active);
+    let mut last_checkpoint_tokens = 0_u64;
     if output.tool.is_none() {
+        let mut delivered_content = String::new();
         for part in provider_stream_parts(&output.content) {
             provider_session_debug(format!(
                 "sending content s.delta #{index} for session {} request {request_id}",
@@ -22823,6 +22832,39 @@ async fn send_provider_session_output(
                 .context("sending content s.delta")?;
             maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
+            delivered_content.push_str(&part);
+            let delivered_tokens = rough_text_tokens(&delivered_content);
+            if provider_session_checkpoint_due(
+                delivered_tokens,
+                output.usage.output_tokens(),
+                last_checkpoint_tokens,
+                checkpoint_tokens,
+            ) {
+                let usage = ReceiptUsage::text(output.prompt_tokens, delivered_tokens);
+                let receipt = provider_session_receipt_for_usage(
+                    terms,
+                    active,
+                    body,
+                    usage,
+                    receipt_seq,
+                    false,
+                    runtime_keypair,
+                )
+                .context("building provider session checkpoint receipt")?;
+                send_provider_session_receipt_frame(
+                    bridge,
+                    active,
+                    request_id,
+                    &receipt,
+                    "checkpoint",
+                )
+                .await?;
+                wait_for_provider_receipt_ack(bridge, active, &receipt, Duration::from_secs(5))
+                    .await
+                    .context("waiting for checkpoint receipt ack")?;
+                last_checkpoint_tokens = delivered_tokens;
+                receipt_seq = receipt_seq.saturating_add(1);
+            }
         }
     }
 
@@ -22863,10 +22905,44 @@ async fn send_provider_session_output(
         .await
         .context("sending final s.delta")?;
 
-    let receipt = provider_session_receipt(terms, active, body, output, runtime_keypair)
-        .context("building provider session receipt")?;
+    let receipt = provider_session_receipt_for_usage(
+        terms,
+        active,
+        body,
+        output.usage.clone(),
+        receipt_seq,
+        true,
+        runtime_keypair,
+    )
+    .context("building provider session receipt")?;
+    send_provider_session_receipt_frame(bridge, active, request_id, &receipt, "final").await?;
+    Ok(receipt)
+}
+
+fn provider_session_checkpoint_tokens(active: &ActiveProviderSession) -> u64 {
+    active.checkpoint_every.tokens.max(1)
+}
+
+fn provider_session_checkpoint_due(
+    delivered_tokens: u64,
+    total_completion_tokens: u64,
+    last_checkpoint_tokens: u64,
+    checkpoint_tokens: u64,
+) -> bool {
+    delivered_tokens > 0
+        && delivered_tokens < total_completion_tokens
+        && delivered_tokens.saturating_sub(last_checkpoint_tokens) >= checkpoint_tokens
+}
+
+async fn send_provider_session_receipt_frame(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    receipt: &ProviderSignedSessionReceipt,
+    kind: &str,
+) -> Result<()> {
     provider_session_debug(format!(
-        "sending s.receipt seq {} for session {} request {request_id}",
+        "sending {kind} s.receipt seq {} for session {} request {request_id}",
         receipt.body.seq, active.session_id
     ));
     bridge
@@ -22883,7 +22959,7 @@ async fn send_provider_session_output(
         )
         .await
         .context("sending s.receipt")?;
-    Ok(receipt)
+    Ok(())
 }
 
 fn provider_session_artifact_delta_frames(
@@ -23146,6 +23222,7 @@ async fn send_provider_session_close(
     Ok(())
 }
 
+#[cfg(test)]
 fn provider_session_receipt(
     terms: &ProviderSessionTerms,
     active: &ActiveProviderSession,
@@ -23153,12 +23230,31 @@ fn provider_session_receipt(
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
-    let usage = output.usage.clone();
+    provider_session_receipt_for_usage(
+        terms,
+        active,
+        body,
+        output.usage.clone(),
+        1,
+        true,
+        runtime_keypair,
+    )
+}
+
+fn provider_session_receipt_for_usage(
+    terms: &ProviderSessionTerms,
+    active: &ActiveProviderSession,
+    body: &Value,
+    usage: ReceiptUsage,
+    seq: u64,
+    final_receipt: bool,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<ProviderSignedSessionReceipt> {
     let receipt_body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: active.session_id.clone(),
-        seq: 1,
-        final_receipt: true,
+        seq,
+        final_receipt,
         rail: active.rail.clone(),
         user: active.user_pubkey.clone(),
         provider: terms.provider.clone(),
@@ -24141,6 +24237,14 @@ fn provider_session_frame_rail(frame: &Value) -> Option<&str> {
     frame.get("rail").and_then(Value::as_str)
 }
 
+fn provider_session_frame_checkpoint_policy(frame: &Value) -> Option<CheckpointPolicy> {
+    frame
+        .get("voucher")
+        .and_then(|voucher| voucher.get("checkpoint_every"))
+        .cloned()
+        .and_then(|policy| serde_json::from_value::<CheckpointPolicy>(policy).ok())
+}
+
 fn frame_contract_version(frame: &Value) -> Option<u32> {
     frame
         .get("contract_version")
@@ -24957,10 +25061,11 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         .map(provider_message_to_text)
     {
         let content = format!("Tool result received: {tool_result}");
+        let completion_tokens = rough_text_tokens(&content);
         return ProviderSessionOutput {
-            usage: ReceiptUsage::text(prompt_tokens, rough_text_tokens(&content)),
-            completion_tokens: rough_text_tokens(&content),
-            token_ids: content.bytes().map(i32::from).collect(),
+            usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
+            completion_tokens,
+            token_ids: synthetic_provider_token_ids(completion_tokens),
             content,
             tool: None,
             embeddings: None,
@@ -25018,10 +25123,11 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             provider_last_user_text(messages)
         )
     };
+    let completion_tokens = rough_text_tokens(&content);
     ProviderSessionOutput {
-        usage: ReceiptUsage::text(prompt_tokens, rough_text_tokens(&content)),
-        completion_tokens: rough_text_tokens(&content),
-        token_ids: content.bytes().map(i32::from).collect(),
+        usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
+        completion_tokens,
+        token_ids: synthetic_provider_token_ids(completion_tokens),
         content,
         tool: None,
         embeddings: None,
@@ -25210,6 +25316,13 @@ fn rough_text_tokens(text: &str) -> u64 {
     } else {
         text.split_whitespace().count() as u64
     }
+}
+
+fn synthetic_provider_token_ids(count: u64) -> Vec<i32> {
+    let count = usize::try_from(count.min(i32::MAX as u64)).unwrap_or(i32::MAX as usize);
+    (0..count)
+        .map(|idx| i32::try_from(idx).unwrap_or(i32::MAX))
+        .collect()
 }
 
 fn is_hex_len(value: &str, len: usize) -> bool {
@@ -29516,6 +29629,7 @@ mod tests {
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
             rail: "fiat".to_owned(),
+            checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
             "messages": [
@@ -29567,6 +29681,62 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_checkpoint_receipt_is_cumulative_non_final_and_sequenced() {
+        let terms = test_provider_session_terms();
+        let active = ActiveProviderSession {
+            remote: "peer-a".to_owned(),
+            user_pubkey: "66".repeat(32),
+            session_id: "aa".repeat(32),
+            rail: "fiat".to_owned(),
+            checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hello mayhem" }],
+            "stream": true
+        });
+        let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
+        let usage = ReceiptUsage::text(2, 4);
+        let receipt = provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &body,
+            usage.clone(),
+            7,
+            false,
+            &runtime_keypair,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.body.seq, 7);
+        assert!(!receipt.body.final_receipt);
+        assert_eq!(receipt.body.usage, usage);
+        assert_eq!(
+            receipt.body.mu_owed_cum,
+            provider_session_mu_owed(&terms, &usage)
+        );
+
+        let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
+            .try_into()
+            .unwrap();
+        let sig_bytes: [u8; 64] = test_hex_decode(&receipt.enclave_sig).try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
+        let signature = Signature::from_bytes(&sig_bytes);
+        verifying_key
+            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_session_checkpoint_policy_bounds_unacked_output_window() {
+        assert!(!provider_session_checkpoint_due(0, 10, 0, 2));
+        assert!(!provider_session_checkpoint_due(1, 10, 0, 2));
+        assert!(provider_session_checkpoint_due(2, 10, 0, 2));
+        assert!(!provider_session_checkpoint_due(3, 10, 2, 2));
+        assert!(provider_session_checkpoint_due(4, 10, 2, 2));
+        assert!(!provider_session_checkpoint_due(10, 10, 8, 2));
+    }
+
+    #[test]
     fn provider_session_receipt_ack_verifies_user_signature() {
         let terms = test_provider_session_terms();
         let user_seed = [41_u8; 32];
@@ -29576,6 +29746,7 @@ mod tests {
             user_pubkey: hex_encode(&user_key.verifying_key().to_bytes()),
             session_id: "aa".repeat(32),
             rail: "fiat".to_owned(),
+            checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],

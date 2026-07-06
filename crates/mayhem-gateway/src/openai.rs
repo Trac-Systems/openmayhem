@@ -874,7 +874,7 @@ pub struct ToolCallOutput {
     pub arguments: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -3376,8 +3376,10 @@ impl ScBridgeGatewaySessionBackend {
             &mut bridge,
             &invocation.session_id,
             &request_id,
-            invocation.failover,
+            invocation,
             request,
+            provider,
+            model,
             &accept_info.enclave_pubkey,
         )
         .await
@@ -4658,15 +4660,19 @@ async fn collect_direct_session_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
     request_id: &str,
-    failover: GatewayFailoverInvocation,
+    invocation: &GatewaySessionInvocation,
     request: &ChatCompletionRequest,
+    provider: &str,
+    model: &GatewayModel,
     enclave_pubkey: &str,
 ) -> Result<DirectSessionCollected, GatewaySessionError> {
+    let failover = invocation.failover;
     let mut content = String::new();
     let mut tool_call = None;
     let mut finish_reason = None;
-    let mut usage = None;
-    let mut provider_receipt = None;
+    let mut claimed_usage = None;
+    let mut final_provider_receipt = None;
+    let mut latest_checkpoint_receipt = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
     let started_at_millis = now_millis_u64();
@@ -4678,7 +4684,7 @@ async fn collect_direct_session_output(
         failover.min_tok_s,
     );
 
-    while finish_reason.is_none() || provider_receipt.is_none() {
+    while finish_reason.is_none() || final_provider_receipt.is_none() {
         let remaining_millis = watchdog
             .next_wait_millis(now_millis_u64())
             .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
@@ -4697,7 +4703,7 @@ async fn collect_direct_session_output(
                 if let Some(partial) = interrupted_direct_session_partial(
                     &content,
                     tool_call.clone(),
-                    provider_receipt.as_ref(),
+                    latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
                     now,
@@ -4730,7 +4736,7 @@ async fn collect_direct_session_output(
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
                     finish_reason = Some(fin.to_owned());
-                    usage = usage_from_session_delta(&frame);
+                    claimed_usage = usage_from_session_delta(&frame);
                 }
                 if finish_reason.is_none() {
                     let output_tokens = streamed_output_token_count(&content, &token_ids);
@@ -4743,7 +4749,7 @@ async fn collect_direct_session_output(
                         if let Some(partial) = interrupted_direct_session_partial(
                             &content,
                             tool_call.clone(),
-                            provider_receipt.as_ref(),
+                            latest_checkpoint_receipt.as_ref(),
                             &token_ids,
                             &watchdog,
                             now,
@@ -4756,11 +4762,40 @@ async fn collect_direct_session_output(
                 }
             }
             Some("s.receipt") => {
-                provider_receipt = Some(provider_signed_receipt_from_frame(
-                    &frame,
-                    session_id,
-                    enclave_pubkey,
-                )?);
+                let receipt =
+                    provider_signed_receipt_from_frame(&frame, session_id, enclave_pubkey)?;
+                if receipt.body.final_receipt {
+                    final_provider_receipt = Some(receipt);
+                } else {
+                    let now = now_millis_u64();
+                    let partial = direct_session_checkpoint_partial(
+                        request,
+                        &content,
+                        tool_call.clone(),
+                        receipt.clone(),
+                        &token_ids,
+                        &watchdog,
+                        now,
+                    );
+                    let receipt_ack = direct_session_partial_receipt_ack(
+                        request, invocation, &partial, provider, model,
+                    )?;
+                    bridge
+                        .session_send(
+                            provider,
+                            session_id,
+                            json!({
+                                "t": "s.receipt_ack",
+                                "v": 1,
+                                "session_id": receipt_ack.session_id,
+                                "seq": receipt_ack.seq,
+                                "user_sig": receipt_ack.user_sig,
+                                "reason": "checkpoint",
+                            }),
+                        )
+                        .await?;
+                    latest_checkpoint_receipt = Some(receipt);
+                }
             }
             Some("s.error") => {
                 let code = frame
@@ -4775,7 +4810,7 @@ async fn collect_direct_session_output(
                 if let Some(partial) = interrupted_direct_session_partial(
                     &content,
                     tool_call.clone(),
-                    provider_receipt.as_ref(),
+                    latest_checkpoint_receipt.as_ref(),
                     &token_ids,
                     &watchdog,
                     now_millis_u64(),
@@ -4797,7 +4832,7 @@ async fn collect_direct_session_output(
                     if let Some(partial) = interrupted_direct_session_partial(
                         &content,
                         tool_call.clone(),
-                        provider_receipt.as_ref(),
+                        latest_checkpoint_receipt.as_ref(),
                         &token_ids,
                         &watchdog,
                         now_millis_u64(),
@@ -4815,8 +4850,15 @@ async fn collect_direct_session_output(
         }
     }
 
-    let prompt_text = chat_prompt_text(request);
-    let usage = usage.unwrap_or_else(|| usage_for(&prompt_text, &content));
+    let usage = observed_chat_usage(request, &content, &token_ids);
+    if let Some(claimed) = claimed_usage {
+        if claimed != usage {
+            return Err(GatewaySessionError::new(format!(
+                "provider reported usage {:?} did not match gateway-observed usage {:?}",
+                claimed, usage
+            )));
+        }
+    }
     let completed_at_millis = now_millis_u64();
     let quality = watchdog.first_delta_at_millis.map(|first_delta_at_millis| {
         let elapsed_millis = completed_at_millis.saturating_sub(started_at_millis).max(1);
@@ -4834,10 +4876,20 @@ async fn collect_direct_session_output(
             finish_reason: finish_reason.expect("loop ended with final delta"),
             usage,
         },
-        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        provider_receipt: final_provider_receipt.expect("loop ended with provider receipt"),
         token_ids,
         quality,
     })
+}
+
+fn observed_chat_usage(request: &ChatCompletionRequest, content: &str, token_ids: &[i32]) -> Usage {
+    let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+    let completion_tokens = streamed_output_token_count(content, token_ids);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    }
 }
 
 async fn collect_direct_session_embedding_output(
@@ -5280,6 +5332,42 @@ fn interrupted_direct_session_partial(
     })
 }
 
+fn direct_session_checkpoint_partial(
+    request: &ChatCompletionRequest,
+    content: &str,
+    tool_call: Option<ToolCallOutput>,
+    provider_receipt: ProviderSignedReceipt,
+    token_ids: &[i32],
+    watchdog: &DirectSessionWatchdog,
+    now_millis: u64,
+) -> GatewaySessionPartial {
+    let usage = observed_chat_usage(request, content, token_ids);
+    let quality =
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
+                tok_s: Some(
+                    (usage.completion_tokens as f64) * 1000.0
+                        / now_millis.saturating_sub(watchdog.started_at_millis).max(1) as f64,
+                ),
+            });
+    GatewaySessionPartial {
+        output: ChatOutput {
+            content: tool_call.is_none().then_some(content.to_owned()),
+            tool_call,
+            artifacts: Vec::new(),
+            finish_reason: "checkpoint".to_owned(),
+            usage,
+        },
+        provider_receipt,
+        token_ids: token_ids.to_vec(),
+        quality,
+        reason: "checkpoint".to_owned(),
+        redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
+    }
+}
+
 fn usage_from_receipt_usage(usage: &ReceiptUsage) -> Usage {
     let prompt_tokens = usage.input_tokens();
     let completion_tokens = usage.output_tokens();
@@ -5626,6 +5714,10 @@ fn direct_session_partial_receipt_ack(
         ));
     }
     let body = &partial.provider_receipt.body;
+    let usage = ReceiptUsage::text(
+        partial.output.usage.prompt_tokens,
+        partial.output.usage.completion_tokens,
+    );
     validate_provider_receipt(
         model,
         invocation,
@@ -5634,8 +5726,8 @@ fn direct_session_partial_receipt_ack(
             provider,
             seq: body.seq,
             final_receipt: false,
-            usage: body.usage.clone(),
-            mu_owed_cum: body.mu_owed_cum,
+            mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+            usage,
             prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
         },
     )?;
@@ -9003,6 +9095,10 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let body = &partial.provider_receipt.body;
+        let usage = ReceiptUsage::text(
+            partial.output.usage.prompt_tokens,
+            partial.output.usage.completion_tokens,
+        );
         let receipt = self.cosign_provider_receipt(
             model,
             invocation,
@@ -9011,8 +9107,8 @@ impl GatewayState {
                 provider: &provider,
                 seq: body.seq,
                 final_receipt: false,
-                usage: body.usage.clone(),
-                mu_owed_cum: body.mu_owed_cum,
+                mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+                usage,
                 prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
             },
         )?;
@@ -11068,12 +11164,88 @@ mod tests {
             .expect_err("wrong amount must be rejected");
         assert!(err.message.contains("amount"));
 
+        let mut wrong_usage = provider_receipt.clone();
+        wrong_usage.body.usage = ReceiptUsage::text(
+            output.usage.prompt_tokens,
+            output.usage.completion_tokens.saturating_add(1),
+        );
+        wrong_usage.body.mu_owed_cum =
+            calculate_mu_owed(&model.mayhem.price_ref_mu, &wrong_usage.body.usage);
+        wrong_usage.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&wrong_usage.body).unwrap(),
+        );
+        let err = direct_session_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &wrong_usage,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect_err("inflated provider usage must not receive a receipt ack");
+        assert!(err.message.contains("usage"));
+
         let mut wrong_sig = provider_receipt;
         wrong_sig.enclave_sig = "11".repeat(64);
         let err = state
             .meter_chat_session(&model, &request, &output, &invocation, Some(&wrong_sig))
             .expect_err("wrong enclave signature must be rejected");
         assert!(err.message.contains("signature"));
+    }
+
+    #[test]
+    fn partial_provider_receipt_must_match_gateway_observed_usage_before_ack() {
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let invocation = test_invocation();
+        let provider_receipt =
+            test_provider_receipt_with_finality(&model, &request, &output, &invocation, 1, false);
+        let partial = GatewaySessionPartial {
+            output: output.clone(),
+            provider_receipt: provider_receipt.clone(),
+            token_ids: vec![1, 2, 3],
+            quality: Some(GatewaySessionQuality {
+                ttft_ms: 10,
+                tok_s: Some(20.0),
+            }),
+            reason: "checkpoint".to_owned(),
+            redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
+        };
+
+        let ack = direct_session_partial_receipt_ack(
+            &request,
+            &invocation,
+            &partial,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect("matching partial receipt should be acked");
+        assert_eq!(ack.seq, provider_receipt.body.seq);
+
+        let mut inflated = partial;
+        inflated.provider_receipt.body.usage = ReceiptUsage::text(
+            output.usage.prompt_tokens,
+            output.usage.completion_tokens.saturating_add(1),
+        );
+        inflated.provider_receipt.body.mu_owed_cum = calculate_mu_owed(
+            &model.mayhem.price_ref_mu,
+            &inflated.provider_receipt.body.usage,
+        );
+        inflated.provider_receipt.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&inflated.provider_receipt.body).unwrap(),
+        );
+        let err = direct_session_partial_receipt_ack(
+            &request,
+            &invocation,
+            &inflated,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect_err("inflated partial receipt must not receive a receipt ack");
+        assert!(err.message.contains("usage"));
     }
 
     #[test]
