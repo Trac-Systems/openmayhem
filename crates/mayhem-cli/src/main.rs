@@ -3435,7 +3435,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, or llama.cpp.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -4182,6 +4182,7 @@ struct CatalogListReport {
     catalog_hash: String,
     key_id: String,
     tier_filter: String,
+    local_hardware: Option<CatalogListHardware>,
     authority: String,
     model_count: usize,
     artifact_count: usize,
@@ -4238,6 +4239,7 @@ struct CatalogListRequirements {
 struct CatalogListArtifact {
     artifact: String,
     engine: String,
+    compatibility: Option<CatalogArtifactCompatibility>,
     artifact_root: String,
     artifact_root_kind: String,
     weights_bytes: u64,
@@ -4250,6 +4252,22 @@ struct CatalogListArtifact {
     source_sha256: Option<String>,
     canary_fingerprint: Option<String>,
     notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListHardware {
+    source: String,
+    fixture: Option<String>,
+    host: String,
+    selected_backend: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogArtifactCompatibility {
+    compatible: bool,
+    status: String,
+    reason: String,
+    suggestion: Option<String>,
 }
 
 fn catalog_list(args: CatalogListArgs) -> Result<()> {
@@ -4302,6 +4320,7 @@ fn catalog_list(args: CatalogListArgs) -> Result<()> {
         verification.catalog_hash,
         verification.key_id,
         args.tier,
+        None,
     );
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -4318,12 +4337,13 @@ fn catalog_list_report(
     catalog_hash: String,
     key_id: String,
     tier: CatalogListTier,
+    hardware: Option<&HardwareReport>,
 ) -> CatalogListReport {
     let models = catalog_doc
         .models
         .iter()
         .filter(|model| catalog_list_tier_matches(model.tier.as_str(), tier))
-        .map(catalog_list_model)
+        .map(|model| catalog_list_model(model, hardware))
         .collect::<Vec<_>>();
     let artifact_count = models.iter().map(|model| model.artifacts.len()).sum();
     CatalogListReport {
@@ -4333,6 +4353,7 @@ fn catalog_list_report(
         catalog_hash,
         key_id,
         tier_filter: catalog_list_tier_name(tier).to_owned(),
+        local_hardware: hardware.map(catalog_list_hardware),
         authority: "admin-signed catalog; live routability still requires active contract ledger enclave, room, admin price, and provider join".to_owned(),
         model_count: models.len(),
         artifact_count,
@@ -4356,13 +4377,28 @@ fn catalog_list_tier_name(tier: CatalogListTier) -> &'static str {
     }
 }
 
-fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
+fn catalog_list_hardware(hardware: &HardwareReport) -> CatalogListHardware {
+    CatalogListHardware {
+        source: hardware.source.kind.clone(),
+        fixture: hardware.source.fixture.clone(),
+        host: format!("{}/{}", hardware.host.os, hardware.host.arch),
+        selected_backend: hardware.selected_backend.clone(),
+    }
+}
+
+fn catalog_list_model(
+    model: &catalog::CatalogModel,
+    hardware: Option<&HardwareReport>,
+) -> CatalogListModel {
     let artifacts = model
         .artifacts
         .iter()
         .map(|(artifact_name, artifact)| CatalogListArtifact {
             artifact: artifact_name.clone(),
             engine: artifact.engine.clone(),
+            compatibility: hardware.map(|hardware| {
+                artifact_hardware_compatibility(model, artifact_name, artifact, hardware)
+            }),
             artifact_root: artifact.artifact_root.clone(),
             artifact_root_kind: artifact.artifact_root_kind.clone(),
             weights_bytes: artifact.weights_bytes,
@@ -4417,6 +4453,219 @@ fn catalog_list_model(model: &catalog::CatalogModel) -> CatalogListModel {
     }
 }
 
+fn artifact_hardware_compatibility(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    hardware: &HardwareReport,
+) -> CatalogArtifactCompatibility {
+    let mut compatibility =
+        artifact_hardware_compatibility_base(model, artifact_name, artifact, hardware);
+    if !compatibility.compatible {
+        compatibility.suggestion =
+            compatible_catalog_artifact_suggestion(model, hardware, Some(artifact_name));
+    }
+    compatibility
+}
+
+fn artifact_hardware_compatibility_base(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    hardware: &HardwareReport,
+) -> CatalogArtifactCompatibility {
+    if !model
+        .requirements
+        .backends
+        .iter()
+        .any(|backend| backend == &artifact.engine)
+    {
+        return incompatible_artifact(format!(
+            "artifact backend {} is not listed in model requirements",
+            artifact.engine
+        ));
+    }
+    let min_ram_bytes = gib_u64(model.requirements.min_ram_gb);
+    if hardware.memory.total_bytes < min_ram_bytes {
+        return incompatible_artifact(format!(
+            "needs at least {} GiB RAM; local host has {}",
+            model.requirements.min_ram_gb,
+            human_bytes(hardware.memory.total_bytes)
+        ));
+    }
+    if let Some(requirement) =
+        unsatisfied_cpu_flag_requirement(&model.requirements.cpu_flags, hardware)
+    {
+        return incompatible_artifact(format!(
+            "missing required CPU feature expression {requirement}"
+        ));
+    }
+    let Some(verdict) = hardware
+        .backend_verdicts
+        .iter()
+        .find(|verdict| verdict.backend == artifact.engine)
+    else {
+        return incompatible_artifact(format!(
+            "backend {} is not reported by hwprobe on this host",
+            artifact.engine
+        ));
+    };
+    if verdict.status == VerdictStatus::Insufficient {
+        return incompatible_artifact(format!(
+            "{}; {}",
+            backend_requirement_hint(&artifact.engine),
+            verdict
+                .reason
+                .as_deref()
+                .unwrap_or("hwprobe marked this backend insufficient")
+        ));
+    }
+    if let Some(min_compute_cap) = artifact.min_compute_cap.as_deref() {
+        if !hardware_supports_compute_cap(hardware, min_compute_cap) {
+            return incompatible_artifact(format!(
+                "artifact {artifact_name} requires NVIDIA compute capability >= {min_compute_cap}; local best is {}",
+                best_compute_capability_label(hardware)
+            ));
+        }
+    }
+    if artifact.engine == "trt-llm" || artifact.engine == "vllm" {
+        let min_vram_bytes = gib_u64(model.requirements.min_vram_gb_full_offload);
+        if min_vram_bytes > 0 && total_dedicated_vram_bytes(hardware) < min_vram_bytes {
+            return incompatible_artifact(format!(
+                "needs at least {} GiB dedicated VRAM for {}; local dedicated VRAM is {}",
+                model.requirements.min_vram_gb_full_offload,
+                artifact.engine,
+                human_bytes(total_dedicated_vram_bytes(hardware))
+            ));
+        }
+    }
+    compatible_artifact(format!("{:?}", verdict.status))
+}
+
+fn compatible_artifact(status: String) -> CatalogArtifactCompatibility {
+    CatalogArtifactCompatibility {
+        compatible: true,
+        status,
+        reason: "local hardware can run this artifact".to_owned(),
+        suggestion: None,
+    }
+}
+
+fn incompatible_artifact(reason: String) -> CatalogArtifactCompatibility {
+    CatalogArtifactCompatibility {
+        compatible: false,
+        status: "incompatible".to_owned(),
+        reason,
+        suggestion: None,
+    }
+}
+
+fn compatible_catalog_artifact_suggestion(
+    model: &catalog::CatalogModel,
+    hardware: &HardwareReport,
+    exclude_artifact: Option<&str>,
+) -> Option<String> {
+    model
+        .artifacts
+        .iter()
+        .filter(|(name, _)| exclude_artifact != Some(name.as_str()))
+        .filter_map(|(name, artifact)| {
+            let compatibility =
+                artifact_hardware_compatibility_base(model, name, artifact, hardware);
+            compatibility
+                .compatible
+                .then_some((name, artifact, backend_rank(&artifact.engine)))
+        })
+        .max_by_key(|(_, _, rank)| *rank)
+        .map(|(name, artifact, _)| {
+            format!(
+                "use catalog artifact {name} via {} for model {}",
+                artifact.engine, model.model_id
+            )
+        })
+}
+
+fn backend_requirement_hint(backend: &str) -> &'static str {
+    match backend {
+        "mlx" => "MLX requires Apple Silicon with a Metal unified-memory GPU",
+        "trt-llm" => {
+            "TensorRT-LLM requires a compatible NVIDIA GPU; NVFP4 artifacts require Blackwell-class compute capability"
+        }
+        "vllm" => "vLLM launch artifacts require a compatible NVIDIA GPU",
+        "llama.cpp" => "llama.cpp requires enough RAM and a compatible CPU/GPU runtime",
+        "stable-diffusion.cpp" => {
+            "stable-diffusion.cpp requires enough local RAM and preferably a local accelerator"
+        }
+        "whisper.cpp" => "whisper.cpp requires enough local RAM and CPU SIMD support",
+        "piper" => "Piper requires enough local RAM for the voice artifact",
+        _ => "backend is not compatible with this host",
+    }
+}
+
+fn unsatisfied_cpu_flag_requirement(
+    requirements: &[String],
+    hardware: &HardwareReport,
+) -> Option<String> {
+    requirements
+        .iter()
+        .find(|requirement| !cpu_flag_expression_satisfied(requirement, hardware))
+        .cloned()
+}
+
+fn cpu_flag_expression_satisfied(requirement: &str, hardware: &HardwareReport) -> bool {
+    requirement
+        .split('|')
+        .map(str::trim)
+        .filter(|flag| !flag.is_empty())
+        .any(|flag| match flag.to_ascii_lowercase().as_str() {
+            "avx2" => hardware.cpu.flags.avx2,
+            "avx512" | "avx512f" => hardware.cpu.flags.avx512,
+            "neon" => hardware.cpu.flags.neon,
+            _ => false,
+        })
+}
+
+fn hardware_supports_compute_cap(hardware: &HardwareReport, min_compute_cap: &str) -> bool {
+    let Some(minimum) = parse_compute_capability_pair(min_compute_cap) else {
+        return false;
+    };
+    hardware
+        .gpus
+        .iter()
+        .filter_map(|gpu| gpu.compute_capability.as_deref())
+        .filter_map(parse_compute_capability_pair)
+        .any(|capability| capability >= minimum)
+}
+
+fn best_compute_capability_label(hardware: &HardwareReport) -> String {
+    hardware
+        .gpus
+        .iter()
+        .filter_map(|gpu| gpu.compute_capability.as_deref())
+        .filter_map(parse_compute_capability_pair)
+        .max()
+        .map(|(major, minor)| format!("{major}.{minor}"))
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn parse_compute_capability_pair(value: &str) -> Option<(u32, u32)> {
+    let (major, minor) = value.trim().split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+fn total_dedicated_vram_bytes(hardware: &HardwareReport) -> u64 {
+    hardware
+        .gpus
+        .iter()
+        .filter(|gpu| !gpu.unified_memory)
+        .filter_map(|gpu| gpu.memory_bytes)
+        .sum()
+}
+
+fn gib_u64(gib: u64) -> u64 {
+    gib.saturating_mul(1024 * 1024 * 1024)
+}
+
 fn print_catalog_list_report(report: &CatalogListReport) {
     println!(
         "Signed catalog: {} (hash {}, key {})",
@@ -4429,8 +4678,15 @@ fn print_catalog_list_report(report: &CatalogListReport) {
         report.model_count, report.artifact_count, report.tier_filter
     );
     println!(
-        "Authority: catalog approval is admin-signed; live routing comes from contract ledger state."
-    );
+            "Authority: catalog approval is admin-signed; live routing comes from contract ledger state."
+        );
+    if let Some(hardware) = &report.local_hardware {
+        println!(
+            "Local hardware: {} selected_backend={}",
+            hardware.host,
+            hardware.selected_backend.as_deref().unwrap_or("none")
+        );
+    }
 
     for model in &report.models {
         println!();
@@ -4506,14 +4762,30 @@ fn print_catalog_list_report(report: &CatalogListReport) {
                 ("token_fingerprint", None) => "missing",
                 _ => "n/a",
             };
+            let compatibility = artifact
+                .compatibility
+                .as_ref()
+                .map(|compat| {
+                    let marker = if compat.compatible { "yes" } else { "no" };
+                    format!("{marker} {}", compat.reason)
+                })
+                .unwrap_or_else(|| "n/a".to_owned());
             println!(
-                "  - {} ({}) {} root={} canary={}",
+                "  - {} ({}) {} root={} canary={} compat={}",
                 artifact.artifact,
                 artifact.engine,
                 artifact.weights_human,
                 short_hash(&artifact.artifact_root),
-                canary
+                canary,
+                compatibility
             );
+            if let Some(suggestion) = artifact
+                .compatibility
+                .as_ref()
+                .and_then(|compat| compat.suggestion.as_deref())
+            {
+                println!("    suggestion: {suggestion}");
+            }
             println!(
                 "    source: {}@{} {}",
                 artifact.source_repo, artifact.source_revision, artifact.source_path
@@ -13193,6 +13465,12 @@ async fn models(args: ModelsArgs) -> Result<()> {
         let release = read_catalog_release_anchor(&rpc).await?;
         let files = fetch_catalog_release_files(&client, &home, &release).await?;
         let catalog_doc = catalog::load_document(&files.catalog_path)?;
+        let hardware = probe(ProbeOptions {
+            disk_path: home.clone(),
+            run_disk_bench: false,
+            disk_bench_mib: 1,
+            fixture: None,
+        });
         let catalog_report = catalog_list_report(
             &catalog_doc,
             files.catalog_path,
@@ -13200,6 +13478,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
             release.catalog_hash.clone(),
             release.key_id.clone(),
             CatalogListTier::Launch,
+            Some(&hardware),
         );
 
         if args.json {
@@ -18294,6 +18573,15 @@ struct ProviderCandidate {
 }
 
 #[derive(Debug, Clone)]
+struct ProviderCandidateRejection {
+    enclave_id: String,
+    model_id: String,
+    backend: String,
+    reason: String,
+    suggestion: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct ProviderArtifactPaths {
     primary: PathBuf,
     sidecars: BTreeMap<String, PathBuf>,
@@ -20706,17 +20994,35 @@ fn build_provider_candidates(
     args: &ProviderStartArgs,
 ) -> Result<Vec<ProviderCandidate>> {
     let requested_backend = requested_backend(args, hardware)?;
+    let requested_enclave = args.enclave.as_deref();
     let mut candidates = Vec::new();
+    let mut rejections = Vec::new();
     let mut version_gates = BTreeMap::new();
     for enclave in contract.enclaves.iter().filter(|enclave| {
         enclave.status == "active" && admin_role_marker_ok(enclave.created_by_role.as_deref())
     }) {
         if let Some(requested) = &requested_backend {
             if &enclave.backend != requested {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!(
+                        "requested backend {requested}, but enclave uses {}",
+                        enclave.backend
+                    ),
+                    None,
+                ));
                 continue;
             }
         }
         if enclave.att_tier > hardware.tee.tier {
+            rejections.push(provider_rejection(
+                enclave,
+                format!(
+                    "attestation tier mismatch: enclave requires tier {}, local hardware reports tier {}",
+                    enclave.att_tier, hardware.tee.tier
+                ),
+                None,
+            ));
             continue;
         }
         let Some(model) = catalog_doc
@@ -20724,9 +21030,25 @@ fn build_provider_candidates(
             .iter()
             .find(|model| model.model_id == enclave.model_id)
         else {
+            rejections.push(provider_rejection(
+                enclave,
+                format!(
+                    "model {} is not present in the signed admin catalog",
+                    enclave.model_id
+                ),
+                None,
+            ));
             continue;
         };
         if enclave.model_class != model.model_class {
+            rejections.push(provider_rejection(
+                enclave,
+                format!(
+                    "model_class mismatch: ledger has {}, signed catalog has {}",
+                    enclave.model_class, model.model_class
+                ),
+                compatible_catalog_artifact_suggestion(model, hardware, None),
+            ));
             continue;
         }
         if let Some(gate) =
@@ -20741,34 +21063,110 @@ fn build_provider_candidates(
             }
             version_gates
                 .entry(gate.model_id.clone())
-                .or_insert_with(|| gate);
+                .or_insert_with(|| gate.clone());
+            rejections.push(provider_rejection(
+                enclave,
+                gate.message.clone(),
+                compatible_catalog_artifact_suggestion(model, hardware, None),
+            ));
             continue;
         }
         let Some(verdict) = hardware
             .backend_verdicts
             .iter()
             .find(|verdict| verdict.backend == enclave.backend)
-            .filter(|verdict| verdict.status != VerdictStatus::Insufficient)
         else {
+            rejections.push(provider_rejection(
+                enclave,
+                format!(
+                    "backend {} is not reported by hwprobe on this host",
+                    enclave.backend
+                ),
+                compatible_catalog_artifact_suggestion(model, hardware, None),
+            ));
             continue;
         };
+        if verdict.status == VerdictStatus::Insufficient {
+            rejections.push(provider_rejection(
+                enclave,
+                format!(
+                    "{}; {}",
+                    backend_requirement_hint(&enclave.backend),
+                    verdict
+                        .reason
+                        .as_deref()
+                        .unwrap_or("hwprobe marked this backend insufficient")
+                ),
+                compatible_catalog_artifact_suggestion(model, hardware, None),
+            ));
+            continue;
+        }
         if enclave.backend == "trt-llm" {
             let Ok(tp_degree) = enclave_tp_degree(&enclave.caps) else {
+                rejections.push(provider_rejection(
+                    enclave,
+                    "trt-llm enclave caps are missing a valid tp_degree".to_owned(),
+                    compatible_catalog_artifact_suggestion(model, hardware, None),
+                ));
                 continue;
             };
             if tp_degree > 1
                 && tensor_parallel_capable_gpu_count(hardware)
                     < usize::try_from(tp_degree).unwrap_or(usize::MAX)
             {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!(
+                        "tensor-parallel mismatch: enclave requires tp_degree {tp_degree}, local hardware has {} matching tensor-parallel GPU(s)",
+                        tensor_parallel_capable_gpu_count(hardware)
+                    ),
+                    compatible_catalog_artifact_suggestion(model, hardware, None),
+                ));
                 continue;
             }
         }
         let Some((artifact_name, artifact)) =
             select_catalog_artifact(model, &enclave.backend, hardware)
         else {
+            let backend_artifacts = model
+                .artifacts
+                .iter()
+                .filter(|(_, artifact)| artifact.engine == enclave.backend)
+                .map(|(name, artifact)| {
+                    let compatibility =
+                        artifact_hardware_compatibility(model, name, artifact, hardware);
+                    format!("{name}: {}", compatibility.reason)
+                })
+                .collect::<Vec<_>>();
+            let reason = if backend_artifacts.is_empty() {
+                format!(
+                    "signed catalog has no artifact for backend {} on model {}",
+                    enclave.backend, model.model_id
+                )
+            } else {
+                format!(
+                    "no local-compatible artifact for backend {} on model {}; {}",
+                    enclave.backend,
+                    model.model_id,
+                    backend_artifacts.join("; ")
+                )
+            };
+            rejections.push(provider_rejection(
+                enclave,
+                reason,
+                compatible_catalog_artifact_suggestion(model, hardware, None),
+            ));
             continue;
         };
         if !ledger_enclave_matches_catalog_artifact(enclave, &artifact) {
+            rejections.push(provider_rejection(
+                enclave,
+                format!(
+                    "ledger artifact binding does not match signed catalog artifact {artifact_name} ({})",
+                    artifact.engine
+                ),
+                compatible_catalog_artifact_suggestion(model, hardware, Some(&artifact_name)),
+            ));
             continue;
         }
         let Some(price) = contract
@@ -20778,6 +21176,11 @@ fn build_provider_candidates(
             .filter(|price| current_mu_usd_price(price).is_some())
             .cloned()
         else {
+            rejections.push(provider_rejection(
+                enclave,
+                "missing current mu_usd admin price for this enclave".to_owned(),
+                None,
+            ));
             continue;
         };
         candidates.push(ProviderCandidate {
@@ -20789,10 +21192,28 @@ fn build_provider_candidates(
             price: Some(price),
         });
     }
+    if let Some(requested) = requested_enclave {
+        if !candidates
+            .iter()
+            .any(|candidate| requested_provider_enclave_matches(requested, &candidate.enclave))
+        {
+            let relevant = rejections
+                .iter()
+                .filter(|rejection| requested_provider_rejection_matches(requested, rejection))
+                .collect::<Vec<_>>();
+            if !relevant.is_empty() {
+                bail!("{}", provider_rejection_summary(requested, &relevant));
+            }
+        }
+    }
     if candidates.is_empty() {
         if !version_gates.is_empty() {
             let gates = version_gates.into_values().collect::<Vec<_>>();
             bail!("{}", version_gate_summary("serve", &gates));
+        }
+        if !rejections.is_empty() {
+            let relevant = rejections.iter().collect::<Vec<_>>();
+            bail!("{}", provider_rejection_summary("auto", &relevant));
         }
         bail!(
             "no feasible active admin-created enclaves with a current mu_usd admin price found in contract state; providers can only join priced enclaves the admin already registered"
@@ -20807,6 +21228,63 @@ fn requested_provider_enclave_matches(requested: &str, enclave: &LedgerEnclave) 
     } else {
         enclave.model_id == requested
     }
+}
+
+fn provider_rejection(
+    enclave: &LedgerEnclave,
+    reason: String,
+    suggestion: Option<String>,
+) -> ProviderCandidateRejection {
+    ProviderCandidateRejection {
+        enclave_id: enclave.enclave_id.clone(),
+        model_id: enclave.model_id.clone(),
+        backend: enclave.backend.clone(),
+        reason,
+        suggestion,
+    }
+}
+
+fn requested_provider_rejection_matches(
+    requested: &str,
+    rejection: &ProviderCandidateRejection,
+) -> bool {
+    if is_32_byte_hex(requested) {
+        rejection.enclave_id == requested
+    } else {
+        rejection.model_id == requested
+    }
+}
+
+fn provider_rejection_summary(
+    requested: &str,
+    rejections: &[&ProviderCandidateRejection],
+) -> String {
+    let mut lines = Vec::new();
+    let prefix = if requested == "auto" {
+        "no feasible active admin-created enclaves for this hardware".to_owned()
+    } else {
+        format!("requested enclave/model {requested} is not feasible on this hardware")
+    };
+    lines.push(prefix);
+    for rejection in rejections.iter().take(6) {
+        lines.push(format!(
+            "- {} via {} (enclave {}): {}",
+            rejection.model_id,
+            rejection.backend,
+            short_hash(&rejection.enclave_id),
+            rejection.reason
+        ));
+        if let Some(suggestion) = &rejection.suggestion {
+            lines.push(format!("  suggestion: {suggestion}"));
+        }
+    }
+    if rejections.len() > 6 {
+        lines.push(format!(
+            "- ... {} more rejected enclave(s)",
+            rejections.len() - 6
+        ));
+    }
+    lines.join("\n")
 }
 
 fn ledger_enclave_matches_catalog_artifact(
@@ -20880,6 +21358,9 @@ fn select_catalog_artifact(
         .artifacts
         .iter()
         .filter(|(_, artifact)| artifact.engine == backend)
+        .filter(|(name, artifact)| {
+            artifact_hardware_compatibility_base(model, name, artifact, hardware).compatible
+        })
         .collect::<Vec<_>>();
     if backend == "trt-llm" {
         let supports_nvfp4 = hardware.gpus.iter().any(|gpu| gpu.supports_nvfp4);
@@ -20931,6 +21412,7 @@ fn backend_rank(backend: &str) -> u8 {
         "trt-llm" => 3,
         "mlx" => 2,
         "llama.cpp" => 1,
+        "stable-diffusion.cpp" | "whisper.cpp" | "piper" => 0,
         _ => 0,
     }
 }
@@ -27616,6 +28098,132 @@ mod tests {
     }
 
     #[test]
+    fn provider_candidates_explain_mlx_artifact_on_nvidia_and_suggest_gguf() {
+        let root = "aa".repeat(32);
+        let mlx_root = "bb".repeat(32);
+        let mut catalog = test_catalog(&root);
+        let mut mlx_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        mlx_artifact.engine = "mlx".to_owned();
+        mlx_artifact.path = "model.safetensors".to_owned();
+        mlx_artifact.artifact_root = mlx_root.clone();
+        catalog.models[0]
+            .requirements
+            .backends
+            .push("mlx".to_owned());
+        catalog.models[0]
+            .artifacts
+            .insert("mlx-4bit".to_owned(), mlx_artifact);
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].backend = "mlx".to_owned();
+        contract.enclaves[0].artifact_root = mlx_root;
+        contract.enclaves[0].artifact_source.path = "model.safetensors".to_owned();
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let mut args = test_provider_start_args();
+        args.enclave = Some("test/model@4bit".to_owned());
+
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("requested enclave/model test/model@4bit is not feasible"));
+        assert!(message.contains("MLX requires Apple Silicon"));
+        assert!(message.contains("no Apple Metal unified-memory GPU detected"));
+        assert!(message.contains("suggestion: use catalog artifact gguf-q4_k_m via llama.cpp"));
+    }
+
+    #[test]
+    fn provider_candidates_explain_nvfp4_artifact_on_mac_and_suggest_mlx() {
+        let root = "aa".repeat(32);
+        let trt_root = "bb".repeat(32);
+        let mlx_root = "cc".repeat(32);
+        let mut catalog = test_catalog(&root);
+        let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        trt_artifact.engine = "trt-llm".to_owned();
+        trt_artifact.path = "checkpoint.nvfp4.safetensors".to_owned();
+        trt_artifact.artifact_root = trt_root.clone();
+        trt_artifact.min_compute_cap = Some("10.0".to_owned());
+        let mut mlx_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        mlx_artifact.engine = "mlx".to_owned();
+        mlx_artifact.path = "model.safetensors".to_owned();
+        mlx_artifact.artifact_root = mlx_root;
+        catalog.models[0].requirements.backends = vec![
+            "trt-llm".to_owned(),
+            "mlx".to_owned(),
+            "llama.cpp".to_owned(),
+        ];
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), trt_artifact);
+        catalog.models[0]
+            .artifacts
+            .insert("mlx-4bit".to_owned(), mlx_artifact);
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].backend = "trt-llm".to_owned();
+        contract.enclaves[0].artifact_root = trt_root;
+        contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        let hardware = test_hardware(FixtureProfile::AppleSilicon);
+        let mut args = test_provider_start_args();
+        args.enclave = Some("test/model@4bit".to_owned());
+
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("requested enclave/model test/model@4bit is not feasible"));
+        assert!(message.contains("TensorRT-LLM requires a compatible NVIDIA GPU"));
+        assert!(message.contains("no NVIDIA GPU detected"));
+        assert!(message.contains("suggestion: use catalog artifact mlx-4bit via mlx"));
+    }
+
+    #[test]
+    fn catalog_list_report_marks_artifact_compatibility_for_local_hardware() {
+        let root = "aa".repeat(32);
+        let mlx_root = "bb".repeat(32);
+        let mut catalog = test_catalog(&root);
+        let mut mlx_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        mlx_artifact.engine = "mlx".to_owned();
+        mlx_artifact.path = "model.safetensors".to_owned();
+        mlx_artifact.artifact_root = mlx_root;
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0]
+            .requirements
+            .backends
+            .push("mlx".to_owned());
+        catalog.models[0]
+            .artifacts
+            .insert("mlx-4bit".to_owned(), mlx_artifact);
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+
+        let report = catalog_list_report(
+            &catalog,
+            PathBuf::from("catalog/models.json"),
+            PathBuf::from("catalog/signatures/models.json.sig"),
+            "cc".repeat(32),
+            "test-key".to_owned(),
+            CatalogListTier::Launch,
+            Some(&hardware),
+        );
+
+        let gguf = report.models[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact == "gguf-q4_k_m")
+            .unwrap();
+        let mlx = report.models[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact == "mlx-4bit")
+            .unwrap();
+        assert!(gguf.compatibility.as_ref().unwrap().compatible);
+        assert!(!mlx.compatibility.as_ref().unwrap().compatible);
+        assert!(mlx
+            .compatibility
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("MLX requires Apple Silicon"));
+        assert!(report.local_hardware.is_some());
+    }
+
+    #[test]
     fn provider_candidates_require_hardware_tier_for_tier2_enclave() {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
@@ -30354,6 +30962,7 @@ mod tests {
             "cc".repeat(32),
             "test-key".to_owned(),
             CatalogListTier::Launch,
+            None,
         );
 
         assert!(report.ok);

@@ -250,6 +250,9 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         trt_llm_verdict(profile),
         mlx_verdict(profile),
         llama_cpp_verdict(profile),
+        stable_diffusion_cpp_verdict(profile),
+        whisper_cpp_verdict(profile),
+        piper_verdict(profile),
     ]
 }
 
@@ -434,6 +437,94 @@ fn llama_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
             "llama.cpp",
             "less than 8 GiB RAM available for baseline GGUF serving",
         )
+    }
+}
+
+fn stable_diffusion_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    if profile.memory.total_bytes < 4 * GIB {
+        return insufficient(
+            "stable-diffusion.cpp",
+            "less than 4 GiB RAM available for small diffusion serving",
+        );
+    }
+    let has_accel = profile.gpus.iter().any(|gpu| {
+        matches!(
+            gpu.backend,
+            GpuBackend::Metal | GpuBackend::Nvml | GpuBackend::Rocm | GpuBackend::Vulkan
+        )
+    });
+    if has_accel {
+        BackendVerdict {
+            backend: "stable-diffusion.cpp".to_owned(),
+            status: VerdictStatus::PartialOffload,
+            reason: Some("local accelerator available for stable-diffusion.cpp".to_owned()),
+            est_tok_s: None,
+            n_layers_gpu: None,
+            max_sessions: 1,
+            kv_cache_bytes_budget: profile
+                .memory
+                .available_bytes
+                .unwrap_or(profile.memory.total_bytes)
+                / 4,
+        }
+    } else {
+        BackendVerdict {
+            backend: "stable-diffusion.cpp".to_owned(),
+            status: VerdictStatus::CpuOnly,
+            reason: Some(cpu_reason(&profile.cpu)),
+            est_tok_s: None,
+            n_layers_gpu: Some(0),
+            max_sessions: 1,
+            kv_cache_bytes_budget: profile
+                .memory
+                .available_bytes
+                .unwrap_or(profile.memory.total_bytes)
+                / 5,
+        }
+    }
+}
+
+fn whisper_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    if profile.memory.total_bytes < GIB {
+        return insufficient(
+            "whisper.cpp",
+            "less than 1 GiB RAM available for small Whisper serving",
+        );
+    }
+    BackendVerdict {
+        backend: "whisper.cpp".to_owned(),
+        status: VerdictStatus::CpuOnly,
+        reason: Some(cpu_reason(&profile.cpu)),
+        est_tok_s: None,
+        n_layers_gpu: Some(0),
+        max_sessions: 2,
+        kv_cache_bytes_budget: profile
+            .memory
+            .available_bytes
+            .unwrap_or(profile.memory.total_bytes)
+            / 8,
+    }
+}
+
+fn piper_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    if profile.memory.total_bytes < GIB {
+        return insufficient(
+            "piper",
+            "less than 1 GiB RAM available for small Piper TTS serving",
+        );
+    }
+    BackendVerdict {
+        backend: "piper".to_owned(),
+        status: VerdictStatus::CpuOnly,
+        reason: Some(cpu_reason(&profile.cpu)),
+        est_tok_s: None,
+        n_layers_gpu: Some(0),
+        max_sessions: 2,
+        kv_cache_bytes_budget: profile
+            .memory
+            .available_bytes
+            .unwrap_or(profile.memory.total_bytes)
+            / 8,
     }
 }
 
