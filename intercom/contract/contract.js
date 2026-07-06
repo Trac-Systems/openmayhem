@@ -111,6 +111,7 @@ const ENCLAVE_BACKENDS = new Set([
   'llama.cpp',
   'mlx',
   'trt-llm',
+  'vllm',
   'diffusers',
   'stable-diffusion.cpp',
   'comfyui',
@@ -172,9 +173,13 @@ const ENCLAVE_CAP_INTEGER_FIELDS = [
   'max_audio_seconds',
   'sample_rate_hz',
 ];
+const ENCLAVE_CAP_STRING_FIELDS = [
+  'vllm_dtype',
+];
 const ENCLAVE_CAP_FIELDS = new Set([
   ...ENCLAVE_CAP_BOOLEAN_FIELDS,
   ...ENCLAVE_CAP_INTEGER_FIELDS,
+  ...ENCLAVE_CAP_STRING_FIELDS,
   'output_modality',
   'output_modalities',
 ]);
@@ -4407,6 +4412,11 @@ class MayhemContract extends Contract {
     for (const key of ENCLAVE_CAP_INTEGER_FIELDS) {
       if (hasOwn(caps, key) && (!Number.isSafeInteger(caps[key]) || caps[key] <= 0)) {
         return new Error(`Enclave caps ${key} must be a positive integer.`);
+      }
+    }
+    for (const key of ENCLAVE_CAP_STRING_FIELDS) {
+      if (hasOwn(caps, key) && (typeof caps[key] !== 'string' || caps[key].length === 0 || caps[key].length > 64)) {
+        return new Error(`Enclave caps ${key} must be a non-empty string with at most 64 characters.`);
       }
     }
     if (hasCtx && hasCtxMax && caps.ctx !== caps.ctx_max) {

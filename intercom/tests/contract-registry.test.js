@@ -1032,6 +1032,28 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   );
   assert.equal(tensorParallelCaps.ok, true, tensorParallelCaps.message);
 
+  const vllmEnclave = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: '9'.repeat(64),
+      backend: 'vllm',
+      caps: {
+        ...catalogStyleCaps,
+        tools: true,
+        tp_degree: 1,
+        max_batch_size: 2,
+        max_num_tokens: 1024,
+        vllm_dtype: 'bfloat16',
+      },
+    },
+    admin.publicKey,
+    55
+  );
+  assert.equal(vllmEnclave.ok, true, vllmEnclave.message);
+
   const diffusionImageCaps = {
     image: true,
     output_modality: 'image',

@@ -10,7 +10,10 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -45,8 +48,8 @@ use mayhem_gateway::{
     RateMapEntry, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
-    human_report, probe, BackendVerdict, FixtureProfile, HardwareReport, ProbeOptions,
-    VerdictStatus,
+    human_report, probe, BackendVerdict, FixtureProfile, GpuInfo, GpuVendor, HardwareReport,
+    ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
@@ -4575,7 +4578,7 @@ fn artifact_hardware_compatibility_base(
             ));
         }
     }
-    if artifact.engine == "trt-llm" || artifact.engine == "vllm" {
+    if artifact.engine == "trt-llm" {
         let min_vram_bytes = gib_u64(model.requirements.min_vram_gb_full_offload);
         if min_vram_bytes > 0 && dedicated_vram_known_below(hardware, min_vram_bytes) {
             return incompatible_artifact(format!(
@@ -4583,6 +4586,16 @@ fn artifact_hardware_compatibility_base(
                 model.requirements.min_vram_gb_full_offload,
                 artifact.engine,
                 dedicated_vram_label(hardware)
+            ));
+        }
+    } else if artifact.engine == "vllm" {
+        let min_memory_bytes = gib_u64(model.requirements.min_vram_gb_full_offload);
+        if min_memory_bytes > 0 && nvidia_vllm_memory_known_below(hardware, min_memory_bytes) {
+            return incompatible_artifact(format!(
+                "needs at least {} GiB NVIDIA dedicated or unified memory for {}; local NVIDIA memory is {}",
+                model.requirements.min_vram_gb_full_offload,
+                artifact.engine,
+                nvidia_vllm_memory_label(hardware)
             ));
         }
     }
@@ -4719,6 +4732,46 @@ fn dedicated_vram_label(hardware: &HardwareReport) -> String {
 
 fn dedicated_vram_known_below(hardware: &HardwareReport, min_vram_bytes: u64) -> bool {
     known_total_dedicated_vram_bytes(hardware).is_some_and(|total| total < min_vram_bytes)
+}
+
+fn known_total_nvidia_vllm_memory_bytes(hardware: &HardwareReport) -> Option<u64> {
+    let mut saw_nvidia = false;
+    let mut total = 0u64;
+    for gpu in hardware
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
+    {
+        saw_nvidia = true;
+        let memory = match gpu.memory_bytes {
+            Some(memory) => memory,
+            None if nvidia_gpu_uses_host_unified_memory(hardware, gpu) => hardware
+                .memory
+                .available_bytes
+                .unwrap_or(hardware.memory.total_bytes),
+            None => return None,
+        };
+        total = total.saturating_add(memory);
+    }
+    saw_nvidia.then_some(total)
+}
+
+fn nvidia_gpu_uses_host_unified_memory(hardware: &HardwareReport, gpu: &GpuInfo) -> bool {
+    gpu.unified_memory
+        || (gpu.vendor == GpuVendor::Nvidia
+            && gpu.memory_bytes.is_none()
+            && hardware.host.os == "linux"
+            && matches!(hardware.host.arch.as_str(), "aarch64" | "arm64"))
+}
+
+fn nvidia_vllm_memory_label(hardware: &HardwareReport) -> String {
+    known_total_nvidia_vllm_memory_bytes(hardware)
+        .map(human_bytes)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn nvidia_vllm_memory_known_below(hardware: &HardwareReport, min_memory_bytes: u64) -> bool {
+    known_total_nvidia_vllm_memory_bytes(hardware).is_some_and(|total| total < min_memory_bytes)
 }
 
 fn gib_u64(gib: u64) -> u64 {
@@ -18861,6 +18914,7 @@ struct ProviderLoadSnapshot {
 }
 
 impl ProviderLoadSnapshot {
+    #[cfg(test)]
     fn from_sessions(sessions: &HashMap<String, ActiveProviderSession>) -> Self {
         Self {
             active_slots: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
@@ -18868,6 +18922,51 @@ impl ProviderLoadSnapshot {
             est_wait_ms: 0,
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProviderHeartbeatLoad {
+    active_slots: Arc<AtomicU64>,
+    queue_depth: Arc<AtomicU64>,
+    est_wait_ms: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ProviderHeartbeatLoad {
+    fn snapshot(&self) -> ProviderLoadSnapshot {
+        ProviderLoadSnapshot {
+            active_slots: self.active_slots.load(Ordering::Relaxed),
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            est_wait_ms: self.est_wait_ms.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set_active_sessions(&self, sessions: usize) {
+        let active = u64::try_from(sessions).unwrap_or(u64::MAX);
+        self.active_slots.store(active, Ordering::Relaxed);
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderSessionHeartbeatTask {
+    sc_bridge_url: String,
+    sc_bridge_token: String,
+    keypair_path: PathBuf,
+    password: String,
+    provider_pubkey: String,
+    selected: ProviderCandidate,
+    rooms: Vec<LedgerRoom>,
+    attestation: Tier1AttestationReport,
+    attestation_head: String,
+    load: ProviderHeartbeatLoad,
 }
 
 struct ProviderSessionContext<'a> {
@@ -22527,7 +22626,13 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
         sent.extend(
             send_provider_heartbeat_round(
                 &mut bridge,
-                &ctx,
+                ctx.keypair_path,
+                ctx.password,
+                &ctx.wallet.public_key,
+                ctx.selected,
+                ctx.rooms,
+                ctx.attestation,
+                ctx.attestation_head,
                 seq,
                 seq == 0,
                 ProviderLoadSnapshot::default(),
@@ -22540,14 +22645,20 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
 
 async fn send_provider_heartbeat_round(
     bridge: &mut ScBridgeClient,
-    ctx: &HeartbeatContext<'_>,
+    keypair_path: &Path,
+    password: &str,
+    provider_pubkey: &str,
+    selected: &ProviderCandidate,
+    rooms: &[LedgerRoom],
+    attestation: &Tier1AttestationReport,
+    attestation_head: &str,
     seq: u64,
     join_rooms: bool,
     load: ProviderLoadSnapshot,
 ) -> Result<Vec<Value>> {
     let mut sent = Vec::new();
-    let caps = provider_heartbeat_caps(ctx.selected);
-    for room in ctx.rooms {
+    let caps = provider_heartbeat_caps(selected);
+    for room in rooms {
         if join_rooms {
             bridge
                 .join(&room.sidechannel)
@@ -22559,24 +22670,24 @@ async fn send_provider_heartbeat_round(
             "t": "hb",
             "v": 1,
             "contract_version": CONTRACT_VERSION,
-            "provider": ctx.wallet.public_key,
-            "enclave_id": ctx.selected.enclave.enclave_id,
-            "model_id": ctx.selected.enclave.model_id,
+            "provider": provider_pubkey,
+            "enclave_id": selected.enclave.enclave_id,
+            "model_id": selected.enclave.model_id,
             "room_id": room.room_id,
-            "sat": provider_saturation(load.active_slots, ctx.selected.verdict.max_sessions),
+            "sat": provider_saturation(load.active_slots, selected.verdict.max_sessions),
             "slots": {
                 "active": load.active_slots,
-                "max": ctx.selected.verdict.max_sessions,
+                "max": selected.verdict.max_sessions,
             },
             "q": {
                 "depth": load.queue_depth,
                 "est_wait_ms": load.est_wait_ms,
             },
             "perf": {
-                "tok_s": ctx.selected.verdict.est_tok_s,
+                "tok_s": selected.verdict.est_tok_s,
                 "ttft_ms": 0,
             },
-            "price_ver": ctx.selected
+            "price_ver": selected
                 .price
                 .as_ref()
                 .and_then(|price| price.current.as_ref())
@@ -22589,15 +22700,15 @@ async fn send_provider_heartbeat_round(
                 "vision": caps.vision,
             },
             "att": {
-                "epoch": ctx.attestation.report.boot_epoch,
-                "head": ctx.attestation_head,
+                "epoch": attestation.report.boot_epoch,
+                "head": attestation_head,
             },
             "ts": ts,
-            "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, ctx.wallet.public_key, ts, seq).as_bytes()).to_hex().to_string(),
+            "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
         let signing_payload = String::from_utf8(heartbeat_signing_payload(&heartbeat)?)
             .context("heartbeat signing payload was not UTF-8")?;
-        let sig = sign_message(ctx.keypair_path, ctx.password, &signing_payload).await?;
+        let sig = sign_message(keypair_path, password, &signing_payload).await?;
         heartbeat["sig"] = json!(sig);
         bridge
             .send(&room.sidechannel, &heartbeat)
@@ -22610,6 +22721,38 @@ async fn send_provider_heartbeat_round(
         }));
     }
     Ok(sent)
+}
+
+async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+        &ctx.sc_bridge_url,
+        ctx.sc_bridge_token,
+    )?)
+    .await
+    .context("connecting to SC-Bridge for live provider session heartbeats")?;
+    let mut seq = 0_u64;
+    let mut join_rooms = true;
+    while !ctx.load.is_stopped() {
+        send_provider_heartbeat_round(
+            &mut bridge,
+            &ctx.keypair_path,
+            &ctx.password,
+            &ctx.provider_pubkey,
+            &ctx.selected,
+            &ctx.rooms,
+            &ctx.attestation,
+            &ctx.attestation_head,
+            seq,
+            join_rooms,
+            ctx.load.snapshot(),
+        )
+        .await
+        .with_context(|| format!("sending live provider heartbeat seq {seq}"))?;
+        join_rooms = false;
+        seq = seq.saturating_add(1);
+        sleep(Duration::from_secs(2)).await;
+    }
+    Ok(())
 }
 
 fn provider_saturation(active_slots: u64, max_sessions: u32) -> f64 {
@@ -22642,9 +22785,12 @@ async fn serve_provider_sessions(
         ctx.args.sc_bridge_token.as_deref(),
     )?;
     provider_session_debug(format!("connecting to SC-Bridge {sc_bridge_url}"));
-    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(&sc_bridge_url, sc_bridge_token)?)
-        .await
-        .context("connecting to SC-Bridge for provider session serving")?;
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+        &sc_bridge_url,
+        sc_bridge_token.clone(),
+    )?)
+    .await
+    .context("connecting to SC-Bridge for provider session serving")?;
     provider_session_debug("subscribing to all direct session frames");
     let subscription = bridge
         .session_subscribe_all()
@@ -22670,94 +22816,97 @@ async fn serve_provider_sessions(
         ),
     );
 
-    let no_config = None;
-    let heartbeat_ctx = HeartbeatContext {
-        args: ctx.args,
-        config: &no_config,
-        keypair_path: ctx.keypair_path,
-        password: ctx.password,
-        wallet: ctx.wallet,
-        selected: ctx.selected,
-        rooms: ctx.rooms,
-        attestation: ctx.attestation,
-        attestation_head: ctx.attestation_head,
-    };
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
-    let mut heartbeat_seq = 0_u64;
-    let mut heartbeat_rooms_joined = false;
-    let mut next_heartbeat_at = Instant::now();
+    let heartbeat_load = ProviderHeartbeatLoad::default();
+    let heartbeat_task = heartbeat_enabled.then(|| {
+        tokio::spawn(run_provider_session_heartbeats(
+            ProviderSessionHeartbeatTask {
+                sc_bridge_url: sc_bridge_url.clone(),
+                sc_bridge_token: sc_bridge_token.clone(),
+                keypair_path: ctx.keypair_path.to_path_buf(),
+                password: ctx.password.to_owned(),
+                provider_pubkey: ctx.wallet.public_key.clone(),
+                selected: ctx.selected.clone(),
+                rooms: ctx.rooms.to_vec(),
+                attestation: ctx.attestation.clone(),
+                attestation_head: ctx.attestation_head.to_owned(),
+                load: heartbeat_load.clone(),
+            },
+        ))
+    });
     let deadline = (ctx.args.serve_sessions_seconds > 0)
         .then(|| Instant::now() + Duration::from_secs(ctx.args.serve_sessions_seconds));
     let mut sessions = HashMap::new();
-    loop {
-        let now = Instant::now();
-        if heartbeat_enabled && now >= next_heartbeat_at {
-            send_provider_heartbeat_round(
-                &mut bridge,
-                &heartbeat_ctx,
-                heartbeat_seq,
-                !heartbeat_rooms_joined,
-                ProviderLoadSnapshot::from_sessions(&sessions),
-            )
-            .await?;
-            heartbeat_rooms_joined = true;
-            heartbeat_seq = heartbeat_seq.saturating_add(1);
-            next_heartbeat_at = Instant::now() + Duration::from_secs(2);
-        }
-        let mut wait = deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .filter(|remaining| !remaining.is_zero())
-            .unwrap_or_else(|| Duration::from_secs(1));
-        if heartbeat_enabled {
-            let heartbeat_wait = next_heartbeat_at.saturating_duration_since(Instant::now());
-            if heartbeat_wait < wait {
-                wait = heartbeat_wait;
+    let serve_result: Result<()> = async {
+        loop {
+            let wait = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .filter(|remaining| !remaining.is_zero())
+                .unwrap_or_else(|| Duration::from_secs(1));
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
             }
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
-        }
-        if wait.is_zero() {
-            continue;
-        }
-        match bridge.next_session_frame(wait).await {
-            Ok(event) => {
-                let frame_type = event
-                    .get("frame")
-                    .and_then(|frame| frame.get("t"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("frame");
-                provider_session_debug(format!(
-                    "received session event {} type {frame_type}",
-                    event
-                        .get("session_id")
+            if wait.is_zero() {
+                continue;
+            }
+            match bridge.next_session_frame(wait).await {
+                Ok(event) => {
+                    let frame_type = event
+                        .get("frame")
+                        .and_then(|frame| frame.get("t"))
                         .and_then(Value::as_str)
-                        .unwrap_or("")
-                ));
-                handle_provider_session_frame(
-                    &mut bridge,
-                    &mut sessions,
-                    &terms,
-                    &runtime,
-                    responder.as_mut(),
-                    event,
-                )
-                .await?;
-            }
-            Err(BridgeError::Timeout) => {
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    break;
+                        .unwrap_or("frame");
+                    provider_session_debug(format!(
+                        "received session event {} type {frame_type}",
+                        event
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                    ));
+                    handle_provider_session_frame(
+                        &mut bridge,
+                        &mut sessions,
+                        &heartbeat_load,
+                        &terms,
+                        &runtime,
+                        responder.as_mut(),
+                        event,
+                    )
+                    .await?;
                 }
+                Err(BridgeError::Timeout) => {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                }
+                Err(err) => return Err(err).context("reading provider session frame"),
             }
-            Err(err) => return Err(err).context("reading provider session frame"),
+        }
+        Ok(())
+    }
+    .await;
+    heartbeat_load.stop();
+    if let Some(task) = heartbeat_task {
+        match tokio::time::timeout(Duration::from_secs(5), task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => {
+                provider_session_debug(format!("live provider heartbeat task failed: {err:#}"));
+            }
+            Ok(Err(err)) => {
+                provider_session_debug(format!("live provider heartbeat task join failed: {err}"));
+            }
+            Err(_) => {
+                provider_session_debug("live provider heartbeat task did not stop before timeout");
+            }
         }
     }
-    Ok(())
+    serve_result
 }
 
 async fn handle_provider_session_frame(
     bridge: &mut ScBridgeClient,
     sessions: &mut HashMap<String, ActiveProviderSession>,
+    heartbeat_load: &ProviderHeartbeatLoad,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
     responder: &mut dyn ProviderSessionResponder,
@@ -22835,6 +22984,7 @@ async fn handle_provider_session_frame(
                             checkpoint_every,
                         },
                     );
+                    heartbeat_load.set_active_sessions(sessions.len());
                     let ts = unix_epoch_millis()?;
                     let open_head =
                         session_frame_head(&frame).context("hashing s.open frame for s.accept")?;
@@ -22961,6 +23111,7 @@ async fn handle_provider_session_frame(
                             )
                             .await?;
                             sessions.remove(&session_id);
+                            heartbeat_load.set_active_sessions(sessions.len());
                             return Ok(());
                         }
                     }
@@ -22987,6 +23138,7 @@ async fn handle_provider_session_frame(
                     )
                     .await?;
                     sessions.remove(&session_id);
+                    heartbeat_load.set_active_sessions(sessions.len());
                     return Ok(());
                 }
             };
@@ -23030,6 +23182,7 @@ async fn handle_provider_session_frame(
                     .await
                     .ok();
                     sessions.remove(&session_id);
+                    heartbeat_load.set_active_sessions(sessions.len());
                     return Ok(());
                 }
             };
@@ -23056,6 +23209,7 @@ async fn handle_provider_session_frame(
                 )
                 .await?;
                 sessions.remove(&session_id);
+                heartbeat_load.set_active_sessions(sessions.len());
                 return Ok(());
             }
             provider_session_debug(format!(
@@ -23063,9 +23217,11 @@ async fn handle_provider_session_frame(
             ));
             send_provider_session_close(bridge, &active.remote, &active.session_id, "done").await?;
             sessions.remove(&session_id);
+            heartbeat_load.set_active_sessions(sessions.len());
         }
         Some("s.close") => {
             sessions.remove(&session_id);
+            heartbeat_load.set_active_sessions(sessions.len());
         }
         _ => {}
     }
@@ -29293,6 +29449,106 @@ mod tests {
     }
 
     #[test]
+    fn provider_candidates_allow_vllm_on_nvidia_unified_memory() {
+        let gguf_root = "aa".repeat(32);
+        let vllm_root = "bb".repeat(32);
+        let mut catalog = test_catalog(&gguf_root);
+        let mut vllm_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        vllm_artifact.engine = "vllm".to_owned();
+        vllm_artifact.path = "model.safetensors".to_owned();
+        vllm_artifact.artifact_root = vllm_root.clone();
+        vllm_artifact.min_compute_cap = Some("7.0".to_owned());
+        catalog.models[0]
+            .artifacts
+            .insert("vllm-fp16".to_owned(), vllm_artifact);
+        catalog.models[0]
+            .requirements
+            .backends
+            .push("vllm".to_owned());
+        catalog.models[0].requirements.min_vram_gb_full_offload = 8;
+
+        let mut contract = test_contract(&gguf_root);
+        let mut vllm_enclave = contract.enclaves[0].clone();
+        vllm_enclave.enclave_id = "22".repeat(32);
+        vllm_enclave.backend = "vllm".to_owned();
+        vllm_enclave.artifact_root = vllm_root;
+        vllm_enclave.artifact_source.path = "model.safetensors".to_owned();
+        vllm_enclave.caps = json!({
+            "chat": true,
+            "tools": true,
+            "json": true,
+            "ctx": 1024,
+            "tp_degree": 1,
+            "max_batch_size": 2,
+            "max_num_tokens": 1024,
+            "vllm_dtype": "bfloat16"
+        });
+        contract.enclaves.push(vllm_enclave);
+        let room_id = "ee".repeat(16);
+        contract.rooms.push(LedgerRoom {
+            room_id: room_id.clone(),
+            sidechannel: format!("mx/room/{room_id}"),
+            enclave_id: Some("22".repeat(32)),
+            model_id: "test/model@4bit".to_owned(),
+            label: "vllm".to_owned(),
+            status: "open".to_owned(),
+            creator_role: Some("admin".to_owned()),
+        });
+        contract.prices.push(LedgerPriceSchedule {
+            enclave_id: "22".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            denom: "mu_usd".to_owned(),
+            current: Some(LedgerPriceRecord {
+                ver: 1,
+                denom: "mu_usd".to_owned(),
+                rate_map: text_generation_rate_map(1, 2),
+                per_req_mu: 0,
+                min_session_mu: 0,
+                effective_at: 0,
+                set_by_role: Some("admin".to_owned()),
+            }),
+            pending: None,
+        });
+
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.memory.total_bytes = 128 * 1024 * 1024 * 1024;
+        hardware.memory.available_bytes = Some(112 * 1024 * 1024 * 1024);
+        hardware.memory.unified_memory = false;
+        hardware.host.arch = "aarch64".to_owned();
+        hardware.gpus.truncate(1);
+        hardware.gpus[0].name = "NVIDIA GB10".to_owned();
+        hardware.gpus[0].memory_bytes = None;
+        hardware.gpus[0].unified_memory = false;
+        hardware.gpus[0].compute_capability = Some("12.1".to_owned());
+        hardware.backend_verdicts = probe(ProbeOptions {
+            fixture: Some(FixtureProfile::LinuxNvidia),
+            run_disk_bench: false,
+            ..ProbeOptions::default()
+        })
+        .backend_verdicts;
+        if let Some(verdict) = hardware
+            .backend_verdicts
+            .iter_mut()
+            .find(|verdict| verdict.backend == "vllm")
+        {
+            verdict.status = VerdictStatus::FullOffload;
+            verdict.reason = Some(
+                "NVIDIA CUDA GPU with unified memory supports vLLM continuous batching".to_owned(),
+            );
+            verdict.max_sessions = 8;
+        }
+        let args = test_provider_start_args();
+
+        let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.enclave.backend == "vllm"));
+        let selected = select_provider_candidate(&candidates, None).unwrap();
+        assert_eq!(selected.enclave.backend, "vllm");
+        assert_eq!(selected.artifact_name, "vllm-fp16");
+    }
+
+    #[test]
     fn provider_candidates_refuse_models_above_installed_app_version() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -31507,6 +31763,24 @@ mod tests {
         assert_eq!(snapshot.est_wait_ms, 0);
         assert_eq!(provider_saturation(snapshot.active_slots, 4), 0.5);
         assert_eq!(provider_saturation(snapshot.active_slots, 0), 0.0);
+    }
+
+    #[test]
+    fn provider_heartbeat_load_tracks_live_active_slots() {
+        let load = ProviderHeartbeatLoad::default();
+        assert_eq!(load.snapshot(), ProviderLoadSnapshot::default());
+        load.set_active_sessions(2);
+        assert_eq!(
+            load.snapshot(),
+            ProviderLoadSnapshot {
+                active_slots: 2,
+                queue_depth: 0,
+                est_wait_ms: 0
+            }
+        );
+        assert!(!load.is_stopped());
+        load.stop();
+        assert!(load.is_stopped());
     }
 
     #[test]

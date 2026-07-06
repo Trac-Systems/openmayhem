@@ -312,10 +312,107 @@
               "source_sha256": "bd507738b78878bbfc9b991cc14b139453500ecc67a9c82d61822419986156a9"
             }
           }
+        },
+        "vllm-fp16": {
+          "engine": "vllm",
+          "source": {
+            "kind": "huggingface",
+            "repo": "Qwen/Qwen2.5-1.5B-Instruct",
+            "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "model.safetensors",
+          "artifact_root": "c2a982c3c0f9a9276b54780c67525600060daa2a9b74f67cb6f89d773b89c4c0",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 3087467144,
+          "source_sha256": "dd924a11b4c220f385b51ffa522daea7c9f3d850e31b162bb5661df483c6d3ee",
+          "min_compute_cap": "7.0",
+          "download_check": true,
+          "notes": "Official Qwen safetensors checkpoint pinned for vLLM guided-decoding launch smoke.",
+          "sidecars": {
+            "vllm_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "Qwen/Qwen2.5-1.5B-Instruct",
+                "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "config.json",
+              "artifact_root": "1f4f309633e3446924efba73357896cb4b494e2fe818103603420379cb8caf6f",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 660,
+              "source_sha256": "98d2ff8cc47488d08a2b0b3acf4eb99ef210779b42bd48605f6b8e36acdbf670"
+            },
+            "vllm_tokenizer_json": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "Qwen/Qwen2.5-1.5B-Instruct",
+                "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "tokenizer.json",
+              "artifact_root": "ccd1044437f33bc49538ecffa049a4d557122318dd3eb71e016c327f4f9a13d6",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 7031645,
+              "source_sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+            },
+            "vllm_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "Qwen/Qwen2.5-1.5B-Instruct",
+                "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "tokenizer_config.json",
+              "artifact_root": "fb67196e1581d6953b12fa94c45fd6e86b89c679fdcf71448d2682a2aafa1e98",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 7305,
+              "source_sha256": "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583"
+            },
+            "vllm_generation_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "Qwen/Qwen2.5-1.5B-Instruct",
+                "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "generation_config.json",
+              "artifact_root": "349e51c5c7873fd7b9530a843903fb30fda09927fdbabfa69c020d8aec4cd9bd",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 242,
+              "source_sha256": "e558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6"
+            },
+            "vllm_vocab": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "Qwen/Qwen2.5-1.5B-Instruct",
+                "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "vocab.json",
+              "artifact_root": "07e084d5bb703cb11e2e1d14570b12572f794244e2f6b850bfeb278db0053cdf",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2776833,
+              "source_sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+            },
+            "vllm_merges": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "Qwen/Qwen2.5-1.5B-Instruct",
+                "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "merges.txt",
+              "artifact_root": "0298d1b4bd6e08087a7a634ab4be6750a1329f00c187bad62cbb9a753bdd2950",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1671839,
+              "source_sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+            }
+          }
         }
       },
       "caps": {
-        "tools": false,
+        "tools": true,
         "json": true,
         "ctx_max": 1024,
         "vision": false
@@ -328,7 +425,8 @@
         ],
         "backends": [
           "llama.cpp",
-          "trt-llm"
+          "trt-llm",
+          "vllm"
         ]
       },
       "canary": {
@@ -337,7 +435,8 @@
         "verification_method": "token_fingerprint",
         "fingerprints": {
           "gguf-q4_k_m": "b36edf8f4f88fcdac2ae60ec99f3983cea7c077579bf9cd5255f27898315265c",
-          "nvfp4": "7ded3b299cfe9e940b40d8359f019cb37acd9846c88da475c7e6455c444d59ea"
+          "nvfp4": "7ded3b299cfe9e940b40d8359f019cb37acd9846c88da475c7e6455c444d59ea",
+          "vllm-fp16": "f41e2d371829b2a23f422c1cd4b6471f0938a6ac0a60804aaea92da09e99329e"
         },
         "token_prefixes": {
           "gguf-q4_k_m": {
@@ -897,6 +996,94 @@
               5392,
               429,
               646
+            ]
+          },
+          "vllm-fp16": {
+            "launch-instruction-following": [
+              14513,
+              5888,
+              429,
+              1281,
+              458,
+              44378,
+              22567,
+              6136,
+              15368,
+              525,
+              510,
+              12,
+              32758,
+              82,
+              369,
+              1817,
+              7745,
+              345,
+              12,
+              62665,
+              7424,
+              315,
+              678,
+              14131,
+              345,
+              12,
+              62055,
+              315,
+              16216,
+              821,
+              13,
+              151643
+            ],
+            "launch-json-tool-routing": [
+              54275,
+              2236,
+              198,
+              515,
+              220,
+              330,
+              19979,
+              788,
+              330,
+              8687,
+              29518,
+              756,
+              220,
+              330,
+              268,
+              40533,
+              788,
+              330,
+              8687,
+              6205,
+              40533,
+              756,
+              220,
+              330,
+              2966,
+              3097,
+              788,
+              330,
+              8687,
+              25003,
+              3097,
+              698,
+              532,
+              73594,
+              151643
+            ],
+            "launch-safety-refusal": [
+              358,
+              2776,
+              14589,
+              11,
+              714,
+              358,
+              646,
+              944,
+              7789,
+              448,
+              429,
+              13,
+              151643
             ]
           }
         }

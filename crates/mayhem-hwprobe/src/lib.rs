@@ -267,10 +267,7 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
         return insufficient("vllm", "no NVIDIA GPU detected");
     }
 
-    let total_vram = nvidia
-        .iter()
-        .filter_map(|gpu| gpu.memory_bytes)
-        .sum::<u64>();
+    let total_cuda_memory = nvidia_usable_memory_bytes(profile, &nvidia);
     let best_cc = nvidia
         .iter()
         .filter_map(|gpu| gpu.compute_capability.as_deref())
@@ -286,7 +283,7 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
             est_tok_s: Some(30.0),
             n_layers_gpu: None,
             max_sessions: 2,
-            kv_cache_bytes_budget: total_vram / 4,
+            kv_cache_bytes_budget: total_cuda_memory / 4,
         };
     };
     if cc < (7, 0) {
@@ -304,13 +301,18 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
                     && gpu.memory_bytes == first.memory_bytes
             })
     });
-    if total_vram >= 16 * GIB {
+    let uses_unified_memory = nvidia
+        .iter()
+        .any(|gpu| nvidia_gpu_uses_host_unified_memory(profile, gpu));
+    if total_cuda_memory >= 16 * GIB {
         BackendVerdict {
             backend: "vllm".to_owned(),
             status: VerdictStatus::FullOffload,
             reason: Some(if tensor_parallel {
                 "NVIDIA CUDA GPU set supports vLLM continuous batching and tensor parallelism"
                     .to_owned()
+            } else if uses_unified_memory {
+                "NVIDIA CUDA GPU with unified memory supports vLLM continuous batching".to_owned()
             } else {
                 "NVIDIA CUDA GPU supports vLLM continuous batching".to_owned()
             }),
@@ -327,9 +329,9 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
             }),
             n_layers_gpu: None,
             max_sessions: if tensor_parallel { 16 } else { 8 },
-            kv_cache_bytes_budget: total_vram / 2,
+            kv_cache_bytes_budget: total_cuda_memory / 2,
         }
-    } else if total_vram >= 8 * GIB {
+    } else if total_cuda_memory >= 8 * GIB {
         BackendVerdict {
             backend: "vllm".to_owned(),
             status: VerdictStatus::PartialOffload,
@@ -340,11 +342,35 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
             est_tok_s: Some(45.0),
             n_layers_gpu: None,
             max_sessions: 2,
-            kv_cache_bytes_budget: total_vram / 3,
+            kv_cache_bytes_budget: total_cuda_memory / 3,
         }
     } else {
-        insufficient("vllm", "less than 8 GiB dedicated NVIDIA VRAM available")
+        insufficient(
+            "vllm",
+            "less than 8 GiB NVIDIA dedicated or unified memory available",
+        )
     }
+}
+
+fn nvidia_usable_memory_bytes(profile: &HardwareProfile, gpus: &[&GpuInfo]) -> u64 {
+    gpus.iter()
+        .map(|gpu| {
+            gpu.memory_bytes.unwrap_or_else(|| {
+                if nvidia_gpu_uses_host_unified_memory(profile, gpu) {
+                    profile
+                        .memory
+                        .available_bytes
+                        .unwrap_or(profile.memory.total_bytes)
+                } else {
+                    0
+                }
+            })
+        })
+        .sum()
+}
+
+fn nvidia_gpu_uses_host_unified_memory(profile: &HardwareProfile, gpu: &GpuInfo) -> bool {
+    gpu.unified_memory || nvidia_host_unified_memory_signal(&profile.host, gpu)
 }
 
 fn trt_llm_verdict(profile: &HardwareProfile) -> BackendVerdict {
@@ -650,7 +676,7 @@ fn probe_host(options: ProbeOptions) -> HardwareProfile {
         kernel: command_stdout("uname", &["-r"]).or_else(|| command_stdout("cmd", &["/C", "ver"])),
     };
     let cpu = probe_cpu(&host);
-    let memory = probe_memory(&host);
+    let mut memory = probe_memory(&host);
     let disk = probe_disk(
         &options.disk_path,
         options.run_disk_bench,
@@ -669,6 +695,7 @@ fn probe_host(options: ProbeOptions) -> HardwareProfile {
     gpus.extend(probe_rocm());
     gpus.extend(probe_vulkan());
     dedupe_gpus(&mut gpus);
+    mark_nvidia_host_unified_memory(&host, &mut memory, &mut gpus);
 
     let tee = probe_tee(&gpus);
     HardwareProfile {
@@ -978,6 +1005,26 @@ fn probe_nvidia() -> Vec<GpuInfo> {
         }
     }
     gpus
+}
+
+fn mark_nvidia_host_unified_memory(host: &HostInfo, memory: &mut MemoryInfo, gpus: &mut [GpuInfo]) {
+    let mut found = false;
+    for gpu in gpus.iter_mut() {
+        if nvidia_host_unified_memory_signal(host, gpu) {
+            gpu.unified_memory = true;
+            found = true;
+        }
+    }
+    if found {
+        memory.unified_memory = true;
+    }
+}
+
+fn nvidia_host_unified_memory_signal(host: &HostInfo, gpu: &GpuInfo) -> bool {
+    gpu.vendor == GpuVendor::Nvidia
+        && gpu.memory_bytes.is_none()
+        && host.os == "linux"
+        && matches!(host.arch.as_str(), "aarch64" | "arm64")
 }
 
 fn probe_rocm() -> Vec<GpuInfo> {
@@ -1489,6 +1536,49 @@ mod tests {
         assert!(report.gpus.iter().all(|gpu| gpu.supports_nvfp4));
         assert!(report.gpus.iter().all(|gpu| gpu.supports_tensor_parallel));
         assert_eq!(report.tee.tier, 2);
+    }
+
+    #[test]
+    fn nvidia_unified_memory_supports_vllm_without_dedicated_vram_counter() {
+        let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        profile.host.arch = "aarch64".to_owned();
+        profile.memory.total_bytes = 128 * GIB;
+        profile.memory.available_bytes = Some(112 * GIB);
+        profile.memory.unified_memory = false;
+        profile.gpus.truncate(1);
+        profile.gpus[0].name = "NVIDIA GB10".to_owned();
+        profile.gpus[0].memory_bytes = None;
+        profile.gpus[0].unified_memory = false;
+        profile.gpus[0].compute_capability = Some("12.1".to_owned());
+        let report = report_from_profile(profile);
+        let vllm = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "vllm")
+            .unwrap();
+        assert_eq!(vllm.status, VerdictStatus::FullOffload);
+        assert!(vllm
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unified memory"));
+        assert_eq!(report.selected_backend.as_deref(), Some("vllm"));
+    }
+
+    #[test]
+    fn nvidia_arm64_no_vram_counter_is_marked_unified_memory() {
+        let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        profile.host.arch = "aarch64".to_owned();
+        profile.memory.unified_memory = false;
+        profile.gpus.truncate(1);
+        profile.gpus[0].name = "NVIDIA GB10".to_owned();
+        profile.gpus[0].memory_bytes = None;
+        profile.gpus[0].unified_memory = false;
+
+        mark_nvidia_host_unified_memory(&profile.host, &mut profile.memory, &mut profile.gpus);
+
+        assert!(profile.memory.unified_memory);
+        assert!(profile.gpus[0].unified_memory);
     }
 
     #[test]

@@ -13,6 +13,8 @@ sys.stdout = sys.stderr
 engine = None
 tokenizer = None
 ctx_size = 2048
+event_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(event_loop)
 
 
 def send(message):
@@ -316,7 +318,7 @@ def handle(request_id, op, payload):
     if op == "tokenize":
         return handle_tokenize(payload or {})
     if op == "generate":
-        return asyncio.run(async_handle_generate(request_id, payload or {}))
+        return event_loop.run_until_complete(async_handle_generate(request_id, payload or {}))
     if op == "shutdown":
         raise SystemExit(0)
     raise ValueError(f"unknown vLLM worker op {op!r}")

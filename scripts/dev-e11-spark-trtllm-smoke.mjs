@@ -18,6 +18,7 @@ const { blake3 } = require(path.join(ROOT, 'intercom/node_modules/@tracsystems/b
 
 const MODEL_ID = 'qwen/qwen2.5-1.5b-instruct@small';
 const TRT_ARTIFACT = 'nvfp4';
+const DEFAULT_ACCEL_ARTIFACT = TRT_ARTIFACT;
 const GGUF_ARTIFACT = 'gguf-q4_k_m';
 const CHUNK_SIZE = 8 * 1024 * 1024;
 const DEFAULT_CATALOG_RELEASE_REPO = 'TracNetwork/mayhem-catalog';
@@ -56,16 +57,20 @@ function usage() {
 
 Runs the I3-E11 acceptance smoke:
   - local Pear admin/user/provider-bridge dev-net
-  - Spark-hosted provider start and TensorRT-LLM engine
-  - admin-created GGUF + NVFP4 enclaves for ${MODEL_ID}
+  - Spark-hosted provider start and NVIDIA accelerated engine
+  - admin-created GGUF + accelerated enclaves for ${MODEL_ID}
   - real gateway chat, receipt, and epoch billing
   - local Apple fixture provider-start fallback selects GGUF
 
 Environment:
   MAYHEM_E11_CLUSTER_FILE          Spark credential file (default: ../gpd/cluster.txt)
+  MAYHEM_E11_TAG                   Reuse a named run directory/tag instead of generating one
+  MAYHEM_E11_DEVNET_CLEANUP        Remove dev-net stores before starting (default: 1)
   MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: /home/trac/ai/mayhem/i3-e11-operationmayhem)
   MAYHEM_E11_REMOTE_DOWNLOADS      Spark provider download cache (default: /home/trac/ai/mayhem/e11-provider-downloads)
+  MAYHEM_E11_ACCEL_ARTIFACT        Accelerated catalog artifact to prove (default: ${DEFAULT_ACCEL_ARTIFACT}; E14 uses vllm-fp16)
   MAYHEM_E11_TRTLLM_PYTHON         Spark TensorRT-LLM Python wrapper (default: /home/trac/ai/mayhem/bin/trtllm-python)
+  MAYHEM_E11_VLLM_PYTHON           Spark vLLM Python wrapper (default: /home/trac/ai/mayhem/bin/vllm-python-e14)
   MAYHEM_E11_HF_TOKEN_FILE         HF token file copied temporarily to Spark if present (default: ../gpd/hf.txt)
   MAYHEM_E11_CATALOG_RELEASE_REPO  HF repo for the signed catalog release (default: ${DEFAULT_CATALOG_RELEASE_REPO})
   MAYHEM_E11_CATALOG_RELEASE_REVISION  40-hex signed catalog release revision (default: ${DEFAULT_CATALOG_RELEASE_REVISION})
@@ -73,6 +78,9 @@ Environment:
   MAYHEM_E11_PROVIDER_START_TIMEOUT_SECONDS  Spark provider start timeout (default: 1800)
   MAYHEM_E11_CHAT_TIMEOUT_SECONDS  Gateway chat timeout (default: 600)
   MAYHEM_E11_CHAT_MAX_TOKENS       Gateway chat max_tokens (default: 24)
+  MAYHEM_E11_TOOL_TIMEOUT_SECONDS  Gateway guided tool-call timeout (default: 600)
+  MAYHEM_E11_CONCURRENT_TIMEOUT_SECONDS  vLLM concurrent heartbeat timeout (default: 900)
+  MAYHEM_E11_CONCURRENT_MAX_TOKENS vLLM concurrent prompt max_tokens (default: 32)
   MAYHEM_E11_KEEP_REMOTE_RUN       Keep Spark run home/logs after cleanup (default: 0; token is always removed)
 `);
 }
@@ -104,6 +112,12 @@ function envPositiveInt(name, fallback) {
   const value = Number.parseInt(raw, 10);
   if (!Number.isSafeInteger(value) || value <= 0) fail(`${name} must be a positive integer, got ${raw}`);
   return value;
+}
+
+function envFlag(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  return !/^(0|false|no)$/i.test(raw);
 }
 
 function runSync(command, args, options = {}) {
@@ -250,25 +264,48 @@ function sshBase(passFile, remote) {
   return ['-f', passFile, 'ssh', ...SSH_OPTS, `${remote.user}@${remote.host}`];
 }
 
+function retryableRemoteError(error) {
+  const message = String(error?.message || error || '');
+  return /Permission denied|exited 255|Connection (reset|closed|timed out)|kex_exchange_identification|Broken pipe|rsync error.*code 255/i.test(message);
+}
+
+async function withRemoteRetries(label, action, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await action();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !retryableRemoteError(error)) throw error;
+      log(`${label} failed transiently (attempt ${attempt}/${attempts}); retrying`);
+      await sleep(1000 * attempt);
+    }
+  }
+  throw lastError;
+}
+
 async function ssh(remote, passFile, command, options = {}) {
-  return run('sshpass', [...sshBase(passFile, remote), command], options);
+  return withRemoteRetries(`ssh ${remote.host}`, () => run('sshpass', [...sshBase(passFile, remote), command], options));
 }
 
 async function rsyncTo(remote, passFile, localPath, remotePath, options = {}) {
   const rsh = ['sshpass', '-f', passFile, 'ssh', ...SSH_OPTS].map(sh).join(' ');
-  return run(
-    'rsync',
-    [
-      '-a',
-      '--partial',
-      '--inplace',
-      ...(options.extraArgs || []),
-      '-e',
-      rsh,
-      localPath,
-      `${remote.user}@${remote.host}:${remotePath}`,
-    ],
-    options
+  return withRemoteRetries(
+    `rsync ${remote.host}`,
+    () => run(
+      'rsync',
+      [
+        '-a',
+        '--partial',
+        '--inplace',
+        ...(options.extraArgs || []),
+        '-e',
+        rsh,
+        localPath,
+        `${remote.user}@${remote.host}:${remotePath}`,
+      ],
+      options
+    )
   );
 }
 
@@ -399,6 +436,34 @@ function textRateMapJson(model) {
   ]);
 }
 
+function acceleratedCapsJson(backend) {
+  if (backend === 'vllm') {
+    return JSON.stringify({
+      chat: true,
+      tools: true,
+      json: true,
+      ctx: 1024,
+      tp_degree: 1,
+      max_batch_size: 2,
+      max_num_tokens: 1024,
+      vllm_dtype: 'bfloat16',
+    });
+  }
+  return JSON.stringify({
+    chat: true,
+    tools: false,
+    json: true,
+    ctx: 1024,
+    tp_degree: 1,
+    max_batch_size: 1,
+    max_num_tokens: 1024,
+  });
+}
+
+function isSupportedSparkAccelerator(artifact) {
+  return artifact?.engine === 'trt-llm' || artifact?.engine === 'vllm';
+}
+
 function bridgeRequest(url, token, payload, timeoutMs = 10_000) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
@@ -438,6 +503,98 @@ function bridgeRequest(url, token, payload, timeoutMs = 10_000) {
       }
     };
   });
+}
+
+function heartbeatMessageFromEvent(event) {
+  const message = event?.message;
+  if (message && typeof message === 'object' && message.t === 'hb') return message;
+  if (typeof message === 'string') {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed && typeof parsed === 'object' && parsed.t === 'hb') return parsed;
+    } catch {}
+  }
+  return null;
+}
+
+async function startHeartbeatCollector(url, token, channel, outPath) {
+  const events = [];
+  const waiters = [];
+  let ws;
+  let closed = false;
+  const record = (event) => {
+    events.push(event);
+    writeJson(outPath, { channel, events });
+    for (const waiter of [...waiters]) {
+      if (waiter.predicate(event)) {
+        waiter.resolve(event);
+        waiters.splice(waiters.indexOf(waiter), 1);
+      }
+    }
+  };
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`heartbeat collector did not subscribe to ${channel}`)), 30_000);
+    ws = new WebSocket(url);
+    ws.onerror = (error) => {
+      clearTimeout(timer);
+      reject(new Error(error?.message || String(error)));
+    };
+    ws.onopen = () => ws.send(JSON.stringify({ id: 1, type: 'auth', token }));
+    ws.onmessage = (event) => {
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg.type === 'sidechannel_message' && msg.channel === channel) {
+        record(msg);
+        return;
+      }
+      if (msg.id === 1 && msg.type === 'auth_ok') {
+        ws.send(JSON.stringify({ id: 2, type: 'join', channel }));
+        return;
+      }
+      if (msg.id === 2 && msg.type === 'joined') {
+        ws.send(JSON.stringify({ id: 3, type: 'subscribe', channel }));
+        return;
+      }
+      if (msg.id === 3 && msg.type === 'subscribed') {
+        clearTimeout(timer);
+        resolve();
+        return;
+      }
+      if (msg.type === 'error') {
+        clearTimeout(timer);
+        reject(new Error(JSON.stringify(msg)));
+      }
+    };
+  });
+  return {
+    events,
+    async waitFor(predicate, timeoutMs) {
+      const existing = events.find(predicate);
+      if (existing) return existing;
+      return new Promise((resolve, reject) => {
+        const waiter = { predicate, resolve };
+        waiters.push(waiter);
+        const timer = setTimeout(() => {
+          const idx = waiters.indexOf(waiter);
+          if (idx >= 0) waiters.splice(idx, 1);
+          reject(new Error(`timed out waiting for heartbeat on ${channel}`));
+        }, timeoutMs);
+        waiter.resolve = (event) => {
+          clearTimeout(timer);
+          resolve(event);
+        };
+      });
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      try { ws.close(); } catch {}
+    },
+  };
 }
 
 async function waitBridgeSessionOpen(url, token, provider, timeoutMs, label) {
@@ -502,11 +659,20 @@ async function waitGatewayProbe(gatewayUrl, provider, enclaveId, timeoutMs = 180
   fail(`gateway did not record a passing canary probe for ${provider}/${enclaveId}: ${JSON.stringify(last)}`);
 }
 
-async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs, maxTokens }) {
-  const rawPath = path.join(runDir, 'gateway-chat-stream.sse');
-  const summaryPath = path.join(runDir, 'gateway-chat-stream.json');
-  const prompt = 'Write one short sentence proving this is a live TensorRT Mayhem model response. Include the word coral.';
+async function runStreamingChatSmoke(
+  gatewayUrl,
+  modelId,
+  runDir,
+  { timeoutMs, maxTokens, prompt, fileStem, allowTransportErrorAfterContent = false, signal = null }
+) {
+  const stem = fileStem || 'gateway-chat-stream';
+  const rawPath = path.join(runDir, `${stem}.sse`);
+  const summaryPath = path.join(runDir, `${stem}.json`);
+  const chatPrompt = prompt || 'Write one short sentence proving this is a live Mayhem model response. Include the word coral.';
   const controller = new AbortController();
+  const fetchSignal = signal
+    ? (AbortSignal.any ? AbortSignal.any([controller.signal, signal]) : controller.signal)
+    : controller.signal;
   const timer = setTimeout(() => controller.abort(new Error('streaming chat timed out')), timeoutMs);
   let raw = '';
   let content = '';
@@ -520,6 +686,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs, m
   let firstJsonAt = null;
   let firstContentAt = null;
   let doneAt = null;
+  let streamError = null;
   try {
     const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -529,9 +696,9 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs, m
         stream: true,
         temperature: 0.7,
         max_tokens: maxTokens,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [{ role: 'user', content: chatPrompt }],
       }),
-      signal: controller.signal,
+      signal: fetchSignal,
     });
     responseHeadersAt = Date.now();
     if (!response.ok) {
@@ -589,23 +756,30 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs, m
       buffer += tail;
     }
     if (buffer) handleLine(buffer);
+  } catch (err) {
+    streamError = err;
   } finally {
     clearTimeout(timer);
   }
   fs.writeFileSync(rawPath, raw);
+  if (streamError && !(allowTransportErrorAfterContent && content.trim())) {
+    fail(`streaming chat transport failed: ${streamError.message}; raw saved at ${rawPath}`);
+  }
   if (dataEvents === 0) fail('streaming chat produced no SSE data events');
   if (!content.trim()) fail(`streaming chat produced no model content; raw saved at ${rawPath}`);
   const completedAt = doneAt || Date.now();
   const summary = {
     ok: true,
     model: modelId,
-    prompt,
+    prompt: chatPrompt,
     max_tokens: maxTokens,
     content: content.trim(),
     content_chars: content.trim().length,
     data_events: dataEvents,
     json_events: jsonEvents,
     done_seen: doneSeen,
+    transport_error: streamError ? streamError.message : null,
+    transport_error_tolerated: Boolean(streamError && allowTransportErrorAfterContent && content.trim()),
     timing_ms: {
       response_headers: responseHeadersAt === null ? null : responseHeadersAt - startedAt,
       first_chunk: firstChunkAt === null ? null : firstChunkAt - startedAt,
@@ -614,6 +788,198 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, { timeoutMs, m
       first_content: firstContentAt === null ? null : firstContentAt - startedAt,
       total: completedAt - startedAt,
     },
+    raw_path: path.relative(ROOT, rawPath),
+  };
+  writeJson(summaryPath, summary);
+  return { ...summary, summary_path: path.relative(ROOT, summaryPath) };
+}
+
+function firstFulfilled(promises) {
+  return new Promise((resolve, reject) => {
+    const errors = [];
+    let rejected = 0;
+    promises.forEach((promise, index) => {
+      promise.then(
+        (value) => resolve({ index, value }),
+        (error) => {
+          errors[index] = error;
+          rejected += 1;
+          if (rejected === promises.length) {
+            reject(new AggregateError(errors, 'all concurrent streams failed'));
+          }
+        }
+      );
+    });
+  });
+}
+
+async function runConcurrentHeartbeatSmoke(
+  gatewayUrl,
+  modelId,
+  runDir,
+  heartbeatCollector,
+  { timeoutMs, maxTokens, provider, enclaveId }
+) {
+  const heartbeatEventsPath = path.join(runDir, 'gateway-concurrent-heartbeats.json');
+  const prompts = [
+    'Write a compact checklist about coral restoration. Keep going until the token limit.',
+    'Write a compact checklist about satellite safety. Keep going until the token limit.',
+  ];
+  const heartbeatPromise = heartbeatCollector.waitFor((event) => {
+    const heartbeat = heartbeatMessageFromEvent(event);
+    return heartbeat?.provider === provider
+      && heartbeat?.enclave_id === enclaveId
+      && Number(heartbeat?.slots?.active || 0) >= 2;
+  }, timeoutMs);
+  const streamControllers = prompts.map(() => new AbortController());
+  const streams = prompts.map((prompt, index) => runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
+    timeoutMs,
+    maxTokens,
+    prompt,
+    fileStem: `gateway-concurrent-${index + 1}`,
+    allowTransportErrorAfterContent: true,
+    signal: streamControllers[index].signal,
+  }));
+
+  let heartbeatEvent = null;
+  let heartbeatError = null;
+  let firstStream = null;
+  let firstStreamError = null;
+  try {
+    heartbeatEvent = await heartbeatPromise;
+  } catch (err) {
+    heartbeatError = err;
+  }
+  try {
+    firstStream = await firstFulfilled(streams);
+  } catch (err) {
+    firstStreamError = err;
+  }
+  if (heartbeatEvent && firstStream) {
+    streamControllers.forEach((controller, index) => {
+      if (index !== firstStream.index) controller.abort(new Error('concurrent heartbeat proof captured'));
+    });
+  }
+  const streamResults = await Promise.allSettled(streams);
+  const successfulStreams = streamResults
+    .map((result, index) => ({ result, index }))
+    .filter(({ result }) => result.status === 'fulfilled');
+  if (successfulStreams.length === 0) {
+    if (firstStreamError) throw firstStreamError;
+    fail('concurrent heartbeat proof captured no completed stream');
+  }
+  if (heartbeatError) {
+    const observed = heartbeatCollector.events
+      .map(heartbeatMessageFromEvent)
+      .filter(Boolean)
+      .map((heartbeat) => ({
+        provider: heartbeat.provider,
+        enclave_id: heartbeat.enclave_id,
+        seq: heartbeat.seq,
+        slots: heartbeat.slots,
+        q: heartbeat.q,
+      }));
+    fail(`did not observe slots.active >= 2 heartbeat; observed ${JSON.stringify(observed.slice(-8))}`);
+  }
+
+  const heartbeat = heartbeatMessageFromEvent(heartbeatEvent);
+  const summary = {
+    ok: true,
+    heartbeat,
+    heartbeat_event: heartbeatEvent,
+    streams: streamResults.map((result, index) => result.status === 'fulfilled'
+      ? result.value
+      : {
+          ok: false,
+          index: index + 1,
+          tolerated_after_heartbeat: Boolean(heartbeatEvent && successfulStreams.length > 0),
+          error: result.reason?.message || String(result.reason),
+        }),
+    completed_streams: successfulStreams.length,
+    heartbeat_events_path: path.relative(ROOT, heartbeatEventsPath),
+  };
+  writeJson(path.join(runDir, 'gateway-concurrent-heartbeat.json'), summary);
+  return summary;
+}
+
+async function runGuidedToolCallSmoke(gatewayUrl, modelId, runDir, { timeoutMs }) {
+  const rawPath = path.join(runDir, 'gateway-tool-call-response.json');
+  const summaryPath = path.join(runDir, 'gateway-tool-call.json');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('guided tool-call timed out')), timeoutMs);
+  const body = {
+    model: modelId,
+    stream: false,
+    temperature: 0,
+    max_tokens: 96,
+    messages: [
+      {
+        role: 'user',
+        content: 'Use the lookup_room tool for room alpha. Return only the tool call.',
+      },
+    ],
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'lookup_room',
+          description: 'Look up a Mayhem room by name.',
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['room'],
+            properties: {
+              room: { type: 'string' },
+            },
+          },
+        },
+      },
+    ],
+    tool_choice: { type: 'function', function: { name: 'lookup_room' } },
+  };
+  let responseBody;
+  try {
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    responseBody = await response.text();
+    if (!response.ok) fail(`guided tool-call returned HTTP ${response.status}: ${responseBody}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  fs.writeFileSync(rawPath, responseBody);
+  const parsed = JSON.parse(responseBody);
+  const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
+  const toolCall = choice?.message?.tool_calls?.[0];
+  const argsRaw = toolCall?.function?.arguments;
+  let args = null;
+  if (typeof argsRaw === 'string') {
+    try {
+      args = JSON.parse(argsRaw);
+    } catch {
+      args = null;
+    }
+  } else if (argsRaw && typeof argsRaw === 'object') {
+    args = argsRaw;
+  }
+  if (choice?.finish_reason !== 'tool_calls') {
+    fail(`guided tool-call did not finish with tool_calls: ${JSON.stringify(choice)}`);
+  }
+  if (toolCall?.function?.name !== 'lookup_room') {
+    fail(`guided tool-call selected wrong tool: ${JSON.stringify(toolCall)}`);
+  }
+  if (!args || typeof args.room !== 'string' || args.room.length === 0) {
+    fail(`guided tool-call arguments were not valid JSON with a room: ${argsRaw}`);
+  }
+  const summary = {
+    ok: true,
+    model: modelId,
+    finish_reason: choice.finish_reason,
+    tool_name: toolCall.function.name,
+    arguments: args,
     raw_path: path.relative(ROOT, rawPath),
   };
   writeJson(summaryPath, summary);
@@ -635,6 +1001,21 @@ async function readStatePrefix(rpcUrl, prefix, limit = 500) {
   if (!response.ok) fail(`state prefix ${prefix} returned HTTP ${response.status}: ${await response.text()}`);
   const body = await response.json();
   return body.values || body.result?.values || [];
+}
+
+async function waitForStateValue(rpcUrl, key, predicate, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      last = await readStateValue(rpcUrl, key);
+      if (predicate(last)) return last;
+    } catch (err) {
+      last = { error: err.message };
+    }
+    await sleep(500);
+  }
+  fail(`timed out waiting for ${label || key}: ${JSON.stringify(last)}`);
 }
 
 async function waitForCanonicalEnclaveReady(rpcUrl, { enclaveId, modelId, backend }, timeoutMs = 60_000) {
@@ -854,7 +1235,7 @@ async function main() {
     return;
   }
 
-  const tag = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '');
+  const tag = process.env.MAYHEM_E11_TAG || new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '');
   const runDir = path.join(ROOT, '.mayhem-local/i3-e11-spark-trtllm', tag);
   const logsDir = path.join(runDir, 'logs');
   await fsp.mkdir(logsDir, { recursive: true });
@@ -876,10 +1257,15 @@ async function main() {
   const catalog = readJson(path.join(ROOT, 'catalog/models.json'));
   const model = catalog.models.find((entry) => entry.model_id === MODEL_ID);
   if (!model) fail(`catalog model not found: ${MODEL_ID}`);
-  const trtArtifact = model.artifacts?.[TRT_ARTIFACT];
+  const accelArtifactName = process.env.MAYHEM_E11_ACCEL_ARTIFACT || DEFAULT_ACCEL_ARTIFACT;
+  const accelArtifact = model.artifacts?.[accelArtifactName];
   const ggufArtifact = model.artifacts?.[GGUF_ARTIFACT];
-  if (!trtArtifact || trtArtifact.engine !== 'trt-llm') fail(`missing ${TRT_ARTIFACT} trt-llm artifact`);
+  if (!isSupportedSparkAccelerator(accelArtifact)) {
+    fail(`missing supported Spark accelerated artifact ${accelArtifactName}: ${JSON.stringify(accelArtifact)}`);
+  }
   if (!ggufArtifact || ggufArtifact.engine !== 'llama.cpp') fail(`missing ${GGUF_ARTIFACT} llama.cpp artifact`);
+  const accelBackend = accelArtifact.engine;
+  const accelLabel = `${accelArtifactName}/${accelBackend}`;
   const rateMapJson = textRateMapJson(model);
   const manifestHash = sha256File(path.join(ROOT, 'catalog/models.json'));
   const catalogReleaseRepo = process.env.MAYHEM_E11_CATALOG_RELEASE_REPO || DEFAULT_CATALOG_RELEASE_REPO;
@@ -913,6 +1299,7 @@ async function main() {
   const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
   const remoteNode = (await ssh(remote, passFile, 'command -v node || true')).stdout.trim() || '/usr/bin/node';
   const remoteTrtPython = process.env.MAYHEM_E11_TRTLLM_PYTHON || '/home/trac/ai/mayhem/bin/trtllm-python';
+  const remoteVllmPython = process.env.MAYHEM_E11_VLLM_PYTHON || '/home/trac/ai/mayhem/bin/vllm-python-e14';
 
   log('syncing current source tree to Spark');
   await ssh(remote, passFile, `mkdir -p ${sh(remoteRoot)} ${sh(remoteLogs)} ${sh(remoteDownloads)}`);
@@ -958,7 +1345,9 @@ async function main() {
   await preauthorizeLocalApps([localNode, localPear, mayhemBin], path.join(logsDir, 'local-firewall.log'));
   const devnetLog = path.join(logsDir, 'dev-net.log');
   const subnetChannel = `mayhem-e11-${tag}`;
-  const devnet = spawnLogged('bash', ['scripts/dev-net.sh', '--cleanup', '--keep-running'], devnetLog, {
+  const devnetArgs = ['scripts/dev-net.sh', '--keep-running'];
+  if (envFlag('MAYHEM_E11_DEVNET_CLEANUP', true)) devnetArgs.splice(1, 0, '--cleanup');
+  const devnet = spawnLogged('bash', devnetArgs, devnetLog, {
     env: {
       ...process.env,
       MAYHEM_DEVNET_JOINERS: '2',
@@ -990,11 +1379,11 @@ async function main() {
   const providerPeerPubkey = joinerBLog.match(/Peer pubkey \(hex\):\s+([0-9a-f]{64})/i)?.[1];
   if (!adminPubkey || !userPubkey || !providerPeerPubkey) fail('could not parse dev-net peer pubkeys');
 
-  const trtEnclaveId = await catalogEnclaveId({
+  const accelEnclaveId = await catalogEnclaveId({
     adminPubkey,
     modelId: MODEL_ID,
-    artifactRoot: trtArtifact.artifact_root,
-    artifactSidecarRoots: artifactSidecarRoots(trtArtifact),
+    artifactRoot: accelArtifact.artifact_root,
+    artifactSidecarRoots: artifactSidecarRoots(accelArtifact),
     manifestHash,
     binaryHash: remoteBinaryHash,
   });
@@ -1006,7 +1395,7 @@ async function main() {
     binaryHash: localBinaryHash,
   });
 
-  log('seeding admin rules, prices, GGUF and NVFP4 enclaves');
+  log(`seeding admin rules, prices, GGUF and ${accelLabel} enclaves`);
   const adminHome = path.join(runDir, 'admin-home');
   await fsp.mkdir(path.join(adminHome, 'stores'), { recursive: true });
   await fsp.rm(path.join(adminHome, 'stores/admin'), { recursive: true, force: true });
@@ -1051,26 +1440,46 @@ async function main() {
     '--binary-hash', localBinaryHash,
     '--caps-json', '{"chat":true,"tools":true,"json":true,"ctx":1024}',
   ]);
+  await waitForStateValue(
+    adminRpcUrl,
+    `enclave/${ggufEnclaveId}`,
+    (value) => value?.status === 'active' && value?.backend === 'llama.cpp',
+    180_000,
+    'admin-created GGUF enclave'
+  );
   adminRun('admin-set-gguf-price', ['set-price', '--enclave-id', ggufEnclaveId, '--rate-map-json', rateMapJson, '--effective-at', '0']);
   adminRun('admin-open-gguf-room', ['open-room', '--enclave-id', ggufEnclaveId, '--model', MODEL_ID, '--nonce', `e11-gguf-${tag}`, '--label', 'i3-e11-gguf-fallback']);
-  adminRun('admin-register-trt-enclave', [
+  adminRun('admin-register-accelerated-enclave', [
     'register-enclave',
-    '--enclave-id', trtEnclaveId,
+    '--enclave-id', accelEnclaveId,
     '--model', MODEL_ID,
-    '--backend', 'trt-llm',
-    '--artifact-root', trtArtifact.artifact_root,
-    '--artifact-root-kind', trtArtifact.artifact_root_kind,
-    '--artifact-repo', trtArtifact.source.repo,
-    '--artifact-revision', trtArtifact.source.revision,
-    '--artifact-path', trtArtifact.path,
-    '--source-sha256', trtArtifact.source_sha256,
+    '--backend', accelBackend,
+    '--artifact-root', accelArtifact.artifact_root,
+    '--artifact-root-kind', accelArtifact.artifact_root_kind,
+    '--artifact-repo', accelArtifact.source.repo,
+    '--artifact-revision', accelArtifact.source.revision,
+    '--artifact-path', accelArtifact.path,
+    '--source-sha256', accelArtifact.source_sha256,
     '--catalog-path', path.join(ROOT, 'catalog/models.json'),
     '--manifest-hash', manifestHash,
     '--binary-hash', remoteBinaryHash,
-    '--caps-json', '{"chat":true,"tools":false,"json":true,"ctx":1024,"tp_degree":1,"max_batch_size":1,"max_num_tokens":1024}',
+    '--caps-json', acceleratedCapsJson(accelBackend),
   ]);
-  adminRun('admin-set-trt-price', ['set-price', '--enclave-id', trtEnclaveId, '--rate-map-json', rateMapJson, '--effective-at', '0']);
-  adminRun('admin-open-trt-room', ['open-room', '--enclave-id', trtEnclaveId, '--model', MODEL_ID, '--nonce', `e11-trt-${tag}`, '--label', 'i3-e11-trt-spark']);
+  await waitForStateValue(
+    adminRpcUrl,
+    `enclave/${accelEnclaveId}`,
+    (value) => value?.status === 'active' && value?.backend === accelBackend,
+    180_000,
+    `admin-created ${accelLabel} enclave`
+  );
+  adminRun('admin-set-accelerated-price', ['set-price', '--enclave-id', accelEnclaveId, '--rate-map-json', rateMapJson, '--effective-at', '0']);
+  adminRun('admin-open-accelerated-room', [
+    'open-room',
+    '--enclave-id', accelEnclaveId,
+    '--model', MODEL_ID,
+    '--nonce', `e11-${accelBackend}-${tag}`,
+    '--label', `i3-e11-${accelBackend}-spark`,
+  ]);
   const fiatDepositRef = (await b3(Buffer.from(`i3-e11-fiat-credit:${tag}:${userPubkey}`, 'utf8'))).toString('hex');
   adminRun('admin-fiat-deposit', [
     'fiat-deposit',
@@ -1083,19 +1492,19 @@ async function main() {
     '--epoch', '1',
     '--at', '0',
   ]);
-  const trtReadiness = await waitForCanonicalEnclaveReady(adminRpcUrl, {
-    enclaveId: trtEnclaveId,
+  const accelReadiness = await waitForCanonicalEnclaveReady(adminRpcUrl, {
+    enclaveId: accelEnclaveId,
     modelId: MODEL_ID,
-    backend: 'trt-llm',
-  });
-  writeJson(path.join(runDir, 'admin-trt-readiness.json'), {
-    enclave_id: trtEnclaveId,
+    backend: accelBackend,
+  }, 180_000);
+  writeJson(path.join(runDir, 'admin-accelerated-readiness.json'), {
+    enclave_id: accelEnclaveId,
     model_id: MODEL_ID,
-    backend: 'trt-llm',
-    price_ver: trtReadiness.price.current.ver,
-    room_id: trtReadiness.room.room_id,
-    sidechannel: trtReadiness.room.sidechannel,
-    checked_at_ms: trtReadiness.checked_at_ms,
+    backend: accelBackend,
+    price_ver: accelReadiness.price.current.ver,
+    room_id: accelReadiness.room.room_id,
+    sidechannel: accelReadiness.room.sidechannel,
+    checked_at_ms: accelReadiness.checked_at_ms,
   });
 
   log('copying provider peer wallet to Spark and opening reverse tunnels');
@@ -1139,9 +1548,24 @@ async function main() {
     'Spark contract RPC'
   );
 
-  log('starting Spark provider start with auto backend selection');
+  if (accelBackend === 'vllm') {
+    const vllmReady = (await ssh(remote, passFile, `test -x ${sh(remoteVllmPython)} && echo yes || true`)).stdout.trim() === 'yes';
+    if (!vllmReady) fail(`vLLM Python wrapper is not executable on Spark: ${remoteVllmPython}`);
+  }
+
+  log(`starting Spark provider start with auto backend selection for ${accelLabel}`);
   const remoteProviderLog = path.posix.join(remoteLogs, 'provider-start.log');
-  const providerEnv = `MAYHEM_PROVIDER_SESSION_DEBUG=1 MAYHEM_PROVIDER_CANDIDATE_DEBUG=1 MAYHEM_TRTLLM_PYTHON=${sh(remoteTrtPython)} MAYHEM_TRTLLM_REQUEST_TIMEOUT_SECS=600 MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} PATH="$HOME/.cargo/bin:$PATH"`;
+  const providerEnv = [
+    'MAYHEM_PROVIDER_SESSION_DEBUG=1',
+    'MAYHEM_PROVIDER_CANDIDATE_DEBUG=1',
+    `MAYHEM_TRTLLM_PYTHON=${sh(remoteTrtPython)}`,
+    'MAYHEM_TRTLLM_REQUEST_TIMEOUT_SECS=600',
+    `MAYHEM_VLLM_PYTHON=${sh(remoteVllmPython)}`,
+    'MAYHEM_VLLM_REQUEST_TIMEOUT_SECS=900',
+    `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)}`,
+    `MAYHEM_NODE_BIN=${sh(remoteNode)}`,
+    'PATH="$HOME/.cargo/bin:$PATH"',
+  ].join(' ');
   const providerArgs = [
     `setsid env ${providerEnv} ${sh(remoteMayhem)} provider start`,
     `--home ${sh(remoteProviderHome)}`,
@@ -1181,8 +1605,8 @@ async function main() {
   const providerReport = parseProviderStartupReport(providerLogText);
   if (!providerReport?.provider) fail(`provider startup report missing provider; see ${path.join(logsDir, 'provider-start.spark.log')}`);
   if (providerReport.provider !== providerPeerPubkey) fail(`Spark provider wallet ${providerReport.provider} did not match Pear provider peer ${providerPeerPubkey}`);
-  if (providerReport.artifact?.name !== TRT_ARTIFACT || providerReport.artifact?.engine !== 'trt-llm') {
-    fail(`Spark provider did not auto-select ${TRT_ARTIFACT}/trt-llm: ${JSON.stringify(providerReport.artifact)}`);
+  if (providerReport.artifact?.name !== accelArtifactName || providerReport.artifact?.engine !== accelBackend) {
+    fail(`Spark provider did not auto-select ${accelLabel}: ${JSON.stringify(providerReport.artifact)}`);
   }
 
   log('checking local Apple fallback provider-start selects GGUF');
@@ -1228,6 +1652,8 @@ async function main() {
       '--rpc-url', adminRpcUrl,
       '--sc-bridge-url', joinerAWs[1],
       '--sc-bridge-token', scToken,
+      '--dev-catalog-path', path.join(ROOT, 'catalog/models.json'),
+      '--dev-skip-catalog-verify',
       '--session-open-timeout-seconds', '120',
       '--session-ttft-timeout-seconds', '420',
       '--session-frame-timeout-seconds', '420',
@@ -1243,20 +1669,46 @@ async function main() {
   await waitHttp(`${gatewayUrl}/mayhem/status`, 120_000, 'local gateway', async () => gateway.exitCode === null);
   const routeInfo = await waitGatewayRoute(gatewayUrl, MODEL_ID, providerReport.provider, 180_000);
 
-  log('running real streaming chat through Spark TRT provider');
+  log(`running real streaming chat through Spark ${accelLabel} provider`);
   const chatStream = await runStreamingChatSmoke(gatewayUrl, MODEL_ID, runDir, {
     timeoutMs: envPositiveInt('MAYHEM_E11_CHAT_TIMEOUT_SECONDS', 600) * 1000,
     maxTokens: envPositiveInt('MAYHEM_E11_CHAT_MAX_TOKENS', 24),
+    fileStem: 'gateway-chat-stream',
   });
-  const canaryProbe = await waitGatewayProbe(gatewayUrl, providerReport.provider, trtEnclaveId, 180_000);
+  const toolCall = accelBackend === 'vllm'
+    ? await runGuidedToolCallSmoke(gatewayUrl, MODEL_ID, runDir, {
+        timeoutMs: envPositiveInt('MAYHEM_E11_TOOL_TIMEOUT_SECONDS', 600) * 1000,
+      })
+    : null;
+  let concurrentHeartbeat = null;
+  if (accelBackend === 'vllm') {
+    log('running two concurrent vLLM sessions and capturing slots.active heartbeat');
+    const heartbeatCollector = await startHeartbeatCollector(
+      joinerAWs[1],
+      scToken,
+      accelReadiness.room.sidechannel,
+      path.join(runDir, 'gateway-concurrent-heartbeats.json')
+    );
+    try {
+      concurrentHeartbeat = await runConcurrentHeartbeatSmoke(gatewayUrl, MODEL_ID, runDir, heartbeatCollector, {
+        timeoutMs: envPositiveInt('MAYHEM_E11_CONCURRENT_TIMEOUT_SECONDS', 900) * 1000,
+        maxTokens: envPositiveInt('MAYHEM_E11_CONCURRENT_MAX_TOKENS', 32),
+        provider: providerReport.provider,
+        enclaveId: accelEnclaveId,
+      });
+    } finally {
+      heartbeatCollector.close();
+    }
+  }
+  const canaryProbe = await waitGatewayProbe(gatewayUrl, providerReport.provider, accelEnclaveId, 180_000);
   const receipts = await (await fetch(`${gatewayUrl}/mayhem/receipts`)).json();
   const receiptsPath = path.join(runDir, 'gateway-receipts.json');
   writeJson(receiptsPath, receipts);
   const latestReceipt = Array.isArray(receipts.data) ? receipts.data.at(-1) : null;
   const receiptBody = latestReceipt?.receipt?.body || latestReceipt?.receipt || latestReceipt || null;
   if (!latestReceipt) fail('streaming chat completed but no gateway receipt was recorded');
-  if (receiptBody?.provider !== providerReport.provider || receiptBody?.enclave_id !== trtEnclaveId) {
-    fail(`latest receipt did not bind Spark TRT provider/enclave: ${JSON.stringify(receiptBody)}`);
+  if (receiptBody?.provider !== providerReport.provider || receiptBody?.enclave_id !== accelEnclaveId) {
+    fail(`latest receipt did not bind Spark ${accelLabel} provider/enclave: ${JSON.stringify(receiptBody)}`);
   }
 
   log('settling receipt through epoch commit/apply');
@@ -1279,8 +1731,10 @@ async function main() {
     model_id: MODEL_ID,
     catalog: {
       manifest_hash: manifestHash,
-      trt_artifact: TRT_ARTIFACT,
+      accelerated_artifact: accelArtifactName,
+      accelerated_backend: accelBackend,
       gguf_artifact: GGUF_ARTIFACT,
+      gateway_catalog_source: 'contract-plus-dev-local-current-signed',
     },
     local: {
       admin_rpc_url: adminRpcUrl,
@@ -1307,11 +1761,11 @@ async function main() {
       }])),
     },
     enclaves: {
-      trt: {
-        enclave_id: trtEnclaveId,
-        backend: 'trt-llm',
-        artifact_name: TRT_ARTIFACT,
-        artifact_root: trtArtifact.artifact_root,
+      accelerated: {
+        enclave_id: accelEnclaveId,
+        backend: accelBackend,
+        artifact_name: accelArtifactName,
+        artifact_root: accelArtifact.artifact_root,
         binary_hash: remoteBinaryHash,
       },
       gguf: {
@@ -1342,6 +1796,8 @@ async function main() {
         route_count: routeInfo.routes.length,
       },
       chat_stream: chatStream,
+      guided_tool_call: toolCall,
+      concurrent_heartbeat: concurrentHeartbeat,
       canary_probe: canaryProbe,
       latest_receipt: receiptBody,
       receipts: path.relative(ROOT, receiptsPath),
