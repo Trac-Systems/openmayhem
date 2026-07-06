@@ -25,12 +25,12 @@ use mayhem_bridge::{
     DEFAULT_SC_BRIDGE_URL,
 };
 use mayhem_enclave::{
-    boot_sealed_store, build_merkle_manifest, download_resumable,
-    finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
-    prepare_tier1_attestation_report, read_sealed_manifest, seal_artifact, BootOptions,
-    DownloadReport, DownloadRequest, DownloadSource, KeyContext, RuntimeKeyContext, RuntimeKeypair,
-    RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationDraft, Tier1AttestationReport,
-    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
+    build_merkle_manifest, download_resumable, finalize_tier1_attestation_report,
+    load_or_create_runtime_keypair_store, measure_binary, prepare_tier1_attestation_report,
+    read_sealed_manifest, seal_artifact, DownloadReport, DownloadRequest, DownloadSource,
+    KeyContext, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions,
+    Tier1AttestationDraft, Tier1AttestationReport, Tier1ExternalProviderAttestationOptions,
+    DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
@@ -18909,8 +18909,11 @@ struct HeartbeatContext<'a> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProviderLoadSnapshot {
     active_slots: u64,
+    active_requests: u64,
     queue_depth: u64,
     est_wait_ms: u64,
+    ttft_ms: u64,
+    measured_tok_s_milli: Option<u64>,
 }
 
 impl ProviderLoadSnapshot {
@@ -18918,8 +18921,11 @@ impl ProviderLoadSnapshot {
     fn from_sessions(sessions: &HashMap<String, ActiveProviderSession>) -> Self {
         Self {
             active_slots: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+            active_requests: 0,
             queue_depth: 0,
             est_wait_ms: 0,
+            ttft_ms: 0,
+            measured_tok_s_milli: None,
         }
     }
 }
@@ -18927,17 +18933,39 @@ impl ProviderLoadSnapshot {
 #[derive(Clone, Debug, Default)]
 struct ProviderHeartbeatLoad {
     active_slots: Arc<AtomicU64>,
-    queue_depth: Arc<AtomicU64>,
-    est_wait_ms: Arc<AtomicU64>,
+    active_requests: Arc<AtomicU64>,
+    rolling_turn_ms: Arc<AtomicU64>,
+    rolling_ttft_ms: Arc<AtomicU64>,
+    rolling_tok_s_milli: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 }
 
 impl ProviderHeartbeatLoad {
     fn snapshot(&self) -> ProviderLoadSnapshot {
+        let active_slots = self.active_slots.load(Ordering::Relaxed);
+        let active_requests = self.active_requests.load(Ordering::Relaxed);
+        let queue_depth = if active_requests > 0 {
+            active_slots.saturating_sub(active_requests)
+        } else {
+            0
+        };
+        let rolling_turn_ms = self.rolling_turn_ms.load(Ordering::Relaxed);
+        let est_wait_ms = if queue_depth > 0 && rolling_turn_ms > 0 {
+            rolling_turn_ms.saturating_mul(queue_depth)
+        } else {
+            0
+        };
+        let measured_tok_s_milli = match self.rolling_tok_s_milli.load(Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        };
         ProviderLoadSnapshot {
-            active_slots: self.active_slots.load(Ordering::Relaxed),
-            queue_depth: self.queue_depth.load(Ordering::Relaxed),
-            est_wait_ms: self.est_wait_ms.load(Ordering::Relaxed),
+            active_slots,
+            active_requests,
+            queue_depth,
+            est_wait_ms,
+            ttft_ms: self.rolling_ttft_ms.load(Ordering::Relaxed),
+            measured_tok_s_milli,
         }
     }
 
@@ -18946,12 +18974,89 @@ impl ProviderHeartbeatLoad {
         self.active_slots.store(active, Ordering::Relaxed);
     }
 
+    fn begin_request(&self) -> ProviderRequestLoadGuard {
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        ProviderRequestLoadGuard {
+            load: self.clone(),
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn record_ttft_ms(&self, ttft_ms: u64) {
+        self.store_rolling_ms(&self.rolling_ttft_ms, ttft_ms.max(1));
+    }
+
+    fn record_turn_result(&self, elapsed: Duration, output_tokens: u64) {
+        let elapsed_ms = duration_millis_u64(elapsed).max(1);
+        self.store_rolling_ms(&self.rolling_turn_ms, elapsed_ms);
+        if output_tokens > 0 {
+            let tok_s_milli = ((u128::from(output_tokens) * 1_000_000_u128)
+                / u128::from(elapsed_ms))
+            .min(u128::from(u64::MAX)) as u64;
+            self.store_rolling_ms(&self.rolling_tok_s_milli, tok_s_milli.max(1));
+        }
+    }
+
+    fn finish_request(&self) {
+        let _ =
+            self.active_requests
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_sub(1)
+                });
+    }
+
+    fn store_rolling_ms(&self, target: &AtomicU64, sample: u64) {
+        let previous = target.load(Ordering::Relaxed);
+        let next = if previous == 0 {
+            sample
+        } else {
+            previous
+                .saturating_mul(3)
+                .saturating_add(sample)
+                .saturating_add(2)
+                / 4
+        };
+        target.store(next, Ordering::Relaxed);
+    }
+
     fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
     fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+}
+
+struct ProviderRequestLoadGuard {
+    load: ProviderHeartbeatLoad,
+    started: Instant,
+    finished: bool,
+}
+
+impl ProviderRequestLoadGuard {
+    fn started(&self) -> Instant {
+        self.started
+    }
+
+    fn finish_with_output(&mut self, output: &ProviderSessionOutput) {
+        self.load
+            .record_turn_result(self.started.elapsed(), output.usage.output_tokens());
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if !self.finished {
+            self.load.finish_request();
+            self.finished = true;
+        }
+    }
+}
+
+impl Drop for ProviderRequestLoadGuard {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -19202,10 +19307,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let downloads_dir = absolutize(downloads_dir)?;
     let artifact_paths = download_provider_artifact(&args, &downloads_dir, &selected).await?;
 
-    provider_log(
-        &args,
-        "Verifying, sealing, and boot-checking the enclave artifact",
-    );
+    provider_log(&args, "Verifying and sealing the enclave artifact");
     let sealed_store = home
         .join("enclaves")
         .join(safe_path_component(&selected.enclave.model_id))
@@ -19223,13 +19325,25 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &provider_secret,
         args.chunk_size,
     )?;
-    let boot_report = boot_sealed_store(&BootOptions {
-        store_dir: sealed_store.clone(),
-        key_context: key_context.clone(),
-        provider_secret: provider_secret.clone(),
-        output_path: None,
-        expected_merkle_root: Some(selected.enclave.artifact_root.clone()),
-    })?;
+    if seal_report.bytes_written == 0 {
+        provider_log(
+            &args,
+            &format!(
+                "Using cached sealed enclave artifact: {} bytes in {} chunks",
+                seal_report.total_bytes,
+                seal_report.merkle.chunks.len()
+            ),
+        );
+    } else {
+        provider_log(
+            &args,
+            &format!(
+                "Sealed enclave artifact: {} bytes in {} chunks",
+                seal_report.total_bytes,
+                seal_report.merkle.chunks.len()
+            ),
+        );
+    }
 
     provider_log(&args, "Preparing Tier-1 attestation");
     let runtime_context = RuntimeKeyContext {
@@ -19366,6 +19480,15 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &selected.enclave.enclave_id,
         &heartbeats,
     )?;
+    let sealed_store_boot = json!({
+        "checked": false,
+        "mode": "sealed-manifest",
+        "store_dir": sealed_store.clone(),
+        "output_path": null,
+        "merkle_root": seal_report.merkle.root.clone(),
+        "total_bytes": seal_report.total_bytes,
+        "chunk_count": seal_report.merkle.chunks.len(),
+    });
     let report = json!({
         "status": heartbeat_status,
         "home": home,
@@ -19388,9 +19511,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "root": selected.enclave.artifact_root.clone(),
         },
         "sealed_store": {
-            "path": sealed_store,
+            "path": sealed_store.clone(),
             "sealed": seal_report,
-            "boot": boot_report,
+            "boot": sealed_store_boot,
+            "boot_checked": false,
         },
         "attestation": {
             "head": attestation.report_head,
@@ -19409,7 +19533,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "heartbeats": heartbeats,
         "self_test": {
             "ok": true,
-            "kind": "sealed-boot-attestation-heartbeat",
+            "kind": "sealed-manifest-attestation-heartbeat",
         },
         "session_rpc_url": if args.serve_sessions { Some(session_rpc_url.as_str()) } else { None },
     });
@@ -22288,13 +22412,27 @@ fn seal_provider_artifact(
     chunk_size: usize,
 ) -> Result<DownloadReport> {
     if sealed_store.join(SEALED_STORE_MANIFEST).exists() {
-        let merkle = build_merkle_manifest(artifact_path, chunk_size)?;
+        let manifest = read_sealed_manifest(sealed_store)?;
+        if &manifest.key_context != key_context {
+            bail!(
+                "sealed store context mismatch for {}",
+                sealed_store.display()
+            );
+        }
+        if manifest.merkle.root != key_context.artifact_root {
+            bail!(
+                "sealed store artifact root mismatch for {}: expected {}, got {}",
+                sealed_store.display(),
+                key_context.artifact_root,
+                manifest.merkle.root
+            );
+        }
         return Ok(DownloadReport {
-            destination: artifact_path.to_path_buf(),
+            destination: sealed_store.to_path_buf(),
             resumed_from: 0,
             bytes_written: 0,
-            total_bytes: merkle.total_bytes,
-            merkle,
+            total_bytes: manifest.merkle.total_bytes,
+            merkle: manifest.merkle,
         });
     }
 
@@ -22658,6 +22796,7 @@ async fn send_provider_heartbeat_round(
 ) -> Result<Vec<Value>> {
     let mut sent = Vec::new();
     let caps = provider_heartbeat_caps(selected);
+    let (tok_s, tok_s_source) = provider_heartbeat_tok_s(load, selected.verdict.est_tok_s);
     for room in rooms {
         if join_rooms {
             bridge
@@ -22677,6 +22816,7 @@ async fn send_provider_heartbeat_round(
             "sat": provider_saturation(load.active_slots, selected.verdict.max_sessions),
             "slots": {
                 "active": load.active_slots,
+                "active_requests": load.active_requests,
                 "max": selected.verdict.max_sessions,
             },
             "q": {
@@ -22684,8 +22824,9 @@ async fn send_provider_heartbeat_round(
                 "est_wait_ms": load.est_wait_ms,
             },
             "perf": {
-                "tok_s": selected.verdict.est_tok_s,
-                "ttft_ms": 0,
+                "tok_s": tok_s,
+                "tok_s_source": tok_s_source,
+                "ttft_ms": load.ttft_ms,
             },
             "price_ver": selected
                 .price
@@ -22721,6 +22862,16 @@ async fn send_provider_heartbeat_round(
         }));
     }
     Ok(sent)
+}
+
+fn provider_heartbeat_tok_s(
+    load: ProviderLoadSnapshot,
+    cold_start_prior: Option<f64>,
+) -> (Option<f64>, &'static str) {
+    if let Some(measured) = load.measured_tok_s_milli {
+        return (Some(measured as f64 / 1000.0), "measured");
+    }
+    (cold_start_prior, "hwprobe_cold_start_prior")
 }
 
 async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
@@ -22837,8 +22988,16 @@ async fn serve_provider_sessions(
     let deadline = (ctx.args.serve_sessions_seconds > 0)
         .then(|| Instant::now() + Duration::from_secs(ctx.args.serve_sessions_seconds));
     let mut sessions = HashMap::new();
+    let mut pending_requests = HashMap::new();
     let serve_result: Result<()> = async {
         loop {
+            expire_provider_pending_sessions(
+                &mut bridge,
+                &mut sessions,
+                &mut pending_requests,
+                &heartbeat_load,
+            )
+            .await;
             let wait = deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .filter(|remaining| !remaining.is_zero())
@@ -22866,6 +23025,7 @@ async fn serve_provider_sessions(
                     handle_provider_session_frame(
                         &mut bridge,
                         &mut sessions,
+                        &mut pending_requests,
                         &heartbeat_load,
                         &terms,
                         &runtime,
@@ -22875,6 +23035,13 @@ async fn serve_provider_sessions(
                     .await?;
                 }
                 Err(BridgeError::Timeout) => {
+                    expire_provider_pending_sessions(
+                        &mut bridge,
+                        &mut sessions,
+                        &mut pending_requests,
+                        &heartbeat_load,
+                    )
+                    .await;
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break;
                     }
@@ -22903,9 +23070,69 @@ async fn serve_provider_sessions(
     serve_result
 }
 
+async fn expire_provider_pending_sessions(
+    bridge: &mut ScBridgeClient,
+    sessions: &mut HashMap<String, ActiveProviderSession>,
+    pending_requests: &mut HashMap<String, Instant>,
+    heartbeat_load: &ProviderHeartbeatLoad,
+) {
+    let expired = provider_session_expired_pending_ids(pending_requests, Instant::now());
+    if expired.is_empty() {
+        return;
+    }
+    for session_id in expired {
+        pending_requests.remove(&session_id);
+        let Some(active) = sessions.remove(&session_id) else {
+            continue;
+        };
+        provider_session_debug(format!(
+            "closing stale accepted session {} after no s.req arrived before request timeout",
+            active.session_id
+        ));
+        if let Err(err) = send_provider_session_close(
+            bridge,
+            &active.remote,
+            &active.session_id,
+            "err:request_timeout",
+        )
+        .await
+        {
+            provider_session_debug(format!(
+                "sending request-timeout close failed for session {}: {err:#}",
+                active.session_id
+            ));
+        }
+    }
+    heartbeat_load.set_active_sessions(sessions.len());
+}
+
+fn provider_session_expired_pending_ids(
+    pending_requests: &HashMap<String, Instant>,
+    now: Instant,
+) -> Vec<String> {
+    let mut expired = pending_requests
+        .iter()
+        .filter_map(|(session_id, deadline)| (*deadline <= now).then(|| session_id.clone()))
+        .collect::<Vec<_>>();
+    expired.sort();
+    expired
+}
+
+fn provider_session_request_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .unwrap_or(15_000)
+            .min(300_000),
+    )
+}
+
 async fn handle_provider_session_frame(
     bridge: &mut ScBridgeClient,
     sessions: &mut HashMap<String, ActiveProviderSession>,
+    pending_requests: &mut HashMap<String, Instant>,
     heartbeat_load: &ProviderHeartbeatLoad,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
@@ -22984,6 +23211,10 @@ async fn handle_provider_session_frame(
                             checkpoint_every,
                         },
                     );
+                    pending_requests.insert(
+                        session_id.clone(),
+                        Instant::now() + provider_session_request_timeout(),
+                    );
                     heartbeat_load.set_active_sessions(sessions.len());
                     let ts = unix_epoch_millis()?;
                     let open_head =
@@ -23059,6 +23290,7 @@ async fn handle_provider_session_frame(
         }
         Some("s.req") => {
             provider_session_debug(format!("handling s.req for session {session_id}"));
+            pending_requests.remove(&session_id);
             let Some(active) = sessions.get(&session_id).cloned() else {
                 provider_session_debug(format!(
                     "closing unknown session {session_id} after s.req from {remote}"
@@ -23076,6 +23308,8 @@ async fn handle_provider_session_frame(
             provider_session_debug(format!(
                 "building response for session {session_id} request {request_id}"
             ));
+            let mut request_load = heartbeat_load.begin_request();
+            let request_started = request_load.started();
             let mut live_stream = responder.supports_live_text_streaming().then(|| {
                 ProviderSessionLiveStream::new(
                     bridge,
@@ -23084,11 +23318,22 @@ async fn handle_provider_session_frame(
                     terms,
                     &body,
                     runtime.runtime_keypair,
+                    request_started,
+                    heartbeat_load.clone(),
                 )
             });
             let response = responder.respond_streaming(terms, &body, live_stream.as_mut());
             let output = match response {
                 Ok(output) => {
+                    if live_stream
+                        .as_ref()
+                        .and_then(|stream| stream.first_ttft_ms())
+                        .is_none()
+                    {
+                        heartbeat_load
+                            .record_ttft_ms(duration_millis_u64(request_started.elapsed()));
+                    }
+                    request_load.finish_with_output(&output);
                     if let Some(stream) = live_stream.as_mut() {
                         if let Err(err) = stream.finish() {
                             provider_session_debug(format!(
@@ -23111,6 +23356,7 @@ async fn handle_provider_session_frame(
                             )
                             .await?;
                             sessions.remove(&session_id);
+                            pending_requests.remove(&session_id);
                             heartbeat_load.set_active_sessions(sessions.len());
                             return Ok(());
                         }
@@ -23118,6 +23364,7 @@ async fn handle_provider_session_frame(
                     output
                 }
                 Err(err) => {
+                    request_load.finish();
                     provider_session_debug(format!(
                         "response failed for session {session_id}: {err:#}"
                     ));
@@ -23138,6 +23385,7 @@ async fn handle_provider_session_frame(
                     )
                     .await?;
                     sessions.remove(&session_id);
+                    pending_requests.remove(&session_id);
                     heartbeat_load.set_active_sessions(sessions.len());
                     return Ok(());
                 }
@@ -23182,6 +23430,7 @@ async fn handle_provider_session_frame(
                     .await
                     .ok();
                     sessions.remove(&session_id);
+                    pending_requests.remove(&session_id);
                     heartbeat_load.set_active_sessions(sessions.len());
                     return Ok(());
                 }
@@ -23209,6 +23458,7 @@ async fn handle_provider_session_frame(
                 )
                 .await?;
                 sessions.remove(&session_id);
+                pending_requests.remove(&session_id);
                 heartbeat_load.set_active_sessions(sessions.len());
                 return Ok(());
             }
@@ -23217,10 +23467,12 @@ async fn handle_provider_session_frame(
             ));
             send_provider_session_close(bridge, &active.remote, &active.session_id, "done").await?;
             sessions.remove(&session_id);
+            pending_requests.remove(&session_id);
             heartbeat_load.set_active_sessions(sessions.len());
         }
         Some("s.close") => {
             sessions.remove(&session_id);
+            pending_requests.remove(&session_id);
             heartbeat_load.set_active_sessions(sessions.len());
         }
         _ => {}
@@ -23242,9 +23494,12 @@ struct ProviderSessionLiveStream<'a> {
     terms: &'a ProviderSessionTerms,
     body: &'a Value,
     runtime_keypair: &'a RuntimeKeypair,
+    request_started: Instant,
+    heartbeat_load: ProviderHeartbeatLoad,
     next_index: u64,
     receipt_seq: u64,
     last_checkpoint_tokens: u64,
+    first_ttft_ms: Option<u64>,
     delivered_tokens: u64,
     streamed_any: bool,
     pending_text: String,
@@ -23259,6 +23514,8 @@ impl<'a> ProviderSessionLiveStream<'a> {
         terms: &'a ProviderSessionTerms,
         body: &'a Value,
         runtime_keypair: &'a RuntimeKeypair,
+        request_started: Instant,
+        heartbeat_load: ProviderHeartbeatLoad,
     ) -> Self {
         Self {
             bridge,
@@ -23267,9 +23524,12 @@ impl<'a> ProviderSessionLiveStream<'a> {
             terms,
             body,
             runtime_keypair,
+            request_started,
+            heartbeat_load,
             next_index: 0,
             receipt_seq: 1,
             last_checkpoint_tokens: 0,
+            first_ttft_ms: None,
             delivered_tokens: 0,
             streamed_any: false,
             pending_text: String::new(),
@@ -23278,6 +23538,11 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn on_token(&mut self, chunk: TokenChunk, prompt_tokens: u64) -> Result<()> {
+        if self.first_ttft_ms.is_none() {
+            let ttft_ms = duration_millis_u64(self.request_started.elapsed()).max(1);
+            self.first_ttft_ms = Some(ttft_ms);
+            self.heartbeat_load.record_ttft_ms(ttft_ms);
+        }
         provider_session_debug(format!(
             "live buffering token #{} for session {} request {}",
             self.delivered_tokens, self.active.session_id, self.request_id
@@ -23337,6 +23602,10 @@ impl<'a> ProviderSessionLiveStream<'a> {
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         Ok(())
+    }
+
+    fn first_ttft_ms(&self) -> Option<u64> {
+        self.first_ttft_ms
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -31707,6 +31976,38 @@ mod tests {
     }
 
     #[test]
+    fn seal_provider_artifact_reuses_cached_sealed_store_without_plaintext() {
+        let temp = test_temp_dir("mayhem-seal-cache");
+        let artifact = temp.join("model.bin");
+        fs::write(&artifact, b"admin-approved artifact bytes").unwrap();
+        let merkle = build_merkle_manifest(&artifact, 8).unwrap();
+        let sealed_store = temp.join("sealed");
+        let key_context = KeyContext {
+            provider_id: "11".repeat(32),
+            enclave_id: "22".repeat(32),
+            artifact_root: merkle.root.clone(),
+            manifest_hash: "33".repeat(32),
+        };
+        let provider_secret = vec![7_u8; 32];
+
+        let first =
+            seal_provider_artifact(&artifact, &sealed_store, &key_context, &provider_secret, 8)
+                .unwrap();
+        assert_eq!(first.bytes_written, merkle.total_bytes);
+        fs::remove_file(&artifact).unwrap();
+
+        let cached =
+            seal_provider_artifact(&artifact, &sealed_store, &key_context, &provider_secret, 8)
+                .unwrap();
+
+        assert_eq!(cached.destination, sealed_store);
+        assert_eq!(cached.bytes_written, 0);
+        assert_eq!(cached.total_bytes, merkle.total_bytes);
+        assert_eq!(cached.merkle.root, merkle.root);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_heartbeat_caps_deadvertise_unsupported_tool_backends() {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
@@ -31774,13 +32075,77 @@ mod tests {
             load.snapshot(),
             ProviderLoadSnapshot {
                 active_slots: 2,
+                active_requests: 0,
                 queue_depth: 0,
-                est_wait_ms: 0
+                est_wait_ms: 0,
+                ttft_ms: 0,
+                measured_tok_s_milli: None
             }
         );
         assert!(!load.is_stopped());
         load.stop();
         assert!(load.is_stopped());
+    }
+
+    #[test]
+    fn provider_heartbeat_load_tracks_queue_and_measured_perf() {
+        let load = ProviderHeartbeatLoad::default();
+        load.set_active_sessions(3);
+        let mut request = load.begin_request();
+
+        let busy = load.snapshot();
+        assert_eq!(busy.active_slots, 3);
+        assert_eq!(busy.active_requests, 1);
+        assert_eq!(busy.queue_depth, 2);
+        assert_eq!(busy.ttft_ms, 0);
+
+        load.record_ttft_ms(125);
+        load.record_turn_result(Duration::from_millis(500), 10);
+        request.finish();
+
+        let measured = load.snapshot();
+        assert_eq!(measured.active_requests, 0);
+        assert_eq!(measured.queue_depth, 0);
+        assert_eq!(measured.ttft_ms, 125);
+        assert_eq!(measured.measured_tok_s_milli, Some(20_000));
+        assert_eq!(
+            provider_heartbeat_tok_s(measured, Some(30.0)),
+            (Some(20.0), "measured")
+        );
+    }
+
+    #[test]
+    fn provider_heartbeat_tok_s_uses_labeled_cold_start_prior_until_measured() {
+        let snapshot = ProviderLoadSnapshot {
+            active_slots: 0,
+            active_requests: 0,
+            queue_depth: 0,
+            est_wait_ms: 0,
+            ttft_ms: 0,
+            measured_tok_s_milli: None,
+        };
+
+        assert_eq!(
+            provider_heartbeat_tok_s(snapshot, Some(42.0)),
+            (Some(42.0), "hwprobe_cold_start_prior")
+        );
+    }
+
+    #[test]
+    fn provider_session_pending_request_expiry_is_deterministic() {
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        pending.insert("future".to_owned(), now + Duration::from_secs(1));
+        pending.insert("expired-b".to_owned(), now);
+        pending.insert(
+            "expired-a".to_owned(),
+            now.checked_sub(Duration::from_millis(1)).unwrap_or(now),
+        );
+
+        assert_eq!(
+            provider_session_expired_pending_ids(&pending, now),
+            vec!["expired-a".to_owned(), "expired-b".to_owned()]
+        );
     }
 
     #[test]

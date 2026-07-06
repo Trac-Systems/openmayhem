@@ -47,6 +47,7 @@ const cleanupState = {
   localChildren: [],
   devnetLog: null,
   remoteRun: null,
+  remoteProviderCacheRoot: null,
   remoteHfToken: null,
 };
 let cleanupStarted = false;
@@ -68,6 +69,7 @@ Environment:
   MAYHEM_E11_DEVNET_CLEANUP        Remove dev-net stores before starting (default: 1)
   MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: /home/trac/ai/mayhem/i3-e11-operationmayhem)
   MAYHEM_E11_REMOTE_DOWNLOADS      Spark provider download cache (default: /home/trac/ai/mayhem/e11-provider-downloads)
+  MAYHEM_E11_REMOTE_PROVIDER_CACHE Spark provider sealed-store cache root (default: <remote root>/.mayhem-local/i3-e11-spark-provider-cache)
   MAYHEM_E11_ACCEL_ARTIFACT        Accelerated catalog artifact to prove (default: ${DEFAULT_ACCEL_ARTIFACT}; E14 uses vllm-fp16)
   MAYHEM_E11_TRTLLM_PYTHON         Spark TensorRT-LLM Python wrapper (default: /home/trac/ai/mayhem/bin/trtllm-python)
   MAYHEM_E11_VLLM_PYTHON           Spark vLLM Python wrapper (default: /home/trac/ai/mayhem/bin/vllm-python-e14)
@@ -80,8 +82,12 @@ Environment:
   MAYHEM_E11_CHAT_MAX_TOKENS       Gateway chat max_tokens (default: 24)
   MAYHEM_E11_TOOL_TIMEOUT_SECONDS  Gateway guided tool-call timeout (default: 600)
   MAYHEM_E11_CONCURRENT_TIMEOUT_SECONDS  vLLM concurrent heartbeat timeout (default: 900)
+  MAYHEM_E11_CONCURRENT_SESSIONS   Concurrent vLLM sessions for heartbeat proof (default: 2; D1 uses 3)
   MAYHEM_E11_CONCURRENT_MAX_TOKENS vLLM concurrent prompt max_tokens (default: 32)
+  MAYHEM_E11_CONCURRENT_ABORT_AFTER_PROOF  Abort extra streams once heartbeat is captured (default: 0)
+  MAYHEM_E11_PROVIDER_SESSION_REQUEST_TIMEOUT_MS  Provider accepted-open request timeout (default: 15000)
   MAYHEM_E11_KEEP_REMOTE_RUN       Keep Spark run home/logs after cleanup (default: 0; token is always removed)
+  MAYHEM_E11_KEEP_PROVIDER_CACHE   Keep Spark sealed-store cache on cleanup (default: 1)
 `);
 }
 
@@ -818,18 +824,25 @@ async function runConcurrentHeartbeatSmoke(
   modelId,
   runDir,
   heartbeatCollector,
-  { timeoutMs, maxTokens, provider, enclaveId }
+  { timeoutMs, maxTokens, provider, enclaveId, sessionCount, abortAfterProof = false }
 ) {
   const heartbeatEventsPath = path.join(runDir, 'gateway-concurrent-heartbeats.json');
-  const prompts = [
+  const promptTopics = [
     'Write a compact checklist about coral restoration. Keep going until the token limit.',
     'Write a compact checklist about satellite safety. Keep going until the token limit.',
+    'Write a compact checklist about battery recycling. Keep going until the token limit.',
+    'Write a compact checklist about cold-chain logistics. Keep going until the token limit.',
+    'Write a compact checklist about urban flood response. Keep going until the token limit.',
   ];
+  const prompts = Array.from({ length: sessionCount }, (_, index) => (
+    promptTopics[index] || `Write a compact checklist about test topic ${index + 1}. Keep going until the token limit.`
+  ));
   const heartbeatPromise = heartbeatCollector.waitFor((event) => {
     const heartbeat = heartbeatMessageFromEvent(event);
     return heartbeat?.provider === provider
       && heartbeat?.enclave_id === enclaveId
-      && Number(heartbeat?.slots?.active || 0) >= 2;
+      && Number(heartbeat?.slots?.active || 0) >= sessionCount
+      && Number(heartbeat?.perf?.ttft_ms || 0) > 0;
   }, timeoutMs);
   const streamControllers = prompts.map(() => new AbortController());
   const streams = prompts.map((prompt, index) => runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
@@ -840,6 +853,8 @@ async function runConcurrentHeartbeatSmoke(
     allowTransportErrorAfterContent: true,
     signal: streamControllers[index].signal,
   }));
+  const firstStreamPromise = firstFulfilled(streams);
+  const streamResultsPromise = Promise.allSettled(streams);
 
   let heartbeatEvent = null;
   let heartbeatError = null;
@@ -851,16 +866,16 @@ async function runConcurrentHeartbeatSmoke(
     heartbeatError = err;
   }
   try {
-    firstStream = await firstFulfilled(streams);
+    firstStream = await firstStreamPromise;
   } catch (err) {
     firstStreamError = err;
   }
-  if (heartbeatEvent && firstStream) {
+  if (abortAfterProof && heartbeatEvent && firstStream) {
     streamControllers.forEach((controller, index) => {
       if (index !== firstStream.index) controller.abort(new Error('concurrent heartbeat proof captured'));
     });
   }
-  const streamResults = await Promise.allSettled(streams);
+  const streamResults = await streamResultsPromise;
   const successfulStreams = streamResults
     .map((result, index) => ({ result, index }))
     .filter(({ result }) => result.status === 'fulfilled');
@@ -878,21 +893,67 @@ async function runConcurrentHeartbeatSmoke(
         seq: heartbeat.seq,
         slots: heartbeat.slots,
         q: heartbeat.q,
+        perf: heartbeat.perf,
       }));
-    fail(`did not observe slots.active >= 2 heartbeat; observed ${JSON.stringify(observed.slice(-8))}`);
+    fail(`did not observe slots.active >= ${sessionCount} heartbeat with ttft_ms; observed ${JSON.stringify(observed.slice(-8))}`);
   }
 
   const heartbeat = heartbeatMessageFromEvent(heartbeatEvent);
+  let measuredPerfEvent = null;
+  try {
+    measuredPerfEvent = await heartbeatCollector.waitFor((event) => {
+      const candidate = heartbeatMessageFromEvent(event);
+      return candidate?.provider === provider
+        && candidate?.enclave_id === enclaveId
+        && candidate?.perf?.tok_s_source === 'measured'
+        && Number(candidate?.perf?.tok_s || 0) > 0;
+    }, Math.min(timeoutMs, 120_000));
+  } catch (err) {
+    const observed = heartbeatCollector.events
+      .map(heartbeatMessageFromEvent)
+      .filter(Boolean)
+      .map((candidate) => ({
+        seq: candidate.seq,
+        slots: candidate.slots,
+        q: candidate.q,
+        perf: candidate.perf,
+      }));
+    fail(`did not observe measured tok_s heartbeat after concurrent run: ${err.message}; observed ${JSON.stringify(observed.slice(-8))}`);
+  }
+  let idleEvent = null;
+  try {
+    idleEvent = await heartbeatCollector.waitFor((event) => {
+      const candidate = heartbeatMessageFromEvent(event);
+      return candidate?.provider === provider
+        && candidate?.enclave_id === enclaveId
+        && Number(candidate?.slots?.active || 0) === 0
+        && Number(candidate?.q?.depth || 0) === 0;
+    }, Math.min(timeoutMs, 120_000));
+  } catch (err) {
+    const observed = heartbeatCollector.events
+      .map(heartbeatMessageFromEvent)
+      .filter(Boolean)
+      .map((candidate) => ({
+        seq: candidate.seq,
+        slots: candidate.slots,
+        q: candidate.q,
+        perf: candidate.perf,
+      }));
+    fail(`did not observe idle heartbeat decay after concurrent run: ${err.message}; observed ${JSON.stringify(observed.slice(-8))}`);
+  }
   const summary = {
     ok: true,
+    requested_sessions: sessionCount,
     heartbeat,
+    measured_perf_heartbeat: heartbeatMessageFromEvent(measuredPerfEvent),
+    idle_heartbeat: heartbeatMessageFromEvent(idleEvent),
     heartbeat_event: heartbeatEvent,
     streams: streamResults.map((result, index) => result.status === 'fulfilled'
       ? result.value
       : {
           ok: false,
           index: index + 1,
-          tolerated_after_heartbeat: Boolean(heartbeatEvent && successfulStreams.length > 0),
+          tolerated_after_heartbeat: Boolean(abortAfterProof && heartbeatEvent && successfulStreams.length > 0),
           error: result.reason?.message || String(result.reason),
         }),
     completed_streams: successfulStreams.length,
@@ -1288,10 +1349,14 @@ async function main() {
   const remoteDownloads = (process.env.MAYHEM_E11_REMOTE_DOWNLOADS || '/home/trac/ai/mayhem/e11-provider-downloads')
     .replace(/^~(?=\/|$)/, remoteHome)
     .replace('$HOME', remoteHome);
+  const remoteProviderCacheRoot = (process.env.MAYHEM_E11_REMOTE_PROVIDER_CACHE || path.posix.join(remoteRoot, '.mayhem-local/i3-e11-spark-provider-cache'))
+    .replace(/^~(?=\/|$)/, remoteHome)
+    .replace('$HOME', remoteHome);
+  cleanupState.remoteProviderCacheRoot = remoteProviderCacheRoot;
   const remoteRun = path.posix.join(remoteRoot, '.mayhem-local/i3-e11-spark-trtllm', tag);
   cleanupState.remoteRun = remoteRun;
   const remoteLogs = path.posix.join(remoteRun, 'logs');
-  const remoteProviderHome = path.posix.join(remoteRun, 'provider-home');
+  const remoteProviderHome = path.posix.join(remoteProviderCacheRoot, 'provider-home');
   const remoteKeypair = path.posix.join(remoteProviderHome, 'stores/main/db/keypair.json');
   const remoteHfToken = path.posix.join(remoteRun, 'secrets/hf.txt');
   const remoteMayhem = path.posix.join(remoteRoot, 'target/debug/mayhem');
@@ -1302,7 +1367,7 @@ async function main() {
   const remoteVllmPython = process.env.MAYHEM_E11_VLLM_PYTHON || '/home/trac/ai/mayhem/bin/vllm-python-e14';
 
   log('syncing current source tree to Spark');
-  await ssh(remote, passFile, `mkdir -p ${sh(remoteRoot)} ${sh(remoteLogs)} ${sh(remoteDownloads)}`);
+  await ssh(remote, passFile, `mkdir -p ${sh(remoteRoot)} ${sh(remoteLogs)} ${sh(remoteDownloads)} ${sh(remoteProviderHome)}`);
   await rsyncRepoTo(remote, passFile, `${ROOT}/`, `${remoteRoot}/`, {
     logFile: path.join(logsDir, 'rsync-source.log'),
     timeoutMs: 20 * 60_000,
@@ -1352,6 +1417,7 @@ async function main() {
       ...process.env,
       MAYHEM_DEVNET_JOINERS: '2',
       MAYHEM_DEVNET_SUBNET_CHANNEL: subnetChannel,
+      MAYHEM_DEVNET_PRESERVE_KEYPAIRS: '1',
       MAYHEM_DEVNET_REPLICATE_FLUSH_TIMEOUT_MS: '5000',
       SC_BRIDGE_DEBUG: '1',
       SESSION_DEBUG: '1',
@@ -1562,6 +1628,7 @@ async function main() {
     'MAYHEM_TRTLLM_REQUEST_TIMEOUT_SECS=600',
     `MAYHEM_VLLM_PYTHON=${sh(remoteVllmPython)}`,
     'MAYHEM_VLLM_REQUEST_TIMEOUT_SECS=900',
+    `MAYHEM_PROVIDER_SESSION_REQUEST_TIMEOUT_MS=${envPositiveInt('MAYHEM_E11_PROVIDER_SESSION_REQUEST_TIMEOUT_MS', 15_000)}`,
     `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)}`,
     `MAYHEM_NODE_BIN=${sh(remoteNode)}`,
     'PATH="$HOME/.cargo/bin:$PATH"',
@@ -1682,7 +1749,8 @@ async function main() {
     : null;
   let concurrentHeartbeat = null;
   if (accelBackend === 'vllm') {
-    log('running two concurrent vLLM sessions and capturing slots.active heartbeat');
+    const concurrentSessions = envPositiveInt('MAYHEM_E11_CONCURRENT_SESSIONS', 2);
+    log(`running ${concurrentSessions} concurrent vLLM sessions and capturing live heartbeat load`);
     const heartbeatCollector = await startHeartbeatCollector(
       joinerAWs[1],
       scToken,
@@ -1695,6 +1763,8 @@ async function main() {
         maxTokens: envPositiveInt('MAYHEM_E11_CONCURRENT_MAX_TOKENS', 32),
         provider: providerReport.provider,
         enclaveId: accelEnclaveId,
+        sessionCount: concurrentSessions,
+        abortAfterProof: envFlag('MAYHEM_E11_CONCURRENT_ABORT_AFTER_PROOF', false),
       });
     } finally {
       heartbeatCollector.close();
@@ -1838,6 +1908,11 @@ async function cleanup(state) {
     if (!/^(1|true|yes)$/i.test(process.env.MAYHEM_E11_KEEP_REMOTE_RUN || '0') && state.remoteRun) {
       try {
         await ssh(remote, passFile, `rm -rf ${sh(state.remoteRun)}`);
+      } catch {}
+    }
+    if (/^(0|false|no)$/i.test(process.env.MAYHEM_E11_KEEP_PROVIDER_CACHE || '1') && state.remoteProviderCacheRoot) {
+      try {
+        await ssh(remote, passFile, `rm -rf ${sh(state.remoteProviderCacheRoot)}`);
       } catch {}
     }
   }

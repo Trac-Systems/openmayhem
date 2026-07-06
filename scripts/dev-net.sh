@@ -16,6 +16,7 @@ Environment:
   MAYHEM_DEVNET_NETWORK passes an explicit app network flag, for example development.
   MAYHEM_DEVNET_SUBNET_CHANNEL overrides the default local subnet channel.
   MAYHEM_DEVNET_PEER_DHT_BOOTSTRAP passes --peer-dht-bootstrap to every peer.
+  MAYHEM_DEVNET_PRESERVE_KEYPAIRS=1 keeps peer/MSB wallet keypairs across --cleanup.
 USAGE
 }
 
@@ -57,6 +58,29 @@ if [[ ! -d "$app_dir" ]]; then
   exit 1
 fi
 
+preserve_keypairs=0
+case "${MAYHEM_DEVNET_PRESERVE_KEYPAIRS:-0}" in
+  1|true|yes) preserve_keypairs=1 ;;
+esac
+
+preserved_keypairs_dir=""
+if [[ "$cleanup_stores" -eq 1 && "$preserve_keypairs" -eq 1 ]]; then
+  preserved_keypairs_dir="$(mktemp -d)"
+  for store in \
+    mayhem-devnet-admin \
+    mayhem-devnet-admin-msb \
+    mayhem-devnet-joiner-a \
+    mayhem-devnet-joiner-a-msb \
+    mayhem-devnet-joiner-b \
+    mayhem-devnet-joiner-b-msb
+  do
+    keypair="$stores_dir/$store/db/keypair.json"
+    if [[ -f "$keypair" ]]; then
+      cp "$keypair" "$preserved_keypairs_dir/$store.keypair.json"
+    fi
+  done
+fi
+
 if [[ "$cleanup_stores" -eq 1 ]]; then
   rm -rf \
     "$stores_dir/mayhem-devnet-admin" \
@@ -66,6 +90,15 @@ if [[ "$cleanup_stores" -eq 1 ]]; then
     "$stores_dir/mayhem-devnet-joiner-b" \
     "$stores_dir/mayhem-devnet-joiner-b-msb" \
     "$log_dir"
+fi
+if [[ -n "$preserved_keypairs_dir" ]]; then
+  for keypair in "$preserved_keypairs_dir"/*.keypair.json; do
+    [[ -f "$keypair" ]] || continue
+    store="$(basename "$keypair" .keypair.json)"
+    mkdir -p "$stores_dir/$store/db"
+    cp "$keypair" "$stores_dir/$store/db/keypair.json"
+  done
+  rm -rf "$preserved_keypairs_dir"
 fi
 mkdir -p "$log_dir"
 
