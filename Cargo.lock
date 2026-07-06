@@ -1482,6 +1482,7 @@ dependencies = [
 name = "mayhem-engine"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "encoding_rs",
  "llama-cpp-2",

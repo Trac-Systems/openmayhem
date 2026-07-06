@@ -2672,6 +2672,7 @@ mod tests {
             admin_pubkey: "admin".to_owned(),
             model_id: "model".to_owned(),
             artifact_root: "artifact".to_owned(),
+            artifact_sidecar_roots: std::collections::BTreeMap::new(),
             manifest_hash: "manifest".to_owned(),
             binary_hash: binary_hash.clone(),
         };
@@ -2716,6 +2717,7 @@ mod tests {
             admin_pubkey: "admin".to_owned(),
             model_id: "model".to_owned(),
             artifact_root: "artifact".to_owned(),
+            artifact_sidecar_roots: std::collections::BTreeMap::new(),
             manifest_hash: "manifest".to_owned(),
             binary_hash,
         };
@@ -2771,6 +2773,7 @@ mod tests {
             admin_pubkey: "admin".to_owned(),
             model_id: "model".to_owned(),
             artifact_root: "artifact".to_owned(),
+            artifact_sidecar_roots: std::collections::BTreeMap::new(),
             manifest_hash: "manifest".to_owned(),
             binary_hash,
         };
@@ -2796,6 +2799,7 @@ mod tests {
                 admin_pubkey: "admin".to_owned(),
                 model_id: "model".to_owned(),
                 artifact_root: "artifact".to_owned(),
+                artifact_sidecar_roots: std::collections::BTreeMap::new(),
                 manifest_hash: "manifest".to_owned(),
                 binary_hash: report.report.binary_hash.clone(),
             })

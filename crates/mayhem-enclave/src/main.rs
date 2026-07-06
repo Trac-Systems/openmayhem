@@ -497,6 +497,7 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
         admin_pubkey: args.admin_pubkey.clone(),
         model_id: args.model_id.clone(),
         artifact_root: args.artifact_root.clone(),
+        artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: args.manifest_hash.clone(),
         binary_hash: measured_binary_hash.clone(),
     };

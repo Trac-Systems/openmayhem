@@ -1698,6 +1698,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         att_tier: 1,
         admin_pubkey: identity.admin_pubkey,
         artifact_root: identity.artifact_root,
+        artifact_sidecar_roots: BTreeMap::new(),
         manifest_hash: identity.manifest_hash,
         binary_hash: identity.binary_hash,
         kyb: None,
@@ -1710,6 +1711,7 @@ fn routed_test_identity() -> CatalogEnclaveIdentity {
         admin_pubkey: "44".repeat(32),
         model_id: "mayhem/routed-test".to_owned(),
         artifact_root: "aa".repeat(32),
+        artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: "bb".repeat(32),
         binary_hash: "cc".repeat(32),
     }

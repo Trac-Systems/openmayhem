@@ -31,7 +31,7 @@ use mayhem_enclave::{
 };
 use mayhem_engine::{
     ArtifactChunk, EngineBackend, GenerateRequest, GrammarSpec, LoadConfig, MediaInput,
-    ModelArtifact, ToolSpec,
+    ModelArtifact, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
     heartbeat_signing_payload, normalize_rate_map,
@@ -10016,7 +10016,7 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
 }
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
-    let model_class = validate_admin_enclave_catalog_binding(args)?;
+    let binding = validate_admin_enclave_catalog_binding(args)?;
     let mut caps = json_arg_or_file_object(
         args.caps_json.as_deref(),
         args.caps_file.as_ref(),
@@ -10028,7 +10028,7 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "op": "register_enclave",
         "enclave_id": &args.enclave_id,
         "model_id": &args.model,
-        "model_class": model_class,
+        "model_class": binding.model_class,
         "backend": &args.backend,
         "artifact_root": &args.artifact_root,
         "artifact_root_kind": &args.artifact_root_kind,
@@ -10045,6 +10045,9 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
     });
     if let Some(source_sha256) = &args.source_sha256 {
         payload["source_sha256"] = json!(source_sha256.to_ascii_lowercase());
+    }
+    if !binding.artifact_sidecars.is_empty() {
+        payload["artifact_sidecars"] = json!(binding.artifact_sidecars);
     }
     Ok(payload)
 }
@@ -10067,7 +10070,25 @@ fn backend_supports_tool_calls(backend: &str) -> bool {
     !matches!(backend, "mlx" | "trt-llm")
 }
 
-fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Result<String> {
+#[derive(Debug)]
+struct AdminEnclaveCatalogBinding {
+    model_class: String,
+    artifact_sidecars: BTreeMap<String, CatalogSidecarPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogSidecarPayload {
+    source: LedgerArtifactSource,
+    path: String,
+    artifact_root: String,
+    artifact_root_kind: String,
+    weights_bytes: u64,
+    source_sha256: String,
+}
+
+fn validate_admin_enclave_catalog_binding(
+    args: &AdminRegisterEnclaveArgs,
+) -> Result<AdminEnclaveCatalogBinding> {
     let catalog_path = args
         .catalog_path
         .clone()
@@ -10159,7 +10180,31 @@ fn validate_admin_enclave_catalog_binding(args: &AdminRegisterEnclaveArgs) -> Re
         args.source_sha256.as_deref(),
         artifact.source_sha256.as_deref(),
     )?;
-    Ok(model.model_class.clone())
+    Ok(AdminEnclaveCatalogBinding {
+        model_class: model.model_class.clone(),
+        artifact_sidecars: artifact
+            .sidecars
+            .iter()
+            .map(|(name, sidecar)| {
+                (
+                    name.clone(),
+                    CatalogSidecarPayload {
+                        source: LedgerArtifactSource {
+                            kind: sidecar.source.kind.clone(),
+                            repo: sidecar.source.repo.clone(),
+                            revision: sidecar.source.revision.to_ascii_lowercase(),
+                            path: sidecar.path.clone(),
+                        },
+                        path: sidecar.path.clone(),
+                        artifact_root: sidecar.artifact_root.clone(),
+                        artifact_root_kind: sidecar.artifact_root_kind.clone(),
+                        weights_bytes: sidecar.weights_bytes,
+                        source_sha256: sidecar.source_sha256.to_ascii_lowercase(),
+                    },
+                )
+            })
+            .collect(),
+    })
 }
 
 fn ensure_catalog_text_match(label: &str, requested: &str, catalog: &str) -> Result<()> {
@@ -17930,6 +17975,8 @@ struct LedgerEnclave {
     artifact_root_kind: String,
     artifact_source: LedgerArtifactSource,
     #[serde(default)]
+    artifact_sidecars: BTreeMap<String, LedgerArtifactSidecar>,
+    #[serde(default)]
     source_sha256: Option<String>,
     manifest_hash: String,
     att_tier: u8,
@@ -17948,6 +17995,16 @@ struct LedgerArtifactSource {
     repo: String,
     revision: String,
     path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct LedgerArtifactSidecar {
+    source: LedgerArtifactSource,
+    path: String,
+    artifact_root: String,
+    artifact_root_kind: String,
+    weights_bytes: u64,
+    source_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -18227,6 +18284,12 @@ struct ProviderCandidate {
     price: Option<LedgerPriceSchedule>,
 }
 
+#[derive(Debug, Clone)]
+struct ProviderArtifactPaths {
+    primary: PathBuf,
+    sidecars: BTreeMap<String, PathBuf>,
+}
+
 struct HeartbeatContext<'a> {
     args: &'a ProviderStartArgs,
     config: &'a Option<MayhemConfig>,
@@ -18245,7 +18308,7 @@ struct ProviderSessionContext<'a> {
     password: &'a str,
     wallet: &'a WalletInfo,
     selected: &'a ProviderCandidate,
-    artifact_path: &'a Path,
+    artifact_paths: &'a ProviderArtifactPaths,
     rooms: &'a [LedgerRoom],
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
@@ -18433,7 +18496,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| home.join("downloads"));
     let downloads_dir = absolutize(downloads_dir)?;
-    let artifact_path = download_provider_artifact(&args, &downloads_dir, &selected).await?;
+    let artifact_paths = download_provider_artifact(&args, &downloads_dir, &selected).await?;
 
     provider_log(
         &args,
@@ -18450,7 +18513,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         manifest_hash: selected.enclave.manifest_hash.clone(),
     };
     let seal_report = seal_provider_artifact(
-        &artifact_path,
+        &artifact_paths.primary,
         &sealed_store,
         &key_context,
         &provider_secret,
@@ -18502,6 +18565,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         admin_pubkey: selected.enclave.created_by.clone(),
         model_id: selected.enclave.model_id.clone(),
         artifact_root: selected.enclave.artifact_root.clone(),
+        artifact_sidecar_roots: enclave_artifact_sidecar_roots(&selected.enclave),
         manifest_hash: selected.enclave.manifest_hash.clone(),
         binary_hash: binary_hash.clone(),
     };
@@ -18538,7 +18602,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             password: &password,
             wallet: &wallet,
             selected: &selected,
-            artifact_path: &artifact_path,
+            artifact_paths: &artifact_paths,
             rooms: &rooms,
             attestation: &attestation,
             attestation_head: &attestation.report_head,
@@ -18615,7 +18679,8 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "artifact": {
             "name": selected.artifact_name.clone(),
             "engine": selected.artifact.engine.clone(),
-            "path": artifact_path,
+            "path": artifact_paths.primary.clone(),
+            "sidecars": artifact_paths.sidecars.clone(),
             "root": selected.enclave.artifact_root.clone(),
         },
         "sealed_store": {
@@ -18671,7 +18736,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 password: &password,
                 wallet: &wallet,
                 selected: &selected,
-                artifact_path: &artifact_path,
+                artifact_paths: &artifact_paths,
                 rooms: &rooms,
                 attestation: &attestation,
                 attestation_head: &attestation.report_head,
@@ -20301,6 +20366,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     att_tier: effective_att_tier,
                     admin_pubkey: enclave.created_by.clone(),
                     artifact_root: enclave.artifact_root.clone(),
+                    artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
                     manifest_hash: enclave.manifest_hash.clone(),
                     binary_hash: enclave.binary_hash.clone(),
                     kyb,
@@ -20746,6 +20812,37 @@ fn ledger_enclave_matches_catalog_artifact(
         && enclave.artifact_source.revision == artifact.source.revision
         && enclave.artifact_source.path == artifact.path
         && enclave.source_sha256 == artifact.source_sha256
+        && ledger_sidecars_match_catalog(&enclave.artifact_sidecars, &artifact.sidecars)
+}
+
+fn ledger_sidecars_match_catalog(
+    ledger: &BTreeMap<String, LedgerArtifactSidecar>,
+    catalog: &BTreeMap<String, catalog::CatalogArtifactSidecar>,
+) -> bool {
+    ledger.len() == catalog.len()
+        && catalog.iter().all(|(name, catalog_sidecar)| {
+            ledger.get(name).is_some_and(|ledger_sidecar| {
+                ledger_sidecar.source.kind == catalog_sidecar.source.kind
+                    && ledger_sidecar.source.repo == catalog_sidecar.source.repo
+                    && ledger_sidecar.source.revision == catalog_sidecar.source.revision
+                    && ledger_sidecar.source.path == catalog_sidecar.path
+                    && ledger_sidecar.path == catalog_sidecar.path
+                    && ledger_sidecar.artifact_root == catalog_sidecar.artifact_root
+                    && ledger_sidecar.artifact_root_kind == catalog_sidecar.artifact_root_kind
+                    && ledger_sidecar.weights_bytes == catalog_sidecar.weights_bytes
+                    && ledger_sidecar
+                        .source_sha256
+                        .eq_ignore_ascii_case(&catalog_sidecar.source_sha256)
+            })
+        })
+}
+
+fn enclave_artifact_sidecar_roots(enclave: &LedgerEnclave) -> BTreeMap<String, String> {
+    enclave
+        .artifact_sidecars
+        .iter()
+        .map(|(name, sidecar)| (name.clone(), sidecar.artifact_root.clone()))
+        .collect()
 }
 
 fn requested_backend(
@@ -20904,9 +21001,9 @@ async fn download_provider_artifact(
     args: &ProviderStartArgs,
     downloads_dir: &Path,
     selected: &ProviderCandidate,
-) -> Result<PathBuf> {
+) -> Result<ProviderArtifactPaths> {
     require_provider_merkle_artifact(selected)?;
-    if let Some(path) = &args.artifact {
+    let primary = if let Some(path) = &args.artifact {
         let source = absolutize(path.clone())?;
         let merkle = build_merkle_manifest(&source, args.chunk_size).with_context(|| {
             format!(
@@ -20923,23 +21020,54 @@ async fn download_provider_artifact(
             );
         }
         verify_artifact_sha256(&source, &selected.artifact)?;
-        return Ok(source);
-    }
-    let artifact_file = format!(
-        "{}-{}",
-        safe_path_component(&selected.enclave.enclave_id),
-        safe_path_component(&selected.artifact_name)
-    );
-    let destination = downloads_dir.join(artifact_file);
-    if destination.exists() {
-        let merkle = build_merkle_manifest(&destination, args.chunk_size)?;
-        if merkle.root == selected.enclave.artifact_root
-            && artifact_sha256_matches(&destination, &selected.artifact)?
-        {
-            return Ok(destination);
+        source
+    } else {
+        let artifact_file = format!(
+            "{}-{}",
+            safe_path_component(&selected.enclave.enclave_id),
+            safe_path_component(&selected.artifact_name)
+        );
+        let destination = downloads_dir.join(artifact_file);
+        if destination.exists() {
+            let merkle = build_merkle_manifest(&destination, args.chunk_size)?;
+            if merkle.root == selected.enclave.artifact_root
+                && artifact_sha256_matches(&destination, &selected.artifact)?
+            {
+                destination
+            } else {
+                download_provider_primary_artifact(args, selected, destination)?
+            }
+        } else {
+            download_provider_primary_artifact(args, selected, destination)?
         }
+    };
+
+    let mut sidecars = BTreeMap::new();
+    for (name, sidecar) in &selected.artifact.sidecars {
+        let ledger_sidecar = selected
+            .enclave
+            .artifact_sidecars
+            .get(name)
+            .with_context(|| format!("admin enclave is missing catalog sidecar {name}"))?;
+        let path = download_provider_sidecar_artifact(
+            args,
+            downloads_dir,
+            selected,
+            name,
+            sidecar,
+            ledger_sidecar,
+        )?;
+        sidecars.insert(name.clone(), path);
     }
 
+    Ok(ProviderArtifactPaths { primary, sidecars })
+}
+
+fn download_provider_primary_artifact(
+    args: &ProviderStartArgs,
+    selected: &ProviderCandidate,
+    destination: PathBuf,
+) -> Result<PathBuf> {
     let source = if selected.artifact.source.kind == "huggingface" {
         DownloadSource::Http {
             url: catalog::huggingface_resolve_url(
@@ -20965,6 +21093,71 @@ async fn download_provider_artifact(
         )
     })?;
     verify_artifact_sha256(&destination, &selected.artifact)?;
+    Ok(destination)
+}
+
+fn download_provider_sidecar_artifact(
+    args: &ProviderStartArgs,
+    downloads_dir: &Path,
+    selected: &ProviderCandidate,
+    name: &str,
+    sidecar: &catalog::CatalogArtifactSidecar,
+    ledger_sidecar: &LedgerArtifactSidecar,
+) -> Result<PathBuf> {
+    if sidecar.artifact_root_kind != "blake3_merkle_v1" {
+        bail!(
+            "provider serving requires admin sidecar artifact_root_kind blake3_merkle_v1 for {}/{} sidecar {}; catalog has {}",
+            selected.model.model_id,
+            selected.artifact_name,
+            name,
+            sidecar.artifact_root_kind
+        );
+    }
+    let artifact_file = format!(
+        "{}-{}-{}",
+        safe_path_component(&selected.enclave.enclave_id),
+        safe_path_component(&selected.artifact_name),
+        safe_path_component(name)
+    );
+    let destination = downloads_dir.join(artifact_file);
+    if destination.exists() {
+        let merkle = build_merkle_manifest(&destination, args.chunk_size)?;
+        if merkle.root == ledger_sidecar.artifact_root
+            && file_sha256_hex(&destination)?.eq_ignore_ascii_case(&sidecar.source_sha256)
+        {
+            return Ok(destination);
+        }
+    }
+    let source = if sidecar.source.kind == "huggingface" {
+        DownloadSource::Http {
+            url: catalog::huggingface_resolve_url(&sidecar.source, &sidecar.path)?,
+            bearer_token: read_optional_token(args.hf_token_file.as_deref())?,
+        }
+    } else {
+        bail!(
+            "unsupported sidecar source kind {}; sidecar {name} must be an admin-pinned Hugging Face artifact",
+            sidecar.source.kind
+        );
+    };
+
+    let mut request = DownloadRequest::new(source, destination.clone());
+    request.chunk_size = args.chunk_size;
+    request.expected_merkle_root = Some(ledger_sidecar.artifact_root.clone());
+    download_resumable(&request).with_context(|| {
+        format!(
+            "downloading and verifying sidecar {name} root {}",
+            ledger_sidecar.artifact_root
+        )
+    })?;
+    let actual = file_sha256_hex(&destination)?;
+    if !actual.eq_ignore_ascii_case(&sidecar.source_sha256) {
+        bail!(
+            "sidecar {name} sha256 mismatch for {}; expected admin catalog source_sha256 {}, got {}",
+            destination.display(),
+            sidecar.source_sha256,
+            actual
+        );
+    }
     Ok(destination)
 }
 
@@ -22388,10 +22581,10 @@ fn provider_session_responder(
         &format!(
             "Loading {} session engine from verified admin artifact {}",
             ctx.selected.artifact.engine,
-            ctx.artifact_path.display()
+            ctx.artifact_paths.primary.display()
         ),
     );
-    let load_config = provider_engine_load_config(ctx.selected, ctx.artifact_path)?;
+    let load_config = provider_engine_load_config(ctx.selected, ctx.artifact_paths)?;
     match ctx.selected.artifact.engine.as_str() {
         "llama.cpp" => {
             let mut backend = mayhem_engine::LlamaCppBackend::new()
@@ -22431,7 +22624,7 @@ fn provider_session_responder(
 
 fn provider_engine_load_config(
     selected: &ProviderCandidate,
-    artifact_path: &Path,
+    artifact_paths: &ProviderArtifactPaths,
 ) -> Result<LoadConfig> {
     let ctx_size = u32::try_from(selected.model.caps.ctx_max).with_context(|| {
         format!(
@@ -22439,6 +22632,7 @@ fn provider_engine_load_config(
             selected.model.caps.ctx_max, selected.model.model_id
         )
     })?;
+    let artifact_path = artifact_paths.primary.as_path();
     let artifact = match selected.artifact.engine.as_str() {
         "llama.cpp" => ModelArtifact::gguf(artifact_path),
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
@@ -22459,6 +22653,15 @@ fn provider_engine_load_config(
     config.artifact = artifact;
     config.ctx_size = ctx_size.max(1);
     config.gpu_layers = selected.verdict.n_layers_gpu;
+    if let Some(mmproj_path) = artifact_paths.sidecars.get("mmproj") {
+        let sidecar = selected
+            .artifact
+            .sidecars
+            .get("mmproj")
+            .context("downloaded mmproj sidecar is missing from selected catalog artifact")?;
+        config.vision_projector =
+            Some(ModelArtifact::gguf(mmproj_path).with_sha256(sidecar.source_sha256.clone()));
+    }
     if selected.artifact.engine == "trt-llm" {
         config.trt_engine_dir = Some(trt_engine_cache_dir(artifact_path, &selected.artifact_name));
         config.trt_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
@@ -23634,7 +23837,10 @@ fn provider_message_to_text_for_adapter(
     message: &Value,
     adapter: &catalog::CatalogAdapter,
 ) -> String {
-    let content = provider_message_to_text(message);
+    let content = provider_content_to_text_for_adapter(
+        message.get("content").unwrap_or(&Value::Null),
+        adapter,
+    );
     if adapter.reasoning_passthrough != "preserve" {
         return content;
     }
@@ -23646,6 +23852,41 @@ fn provider_message_to_text_for_adapter(
     } else {
         format!("{reasoning}\n{content}")
     }
+}
+
+fn provider_content_to_text_for_adapter(
+    value: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|part| provider_content_part_to_text_for_adapter(part, adapter))
+            .collect::<Vec<_>>()
+            .join(""),
+        other => other.to_string(),
+    }
+}
+
+fn provider_content_part_to_text_for_adapter(
+    part: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> String {
+    if part.get("type").and_then(Value::as_str) == Some("image_url")
+        && adapter_supports_image_input(adapter)
+    {
+        return MTMD_MEDIA_MARKER.to_owned();
+    }
+    provider_content_part_to_text(part)
+}
+
+fn adapter_supports_image_input(adapter: &catalog::CatalogAdapter) -> bool {
+    adapter
+        .modality_set
+        .iter()
+        .any(|modality| matches!(modality.as_str(), "image" | "vision"))
 }
 
 fn provider_content_to_text(value: &Value) -> String {
@@ -26375,6 +26616,7 @@ mod tests {
                 revision: "1".repeat(40),
                 path: "model.gguf".to_owned(),
             },
+            artifact_sidecars: BTreeMap::new(),
             source_sha256: None,
             manifest_hash: "cc".repeat(32),
             att_tier: 1,
@@ -26454,6 +26696,7 @@ mod tests {
                 revision: "1".repeat(40),
                 path: "model.gguf".to_owned(),
             },
+            artifact_sidecars: BTreeMap::new(),
             source_sha256: None,
             manifest_hash: "cc".repeat(32),
             att_tier: 1,
@@ -27642,6 +27885,7 @@ mod tests {
             admin_pubkey: "44".repeat(32),
             model_id: terms.model_id.clone(),
             artifact_root: "aa".repeat(32),
+            artifact_sidecar_roots: BTreeMap::new(),
             manifest_hash: "bb".repeat(32),
             binary_hash: measure_binary(&binary_path).unwrap(),
         };
@@ -27981,6 +28225,30 @@ mod tests {
     }
 
     #[test]
+    fn provider_engine_request_uses_media_marker_for_vision_adapters() {
+        let adapter = catalog::CatalogAdapter {
+            modality_set: vec!["text".to_owned(), "image".to_owned()],
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe this" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } }
+                ]
+            }]
+        });
+
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        assert_eq!(request.media.len(), 1);
+        assert!(request.prompt.contains("describe this"));
+        assert!(request.prompt.contains(MTMD_MEDIA_MARKER));
+        assert!(!request.prompt.contains("[image:"));
+    }
+
+    #[test]
     fn provider_engine_request_uses_json_schema_for_json_mode() {
         let body = json!({
             "messages": [{ "role": "user", "content": "return json" }],
@@ -28200,8 +28468,11 @@ mod tests {
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
-        let config =
-            provider_engine_load_config(&selected, Path::new("/tmp/admin-approved.gguf")).unwrap();
+        let artifact_paths = ProviderArtifactPaths {
+            primary: PathBuf::from("/tmp/admin-approved.gguf"),
+            sidecars: BTreeMap::new(),
+        };
+        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
 
         assert_eq!(
             config.artifact.path,
@@ -28242,11 +28513,11 @@ mod tests {
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
-        let config = provider_engine_load_config(
-            &selected,
-            Path::new("/tmp/admin-approved-checkpoint.safetensors"),
-        )
-        .unwrap();
+        let artifact_paths = ProviderArtifactPaths {
+            primary: PathBuf::from("/tmp/admin-approved-checkpoint.safetensors"),
+            sidecars: BTreeMap::new(),
+        };
+        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
 
         assert_eq!(selected.artifact_name, "nvfp4");
         assert_eq!(
@@ -28273,6 +28544,78 @@ mod tests {
             config.trt_engine_dir,
             Some(PathBuf::from("/tmp/.trtllm-engines/nvfp4"))
         );
+    }
+
+    #[test]
+    fn provider_engine_load_config_wires_admin_vision_projector_sidecar() {
+        let root = "aa".repeat(32);
+        let sidecar_root = "bc".repeat(32);
+        let sidecar_sha = "cd".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.vision = true;
+        catalog.models[0].adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .sidecars
+            .insert(
+                "mmproj".to_owned(),
+                catalog::CatalogArtifactSidecar {
+                    source: catalog::SourceRef {
+                        kind: "huggingface".to_owned(),
+                        repo: "test/model".to_owned(),
+                        revision: "1".repeat(40),
+                        publisher_key: None,
+                    },
+                    path: "mmproj.gguf".to_owned(),
+                    artifact_root: sidecar_root.clone(),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 12,
+                    source_sha256: sidecar_sha.clone(),
+                },
+            );
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps =
+            json!({ "tools": true, "json": true, "ctx": 8192, "vision": true });
+        contract.enclaves[0].artifact_sidecars.insert(
+            "mmproj".to_owned(),
+            LedgerArtifactSidecar {
+                source: LedgerArtifactSource {
+                    kind: "huggingface".to_owned(),
+                    repo: "test/model".to_owned(),
+                    revision: "1".repeat(40),
+                    path: "mmproj.gguf".to_owned(),
+                },
+                path: "mmproj.gguf".to_owned(),
+                artifact_root: sidecar_root,
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 12,
+                source_sha256: sidecar_sha.clone(),
+            },
+        );
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let args = test_provider_start_args();
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        let artifact_paths = ProviderArtifactPaths {
+            primary: PathBuf::from("/tmp/admin-approved.gguf"),
+            sidecars: BTreeMap::from([(
+                "mmproj".to_owned(),
+                PathBuf::from("/tmp/admin-approved-mmproj.gguf"),
+            )]),
+        };
+
+        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+
+        let projector = config.vision_projector.expect("vision projector");
+        assert_eq!(
+            projector.path,
+            PathBuf::from("/tmp/admin-approved-mmproj.gguf")
+        );
+        assert_eq!(projector.format, mayhem_engine::ArtifactFormat::Gguf);
+        assert_eq!(projector.sha256.as_deref(), Some(sidecar_sha.as_str()));
     }
 
     #[test]
@@ -28387,9 +28730,9 @@ mod tests {
         let accepted = download_provider_artifact(&args, &temp.join("downloads-ok"), &selected)
             .await
             .unwrap();
-        assert!(accepted.exists());
+        assert!(accepted.primary.exists());
         assert_eq!(
-            build_merkle_manifest(&accepted, 8).unwrap().root,
+            build_merkle_manifest(&accepted.primary, 8).unwrap().root,
             selected.enclave.artifact_root
         );
 
@@ -30150,6 +30493,7 @@ mod tests {
                 min_compute_cap: None,
                 download_check: false,
                 notes: None,
+                sidecars: BTreeMap::new(),
             },
         );
 
@@ -30219,6 +30563,7 @@ mod tests {
                 min_compute_cap: Some("10.0".to_owned()),
                 download_check: false,
                 notes: None,
+                sidecars: BTreeMap::new(),
             },
         );
 
@@ -30377,6 +30722,7 @@ mod tests {
                 min_compute_cap: None,
                 download_check: false,
                 notes: None,
+                sidecars: BTreeMap::new(),
             },
         );
         let temp = env::temp_dir().join(format!(
@@ -31620,6 +31966,7 @@ mod tests {
                 min_compute_cap: None,
                 download_check: false,
                 notes: None,
+                sidecars: BTreeMap::new(),
             },
         );
         catalog::CatalogDocument {
@@ -31698,6 +32045,7 @@ mod tests {
                 revision: "1".repeat(40),
                 path: "model.gguf".to_owned(),
             },
+            artifact_sidecars: BTreeMap::new(),
             source_sha256: None,
             manifest_hash: "22".repeat(32),
             att_tier: 1,

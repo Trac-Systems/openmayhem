@@ -28,6 +28,21 @@ const artifactSource = {
   revision: '7'.repeat(40),
   path: 'qwen2.5-4b-instruct-Q4_K_M.gguf',
 };
+const artifactSidecars = {
+  mmproj: {
+    source: {
+      kind: 'huggingface',
+      repo: 'mayhem-catalog/qwen2.5-4b-instruct-GGUF',
+      revision: '7'.repeat(40),
+      path: 'mmproj-qwen2.5-4b-instruct-Q4_K_M.gguf',
+    },
+    path: 'mmproj-qwen2.5-4b-instruct-Q4_K_M.gguf',
+    artifact_root: '8'.repeat(64),
+    artifact_root_kind: 'blake3_merkle_v1',
+    weights_bytes: 1234,
+    source_sha256: '9'.repeat(64),
+  },
+};
 
 const providerRegistration = {
   op: 'register_provider',
@@ -428,6 +443,58 @@ test('MayhemContract rejects unsupported model classes and mismatched model refe
     4
   );
   assert.match(mismatchedPrice.message, /model_class must match/i);
+});
+
+test('MayhemContract stores admin-bound enclave artifact sidecars only when canonical', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  const registered = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'b'.repeat(64),
+      artifact_sidecars: artifactSidecars,
+      caps: {
+        ...enclaveRegistration.caps,
+        vision: true,
+      },
+    },
+    admin.publicKey,
+    1
+  );
+  assert.equal(registered.ok, true, registered.message);
+  assert.deepEqual(
+    (await storage.get(`enclave/${'b'.repeat(64)}`)).value.artifact_sidecars,
+    artifactSidecars
+  );
+
+  const mismatchedPath = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'c'.repeat(64),
+      artifact_sidecars: {
+        mmproj: {
+          ...artifactSidecars.mmproj,
+          source: {
+            ...artifactSidecars.mmproj.source,
+            path: 'different-mmproj.gguf',
+          },
+        },
+      },
+    },
+    admin.publicKey,
+    2
+  );
+  assert.match(mismatchedPath.message, /source\.path must match path/i);
+  assert.equal(await storage.get(`enclave/${'c'.repeat(64)}`), null);
 });
 
 test('MayhemContract requires Hugging Face catalog anchors to use pinned revisions', async () => {

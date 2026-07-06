@@ -100,6 +100,7 @@ const ENCLAVE_UPDATE_FIELDS = [
   'artifact_root',
   'artifact_root_kind',
   'artifact_source',
+  'artifact_sidecars',
   'source_sha256',
   'manifest_hash',
   'att_tier',
@@ -496,6 +497,7 @@ class MayhemContract extends Contract {
         artifact_root: { type: 'string', min: 1, max: 256 },
         artifact_root_kind: { type: 'string', min: 1, max: 64 },
         artifact_source: { type: 'any' },
+        artifact_sidecars: { type: 'any', optional: true },
         source_sha256: { type: 'string', min: 1, max: 128, optional: true },
         manifest_hash: { type: 'string', min: 1, max: 128 },
         att_tier: { type: 'number', integer: true, min: 1, max: 4 },
@@ -515,6 +517,7 @@ class MayhemContract extends Contract {
         artifact_root: { type: 'string', min: 1, max: 256, optional: true },
         artifact_root_kind: { type: 'string', min: 1, max: 64, optional: true },
         artifact_source: { type: 'any', optional: true },
+        artifact_sidecars: { type: 'any', optional: true },
         source_sha256: { type: 'string', min: 1, max: 128, optional: true },
         manifest_hash: { type: 'string', min: 1, max: 128, optional: true },
         att_tier: { type: 'number', integer: true, min: 1, max: 4, optional: true },
@@ -1663,6 +1666,7 @@ class MayhemContract extends Contract {
       artifact_root: this.value.artifact_root,
       artifact_root_kind: this.value.artifact_root_kind,
       artifact_source: cloneValue(this.value.artifact_source),
+      artifact_sidecars: cloneValue(this.value.artifact_sidecars ?? {}),
       source_sha256: this.value.source_sha256 ?? null,
       manifest_hash: this.value.manifest_hash,
       att_tier: this.value.att_tier,
@@ -4476,27 +4480,73 @@ class MayhemContract extends Contract {
     ) {
       return new Error('Enclave source_sha256 must be 32-byte hex.');
     }
-    return this.validateHuggingFaceArtifactSource(value.artifact_source);
+    const sourceError = this.validateHuggingFaceArtifactSource(value.artifact_source, 'enclave artifact_source');
+    if (sourceError) return sourceError;
+    return this.validateEnclaveArtifactSidecars(value.artifact_sidecars ?? {});
   }
 
-  validateHuggingFaceArtifactSource(source) {
+  validateEnclaveArtifactSidecars(sidecars) {
+    if (!sidecars || typeof sidecars !== 'object' || Array.isArray(sidecars)) {
+      return new Error('Enclave artifact_sidecars must be an object.');
+    }
+    const names = Object.keys(sidecars).sort();
+    if (names.length > 16) return new Error('Enclave artifact_sidecars has too many entries.');
+    for (const name of names) {
+      if (!this.isSafeHuggingFacePathSegment(name)) {
+        return new Error('Enclave artifact_sidecars keys must be safe names.');
+      }
+      const sidecar = sidecars[name];
+      const shapeError = this.validateExactObjectKeys(
+        sidecar,
+        ['source', 'path', 'artifact_root', 'artifact_root_kind', 'weights_bytes', 'source_sha256'],
+        `enclave artifact_sidecars.${name}`
+      );
+      if (shapeError) return shapeError;
+      const sourceError = this.validateHuggingFaceArtifactSource(
+        sidecar.source,
+        `enclave artifact_sidecars.${name}.source`
+      );
+      if (sourceError) return sourceError;
+      if (!this.isSafeHuggingFacePath(sidecar.path)) {
+        return new Error(`Enclave artifact_sidecars.${name}.path must be a safe relative Hugging Face artifact path.`);
+      }
+      if (sidecar.source.path !== sidecar.path) {
+        return new Error(`Enclave artifact_sidecars.${name}.source.path must match path.`);
+      }
+      if (!this.isHexBytes(sidecar.artifact_root, 32)) {
+        return new Error(`Enclave artifact_sidecars.${name}.artifact_root must be a 32-byte hex Merkle root.`);
+      }
+      if (sidecar.artifact_root_kind !== ENCLAVE_ARTIFACT_ROOT_KIND) {
+        return new Error(`Enclave artifact_sidecars.${name}.artifact_root_kind must be ${ENCLAVE_ARTIFACT_ROOT_KIND}.`);
+      }
+      if (!Number.isSafeInteger(sidecar.weights_bytes) || sidecar.weights_bytes <= 0) {
+        return new Error(`Enclave artifact_sidecars.${name}.weights_bytes must be a positive integer.`);
+      }
+      if (!this.isHexBytes(sidecar.source_sha256, 32)) {
+        return new Error(`Enclave artifact_sidecars.${name}.source_sha256 must be 32-byte hex.`);
+      }
+    }
+    return null;
+  }
+
+  validateHuggingFaceArtifactSource(source, label = 'enclave artifact_source') {
     const shapeError = this.validateExactObjectKeys(
       source,
       ['kind', 'repo', 'revision', 'path'],
-      'enclave artifact_source'
+      label
     );
     if (shapeError) return shapeError;
     if (source.kind !== 'huggingface') {
-      return new Error('Enclave artifact_source.kind must be huggingface.');
+      return new Error(`${label}.kind must be huggingface.`);
     }
     if (!this.isSafeHuggingFaceRepo(source.repo)) {
-      return new Error('Enclave artifact_source.repo must be a safe namespace/name repo id.');
+      return new Error(`${label}.repo must be a safe namespace/name repo id.`);
     }
     if (!this.isHexBytes(source.revision, 20)) {
-      return new Error('Enclave artifact_source.revision must be a 20-byte git commit hex.');
+      return new Error(`${label}.revision must be a 20-byte git commit hex.`);
     }
     if (!this.isSafeHuggingFacePath(source.path)) {
-      return new Error('Enclave artifact_source.path must be a safe relative Hugging Face artifact path.');
+      return new Error(`${label}.path must be a safe relative Hugging Face artifact path.`);
     }
     return null;
   }
@@ -6714,12 +6764,15 @@ class MayhemContract extends Contract {
       !value.includes('#') &&
       !value.includes('%') &&
       !/[\x00-\x1f\x7f]/.test(value) &&
-      value.split('/').every((part) => (
-        part.length > 0 &&
-        part !== '.' &&
-        part !== '..' &&
-        /^[A-Za-z0-9._+-]+$/.test(part)
-      ));
+      value.split('/').every((part) => this.isSafeHuggingFacePathSegment(part));
+  }
+
+  isSafeHuggingFacePathSegment(value) {
+    return typeof value === 'string' &&
+      value.length > 0 &&
+      value !== '.' &&
+      value !== '..' &&
+      /^[A-Za-z0-9._+-]+$/.test(value);
   }
 
   isHttpsUrl(value) {

@@ -34,6 +34,7 @@ fn test_report() -> (
         admin_pubkey: "admin-key".to_owned(),
         model_id: "mayhem/qwen3.5-4b@q4".to_owned(),
         artifact_root: "artifact-root-v1".to_owned(),
+        artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: "manifest-hash-v1".to_owned(),
         binary_hash,
     };
@@ -55,6 +56,7 @@ fn test_report() -> (
         model_id: identity.model_id,
         model_class: DEFAULT_MODEL_CLASS.to_owned(),
         artifact_root: identity.artifact_root,
+        artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
         att_tier: 1,
@@ -96,6 +98,7 @@ fn test_hardware_report_with_evidence(
         admin_pubkey: "admin-key".to_owned(),
         model_id: "mayhem/qwen3.5-4b@q4".to_owned(),
         artifact_root: "artifact-root-v1".to_owned(),
+        artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: "manifest-hash-v1".to_owned(),
         binary_hash,
     };
@@ -139,6 +142,7 @@ fn test_hardware_report_with_evidence(
         model_id: identity.model_id,
         model_class: DEFAULT_MODEL_CLASS.to_owned(),
         artifact_root: identity.artifact_root,
+        artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
         att_tier: attestation.report.att_tier,

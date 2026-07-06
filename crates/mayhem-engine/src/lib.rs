@@ -15,6 +15,7 @@ pub const DEFAULT_CONTEXT_SIZE: u32 = 2048;
 pub const DEFAULT_BATCH_SIZE: u32 = 512;
 pub const DEFAULT_UBATCH_SIZE: u32 = 512;
 pub const DEFAULT_SEED: u32 = 0x4d415948;
+pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
@@ -149,6 +150,8 @@ impl ModelArtifact {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LoadConfig {
     pub artifact: ModelArtifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_projector: Option<ModelArtifact>,
     #[serde(default = "default_context_size")]
     pub ctx_size: u32,
     #[serde(default = "default_batch_size")]
@@ -200,6 +203,7 @@ impl Default for LoadConfig {
     fn default() -> Self {
         Self {
             artifact: ModelArtifact::gguf(PathBuf::new()),
+            vision_projector: None,
             ctx_size: DEFAULT_CONTEXT_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
             ubatch_size: DEFAULT_UBATCH_SIZE,
@@ -799,27 +803,34 @@ pub use trt_llm_backend::TrtLlmBackend;
 
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_backend {
+    use base64::{engine::general_purpose, Engine as _};
     use encoding_rs::UTF_8;
     use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::{AddBos, LlamaModel};
+    use llama_cpp_2::mtmd::{
+        mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
+    };
     use llama_cpp_2::sampling::LlamaSampler;
     use llama_cpp_2::token::LlamaToken;
 
     use super::{
         tool_call_json_schema, validate_load_config, verify_artifact, ArtifactFormat,
         EmbeddingOutput, EmbeddingRequest, EngineBackend, EngineError, FinishReason,
-        GenerateOutput, GenerateRequest, GrammarSpec, LoadConfig, LoadedModelInfo, Result,
-        TokenChunk, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
+        GenerateOutput, GenerateRequest, GrammarSpec, LoadConfig, LoadedModelInfo, MediaInput,
+        Result, TokenChunk, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
+        MTMD_MEDIA_MARKER,
     };
+    use std::ffi::CString;
     use std::num::NonZeroU32;
 
     #[derive(Debug)]
     pub struct LlamaCppBackend {
         backend: LlamaBackend,
         model: Option<LlamaModel>,
+        mtmd: Option<MtmdContext>,
         loaded: Option<LoadedModelInfo>,
         config: Option<LoadConfig>,
     }
@@ -831,6 +842,7 @@ mod llama_cpp_backend {
             Ok(Self {
                 backend,
                 model: None,
+                mtmd: None,
                 loaded: None,
                 config: None,
             })
@@ -869,6 +881,41 @@ mod llama_cpp_backend {
 
             let model =
                 LlamaModel::load_from_file(&self.backend, &config.artifact.path, &model_params)?;
+            let mtmd = if let Some(projector) = &config.vision_projector {
+                verify_artifact(projector)?;
+                let projector_path = projector.path.to_str().ok_or_else(|| {
+                    EngineError::InvalidConfig(format!(
+                        "vision projector path {} is not valid UTF-8",
+                        projector.path.display()
+                    ))
+                })?;
+                let mut params = MtmdContextParams::default();
+                params.use_gpu = config.gpu_layers.unwrap_or(0) > 0;
+                params.print_timings = false;
+                if let Some(threads) = config.threads {
+                    params.n_threads = threads;
+                }
+                params.media_marker = CString::new(mtmd_default_marker()).map_err(|err| {
+                    EngineError::InvalidConfig(format!("invalid mtmd media marker: {err}"))
+                })?;
+                let mtmd = MtmdContext::init_from_file(projector_path, &model, &params).map_err(
+                    |err| {
+                        EngineError::InvalidConfig(format!(
+                            "initializing llama.cpp vision projector {} failed: {err}",
+                            projector.path.display()
+                        ))
+                    },
+                )?;
+                if !mtmd.support_vision() {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "vision projector {} does not advertise vision support",
+                        projector.path.display()
+                    )));
+                }
+                Some(mtmd)
+            } else {
+                None
+            };
             let info = LoadedModelInfo {
                 backend: self.backend_id().to_owned(),
                 artifact: config.artifact.clone(),
@@ -878,6 +925,7 @@ mod llama_cpp_backend {
             };
 
             self.model = Some(model);
+            self.mtmd = mtmd;
             self.loaded = Some(info.clone());
             self.config = Some(config);
             Ok(info)
@@ -901,6 +949,9 @@ mod llama_cpp_backend {
                     usage: UsageCounters::default(),
                     finish_reason: FinishReason::Length,
                 });
+            }
+            if !request.media.is_empty() {
+                return self.generate_multimodal(request, sink);
             }
 
             let config = self.config()?.clone();
@@ -1068,6 +1119,181 @@ mod llama_cpp_backend {
                 usage: UsageCounters::new(prompt_tokens, 0),
             })
         }
+    }
+
+    impl LlamaCppBackend {
+        fn generate_multimodal(
+            &mut self,
+            request: GenerateRequest,
+            sink: &mut dyn TokenSink,
+        ) -> Result<GenerateOutput> {
+            let config = self.config()?.clone();
+            let model = self.model()?;
+            let mtmd = self.mtmd.as_ref().ok_or_else(|| {
+                EngineError::InvalidConfig(
+                    "llama.cpp received media input but no admin-approved mmproj sidecar is loaded"
+                        .to_owned(),
+                )
+            })?;
+            let ctx_size = NonZeroU32::new(config.ctx_size).ok_or_else(|| {
+                EngineError::InvalidConfig("ctx_size must be greater than zero".to_owned())
+            })?;
+            let mut ctx_params = LlamaContextParams::default()
+                .with_n_ctx(Some(ctx_size))
+                .with_n_batch(config.batch_size)
+                .with_n_ubatch(config.ubatch_size)
+                .with_n_seq_max(1)
+                .with_no_perf(true);
+            if let Some(threads) = config.threads {
+                ctx_params = ctx_params
+                    .with_n_threads(threads)
+                    .with_n_threads_batch(threads);
+            }
+
+            let mut ctx = model.new_context(&self.backend, ctx_params)?;
+            let bitmaps = media_bitmaps(mtmd, &request.media)?;
+            let bitmap_refs = bitmaps.iter().collect::<Vec<_>>();
+            let marker_count = request.prompt.matches(MTMD_MEDIA_MARKER).count();
+            if marker_count != bitmap_refs.len() {
+                return Err(EngineError::InvalidConfig(format!(
+                    "multimodal prompt must contain exactly {} {} marker(s), found {}",
+                    bitmap_refs.len(),
+                    MTMD_MEDIA_MARKER,
+                    marker_count
+                )));
+            }
+            let chunks = mtmd
+                .tokenize(
+                    MtmdInputText {
+                        text: request.prompt.clone(),
+                        add_special: true,
+                        parse_special: true,
+                    },
+                    &bitmap_refs,
+                )
+                .map_err(|err| {
+                    EngineError::InvalidConfig(format!("llama.cpp mtmd tokenization failed: {err}"))
+                })?;
+            let prompt_tokens = chunks.total_tokens();
+            let prompt_positions = chunks.total_positions();
+            if prompt_positions >= i32::try_from(ctx.n_ctx()).unwrap_or(i32::MAX) {
+                return Err(EngineError::PromptTooLong {
+                    prompt_tokens,
+                    ctx_size: ctx.n_ctx(),
+                });
+            }
+            let mut next_pos = chunks
+                .eval_chunks(
+                    mtmd,
+                    &ctx,
+                    0,
+                    0,
+                    i32::try_from(config.batch_size).unwrap_or(i32::MAX),
+                    true,
+                )
+                .map_err(|err| {
+                    EngineError::InvalidConfig(format!("llama.cpp mtmd prompt eval failed: {err}"))
+                })?;
+
+            let mut sampler = make_sampler(model, &request)?;
+            let mut decoder = UTF_8.new_decoder();
+            let mut output = String::new();
+            let mut completion_tokens = 0_u32;
+            let mut finish_reason = FinishReason::Length;
+            let mut batch = LlamaBatch::new(1, 1);
+
+            while completion_tokens < request.max_new_tokens {
+                let token = sampler.sample(&ctx, -1);
+                if model.is_eog_token(token) && !request.ignore_eos {
+                    finish_reason = FinishReason::Stop;
+                    break;
+                }
+
+                let text = model.token_to_piece(token, &mut decoder, true, None)?;
+                output.push_str(&text);
+                sink.on_token(TokenChunk {
+                    index: completion_tokens,
+                    token_id: token.0,
+                    text,
+                })?;
+                completion_tokens = completion_tokens.saturating_add(1);
+
+                if completion_tokens >= request.max_new_tokens {
+                    break;
+                }
+                if next_pos >= i32::try_from(ctx.n_ctx()).unwrap_or(i32::MAX) {
+                    break;
+                }
+
+                batch.clear();
+                batch.add(token, next_pos, &[0], true)?;
+                next_pos = next_pos.saturating_add(1);
+                ctx.decode(&mut batch)?;
+            }
+
+            Ok(GenerateOutput {
+                text: output,
+                usage: UsageCounters::new(prompt_tokens as u32, completion_tokens),
+                finish_reason,
+            })
+        }
+    }
+
+    fn media_bitmaps(mtmd: &MtmdContext, media: &[MediaInput]) -> Result<Vec<MtmdBitmap>> {
+        media
+            .iter()
+            .map(|input| {
+                if input.kind != "image" {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "llama.cpp mtmd currently supports image media only, got {}",
+                        input.kind
+                    )));
+                }
+                let bytes = media_input_bytes(input)?;
+                MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(|err| {
+                    EngineError::InvalidConfig(format!("llama.cpp mtmd image decode failed: {err}"))
+                })
+            })
+            .collect()
+    }
+
+    fn media_input_bytes(input: &MediaInput) -> Result<Vec<u8>> {
+        if let Some(data) = &input.data {
+            return general_purpose::STANDARD.decode(data).map_err(|err| {
+                EngineError::InvalidConfig(format!("media data is not base64: {err}"))
+            });
+        }
+        let Some(url) = &input.url else {
+            return Err(EngineError::InvalidConfig(
+                "media input must include a data URL or base64 data".to_owned(),
+            ));
+        };
+        decode_data_url(url)
+    }
+
+    fn decode_data_url(url: &str) -> Result<Vec<u8>> {
+        let Some(rest) = url.strip_prefix("data:") else {
+            return Err(EngineError::InvalidConfig(
+                "remote media URLs are not fetched by provider engines; pass image data URLs"
+                    .to_owned(),
+            ));
+        };
+        let Some((metadata, payload)) = rest.split_once(',') else {
+            return Err(EngineError::InvalidConfig(
+                "media data URL is missing a comma separator".to_owned(),
+            ));
+        };
+        if !metadata
+            .split(';')
+            .any(|part| part.eq_ignore_ascii_case("base64"))
+        {
+            return Err(EngineError::InvalidConfig(
+                "media data URL must be base64 encoded".to_owned(),
+            ));
+        }
+        general_purpose::STANDARD.decode(payload).map_err(|err| {
+            EngineError::InvalidConfig(format!("media data URL payload is not base64: {err}"))
+        })
     }
 
     fn normalize_embedding(embedding: &mut [f32]) {

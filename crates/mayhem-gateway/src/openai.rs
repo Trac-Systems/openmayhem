@@ -191,6 +191,8 @@ pub struct GatewayRouteCandidate {
     pub att_tier: u8,
     pub admin_pubkey: String,
     pub artifact_root: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifact_sidecar_roots: BTreeMap<String, String>,
     pub manifest_hash: String,
     pub binary_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2662,6 +2664,10 @@ fn canonical_route_candidate(candidate: &GatewayRouteCandidate) -> bool {
         && is_hex_len(&candidate.room_id, 32)
         && is_hex_len(&candidate.admin_pubkey, 64)
         && is_hex_len(&candidate.artifact_root, 64)
+        && candidate
+            .artifact_sidecar_roots
+            .values()
+            .all(|root| is_hex_len(root, 64))
         && is_hex_len(&candidate.manifest_hash, 64)
         && is_hex_len(&candidate.binary_hash, 64)
 }
@@ -6182,6 +6188,7 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 model_class: model.mayhem.model_class.clone(),
                 artifact_root: candidate.artifact_root.clone(),
+                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
                 att_tier: candidate.att_tier,
@@ -6257,6 +6264,7 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 model_class: model.mayhem.model_class.clone(),
                 artifact_root: candidate.artifact_root.clone(),
+                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
                 att_tier: candidate.att_tier,
@@ -8213,6 +8221,7 @@ mod tests {
             model_id: identity.model_id.clone(),
             model_class: DEFAULT_MODEL_CLASS.to_owned(),
             artifact_root: identity.artifact_root.clone(),
+            artifact_sidecar_roots: identity.artifact_sidecar_roots.clone(),
             manifest_hash: identity.manifest_hash.clone(),
             binary_hash: identity.binary_hash.clone(),
             att_tier: 1,
@@ -8382,6 +8391,7 @@ mod tests {
             att_tier: 1,
             admin_pubkey: "33".repeat(32),
             artifact_root: format!("{:02x}", idx.wrapping_add(180)).repeat(32),
+            artifact_sidecar_roots: BTreeMap::new(),
             manifest_hash: format!("{:02x}", idx.wrapping_add(190)).repeat(32),
             binary_hash: format!("{:02x}", idx.wrapping_add(200)).repeat(32),
             kyb: None,
@@ -9032,6 +9042,7 @@ mod tests {
             admin_pubkey: "33".repeat(32),
             model_id: "mayhem/test-model@q4".to_owned(),
             artifact_root: "aa".repeat(32),
+            artifact_sidecar_roots: std::collections::BTreeMap::new(),
             manifest_hash: "bb".repeat(32),
             binary_hash: "cc".repeat(32),
         }

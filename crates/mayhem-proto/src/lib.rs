@@ -37,6 +37,8 @@ pub struct CatalogEnclaveIdentity {
     pub admin_pubkey: String,
     pub model_id: String,
     pub artifact_root: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifact_sidecar_roots: BTreeMap<String, String>,
     pub manifest_hash: String,
     pub binary_hash: String,
 }
@@ -433,6 +435,10 @@ pub fn catalog_enclave_id(identity: &CatalogEnclaveIdentity) -> String {
     hasher.update(identity.admin_pubkey.as_bytes());
     hasher.update(identity.model_id.as_bytes());
     hasher.update(identity.artifact_root.as_bytes());
+    for (name, root) in &identity.artifact_sidecar_roots {
+        hasher.update(name.as_bytes());
+        hasher.update(root.as_bytes());
+    }
     hasher.update(identity.manifest_hash.as_bytes());
     hasher.update(identity.binary_hash.as_bytes());
     hasher.finalize().to_hex().to_string()
@@ -618,6 +624,7 @@ mod tests {
             admin_pubkey: "admin".to_owned(),
             model_id: "model".to_owned(),
             artifact_root: "artifact".to_owned(),
+            artifact_sidecar_roots: BTreeMap::new(),
             manifest_hash: "manifest".to_owned(),
             binary_hash: "binary".to_owned(),
         };

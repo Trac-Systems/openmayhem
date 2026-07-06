@@ -12,7 +12,7 @@ pub use pricing::*;
 pub use provider_table::*;
 pub use reputation::*;
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::{
@@ -128,6 +128,7 @@ pub struct EnclaveContractRecord {
     pub model_id: String,
     pub model_class: String,
     pub artifact_root: String,
+    pub artifact_sidecar_roots: BTreeMap<String, String>,
     pub manifest_hash: String,
     pub binary_hash: String,
     pub att_tier: u8,
@@ -252,6 +253,7 @@ impl EnclaveContractRecord {
             admin_pubkey: self.admin_pubkey.clone(),
             model_id: self.model_id.clone(),
             artifact_root: self.artifact_root.clone(),
+            artifact_sidecar_roots: self.artifact_sidecar_roots.clone(),
             manifest_hash: self.manifest_hash.clone(),
             binary_hash: self.binary_hash.clone(),
         }

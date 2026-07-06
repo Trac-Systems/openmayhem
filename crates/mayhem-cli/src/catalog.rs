@@ -105,7 +105,7 @@ pub(crate) struct Provenance {
     pub(crate) license_sha256: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct SourceRef {
     pub(crate) kind: String,
     pub(crate) repo: String,
@@ -153,6 +153,18 @@ pub(crate) struct CatalogArtifact {
     pub(crate) download_check: bool,
     #[serde(default)]
     pub(crate) notes: Option<String>,
+    #[serde(default)]
+    pub(crate) sidecars: BTreeMap<String, CatalogArtifactSidecar>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CatalogArtifactSidecar {
+    pub(crate) source: SourceRef,
+    pub(crate) path: String,
+    pub(crate) artifact_root: String,
+    pub(crate) artifact_root_kind: String,
+    pub(crate) weights_bytes: u64,
+    pub(crate) source_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -989,14 +1001,14 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     }
     let mut seen = BTreeSet::new();
     for modality in &adapter.modality_set {
-        if !valid_output_modality(modality) {
+        if !valid_adapter_modality(modality) {
             errors.push(format!(
                 "{} adapter.modality_set entry is unsupported: {}",
                 model.model_id, modality
             ));
-        } else if !caps_modalities.is_empty() && !caps_modalities.contains(modality.as_str()) {
+        } else if !adapter_modality_allowed(model, modality) {
             errors.push(format!(
-                "{} adapter.modality_set entry {} is not declared in caps.output_modalities",
+                "{} adapter.modality_set entry {} is not allowed by model caps",
                 model.model_id, modality
             ));
         }
@@ -1028,6 +1040,30 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
             model.model_id
         ));
     }
+}
+
+fn valid_adapter_modality(modality: &str) -> bool {
+    matches!(modality, "text" | "embedding" | "image" | "audio")
+}
+
+fn adapter_modality_allowed(model: &CatalogModel, modality: &str) -> bool {
+    let caps_modalities = model_output_modalities(model);
+    match modality {
+        "image" => model.caps.vision || caps_modalities.contains("image"),
+        "audio" => model.caps.audio || caps_modalities.contains("audio"),
+        other => caps_modalities.is_empty() || caps_modalities.contains(other),
+    }
+}
+
+fn model_output_modalities(model: &CatalogModel) -> BTreeSet<&str> {
+    let mut caps_modalities = BTreeSet::new();
+    if let Some(modality) = model.caps.output_modality.as_deref() {
+        caps_modalities.insert(modality);
+    }
+    for modality in &model.caps.output_modalities {
+        caps_modalities.insert(modality.as_str());
+    }
+    caps_modalities
 }
 
 fn validate_artifact(
@@ -1116,7 +1152,71 @@ fn validate_artifact(
             "{model_id}/{name} trt-llm artifact needs min_compute_cap"
         ));
     }
+    for (sidecar_name, sidecar) in &artifact.sidecars {
+        validate_artifact_sidecar(model_id, name, tier, sidecar_name, sidecar, errors);
+    }
     let _ = (artifact.download_check, &artifact.notes);
+}
+
+fn validate_artifact_sidecar(
+    model_id: &str,
+    artifact_name: &str,
+    tier: &str,
+    sidecar_name: &str,
+    sidecar: &CatalogArtifactSidecar,
+    errors: &mut Vec<String>,
+) {
+    if !is_safe_huggingface_path_segment(sidecar_name) {
+        errors.push(format!(
+            "{model_id}/{artifact_name} sidecar name {sidecar_name} must be a safe path segment"
+        ));
+    }
+    validate_source(
+        model_id,
+        &format!("artifacts.{artifact_name}.sidecars.{sidecar_name}.source"),
+        &sidecar.source,
+        errors,
+    );
+    if sidecar.path.trim().is_empty() {
+        errors.push(format!(
+            "{model_id}/{artifact_name} sidecar {sidecar_name} path is required"
+        ));
+    } else {
+        errors.extend(
+            validate_huggingface_path(
+                model_id,
+                &format!("artifacts.{artifact_name}.sidecars.{sidecar_name}.path"),
+                &sidecar.path,
+            )
+            .err()
+            .unwrap_or_default(),
+        );
+    }
+    if !is_hex_len(&sidecar.artifact_root, 64) {
+        errors.push(format!(
+            "{model_id}/{artifact_name} sidecar {sidecar_name} artifact_root must be 32-byte hex"
+        ));
+    }
+    if sidecar.artifact_root_kind.trim().is_empty() {
+        errors.push(format!(
+            "{model_id}/{artifact_name} sidecar {sidecar_name} artifact_root_kind is required"
+        ));
+    }
+    if tier == "launch" && sidecar.artifact_root_kind != "blake3_merkle_v1" {
+        errors.push(format!(
+            "{model_id}/{artifact_name} launch sidecar {sidecar_name} artifact_root_kind must be blake3_merkle_v1"
+        ));
+    }
+    if sidecar.weights_bytes == 0 {
+        errors.push(format!(
+            "{model_id}/{artifact_name} sidecar {sidecar_name} weights_bytes must be positive"
+        ));
+    }
+    if !is_hex_len(&sidecar.source_sha256, 64) {
+        errors.push(format!(
+            "{model_id}/{artifact_name} sidecar {sidecar_name} source_sha256 must be 32-byte hex"
+        ));
+    }
 }
 
 fn validate_source(model_id: &str, label: &str, source: &SourceRef, errors: &mut Vec<String>) {
@@ -1289,40 +1389,37 @@ fn run_source_checks(
             continue;
         }
         for (artifact_name, artifact) in &model.artifacts {
-            let url = huggingface_resolve_url(&artifact.source, &artifact.path)?;
-            let metadata_errors = if model.tier == "launch" {
-                launch_source_metadata_errors(model, artifact_name, artifact)
-            } else {
-                Vec::new()
-            };
-            let check = check_hf_artifact_head(
-                &artifact.source.repo,
-                &artifact.source.revision,
+            reports.push(source_check_report(
+                model.model_id.clone(),
+                artifact_name,
+                &artifact.source,
                 &artifact.path,
+                &artifact.artifact_root_kind,
+                artifact.source_sha256.clone(),
+                if model.tier == "launch" {
+                    launch_source_metadata_errors(model, artifact_name, artifact)
+                } else {
+                    Vec::new()
+                },
                 &token,
-            );
-            let (status, ok, error) = match check {
-                Ok(status) => (
-                    Some(status),
-                    source_status_ok(status) && metadata_errors.is_empty(),
-                    None,
-                ),
-                Err(err) => (None, false, Some(err.to_string())),
-            };
-            reports.push(SourceCheckReport {
-                model_id: model.model_id.clone(),
-                artifact: artifact_name.clone(),
-                repo: artifact.source.repo.clone(),
-                revision: artifact.source.revision.clone(),
-                path: artifact.path.clone(),
-                url,
-                artifact_root_kind: artifact.artifact_root_kind.clone(),
-                source_sha256: artifact.source_sha256.clone(),
-                status,
-                ok,
-                error,
-                metadata_errors,
-            });
+            )?);
+            for (sidecar_name, sidecar) in &artifact.sidecars {
+                let label = format!("{artifact_name}.sidecar.{sidecar_name}");
+                reports.push(source_check_report(
+                    model.model_id.clone(),
+                    &label,
+                    &sidecar.source,
+                    &sidecar.path,
+                    &sidecar.artifact_root_kind,
+                    Some(sidecar.source_sha256.clone()),
+                    if model.tier == "launch" {
+                        launch_sidecar_metadata_errors(model, artifact_name, sidecar_name, sidecar)
+                    } else {
+                        Vec::new()
+                    },
+                    &token,
+                )?);
+            }
         }
     }
     if reports.is_empty() {
@@ -1332,6 +1429,42 @@ fn run_source_checks(
         );
     }
     Ok(reports)
+}
+
+fn source_check_report(
+    model_id: String,
+    artifact_label: &str,
+    source: &SourceRef,
+    path: &str,
+    artifact_root_kind: &str,
+    source_sha256: Option<String>,
+    metadata_errors: Vec<String>,
+    token: &str,
+) -> Result<SourceCheckReport> {
+    let url = huggingface_resolve_url(source, path)?;
+    let check = check_hf_artifact_head(&source.repo, &source.revision, path, token);
+    let (status, ok, error) = match check {
+        Ok(status) => (
+            Some(status),
+            source_status_ok(status) && metadata_errors.is_empty(),
+            None,
+        ),
+        Err(err) => (None, false, Some(err.to_string())),
+    };
+    Ok(SourceCheckReport {
+        model_id,
+        artifact: artifact_label.to_owned(),
+        repo: source.repo.clone(),
+        revision: source.revision.clone(),
+        path: path.to_owned(),
+        url,
+        artifact_root_kind: artifact_root_kind.to_owned(),
+        source_sha256,
+        status,
+        ok,
+        error,
+        metadata_errors,
+    })
 }
 
 fn launch_source_metadata_errors(
@@ -1356,6 +1489,28 @@ fn launch_source_metadata_errors(
             "{} / {} source_sha256 is required before launch calibration",
             model.model_id, artifact_name
         )),
+    }
+    errors
+}
+
+fn launch_sidecar_metadata_errors(
+    model: &CatalogModel,
+    artifact_name: &str,
+    sidecar_name: &str,
+    sidecar: &CatalogArtifactSidecar,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if sidecar.artifact_root_kind != "blake3_merkle_v1" {
+        errors.push(format!(
+            "{} / {} sidecar {} artifact_root_kind must be blake3_merkle_v1 for launch calibration, got {}",
+            model.model_id, artifact_name, sidecar_name, sidecar.artifact_root_kind
+        ));
+    }
+    if !is_hex_len(&sidecar.source_sha256, 64) {
+        errors.push(format!(
+            "{} / {} sidecar {} source_sha256 must be 32-byte hex for launch calibration, got {}",
+            model.model_id, artifact_name, sidecar_name, sidecar.source_sha256
+        ));
     }
     errors
 }
@@ -1675,6 +1830,7 @@ mod tests {
             min_compute_cap: None,
             download_check: false,
             notes: None,
+            sidecars: BTreeMap::new(),
         };
 
         let errors = launch_source_metadata_errors(&model, "gguf-q4_k_m", &artifact);
@@ -1789,6 +1945,13 @@ mod tests {
         validate_model(&model, &mut errors);
         assert!(errors.is_empty(), "{errors:#?}");
 
+        let mut vision_input = model.clone();
+        vision_input.caps.vision = true;
+        vision_input.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        let mut errors = Vec::new();
+        validate_model(&vision_input, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
         let mut invalid = model.clone();
         invalid.adapter.request_shape_family = "provider_native".to_owned();
         invalid.adapter.chat_template_id = String::new();
@@ -1818,9 +1981,9 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("adapter.modality_set duplicates text")));
-        assert!(errors.iter().any(|error| error.contains(
-            "adapter.modality_set entry image is not declared in caps.output_modalities"
-        )));
+        assert!(errors.iter().any(|error| {
+            error.contains("adapter.modality_set entry image is not allowed by model caps")
+        }));
         assert!(errors
             .iter()
             .any(|error| error.contains("adapter.modality_set entry is unsupported: smell")));
@@ -1939,6 +2102,7 @@ mod tests {
                     min_compute_cap: None,
                     download_check: false,
                     notes: None,
+                    sidecars: BTreeMap::new(),
                 },
             )]),
             caps: CatalogCaps {
