@@ -964,7 +964,7 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     }
     if !matches!(
         adapter.chat_template_id.as_str(),
-        "generic_chatml" | "llama3-instruct" | "qwen2.5-instruct"
+        "generic_chatml" | "llama3-instruct" | "qwen2.5-instruct" | "smolvlm2-instruct"
     ) {
         errors.push(format!(
             "{} adapter.chat_template_id is unsupported: {}",

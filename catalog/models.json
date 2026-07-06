@@ -475,6 +475,104 @@
         "in_per_1k": 2,
         "out_per_1k": 0
       }
+    },
+    {
+      "model_id": "huggingfacetb/smolvlm2-256m-video-instruct@gguf-q8_0",
+      "family": "smolvlm2-256m-video-instruct",
+      "params_b": 0.256,
+      "tier": "launch",
+      "min_app_version": "0.1.0",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "HuggingFaceTB/SmolVLM2-256M-Video-Instruct",
+          "revision": "067788b187b95ebe7b2e040b3e4299e342e5b8fd",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "llama.cpp convert_hf_to_gguf + quantize + mtmd projector",
+            "method": "q8_0",
+            "input_sha256": "dcc8f4c00d30d70bb3028a1bfc373e1b1972e25919f8788183cae4ae72431ce2",
+            "output_sha256": "af7ce9951a2f46c4f6e5def253e5b896ca5e417010e7a9949fdc9e5175c27767"
+          }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "2af71558e438db0b73a20beab92dc278a94e1bbe974c00c1a33e3ab62d53a608"
+      },
+      "artifacts": {
+        "gguf-q8_0": {
+          "engine": "llama.cpp",
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-smolvlm2-256m-video-instruct-GGUF",
+            "revision": "cdb484eebb6fc72e31f95710fe3086eb567d7fa5",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "SmolVLM2-256M-Video-Instruct-Q8_0.gguf",
+          "artifact_root": "cbbf16a4de2d593f9b3e74bac018e23ecec9770fe0de4c5053d7ecbcbf98e455",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 175056352,
+          "source_sha256": "af7ce9951a2f46c4f6e5def253e5b896ca5e417010e7a9949fdc9e5175c27767",
+          "download_check": true,
+          "sidecars": {
+            "mmproj": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-smolvlm2-256m-video-instruct-GGUF",
+                "revision": "cdb484eebb6fc72e31f95710fe3086eb567d7fa5",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "mmproj-SmolVLM2-256M-Video-Instruct-Q8_0.gguf",
+              "artifact_root": "9d251caf36cb83a71b9c96cc8474f63438f5a7c7fe09c364427d2705c160b947",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 103771680,
+              "source_sha256": "d34913a588464ff7215f086193e0426a4f045eaba74456ee5e2667d8ed6798b1"
+            }
+          }
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 4096,
+        "vision": true,
+        "output_modality": "text",
+        "output_modalities": [
+          "text"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 2,
+        "min_vram_gb_full_offload": 0,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "llama.cpp"
+        ]
+      },
+      "adapter": {
+        "request_shape_family": "openai_chat",
+        "chat_template_id": "smolvlm2-instruct",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "text",
+          "image"
+        ],
+        "response_normalization": "openai_chat"
+      },
+      "canary": {
+        "set_id": "canary-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "attestation_of_compute"
+      },
+      "price_ref_mu": {
+        "denom": "mu_usd",
+        "in_per_1k": 4,
+        "out_per_1k": 12
+      }
     }
   ]
 }

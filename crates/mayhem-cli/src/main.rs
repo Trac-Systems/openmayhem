@@ -23476,6 +23476,7 @@ fn provider_engine_prompt(messages: &[Value], adapter: &catalog::CatalogAdapter)
             Ok(provider_engine_generic_chatml_prompt(messages, adapter))
         }
         "llama3-instruct" => Ok(provider_engine_llama3_prompt(messages, adapter)),
+        "smolvlm2-instruct" => Ok(provider_engine_smolvlm2_prompt(messages, adapter)),
         other => bail!("unsupported catalog adapter.chat_template_id: {other}"),
     }
 }
@@ -23512,6 +23513,47 @@ fn provider_engine_llama3_prompt(messages: &[Value], adapter: &catalog::CatalogA
     }
     prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     prompt
+}
+
+fn provider_engine_smolvlm2_prompt(
+    messages: &[Value],
+    adapter: &catalog::CatalogAdapter,
+) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = smolvlm2_role(
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user"),
+        );
+        let content = provider_message_to_text_for_adapter(message, adapter);
+        if provider_message_starts_with_image(message) && adapter_supports_image_input(adapter) {
+            let _ = write!(prompt, "<|im_start|>{role}:{content}<end_of_utterance>\n");
+        } else {
+            let _ = write!(prompt, "<|im_start|>{role}: {content}<end_of_utterance>\n");
+        }
+    }
+    prompt.push_str("Assistant:");
+    prompt
+}
+
+fn smolvlm2_role(role: &str) -> &'static str {
+    match role {
+        "assistant" => "Assistant",
+        "system" => "System",
+        _ => "User",
+    }
+}
+
+fn provider_message_starts_with_image(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|parts| parts.first())
+        .and_then(|part| part.get("type"))
+        .and_then(Value::as_str)
+        == Some("image_url")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28246,6 +28288,32 @@ mod tests {
         assert!(request.prompt.contains("describe this"));
         assert!(request.prompt.contains(MTMD_MEDIA_MARKER));
         assert!(!request.prompt.contains("[image:"));
+    }
+
+    #[test]
+    fn provider_engine_request_uses_smolvlm2_vision_template() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "smolvlm2-instruct".to_owned(),
+            tool_call_strategy: "none".to_owned(),
+            modality_set: vec!["text".to_owned(), "image".to_owned()],
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } },
+                    { "type": "text", "text": "What color is this image?" }
+                ]
+            }]
+        });
+
+        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
+
+        assert_eq!(request.media.len(), 1);
+        assert!(request.prompt.starts_with(&format!(
+            "<|im_start|>User:{MTMD_MEDIA_MARKER}What color is this image?<end_of_utterance>\nAssistant:"
+        )));
     }
 
     #[test]

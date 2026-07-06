@@ -7,7 +7,7 @@ use std::process::Command;
 
 use mayhem_engine::{
     verify_artifact, EmbeddingRequest, EngineBackend, GenerateRequest, GrammarSpec,
-    LlamaCppBackend, LoadConfig, ModelArtifact, ToolSpec,
+    LlamaCppBackend, LoadConfig, MediaInput, ModelArtifact, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use serde_json::json;
 
@@ -20,6 +20,11 @@ const FILE_NAME: &str = "Qwen3.5-4B-Q4_K_M.gguf";
 const EMBED_REPO: &str = "ggml-org/bge-small-en-v1.5-Q8_0-GGUF";
 const EMBED_REVISION: &str = "f2068edd9b54f2a369549ccc71f70ed273a2a801";
 const EMBED_FILE_NAME: &str = "bge-small-en-v1.5-q8_0.gguf";
+const VISION_REPO: &str = "ggml-org/SmolVLM2-256M-Video-Instruct-GGUF";
+const VISION_REVISION: &str = "7b6af08ec3a985c86542c095a63bab2e68510461";
+const VISION_FILE_NAME: &str = "SmolVLM2-256M-Video-Instruct-Q8_0.gguf";
+const VISION_MMPROJ_FILE_NAME: &str = "mmproj-SmolVLM2-256M-Video-Instruct-Q8_0.gguf";
+const RED_SQUARE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAZklEQVR42u3QMREAAAgEIEN8/3jW0ByeDBSgOpnPSoAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECLhvAa870eGT0af7AAAAAElFTkSuQmCC";
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -129,6 +134,54 @@ fn gguf_embedding_model_smoke_returns_semantic_vectors() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn gguf_vision_model_smoke_describes_real_image() -> TestResult {
+    if env::var(RUN_ENV).ok().as_deref() != Some("1") {
+        eprintln!("skipping llama.cpp vision conformance; set {RUN_ENV}=1 to run");
+        return Ok(());
+    }
+
+    let model_path = ensure_vision_model()?;
+    let mmproj_path = ensure_vision_projector()?;
+    let mut backend = LlamaCppBackend::new()?;
+    let mut config = LoadConfig::gguf(&model_path);
+    config.vision_projector = Some(ModelArtifact::gguf(&mmproj_path));
+    config.ctx_size = 4096;
+    config.batch_size = 512;
+    config.ubatch_size = 512;
+    config.threads = Some(4);
+    let info = backend.load(config)?;
+    assert_eq!(info.artifact.path, model_path);
+
+    let prompt = format!(
+        "<|im_start|>User:{MTMD_MEDIA_MARKER}What color is this image? Answer with one color word.<end_of_utterance>\nAssistant:"
+    );
+    let mut request = GenerateRequest::new(prompt).with_max_new_tokens(32);
+    request.temperature = Some(0.0);
+    request.media.push(MediaInput {
+        kind: "image".to_owned(),
+        content_type: Some("image/png".to_owned()),
+        url: None,
+        data: Some(RED_SQUARE_PNG_BASE64.to_owned()),
+    });
+
+    let output = backend.generate(request, &mut |_chunk| Ok(()))?;
+    eprintln!("vision output={:?}", output.text);
+    assert!(
+        !output.text.trim().is_empty(),
+        "vision model returned empty text"
+    );
+    assert!(output.usage.prompt_tokens > 0);
+    assert!(output.usage.completion_tokens > 0);
+    assert!(
+        output.text.to_ascii_lowercase().contains("red"),
+        "expected vision output to name the red image; output={:?}",
+        output.text
+    );
+
+    Ok(())
+}
+
 fn ensure_dev_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
     let path = cache_path(REPO, REVISION, FILE_NAME)?;
     let artifact = ModelArtifact::gguf(&path);
@@ -158,6 +211,39 @@ fn ensure_embedding_model() -> std::result::Result<PathBuf, Box<dyn std::error::
     }
 
     download_hf_file(EMBED_REPO, EMBED_REVISION, EMBED_FILE_NAME, &path)?;
+    verify_artifact(&artifact)?;
+    Ok(path)
+}
+
+fn ensure_vision_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(path) = env::var("MAYHEM_VISION_GGUF") {
+        return Ok(PathBuf::from(path));
+    }
+    ensure_hf_gguf(VISION_REPO, VISION_REVISION, VISION_FILE_NAME)
+}
+
+fn ensure_vision_projector() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(path) = env::var("MAYHEM_VISION_MMPROJ") {
+        return Ok(PathBuf::from(path));
+    }
+    ensure_hf_gguf(VISION_REPO, VISION_REVISION, VISION_MMPROJ_FILE_NAME)
+}
+
+fn ensure_hf_gguf(
+    repo: &str,
+    revision: &str,
+    file_name: &str,
+) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = cache_path(repo, revision, file_name)?;
+    let artifact = ModelArtifact::gguf(&path);
+    if path.exists() {
+        if verify_artifact(&artifact).is_ok() {
+            return Ok(path);
+        }
+        fs::remove_file(&path)?;
+    }
+
+    download_hf_file(repo, revision, file_name, &path)?;
     verify_artifact(&artifact)?;
     Ok(path)
 }
