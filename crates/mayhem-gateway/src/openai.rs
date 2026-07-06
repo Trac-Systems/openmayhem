@@ -106,8 +106,15 @@ pub struct GatewayState {
     provider_earnings: Arc<Vec<Value>>,
     provider_table: Arc<Mutex<ProviderTable>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
+    chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
     failover_policy: GatewayFailoverPolicyConfig,
     dev_session_shim: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ChatAffinityKey {
+    model_id: String,
+    conversation_id: String,
 }
 
 #[derive(Clone)]
@@ -450,6 +457,10 @@ pub struct ChatCompletionRequest {
     pub model: String,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -986,6 +997,7 @@ impl GatewayState {
             provider_earnings: Arc::new(Vec::new()),
             provider_table: Arc::new(Mutex::new(provider_table)),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
+            chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
             failover_policy: GatewayFailoverPolicyConfig::default(),
             dev_session_shim: false,
         }
@@ -4427,6 +4439,14 @@ fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
         "max_tokens",
         request.max_tokens.map(|value| json!(value)),
     );
+    set_optional_json(
+        &mut body,
+        "user",
+        request.user.as_ref().map(|value| json!(value)),
+    );
+    if !request.metadata.is_empty() {
+        body["metadata"] = json!(&request.metadata);
+    }
     body
 }
 
@@ -7542,6 +7562,11 @@ async fn run_live_direct_chat_sse_inner(
         session.route.as_ref(),
         observation_sample_from_success(&result, session.attempt_started.elapsed()),
     );
+    if let Some(route) = session.route.as_ref() {
+        session
+            .state
+            .record_chat_affinity(&session.model, &session.request, route);
+    }
     session
         .state
         .maybe_run_canary_probe_after_session(&session.model, &session.invocation)
@@ -7883,6 +7908,9 @@ async fn run_chat_with_route_retry(
                     route,
                     observation_sample_from_success(&result, attempt_started.elapsed()),
                 );
+                if let Some(route) = route {
+                    state.record_chat_affinity(model, request, route);
+                }
                 let metering_request = attempt_request.clone();
                 let metering_output = result.output.clone();
                 if !partials.is_empty() {
@@ -8130,7 +8158,7 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
             ordered.push(candidate);
         }
     }
-    ordered
+    state.apply_chat_affinity(model, request, ordered)
 }
 
 fn ordered_route_candidates_for_embedding_with_seed<'a>(
@@ -8421,6 +8449,52 @@ impl GatewayState {
             .get(&route_key(route))
             .is_some_and(|cooled_until| *cooled_until > now_millis)
     }
+
+    fn apply_chat_affinity<'a>(
+        &self,
+        model: &GatewayModel,
+        request: &ChatCompletionRequest,
+        mut ordered: Vec<&'a GatewayRouteCandidate>,
+    ) -> Vec<&'a GatewayRouteCandidate> {
+        let Some(key) = chat_affinity_key(model, request) else {
+            return ordered;
+        };
+        let Some(sticky_provider) = self
+            .chat_affinity
+            .lock()
+            .expect("chat affinity map poisoned")
+            .get(&key)
+            .cloned()
+        else {
+            return ordered;
+        };
+        let Some(index) = ordered
+            .iter()
+            .position(|candidate| route_key(candidate) == sticky_provider)
+        else {
+            return ordered;
+        };
+        if index > 0 {
+            let sticky = ordered.remove(index);
+            ordered.insert(0, sticky);
+        }
+        ordered
+    }
+
+    fn record_chat_affinity(
+        &self,
+        model: &GatewayModel,
+        request: &ChatCompletionRequest,
+        route: &GatewayRouteCandidate,
+    ) {
+        let Some(key) = chat_affinity_key(model, request) else {
+            return;
+        };
+        self.chat_affinity
+            .lock()
+            .expect("chat affinity map poisoned")
+            .insert(key, route_key(route));
+    }
 }
 
 fn route_key(candidate: &GatewayRouteCandidate) -> ProviderKey {
@@ -8429,6 +8503,42 @@ fn route_key(candidate: &GatewayRouteCandidate) -> ProviderKey {
         candidate.enclave_id.clone(),
         candidate.room_id.clone(),
     )
+}
+
+fn chat_affinity_key(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+) -> Option<ChatAffinityKey> {
+    for field in [
+        "conversation_id",
+        "thread_id",
+        "session_id",
+        "mayhem_conversation_id",
+        "mayhem_session_id",
+    ] {
+        if let Some(id) = request
+            .metadata
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(ChatAffinityKey {
+                model_id: model.id.clone(),
+                conversation_id: format!("metadata:{field}:{id}"),
+            });
+        }
+    }
+
+    request
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|user| ChatAffinityKey {
+            model_id: model.id.clone(),
+            conversation_id: format!("user:{user}"),
+        })
 }
 
 fn request_requirements_for_chat(
@@ -10628,6 +10738,8 @@ fn canary_chat_request(
     ChatCompletionRequest {
         model: model_id.to_owned(),
         messages: prompt.messages.clone(),
+        user: None,
+        metadata: BTreeMap::new(),
         stream: true,
         stream_options: Some(StreamOptions {
             include_usage: true,
@@ -12758,6 +12870,8 @@ mod tests {
                 name: None,
                 extra: BTreeMap::new(),
             }],
+            user: None,
+            metadata: BTreeMap::new(),
             stream: false,
             stream_options: None,
             tools: None,
@@ -12807,13 +12921,21 @@ mod tests {
     }
 
     fn test_routed_model(provider_count: u8) -> GatewayModel {
+        test_routed_model_with_id("mayhem/routing-test", 0, provider_count)
+    }
+
+    fn test_routed_model_with_id(
+        model_id: &str,
+        provider_offset: u8,
+        provider_count: u8,
+    ) -> GatewayModel {
         let mut model = test_model();
-        model.id = "mayhem/routing-test".to_owned();
+        model.id = model_id.to_owned();
         model.mayhem.source = "contract".to_owned();
         model.mayhem.providers_online = u32::from(provider_count);
         model.mayhem.rooms = u32::from(provider_count);
         model.mayhem.route_candidates = (0..provider_count)
-            .map(test_route_candidate)
+            .map(|idx| test_route_candidate(provider_offset.wrapping_add(idx)))
             .collect::<Vec<_>>();
         model
     }
@@ -12981,6 +13103,53 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SuccessBackend {
+        providers: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GatewaySessionBackend for SuccessBackend {
+        fn name(&self) -> &str {
+            "test-success"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                self.providers
+                    .lock()
+                    .expect("providers lock")
+                    .push(invocation.provider_pubkey.clone().unwrap_or_default());
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                Ok(GatewaySessionResult {
+                    output: ChatOutput {
+                        content: Some("ok".to_owned()),
+                        tool_call: None,
+                        artifacts: Vec::new(),
+                        finish_reason: "stop".to_owned(),
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens: 1,
+                            total_tokens: prompt_tokens + 1,
+                        },
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: None,
+                    token_ids: vec![1],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(40.0),
+                    }),
+                })
+            })
+        }
+    }
+
     #[test]
     fn route_selection_uses_weighted_p2c_not_array_order() {
         let model = test_routed_model(4);
@@ -13064,6 +13233,98 @@ mod tests {
             "slow/error observations should lower future P2C selection weight"
         );
         assert_eq!(after, 0);
+    }
+
+    #[test]
+    fn route_selection_prefers_previous_provider_for_same_conversation_model() {
+        let model = test_routed_model(4);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let mut request = test_chat_request(&model.id);
+        request
+            .metadata
+            .insert("conversation_id".to_owned(), json!("agent-loop-1"));
+        let seed = 0x5eed;
+        let baseline =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, seed);
+        let baseline_first = baseline
+            .first()
+            .expect("baseline route selected")
+            .provider
+            .clone();
+        let sticky_route = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .find(|candidate| candidate.provider != baseline_first)
+            .expect("alternate route");
+
+        state.record_chat_affinity(&model, &request, sticky_route);
+        let selected =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, seed);
+
+        assert_eq!(selected[0].provider, sticky_route.provider);
+        assert_eq!(selected.len(), model.mayhem.route_candidates.len());
+    }
+
+    #[test]
+    fn route_selection_keeps_conversation_affinity_scoped_to_model() {
+        let model_a = test_routed_model_with_id("mayhem/model-a", 0, 4);
+        let mut model_b = model_a.clone();
+        model_b.id = "mayhem/model-b".to_owned();
+        let state = GatewayState::from_models(vec![model_a.clone(), model_b.clone()]);
+        let mut request_a = test_chat_request(&model_a.id);
+        request_a
+            .metadata
+            .insert("conversation_id".to_owned(), json!("agent-loop-1"));
+        let mut request_b = test_chat_request(&model_b.id);
+        request_b
+            .metadata
+            .insert("conversation_id".to_owned(), json!("agent-loop-1"));
+        let seed = 0x5eed;
+        let baseline_b = ordered_route_candidates_for_request_with_seed(
+            &state, &model_b, &request_b, None, seed,
+        )
+        .into_iter()
+        .map(|candidate| candidate.provider.clone())
+        .collect::<Vec<_>>();
+        let baseline_b_first = baseline_b.first().expect("baseline route selected").clone();
+        let sticky_route = model_a
+            .mayhem
+            .route_candidates
+            .iter()
+            .find(|candidate| candidate.provider != baseline_b_first)
+            .expect("alternate route");
+
+        state.record_chat_affinity(&model_a, &request_a, sticky_route);
+        let selected_b = ordered_route_candidates_for_request_with_seed(
+            &state, &model_b, &request_b, None, seed,
+        )
+        .into_iter()
+        .map(|candidate| candidate.provider.clone())
+        .collect::<Vec<_>>();
+
+        assert_eq!(selected_b, baseline_b);
+    }
+
+    #[test]
+    fn route_selection_ignores_conversation_affinity_for_cooled_provider() {
+        let model = test_routed_model(3);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let mut request = test_chat_request(&model.id);
+        request
+            .metadata
+            .insert("conversation_id".to_owned(), json!("agent-loop-1"));
+        let cooled_route = &model.mayhem.route_candidates[0];
+        let cooled_provider = cooled_route.provider.clone();
+
+        state.record_chat_affinity(&model, &request, cooled_route);
+        state.cool_route_provider(cooled_route, now_millis_u64());
+        let selected =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+
+        assert!(!selected
+            .iter()
+            .any(|candidate| candidate.provider == cooled_provider));
     }
 
     #[test]
@@ -13283,6 +13544,56 @@ mod tests {
             .any(|candidate| candidate.provider == providers[0]));
     }
 
+    #[tokio::test]
+    async fn route_retry_records_conversation_affinity_after_success() {
+        let model = test_routed_model(4);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
+            SuccessBackend {
+                providers: providers.clone(),
+            },
+        ));
+        let mut request = test_chat_request(&model.id);
+        request
+            .metadata
+            .insert("conversation_id".to_owned(), json!("agent-loop-1"));
+
+        run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+            .await
+            .expect("request should succeed");
+
+        let served_provider = providers
+            .lock()
+            .expect("providers lock")
+            .first()
+            .cloned()
+            .expect("provider recorded");
+        let affinity_key = chat_affinity_key(&model, &request).expect("affinity key");
+        let sticky_key = state
+            .chat_affinity
+            .lock()
+            .expect("chat affinity map poisoned")
+            .get(&affinity_key)
+            .cloned()
+            .expect("affinity recorded");
+        assert_eq!(sticky_key.provider, served_provider);
+
+        let seed = (0..256_u64)
+            .find(|seed| {
+                ordered_route_candidates_for_request_with_seed(
+                    &state, &model, &request, None, *seed,
+                )
+                .into_iter()
+                .next()
+                .map(|candidate| candidate.provider == served_provider)
+                .unwrap_or(false)
+            })
+            .expect("sticky provider should remain eligible");
+        let selected =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, seed);
+        assert_eq!(selected[0].provider, served_provider);
+    }
+
     #[test]
     fn direct_session_request_body_preserves_multimodal_content_parts() {
         let mut request = test_chat_request("mayhem/vision");
@@ -13304,6 +13615,20 @@ mod tests {
         );
         assert!(chat_prompt_text(&request).contains("[image:"));
         assert!(chat_prompt_text(&request).contains("[audio:wav:"));
+    }
+
+    #[test]
+    fn direct_session_request_body_preserves_conversation_hints() {
+        let mut request = test_chat_request("mayhem/chat");
+        request.user = Some("terminal-user-1".to_owned());
+        request
+            .metadata
+            .insert("conversation_id".to_owned(), json!("agent-loop-1"));
+
+        let body = direct_session_request_body(&request);
+
+        assert_eq!(body["user"], json!("terminal-user-1"));
+        assert_eq!(body["metadata"]["conversation_id"], json!("agent-loop-1"));
     }
 
     fn test_chat_output() -> ChatOutput {
