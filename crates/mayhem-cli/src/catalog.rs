@@ -634,9 +634,15 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             model.model_id
         ));
     }
-    if model.price_ref_mu.in_per_1k == 0 || model.price_ref_mu.out_per_1k == 0 {
+    if model.price_ref_mu.in_per_1k == 0 {
         errors.push(format!(
-            "{} price references must be positive",
+            "{} price_ref_mu.in_per_1k must be positive",
+            model.model_id
+        ));
+    }
+    if model.model_class != "embedding" && model.price_ref_mu.out_per_1k == 0 {
+        errors.push(format!(
+            "{} price_ref_mu.out_per_1k must be positive for non-embedding models",
             model.model_id
         ));
     }
@@ -923,10 +929,25 @@ fn validate_model_caps_modalities(model: &CatalogModel, errors: &mut Vec<String>
 
 fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
     let adapter = &model.adapter;
-    if adapter.request_shape_family != "openai_chat" {
+    if !matches!(
+        adapter.request_shape_family.as_str(),
+        "openai_chat" | "openai_embeddings"
+    ) {
         errors.push(format!(
             "{} adapter.request_shape_family is unsupported: {}",
             model.model_id, adapter.request_shape_family
+        ));
+    }
+    if model.model_class == "embedding" && adapter.request_shape_family != "openai_embeddings" {
+        errors.push(format!(
+            "{} embedding model must use adapter.request_shape_family openai_embeddings",
+            model.model_id
+        ));
+    }
+    if adapter.request_shape_family == "openai_embeddings" && model.model_class != "embedding" {
+        errors.push(format!(
+            "{} adapter.request_shape_family openai_embeddings is only allowed for model_class embedding",
+            model.model_id
         ));
     }
     if !matches!(
@@ -986,10 +1007,25 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
             ));
         }
     }
-    if adapter.response_normalization != "openai_chat" {
+    if !matches!(
+        adapter.response_normalization.as_str(),
+        "openai_chat" | "openai_embeddings"
+    ) {
         errors.push(format!(
             "{} adapter.response_normalization is unsupported: {}",
             model.model_id, adapter.response_normalization
+        ));
+    }
+    if model.model_class == "embedding" && adapter.response_normalization != "openai_embeddings" {
+        errors.push(format!(
+            "{} embedding model must use adapter.response_normalization openai_embeddings",
+            model.model_id
+        ));
+    }
+    if adapter.response_normalization == "openai_embeddings" && model.model_class != "embedding" {
+        errors.push(format!(
+            "{} adapter.response_normalization openai_embeddings is only allowed for model_class embedding",
+            model.model_id
         ));
     }
 }
@@ -1793,6 +1829,62 @@ mod tests {
             .any(|error| error.contains("response_normalization")));
     }
 
+    #[test]
+    fn embedding_adapter_and_input_only_pricing_validate() {
+        let mut model = verification_test_model(
+            "admin/embed@q8",
+            "embedding",
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_ATTESTATION_OF_COMPUTE.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+            },
+        );
+        model.adapter.request_shape_family = "openai_embeddings".to_owned();
+        model.adapter.response_normalization = "openai_embeddings".to_owned();
+        model.price_ref_mu.out_per_1k = 0;
+
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut wrong_shape = model.clone();
+        wrong_shape.adapter.request_shape_family = "openai_chat".to_owned();
+        wrong_shape.adapter.response_normalization = "openai_chat".to_owned();
+        let mut errors = Vec::new();
+        validate_model(&wrong_shape, &mut errors);
+        assert!(errors.iter().any(|error| error
+            .contains("embedding model must use adapter.request_shape_family openai_embeddings")));
+        assert!(errors.iter().any(|error| error.contains(
+            "embedding model must use adapter.response_normalization openai_embeddings"
+        )));
+
+        let mut text_with_zero_output = verification_test_model(
+            "admin/text@zero-output",
+            DEFAULT_MODEL_CLASS,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+            },
+        );
+        text_with_zero_output.price_ref_mu.out_per_1k = 0;
+        let mut errors = Vec::new();
+        validate_model(&text_with_zero_output, &mut errors);
+        assert!(errors.iter().any(|error| error
+            .contains("price_ref_mu.out_per_1k must be positive for non-embedding models")));
+    }
+
     fn verification_test_model(
         model_id: &str,
         model_class: &str,
@@ -1800,6 +1892,7 @@ mod tests {
         canary: CanaryRef,
     ) -> CatalogModel {
         let output_modality = match model_class {
+            "embedding" => "embedding",
             "image-generation" => "image",
             _ => "text",
         };

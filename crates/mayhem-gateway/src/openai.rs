@@ -500,7 +500,7 @@ pub struct CompletionRequest {
     pub stop: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct EmbeddingRequest {
     pub model: String,
     pub input: Value,
@@ -555,6 +555,9 @@ struct ApiError {
 pub type GatewaySessionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GatewaySessionResult, GatewaySessionError>> + Send + 'a>>;
 
+pub type GatewayEmbeddingFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GatewayEmbeddingResult, GatewaySessionError>> + Send + 'a>>;
+
 pub type GatewayHedgeProbeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GatewayHedgeProbeResult, GatewaySessionError>> + Send + 'a>>;
 
@@ -580,6 +583,20 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
         request: &'a ChatCompletionRequest,
         invocation: &'a GatewaySessionInvocation,
     ) -> GatewaySessionFuture<'a>;
+
+    fn run_embedding<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a EmbeddingRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayEmbeddingFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support embeddings",
+                self.name()
+            )))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -589,6 +606,15 @@ pub struct GatewaySessionResult {
     pub direct_session: bool,
     pub provider_receipt: Option<ProviderSignedReceipt>,
     pub token_ids: Vec<i32>,
+    pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayEmbeddingResult {
+    pub output: EmbeddingOutput,
+    pub backend: String,
+    pub direct_session: bool,
+    pub provider_receipt: Option<ProviderSignedReceipt>,
     pub quality: Option<GatewaySessionQuality>,
 }
 
@@ -703,6 +729,12 @@ pub struct ChatOutput {
     pub tool_call: Option<ToolCallOutput>,
     pub artifacts: Vec<GatewayArtifactOutput>,
     pub finish_reason: String,
+    pub usage: Usage,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddingOutput {
+    pub embeddings: Vec<Vec<f32>>,
     pub usage: Usage,
 }
 
@@ -1111,9 +1143,14 @@ async fn create_completion(
 
 async fn create_embedding(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(request): Json<EmbeddingRequest>,
 ) -> Response {
-    match build_embedding(&state, request) {
+    let options = match GatewayRequestOptions::from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    match build_embedding(&state, request, options).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => err.into_response(),
     }
@@ -2214,11 +2251,25 @@ struct DirectSessionCollected {
     quality: Option<GatewaySessionQuality>,
 }
 
+#[derive(Clone, Debug)]
+struct DirectEmbeddingSessionCollected {
+    output: EmbeddingOutput,
+    provider_receipt: ProviderSignedReceipt,
+    quality: Option<GatewaySessionQuality>,
+}
+
 struct GatewaySessionRun {
     result: GatewaySessionResult,
     invocation: GatewaySessionInvocation,
     metering_request: ChatCompletionRequest,
     metering_output: ChatOutput,
+}
+
+struct GatewayEmbeddingRun {
+    result: GatewayEmbeddingResult,
+    invocation: GatewaySessionInvocation,
+    metering_inputs: Vec<String>,
+    metering_output: EmbeddingOutput,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2889,6 +2940,18 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
     ) -> GatewaySessionFuture<'a> {
         Box::pin(async move { self.run_chat_over_bridge(model, request, invocation).await })
     }
+
+    fn run_embedding<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a EmbeddingRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayEmbeddingFuture<'a> {
+        Box::pin(async move {
+            self.run_embedding_over_bridge(model, request, invocation)
+                .await
+        })
+    }
 }
 
 impl ScBridgeGatewaySessionBackend {
@@ -3176,6 +3239,194 @@ impl ScBridgeGatewaySessionBackend {
             quality: collected.quality,
         })
     }
+
+    async fn run_embedding_over_bridge(
+        &self,
+        model: &GatewayModel,
+        request: &EmbeddingRequest,
+        invocation: &GatewaySessionInvocation,
+    ) -> Result<GatewayEmbeddingResult, GatewaySessionError> {
+        let provider = invocation
+            .provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let inputs =
+            embedding_input_texts_from_value(&request.input).map_err(GatewaySessionError::new)?;
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(provider, invocation.failover.open_timeout())
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting direct peer {} for embedding session {} failed: {err}",
+                    provider, invocation.session_id
+                ))
+            })?;
+        let opened = bridge
+            .session_open(provider, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening direct embedding session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        if opened.get("direct").and_then(Value::as_bool) != Some(true)
+            || opened.get("relayed").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(GatewaySessionError::retryable(format!(
+                "embedding session {} was not opened as a direct non-relayed channel",
+                invocation.session_id
+            )));
+        }
+
+        let now = now_millis_u64();
+        let att_nonce = blake3_hex(format!("att:{}:{now}", invocation.session_id).as_bytes());
+        let open_frame = json!({
+            "t": "s.open",
+            "v": 1,
+            "contract_version": invocation.contract_version,
+            "session_id": invocation.session_id.clone(),
+            "rail": invocation.rail.clone(),
+            "user": invocation.user_pubkey.clone(),
+            "enclave_id": invocation.enclave_id.clone(),
+            "price_ver": invocation.price_ver,
+            "rules_ver": invocation.rules_ver,
+            "voucher": invocation.spend_voucher.clone(),
+            "att_nonce": att_nonce,
+            "ts": now,
+            "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
+            "sig": invocation.spend_voucher.user_sig.clone(),
+        });
+        let open_head = session_frame_head(&open_frame)
+            .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
+        bridge
+            .session_send(provider, &invocation.session_id, open_frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.open for embedding session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+
+        let accept = next_session_frame(
+            &mut bridge,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+            &["s.accept", "s.reject"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
+            let code = accept
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            let reason = accept
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason provided");
+            return Err(GatewaySessionError::retryable(format!(
+                "provider rejected embedding session {} with {code}: {reason}",
+                invocation.session_id
+            )));
+        }
+        let accept_info = validate_direct_session_accept(
+            &accept,
+            invocation,
+            &open_head,
+            &att_nonce,
+            now / 1000,
+        )?;
+
+        let request_id = blake3_hex(
+            format!(
+                "rid:{}:{}",
+                invocation.session_id,
+                embedding_prompt_text(&inputs)
+            )
+            .as_bytes(),
+        )
+        .chars()
+        .take(32)
+        .collect::<String>();
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.req",
+                    "rid": request_id,
+                    "body": direct_session_embedding_request_body(request),
+                }),
+            )
+            .await?;
+
+        let collected = collect_direct_session_embedding_output(
+            &mut bridge,
+            &invocation.session_id,
+            &request_id,
+            invocation.failover,
+            &inputs,
+            &accept_info.enclave_pubkey,
+        )
+        .await?;
+        let receipt_ack = direct_session_embedding_receipt_ack(
+            &inputs,
+            &collected.output,
+            invocation,
+            &collected.provider_receipt,
+            provider,
+            model,
+        )?;
+        bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.receipt_ack",
+                    "v": 1,
+                    "session_id": receipt_ack.session_id,
+                    "seq": receipt_ack.seq,
+                    "user_sig": receipt_ack.user_sig,
+                }),
+            )
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending embedding s.receipt_ack for session {} to provider {} failed: {err}",
+                    invocation.session_id, provider
+                ))
+            })?;
+        let _ = bridge
+            .session_send(
+                provider,
+                &invocation.session_id,
+                json!({
+                    "t": "s.close",
+                    "v": 1,
+                    "session_id": invocation.session_id,
+                    "reason": "done",
+                }),
+            )
+            .await;
+
+        Ok(GatewayEmbeddingResult {
+            output: collected.output,
+            backend: self.name().to_owned(),
+            direct_session: true,
+            provider_receipt: Some(collected.provider_receipt),
+            quality: collected.quality,
+        })
+    }
 }
 
 fn validate_direct_session_accept(
@@ -3398,6 +3649,20 @@ fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
         &mut body,
         "max_tokens",
         request.max_tokens.map(|value| json!(value)),
+    );
+    body
+}
+
+fn direct_session_embedding_request_body(request: &EmbeddingRequest) -> Value {
+    let mut body = json!({
+        "kind": "embedding",
+        "input": &request.input,
+        "encoding_format": request.encoding_format.as_deref().unwrap_or("float"),
+    });
+    set_optional_json(
+        &mut body,
+        "dimensions",
+        request.dimensions.map(|value| json!(value)),
     );
     body
 }
@@ -3745,6 +4010,115 @@ async fn collect_direct_session_output(
     })
 }
 
+async fn collect_direct_session_embedding_output(
+    bridge: &mut ScBridgeClient,
+    session_id: &str,
+    request_id: &str,
+    failover: GatewayFailoverInvocation,
+    inputs: &[String],
+    enclave_pubkey: &str,
+) -> Result<DirectEmbeddingSessionCollected, GatewaySessionError> {
+    let mut embeddings = None;
+    let mut usage = None;
+    let mut provider_receipt = None;
+    let started_at_millis = now_millis_u64();
+    let mut watchdog = DirectSessionWatchdog::new(
+        started_at_millis,
+        failover.ttft_timeout(),
+        failover.stall_timeout(),
+        None,
+        None,
+    );
+
+    while embeddings.is_none() || provider_receipt.is_none() {
+        let remaining_millis = watchdog
+            .next_wait_millis(now_millis_u64())
+            .map_err(|kind| direct_session_timeout_error(kind, session_id))?;
+        let frame = next_session_frame(
+            bridge,
+            session_id,
+            Duration::from_millis(remaining_millis),
+            &["s.delta", "s.receipt", "s.error", "s.close"],
+        )
+        .await
+        .map_err(GatewaySessionError::into_retryable)?;
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
+                let now = now_millis_u64();
+                watchdog.record_delta(now);
+                if embeddings.is_none() {
+                    embeddings = embeddings_from_session_delta(&frame)?;
+                }
+                if usage.is_none() {
+                    usage = usage_from_session_delta(&frame);
+                }
+            }
+            Some("s.receipt") => {
+                provider_receipt = Some(provider_signed_receipt_from_frame(
+                    &frame,
+                    session_id,
+                    enclave_pubkey,
+                )?);
+            }
+            Some("s.error") => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_error");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider returned s.error");
+                return Err(GatewaySessionError::new(format!(
+                    "provider returned {code} on embedding session {session_id}: {message}"
+                )));
+            }
+            Some("s.close") => {
+                let reason = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(GatewaySessionError::new(format!(
+                    "provider closed embedding session {session_id} before completion: {reason}"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let quality =
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: None,
+            });
+    Ok(DirectEmbeddingSessionCollected {
+        output: EmbeddingOutput {
+            embeddings: embeddings.expect("loop ended with embeddings"),
+            usage: usage.unwrap_or_else(|| embedding_usage_for_inputs(inputs)),
+        },
+        provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
+        quality,
+    })
+}
+
+fn embeddings_from_session_delta(
+    frame: &Value,
+) -> Result<Option<Vec<Vec<f32>>>, GatewaySessionError> {
+    if let Some(value) = frame.get("embeddings") {
+        return serde_json::from_value::<Vec<Vec<f32>>>(value.clone())
+            .map(Some)
+            .map_err(|err| GatewaySessionError::new(format!("invalid embeddings delta: {err}")));
+    }
+    if let Some(value) = frame.get("embedding") {
+        return serde_json::from_value::<Vec<f32>>(value.clone())
+            .map(|embedding| Some(vec![embedding]))
+            .map_err(|err| GatewaySessionError::new(format!("invalid embedding delta: {err}")));
+    }
+    Ok(None)
+}
+
 fn interrupted_direct_session_partial(
     content: &str,
     tool_call: Option<ToolCallOutput>,
@@ -4028,6 +4402,28 @@ fn direct_session_receipt_ack(
     })
 }
 
+fn direct_session_embedding_receipt_ack(
+    inputs: &[String],
+    output: &EmbeddingOutput,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    provider: &str,
+    model: &GatewayModel,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new(
+            "receipt co-signing refused; session paused",
+        ));
+    }
+    let expected = expected_embedding_provider_receipt(model, inputs, output, provider);
+    validate_provider_receipt(model, invocation, provider_receipt, expected)?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "provider embedding receipt ack signing payload failed: {err}"
+        ))
+    })
+}
+
 fn direct_session_partial_receipt_ack(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
@@ -4059,6 +4455,23 @@ fn direct_session_partial_receipt_ack(
             "provider partial receipt ack signing payload failed: {err}"
         ))
     })
+}
+
+fn expected_embedding_provider_receipt<'a>(
+    model: &GatewayModel,
+    inputs: &[String],
+    output: &EmbeddingOutput,
+    provider: &'a str,
+) -> ExpectedProviderReceipt<'a> {
+    let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
+    ExpectedProviderReceipt {
+        provider,
+        seq: 1,
+        final_receipt: true,
+        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
+        usage,
+    }
 }
 
 fn expected_provider_receipt<'a>(
@@ -4205,6 +4618,139 @@ fn usage_from_session_delta(frame: &Value) -> Option<Usage> {
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
     })
+}
+
+async fn run_embedding_with_route_retry(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &EmbeddingRequest,
+    inputs: &[String],
+    options: GatewayRequestOptions,
+) -> Result<GatewayEmbeddingRun, ApiError> {
+    let eligible_routes =
+        ordered_route_candidates_for_embedding(state, model, inputs, options.min_att_tier);
+    if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        let rail = state.receipt_config.rail.clone();
+        let rail_candidates = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .accepted_rails
+                    .iter()
+                    .any(|candidate_rail| candidate_rail == &rail)
+            })
+            .collect::<Vec<_>>();
+        if rail_candidates.is_empty() {
+            return Err(ApiError::payment_required(
+                format!("no provider accepts the {rail} payment rail"),
+                Some("model"),
+            ));
+        }
+        let att_candidates = rail_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                options
+                    .min_att_tier
+                    .map(|min_tier| candidate.att_tier >= min_tier)
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        if att_candidates.is_empty() {
+            return Err(ApiError::bad_request(
+                "no provider route satisfies X-Mayhem-Min-Att-Tier",
+                Some("X-Mayhem-Min-Att-Tier"),
+            ));
+        }
+        let now_millis = now_millis_u64();
+        if att_candidates
+            .iter()
+            .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
+        {
+            return Err(ApiError::service_unavailable(
+                "all otherwise eligible provider routes are cooling off after a retryable failure",
+                Some("model"),
+            ));
+        }
+        return Err(ApiError::bad_request(
+            "no provider route is currently eligible",
+            Some("model"),
+        ));
+    }
+    if eligible_routes.is_empty() && !state.dev_session_shim {
+        return Err(ApiError::service_unavailable(
+            "no provider available: production gateway requires an active provider joined to an admin-created room",
+            Some("model"),
+        ));
+    }
+
+    let attempt_count = if eligible_routes.is_empty() {
+        1
+    } else {
+        eligible_routes
+            .len()
+            .min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
+    };
+    let mut last_retryable_error = None;
+
+    for attempt_index in 0..attempt_count {
+        let route = eligible_routes.get(attempt_index).copied();
+        let invocation =
+            state.prepare_embedding_invocation_for_route(model, inputs, route, options)?;
+        let attempt_started = Instant::now();
+        match state
+            .session_backend
+            .run_embedding(model, request, &invocation)
+            .await
+        {
+            Ok(result) => {
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_embedding_success(&result, attempt_started.elapsed()),
+                );
+                let metering_output = result.output.clone();
+                return Ok(GatewayEmbeddingRun {
+                    result,
+                    invocation,
+                    metering_inputs: inputs.to_vec(),
+                    metering_output,
+                });
+            }
+            Err(err) if err.retryable => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                last_retryable_error = Some(err.message);
+            }
+            Err(err) => {
+                if let Some(route) = route {
+                    state.cool_route_provider(route, now_millis_u64());
+                }
+                record_route_observation(
+                    state,
+                    route,
+                    observation_sample_from_error(attempt_started.elapsed()),
+                );
+                return Err(ApiError::bad_gateway(err.message, Some("model")));
+            }
+        }
+    }
+
+    Err(ApiError::bad_gateway(
+        format!(
+            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+        ),
+        Some("model"),
+    ))
 }
 
 async fn build_chat_completion(
@@ -4491,6 +5037,16 @@ fn ordered_route_candidates_for_request<'a>(
     ordered_route_candidates_for_request_with_seed(state, model, request, min_att_tier, seed)
 }
 
+fn ordered_route_candidates_for_embedding<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    inputs: &[String],
+    min_att_tier: Option<u8>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = embedding_route_selection_seed(model, inputs, now_millis_u64());
+    ordered_route_candidates_for_embedding_with_seed(state, model, inputs, min_att_tier, seed)
+}
+
 async fn run_hedge_probes_if_requested(
     state: &GatewayState,
     model: &GatewayModel,
@@ -4543,6 +5099,93 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
 
     state.refresh_provider_table_routes(model);
     let requirements = request_requirements_for_chat(state, model, request, now_millis);
+    let route_by_key = eligible_routes
+        .iter()
+        .map(|candidate| (route_key(candidate), *candidate))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining_entries = {
+        let table = state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned");
+        table
+            .entries(now_millis)
+            .into_iter()
+            .filter(|entry| route_by_key.contains_key(&entry.key))
+            .collect::<Vec<_>>()
+    };
+    let weights = SelectionWeights::default();
+    let table_entry_keys = remaining_entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
+    let table_eligible_keys =
+        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
+            .into_iter()
+            .map(|candidate| candidate.entry.key)
+            .collect::<BTreeSet<_>>();
+    let eligible_routes = eligible_routes
+        .into_iter()
+        .filter(|candidate| {
+            let key = route_key(candidate);
+            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
+        })
+        .collect::<Vec<_>>();
+    if eligible_routes.len() <= 1 {
+        return eligible_routes;
+    }
+    let mut rng = LcgBalancerRng::seeded(seed);
+    let mut ordered = Vec::new();
+    let mut selected_keys = BTreeSet::new();
+
+    while !remaining_entries.is_empty() {
+        let Some(selection) = crate::provider_table::select_weighted_p2c(
+            &remaining_entries,
+            &requirements,
+            &weights,
+            &mut rng,
+        ) else {
+            break;
+        };
+        let key = selection.selected.entry.key;
+        if let Some(candidate) = route_by_key.get(&key).copied() {
+            ordered.push(candidate);
+            selected_keys.insert(key.clone());
+        }
+        remaining_entries.retain(|entry| entry.key != key);
+    }
+
+    for candidate in eligible_routes {
+        let key = route_key(candidate);
+        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
+            continue;
+        }
+        if selected_keys.insert(key) {
+            ordered.push(candidate);
+        }
+    }
+    ordered
+}
+
+fn ordered_route_candidates_for_embedding_with_seed<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    inputs: &[String],
+    min_att_tier: Option<u8>,
+    seed: u64,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let now_millis = now_millis_u64();
+    let eligible_routes =
+        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+            .into_iter()
+            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
+            .collect::<Vec<_>>();
+    if eligible_routes.is_empty() {
+        return eligible_routes;
+    }
+
+    state.refresh_provider_table_routes(model);
+    let requirements = request_requirements_for_embedding(state, model, inputs, now_millis);
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
@@ -4679,6 +5322,27 @@ fn request_requirements_for_chat(
     }
 }
 
+fn request_requirements_for_embedding(
+    state: &GatewayState,
+    model: &GatewayModel,
+    inputs: &[String],
+    now_millis: u64,
+) -> RequestRequirements {
+    let input_tokens = embedding_input_token_count(inputs);
+    RequestRequirements {
+        current_rules_ver: state.receipt_config.rules_ver,
+        requires_tools: false,
+        requires_json: false,
+        requires_vision: false,
+        min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
+        input_tokens,
+        output_tokens: 0,
+        now_millis,
+        max_price_mu: Some(estimate_embedding_max_spend_mu(model, inputs)),
+        ..RequestRequirements::default()
+    }
+}
+
 fn route_selection_seed(
     model: &GatewayModel,
     request: &ChatCompletionRequest,
@@ -4688,6 +5352,17 @@ fn route_selection_seed(
     hasher.update(model.id.as_bytes());
     hasher.update(chat_prompt_text(request).as_bytes());
     hasher.update(&request.seed.unwrap_or_default().to_le_bytes());
+    hasher.update(&now_millis.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn embedding_route_selection_seed(model: &GatewayModel, inputs: &[String], now_millis: u64) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.id.as_bytes());
+    hasher.update(embedding_prompt_text(inputs).as_bytes());
     hasher.update(&now_millis.to_le_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
@@ -4728,6 +5403,20 @@ fn observation_sample_from_success(
                 Some(result.output.usage.completion_tokens as f64 / elapsed_seconds)
                     .filter(|tok_s| tok_s.is_finite() && *tok_s >= 0.0)
             }),
+        error: false,
+    }
+}
+
+fn observation_sample_from_embedding_success(
+    result: &GatewayEmbeddingResult,
+    elapsed: Duration,
+) -> ProviderObservationSample {
+    ProviderObservationSample {
+        ttft_ms: result
+            .quality
+            .map(|quality| quality.ttft_ms)
+            .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
+        tok_s: None,
         error: false,
     }
 }
@@ -4900,7 +5589,11 @@ fn build_completion(
     }
 }
 
-fn build_embedding(state: &GatewayState, request: EmbeddingRequest) -> Result<Value, ApiError> {
+async fn build_embedding(
+    state: &GatewayState,
+    request: EmbeddingRequest,
+    options: GatewayRequestOptions,
+) -> Result<Value, ApiError> {
     let model = require_model(state, &request.model)?;
     if !model_supports_embeddings(&model) {
         return Err(ApiError::bad_request(
@@ -4908,7 +5601,77 @@ fn build_embedding(state: &GatewayState, request: EmbeddingRequest) -> Result<Va
             Some("model"),
         ));
     }
-    Err(modality_not_served("embeddings"))
+    let inputs = embedding_input_texts(&request)?;
+    if matches!(
+        request.encoding_format.as_deref().map(str::trim),
+        Some(value) if !value.eq_ignore_ascii_case("float")
+    ) {
+        return Err(ApiError::bad_request(
+            "only encoding_format=float is supported",
+            Some("encoding_format"),
+        ));
+    }
+    let id = make_id("embd");
+    let created = now_secs();
+    let GatewayEmbeddingRun {
+        result:
+            GatewayEmbeddingResult {
+                output,
+                backend,
+                direct_session,
+                provider_receipt,
+                quality,
+            },
+        invocation,
+        metering_inputs,
+        metering_output,
+    } = run_embedding_with_route_retry(state, &model, &request, &inputs, options).await?;
+    let receipt = if state.dev_session_shim {
+        None
+    } else {
+        let receipt = state.meter_embedding_session(
+            &model,
+            &metering_inputs,
+            &metering_output,
+            &invocation,
+            provider_receipt.as_ref(),
+        )?;
+        Some(receipt_summary(&receipt))
+    };
+    let data = output
+        .embeddings
+        .iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            json!({
+                "object": "embedding",
+                "index": index,
+                "embedding": embedding,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "id": id,
+        "object": "list",
+        "created": created,
+        "model": model.id,
+        "data": data,
+        "usage": {
+            "prompt_tokens": output.usage.prompt_tokens,
+            "total_tokens": output.usage.total_tokens,
+        },
+        "mayhem": {
+            "backend": backend,
+            "direct_session": direct_session,
+            "billable": !state.dev_session_shim,
+            "dev_session": state.dev_session_shim,
+            "quality": quality.map(|quality| json!({
+                "ttft_ms": quality.ttft_ms,
+                "tok_s": quality.tok_s,
+            })),
+            "receipt": receipt,
+        },
+    }))
 }
 
 fn build_image_generation(
@@ -5471,6 +6234,81 @@ impl GatewayState {
         })
     }
 
+    fn prepare_embedding_invocation_for_route(
+        &self,
+        model: &GatewayModel,
+        inputs: &[String],
+        route: Option<&GatewayRouteCandidate>,
+        options: GatewayRequestOptions,
+    ) -> Result<GatewaySessionInvocation, ApiError> {
+        let prompt_text = embedding_prompt_text(inputs);
+        let failover = self.failover_thresholds_for_model(model, options);
+        let session_id = session_id_for(&model.id, &prompt_text);
+        let enclave_id = route
+            .map(|candidate| candidate.enclave_id.clone())
+            .unwrap_or_else(|| enclave_id_for_model(&model.id));
+        let price_ver = route
+            .map(|candidate| candidate.price_ver)
+            .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let attestation = route.map(|candidate| GatewaySessionAttestation {
+            contract: EnclaveContractRecord {
+                enclave_id: candidate.enclave_id.clone(),
+                admin_pubkey: candidate.admin_pubkey.clone(),
+                model_id: model.id.clone(),
+                model_class: model.mayhem.model_class.clone(),
+                artifact_root: candidate.artifact_root.clone(),
+                manifest_hash: candidate.manifest_hash.clone(),
+                binary_hash: candidate.binary_hash.clone(),
+                att_tier: candidate.att_tier,
+                caps: candidate.caps.clone(),
+            },
+            trusted_binary_hashes: BTreeSet::from([candidate.binary_hash.clone()]),
+            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
+            trusted_nvidia_gb10_device_jwks: self
+                .hardware_quote_trust
+                .nvidia_gb10_device_jwks
+                .clone(),
+            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
+            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+        });
+        let max_spend_mu = estimate_embedding_max_spend_mu(model, inputs);
+        if max_spend_mu > self.receipt_config.balance_mu {
+            return Err(ApiError::payment_required(
+                "insufficient local balance for spend voucher",
+                Some("model"),
+            ));
+        }
+        let voucher_body = SpendVoucherBody {
+            session_id: session_id.clone(),
+            rail: self.receipt_config.rail.clone(),
+            enclave_id: enclave_id.clone(),
+            price_ver,
+            max_spend_mu,
+            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+        };
+        let voucher_payload =
+            spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
+        Ok(GatewaySessionInvocation {
+            contract_version: CONTRACT_VERSION,
+            session_id,
+            rail: self.receipt_config.rail.clone(),
+            user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
+            provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            enclave_id,
+            price_ver,
+            rules_ver: self.receipt_config.rules_ver,
+            spend_voucher: SpendVoucher {
+                body: voucher_body,
+                user_sig: sign_hex(&self.receipt_config.user_seed, &voucher_payload),
+            },
+            attestation,
+            hedge: GatewayHedgeInvocation::default(),
+            failover,
+            receipt_cosign_enabled: self.receipt_config.cosign_enabled,
+            receipt_user_seed: self.receipt_config.user_seed,
+        })
+    }
+
     fn failover_thresholds_for_model(
         &self,
         model: &GatewayModel,
@@ -5546,6 +6384,94 @@ impl GatewayState {
                 usage,
                 mu_owed_cum,
                 prompt_hash: blake3_hex(prompt_text.as_bytes()),
+                ts: now_millis_u64(),
+            };
+            let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
+            let user_sig = sign_hex(&self.receipt_config.user_seed, &receipt_payload);
+            SessionReceipt {
+                body,
+                enclave_sig: sign_hex(&self.receipt_config.enclave_seed, &receipt_payload),
+                user_sig,
+            }
+        };
+        let user_sig = receipt.user_sig.clone();
+        let receipt_ack = ReceiptAck {
+            session_id: receipt.body.session_id.clone(),
+            seq: receipt.body.seq,
+            user_sig,
+        };
+        let stored = StoredReceipt {
+            rail: invocation.rail.clone(),
+            voucher: invocation.spend_voucher.clone(),
+            receipt,
+            receipt_ack,
+        };
+        self.record_receipt(stored.clone());
+        Ok(stored)
+    }
+
+    fn meter_embedding_session(
+        &self,
+        model: &GatewayModel,
+        inputs: &[String],
+        output: &EmbeddingOutput,
+        invocation: &GatewaySessionInvocation,
+        provider_receipt: Option<&ProviderSignedReceipt>,
+    ) -> Result<StoredReceipt, ApiError> {
+        let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
+        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            return Err(ApiError::payment_required(
+                "session usage exceeded signed spend voucher",
+                Some("model"),
+            ));
+        }
+
+        if !self.receipt_config.cosign_enabled {
+            self.pause_session(PausedSession {
+                session_id: invocation.session_id.clone(),
+                reason: "receipt co-signing refused; session paused".to_owned(),
+            });
+            return Err(ApiError::conflict(
+                "receipt co-signing refused; session paused",
+                None,
+            ));
+        }
+
+        let provider = invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let receipt = if let Some(provider_receipt) = provider_receipt {
+            self.cosign_provider_receipt(
+                model,
+                invocation,
+                provider_receipt,
+                ExpectedProviderReceipt {
+                    provider: &provider,
+                    seq: 1,
+                    final_receipt: true,
+                    usage: usage.clone(),
+                    mu_owed_cum,
+                    prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
+                },
+            )?
+        } else {
+            let body = ReceiptBody {
+                schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+                session_id: invocation.session_id.clone(),
+                seq: 1,
+                final_receipt: true,
+                rail: invocation.rail.clone(),
+                user: invocation.user_pubkey.clone(),
+                provider,
+                enclave_id: invocation.enclave_id.clone(),
+                model_id: model.id.clone(),
+                price_ver: invocation.price_ver,
+                rules_ver: invocation.rules_ver,
+                usage,
+                mu_owed_cum,
+                prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
                 ts: now_millis_u64(),
             };
             let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
@@ -6548,6 +7474,59 @@ fn chat_prompt_text(request: &ChatCompletionRequest) -> String {
         .join("\n")
 }
 
+fn embedding_input_texts(request: &EmbeddingRequest) -> Result<Vec<String>, ApiError> {
+    embedding_input_texts_from_value(&request.input)
+        .map_err(|message| ApiError::bad_request(message, Some("input")))
+}
+
+fn embedding_input_texts_from_value(value: &Value) -> Result<Vec<String>, String> {
+    match value {
+        Value::String(text) => {
+            if text.is_empty() {
+                Err("embedding input must not be empty".to_owned())
+            } else {
+                Ok(vec![text.clone()])
+            }
+        }
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Err("embedding input array must not be empty".to_owned());
+            }
+            let mut inputs = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(text) if !text.is_empty() => inputs.push(text.clone()),
+                    Value::String(_) => {
+                        return Err("embedding input strings must not be empty".to_owned())
+                    }
+                    _ => {
+                        return Err(
+                            "embedding input must be a string or an array of strings".to_owned()
+                        )
+                    }
+                }
+            }
+            Ok(inputs)
+        }
+        _ => Err("embedding input must be a string or an array of strings".to_owned()),
+    }
+}
+
+fn embedding_prompt_text(inputs: &[String]) -> String {
+    stable_json_value(&json!({
+        "kind": "embedding",
+        "input": inputs,
+    }))
+    .to_string()
+}
+
+fn embedding_input_token_count(inputs: &[String]) -> u64 {
+    inputs
+        .iter()
+        .map(|input| rough_tokens(input))
+        .fold(0_u64, u64::saturating_add)
+}
+
 fn content_to_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -6632,6 +7611,15 @@ fn usage_for(input: &str, output: &str) -> Usage {
     }
 }
 
+fn embedding_usage_for_inputs(inputs: &[String]) -> Usage {
+    let prompt_tokens = embedding_input_token_count(inputs);
+    Usage {
+        prompt_tokens,
+        completion_tokens: 0,
+        total_tokens: prompt_tokens,
+    }
+}
+
 fn estimate_max_spend_mu(
     model: &GatewayModel,
     request: &ChatCompletionRequest,
@@ -6641,6 +7629,11 @@ fn estimate_max_spend_mu(
         rough_tokens(prompt_text),
         u64::from(request.max_tokens.unwrap_or(1024).max(1)),
     );
+    calculate_mu_owed(&model.mayhem.price_ref_mu, &usage).max(1_000)
+}
+
+fn estimate_embedding_max_spend_mu(model: &GatewayModel, inputs: &[String]) -> u64 {
+    let usage = ReceiptUsage::text(embedding_input_token_count(inputs), 0);
     calculate_mu_owed(&model.mayhem.price_ref_mu, &usage).max(1_000)
 }
 
@@ -7124,6 +8117,74 @@ mod tests {
             .meter_chat_session(&model, &request, &output, &invocation, Some(&wrong_sig))
             .expect_err("wrong enclave signature must be rejected");
         assert!(err.message.contains("signature"));
+    }
+
+    #[test]
+    fn embedding_provider_receipt_must_match_gateway_observed_usage() {
+        let state = GatewayState::fixture();
+        let model = test_model();
+        let inputs = vec!["alpha".to_owned(), "beta gamma".to_owned()];
+        let output = EmbeddingOutput {
+            embeddings: vec![vec![0.1, 0.2, 0.3], vec![0.2, 0.3, 0.4]],
+            usage: Usage {
+                prompt_tokens: 3,
+                completion_tokens: 0,
+                total_tokens: 3,
+            },
+        };
+        let invocation = test_invocation();
+        let provider_receipt =
+            test_embedding_provider_receipt(&model, &inputs, &output, &invocation);
+
+        let stored = state
+            .meter_embedding_session(
+                &model,
+                &inputs,
+                &output,
+                &invocation,
+                Some(&provider_receipt),
+            )
+            .expect("matching embedding provider receipt is co-signed");
+        let live_ack = direct_session_embedding_receipt_ack(
+            &inputs,
+            &output,
+            &invocation,
+            &provider_receipt,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect("embedding receipt ack signs the accepted receipt");
+        assert_eq!(live_ack, stored.receipt_ack);
+
+        let mut inflated_usage = provider_receipt.clone();
+        inflated_usage.body.usage = ReceiptUsage::text(9, 0);
+        inflated_usage.body.mu_owed_cum =
+            calculate_mu_owed(&model.mayhem.price_ref_mu, &inflated_usage.body.usage);
+        inflated_usage.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&inflated_usage.body).unwrap(),
+        );
+        let err = direct_session_embedding_receipt_ack(
+            &inputs,
+            &output,
+            &invocation,
+            &inflated_usage,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect_err("inflated usage must not receive a receipt ack");
+        assert!(err.message.contains("usage"));
+
+        let mut wrong_amount = provider_receipt;
+        wrong_amount.body.mu_owed_cum = wrong_amount.body.mu_owed_cum.saturating_add(1);
+        wrong_amount.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&wrong_amount.body).unwrap(),
+        );
+        let err = state
+            .meter_embedding_session(&model, &inputs, &output, &invocation, Some(&wrong_amount))
+            .expect_err("wrong embedding amount must be rejected");
+        assert!(err.message.contains("amount"));
     }
 
     fn assert_accept_err(frame: &Value, invocation: &GatewaySessionInvocation, needle: &str) {
@@ -7900,6 +8961,37 @@ mod tests {
         invocation: &GatewaySessionInvocation,
     ) -> ProviderSignedReceipt {
         test_provider_receipt_with_finality(model, request, output, invocation, 1, true)
+    }
+
+    fn test_embedding_provider_receipt(
+        model: &GatewayModel,
+        inputs: &[String],
+        output: &EmbeddingOutput,
+        invocation: &GatewaySessionInvocation,
+    ) -> ProviderSignedReceipt {
+        let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
+        let body = ReceiptBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            session_id: invocation.session_id.clone(),
+            seq: 1,
+            final_receipt: true,
+            rail: invocation.rail.clone(),
+            user: invocation.user_pubkey.clone(),
+            provider: invocation.provider_pubkey.clone().unwrap(),
+            enclave_id: invocation.enclave_id.clone(),
+            model_id: model.id.clone(),
+            price_ver: invocation.price_ver,
+            rules_ver: invocation.rules_ver,
+            usage: usage.clone(),
+            mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+            prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
+            ts: 123,
+        };
+        ProviderSignedReceipt {
+            enclave_sig: sign_hex(&test_enclave_seed(), &receipt_signing_bytes(&body).unwrap()),
+            body,
+            enclave_pubkey: verifying_key_hex(&test_enclave_seed()),
+        }
     }
 
     fn test_provider_receipt_with_finality(

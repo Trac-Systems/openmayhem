@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mayhem_engine::{
-    verify_artifact, EngineBackend, GenerateRequest, GrammarSpec, LlamaCppBackend, LoadConfig,
-    ModelArtifact, ToolSpec,
+    verify_artifact, EmbeddingRequest, EngineBackend, GenerateRequest, GrammarSpec,
+    LlamaCppBackend, LoadConfig, ModelArtifact, ToolSpec,
 };
 use serde_json::json;
 
@@ -17,6 +17,9 @@ const DEFAULT_HF_TOKEN_FILE: &str = "/Applications/MAMP/htdocs/gpd/hf.txt";
 const REPO: &str = "lmstudio-community/Qwen3.5-4B-GGUF";
 const REVISION: &str = "f9f88ac3e234be915e23811a6d28ea287bdb927e";
 const FILE_NAME: &str = "Qwen3.5-4B-Q4_K_M.gguf";
+const EMBED_REPO: &str = "ggml-org/bge-small-en-v1.5-Q8_0-GGUF";
+const EMBED_REVISION: &str = "f2068edd9b54f2a369549ccc71f70ed273a2a801";
+const EMBED_FILE_NAME: &str = "bge-small-en-v1.5-q8_0.gguf";
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -82,8 +85,52 @@ fn gguf_dev_model_smoke_generates_and_constrains_tool_call() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn gguf_embedding_model_smoke_returns_semantic_vectors() -> TestResult {
+    if env::var(RUN_ENV).ok().as_deref() != Some("1") {
+        eprintln!("skipping llama.cpp embedding conformance; set {RUN_ENV}=1 to run");
+        return Ok(());
+    }
+
+    let model_path = ensure_embedding_model()?;
+    let mut backend = LlamaCppBackend::new()?;
+    let mut config = LoadConfig::gguf(&model_path);
+    config.ctx_size = 512;
+    config.batch_size = 128;
+    config.ubatch_size = 128;
+    config.threads = Some(4);
+    let info = backend.load(config)?;
+    assert_eq!(info.artifact.path, model_path);
+
+    let output = backend.embed(EmbeddingRequest::many([
+        "a cat sits on a soft blanket",
+        "a kitten rests on a warm blanket",
+        "corporate debt refinancing terms",
+    ]))?;
+    assert_eq!(output.embeddings.len(), 3);
+    assert!(output
+        .embeddings
+        .iter()
+        .all(|embedding| embedding.len() > 64));
+    assert!(output.usage.prompt_tokens > 0);
+    assert_eq!(output.usage.completion_tokens, 0);
+
+    let similar = cosine(&output.embeddings[0], &output.embeddings[1]);
+    let dissimilar = cosine(&output.embeddings[0], &output.embeddings[2]);
+    let fingerprint = embedding_fingerprint(&output.embeddings);
+    eprintln!(
+        "embedding fingerprint={fingerprint} similar={similar:.4} dissimilar={dissimilar:.4}"
+    );
+    assert!(
+        similar > dissimilar,
+        "expected similar cosine {similar:.4} > dissimilar {dissimilar:.4}"
+    );
+
+    Ok(())
+}
+
 fn ensure_dev_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
-    let path = cache_path()?;
+    let path = cache_path(REPO, REVISION, FILE_NAME)?;
     let artifact = ModelArtifact::gguf(&path);
     if path.exists() {
         if verify_artifact(&artifact).is_ok() {
@@ -92,8 +139,37 @@ fn ensure_dev_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>
         fs::remove_file(&path)?;
     }
 
+    download_hf_file(REPO, REVISION, FILE_NAME, &path)?;
+    verify_artifact(&artifact)?;
+    Ok(path)
+}
+
+fn ensure_embedding_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(path) = env::var("MAYHEM_EMBEDDING_GGUF") {
+        return Ok(PathBuf::from(path));
+    }
+    let path = cache_path(EMBED_REPO, EMBED_REVISION, EMBED_FILE_NAME)?;
+    let artifact = ModelArtifact::gguf(&path);
+    if path.exists() {
+        if verify_artifact(&artifact).is_ok() {
+            return Ok(path);
+        }
+        fs::remove_file(&path)?;
+    }
+
+    download_hf_file(EMBED_REPO, EMBED_REVISION, EMBED_FILE_NAME, &path)?;
+    verify_artifact(&artifact)?;
+    Ok(path)
+}
+
+fn download_hf_file(
+    repo: &str,
+    revision: &str,
+    file_name: &str,
+    path: &Path,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(path.parent().expect("cache path has a parent"))?;
-    let url = format!("https://huggingface.co/{REPO}/resolve/{REVISION}/{FILE_NAME}");
+    let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{file_name}");
     let mut curl = Command::new("curl");
     curl.arg("--fail")
         .arg("--location")
@@ -105,7 +181,7 @@ fn ensure_dev_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>
         .arg("-")
         .arg("--output")
         .arg(&path)
-        .arg(url);
+        .arg(&url);
 
     if let Some(token) = hf_token() {
         curl.arg("--header")
@@ -114,21 +190,55 @@ fn ensure_dev_model() -> std::result::Result<PathBuf, Box<dyn std::error::Error>
 
     let status = curl.status()?;
     if !status.success() {
-        return Err(format!("curl failed to download {FILE_NAME}: {status}").into());
+        return Err(format!("curl failed to download {file_name}: {status}").into());
     }
-    verify_artifact(&artifact)?;
-    Ok(path)
+    Ok(())
 }
 
-fn cache_path() -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+fn cache_path(
+    repo: &str,
+    revision: &str,
+    file_name: &str,
+) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
     let home = env::var_os("HOME").ok_or("HOME is not set")?;
     Ok(Path::new(&home)
         .join(".mayhem")
         .join("cache")
         .join("huggingface")
-        .join(REPO)
-        .join(REVISION)
-        .join(FILE_NAME))
+        .join(repo)
+        .join(revision)
+        .join(file_name))
+}
+
+fn cosine(left: &[f32], right: &[f32]) -> f32 {
+    let len = left.len().min(right.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for index in 0..len {
+        dot += left[index] * right[index];
+        left_norm += left[index] * left[index];
+        right_norm += right[index] * right[index];
+    }
+    if left_norm <= f32::EPSILON || right_norm <= f32::EPSILON {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
+fn embedding_fingerprint(embeddings: &[Vec<f32>]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for embedding in embeddings {
+        hasher.update(&(embedding.len() as u64).to_le_bytes());
+        for value in embedding {
+            hasher.update(&value.to_le_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 fn hf_token() -> Option<String> {

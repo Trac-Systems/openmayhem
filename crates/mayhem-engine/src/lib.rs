@@ -61,6 +61,12 @@ pub enum EngineError {
     #[error("llama.cpp decode error: {0}")]
     LlamaDecode(#[from] llama_cpp_2::DecodeError),
     #[cfg(feature = "llama-cpp")]
+    #[error("llama.cpp encode error: {0}")]
+    LlamaEncode(#[from] llama_cpp_2::EncodeError),
+    #[cfg(feature = "llama-cpp")]
+    #[error("llama.cpp embedding error: {0}")]
+    LlamaEmbeddings(#[from] llama_cpp_2::EmbeddingsError),
+    #[cfg(feature = "llama-cpp")]
     #[error("llama.cpp batch error: {0}")]
     LlamaBatch(#[from] llama_cpp_2::llama_batch::BatchAddError),
     #[cfg(feature = "llama-cpp")]
@@ -254,6 +260,35 @@ pub struct GenerateRequest {
     pub ignore_eos: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    pub inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+}
+
+impl EmbeddingRequest {
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            inputs: vec![input.into()],
+            dimensions: None,
+        }
+    }
+
+    pub fn many(inputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            inputs: inputs.into_iter().map(Into::into).collect(),
+            dimensions: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_dimensions(mut self, dimensions: usize) -> Self {
+        self.dimensions = Some(dimensions);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MediaInput {
     pub kind: String,
@@ -347,6 +382,12 @@ pub struct GenerateOutput {
     pub text: String,
     pub usage: UsageCounters,
     pub finish_reason: FinishReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingOutput {
+    pub embeddings: Vec<Vec<f32>>,
+    pub usage: UsageCounters,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -443,6 +484,12 @@ pub trait EngineBackend {
         _artifact_sink: &mut dyn ArtifactSink,
     ) -> Result<GenerateOutput> {
         self.generate(request, token_sink)
+    }
+    fn embed(&mut self, _request: EmbeddingRequest) -> Result<EmbeddingOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support embeddings",
+            self.backend_id()
+        )))
     }
 }
 
@@ -753,7 +800,7 @@ pub use trt_llm_backend::TrtLlmBackend;
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_backend {
     use encoding_rs::UTF_8;
-    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
@@ -763,9 +810,9 @@ mod llama_cpp_backend {
 
     use super::{
         tool_call_json_schema, validate_load_config, verify_artifact, ArtifactFormat,
-        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, GrammarSpec,
-        LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
-        DEFAULT_SEED,
+        EmbeddingOutput, EmbeddingRequest, EngineBackend, EngineError, FinishReason,
+        GenerateOutput, GenerateRequest, GrammarSpec, LoadConfig, LoadedModelInfo, Result,
+        TokenChunk, TokenSink, Tokenization, UsageCounters, DEFAULT_SEED,
     };
     use std::num::NonZeroU32;
 
@@ -939,6 +986,101 @@ mod llama_cpp_backend {
                 usage: UsageCounters::new(prompt_tokens.len() as u32, completion_tokens),
                 finish_reason,
             })
+        }
+
+        fn embed(&mut self, request: EmbeddingRequest) -> Result<EmbeddingOutput> {
+            if request.inputs.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "embedding request must include at least one input".to_owned(),
+                ));
+            }
+            if request.dimensions == Some(0) {
+                return Err(EngineError::InvalidConfig(
+                    "embedding dimensions must be greater than zero".to_owned(),
+                ));
+            }
+
+            let config = self.config()?.clone();
+            let model = self.model()?;
+            let ctx_size = NonZeroU32::new(config.ctx_size).ok_or_else(|| {
+                EngineError::InvalidConfig("ctx_size must be greater than zero".to_owned())
+            })?;
+            let mut embeddings = Vec::with_capacity(request.inputs.len());
+            let mut prompt_tokens = 0_u32;
+
+            for input in &request.inputs {
+                let input_tokens = model.str_to_token(input, AddBos::Always)?;
+                if input_tokens.len() >= config.ctx_size as usize {
+                    return Err(EngineError::PromptTooLong {
+                        prompt_tokens: input_tokens.len(),
+                        ctx_size: config.ctx_size,
+                    });
+                }
+                prompt_tokens = prompt_tokens
+                    .saturating_add(u32::try_from(input_tokens.len()).unwrap_or(u32::MAX));
+
+                let mut ctx_params = LlamaContextParams::default()
+                    .with_n_ctx(Some(ctx_size))
+                    .with_n_batch(config.batch_size)
+                    .with_n_ubatch(config.ubatch_size)
+                    .with_n_seq_max(1)
+                    .with_pooling_type(LlamaPoolingType::Mean)
+                    .with_embeddings(true)
+                    .with_no_perf(true);
+                if let Some(threads) = config.threads {
+                    ctx_params = ctx_params
+                        .with_n_threads(threads)
+                        .with_n_threads_batch(threads);
+                }
+
+                let mut ctx = model.new_context(&self.backend, ctx_params)?;
+                let mut batch = LlamaBatch::new(input_tokens.len().max(1), 1);
+                let last_prompt_index = input_tokens.len().saturating_sub(1);
+                for (index, token) in input_tokens.iter().enumerate() {
+                    batch.add(
+                        *token,
+                        i32::try_from(index).map_err(|err| {
+                            EngineError::InvalidConfig(format!(
+                                "embedding position overflow: {err}"
+                            ))
+                        })?,
+                        &[0],
+                        index == last_prompt_index,
+                    )?;
+                }
+                ctx.encode(&mut batch)?;
+                let mut embedding = ctx.embeddings_seq_ith(0)?.to_vec();
+                if let Some(dimensions) = request.dimensions {
+                    if dimensions > embedding.len() {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "requested embedding dimensions {dimensions} exceed model dimensions {}",
+                            embedding.len()
+                        )));
+                    }
+                    embedding.truncate(dimensions);
+                }
+                normalize_embedding(&mut embedding);
+                embeddings.push(embedding);
+            }
+
+            Ok(EmbeddingOutput {
+                embeddings,
+                usage: UsageCounters::new(prompt_tokens, 0),
+            })
+        }
+    }
+
+    fn normalize_embedding(embedding: &mut [f32]) {
+        let norm = embedding
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        if norm <= f64::EPSILON || !norm.is_finite() {
+            return;
+        }
+        for value in embedding {
+            *value = (f64::from(*value) / norm) as f32;
         }
     }
 

@@ -4432,9 +4432,14 @@ fn print_catalog_list_report(report: &CatalogListReport) {
 
     for model in &report.models {
         println!();
+        let params = if model.params_b < 0.1 {
+            format!("{:.3}B", model.params_b)
+        } else {
+            format!("{:.1}B", model.params_b)
+        };
         println!(
-            "{} [{}] {:.1}B {}",
-            model.model_id, model.tier, model.params_b, model.family
+            "{} [{}] {} {}",
+            model.model_id, model.tier, params, model.family
         );
         println!(
             "  price ref: {} {}",
@@ -4491,17 +4496,21 @@ fn print_catalog_list_report(report: &CatalogListReport) {
                 .unwrap_or_else(|| "none".to_owned())
         );
         for artifact in &model.artifacts {
+            let canary = match (
+                model.canary_verification_method.as_str(),
+                artifact.canary_fingerprint.as_deref(),
+            ) {
+                ("token_fingerprint", Some(fingerprint)) => short_hash(fingerprint),
+                ("token_fingerprint", None) => "missing",
+                _ => "n/a",
+            };
             println!(
                 "  - {} ({}) {} root={} canary={}",
                 artifact.artifact,
                 artifact.engine,
                 artifact.weights_human,
                 short_hash(&artifact.artifact_root),
-                artifact
-                    .canary_fingerprint
-                    .as_deref()
-                    .map(short_hash)
-                    .unwrap_or("missing")
+                canary
             );
             println!(
                 "    source: {}@{} {}",
@@ -21913,6 +21922,7 @@ async fn send_provider_session_output(
                 "i": index,
                 "d": "",
                 "tool": output.tool.as_ref(),
+                "embeddings": output.embeddings.as_ref(),
                 "fin": output.finish_reason,
                 "usage": { "input_token": output.prompt_tokens, "output_token": output.completion_tokens },
                 "token_ids": &output.token_ids,
@@ -22251,6 +22261,9 @@ fn provider_session_prompt_hash(body: &Value) -> String {
 }
 
 fn provider_session_prompt_text(body: &Value) -> String {
+    if body.get("kind").and_then(Value::as_str) == Some("embedding") {
+        return provider_embedding_prompt_text(body);
+    }
     body.get("messages")
         .and_then(Value::as_array)
         .map(|messages| {
@@ -22261,6 +22274,50 @@ fn provider_session_prompt_text(body: &Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+fn provider_embedding_prompt_text(body: &Value) -> String {
+    match provider_embedding_input_texts_from_body(body) {
+        Ok(inputs) => stable_json_value(&json!({
+            "kind": "embedding",
+            "input": inputs,
+        }))
+        .to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+fn provider_embedding_input_texts_from_body(body: &Value) -> Result<Vec<String>> {
+    let input = body
+        .get("input")
+        .context("embedding request missing input")?;
+    provider_embedding_input_texts_from_value(input)
+}
+
+fn provider_embedding_input_texts_from_value(value: &Value) -> Result<Vec<String>> {
+    match value {
+        Value::String(text) => {
+            if text.is_empty() {
+                bail!("embedding input must not be empty");
+            }
+            Ok(vec![text.clone()])
+        }
+        Value::Array(items) => {
+            if items.is_empty() {
+                bail!("embedding input array must not be empty");
+            }
+            let mut inputs = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(text) if !text.is_empty() => inputs.push(text.clone()),
+                    Value::String(_) => bail!("embedding input strings must not be empty"),
+                    _ => bail!("embedding input must be a string or an array of strings"),
+                }
+            }
+            Ok(inputs)
+        }
+        _ => bail!("embedding input must be a string or an array of strings"),
+    }
 }
 
 async fn provider_session_attestation(
@@ -22959,6 +23016,7 @@ struct ProviderSessionArtifact {
 struct ProviderSessionOutput {
     content: String,
     tool: Option<Value>,
+    embeddings: Option<Vec<Vec<f32>>>,
     artifacts: Vec<ProviderSessionArtifact>,
     finish_reason: String,
     prompt_tokens: u64,
@@ -22971,6 +23029,28 @@ fn provider_engine_session_response(
     adapter: &catalog::CatalogAdapter,
     body: &Value,
 ) -> Result<ProviderSessionOutput> {
+    if body.get("kind").and_then(Value::as_str) == Some("embedding") {
+        let inputs = provider_embedding_input_texts_from_body(body)?;
+        let dimensions = body
+            .get("dimensions")
+            .and_then(Value::as_u64)
+            .map(|value| usize::try_from(value).context("embedding dimensions overflow usize"))
+            .transpose()?;
+        let output = backend
+            .embed(mayhem_engine::EmbeddingRequest { inputs, dimensions })
+            .context("generating provider session embeddings with mayhem-engine")?;
+        return Ok(ProviderSessionOutput {
+            content: String::new(),
+            tool: None,
+            embeddings: Some(output.embeddings),
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: u64::from(output.usage.prompt_tokens),
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+        });
+    }
+
     let tool_mode = provider_engine_tool_request(body, adapter)?.map(|(strategy, _)| strategy);
     let request = provider_engine_request_from_body(body, adapter)?;
     let mut token_ids = Vec::new();
@@ -23008,6 +23088,7 @@ fn provider_engine_session_response(
             output.text
         },
         tool,
+        embeddings: None,
         artifacts,
         finish_reason: if tool_mode.is_some() {
             "tool_calls".to_owned()
@@ -23431,6 +23512,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
             token_ids: content.bytes().map(i32::from).collect(),
             content,
             tool: None,
+            embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens,
@@ -23446,6 +23528,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
                 "arguments": provider_tool_arguments("bash"),
             })),
             finish_reason: "tool_calls".to_owned(),
+            embeddings: None,
             artifacts: Vec::new(),
             prompt_tokens,
             completion_tokens: 1,
@@ -23461,6 +23544,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
                 "arguments": provider_tool_arguments(&tool_name),
             })),
             finish_reason: "tool_calls".to_owned(),
+            embeddings: None,
             artifacts: Vec::new(),
             prompt_tokens,
             completion_tokens: 1,
@@ -23486,6 +23570,7 @@ fn provider_session_response(terms: &ProviderSessionTerms, body: &Value) -> Prov
         token_ids: content.bytes().map(i32::from).collect(),
         content,
         tool: None,
+        embeddings: None,
         artifacts: Vec::new(),
         finish_reason: "stop".to_owned(),
         prompt_tokens,
@@ -24514,8 +24599,10 @@ mod tests {
 
     struct FakeEngineBackend {
         output: mayhem_engine::GenerateOutput,
+        embedding_output: mayhem_engine::EmbeddingOutput,
         artifact_chunks: Vec<ArtifactChunk>,
         last_request: Option<GenerateRequest>,
+        last_embedding_request: Option<mayhem_engine::EmbeddingRequest>,
     }
 
     impl FakeEngineBackend {
@@ -24526,8 +24613,13 @@ mod tests {
                     usage: mayhem_engine::UsageCounters::new(4, 2),
                     finish_reason: mayhem_engine::FinishReason::Stop,
                 },
+                embedding_output: mayhem_engine::EmbeddingOutput {
+                    embeddings: vec![vec![0.1, 0.2, 0.3]],
+                    usage: mayhem_engine::UsageCounters::new(3, 0),
+                },
                 artifact_chunks: Vec::new(),
                 last_request: None,
+                last_embedding_request: None,
             }
         }
 
@@ -24581,6 +24673,14 @@ mod tests {
                 artifact_sink.on_artifact_chunk(chunk)?;
             }
             Ok(output)
+        }
+
+        fn embed(
+            &mut self,
+            request: mayhem_engine::EmbeddingRequest,
+        ) -> mayhem_engine::Result<mayhem_engine::EmbeddingOutput> {
+            self.last_embedding_request = Some(request);
+            Ok(self.embedding_output.clone())
         }
     }
 
@@ -25433,8 +25533,15 @@ mod tests {
         assert_eq!(payload["source_kind"], "huggingface");
         assert!(is_hex_len(payload["catalog_hash"].as_str().unwrap(), 64));
         assert!(is_hex_len(payload["signature_hash"].as_str().unwrap(), 64));
-        assert_eq!(payload["model_count"], 5);
-        assert_eq!(payload["artifact_count"], 7);
+        let catalog_doc =
+            catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let expected_artifact_count = catalog_doc
+            .models
+            .iter()
+            .map(|model| model.artifacts.len())
+            .sum::<usize>();
+        assert_eq!(payload["model_count"], catalog_doc.models.len());
+        assert_eq!(payload["artifact_count"], expected_artifact_count);
         assert!(payload["canaries"].as_array().unwrap().iter().any(|entry| {
             entry["set_id"] == "canary-launch-v1"
                 && entry["url"]
@@ -27602,6 +27709,7 @@ mod tests {
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
             tool: None,
+            embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 3,
@@ -27657,6 +27765,7 @@ mod tests {
         let output = ProviderSessionOutput {
             content: "receipt ok".to_owned(),
             tool: None,
+            embeddings: None,
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
             prompt_tokens: 2,
@@ -27918,6 +28027,33 @@ mod tests {
         assert!(request.prompt.contains("user: hello"));
         assert_eq!(request.max_new_tokens, 8);
         assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn provider_engine_session_response_uses_embedding_backend_output() {
+        let mut backend = FakeEngineBackend::new("unused text");
+        let body = json!({
+            "kind": "embedding",
+            "input": ["similar phrase", "similar sentence"],
+            "dimensions": 3
+        });
+        let output = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(output.content, "");
+        assert!(output.tool.is_none());
+        assert_eq!(output.embeddings, Some(vec![vec![0.1, 0.2, 0.3]]));
+        assert_eq!(output.finish_reason, "stop");
+        assert_eq!(output.prompt_tokens, 3);
+        assert_eq!(output.completion_tokens, 0);
+        let request = backend.last_embedding_request.expect("embedding request");
+        assert_eq!(request.inputs, vec!["similar phrase", "similar sentence"]);
+        assert_eq!(request.dimensions, Some(3));
+        assert!(backend.last_request.is_none());
     }
 
     #[test]

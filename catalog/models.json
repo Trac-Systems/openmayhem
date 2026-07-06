@@ -392,6 +392,89 @@
         "in_per_1k": 24,
         "out_per_1k": 72
       }
+    },
+    {
+      "model_id": "baai/bge-small-en-v1.5@gguf-q8_0",
+      "model_class": "embedding",
+      "family": "bge-small-en-v1.5",
+      "params_b": 0.033,
+      "tier": "launch",
+      "min_app_version": "0.1.0",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "BAAI/bge-small-en-v1.5",
+          "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "llama.cpp convert_hf_to_gguf + quantize",
+            "method": "q8_0",
+            "input_sha256": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad",
+            "output_sha256": "f046db1dc724cf4f6f0a0c5917e922823b73eb1d27b8f9a9c2797f7866974804"
+          }
+        ],
+        "license": "mit",
+        "license_sha256": "e5dcffe836b6ec8a58e492419b550e65fb8cbdc308503979e5dacb33ac7ea3b7"
+      },
+      "artifacts": {
+        "gguf-q8_0": {
+          "engine": "llama.cpp",
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-bge-small-en-v1.5-GGUF",
+            "revision": "cc42bcf9a21e52e5f0c8fb019be27fd70402eb93",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "bge-small-en-v1.5-q8_0.gguf",
+          "artifact_root": "d22932ffda0e9d4a33b4d87af25fa1f4ad46f05aba228986015005aee1f9c5f4",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 36685152,
+          "source_sha256": "f046db1dc724cf4f6f0a0c5917e922823b73eb1d27b8f9a9c2797f7866974804",
+          "download_check": true
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 512,
+        "vision": false,
+        "output_modality": "embedding",
+        "output_modalities": [
+          "embedding"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 1,
+        "min_vram_gb_full_offload": 0,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "llama.cpp"
+        ]
+      },
+      "adapter": {
+        "request_shape_family": "openai_embeddings",
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "embedding"
+        ],
+        "response_normalization": "openai_embeddings"
+      },
+      "canary": {
+        "set_id": "canary-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "attestation_of_compute"
+      },
+      "price_ref_mu": {
+        "denom": "mu_usd",
+        "in_per_1k": 2,
+        "out_per_1k": 0
+      }
     }
   ]
 }

@@ -5,11 +5,11 @@ use axum::{
 };
 use mayhem_gateway::openai::{
     openai_router, validate_loopback_dashboard_bind, ChatCompletionRequest, ChatMessage,
-    ChatOutput, GatewayArtifactOutput, GatewayCanaryModelConfig, GatewayCanaryProbePolicy,
-    GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayModel, GatewayRouteCandidate,
-    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
-    GatewaySessionResult, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, ShapeAdapterInfo,
-    ToolCallOutput, Usage,
+    ChatOutput, EmbeddingOutput, EmbeddingRequest, GatewayArtifactOutput, GatewayCanaryModelConfig,
+    GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
+    GatewayEmbeddingResult, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
+    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
+    GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, text_generation_rate_map, token_fingerprint, ReputationEventKind,
@@ -60,6 +60,48 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
                 direct_session: true,
                 provider_receipt: None,
                 token_ids: vec![1, 2, 3, 4],
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct EmbeddingDirectSessionBackend;
+
+impl GatewaySessionBackend for EmbeddingDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-embedding-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_embedding<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a EmbeddingRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayEmbeddingFuture<'a> {
+        Box::pin(async move {
+            Ok(GatewayEmbeddingResult {
+                output: EmbeddingOutput {
+                    embeddings: vec![vec![0.12, 0.34, 0.56], vec![0.11, 0.33, 0.55]],
+                    usage: Usage {
+                        prompt_tokens: 2,
+                        completion_tokens: 0,
+                        total_tokens: 2,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
                 quality: None,
             })
         })
@@ -680,59 +722,42 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
 }
 
 #[tokio::test]
-async fn embeddings_endpoint_requires_real_engine_and_records_zero_charge() {
-    let catalog = json!({
-        "models": [{
-            "model_id": "admin/embed-fixture",
-            "model_class": "embedding",
-            "caps": {
-                "tools": false,
-                "json": false,
-                "ctx_max": 8192,
-                "vision": false,
-                "output_modality": "embedding",
-                "output_modalities": ["embedding"]
-            },
-            "adapter": {
-                "request_shape_family": "openai_chat",
-                "chat_template_id": "generic_chatml",
-                "tool_call_strategy": "none",
-                "reasoning_passthrough": "strip",
-                "modality_set": ["embedding"],
-                "response_normalization": "openai_chat"
-            },
-            "price_ref_mu": {
-                "denom": "mu_usd",
-                "ver": 3,
-                "rate_map": [
-                    { "unit": "input_token", "per_unit_mu": 10, "granularity": 1000 }
-                ]
-            },
-            "attestation_tiers": { "T1": 1 }
-        }]
-    });
-    let state = GatewayState::from_catalog_json(&catalog.to_string()).expect("catalog parses");
+async fn embeddings_endpoint_uses_routed_engine_and_records_receipt() {
+    let state = GatewayState::from_models(vec![routed_embedding_test_model()])
+        .with_session_backend(Arc::new(EmbeddingDirectSessionBackend));
     let app = openai_router(state.clone());
     let request = json!({
         "model": "admin/embed-fixture",
         "input": ["alpha", "beta"],
-        "dimensions": 8,
+        "dimensions": 3,
         "encoding_format": "float"
     });
 
     let (status, body) = json_request(app, Method::POST, "/v1/embeddings", request).await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"]["param"], "model");
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("embeddings is not served"));
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("no charge recorded"));
-    assert!(state.receipts().is_empty());
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "admin/embed-fixture");
+    assert_eq!(body["data"].as_array().expect("embedding data").len(), 2);
+    assert_eq!(body["data"][0]["object"], "embedding");
+    let first_value = body["data"][0]["embedding"][0]
+        .as_f64()
+        .expect("embedding value");
+    assert!((first_value - 0.12).abs() < 0.0001);
+    assert_eq!(body["usage"]["prompt_tokens"], 2);
+    assert_eq!(body["usage"]["total_tokens"], 2);
+    assert_eq!(body["mayhem"]["backend"], "test-embedding-direct-session");
+    assert_eq!(body["mayhem"]["direct_session"], true);
+    assert_eq!(body["mayhem"]["receipt"]["rail"], "fiat");
+
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.body.model_id, "admin/embed-fixture");
+    assert_eq!(receipt.body.price_ver, 3);
+    assert_eq!(receipt.body.usage.input_tokens(), 2);
+    assert_eq!(receipt.body.usage.output_tokens(), 0);
+    assert_eq!(receipt.body.mu_owed_cum, 1);
 }
 
 #[tokio::test]
@@ -1537,6 +1562,42 @@ async fn chat_completion_min_att_tier_rejects_when_no_route_meets_pin() {
 
 fn routed_test_model() -> GatewayModel {
     routed_test_model_with_providers(&["55".repeat(32)])
+}
+
+fn routed_embedding_test_model() -> GatewayModel {
+    let mut model = routed_test_model_with_providers(&["55".repeat(32)]);
+    model.id = "admin/embed-fixture".to_owned();
+    model.mayhem.model_class = "embedding".to_owned();
+    model.mayhem.price_ref_mu = PriceRefMu {
+        denom: "mu_usd".to_owned(),
+        ver: 3,
+        rate_map: vec![mayhem_gateway::RateMapEntry {
+            unit: "input_token".to_owned(),
+            per_unit_mu: 10,
+            granularity: 1_000,
+        }],
+    };
+    model.mayhem.caps = ModelCaps {
+        tools: false,
+        json: false,
+        ctx: 8192,
+        vision: false,
+        image: false,
+        video: false,
+        audio: false,
+        output_modality: Some("embedding".to_owned()),
+        output_modalities: vec!["embedding".to_owned()],
+    };
+    model.mayhem.adapter.modality_set = vec!["embedding".to_owned()];
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.price_ver = 3;
+        candidate.caps = serde_json::json!({
+            "ctx_max": 8192,
+            "output_modality": "embedding",
+            "output_modalities": ["embedding"]
+        });
+    }
+    model
 }
 
 fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
