@@ -1,8 +1,21 @@
 import { Protocol } from 'trac-peer';
 
+const DEFAULT_MAYHEM_TX_MAX_BYTES = 64_000;
+
+function positiveEnvInteger(name, fallback) {
+  const raw = globalThis?.process?.env?.[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
 class MayhemProtocol extends Protocol {
   constructor(peer, base, options = {}) {
     super(peer, base, options);
+  }
+
+  txMaxBytes() {
+    return positiveEnvInteger('MAYHEM_TX_MAX_BYTES', DEFAULT_MAYHEM_TX_MAX_BYTES);
   }
 
   async extendApi() {

@@ -904,6 +904,13 @@ impl GatewayState {
         }
     }
 
+    pub fn canary_registry_from_catalog_json(
+        catalog: &str,
+    ) -> Result<GatewayCanaryRegistry, serde_json::Error> {
+        let root: Value = serde_json::from_str(catalog)?;
+        Ok(canary_registry_from_catalog_root(&root))
+    }
+
     pub fn fixture() -> Self {
         let mut tiers = BTreeMap::new();
         tiers.insert("T1".to_owned(), 1);

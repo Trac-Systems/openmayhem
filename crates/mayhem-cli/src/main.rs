@@ -24,9 +24,9 @@ use mayhem_bridge::{
 use mayhem_enclave::{
     boot_sealed_store, build_merkle_manifest, download_resumable,
     finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
-    prepare_tier1_attestation_report, seal_artifact, BootOptions, DownloadReport, DownloadRequest,
-    DownloadSource, KeyContext, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions,
-    SealOptions, Tier1AttestationDraft, Tier1AttestationReport,
+    prepare_tier1_attestation_report, read_sealed_manifest, seal_artifact, BootOptions,
+    DownloadReport, DownloadRequest, DownloadSource, KeyContext, RuntimeKeyContext, RuntimeKeypair,
+    RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationDraft, Tier1AttestationReport,
     Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
@@ -37,8 +37,8 @@ use mayhem_engine::{
 use mayhem_gateway::{
     heartbeat_signing_payload, normalize_rate_map,
     openai::{
-        serve as serve_gateway, validate_loopback_dashboard_bind, GatewayModel,
-        GatewayRouteCandidate, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
+        serve as serve_gateway, validate_loopback_dashboard_bind, GatewayCanaryProbePolicy,
+        GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
         ProviderKybInfo, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
     },
     rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
@@ -768,6 +768,22 @@ struct UseArgs {
     /// Minimum sustained provider throughput before the gateway reroutes.
     #[arg(long)]
     min_tok_s: Option<f64>,
+
+    /// Disable automatic catalog canary probes after served sessions.
+    #[arg(long)]
+    disable_canary_probes: bool,
+
+    /// Minimum sessions between automatic catalog canary probes.
+    #[arg(long)]
+    canary_probe_min_interval_sessions: Option<u64>,
+
+    /// Maximum sessions between automatic catalog canary probes.
+    #[arg(long)]
+    canary_probe_max_interval_sessions: Option<u64>,
+
+    /// Epoch value stamped into automatic catalog canary probe evidence.
+    #[arg(long)]
+    canary_probe_epoch: Option<u64>,
 
     /// Trusted Apple App Attest JWKS JSON file for verifying Tier 2 Apple hardware-identity quotes.
     #[arg(long, value_name = "PATH")]
@@ -3371,7 +3387,7 @@ struct ProviderRoomLeaveArgs {
     enclave: String,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 struct ProviderStartArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -4530,12 +4546,12 @@ fn artifact_hardware_compatibility_base(
     }
     if artifact.engine == "trt-llm" || artifact.engine == "vllm" {
         let min_vram_bytes = gib_u64(model.requirements.min_vram_gb_full_offload);
-        if min_vram_bytes > 0 && total_dedicated_vram_bytes(hardware) < min_vram_bytes {
+        if min_vram_bytes > 0 && dedicated_vram_known_below(hardware, min_vram_bytes) {
             return incompatible_artifact(format!(
                 "needs at least {} GiB dedicated VRAM for {}; local dedicated VRAM is {}",
                 model.requirements.min_vram_gb_full_offload,
                 artifact.engine,
-                human_bytes(total_dedicated_vram_bytes(hardware))
+                dedicated_vram_label(hardware)
             ));
         }
     }
@@ -4653,13 +4669,25 @@ fn parse_compute_capability_pair(value: &str) -> Option<(u32, u32)> {
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
-fn total_dedicated_vram_bytes(hardware: &HardwareReport) -> u64 {
-    hardware
-        .gpus
-        .iter()
-        .filter(|gpu| !gpu.unified_memory)
-        .filter_map(|gpu| gpu.memory_bytes)
-        .sum()
+fn known_total_dedicated_vram_bytes(hardware: &HardwareReport) -> Option<u64> {
+    let mut saw_dedicated_gpu = false;
+    let mut total = 0u64;
+    for gpu in hardware.gpus.iter().filter(|gpu| !gpu.unified_memory) {
+        saw_dedicated_gpu = true;
+        let memory = gpu.memory_bytes?;
+        total = total.saturating_add(memory);
+    }
+    saw_dedicated_gpu.then_some(total).or(Some(0))
+}
+
+fn dedicated_vram_label(hardware: &HardwareReport) -> String {
+    known_total_dedicated_vram_bytes(hardware)
+        .map(human_bytes)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn dedicated_vram_known_below(hardware: &HardwareReport, min_vram_bytes: u64) -> bool {
+    known_total_dedicated_vram_bytes(hardware).is_some_and(|total| total < min_vram_bytes)
 }
 
 fn gib_u64(gib: u64) -> u64 {
@@ -13222,6 +13250,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                         catalog_files.catalog_path.display()
                     )
                 })?;
+            let catalog_json =
+                fs::read_to_string(&catalog_files.catalog_path).with_context(|| {
+                    format!(
+                        "reading verified ledger catalog {}",
+                        catalog_files.catalog_path.display()
+                    )
+                })?;
+            let canary_registry = GatewayState::canary_registry_from_catalog_json(&catalog_json)
+                .context("loading canary registry from verified ledger catalog")?;
             let wallet_password = args.wallet_password.clone().unwrap_or_default();
             let wallet = resolve_cli_wallet_with_keypair(
                 &home,
@@ -13299,6 +13336,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             let backend = ScBridgeGatewaySessionBackend::new(session_config);
             (
                 GatewayState::from_models(models)
+                    .with_canary_registry(canary_registry)
                     .with_provider_earnings(provider_earnings)
                     .with_failover_policy(failover_policy)
                     .with_receipt_user_seed(user_seed)
@@ -13328,6 +13366,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         Some(jwks) => state.with_nvidia_offline_jwks(jwks),
         None => state,
     };
+    let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state.with_receipt_rail(args.rail.as_str());
     let dashboard_url = state.dashboard_url(&gateway_url);
     let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
@@ -13412,6 +13451,39 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         .await
         .with_context(|| format!("serving Mayhem gateway on {bind}"))?;
     Ok(())
+}
+
+fn apply_gateway_canary_policy_args(state: GatewayState, args: &UseArgs) -> Result<GatewayState> {
+    let custom = args.disable_canary_probes
+        || args.canary_probe_min_interval_sessions.is_some()
+        || args.canary_probe_max_interval_sessions.is_some()
+        || args.canary_probe_epoch.is_some();
+    if !custom {
+        return Ok(state);
+    }
+    let mut policy = GatewayCanaryProbePolicy::default();
+    policy.enabled = !args.disable_canary_probes;
+    if let Some(min) = args.canary_probe_min_interval_sessions {
+        if min == 0 {
+            bail!("--canary-probe-min-interval-sessions must be positive");
+        }
+        policy.min_interval_sessions = min;
+    }
+    if let Some(max) = args.canary_probe_max_interval_sessions {
+        if max == 0 {
+            bail!("--canary-probe-max-interval-sessions must be positive");
+        }
+        policy.max_interval_sessions = max;
+    }
+    if policy.max_interval_sessions < policy.min_interval_sessions {
+        bail!(
+            "--canary-probe-max-interval-sessions must be >= --canary-probe-min-interval-sessions"
+        );
+    }
+    if let Some(epoch) = args.canary_probe_epoch {
+        policy.epoch = epoch;
+    }
+    Ok(state.with_canary_probe_policy(policy))
 }
 
 async fn models(args: ModelsArgs) -> Result<()> {
@@ -18764,6 +18836,19 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| rpc_url.clone());
     let rules = resolve_rules(None, None, &rpc, None).await?;
+    let prior_consent = read_consent_state(&rpc, &wallet.public_key).await?;
+    if !consent_matches(prior_consent.as_ref(), &rules) {
+        provider_log(&args, "Signing current router rules consent");
+        submit_consent(
+            &rpc,
+            &keypair_path,
+            &password,
+            &wallet,
+            rules.clone(),
+            args.sim,
+        )
+        .await?;
+    }
 
     provider_log(
         &args,
@@ -21231,6 +21316,37 @@ fn build_provider_candidates(
             "no feasible active admin-created enclaves with a current mu_usd admin price found in contract state; providers can only join priced enclaves the admin already registered"
         );
     }
+    if env::var_os("MAYHEM_PROVIDER_CANDIDATE_DEBUG").is_some() {
+        for candidate in &candidates {
+            provider_log(
+                args,
+                &format!(
+                    "Candidate {} via {} ({}) enclave {}",
+                    candidate.enclave.model_id,
+                    candidate.enclave.backend,
+                    candidate.artifact_name,
+                    short_hash(&candidate.enclave.enclave_id)
+                ),
+            );
+        }
+        for rejection in &rejections {
+            provider_log(
+                args,
+                &format!(
+                    "Rejected {} via {} enclave {}: {}{}",
+                    rejection.model_id,
+                    rejection.backend,
+                    short_hash(&rejection.enclave_id),
+                    rejection.reason,
+                    rejection
+                        .suggestion
+                        .as_ref()
+                        .map(|suggestion| format!("; suggestion: {suggestion}"))
+                        .unwrap_or_default()
+                ),
+            );
+        }
+    }
     Ok(candidates)
 }
 
@@ -21504,6 +21620,22 @@ async fn download_provider_artifact(
     downloads_dir: &Path,
     selected: &ProviderCandidate,
 ) -> Result<ProviderArtifactPaths> {
+    let args = args.clone();
+    let downloads_dir = downloads_dir.to_path_buf();
+    let selected = selected.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        download_provider_artifact_blocking(&args, &downloads_dir, &selected)
+    })
+    .await
+    .context("provider artifact download worker panicked")?;
+    result
+}
+
+fn download_provider_artifact_blocking(
+    args: &ProviderStartArgs,
+    downloads_dir: &Path,
+    selected: &ProviderCandidate,
+) -> Result<ProviderArtifactPaths> {
     require_provider_merkle_artifact(selected)?;
     let primary = if let Some(path) = &args.artifact {
         let source = absolutize(path.clone())?;
@@ -21524,21 +21656,25 @@ async fn download_provider_artifact(
         verify_artifact_sha256(&source, &selected.artifact)?;
         source
     } else {
-        let artifact_file = format!(
-            "{}-{}",
-            safe_path_component(&selected.enclave.enclave_id),
-            safe_path_component(&selected.artifact_name)
-        );
+        let artifact_file = provider_primary_cache_file(selected);
         let destination = downloads_dir.join(artifact_file);
-        if destination.exists() {
-            let merkle = build_merkle_manifest(&destination, args.chunk_size)?;
-            if merkle.root == selected.enclave.artifact_root
-                && artifact_sha256_matches(&destination, &selected.artifact)?
-            {
-                destination
-            } else {
-                download_provider_primary_artifact(args, selected, destination)?
-            }
+        if cached_provider_file_matches(
+            &destination,
+            args.chunk_size,
+            &selected.enclave.artifact_root,
+            selected.artifact.source_sha256.as_deref(),
+            selected.artifact.weights_bytes,
+        )? {
+            destination
+        } else if let Some(cached) = find_cached_provider_download(
+            downloads_dir,
+            args.chunk_size,
+            &selected.enclave.artifact_root,
+            selected.artifact.source_sha256.as_deref(),
+            selected.artifact.weights_bytes,
+            &[&selected.artifact_name],
+        )? {
+            cached
         } else {
             download_provider_primary_artifact(args, selected, destination)?
         }
@@ -21615,20 +21751,26 @@ fn download_provider_sidecar_artifact(
             sidecar.artifact_root_kind
         );
     }
-    let artifact_file = format!(
-        "{}-{}-{}",
-        safe_path_component(&selected.enclave.enclave_id),
-        safe_path_component(&selected.artifact_name),
-        safe_path_component(name)
-    );
+    let artifact_file = provider_sidecar_cache_file(selected, name, ledger_sidecar);
     let destination = downloads_dir.join(artifact_file);
-    if destination.exists() {
-        let merkle = build_merkle_manifest(&destination, args.chunk_size)?;
-        if merkle.root == ledger_sidecar.artifact_root
-            && file_sha256_hex(&destination)?.eq_ignore_ascii_case(&sidecar.source_sha256)
-        {
-            return Ok(destination);
-        }
+    if cached_provider_file_matches(
+        &destination,
+        args.chunk_size,
+        &ledger_sidecar.artifact_root,
+        Some(&sidecar.source_sha256),
+        ledger_sidecar.weights_bytes,
+    )? {
+        return Ok(destination);
+    }
+    if let Some(cached) = find_cached_provider_download(
+        downloads_dir,
+        args.chunk_size,
+        &ledger_sidecar.artifact_root,
+        Some(&sidecar.source_sha256),
+        ledger_sidecar.weights_bytes,
+        &[&selected.artifact_name, name],
+    )? {
+        return Ok(cached);
     }
     let source = if sidecar.source.kind == "huggingface" {
         DownloadSource::Http {
@@ -21661,6 +21803,99 @@ fn download_provider_sidecar_artifact(
         );
     }
     Ok(destination)
+}
+
+fn provider_primary_cache_file(selected: &ProviderCandidate) -> String {
+    let sha = selected
+        .artifact
+        .source_sha256
+        .as_deref()
+        .unwrap_or("no-source-sha256");
+    format!(
+        "root-{}-sha-{}-{}",
+        safe_path_component(&selected.enclave.artifact_root),
+        safe_path_component(sha),
+        safe_path_component(&selected.artifact_name)
+    )
+}
+
+fn provider_sidecar_cache_file(
+    selected: &ProviderCandidate,
+    name: &str,
+    sidecar: &LedgerArtifactSidecar,
+) -> String {
+    format!(
+        "root-{}-sha-{}-{}-{}",
+        safe_path_component(&sidecar.artifact_root),
+        safe_path_component(&sidecar.source_sha256),
+        safe_path_component(&selected.artifact_name),
+        safe_path_component(name)
+    )
+}
+
+fn cached_provider_file_matches(
+    path: &Path,
+    chunk_size: usize,
+    expected_root: &str,
+    expected_sha256: Option<&str>,
+    expected_bytes: u64,
+) -> Result<bool> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    if expected_bytes > 0 && metadata.len() != expected_bytes {
+        return Ok(false);
+    }
+    let merkle = build_merkle_manifest(path, chunk_size)?;
+    if merkle.root != expected_root {
+        return Ok(false);
+    }
+    if let Some(expected_sha256) = expected_sha256 {
+        if !file_sha256_hex(&path.to_path_buf())?.eq_ignore_ascii_case(expected_sha256) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn find_cached_provider_download(
+    downloads_dir: &Path,
+    chunk_size: usize,
+    expected_root: &str,
+    expected_sha256: Option<&str>,
+    expected_bytes: u64,
+    name_hints: &[&str],
+) -> Result<Option<PathBuf>> {
+    let Ok(entries) = fs::read_dir(downloads_dir) else {
+        return Ok(None);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.ends_with(".part")
+            || !name_hints
+                .iter()
+                .all(|hint| file_name.contains(&safe_path_component(hint)))
+        {
+            continue;
+        }
+        if cached_provider_file_matches(
+            &path,
+            chunk_size,
+            expected_root,
+            expected_sha256,
+            expected_bytes,
+        )? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 fn require_provider_merkle_artifact(selected: &ProviderCandidate) -> Result<()> {
@@ -21757,12 +21992,13 @@ fn seal_provider_artifact(
     options.chunk_size = chunk_size;
     options.expected_merkle_root = Some(key_context.artifact_root.clone());
     let report = seal_artifact(&options)?;
+    let manifest = read_sealed_manifest(&report.store_dir)?;
     Ok(DownloadReport {
         destination: report.store_dir,
         resumed_from: 0,
         bytes_written: report.total_bytes,
         total_bytes: report.total_bytes,
-        merkle: build_merkle_manifest(artifact_path, chunk_size)?,
+        merkle: manifest.merkle,
     })
 }
 
@@ -28248,6 +28484,79 @@ mod tests {
     }
 
     #[test]
+    fn provider_candidates_allow_unknown_dedicated_vram_when_backend_probe_passes() {
+        let gguf_root = "aa".repeat(32);
+        let trt_root = "bb".repeat(32);
+        let mut catalog = test_catalog(&gguf_root);
+        let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        trt_artifact.engine = "trt-llm".to_owned();
+        trt_artifact.path = "checkpoint.nvfp4.safetensors".to_owned();
+        trt_artifact.artifact_root = trt_root.clone();
+        trt_artifact.min_compute_cap = Some("10.0".to_owned());
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), trt_artifact);
+        catalog.models[0]
+            .requirements
+            .backends
+            .push("trt-llm".to_owned());
+        catalog.models[0].requirements.min_vram_gb_full_offload = 4;
+
+        let mut contract = test_contract(&gguf_root);
+        let mut trt_enclave = contract.enclaves[0].clone();
+        trt_enclave.enclave_id = "22".repeat(32);
+        trt_enclave.backend = "trt-llm".to_owned();
+        trt_enclave.artifact_root = trt_root;
+        trt_enclave.artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        trt_enclave.caps = json!({
+            "chat": true,
+            "tools": false,
+            "json": true,
+            "ctx": 8192,
+            "tp_degree": 1
+        });
+        contract.enclaves.push(trt_enclave);
+        let room_id = "dd".repeat(16);
+        contract.rooms.push(LedgerRoom {
+            room_id: room_id.clone(),
+            sidechannel: format!("mx/room/{room_id}"),
+            enclave_id: Some("22".repeat(32)),
+            model_id: "test/model@4bit".to_owned(),
+            label: "trt".to_owned(),
+            status: "open".to_owned(),
+            creator_role: Some("admin".to_owned()),
+        });
+        contract.prices.push(LedgerPriceSchedule {
+            enclave_id: "22".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            denom: "mu_usd".to_owned(),
+            current: Some(LedgerPriceRecord {
+                ver: 1,
+                denom: "mu_usd".to_owned(),
+                rate_map: text_generation_rate_map(1, 2),
+                per_req_mu: 0,
+                min_session_mu: 0,
+                effective_at: 0,
+                set_by_role: Some("admin".to_owned()),
+            }),
+            pending: None,
+        });
+
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.gpus.truncate(1);
+        hardware.gpus[0].memory_bytes = None;
+        let args = test_provider_start_args();
+
+        let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.enclave.backend == "trt-llm"));
+        let selected = select_provider_candidate(&candidates, None).unwrap();
+        assert_eq!(selected.enclave.backend, "trt-llm");
+        assert_eq!(selected.artifact_name, "nvfp4");
+    }
+
+    #[test]
     fn provider_candidates_refuse_models_above_installed_app_version() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -31027,6 +31336,12 @@ mod tests {
             "secret",
             "--rail",
             "tnk",
+            "--canary-probe-min-interval-sessions",
+            "1",
+            "--canary-probe-max-interval-sessions",
+            "1",
+            "--canary-probe-epoch",
+            "7",
         ])
         .unwrap();
         match cli.command {
@@ -31038,6 +31353,9 @@ mod tests {
                 assert_eq!(args.peer_store_name, "terminal");
                 assert_eq!(args.wallet_password.as_deref(), Some("secret"));
                 assert_eq!(args.rail, GatewayLedgerRail::Tnk);
+                assert_eq!(args.canary_probe_min_interval_sessions, Some(1));
+                assert_eq!(args.canary_probe_max_interval_sessions, Some(1));
+                assert_eq!(args.canary_probe_epoch, Some(7));
             }
             other => panic!("expected use command, got {other:?}"),
         }
