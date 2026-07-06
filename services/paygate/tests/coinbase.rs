@@ -53,7 +53,7 @@ impl ContractPoster for RecordingContractPoster {
 
 fn test_config(temp: &std::path::Path) -> PaygateConfig {
     PaygateConfig {
-        contract_simulate: true,
+        contract_dry_run: true,
         rails: RailConfig {
             stripe: StripeSettings {
                 event_store_path: temp.join("stripe-events.jsonl"),

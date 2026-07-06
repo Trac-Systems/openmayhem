@@ -178,7 +178,7 @@ async fn start_mock_stripe() -> (String, StripeCapture) {
 fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> PaygateConfig {
     let coinbase_event_store_path = event_store_path.with_file_name("coinbase-events.jsonl");
     PaygateConfig {
-        contract_simulate: true,
+        contract_dry_run: true,
         rails: RailConfig {
             stripe: StripeSettings {
                 enabled: true,

@@ -89,8 +89,6 @@ pub enum GatewayError {
     HardwareQuoteEvidenceMissing,
     #[error("hardware quote binding mismatch: expected {expected}, got {actual}")]
     HardwareQuoteBindingMismatch { expected: String, actual: String },
-    #[error("mock hardware quotes are disabled")]
-    MockHardwareQuoteDisabled,
     #[error("hardware quote kind {kind} is not verified by this build")]
     HardwareQuoteUnsupported { kind: String },
     #[error("hardware quote kind {kind} requires a trusted verifier root")]
@@ -145,7 +143,6 @@ pub struct AttestationVerificationRequest<'a> {
     pub now_ts: u64,
     pub max_report_age_secs: u64,
     pub max_report_clock_skew_secs: u64,
-    pub allow_mock_hardware_quote: bool,
     pub trusted_apple_app_attest_jwks: Option<&'a Value>,
     pub trusted_nvidia_gb10_device_jwks: Option<&'a Value>,
     pub trusted_nvidia_nras_jwks: Option<&'a Value>,
@@ -278,7 +275,6 @@ impl<'a> AttestationVerificationRequest<'a> {
             now_ts,
             max_report_age_secs: DEFAULT_MAX_REPORT_AGE_SECS,
             max_report_clock_skew_secs: DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS,
-            allow_mock_hardware_quote: false,
             trusted_apple_app_attest_jwks: None,
             trusted_nvidia_gb10_device_jwks: None,
             trusted_nvidia_nras_jwks: None,
@@ -549,8 +545,6 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
             &expected,
             request.report,
         ),
-        HardwareQuoteKind::MockDeviceIdentity if request.allow_mock_hardware_quote => Ok(()),
-        HardwareQuoteKind::MockDeviceIdentity => Err(GatewayError::MockHardwareQuoteDisabled),
         HardwareQuoteKind::AmdSevSnpVcek => Err(GatewayError::HardwareQuoteUnsupported {
             kind: "amd_sev_snp_vcek".to_owned(),
         }),

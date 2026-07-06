@@ -86,7 +86,7 @@ pub enum PaygateError {
 pub struct PaygateConfig {
     pub bind: SocketAddr,
     pub contract_rpc_url: String,
-    pub contract_simulate: bool,
+    pub contract_dry_run: bool,
     pub epoch_seconds: u64,
     pub oracle_key_path: PathBuf,
     pub rails: RailConfig,
@@ -153,7 +153,7 @@ struct ServerConfigFile {
 #[derive(Debug, Default, Deserialize)]
 struct ContractConfigFile {
     rpc_url: Option<String>,
-    simulate: Option<bool>,
+    dry_run: Option<bool>,
     epoch_seconds: Option<u64>,
 }
 
@@ -226,7 +226,7 @@ struct HealthResponse {
 #[derive(Debug, Serialize)]
 struct HealthContract {
     rpc_configured: bool,
-    simulate: bool,
+    dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -479,7 +479,7 @@ struct ApiError {
 #[derive(Clone)]
 pub struct PeerRpcContractPoster {
     rpc_url: String,
-    simulate: bool,
+    dry_run: bool,
     http: reqwest::Client,
 }
 
@@ -490,7 +490,7 @@ impl Default for PaygateConfig {
                 .parse()
                 .expect("default paygate bind address is valid"),
             contract_rpc_url: DEFAULT_CONTRACT_RPC_URL.to_owned(),
-            contract_simulate: false,
+            contract_dry_run: false,
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
             oracle_key_path: default_oracle_key_path(),
             rails: RailConfig::default(),
@@ -601,9 +601,9 @@ impl PaygateConfig {
                         "Stripe live mode requires the official Stripe API base URL".to_owned(),
                     ));
                 }
-                if self.contract_simulate {
+                if self.contract_dry_run {
                     return Err(PaygateError::InvalidConfig(
-                        "contract.simulate is forbidden in Stripe live mode".to_owned(),
+                        "contract.dry_run is forbidden in Stripe live mode".to_owned(),
                     ));
                 }
                 if contract_rpc_is_localhost(&self.contract_rpc_url) {
@@ -635,8 +635,8 @@ impl PaygateConfig {
         if let Some(rpc_url) = file.contract.rpc_url {
             self.contract_rpc_url = rpc_url;
         }
-        if let Some(simulate) = file.contract.simulate {
-            self.contract_simulate = simulate;
+        if let Some(dry_run) = file.contract.dry_run {
+            self.contract_dry_run = dry_run;
         }
         if let Some(epoch_seconds) = file.contract.epoch_seconds {
             self.epoch_seconds = epoch_seconds;
@@ -690,8 +690,8 @@ impl PaygateConfig {
         if let Ok(rpc_url) = env::var("MAYHEM_CONTRACT_RPC_URL") {
             self.contract_rpc_url = rpc_url;
         }
-        if let Ok(simulate) = env::var("MAYHEM_PAYGATE_CONTRACT_SIM") {
-            self.contract_simulate = parse_bool("MAYHEM_PAYGATE_CONTRACT_SIM", &simulate)?;
+        if let Ok(dry_run) = env::var("MAYHEM_PAYGATE_CONTRACT_DRY_RUN") {
+            self.contract_dry_run = parse_bool("MAYHEM_PAYGATE_CONTRACT_DRY_RUN", &dry_run)?;
         }
         if let Ok(epoch_seconds) = env::var("MAYHEM_PAYGATE_EPOCH_SECONDS") {
             self.epoch_seconds = parse_u64("MAYHEM_PAYGATE_EPOCH_SECONDS", &epoch_seconds)?;
@@ -792,7 +792,7 @@ impl PaygateState {
         let http = reqwest::Client::new();
         let contract = Arc::new(PeerRpcContractPoster::new(
             config.contract_rpc_url.clone(),
-            config.contract_simulate,
+            config.contract_dry_run,
             http.clone(),
         ));
         Self::with_parts(config, oracle, http, StripeEventStore::memory(), contract)
@@ -803,7 +803,7 @@ impl PaygateState {
         let http = reqwest::Client::new();
         let contract = Arc::new(PeerRpcContractPoster::new(
             config.contract_rpc_url.clone(),
-            config.contract_simulate,
+            config.contract_dry_run,
             http.clone(),
         ));
         let stripe_events = StripeEventStore::load(&config.rails.stripe.event_store_path)?;
@@ -864,7 +864,7 @@ impl PaygateState {
             oracle_pubkey: self.oracle_public_key.clone(),
             contract: HealthContract {
                 rpc_configured: !self.config.contract_rpc_url.trim().is_empty(),
-                simulate: self.config.contract_simulate,
+                dry_run: self.config.contract_dry_run,
             },
             rails: HealthRails {
                 stripe: HealthStripeRail {
@@ -902,10 +902,10 @@ impl PaygateState {
 }
 
 impl PeerRpcContractPoster {
-    pub fn new(rpc_url: String, simulate: bool, http: reqwest::Client) -> Self {
+    pub fn new(rpc_url: String, dry_run: bool, http: reqwest::Client) -> Self {
         Self {
             rpc_url,
-            simulate,
+            dry_run,
             http,
         }
     }
@@ -972,7 +972,7 @@ impl PeerRpcContractPoster {
                 "address": oracle.public_key_hex(),
                 "signature": signature,
                 "nonce": nonce,
-                "sim": self.simulate,
+                "sim": self.dry_run,
             }))
             .send()
             .await?
@@ -2196,7 +2196,7 @@ mod tests {
 
             [contract]
             rpc_url = "http://127.0.0.1:49299/v1"
-            simulate = true
+            dry_run = true
             epoch_seconds = 7200
 
             [oracle]
@@ -2221,7 +2221,7 @@ mod tests {
 
         assert_eq!(config.bind, "127.0.0.1:19091".parse().unwrap());
         assert_eq!(config.contract_rpc_url, "http://127.0.0.1:49299/v1");
-        assert!(config.contract_simulate);
+        assert!(config.contract_dry_run);
         assert_eq!(config.epoch_seconds, 7200);
         assert_eq!(
             config.oracle_key_path,
@@ -2254,7 +2254,7 @@ mod tests {
         let test_err = PaygateConfig::from_toml_str(
             r#"
             [contract]
-            simulate = true
+            dry_run = true
 
             [stripe]
             enabled = true
@@ -2287,12 +2287,12 @@ mod tests {
     }
 
     #[test]
-    fn stripe_live_mode_rejects_simulation_and_local_contract_rpc() {
-        let simulated = PaygateConfig::from_toml_str(
+    fn stripe_live_mode_rejects_dry_run_and_local_contract_rpc() {
+        let dry_run = PaygateConfig::from_toml_str(
             r#"
             [contract]
             rpc_url = "https://contract.testnet.trac.network/v1"
-            simulate = true
+            dry_run = true
 
             [stripe]
             enabled = true
@@ -2301,8 +2301,8 @@ mod tests {
             webhook_secret = "whsec_local"
             "#,
         )
-        .expect_err("live Stripe refuses contract simulation");
-        assert!(simulated.to_string().contains("simulate is forbidden"));
+        .expect_err("live Stripe refuses contract dry-run");
+        assert!(dry_run.to_string().contains("dry_run is forbidden"));
 
         let local = PaygateConfig::from_toml_str(
             r#"

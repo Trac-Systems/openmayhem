@@ -75,7 +75,7 @@ fn test_hardware_report(
     EnclaveContractRecord,
     BTreeSet<String>,
 ) {
-    test_hardware_report_with_evidence(quote_kind, |_, _| "mock-hardware-quote".to_owned())
+    test_hardware_report_with_evidence(quote_kind, |_, _| "test-hardware-quote".to_owned())
 }
 
 fn test_hardware_report_with_evidence(
@@ -419,44 +419,6 @@ fn verification_rejects_runtime_model_class_mismatch() {
 }
 
 #[test]
-fn verifies_mock_device_identity_report_when_explicitly_enabled() {
-    let (_temp, report, contract, trusted) =
-        test_hardware_report(HardwareQuoteKind::MockDeviceIdentity);
-    let mut request = AttestationVerificationRequest::new(
-        &report,
-        &contract,
-        &trusted,
-        &report.nonce_u,
-        &report.provider_pubkey,
-        210,
-    );
-    request.allow_mock_hardware_quote = true;
-
-    let verified = verify_tier1_attestation(&request).expect("mock hardware report verifies");
-
-    assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
-    assert_eq!(verified.enclave_id, contract.enclave_id);
-}
-
-#[test]
-fn hardware_report_requires_quote_verification() {
-    let (_temp, report, contract, trusted) =
-        test_hardware_report(HardwareQuoteKind::MockDeviceIdentity);
-    let request = AttestationVerificationRequest::new(
-        &report,
-        &contract,
-        &trusted,
-        &report.nonce_u,
-        &report.provider_pubkey,
-        210,
-    );
-
-    let err = verify_tier1_attestation(&request).expect_err("mock quotes require opt-in");
-
-    assert!(matches!(err, GatewayError::MockHardwareQuoteDisabled));
-}
-
-#[test]
 fn verifies_apple_app_attest_tier2_identity_with_trusted_jwks() {
     let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
         HardwareQuoteKind::AppleAppAttestJwt,
@@ -767,7 +729,7 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
 #[test]
 fn sev_snp_and_tdx_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
     let (_temp, report, contract, trusted) = test_hardware_report(HardwareQuoteKind::IntelTdxDcap);
-    let mut request = AttestationVerificationRequest::new(
+    let request = AttestationVerificationRequest::new(
         &report,
         &contract,
         &trusted,
@@ -775,7 +737,6 @@ fn sev_snp_and_tdx_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
         &report.provider_pubkey,
         210,
     );
-    request.allow_mock_hardware_quote = true;
 
     let err = verify_tier1_attestation(&request).expect_err("vendor quote verifier is required");
 

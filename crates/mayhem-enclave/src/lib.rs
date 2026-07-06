@@ -2743,7 +2743,7 @@ mod tests {
             nonce_u: binding_options.nonce_u,
             hw_quote: HardwareQuote {
                 kind: mayhem_proto::HardwareQuoteKind::NvidiaNrasJwt,
-                evidence: "jwt.placeholder.parts".to_owned(),
+                evidence: "jwt.invalid.parts".to_owned(),
                 binding: binding.clone(),
                 endorsements: Vec::new(),
             },

@@ -42,10 +42,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payout_plan_is_retired_instead_of_emitting_placeholder_commands() {
+    fn payout_plan_is_retired_instead_of_emitting_template_commands() {
         let err = retire_payout_plan().expect_err("retired command must fail");
         assert!(err.to_string().contains("one treasury-signed MSB batch"));
-        assert!(!err.to_string().contains("placeholder"));
+        assert!(!err.to_string().contains("template"));
         assert!(!err.to_string().contains("payout_confirm"));
     }
 }

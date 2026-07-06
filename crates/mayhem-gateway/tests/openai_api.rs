@@ -2614,18 +2614,16 @@ async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
 }
 
 #[tokio::test]
-async fn dashboard_component_gallery_uses_local_design_system_and_font_asset() {
+async fn dashboard_uses_local_design_system_and_font_asset() {
     let state = GatewayState::from_embedded_catalog();
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
         .expect("dashboard url is rooted at gateway");
-    let component_path =
-        dashboard_path.replacen("/mayhem/dashboard", "/mayhem/dashboard/components", 1);
     let app = openai_router(state);
 
     let (status, headers, bytes) =
-        raw_request(app.clone(), Method::GET, &component_path, None).await;
+        raw_request(app.clone(), Method::GET, dashboard_path, None).await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("dashboard html");
     for expected in [
@@ -2636,11 +2634,10 @@ async fn dashboard_component_gallery_uses_local_design_system_and_font_asset() {
         "class=\"status-dot\"",
         "class=\"copy-chip\"",
         "class=\"count-chip\"",
-        "class=\"empty-state\"",
-        "class=\"chart-shell\"",
     ] {
         assert!(body.contains(expected), "missing {expected}");
     }
+    assert!(!body.contains("/mayhem/dashboard/components"));
     assert_no_external_urls(&body);
 
     let cookie = headers

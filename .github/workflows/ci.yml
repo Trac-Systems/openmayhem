@@ -21,6 +21,9 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
 
+      - name: Sellable surface audit
+        run: node scripts/i3-e15-sellable-surface-audit.mjs
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

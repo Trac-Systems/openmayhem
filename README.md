@@ -178,6 +178,26 @@ The model catalog is admin-canonical. Users and providers should discover curren
 
 Enclave model bundles are separate release artifacts. They are not committed as repo blobs; production catalog entries point at admin-approved downloads with hashes, sizes, signatures, and provenance.
 
+## What We Actually Sell At Launch
+
+This is the launch sellable surface. Dev catalog entries may exist for smoke work, but users and providers should not treat them as launch products.
+
+<!-- MAYHEM-LAUNCH-SURFACE:START -->
+| Model ID | Class | Routes | Artifacts / engines | Verified path | Launch attestation |
+|----------|-------|--------|---------------------|---------------|--------------------|
+| `qwen/qwen2.5-1.5b-instruct@small` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp; `nvfp4` / trt-llm; `vllm-fp16` / vllm | I3-E11/I3-E14 real GGUF, TensorRT-LLM, and vLLM chat/tool paths | Tier 1 launch |
+| `meta/llama-3.1-8b-instruct@4bit` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp; `mlx-4bit` / mlx | I3-E10 catalog/backend compatibility and launch source checks | Tier 1 launch |
+| `google/gemma-3-12b-it@4bit` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp; `mlx-4bit` / mlx | I3-E10 catalog/backend compatibility and launch source checks | Tier 1 launch |
+| `deepseek/deepseek-r1-distill-qwen-14b@4bit` | Text chat, JSON, tools | `/v1/chat/completions`, `/v1/completions` | `gguf-q4_k_m` / llama.cpp | I3-E10 catalog/backend compatibility and launch source checks | Tier 1 launch |
+| `baai/bge-small-en-v1.5@gguf-q8_0` | Embedding | `/v1/embeddings` | `gguf-q8_0` / llama.cpp | I3-E6 real embedding path | Tier 1 launch |
+| `huggingfacetb/smolvlm2-256m-video-instruct@gguf-q8_0` | Vision chat | `/v1/chat/completions`, `/v1/completions` | `gguf-q8_0` / llama.cpp | I3-E7/E12/E13 real vision chat path | Tier 1 launch |
+| `concedo/sdxs-512-tinysd-distilled@gguf-q8_0` | Image generation | `/v1/images/generations` | `gguf-q8_0` / stable-diffusion.cpp | I3-E8 real image-generation path | Tier 1 launch |
+| `openai/whisper-tiny-en@ggml` | Speech to text | `/v1/audio/transcriptions` | `ggml-tiny-en` / whisper.cpp | I3-E9 real STT path | Tier 1 launch |
+| `rhasspy/piper-en-us-lessac-low@onnx` | Text to speech | `/v1/audio/speech` | `onnx-lessac-low` / piper | I3-E9 real TTS path | Tier 1 launch |
+<!-- MAYHEM-LAUNCH-SURFACE:END -->
+
+Higher trust tiers are not sold at launch until the hardware quote task proves them on real hardware. Tool support is route-specific: llama.cpp and vLLM routes can serve tool/JSON paths where listed; MLX and TensorRT-LLM routes de-advertise tools until their real constrained-decoding paths exist.
+
 ## Model Classes And Routes
 
 Catalog entries carry a `model_class` and admin-defined `rate_map`. Text models price token units, embeddings price embedding/input units, image models price image/step units, and audio routes price their own metered dimensions. The gateway exposes the matching OpenAI-compatible route families:

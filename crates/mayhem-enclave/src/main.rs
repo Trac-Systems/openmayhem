@@ -252,7 +252,6 @@ enum HardwareQuoteKindArg {
     NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
     NvidiaNvtrustOfflineJwt,
-    MockDeviceIdentity,
 }
 
 impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
@@ -266,7 +265,6 @@ impl From<HardwareQuoteKindArg> for HardwareQuoteKind {
             HardwareQuoteKindArg::NvidiaNvtrustOfflineJwt => {
                 HardwareQuoteKind::NvidiaNvtrustOfflineJwt
             }
-            HardwareQuoteKindArg::MockDeviceIdentity => HardwareQuoteKind::MockDeviceIdentity,
         }
     }
 }
@@ -280,7 +278,6 @@ impl HardwareQuoteKindArg {
             HardwareQuoteKindArg::NvidiaGb10DeviceJwt => "nvidia_gb10_device_jwt",
             HardwareQuoteKindArg::NvidiaNrasJwt => "nvidia_nras_jwt",
             HardwareQuoteKindArg::NvidiaNvtrustOfflineJwt => "nvidia_nvtrust_offline_jwt",
-            HardwareQuoteKindArg::MockDeviceIdentity => "mock_device_identity",
         }
     }
 }

@@ -99,15 +99,12 @@ pub enum HardwareQuoteKind {
     NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
     NvidiaNvtrustOfflineJwt,
-    MockDeviceIdentity,
 }
 
 impl HardwareQuoteKind {
     pub fn attestation_tier(&self) -> u8 {
         match self {
-            Self::AppleAppAttestJwt | Self::NvidiaGb10DeviceJwt | Self::MockDeviceIdentity => {
-                TIER2_DEVICE_IDENTITY_TIER
-            }
+            Self::AppleAppAttestJwt | Self::NvidiaGb10DeviceJwt => TIER2_DEVICE_IDENTITY_TIER,
             Self::AmdSevSnpVcek
             | Self::IntelTdxDcap
             | Self::NvidiaNrasJwt
@@ -653,8 +650,8 @@ mod tests {
         };
         let base = hardware_quote_binding(&body).unwrap();
         body.hw_quote = Some(HardwareQuote {
-            kind: HardwareQuoteKind::MockDeviceIdentity,
-            evidence: "mock".to_owned(),
+            kind: HardwareQuoteKind::NvidiaGb10DeviceJwt,
+            evidence: "jwt.invalid.parts".to_owned(),
             binding: base.clone(),
             endorsements: Vec::new(),
         });
