@@ -18587,6 +18587,18 @@ struct ProviderArtifactPaths {
     sidecars: BTreeMap<String, PathBuf>,
 }
 
+const TRT_CHECKPOINT_REQUIRED_SIDECARS: [(&str, &str); 3] = [
+    ("trt_checkpoint_config", "config.json"),
+    ("trt_tokenizer_json", "tokenizer.json"),
+    ("trt_tokenizer_config", "tokenizer_config.json"),
+];
+const TRT_CHECKPOINT_OPTIONAL_SIDECARS: [(&str, &str); 3] = [
+    ("trt_generation_config", "generation_config.json"),
+    ("trt_vocab_json", "vocab.json"),
+    ("trt_merges_txt", "merges.txt"),
+];
+const TRT_ENGINE_CONFIG_SIDECAR: &str = "trt_engine_config";
+
 struct HeartbeatContext<'a> {
     args: &'a ProviderStartArgs,
     config: &'a Option<MayhemConfig>,
@@ -23158,7 +23170,14 @@ fn provider_engine_load_config(
             selected.model.caps.ctx_max, selected.model.model_id
         )
     })?;
-    let artifact_path = artifact_paths.primary.as_path();
+    let mut artifact_path_buf = artifact_paths.primary.clone();
+    let mut materialized_trt_engine_dir = None;
+    if selected.artifact.engine == "trt-llm" {
+        let layout = materialize_trt_llm_artifacts(selected, artifact_paths)?;
+        artifact_path_buf = layout.checkpoint_dir;
+        materialized_trt_engine_dir = Some(layout.engine_dir);
+    }
+    let artifact_path = artifact_path_buf.as_path();
     let artifact = match selected.artifact.engine.as_str() {
         "llama.cpp" => ModelArtifact::gguf(artifact_path),
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
@@ -23205,7 +23224,8 @@ fn provider_engine_load_config(
         );
     }
     if selected.artifact.engine == "trt-llm" {
-        config.trt_engine_dir = Some(trt_engine_cache_dir(artifact_path, &selected.artifact_name));
+        config.trt_engine_dir = materialized_trt_engine_dir
+            .or_else(|| Some(trt_engine_cache_dir(artifact_path, &selected.artifact_name)));
         config.trt_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
         if let Some(max_batch_size) = enclave_max_batch_size(&selected.enclave.caps)? {
             config.batch_size = max_batch_size;
@@ -23218,6 +23238,161 @@ fn provider_engine_load_config(
         config.trt_require_engine_dir = true;
     }
     Ok(config)
+}
+
+struct TrtLlmMaterializedLayout {
+    checkpoint_dir: PathBuf,
+    engine_dir: PathBuf,
+}
+
+fn materialize_trt_llm_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<TrtLlmMaterializedLayout> {
+    let checkpoint_dir = if artifact_paths.primary.is_dir() {
+        artifact_paths.primary.clone()
+    } else {
+        let checkpoint_dir =
+            trt_checkpoint_cache_dir(&artifact_paths.primary, &selected.artifact_name);
+        fs::create_dir_all(&checkpoint_dir).with_context(|| {
+            format!(
+                "creating TensorRT-LLM checkpoint layout {}",
+                checkpoint_dir.display()
+            )
+        })?;
+        let payload_name = catalog_path_file_name(
+            &selected.artifact.path,
+            "TensorRT-LLM primary checkpoint artifact",
+        )?;
+        link_or_copy_file(&artifact_paths.primary, &checkpoint_dir.join(payload_name))?;
+        checkpoint_dir
+    };
+
+    for (sidecar, filename) in TRT_CHECKPOINT_REQUIRED_SIDECARS {
+        materialize_trt_sidecar(
+            selected,
+            artifact_paths,
+            sidecar,
+            &checkpoint_dir,
+            filename,
+            true,
+        )?;
+    }
+    for (sidecar, filename) in TRT_CHECKPOINT_OPTIONAL_SIDECARS {
+        materialize_trt_sidecar(
+            selected,
+            artifact_paths,
+            sidecar,
+            &checkpoint_dir,
+            filename,
+            false,
+        )?;
+    }
+
+    let engine_dir = trt_engine_cache_dir(&artifact_paths.primary, &selected.artifact_name);
+    fs::create_dir_all(&engine_dir).with_context(|| {
+        format!(
+            "creating TensorRT-LLM engine layout {}",
+            engine_dir.display()
+        )
+    })?;
+    materialize_trt_sidecar(
+        selected,
+        artifact_paths,
+        TRT_ENGINE_CONFIG_SIDECAR,
+        &engine_dir,
+        "config.json",
+        true,
+    )?;
+    let tp_degree = enclave_tp_degree(&selected.enclave.caps)?;
+    for rank in 0..tp_degree {
+        let sidecar = format!("trt_engine_rank{rank}");
+        let filename = format!("rank{rank}.engine");
+        materialize_trt_sidecar(
+            selected,
+            artifact_paths,
+            &sidecar,
+            &engine_dir,
+            &filename,
+            true,
+        )?;
+    }
+
+    Ok(TrtLlmMaterializedLayout {
+        checkpoint_dir,
+        engine_dir,
+    })
+}
+
+fn materialize_trt_sidecar(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+    sidecar: &str,
+    target_dir: &Path,
+    filename: &str,
+    required: bool,
+) -> Result<()> {
+    let destination = target_dir.join(filename);
+    if destination.is_file() {
+        return Ok(());
+    }
+    let Some(source) = artifact_paths.sidecars.get(sidecar) else {
+        if required {
+            bail!(
+                "TensorRT-LLM artifact {}/{} requires admin catalog sidecar {} -> {}",
+                selected.model.model_id,
+                selected.artifact_name,
+                sidecar,
+                filename
+            );
+        }
+        return Ok(());
+    };
+    link_or_copy_file(source, &destination).with_context(|| {
+        format!(
+            "materializing TensorRT-LLM sidecar {} at {}",
+            sidecar,
+            destination.display()
+        )
+    })
+}
+
+fn catalog_path_file_name(path: &str, label: &str) -> Result<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("{label} path {path} has no file name"))
+}
+
+fn link_or_copy_file(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        bail!("{} is not a file", source.display());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if destination.exists() {
+        if same_canonical_path(source, destination) {
+            return Ok(());
+        }
+        fs::remove_file(destination)
+            .with_context(|| format!("removing stale {}", destination.display()))?;
+    }
+    if fs::hard_link(source, destination).is_err() {
+        fs::copy(source, destination).with_context(|| {
+            format!("copying {} to {}", source.display(), destination.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn same_canonical_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn provider_attestation_runtime_config(
@@ -23256,6 +23431,19 @@ fn trt_engine_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
             .unwrap_or_else(|| PathBuf::from("."))
     };
     base.join(".trtllm-engines")
+        .join(safe_path_component(artifact_name))
+}
+
+fn trt_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
+    let base = if artifact_path.is_dir() {
+        artifact_path.to_path_buf()
+    } else {
+        artifact_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    base.join(".trtllm-checkpoints")
         .join(safe_path_component(artifact_name))
 }
 
@@ -29706,42 +29894,112 @@ mod tests {
         let mut catalog = test_catalog(&root);
         let mut trt_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
         trt_artifact.engine = "trt-llm".to_owned();
-        trt_artifact.path = "checkpoint.nvfp4.safetensors".to_owned();
+        trt_artifact.path = "rank0.safetensors".to_owned();
         trt_artifact.min_compute_cap = Some("10.0".to_owned());
         trt_artifact.notes = Some("NVFP4 Blackwell checkpoint".to_owned());
-        catalog.models[0]
-            .artifacts
-            .insert("nvfp4".to_owned(), trt_artifact);
         catalog.models[0].requirements.backends = vec!["trt-llm".to_owned()];
 
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "trt-llm".to_owned();
-        contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        contract.enclaves[0].artifact_source.path = "rank0.safetensors".to_owned();
         contract.enclaves[0].caps = json!({
-            "tools": true,
+            "tools": false,
             "json": true,
             "ctx": 8192,
-            "tp_degree": 2,
+            "tp_degree": 1,
             "max_batch_size": 4,
             "max_num_tokens": 16384
         });
+        let trt_sidecars = [
+            ("trt_checkpoint_config", "config.json"),
+            ("trt_tokenizer_json", "tokenizer.json"),
+            ("trt_tokenizer_config", "tokenizer_config.json"),
+            ("trt_engine_config", "engine/config.json"),
+            ("trt_engine_rank0", "engine/rank0.engine"),
+        ];
+        for (name, path) in trt_sidecars {
+            trt_artifact.sidecars.insert(
+                name.to_owned(),
+                catalog::CatalogArtifactSidecar {
+                    source: catalog::SourceRef {
+                        kind: "huggingface".to_owned(),
+                        repo: "test/model".to_owned(),
+                        revision: "1".repeat(40),
+                        publisher_key: None,
+                    },
+                    path: path.to_owned(),
+                    artifact_root: "bc".repeat(32),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 12,
+                    source_sha256: "cd".repeat(32),
+                },
+            );
+            contract.enclaves[0].artifact_sidecars.insert(
+                name.to_owned(),
+                LedgerArtifactSidecar {
+                    source: LedgerArtifactSource {
+                        kind: "huggingface".to_owned(),
+                        repo: "test/model".to_owned(),
+                        revision: "1".repeat(40),
+                        path: path.to_owned(),
+                    },
+                    path: path.to_owned(),
+                    artifact_root: "bc".repeat(32),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 12,
+                    source_sha256: "cd".repeat(32),
+                },
+            );
+        }
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), trt_artifact);
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
         let args = test_provider_start_args();
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
+        let temp = test_temp_dir("mayhem-trt-layout");
+        let primary = temp.join("rank0.safetensors");
+        fs::write(&primary, b"checkpoint").unwrap();
+        let sidecar_paths = BTreeMap::from([
+            (
+                "trt_checkpoint_config".to_owned(),
+                temp.join("checkpoint-config.json"),
+            ),
+            ("trt_tokenizer_json".to_owned(), temp.join("tokenizer.json")),
+            (
+                "trt_tokenizer_config".to_owned(),
+                temp.join("tokenizer-config.json"),
+            ),
+            (
+                "trt_engine_config".to_owned(),
+                temp.join("engine-config.json"),
+            ),
+            ("trt_engine_rank0".to_owned(), temp.join("rank0.engine")),
+        ]);
+        for path in sidecar_paths.values() {
+            fs::write(path, b"sidecar").unwrap();
+        }
         let artifact_paths = ProviderArtifactPaths {
-            primary: PathBuf::from("/tmp/admin-approved-checkpoint.safetensors"),
-            sidecars: BTreeMap::new(),
+            primary: primary.clone(),
+            sidecars: sidecar_paths,
         };
         let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+        let checkpoint_dir = temp.join(".trtllm-checkpoints/nvfp4");
+        let engine_dir = temp.join(".trtllm-engines/nvfp4");
 
         assert_eq!(selected.artifact_name, "nvfp4");
         assert_eq!(
             config.artifact.format,
             mayhem_engine::ArtifactFormat::TensorRtLlmCheckpoint
         );
-        assert_eq!(config.trt_tensor_parallel, Some(2));
+        assert_eq!(config.artifact.path, checkpoint_dir);
+        assert!(config.artifact.path.join("rank0.safetensors").is_file());
+        assert!(config.artifact.path.join("config.json").is_file());
+        assert!(config.artifact.path.join("tokenizer.json").is_file());
+        assert!(config.artifact.path.join("tokenizer_config.json").is_file());
+        assert_eq!(config.trt_tensor_parallel, Some(1));
         assert_eq!(config.batch_size, 4);
         assert_eq!(config.ubatch_size, 16384);
         assert_eq!(
@@ -29750,17 +30008,17 @@ mod tests {
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 backend: "trt-llm".to_owned(),
                 ctx: 8192,
-                tp_degree: 2,
+                tp_degree: 1,
                 max_batch_size: Some(4),
                 max_num_tokens: Some(16384),
             }
         );
         assert_eq!(config.trt_kv_cache_dtype, None);
         assert!(config.trt_require_engine_dir);
-        assert_eq!(
-            config.trt_engine_dir,
-            Some(PathBuf::from("/tmp/.trtllm-engines/nvfp4"))
-        );
+        assert_eq!(config.trt_engine_dir, Some(engine_dir.clone()));
+        assert!(engine_dir.join("config.json").is_file());
+        assert!(engine_dir.join("rank0.engine").is_file());
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
