@@ -58,13 +58,13 @@ use mayhem_hwprobe::{
     ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
-    chunk_json_payload, ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule,
-    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
-    validate_ctx_bracket_schedule, AttestationRuntimeConfig, CatalogEnclaveIdentity,
-    CheckpointPolicy, CtxBracketSchedule, PayloadChunk, PayloadChunkManifest, ReceiptAck,
-    ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    chunk_json_payload, ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at,
+    default_ctx_bracket_schedule, reassemble_json_payload, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, supported_receipt_signing_bytes,
+    supported_spend_voucher_signing_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, PayloadChunk,
+    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
     USAGE_STEP,
 };
@@ -93,6 +93,15 @@ const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
+const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+const F13_DEDICATED_MEMORY_RESERVE_BPS: u64 = 1_000;
+const F13_UNIFIED_MEMORY_RESERVE_BPS: u64 = 1_500;
+const F13_DEDICATED_MEMORY_RESERVE_MIN_BYTES: u64 = 2 * GIB_BYTES;
+const F13_UNIFIED_MEMORY_RESERVE_MIN_BYTES: u64 = 4 * GIB_BYTES;
+const F13_MEMORY_RESERVE_FLOOR_BYTES: u64 = GIB_BYTES;
+const F13_DISK_RESERVE_DEFAULT_BYTES: u64 = 10 * GIB_BYTES;
+const F13_DISK_RESERVE_FLOOR_BYTES: u64 = 2 * GIB_BYTES;
+const F13_MEMORY_CLAIM_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
@@ -3763,6 +3772,14 @@ struct ProviderLimitsSetArgs {
     #[arg(long)]
     budget: Option<String>,
 
+    /// Memory reserve kept free before model/KV feasibility math, e.g. 4GB or 15%.
+    #[arg(long, value_name = "GB|%")]
+    memory_reserve: Option<String>,
+
+    /// Disk reserve kept free for downloads/sealed stores, e.g. 20GB.
+    #[arg(long, value_name = "GB")]
+    disk_reserve: Option<String>,
+
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
@@ -3992,6 +4009,14 @@ struct ProviderStartArgs {
     #[arg(long)]
     ctx: Option<u64>,
 
+    /// Memory reserve kept free before model/KV feasibility math, e.g. 4GB or 15%.
+    #[arg(long, value_name = "GB|%")]
+    memory_reserve: Option<String>,
+
+    /// Disk reserve kept free for downloads/sealed stores, e.g. 20GB.
+    #[arg(long, value_name = "GB")]
+    disk_reserve: Option<String>,
+
     /// Local hard cap for concurrently accepted direct sessions. Defaults to the hwprobe cap.
     #[arg(long, value_name = "N")]
     max_sessions: Option<u32>,
@@ -4216,6 +4241,8 @@ struct ConfigProviderLimits {
     serve_budget_mu: Option<u64>,
     serve_budget_units: Option<u64>,
     serve_budget_period_seconds: Option<u64>,
+    memory_reserve: Option<String>,
+    disk_reserve: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19248,6 +19275,20 @@ fn print_provider_limits_report(report: &Value) {
             .and_then(Value::as_u64)
             .unwrap_or(86_400)
     );
+    println!(
+        "memory_reserve: {}",
+        limits
+            .get("memory_reserve")
+            .and_then(Value::as_str)
+            .unwrap_or("auto")
+    );
+    println!(
+        "disk_reserve: {}",
+        limits
+            .get("disk_reserve")
+            .and_then(Value::as_str)
+            .unwrap_or("auto")
+    );
 }
 
 fn attestation_summary_for_model(model: &Value) -> String {
@@ -22076,7 +22117,106 @@ struct ProviderCandidate {
     verdict: BackendVerdict,
     price: Option<LedgerPriceSchedule>,
     served_ctx: u64,
+    feasibility: ProviderCtxFeasibility,
     ctx_bracket_schedule: CtxBracketSchedule,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderCtxFeasibility {
+    requested_ctx: u64,
+    served_ctx: u64,
+    catalog_ctx_max: u64,
+    fallback_applied: bool,
+    message: Option<String>,
+    estimated_required_bytes: u64,
+    estimated_weights_bytes: u64,
+    estimated_kv_bytes: u64,
+    estimated_overhead_bytes: u64,
+    memory_budget: ProviderMemoryBudget,
+}
+
+impl ProviderCtxFeasibility {
+    fn not_applicable(served_ctx: u64, catalog_ctx_max: u64) -> Self {
+        Self {
+            requested_ctx: served_ctx,
+            served_ctx,
+            catalog_ctx_max,
+            fallback_applied: false,
+            message: None,
+            estimated_required_bytes: 0,
+            estimated_weights_bytes: 0,
+            estimated_kv_bytes: 0,
+            estimated_overhead_bytes: 0,
+            memory_budget: ProviderMemoryBudget::not_applicable(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderMemoryBudget {
+    pool: String,
+    source: String,
+    unified: bool,
+    total_bytes: u64,
+    available_bytes: u64,
+    reserve_bytes: u64,
+    claimed_bytes: u64,
+    budget_bytes: u64,
+}
+
+impl ProviderMemoryBudget {
+    fn not_applicable() -> Self {
+        Self {
+            pool: "not_applicable".to_owned(),
+            source: "not_applicable".to_owned(),
+            unified: false,
+            total_bytes: 0,
+            available_bytes: 0,
+            reserve_bytes: 0,
+            claimed_bytes: 0,
+            budget_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderMemoryEstimate {
+    required_bytes: u64,
+    weights_bytes: u64,
+    kv_bytes: u64,
+    overhead_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderMemoryPool {
+    pool: String,
+    source: String,
+    unified: bool,
+    total_bytes: u64,
+    available_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ProviderMemoryClaimRecord {
+    schema_version: u32,
+    pid: u32,
+    provider: String,
+    enclave_id: String,
+    model_id: String,
+    backend: String,
+    served_ctx: u64,
+    claimed_bytes: u64,
+    created_at: u64,
+}
+
+struct ProviderMemoryClaimGuard {
+    path: PathBuf,
+}
+
+impl Drop for ProviderMemoryClaimGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -22674,6 +22814,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     validate_provider_start_security_mode(&args, cfg!(debug_assertions))?;
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
+    args.home = Some(home.clone());
     let config = read_mayhem_config(&home)?;
     if args.engine_backend == "auto" {
         if let Some(config_backend) = config
@@ -22685,6 +22826,9 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             args.engine_backend = config_backend;
         }
     }
+    apply_provider_resource_config_defaults(&mut args, config.as_ref());
+    let (disk_reserve_bytes, disk_reserve_source) =
+        provider_disk_reserve_bytes(args.disk_reserve.as_deref())?;
     let rpc_url = args
         .rpc_url
         .clone()
@@ -22775,6 +22919,14 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             selected.served_ctx, selected.model.caps.ctx_max
         ),
     );
+    if let Some(message) = &selected.feasibility.message {
+        provider_log(&args, message);
+    }
+    let _memory_claim_guard = if args.serve_sessions {
+        write_provider_memory_claim(&home, &wallet.public_key, &selected)?
+    } else {
+        None
+    };
     let provider_secret = derive_provider_secret(&keypair_path, &password, &wallet).await?;
     let downloads_dir = args
         .downloads_dir
@@ -23030,7 +23182,12 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "context": {
             "served_ctx": selected.served_ctx,
             "catalog_ctx_max": selected.model.caps.ctx_max,
-            "source": if args.ctx.is_some() { "cli" } else { "default" },
+            "source": provider_context_source(&args, &selected),
+            "feasibility": selected.feasibility.clone(),
+        },
+        "storage": {
+            "disk_reserve_bytes": disk_reserve_bytes,
+            "disk_reserve_source": disk_reserve_source,
         },
         "protection": {
             "max_sessions": protection_config.max_sessions,
@@ -23406,8 +23563,13 @@ fn provider_limits_get(args: ProviderLimitsGetArgs) -> Result<()> {
 }
 
 fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
-    if args.max_concurrent.is_none() && args.accept_rate.is_none() && args.budget.is_none() {
-        bail!("set at least one of --max-concurrent, --accept-rate, or --budget");
+    if args.max_concurrent.is_none()
+        && args.accept_rate.is_none()
+        && args.budget.is_none()
+        && args.memory_reserve.is_none()
+        && args.disk_reserve.is_none()
+    {
+        bail!("set at least one of --max-concurrent, --accept-rate, --budget, --memory-reserve, or --disk-reserve");
     }
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -23454,6 +23616,22 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
             &mut config,
             "provider.limits.serve_budget_period_seconds",
             parsed.period_seconds,
+        )?;
+    }
+    if let Some(memory_reserve) = args.memory_reserve.as_deref() {
+        provider_memory_reserve_bytes(Some(memory_reserve), 16 * GIB_BYTES, false)?;
+        toml_set_string(
+            &mut config,
+            "provider.limits.memory_reserve",
+            memory_reserve.to_owned(),
+        )?;
+    }
+    if let Some(disk_reserve) = args.disk_reserve.as_deref() {
+        provider_disk_reserve_bytes(Some(disk_reserve))?;
+        toml_set_string(
+            &mut config,
+            "provider.limits.disk_reserve",
+            disk_reserve.to_owned(),
         )?;
     }
     write_config_toml_value(&path, &config)?;
@@ -23668,6 +23846,24 @@ fn apply_provider_config_defaults(
     }
 }
 
+fn apply_provider_resource_config_defaults(
+    args: &mut ProviderStartArgs,
+    config: Option<&MayhemConfig>,
+) {
+    let Some(limits) = config
+        .and_then(|config| config.provider.as_ref())
+        .and_then(|provider| provider.limits.as_ref())
+    else {
+        return;
+    };
+    if args.memory_reserve.is_none() {
+        args.memory_reserve = limits.memory_reserve.clone();
+    }
+    if args.disk_reserve.is_none() {
+        args.disk_reserve = limits.disk_reserve.clone();
+    }
+}
+
 fn provider_min_ask_table(config: &toml::Value) -> BTreeMap<String, u64> {
     toml_get_path(config, "provider.min_ask")
         .and_then(toml::Value::as_table)
@@ -23693,12 +23889,19 @@ fn provider_limits_value(config: &toml::Value) -> Value {
             .and_then(toml::Value::as_integer)
             .and_then(|value| u64::try_from(value).ok())
     };
+    let get_str = |key: &str| {
+        limits
+            .and_then(|limits| limits.get(key))
+            .and_then(toml::Value::as_str)
+    };
     json!({
         "max_sessions": get_u64("max_sessions"),
         "accept_rate_per_minute": get_u64("accept_rate_per_minute").unwrap_or(0),
         "serve_budget_mu": get_u64("serve_budget_mu").unwrap_or(0),
         "serve_budget_units": get_u64("serve_budget_units").unwrap_or(0),
         "serve_budget_period_seconds": get_u64("serve_budget_period_seconds").unwrap_or(86_400),
+        "memory_reserve": get_str("memory_reserve"),
+        "disk_reserve": get_str("disk_reserve"),
     })
 }
 
@@ -25996,6 +26199,498 @@ fn resolve_provider_served_ctx(model: &catalog::CatalogModel, requested_ctx: Opt
         .clamp(1, ctx_max)
 }
 
+fn provider_context_source(args: &ProviderStartArgs, selected: &ProviderCandidate) -> &'static str {
+    match (args.ctx.is_some(), selected.feasibility.fallback_applied) {
+        (true, true) => "cli_auto_memory_fallback",
+        (false, true) => "default_auto_memory_fallback",
+        (true, false) => "cli",
+        (false, false) => "default",
+    }
+}
+
+fn provider_reserve_bytes_from_gib(
+    value: &str,
+    flag: &str,
+    floor_bytes: u64,
+) -> Result<(u64, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{flag} must not be empty");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let number = lower
+        .strip_suffix("gib")
+        .or_else(|| lower.strip_suffix("gb"))
+        .or_else(|| lower.strip_suffix('g'))
+        .unwrap_or(&lower)
+        .trim();
+    let gib = number
+        .parse::<f64>()
+        .with_context(|| format!("{flag} must be a GiB value like 4GB or 4"))?;
+    if !gib.is_finite() || gib <= 0.0 {
+        bail!("{flag} must be greater than zero");
+    }
+    let raw = (gib * GIB_BYTES as f64).ceil();
+    if raw > u64::MAX as f64 {
+        bail!("{flag} is too large");
+    }
+    let raw = raw as u64;
+    let bytes = raw.max(floor_bytes);
+    Ok((
+        bytes,
+        if bytes == raw {
+            format!("{flag} override {}", human_bytes(bytes))
+        } else {
+            format!(
+                "{flag} override {} raised to floor {}",
+                human_bytes(raw),
+                human_bytes(bytes)
+            )
+        },
+    ))
+}
+
+fn provider_memory_reserve_bytes(
+    setting: Option<&str>,
+    basis_bytes: u64,
+    unified: bool,
+) -> Result<(u64, String)> {
+    let basis_bytes = basis_bytes.max(GIB_BYTES);
+    if let Some(setting) = setting.map(str::trim).filter(|setting| !setting.is_empty()) {
+        if let Some(percent) = setting.strip_suffix('%') {
+            let percent = percent.trim().parse::<f64>().with_context(|| {
+                format!("--memory-reserve percent must be numeric, got {setting:?}")
+            })?;
+            if !percent.is_finite() || percent <= 0.0 || percent >= 100.0 {
+                bail!("--memory-reserve percent must be greater than 0 and less than 100");
+            }
+            let raw = (basis_bytes as f64 * percent / 100.0).ceil();
+            if raw > u64::MAX as f64 {
+                bail!("--memory-reserve is too large");
+            }
+            let raw = raw as u64;
+            let bytes = raw.max(F13_MEMORY_RESERVE_FLOOR_BYTES);
+            return Ok((
+                bytes,
+                if bytes == raw {
+                    format!(
+                        "--memory-reserve override {percent}% = {}",
+                        human_bytes(bytes)
+                    )
+                } else {
+                    format!(
+                        "--memory-reserve override {percent}% raised to floor {}",
+                        human_bytes(bytes)
+                    )
+                },
+            ));
+        }
+        return provider_reserve_bytes_from_gib(
+            setting,
+            "--memory-reserve",
+            F13_MEMORY_RESERVE_FLOOR_BYTES,
+        );
+    }
+
+    let (bps, floor, label) = if unified {
+        (
+            F13_UNIFIED_MEMORY_RESERVE_BPS,
+            F13_UNIFIED_MEMORY_RESERVE_MIN_BYTES,
+            "default unified",
+        )
+    } else {
+        (
+            F13_DEDICATED_MEMORY_RESERVE_BPS,
+            F13_DEDICATED_MEMORY_RESERVE_MIN_BYTES,
+            "default dedicated/system",
+        )
+    };
+    let pct = ((u128::from(basis_bytes) * u128::from(bps)) / 10_000)
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let bytes = pct.max(floor);
+    Ok((
+        bytes,
+        format!(
+            "{label} memory reserve {}bps floor {} = {}",
+            bps,
+            human_bytes(floor),
+            human_bytes(bytes)
+        ),
+    ))
+}
+
+fn provider_disk_reserve_bytes(setting: Option<&str>) -> Result<(u64, String)> {
+    if let Some(setting) = setting.map(str::trim).filter(|setting| !setting.is_empty()) {
+        return provider_reserve_bytes_from_gib(
+            setting,
+            "--disk-reserve",
+            F13_DISK_RESERVE_FLOOR_BYTES,
+        );
+    }
+    Ok((
+        F13_DISK_RESERVE_DEFAULT_BYTES,
+        format!(
+            "default disk reserve {}",
+            human_bytes(F13_DISK_RESERVE_DEFAULT_BYTES)
+        ),
+    ))
+}
+
+fn provider_system_memory_pool(
+    hardware: &HardwareReport,
+    pool: &str,
+    source: &str,
+) -> ProviderMemoryPool {
+    ProviderMemoryPool {
+        pool: pool.to_owned(),
+        source: source.to_owned(),
+        unified: hardware.memory.unified_memory,
+        total_bytes: hardware.memory.total_bytes,
+        available_bytes: hardware
+            .memory
+            .available_bytes
+            .unwrap_or(hardware.memory.total_bytes),
+    }
+}
+
+fn hardware_has_unified_accelerator(hardware: &HardwareReport) -> bool {
+    hardware.memory.unified_memory
+        || hardware
+            .gpus
+            .iter()
+            .any(|gpu| gpu.unified_memory || nvidia_gpu_uses_host_unified_memory(hardware, gpu))
+}
+
+fn provider_memory_pool(
+    hardware: &HardwareReport,
+    verdict: &BackendVerdict,
+    backend: &str,
+) -> ProviderMemoryPool {
+    match backend {
+        "mlx" => ProviderMemoryPool {
+            unified: true,
+            ..provider_system_memory_pool(
+                hardware,
+                "unified_memory",
+                "host available unified memory",
+            )
+        },
+        "vllm" => {
+            if let Some(total) =
+                known_total_nvidia_vllm_memory_bytes(hardware).filter(|total| *total > 0)
+            {
+                let unified = hardware
+                    .gpus
+                    .iter()
+                    .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
+                    .any(|gpu| nvidia_gpu_uses_host_unified_memory(hardware, gpu));
+                return ProviderMemoryPool {
+                    pool: if unified {
+                        "nvidia_unified_memory".to_owned()
+                    } else {
+                        "nvidia_dedicated_memory".to_owned()
+                    },
+                    source: if unified {
+                        "NVIDIA unified memory from hwprobe".to_owned()
+                    } else {
+                        "NVIDIA dedicated memory from hwprobe".to_owned()
+                    },
+                    unified,
+                    total_bytes: total,
+                    available_bytes: if unified {
+                        hardware.memory.available_bytes.unwrap_or(total)
+                    } else {
+                        total
+                    },
+                };
+            }
+            provider_system_memory_pool(
+                hardware,
+                "system_memory",
+                "host available memory fallback for vllm",
+            )
+        }
+        "trt-llm" => {
+            if let Some(total) =
+                known_total_dedicated_vram_bytes(hardware).filter(|total| *total > 0)
+            {
+                return ProviderMemoryPool {
+                    pool: "nvidia_dedicated_memory".to_owned(),
+                    source: "NVIDIA dedicated memory from hwprobe".to_owned(),
+                    unified: false,
+                    total_bytes: total,
+                    available_bytes: total,
+                };
+            }
+            provider_system_memory_pool(
+                hardware,
+                "system_memory",
+                "host available memory fallback for trt-llm",
+            )
+        }
+        _ if verdict.n_layers_gpu.unwrap_or(0) > 0
+            && hardware_has_unified_accelerator(hardware) =>
+        {
+            ProviderMemoryPool {
+                unified: true,
+                ..provider_system_memory_pool(
+                    hardware,
+                    "unified_memory",
+                    "accelerator uses host unified memory",
+                )
+            }
+        }
+        _ if verdict.n_layers_gpu.unwrap_or(0) > 0 => {
+            if let Some(total) =
+                known_total_dedicated_vram_bytes(hardware).filter(|total| *total > 0)
+            {
+                ProviderMemoryPool {
+                    pool: "dedicated_gpu_memory".to_owned(),
+                    source: "dedicated GPU memory from hwprobe".to_owned(),
+                    unified: false,
+                    total_bytes: total,
+                    available_bytes: total,
+                }
+            } else {
+                provider_system_memory_pool(
+                    hardware,
+                    "system_memory",
+                    "host available memory fallback for partial offload",
+                )
+            }
+        }
+        _ => provider_system_memory_pool(hardware, "system_memory", "host available memory"),
+    }
+}
+
+fn provider_memory_budget(
+    hardware: &HardwareReport,
+    verdict: &BackendVerdict,
+    backend: &str,
+    args: &ProviderStartArgs,
+    claimed_bytes: u64,
+) -> Result<ProviderMemoryBudget> {
+    let pool = provider_memory_pool(hardware, verdict, backend);
+    let reserve_basis = pool.total_bytes.max(pool.available_bytes);
+    let (reserve_bytes, _reserve_source) =
+        provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
+    let budget_bytes = pool
+        .available_bytes
+        .saturating_sub(reserve_bytes)
+        .saturating_sub(claimed_bytes);
+    Ok(ProviderMemoryBudget {
+        pool: pool.pool,
+        source: pool.source,
+        unified: pool.unified,
+        total_bytes: pool.total_bytes,
+        available_bytes: pool.available_bytes,
+        reserve_bytes,
+        claimed_bytes,
+        budget_bytes,
+    })
+}
+
+fn provider_kv_bytes_per_token(
+    enclave: &LedgerEnclave,
+    model: &catalog::CatalogModel,
+    artifact: &catalog::CatalogArtifact,
+) -> u64 {
+    let base_per_billion = if matches!(artifact.engine.as_str(), "trt-llm" | "vllm")
+        && matches!(enclave.quant.as_str(), "nvfp4" | "fp8" | "int4")
+    {
+        16 * 1024
+    } else {
+        24 * 1024
+    };
+    ((model.params_b.max(0.1) * base_per_billion as f64).ceil() as u64).max(1024)
+}
+
+fn provider_memory_estimate(
+    enclave: &LedgerEnclave,
+    model: &catalog::CatalogModel,
+    artifact: &catalog::CatalogArtifact,
+    served_ctx: u64,
+) -> ProviderMemoryEstimate {
+    let weights_bytes = artifact.weights_bytes;
+    let kv_bytes = served_ctx.saturating_mul(provider_kv_bytes_per_token(enclave, model, artifact));
+    let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024);
+    ProviderMemoryEstimate {
+        required_bytes: weights_bytes
+            .saturating_add(kv_bytes)
+            .saturating_add(overhead_bytes),
+        weights_bytes,
+        kv_bytes,
+        overhead_bytes,
+    }
+}
+
+fn provider_bucket_aligned_ctx_candidates(
+    model_ctx_max: u64,
+    requested_ctx: u64,
+    schedule: &CtxBracketSchedule,
+    at: u64,
+) -> Vec<u64> {
+    if model_ctx_max == 0 || requested_ctx == 0 {
+        return Vec::new();
+    }
+    let desired = requested_ctx.clamp(1, model_ctx_max);
+    let table = ctx_bracket_table_at(schedule, at);
+    let mut candidates = vec![desired];
+    for bracket in &table.brackets {
+        let ctx = bracket.max_ctx.unwrap_or(model_ctx_max).min(model_ctx_max);
+        if ctx > 0 && ctx <= desired {
+            candidates.push(ctx);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    candidates
+}
+
+fn provider_memory_claims_dir(home: &Path) -> PathBuf {
+    home.join("provider-memory-claims")
+}
+
+fn read_provider_memory_claimed_bytes(home: Option<&Path>) -> Result<u64> {
+    let Some(home) = home else {
+        return Ok(0);
+    };
+    let dir = provider_memory_claims_dir(home);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let now = unix_epoch_seconds().unwrap_or(0);
+    let mut total = 0_u64;
+    for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let Ok(record) = serde_json::from_str::<ProviderMemoryClaimRecord>(&text) else {
+            continue;
+        };
+        if now.saturating_sub(record.created_at) > F13_MEMORY_CLAIM_TTL_SECONDS {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        total = total.saturating_add(record.claimed_bytes);
+    }
+    Ok(total)
+}
+
+fn write_provider_memory_claim(
+    home: &Path,
+    provider: &str,
+    selected: &ProviderCandidate,
+) -> Result<Option<ProviderMemoryClaimGuard>> {
+    let claimed_bytes = selected.feasibility.estimated_required_bytes;
+    if claimed_bytes == 0 {
+        return Ok(None);
+    }
+    let dir = provider_memory_claims_dir(home);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let now = unix_epoch_seconds()?;
+    let record = ProviderMemoryClaimRecord {
+        schema_version: 1,
+        pid: std::process::id(),
+        provider: provider.to_owned(),
+        enclave_id: selected.enclave.enclave_id.clone(),
+        model_id: selected.enclave.model_id.clone(),
+        backend: selected.enclave.backend.clone(),
+        served_ctx: selected.served_ctx,
+        claimed_bytes,
+        created_at: now,
+    };
+    let path = dir.join(format!(
+        "{}-{}-{}-{now}.json",
+        short_hash(provider),
+        short_hash(&selected.enclave.enclave_id),
+        std::process::id()
+    ));
+    fs::write(&path, serde_json::to_vec_pretty(&record)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(ProviderMemoryClaimGuard { path }))
+}
+
+fn provider_context_feasibility(
+    enclave: &LedgerEnclave,
+    model: &catalog::CatalogModel,
+    artifact: &catalog::CatalogArtifact,
+    verdict: &BackendVerdict,
+    hardware: &HardwareReport,
+    args: &ProviderStartArgs,
+    schedule: &CtxBracketSchedule,
+    at: u64,
+) -> Result<ProviderCtxFeasibility> {
+    let requested_ctx = resolve_provider_served_ctx(model, args.ctx);
+    if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
+        return Ok(ProviderCtxFeasibility::not_applicable(
+            requested_ctx,
+            model.caps.ctx_max,
+        ));
+    }
+    let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
+    let memory_budget =
+        provider_memory_budget(hardware, verdict, &enclave.backend, args, claimed_bytes)?;
+    let candidates =
+        provider_bucket_aligned_ctx_candidates(model.caps.ctx_max, requested_ctx, schedule, at);
+    let Some(min_ctx) = candidates.last().copied() else {
+        bail!(
+            "no active context bucket can serve model {}",
+            model.model_id
+        );
+    };
+    let mut min_estimate = provider_memory_estimate(enclave, model, artifact, min_ctx);
+    for served_ctx in candidates {
+        let estimate = provider_memory_estimate(enclave, model, artifact, served_ctx);
+        if served_ctx == min_ctx {
+            min_estimate = estimate;
+        }
+        if estimate.required_bytes <= memory_budget.budget_bytes {
+            let fallback_applied = served_ctx != requested_ctx;
+            let message = fallback_applied.then(|| {
+                format!(
+                    "Context auto-fallback: requested/default {} tokens did not fit available {}; serving {} tokens in the active admin context table.",
+                    requested_ctx,
+                    human_bytes(memory_budget.budget_bytes),
+                    served_ctx
+                )
+            });
+            return Ok(ProviderCtxFeasibility {
+                requested_ctx,
+                served_ctx,
+                catalog_ctx_max: model.caps.ctx_max,
+                fallback_applied,
+                message,
+                estimated_required_bytes: estimate.required_bytes,
+                estimated_weights_bytes: estimate.weights_bytes,
+                estimated_kv_bytes: estimate.kv_bytes,
+                estimated_overhead_bytes: estimate.overhead_bytes,
+                memory_budget,
+            });
+        }
+    }
+    bail!(
+        "minimum context {} tokens cannot fit: estimated required {} (weights {}, KV {}, overhead {}) exceeds usable {} after reserve {} and local claims {} in {}",
+        min_ctx,
+        human_bytes(min_estimate.required_bytes),
+        human_bytes(min_estimate.weights_bytes),
+        human_bytes(min_estimate.kv_bytes),
+        human_bytes(min_estimate.overhead_bytes),
+        human_bytes(memory_budget.budget_bytes),
+        human_bytes(memory_budget.reserve_bytes),
+        human_bytes(memory_budget.claimed_bytes),
+        memory_budget.pool
+    )
+}
+
 fn enclave_cap_u32(caps: &Value, key: &'static str, default: u32) -> Result<u32> {
     match caps.get(key) {
         None => Ok(default),
@@ -26231,7 +26926,27 @@ fn build_provider_candidates(
             ));
             continue;
         }
-        let served_ctx = resolve_provider_served_ctx(model, args.ctx);
+        let feasibility = match provider_context_feasibility(
+            enclave,
+            model,
+            &artifact,
+            verdict,
+            hardware,
+            args,
+            &contract.ctx_bracket_schedule,
+            now,
+        ) {
+            Ok(feasibility) => feasibility,
+            Err(err) => {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!("{err:#}"),
+                    compatible_catalog_artifact_suggestion(model, hardware, Some(&artifact_name)),
+                ));
+                continue;
+            }
+        };
+        let served_ctx = feasibility.served_ctx;
         let price_ctx_bracket = price_ctx_bracket_for_model_class(
             &enclave.model_class,
             served_ctx,
@@ -26264,6 +26979,7 @@ fn build_provider_candidates(
             verdict: verdict.clone(),
             price: Some(price),
             served_ctx,
+            feasibility,
             ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
         });
     }
@@ -31841,13 +32557,21 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "keypair_path" | "identity.keypair_path" => Ok("identity.keypair_path"),
         "store_name" | "identity.store_name" => Ok("identity.store_name"),
         "engine_backend" | "provider.engine_backend" => Ok("provider.engine_backend"),
+        "memory_reserve"
+        | "provider_memory_reserve"
+        | "provider.memory_reserve"
+        | "provider.limits.memory_reserve" => Ok("provider.limits.memory_reserve"),
+        "disk_reserve"
+        | "provider_disk_reserve"
+        | "provider.disk_reserve"
+        | "provider.limits.disk_reserve" => Ok("provider.limits.disk_reserve"),
         "max_price" | "max_price_mu" | "user.max_price" | "user.max_price_mu" => {
             Ok("user.max_price_mu")
         }
         "min_ctx" | "user.min_ctx" => Ok("user.min_ctx"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, user.max_price_mu, user.min_ctx, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_mu, user.min_ctx, and role.mode"),
     }
 }
 
@@ -33070,6 +33794,14 @@ mod tests {
             "network.msb_bootstrap"
         );
         assert_eq!(canonical_config_key("min-ctx").unwrap(), "user.min_ctx");
+        assert_eq!(
+            canonical_config_key("memory-reserve").unwrap(),
+            "provider.limits.memory_reserve"
+        );
+        assert_eq!(
+            canonical_config_key("disk-reserve").unwrap(),
+            "provider.limits.disk_reserve"
+        );
         config_set(ConfigSetArgs {
             home: Some(home.clone()),
             key: "min-ctx".to_owned(),
@@ -33081,6 +33813,29 @@ mod tests {
         assert_eq!(
             toml_get_path(&config, "user.min_ctx").and_then(toml::Value::as_integer),
             Some(128_000)
+        );
+        config_set(ConfigSetArgs {
+            home: Some(home.clone()),
+            key: "memory-reserve".to_owned(),
+            value: "15%".to_owned(),
+            json: true,
+        })
+        .unwrap();
+        config_set(ConfigSetArgs {
+            home: Some(home.clone()),
+            key: "disk-reserve".to_owned(),
+            value: "20GB".to_owned(),
+            json: true,
+        })
+        .unwrap();
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        assert_eq!(
+            toml_get_path(&config, "provider.limits.memory_reserve").and_then(toml::Value::as_str),
+            Some("15%")
+        );
+        assert_eq!(
+            toml_get_path(&config, "provider.limits.disk_reserve").and_then(toml::Value::as_str),
+            Some("20GB")
         );
         let typed = read_mayhem_config(&home).unwrap().unwrap();
         assert_eq!(typed.user.and_then(|user| user.min_ctx), Some(128_000));
@@ -33177,6 +33932,10 @@ mod tests {
             },
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
+            feasibility: ProviderCtxFeasibility::not_applicable(
+                4096,
+                catalog.models[0].caps.ctx_max,
+            ),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
         };
         let config: MayhemConfig = toml::from_str(
@@ -33189,16 +33948,21 @@ mod tests {
             accept_rate_per_minute = 9
             serve_budget_mu = 1000
             serve_budget_period_seconds = 3600
+            memory_reserve = "15%"
+            disk_reserve = "20GB"
             "#,
         )
         .unwrap();
         let mut args = test_provider_start_args();
+        apply_provider_resource_config_defaults(&mut args, Some(&config));
         apply_provider_config_defaults(&mut args, Some(&config), &selected);
         assert_eq!(args.min_ask_mu, 700);
         assert_eq!(args.max_sessions, Some(2));
         assert_eq!(args.accept_rate_per_minute, 9);
         assert_eq!(args.serve_budget_mu, 1000);
         assert_eq!(args.serve_budget_period_seconds, 3600);
+        assert_eq!(args.memory_reserve.as_deref(), Some("15%"));
+        assert_eq!(args.disk_reserve.as_deref(), Some("20GB"));
     }
 
     #[test]
@@ -35419,6 +36183,59 @@ mod tests {
         let mut mismatched = contract;
         mismatched.enclaves[0].artifact_root = "bb".repeat(32);
         assert!(build_provider_candidates(&mismatched, &catalog, &hardware, &args).is_err());
+    }
+
+    #[test]
+    fn provider_candidates_auto_fallback_context_to_largest_fitting_bucket() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 131_072;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({ "tools": true, "json": true, "ctx": 131_072 });
+        let mut hardware = test_hardware(FixtureProfile::CpuOnly);
+        hardware.memory.total_bytes = 4 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(3 * GIB_BYTES);
+        let mut args = test_provider_start_args();
+        args.ctx = Some(131_072);
+
+        let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
+        let selected = &candidates[0];
+
+        assert_eq!(selected.feasibility.requested_ctx, 131_072);
+        assert_eq!(selected.served_ctx, 8_192);
+        assert!(selected.feasibility.fallback_applied);
+        assert!(selected
+            .feasibility
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("Context auto-fallback"));
+        assert_eq!(
+            selected.price.as_ref().unwrap().ctx_bracket.as_deref(),
+            Some(ctx_bracket_for_tokens(8_192))
+        );
+    }
+
+    #[test]
+    fn provider_candidates_refuse_when_minimum_context_cannot_fit() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 131_072;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({ "tools": true, "json": true, "ctx": 131_072 });
+        let mut hardware = test_hardware(FixtureProfile::CpuOnly);
+        hardware.memory.total_bytes = 3 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(2 * GIB_BYTES);
+        let mut args = test_provider_start_args();
+        args.ctx = Some(131_072);
+        args.enclave = Some("test/model@4bit".to_owned());
+
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .expect_err("minimum context should not fit");
+        let message = format!("{err:#}");
+        assert!(message.contains("minimum context 8192 tokens cannot fit"));
+        assert!(message.contains("estimated required"));
+        assert!(message.contains("after reserve"));
     }
 
     #[test]
@@ -38083,6 +38900,7 @@ mod tests {
             },
             price: None,
             served_ctx: 1,
+            feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
         };
         let artifact_paths = ProviderArtifactPaths {
@@ -38162,6 +38980,10 @@ mod tests {
             verdict,
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
+            feasibility: ProviderCtxFeasibility::not_applicable(
+                4096,
+                catalog.models[0].caps.ctx_max,
+            ),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
         };
         selected.enclave.caps = json!({ "tools": true, "json": true, "ctx": 4096 });
@@ -41786,6 +42608,8 @@ mod tests {
             heartbeat_count: 1,
             min_ask_mu: 0,
             ctx: None,
+            memory_reserve: None,
+            disk_reserve: None,
             max_sessions: None,
             accept_rate_per_minute: 0,
             serve_budget_mu: 0,
