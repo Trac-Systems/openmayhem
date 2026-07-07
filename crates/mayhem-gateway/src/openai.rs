@@ -834,6 +834,7 @@ pub struct GatewaySessionAttestation {
 pub struct GatewaySessionError {
     pub message: String,
     pub retryable: bool,
+    pub clean_refusal: bool,
     pub partial: Option<Box<GatewaySessionPartial>>,
 }
 
@@ -3479,6 +3480,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: false,
+            clean_refusal: false,
             partial: None,
         }
     }
@@ -3487,6 +3489,16 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            clean_refusal: false,
+            partial: None,
+        }
+    }
+
+    pub fn clean_refusal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            clean_refusal: true,
             partial: None,
         }
     }
@@ -3495,6 +3507,7 @@ impl GatewaySessionError {
         Self {
             message: message.into(),
             retryable: true,
+            clean_refusal: false,
             partial: Some(Box::new(partial)),
         }
     }
@@ -3974,18 +3987,10 @@ impl ScBridgeGatewaySessionBackend {
         .await
         .map_err(GatewaySessionError::into_retryable)?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            let code = accept
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN");
-            let reason = accept
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("no reason provided");
-            return Err(GatewaySessionError::retryable(format!(
-                "provider rejected session {} with {code}: {reason}",
-                invocation.session_id
-            )));
+            return Err(provider_reject_session_error(
+                &accept,
+                &invocation.session_id,
+            ));
         }
         let accept_info = validate_direct_session_accept(
             &accept,
@@ -4198,18 +4203,10 @@ impl ScBridgeGatewaySessionBackend {
         .await
         .map_err(GatewaySessionError::into_retryable)?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            let code = accept
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN");
-            let reason = accept
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("no reason provided");
-            return Err(GatewaySessionError::retryable(format!(
-                "provider rejected embedding session {} with {code}: {reason}",
-                invocation.session_id
-            )));
+            return Err(provider_reject_session_error(
+                &accept,
+                &invocation.session_id,
+            ));
         }
         let accept_info = validate_direct_session_accept(
             &accept,
@@ -4378,18 +4375,10 @@ impl ScBridgeGatewaySessionBackend {
         .await
         .map_err(GatewaySessionError::into_retryable)?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            let code = accept
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN");
-            let reason = accept
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("no reason provided");
-            return Err(GatewaySessionError::retryable(format!(
-                "provider rejected image session {} with {code}: {reason}",
-                invocation.session_id
-            )));
+            return Err(provider_reject_session_error(
+                &accept,
+                &invocation.session_id,
+            ));
         }
         let accept_info = validate_direct_session_accept(
             &accept,
@@ -4558,18 +4547,10 @@ impl ScBridgeGatewaySessionBackend {
         .await
         .map_err(GatewaySessionError::into_retryable)?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            let code = accept
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN");
-            let reason = accept
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("no reason provided");
-            return Err(GatewaySessionError::retryable(format!(
-                "provider rejected audio speech session {} with {code}: {reason}",
-                invocation.session_id
-            )));
+            return Err(provider_reject_session_error(
+                &accept,
+                &invocation.session_id,
+            ));
         }
         let accept_info = validate_direct_session_accept(
             &accept,
@@ -4728,18 +4709,10 @@ impl ScBridgeGatewaySessionBackend {
         .await
         .map_err(GatewaySessionError::into_retryable)?;
         if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-            let code = accept
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN");
-            let reason = accept
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("no reason provided");
-            return Err(GatewaySessionError::retryable(format!(
-                "provider rejected audio transcription session {} with {code}: {reason}",
-                invocation.session_id
-            )));
+            return Err(provider_reject_session_error(
+                &accept,
+                &invocation.session_id,
+            ));
         }
         let accept_info = validate_direct_session_accept(
             &accept,
@@ -4929,6 +4902,30 @@ fn verify_direct_session_accept_signature(
             &signature,
         )
         .map_err(|err| GatewaySessionError::new(format!("provider accept signature failed: {err}")))
+}
+
+fn provider_reject_session_error(frame: &Value, session_id: &str) -> GatewaySessionError {
+    let code = frame
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("UNKNOWN");
+    let reason = frame
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("no reason provided");
+    let message = format!("provider rejected session {session_id} with {code}: {reason}");
+    if clean_provider_reject_code(code) {
+        GatewaySessionError::clean_refusal(message)
+    } else {
+        GatewaySessionError::retryable(message)
+    }
+}
+
+fn clean_provider_reject_code(code: &str) -> bool {
+    matches!(
+        code,
+        "CAPACITY" | "BUSY" | "RATE" | "QUOTA" | "PRICE_FLOOR" | "DRAINING"
+    )
 }
 
 fn verify_provider_receipt_signature(
@@ -7101,25 +7098,11 @@ async fn run_embedding_with_route_retry(
                 });
             }
             Err(err) if err.retryable => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_route_failure_attempt(state, route, attempt_started.elapsed());
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -7190,25 +7173,11 @@ async fn run_image_generation_with_route_retry(
                 });
             }
             Err(err) if err.retryable => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_route_failure_attempt(state, route, attempt_started.elapsed());
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -7278,25 +7247,11 @@ async fn run_audio_speech_with_route_retry(
                 });
             }
             Err(err) if err.retryable => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_route_failure_attempt(state, route, attempt_started.elapsed());
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -7366,25 +7321,11 @@ async fn run_audio_transcription_with_route_retry(
                 });
             }
             Err(err) if err.retryable => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_route_failure_attempt(state, route, attempt_started.elapsed());
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -7679,25 +7620,11 @@ async fn prepare_live_direct_chat_session(
                 });
             }
             Err(err) if err.retryable => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    &state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_retryable_route_attempt(&state, route, attempt_started.elapsed(), &err);
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    &state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_route_failure_attempt(&state, route, attempt_started.elapsed());
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -7792,18 +7719,10 @@ async fn open_live_direct_chat_session(
     .await
     .map_err(GatewaySessionError::into_retryable)?;
     if accept.get("t").and_then(Value::as_str) == Some("s.reject") {
-        let code = accept
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("UNKNOWN");
-        let reason = accept
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("no reason provided");
-        return Err(GatewaySessionError::retryable(format!(
-            "provider rejected session {} with {code}: {reason}",
-            invocation.session_id
-        )));
+        return Err(provider_reject_session_error(
+            &accept,
+            &invocation.session_id,
+        ));
     }
     let accept_info =
         validate_direct_session_accept(&accept, invocation, &open_head, &att_nonce, now / 1000)?;
@@ -8798,14 +8717,7 @@ async fn run_chat_with_route_retry(
                 });
             }
             Err(err) if err.retryable => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
                 if let Some(partial) = err.partial.as_ref() {
                     state.record_partial_provider_receipt(
                         model,
@@ -8821,14 +8733,7 @@ async fn run_chat_with_route_retry(
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                if let Some(route) = route {
-                    state.cool_route_provider(route, now_millis_u64());
-                }
-                record_route_observation(
-                    state,
-                    route,
-                    observation_sample_from_error(attempt_started.elapsed()),
-                );
+                record_route_failure_attempt(state, route, attempt_started.elapsed());
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -9691,6 +9596,28 @@ fn record_route_observation(
         .lock()
         .expect("provider table poisoned")
         .record_observation_at(&route_key(route), sample, now_millis_u64());
+}
+
+fn record_route_failure_attempt(
+    state: &GatewayState,
+    route: Option<&GatewayRouteCandidate>,
+    elapsed: Duration,
+) {
+    if let Some(route) = route {
+        state.cool_route_provider(route, now_millis_u64());
+    }
+    record_route_observation(state, route, observation_sample_from_error(elapsed));
+}
+
+fn record_retryable_route_attempt(
+    state: &GatewayState,
+    route: Option<&GatewayRouteCandidate>,
+    elapsed: Duration,
+    err: &GatewaySessionError,
+) {
+    if !err.clean_refusal {
+        record_route_failure_attempt(state, route, elapsed);
+    }
 }
 
 fn observation_sample_from_success(
@@ -14184,6 +14111,59 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct CleanRefusalThenSuccessBackend {
+        providers: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GatewaySessionBackend for CleanRefusalThenSuccessBackend {
+        fn name(&self) -> &str {
+            "test-clean-refusal-then-success"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                let attempt = {
+                    let mut providers = self.providers.lock().expect("providers lock");
+                    providers.push(invocation.provider_pubkey.clone().unwrap_or_default());
+                    providers.len()
+                };
+                if attempt == 1 {
+                    return Err(GatewaySessionError::clean_refusal(
+                        "provider rejected session with CAPACITY: provider full",
+                    ));
+                }
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                Ok(GatewaySessionResult {
+                    output: ChatOutput {
+                        content: Some("recovered".to_owned()),
+                        tool_call: None,
+                        artifacts: Vec::new(),
+                        finish_reason: "stop".to_owned(),
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens: 1,
+                            total_tokens: prompt_tokens + 1,
+                        },
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: None,
+                    token_ids: vec![2],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(40.0),
+                    }),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct SuccessBackend {
         providers: Arc<Mutex<Vec<String>>>,
     }
@@ -14714,6 +14694,74 @@ mod tests {
         assert!(!post_failure_order
             .iter()
             .any(|candidate| candidate.provider == providers[0]));
+    }
+
+    #[test]
+    fn provider_reject_session_error_marks_self_protection_codes_clean() {
+        for code in ["CAPACITY", "BUSY", "RATE", "QUOTA", "PRICE_FLOOR"] {
+            let err = provider_reject_session_error(
+                &json!({
+                    "t": "s.reject",
+                    "code": code,
+                    "reason": "self protection",
+                }),
+                "session-a",
+            );
+            assert!(err.retryable);
+            assert!(err.clean_refusal, "{code} should be a clean refusal");
+        }
+
+        let err = provider_reject_session_error(
+            &json!({
+                "t": "s.reject",
+                "code": "SIGNATURE",
+                "reason": "bad open frame",
+            }),
+            "session-a",
+        );
+        assert!(err.retryable);
+        assert!(!err.clean_refusal);
+    }
+
+    #[tokio::test]
+    async fn route_retry_clean_refusal_reroutes_without_failure_penalty() {
+        let model = test_routed_model(2);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(Arc::new(
+            CleanRefusalThenSuccessBackend {
+                providers: providers.clone(),
+            },
+        ));
+        let request = test_chat_request(&model.id);
+
+        let run =
+            run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+                .await
+                .expect("clean refusal should reroute");
+
+        assert_eq!(run.result.output.content.as_deref(), Some("recovered"));
+        let providers = providers.lock().expect("providers lock").clone();
+        assert_eq!(providers.len(), 2);
+        assert_ne!(providers[0], providers[1]);
+        let refused_route = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .find(|candidate| candidate.provider == providers[0])
+            .expect("refused provider route");
+        assert!(!state.route_provider_in_cooloff(refused_route, now_millis_u64()));
+        let refused_entry = state
+            .provider_table
+            .lock()
+            .expect("provider table lock")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key.provider == providers[0])
+            .expect("refused provider table entry");
+        assert_eq!(refused_entry.observed.samples, 0);
+        assert_eq!(refused_entry.observed.consecutive_failures, 0);
+        assert_eq!(refused_entry.observed.ewma_error_rate, 0.0);
+        assert_eq!(refused_entry.observed.circuit_open_until_millis, None);
     }
 
     #[tokio::test]

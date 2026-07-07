@@ -2,7 +2,7 @@
 
 mod catalog;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
@@ -3683,6 +3683,26 @@ struct ProviderStartArgs {
     /// Provider floor for accepted sessions in µUSD. 0 accepts the current market price.
     #[arg(long, default_value_t = 0)]
     min_ask_mu: u64,
+
+    /// Local hard cap for concurrently accepted direct sessions. Defaults to the hwprobe cap.
+    #[arg(long, value_name = "N")]
+    max_sessions: Option<u32>,
+
+    /// Local maximum accepted session opens per rolling minute. 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    accept_rate_per_minute: u32,
+
+    /// Local serving budget per period in µUSD owed. 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    serve_budget_mu: u64,
+
+    /// Local serving budget per period in total receipt usage units. 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    serve_budget_units: u64,
+
+    /// Local serving budget reset period in seconds when a budget is set.
+    #[arg(long, default_value_t = 86_400)]
+    serve_budget_period_seconds: u64,
 
     /// Keep running and answer direct mx/s/<session_id> requests over SC-Bridge.
     #[arg(long)]
@@ -21272,6 +21292,153 @@ impl ProviderHeartbeatLoad {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderProtectionConfig {
+    max_sessions: u32,
+    accept_rate_per_minute: u32,
+    budget_mu: u64,
+    budget_units: u64,
+    budget_period: Duration,
+}
+
+impl ProviderProtectionConfig {
+    fn from_provider_args(args: &ProviderStartArgs, selected: &ProviderCandidate) -> Result<Self> {
+        let max_sessions = args.max_sessions.unwrap_or(selected.verdict.max_sessions);
+        if max_sessions == 0 {
+            bail!("provider --max-sessions must be greater than zero");
+        }
+        if (args.serve_budget_mu > 0 || args.serve_budget_units > 0)
+            && args.serve_budget_period_seconds == 0
+        {
+            bail!("provider --serve-budget-period-seconds must be greater than zero when a serving budget is set");
+        }
+        Ok(Self {
+            max_sessions,
+            accept_rate_per_minute: args.accept_rate_per_minute,
+            budget_mu: args.serve_budget_mu,
+            budget_units: args.serve_budget_units,
+            budget_period: Duration::from_secs(args.serve_budget_period_seconds.max(1)),
+        })
+    }
+
+    #[cfg(test)]
+    fn unlimited_for_tests(max_sessions: u32) -> Self {
+        Self {
+            max_sessions,
+            accept_rate_per_minute: 0,
+            budget_mu: 0,
+            budget_units: 0,
+            budget_period: Duration::from_secs(86_400),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderProtectionState {
+    config: ProviderProtectionConfig,
+    accepted_at: VecDeque<Instant>,
+    period_started: Instant,
+    used_mu: u64,
+    used_units: u64,
+}
+
+impl ProviderProtectionState {
+    fn new(config: ProviderProtectionConfig) -> Self {
+        Self {
+            config,
+            accepted_at: VecDeque::new(),
+            period_started: Instant::now(),
+            used_mu: 0,
+            used_units: 0,
+        }
+    }
+
+    fn acceptance_decision(&mut self, active_sessions: usize) -> ProviderSessionDecision {
+        let now = Instant::now();
+        self.reset_if_period_elapsed(now);
+        self.prune_accept_window(now);
+        if active_sessions >= self.config.max_sessions as usize {
+            return ProviderSessionDecision::Reject {
+                code: "CAPACITY",
+                reason: format!(
+                    "provider has reached its local max_sessions cap of {}",
+                    self.config.max_sessions
+                ),
+            };
+        }
+        if self.config.accept_rate_per_minute > 0
+            && self.accepted_at.len() >= self.config.accept_rate_per_minute as usize
+        {
+            return ProviderSessionDecision::Reject {
+                code: "RATE",
+                reason: format!(
+                    "provider has reached its local accept-rate limit of {} session(s)/minute",
+                    self.config.accept_rate_per_minute
+                ),
+            };
+        }
+        if self.config.budget_mu > 0 && self.used_mu >= self.config.budget_mu {
+            return ProviderSessionDecision::Reject {
+                code: "QUOTA",
+                reason: format!(
+                    "provider has reached its local serving budget of {}µUSD for this period",
+                    self.config.budget_mu
+                ),
+            };
+        }
+        if self.config.budget_units > 0 && self.used_units >= self.config.budget_units {
+            return ProviderSessionDecision::Reject {
+                code: "QUOTA",
+                reason: format!(
+                    "provider has reached its local serving budget of {} usage unit(s) for this period",
+                    self.config.budget_units
+                ),
+            };
+        }
+        ProviderSessionDecision::Accept
+    }
+
+    fn record_accept(&mut self) {
+        let now = Instant::now();
+        self.prune_accept_window(now);
+        self.accepted_at.push_back(now);
+    }
+
+    fn record_usage(&mut self, usage: &ReceiptUsage, mu_owed: u64) {
+        self.reset_if_period_elapsed(Instant::now());
+        self.used_mu = self.used_mu.saturating_add(mu_owed);
+        self.used_units = self
+            .used_units
+            .saturating_add(provider_session_usage_units(usage));
+    }
+
+    fn reset_if_period_elapsed(&mut self, now: Instant) {
+        if now.duration_since(self.period_started) >= self.config.budget_period {
+            self.period_started = now;
+            self.used_mu = 0;
+            self.used_units = 0;
+        }
+    }
+
+    fn prune_accept_window(&mut self, now: Instant) {
+        while self
+            .accepted_at
+            .front()
+            .is_some_and(|accepted| now.duration_since(*accepted) >= Duration::from_secs(60))
+        {
+            self.accepted_at.pop_front();
+        }
+    }
+}
+
+fn provider_session_usage_units(usage: &ReceiptUsage) -> u64 {
+    usage
+        .units()
+        .values()
+        .copied()
+        .fold(0_u64, u64::saturating_add)
+}
+
 struct ProviderRequestLoadGuard {
     load: ProviderHeartbeatLoad,
     started: Instant,
@@ -21315,6 +21482,7 @@ struct ProviderSessionHeartbeatTask {
     attestation: Tier1AttestationReport,
     attestation_head: String,
     min_ask_mu: u64,
+    max_sessions: u32,
     load: ProviderHeartbeatLoad,
 }
 
@@ -21535,6 +21703,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
     let selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
     let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
+    let protection_config = ProviderProtectionConfig::from_provider_args(&args, &selected)?;
     if rooms.is_empty() {
         bail!(
             "no open admin-created canonical rooms found for {}; ask the admin to open one",
@@ -21805,6 +21974,13 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "rules": &rules,
         "market": {
             "min_ask_mu": args.min_ask_mu,
+        },
+        "protection": {
+            "max_sessions": protection_config.max_sessions,
+            "accept_rate_per_minute": protection_config.accept_rate_per_minute,
+            "serve_budget_mu": protection_config.budget_mu,
+            "serve_budget_units": protection_config.budget_units,
+            "serve_budget_period_seconds": protection_config.budget_period.as_secs(),
         },
         "rooms": rooms.clone(),
         "local_heartbeat_cache": heartbeat_cache,
@@ -25423,6 +25599,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
         .context("connecting to SC-Bridge for provider heartbeats")?;
     let mut sent = Vec::new();
     let count = u64::from(ctx.args.heartbeat_count.max(1));
+    let protection = ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
     for seq in 0..count {
         sent.extend(
             send_provider_heartbeat_round(
@@ -25435,6 +25612,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.attestation,
                 ctx.attestation_head,
                 ctx.args.min_ask_mu,
+                protection.max_sessions,
                 seq,
                 seq == 0,
                 ProviderLoadSnapshot::default(),
@@ -25455,6 +25633,7 @@ async fn send_provider_heartbeat_round(
     attestation: &Tier1AttestationReport,
     attestation_head: &str,
     min_ask_mu: u64,
+    max_sessions: u32,
     seq: u64,
     join_rooms: bool,
     load: ProviderLoadSnapshot,
@@ -25478,11 +25657,11 @@ async fn send_provider_heartbeat_round(
             "enclave_id": selected.enclave.enclave_id,
             "model_id": selected.enclave.model_id,
             "room_id": room.room_id,
-            "sat": provider_saturation(load.active_slots, selected.verdict.max_sessions),
+            "sat": provider_saturation(load.active_slots, max_sessions),
             "slots": {
                 "active": load.active_slots,
                 "active_requests": load.active_requests,
-                "max": selected.verdict.max_sessions,
+                "max": max_sessions,
             },
             "q": {
                 "depth": load.queue_depth,
@@ -25526,6 +25705,7 @@ async fn send_provider_heartbeat_round(
             "sidechannel": room.sidechannel,
             "seq": seq,
             "min_ask_mu": min_ask_mu,
+            "max_sessions": max_sessions,
         }));
     }
     Ok(sent)
@@ -25561,6 +25741,7 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
             &ctx.attestation,
             &ctx.attestation_head,
             ctx.min_ask_mu,
+            ctx.max_sessions,
             seq,
             join_rooms,
             ctx.load.snapshot(),
@@ -25598,6 +25779,7 @@ async fn serve_provider_sessions(
     mut responder: Box<dyn ProviderSessionResponder>,
 ) -> Result<()> {
     let terms = provider_session_terms(&ctx)?;
+    let protection_config = ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
         ctx.args.sc_bridge_url.as_deref(),
@@ -25608,14 +25790,15 @@ async fn serve_provider_sessions(
     provider_log(
         ctx.args,
         &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} and min_ask_mu {}",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} min_ask_mu {} max_sessions {}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
             responder.mode(),
             terms.price_ver,
             format_rate_map(&terms.rate_map),
-            terms.min_ask_mu
+            terms.min_ask_mu,
+            protection_config.max_sessions
         ),
     );
 
@@ -25634,6 +25817,7 @@ async fn serve_provider_sessions(
                 attestation: ctx.attestation.clone(),
                 attestation_head: ctx.attestation_head.to_owned(),
                 min_ask_mu: ctx.args.min_ask_mu,
+                max_sessions: protection_config.max_sessions,
                 load: heartbeat_load.clone(),
             },
         ))
@@ -25643,6 +25827,7 @@ async fn serve_provider_sessions(
     let mut sessions = HashMap::new();
     let mut pending_requests = HashMap::new();
     let mut pending_payloads = HashMap::new();
+    let mut protection = ProviderProtectionState::new(protection_config);
     let serve_result: Result<()> = async {
         loop {
             expire_provider_pending_sessions(
@@ -25683,6 +25868,7 @@ async fn serve_provider_sessions(
                         &mut pending_requests,
                         &mut pending_payloads,
                         &heartbeat_load,
+                        &mut protection,
                         &terms,
                         &runtime,
                         responder.as_mut(),
@@ -25956,6 +26142,7 @@ async fn handle_provider_session_frame(
     pending_requests: &mut HashMap<String, Instant>,
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
+    protection: &mut ProviderProtectionState,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
     responder: &mut dyn ProviderSessionResponder,
@@ -25989,27 +26176,34 @@ async fn handle_provider_session_frame(
             let static_decision = provider_session_open_decision(&frame, terms);
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
-                    provider_session_debug("s.open static decision accepted; rechecking contract");
-                    let live_decision = provider_session_current_state_decision(
-                        runtime.rpc,
-                        terms,
-                        runtime.rooms,
-                        &session_rail,
-                    )
-                    .await?;
-                    match live_decision {
-                        ProviderSessionDecision::Accept => {
-                            provider_session_spend_reservation_decision(
-                                runtime.rpc,
-                                runtime.keypair_path,
-                                runtime.password,
-                                terms,
-                                &frame,
-                                &session_rail,
-                            )
-                            .await?
+                    let protection_decision = protection.acceptance_decision(sessions.len());
+                    if !matches!(protection_decision, ProviderSessionDecision::Accept) {
+                        protection_decision
+                    } else {
+                        provider_session_debug(
+                            "s.open static decision accepted; rechecking contract",
+                        );
+                        let live_decision = provider_session_current_state_decision(
+                            runtime.rpc,
+                            terms,
+                            runtime.rooms,
+                            &session_rail,
+                        )
+                        .await?;
+                        match live_decision {
+                            ProviderSessionDecision::Accept => {
+                                provider_session_spend_reservation_decision(
+                                    runtime.rpc,
+                                    runtime.keypair_path,
+                                    runtime.password,
+                                    terms,
+                                    &frame,
+                                    &session_rail,
+                                )
+                                .await?
+                            }
+                            reject => reject,
                         }
-                        reject => reject,
                     }
                 }
                 reject => reject,
@@ -26046,6 +26240,7 @@ async fn handle_provider_session_frame(
                             checkpoint_every,
                         },
                     );
+                    protection.record_accept();
                     pending_requests.insert(
                         session_id.clone(),
                         Instant::now() + provider_session_request_timeout(),
@@ -26344,6 +26539,7 @@ async fn handle_provider_session_frame(
                     return Ok(());
                 }
             };
+            protection.record_usage(&receipt.body.usage, receipt.body.mu_owed_cum);
             provider_session_debug(format!(
                 "waiting for receipt ack on session {session_id} request {request_id}"
             ));
@@ -35703,6 +35899,68 @@ mod tests {
     }
 
     #[test]
+    fn provider_protection_rejects_capacity_rate_and_quota_cleanly() {
+        let mut capacity =
+            ProviderProtectionState::new(ProviderProtectionConfig::unlimited_for_tests(1));
+        assert_eq!(
+            capacity.acceptance_decision(0),
+            ProviderSessionDecision::Accept
+        );
+        assert!(matches!(
+            capacity.acceptance_decision(1),
+            ProviderSessionDecision::Reject {
+                code: "CAPACITY",
+                ..
+            }
+        ));
+
+        let mut rate = ProviderProtectionState::new(ProviderProtectionConfig {
+            max_sessions: 4,
+            accept_rate_per_minute: 1,
+            budget_mu: 0,
+            budget_units: 0,
+            budget_period: Duration::from_secs(86_400),
+        });
+        assert_eq!(rate.acceptance_decision(0), ProviderSessionDecision::Accept);
+        rate.record_accept();
+        assert!(matches!(
+            rate.acceptance_decision(0),
+            ProviderSessionDecision::Reject { code: "RATE", .. }
+        ));
+
+        let mut quota_mu = ProviderProtectionState::new(ProviderProtectionConfig {
+            max_sessions: 4,
+            accept_rate_per_minute: 0,
+            budget_mu: 10,
+            budget_units: 0,
+            budget_period: Duration::from_secs(1),
+        });
+        quota_mu.record_usage(&ReceiptUsage::text(1, 1), 10);
+        assert!(matches!(
+            quota_mu.acceptance_decision(0),
+            ProviderSessionDecision::Reject { code: "QUOTA", .. }
+        ));
+        quota_mu.period_started = Instant::now() - Duration::from_secs(2);
+        assert_eq!(
+            quota_mu.acceptance_decision(0),
+            ProviderSessionDecision::Accept
+        );
+
+        let mut quota_units = ProviderProtectionState::new(ProviderProtectionConfig {
+            max_sessions: 4,
+            accept_rate_per_minute: 0,
+            budget_mu: 0,
+            budget_units: 3,
+            budget_period: Duration::from_secs(86_400),
+        });
+        quota_units.record_usage(&ReceiptUsage::text(1, 2), 0);
+        assert!(matches!(
+            quota_units.acceptance_decision(0),
+            ProviderSessionDecision::Reject { code: "QUOTA", .. }
+        ));
+    }
+
+    #[test]
     fn provider_heartbeat_tok_s_uses_labeled_cold_start_prior_until_measured() {
         let snapshot = ProviderLoadSnapshot {
             active_slots: 0,
@@ -38910,6 +39168,11 @@ mod tests {
             no_heartbeat: true,
             heartbeat_count: 1,
             min_ask_mu: 0,
+            max_sessions: None,
+            accept_rate_per_minute: 0,
+            serve_budget_mu: 0,
+            serve_budget_units: 0,
+            serve_budget_period_seconds: 86_400,
             serve_sessions: false,
             serve_sessions_seconds: 0,
             dev_session_shim: false,
