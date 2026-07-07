@@ -105,6 +105,7 @@ const F13_UNIFIED_MEMORY_RESERVE_MIN_BYTES: u64 = 4 * GIB_BYTES;
 const F13_MEMORY_RESERVE_FLOOR_BYTES: u64 = GIB_BYTES;
 const F13_DISK_RESERVE_DEFAULT_BYTES: u64 = 10 * GIB_BYTES;
 const F13_DISK_RESERVE_FLOOR_BYTES: u64 = 2 * GIB_BYTES;
+const PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL: i32 = 2;
 const F13_MEMORY_CLAIM_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
@@ -23272,6 +23273,202 @@ impl ProviderProtectionState {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderRuntimeFloorRejection {
+    code: &'static str,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderRuntimeDiskObservation {
+    path: PathBuf,
+    available_bytes: Option<u64>,
+    reserve_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderRuntimeMemoryObservation {
+    NotChecked,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    AvailableBytes {
+        pool: String,
+        available_bytes: Option<u64>,
+        reserve_bytes: u64,
+    },
+    MacosPressure {
+        level: Option<i32>,
+        stop_level: i32,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ProviderRuntimeFloorMonitor {
+    disk_paths: Vec<PathBuf>,
+    disk_reserve_bytes: u64,
+    memory_pool: String,
+    memory_reserve_bytes: u64,
+}
+
+impl ProviderRuntimeFloorMonitor {
+    fn new(args: &ProviderStartArgs, home: &Path, selected: &ProviderCandidate) -> Result<Self> {
+        let downloads_dir = args
+            .downloads_dir
+            .clone()
+            .unwrap_or_else(|| home.join("downloads"));
+        let downloads_dir = absolutize(downloads_dir)?;
+        let mut disk_paths = vec![home.to_path_buf(), downloads_dir];
+        disk_paths.sort();
+        disk_paths.dedup();
+        let (disk_reserve_bytes, _) = provider_disk_reserve_bytes(args.disk_reserve.as_deref())?;
+        Ok(Self {
+            disk_paths,
+            disk_reserve_bytes,
+            memory_pool: selected.feasibility.memory_budget.pool.clone(),
+            memory_reserve_bytes: selected.feasibility.memory_budget.reserve_bytes,
+        })
+    }
+
+    fn check(&self) -> Option<ProviderRuntimeFloorRejection> {
+        let disk = self
+            .disk_paths
+            .iter()
+            .map(|path| ProviderRuntimeDiskObservation {
+                path: path.clone(),
+                available_bytes: available_bytes_for_path(path).ok().flatten(),
+                reserve_bytes: self.disk_reserve_bytes,
+            })
+            .collect::<Vec<_>>();
+        let memory = provider_runtime_memory_observation(
+            self.memory_reserve_bytes,
+            self.memory_pool.as_str(),
+        );
+        provider_runtime_floor_rejection_from_observations(&disk, memory)
+    }
+}
+
+fn provider_runtime_memory_observation(
+    reserve_bytes: u64,
+    pool: &str,
+) -> ProviderRuntimeMemoryObservation {
+    if reserve_bytes == 0 {
+        return ProviderRuntimeMemoryObservation::NotChecked;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = pool;
+        return ProviderRuntimeMemoryObservation::MacosPressure {
+            level: provider_macos_memory_pressure_level(),
+            stop_level: PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL,
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ProviderRuntimeMemoryObservation::AvailableBytes {
+            pool: pool.to_owned(),
+            available_bytes: provider_live_memory_available_bytes(),
+            reserve_bytes,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn provider_macos_memory_pressure_level() -> Option<i32> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "kern.memorystatus_vm_pressure_level"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i32>()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn provider_live_memory_available_bytes() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemAvailable:") else {
+            continue;
+        };
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return kib.checked_mul(1024);
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn provider_live_memory_available_bytes() -> Option<u64> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let kib = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn provider_live_memory_available_bytes() -> Option<u64> {
+    None
+}
+
+fn provider_runtime_floor_rejection_from_observations(
+    disk: &[ProviderRuntimeDiskObservation],
+    memory: ProviderRuntimeMemoryObservation,
+) -> Option<ProviderRuntimeFloorRejection> {
+    for observation in disk {
+        if let Some(available_bytes) = observation.available_bytes {
+            if available_bytes < observation.reserve_bytes {
+                return Some(ProviderRuntimeFloorRejection {
+                    code: "CAPACITY",
+                    reason: format!(
+                        "provider disk floor is active: {} has {} free, below reserve {}; refusing new sessions until space frees",
+                        observation.path.display(),
+                        human_bytes(available_bytes),
+                        human_bytes(observation.reserve_bytes)
+                    ),
+                });
+            }
+        }
+    }
+    match memory {
+        ProviderRuntimeMemoryObservation::AvailableBytes {
+            pool,
+            available_bytes: Some(available_bytes),
+            reserve_bytes,
+        } if available_bytes < reserve_bytes => Some(ProviderRuntimeFloorRejection {
+            code: "CAPACITY",
+            reason: format!(
+                "provider memory floor is active: {pool} has {} available, below reserve {}; refusing new sessions until memory frees",
+                human_bytes(available_bytes),
+                human_bytes(reserve_bytes)
+            ),
+        }),
+        ProviderRuntimeMemoryObservation::MacosPressure {
+            level: Some(level),
+            stop_level,
+        } if level >= stop_level => Some(ProviderRuntimeFloorRejection {
+            code: "CAPACITY",
+            reason: format!(
+                "provider macOS memory-pressure floor is active: pressure level {level} reached stop level {stop_level}; refusing new sessions until pressure clears"
+            ),
+        }),
+        _ => None,
+    }
+}
+
 fn provider_session_usage_units(usage: &ReceiptUsage) -> u64 {
     usage
         .units()
@@ -29069,6 +29266,7 @@ async fn serve_provider_sessions(
 
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
     let heartbeat_load = ProviderHeartbeatLoad::default();
+    let runtime_floor_monitor = ProviderRuntimeFloorMonitor::new(ctx.args, ctx.home, ctx.selected)?;
     let heartbeat_task = heartbeat_enabled.then(|| {
         tokio::spawn(run_provider_session_heartbeats(
             ProviderSessionHeartbeatTask {
@@ -29094,6 +29292,7 @@ async fn serve_provider_sessions(
     let mut pending_payloads = HashMap::new();
     let mut protection = ProviderProtectionState::new(protection_config);
     let mut draining = false;
+    let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
     let drain_paths = provider_drain_flag_paths(
         ctx.home,
         &ctx.wallet.public_key,
@@ -29109,6 +29308,27 @@ async fn serve_provider_sessions(
                 &heartbeat_load,
             )
             .await;
+            let next_runtime_floor_reject = if draining {
+                None
+            } else {
+                runtime_floor_monitor.check()
+            };
+            if next_runtime_floor_reject != runtime_floor_reject {
+                match &next_runtime_floor_reject {
+                    Some(reject) => provider_session_debug(format!(
+                        "runtime floor active; refusing new sessions with {}: {}",
+                        reject.code, reject.reason
+                    )),
+                    None if runtime_floor_reject.is_some() => provider_session_debug(
+                        "runtime floor cleared; accepting new sessions again",
+                    ),
+                    None => {}
+                }
+                runtime_floor_reject = next_runtime_floor_reject;
+            }
+            if !draining {
+                heartbeat_load.set_accepting_new(runtime_floor_reject.is_none());
+            }
             if !draining {
                 match provider_drain_requested(&drain_paths) {
                     Ok(Some(path)) => {
@@ -29176,6 +29396,7 @@ async fn serve_provider_sessions(
                         &terms,
                         &runtime,
                         responder.as_mut(),
+                        runtime_floor_reject.clone(),
                         event,
                     )
                     .await?;
@@ -29450,6 +29671,7 @@ async fn handle_provider_session_frame(
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
     responder: &mut dyn ProviderSessionResponder,
+    runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
     event: Value,
 ) -> Result<()> {
     let frame = event.get("frame").cloned().unwrap_or(Value::Null);
@@ -29485,7 +29707,12 @@ async fn handle_provider_session_frame(
             let static_decision = provider_session_open_decision(&frame, &validation_terms);
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
-                    let protection_decision = if heartbeat_load.is_accepting_new() {
+                    let protection_decision = if let Some(reject) = runtime_floor_reject {
+                        ProviderSessionDecision::Reject {
+                            code: reject.code,
+                            reason: reject.reason,
+                        }
+                    } else if heartbeat_load.is_accepting_new() {
                         protection.acceptance_decision(sessions.len())
                     } else {
                         ProviderSessionDecision::Reject {
@@ -40229,6 +40456,54 @@ mod tests {
             quota_units.acceptance_decision(0),
             ProviderSessionDecision::Reject { code: "QUOTA", .. }
         ));
+    }
+
+    #[test]
+    fn provider_runtime_floor_rejects_new_sessions_as_capacity() {
+        let healthy_disk = ProviderRuntimeDiskObservation {
+            path: PathBuf::from("/tmp/mayhem-downloads"),
+            available_bytes: Some(20 * GIB_BYTES),
+            reserve_bytes: 10 * GIB_BYTES,
+        };
+        assert!(provider_runtime_floor_rejection_from_observations(
+            std::slice::from_ref(&healthy_disk),
+            ProviderRuntimeMemoryObservation::NotChecked,
+        )
+        .is_none());
+
+        let disk_reject = provider_runtime_floor_rejection_from_observations(
+            &[ProviderRuntimeDiskObservation {
+                available_bytes: Some(GIB_BYTES),
+                ..healthy_disk.clone()
+            }],
+            ProviderRuntimeMemoryObservation::NotChecked,
+        )
+        .expect("low disk must reject");
+        assert_eq!(disk_reject.code, "CAPACITY");
+        assert!(disk_reject.reason.contains("disk floor is active"));
+
+        let memory_reject = provider_runtime_floor_rejection_from_observations(
+            &[healthy_disk.clone()],
+            ProviderRuntimeMemoryObservation::AvailableBytes {
+                pool: "system_memory".to_owned(),
+                available_bytes: Some(GIB_BYTES),
+                reserve_bytes: 2 * GIB_BYTES,
+            },
+        )
+        .expect("low memory must reject");
+        assert_eq!(memory_reject.code, "CAPACITY");
+        assert!(memory_reject.reason.contains("memory floor is active"));
+
+        let mac_reject = provider_runtime_floor_rejection_from_observations(
+            &[healthy_disk],
+            ProviderRuntimeMemoryObservation::MacosPressure {
+                level: Some(PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL),
+                stop_level: PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL,
+            },
+        )
+        .expect("macOS pressure floor must reject");
+        assert_eq!(mac_reject.code, "CAPACITY");
+        assert!(mac_reject.reason.contains("memory-pressure floor"));
     }
 
     #[test]
