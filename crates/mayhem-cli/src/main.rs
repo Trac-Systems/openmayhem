@@ -15921,13 +15921,18 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     writeln!(&mut out, "bind = {}", toml_string(&plan.supervisor_bind))?;
     writeln!(&mut out)?;
 
+    let stores_directory = plan.home.join("stores").display().to_string();
     let mut peer_args = vec![
         "run".to_owned(),
         ".".to_owned(),
         "--network".to_owned(),
         plan.network.clone(),
+        "--peer-stores-directory".to_owned(),
+        stores_directory.clone(),
         "--peer-store-name".to_owned(),
         plan.peer_store_name.clone(),
+        "--msb-stores-directory".to_owned(),
+        stores_directory,
         "--msb-store-name".to_owned(),
         plan.msb_store_name.clone(),
     ];
@@ -16132,7 +16137,18 @@ fn mayhemd_launcher_command(mayhemd_path: &Path) -> Result<std::process::Command
     }
     #[cfg(not(unix))]
     {
-        Ok(std::process::Command::new(mayhemd_path))
+        let mut command = std::process::Command::new(mayhemd_path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            command.creation_flags(
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+            );
+        }
+        Ok(command)
     }
 }
 
@@ -16455,11 +16471,20 @@ fn generate_sc_bridge_token(home: &Path) -> String {
 }
 
 fn sibling_binary_path(current_exe: &Path, name: &str) -> PathBuf {
-    let candidate = current_exe.with_file_name(name);
+    let sibling_name = executable_sibling_name(name, cfg!(windows));
+    let candidate = current_exe.with_file_name(&sibling_name);
     if candidate.exists() {
         candidate
     } else {
-        PathBuf::from(name)
+        PathBuf::from(sibling_name)
+    }
+}
+
+fn executable_sibling_name(name: &str, windows: bool) -> String {
+    if windows && Path::new(name).extension().is_none() {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
     }
 }
 
@@ -16487,9 +16512,55 @@ fn resolve_pear_runtime_path() -> Result<PathBuf> {
 
 fn command_from_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
+    let pathext = env::var("PATHEXT").ok();
+    command_from_path_entries(
+        name,
+        env::split_paths(&path),
+        cfg!(windows),
+        pathext.as_deref(),
+    )
+}
+
+fn command_from_path_entries<I>(
+    name: &str,
+    paths: I,
+    windows: bool,
+    pathext: Option<&str>,
+) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    paths
+        .into_iter()
+        .flat_map(|dir| command_path_candidates(&dir, name, windows, pathext))
         .find(|candidate| candidate.is_file())
+}
+
+fn command_path_candidates(
+    dir: &Path,
+    name: &str,
+    windows: bool,
+    pathext: Option<&str>,
+) -> Vec<PathBuf> {
+    let base = dir.join(name);
+    if !windows || Path::new(name).extension().is_some() {
+        return vec![base];
+    }
+    let mut candidates = pathext
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| {
+            if ext.starts_with('.') {
+                base.with_extension(&ext[1..])
+            } else {
+                base.with_extension(ext)
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.push(base);
+    candidates
 }
 
 fn rpc_port_from_url(url: &str) -> Result<u16> {
@@ -45381,11 +45452,40 @@ mod tests {
         assert!(text.contains(&"b".repeat(64)));
         assert!(text.contains("--msb-channel"));
         assert!(text.contains("mayhem-msb-mainnet-v1"));
+        assert!(text.contains("--peer-stores-directory"));
+        assert!(text.contains("--msb-stores-directory"));
+        assert!(text.contains(&home.join("stores").display().to_string()));
         assert!(text.contains("--bind"));
         assert!(text.contains("0.0.0.0:11435"));
         assert!(text.contains("--require-auth"));
         assert!(text.contains("--serve-sessions"));
         assert!(!text.contains("--peer-dht-bootstrap"));
+    }
+
+    #[test]
+    fn executable_sibling_name_adds_windows_exe_suffix() {
+        assert_eq!(executable_sibling_name("mayhemd", true), "mayhemd.exe");
+        assert_eq!(executable_sibling_name("mayhemd.exe", true), "mayhemd.exe");
+        assert_eq!(executable_sibling_name("mayhemd", false), "mayhemd");
+    }
+
+    #[test]
+    fn command_from_path_entries_prefers_windows_shims() {
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-command-path-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("pear"), "#!/bin/sh\n").unwrap();
+        fs::write(dir.join("pear.cmd"), "@echo off\n").unwrap();
+        let resolved =
+            command_from_path_entries("pear", vec![dir.clone()], true, Some(".cmd;.exe")).unwrap();
+        assert_eq!(resolved, dir.join("pear.cmd"));
+        let resolved_non_windows =
+            command_from_path_entries("pear", vec![dir.clone()], false, None).unwrap();
+        assert_eq!(resolved_non_windows, dir.join("pear"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
