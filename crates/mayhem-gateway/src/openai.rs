@@ -52,14 +52,14 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{stream, Stream};
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    chunk_json_payload, default_model_class, migrate_receipt_body, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    supported_receipt_signing_bytes, AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_STEP,
+    chunk_json_payload, default_model_class, migrate_receipt_body, reassemble_json_payload,
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, supported_receipt_signing_bytes, AttestationReport,
+    CheckpointPolicy, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -4741,6 +4741,83 @@ fn streamed_output_token_count(content: &str, token_ids: &[i32]) -> u64 {
     }
 }
 
+#[derive(Debug, Default)]
+struct SessionDeltaPayloadChunks {
+    chunks: BTreeMap<String, Vec<PayloadChunk>>,
+}
+
+fn session_delta_payload_key(request_id: &str, field: &str, payload_id: &str) -> String {
+    format!("{request_id}:{field}:{payload_id}")
+}
+
+fn valid_session_delta_ref_field(field: &str) -> bool {
+    matches!(field, "tool" | "embeddings" | "token_ids")
+}
+
+fn collect_session_delta_chunk(
+    frame: &Value,
+    pending: &mut SessionDeltaPayloadChunks,
+) -> Result<(), GatewaySessionError> {
+    let request_id = frame
+        .get("rid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GatewaySessionError::new("s.delta_chunk missing rid"))?;
+    let field = frame
+        .get("field")
+        .and_then(Value::as_str)
+        .filter(|field| valid_session_delta_ref_field(field))
+        .ok_or_else(|| GatewaySessionError::new("s.delta_chunk has unsupported field"))?;
+    let payload_id = frame
+        .get("payload_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GatewaySessionError::new("s.delta_chunk missing payload_id"))?;
+    let chunk: PayloadChunk = serde_json::from_value(
+        frame
+            .get("chunk")
+            .cloned()
+            .ok_or_else(|| GatewaySessionError::new("s.delta_chunk missing chunk"))?,
+    )
+    .map_err(|err| GatewaySessionError::new(format!("invalid s.delta_chunk chunk: {err}")))?;
+    pending
+        .chunks
+        .entry(session_delta_payload_key(request_id, field, payload_id))
+        .or_default()
+        .push(chunk);
+    Ok(())
+}
+
+fn resolve_session_delta_ref_field(
+    frame: &Value,
+    field: &'static str,
+    pending: &mut SessionDeltaPayloadChunks,
+) -> Result<Option<Value>, GatewaySessionError> {
+    let ref_key = format!("{field}_ref");
+    let Some(manifest_value) = frame.get(&ref_key) else {
+        return Ok(None);
+    };
+    let request_id = frame
+        .get("rid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GatewaySessionError::new(format!("s.delta {ref_key} missing rid")))?;
+    let manifest: PayloadChunkManifest = serde_json::from_value(manifest_value.clone())
+        .map_err(|err| GatewaySessionError::new(format!("invalid s.delta {ref_key}: {err}")))?;
+    let key = session_delta_payload_key(request_id, field, &manifest.blake3);
+    let chunks = pending.chunks.remove(&key).ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "s.delta {ref_key} {} has no received chunks",
+            manifest.blake3
+        ))
+    })?;
+    reassemble_json_payload(&manifest, &chunks)
+        .map(Some)
+        .map_err(|err| {
+            GatewaySessionError::new(format!("reassembling s.delta {ref_key} failed: {err}"))
+        })
+}
+
 async fn collect_direct_session_output(
     bridge: &mut ScBridgeClient,
     session_id: &str,
@@ -4761,6 +4838,7 @@ async fn collect_direct_session_output(
     let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
+    let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -4778,7 +4856,13 @@ async fn collect_direct_session_output(
             bridge,
             session_id,
             Duration::from_millis(remaining_millis),
-            &["s.delta", "s.receipt", "s.error", "s.close"],
+            &[
+                "s.delta",
+                "s.delta_chunk",
+                "s.receipt",
+                "s.error",
+                "s.close",
+            ],
         )
         .await
         {
@@ -4818,6 +4902,12 @@ async fn collect_direct_session_output(
             Err(err) => return Err(err),
         };
         match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta_chunk")
+                if frame.get("rid").and_then(Value::as_str) == Some(request_id) =>
+            {
+                watchdog.record_delta(now_millis_u64());
+                collect_session_delta_chunk(&frame, &mut delta_payload_chunks)?;
+            }
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 let now = now_millis_u64();
                 watchdog.record_delta(now);
@@ -4825,6 +4915,10 @@ async fn collect_direct_session_output(
                     content.push_str(delta);
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame) {
+                    token_ids = ids;
+                } else if let Some(ids) =
+                    token_ids_ref_from_session_delta(&frame, &mut delta_payload_chunks)?
+                {
                     token_ids = ids;
                 } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
                     token_ids.extend(ids);
@@ -4855,7 +4949,8 @@ async fn collect_direct_session_output(
                     }
                 }
                 if tool_call.is_none() {
-                    tool_call = tool_call_from_session_delta(&frame);
+                    tool_call =
+                        tool_call_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?;
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
@@ -5031,6 +5126,7 @@ async fn collect_direct_session_embedding_output(
     let mut embeddings = None;
     let mut usage = None;
     let mut provider_receipt = None;
+    let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -5048,16 +5144,28 @@ async fn collect_direct_session_embedding_output(
             bridge,
             session_id,
             Duration::from_millis(remaining_millis),
-            &["s.delta", "s.receipt", "s.error", "s.close"],
+            &[
+                "s.delta",
+                "s.delta_chunk",
+                "s.receipt",
+                "s.error",
+                "s.close",
+            ],
         )
         .await
         .map_err(GatewaySessionError::into_retryable)?;
         match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta_chunk")
+                if frame.get("rid").and_then(Value::as_str) == Some(request_id) =>
+            {
+                watchdog.record_delta(now_millis_u64());
+                collect_session_delta_chunk(&frame, &mut delta_payload_chunks)?;
+            }
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 let now = now_millis_u64();
                 watchdog.record_delta(now);
                 if embeddings.is_none() {
-                    embeddings = embeddings_from_session_delta(&frame)?;
+                    embeddings = embeddings_from_session_delta(&frame, &mut delta_payload_chunks)?;
                 }
                 if usage.is_none() {
                     usage = usage_from_session_delta(&frame);
@@ -5408,13 +5516,21 @@ async fn collect_direct_session_audio_transcription_output(
 
 fn embeddings_from_session_delta(
     frame: &Value,
+    pending: &mut SessionDeltaPayloadChunks,
 ) -> Result<Option<Vec<Vec<f32>>>, GatewaySessionError> {
-    if let Some(value) = frame.get("embeddings") {
+    if let Some(value) = frame.get("embeddings").filter(|value| !value.is_null()) {
         return serde_json::from_value::<Vec<Vec<f32>>>(value.clone())
             .map(Some)
             .map_err(|err| GatewaySessionError::new(format!("invalid embeddings delta: {err}")));
     }
-    if let Some(value) = frame.get("embedding") {
+    if let Some(value) = resolve_session_delta_ref_field(frame, "embeddings", pending)? {
+        return serde_json::from_value::<Vec<Vec<f32>>>(value)
+            .map(Some)
+            .map_err(|err| {
+                GatewaySessionError::new(format!("invalid embeddings_ref delta: {err}"))
+            });
+    }
+    if let Some(value) = frame.get("embedding").filter(|value| !value.is_null()) {
         return serde_json::from_value::<Vec<f32>>(value.clone())
             .map(|embedding| Some(vec![embedding]))
             .map_err(|err| GatewaySessionError::new(format!("invalid embedding delta: {err}")));
@@ -5658,6 +5774,18 @@ fn token_ids_from_session_delta(frame: &Value) -> Option<Vec<i32>> {
             .filter_map(|value| value.as_i64().and_then(|id| i32::try_from(id).ok()))
             .collect(),
     )
+}
+
+fn token_ids_ref_from_session_delta(
+    frame: &Value,
+    pending: &mut SessionDeltaPayloadChunks,
+) -> Result<Option<Vec<i32>>, GatewaySessionError> {
+    let Some(value) = resolve_session_delta_ref_field(frame, "token_ids", pending)? else {
+        return Ok(None);
+    };
+    serde_json::from_value::<Vec<i32>>(value)
+        .map(Some)
+        .map_err(|err| GatewaySessionError::new(format!("invalid token_ids_ref delta: {err}")))
 }
 
 fn token_ids_delta_from_session_delta(frame: &Value) -> Option<Vec<i32>> {
@@ -6197,8 +6325,20 @@ fn receipt_ack_for_body(
     })
 }
 
-fn tool_call_from_session_delta(frame: &Value) -> Option<ToolCallOutput> {
-    let tool = frame.get("tool")?;
+fn tool_call_from_session_delta_resolving(
+    frame: &Value,
+    pending: &mut SessionDeltaPayloadChunks,
+) -> Result<Option<ToolCallOutput>, GatewaySessionError> {
+    if let Some(tool) = frame.get("tool").filter(|tool| !tool.is_null()) {
+        return Ok(tool_call_from_session_value(tool));
+    }
+    if let Some(tool) = resolve_session_delta_ref_field(frame, "tool", pending)? {
+        return Ok(tool_call_from_session_value(&tool));
+    }
+    Ok(None)
+}
+
+fn tool_call_from_session_value(tool: &Value) -> Option<ToolCallOutput> {
     if tool.is_null() {
         return None;
     }
@@ -7364,6 +7504,7 @@ async fn run_live_direct_chat_sse_inner(
     let mut pending_checkpoint_receipt: Option<ProviderSignedReceipt> = None;
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
+    let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
     let started_at_millis = now_millis_u64();
     let failover = session.invocation.failover;
     let mut watchdog = DirectSessionWatchdog::new(
@@ -7387,7 +7528,13 @@ async fn run_live_direct_chat_sse_inner(
             &mut session.bridge,
             &session.invocation.session_id,
             Duration::from_millis(wait_millis),
-            &["s.delta", "s.receipt", "s.error", "s.close"],
+            &[
+                "s.delta",
+                "s.delta_chunk",
+                "s.receipt",
+                "s.error",
+                "s.close",
+            ],
         )
         .await
         {
@@ -7441,6 +7588,14 @@ async fn run_live_direct_chat_sse_inner(
             Err(err) => return Err(err),
         };
         match frame.get("t").and_then(Value::as_str) {
+            Some("s.delta_chunk")
+                if frame.get("rid").and_then(Value::as_str)
+                    == Some(session.request_id.as_str()) =>
+            {
+                latest_checkpoint_ack_frame = None;
+                watchdog.record_delta(now_millis_u64());
+                collect_session_delta_chunk(&frame, &mut delta_payload_chunks)?;
+            }
             Some("s.delta")
                 if frame.get("rid").and_then(Value::as_str)
                     == Some(session.request_id.as_str()) =>
@@ -7452,6 +7607,10 @@ async fn run_live_direct_chat_sse_inner(
                     content.push_str(delta);
                 }
                 if let Some(ids) = token_ids_from_session_delta(&frame) {
+                    token_ids = ids;
+                } else if let Some(ids) =
+                    token_ids_ref_from_session_delta(&frame, &mut delta_payload_chunks)?
+                {
                     token_ids = ids;
                 } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
                     token_ids.extend(ids);
@@ -7507,7 +7666,9 @@ async fn run_live_direct_chat_sse_inner(
                     }
                 }
                 if tool_call.is_none() {
-                    if let Some(next_tool_call) = tool_call_from_session_delta(&frame) {
+                    if let Some(next_tool_call) =
+                        tool_call_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
+                    {
                         if !send_sse_value(
                             tx,
                             chat_chunk(
@@ -12347,7 +12508,7 @@ mod tests {
     use super::*;
     use mayhem_proto::{
         attestation_signing_bytes, reassemble_json_payload, receipt_signing_bytes_for_version,
-        AttestationSigner, PayloadChunk, PayloadChunkManifest,
+        AttestationSigner,
     };
 
     #[test]
@@ -13967,6 +14128,69 @@ mod tests {
             .collect::<Vec<_>>();
         let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
         assert_eq!(restored, body);
+    }
+
+    #[test]
+    fn session_delta_refs_reassemble_large_tool_embeddings_and_token_ids() {
+        let mut pending = SessionDeltaPayloadChunks::default();
+        let tool = json!({
+            "id": "call-large",
+            "name": "write_file",
+            "arguments": "x".repeat(10_000),
+        });
+        let embeddings = json!([vec![0.25_f32; 2048], vec![0.5_f32; 2048]]);
+        let token_ids = json!((0..4096).collect::<Vec<i32>>());
+        let fields = [
+            ("tool", tool.clone()),
+            ("embeddings", embeddings.clone()),
+            ("token_ids", token_ids.clone()),
+        ];
+        let mut manifests = BTreeMap::new();
+        for (field, value) in fields {
+            let (manifest, chunks) = chunk_json_payload(&value, 512).unwrap();
+            for chunk in chunks {
+                collect_session_delta_chunk(
+                    &json!({
+                        "t": "s.delta_chunk",
+                        "rid": "rid-large",
+                        "field": field,
+                        "payload_id": manifest.blake3.clone(),
+                        "chunk": chunk,
+                    }),
+                    &mut pending,
+                )
+                .unwrap();
+            }
+            manifests.insert(field, manifest);
+        }
+        let frame = json!({
+            "t": "s.delta",
+            "rid": "rid-large",
+            "tool": null,
+            "tool_ref": manifests["tool"],
+            "embeddings": null,
+            "embeddings_ref": manifests["embeddings"],
+            "token_ids": null,
+            "token_ids_ref": manifests["token_ids"],
+        });
+
+        let restored_tool = tool_call_from_session_delta_resolving(&frame, &mut pending)
+            .unwrap()
+            .unwrap();
+        let restored_embeddings = embeddings_from_session_delta(&frame, &mut pending)
+            .unwrap()
+            .unwrap();
+        let restored_token_ids = token_ids_ref_from_session_delta(&frame, &mut pending)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(restored_tool.id, "call-large");
+        assert_eq!(restored_tool.name, "write_file");
+        assert_eq!(restored_tool.arguments, "x".repeat(10_000));
+        assert_eq!(restored_embeddings.len(), 2);
+        assert_eq!(restored_embeddings[0].len(), 2048);
+        assert_eq!(restored_token_ids.len(), 4096);
+        assert!(pending.chunks.is_empty());
     }
 
     fn test_chat_output() -> ChatOutput {

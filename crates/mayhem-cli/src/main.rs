@@ -54,12 +54,13 @@ use mayhem_hwprobe::{
     ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
-    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
-    AttestationRuntimeConfig, CatalogEnclaveIdentity, CheckpointPolicy, PayloadChunk,
-    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP,
+    chunk_json_payload, reassemble_json_payload, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, supported_receipt_signing_bytes,
+    supported_spend_voucher_signing_bytes, AttestationRuntimeConfig, CatalogEnclaveIdentity,
+    CheckpointPolicy, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -24664,29 +24665,24 @@ async fn send_provider_session_output(
         index = index.saturating_add(1);
     }
 
-    provider_session_debug(format!(
-        "sending final s.delta #{index} for session {} request {request_id}",
-        active.session_id
-    ));
-    bridge
-        .session_send(
-            &active.remote,
-            &active.session_id,
-            json!({
-                "t": "s.delta",
-                "rid": request_id,
-                "i": index,
-                "d": "",
-                "tool": output.tool.as_ref(),
-                "embeddings": output.embeddings.as_ref(),
-                "fin": output.finish_reason,
-                "usage": output.usage,
-                "token_ids": (!token_ids_sent_in_deltas).then_some(&output.token_ids),
-                "artifacts": provider_session_artifact_summaries(&output.artifacts),
-            }),
-        )
-        .await
-        .context("sending final s.delta")?;
+    for frame in provider_session_final_delta_frames(
+        request_id,
+        index,
+        output,
+        token_ids_sent_in_deltas,
+        provider_session_max_frame_bytes(),
+    )? {
+        provider_session_debug(format!(
+            "sending final response frame {} #{} for session {} request {request_id}",
+            frame.get("t").and_then(Value::as_str).unwrap_or("frame"),
+            frame.get("i").and_then(Value::as_u64).unwrap_or(index),
+            active.session_id
+        ));
+        bridge
+            .session_send(&active.remote, &active.session_id, frame)
+            .await
+            .context("sending final response frame")?;
+    }
 
     let receipt = provider_session_receipt_for_usage(
         terms,
@@ -24712,6 +24708,136 @@ fn provider_session_delta_batch_tokens() -> u64 {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|tokens| *tokens > 0)
         .unwrap_or(8)
+}
+
+fn provider_session_max_frame_bytes() -> usize {
+    std::env::var("MAYHEM_SESSION_MAX_FRAME_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 8 * 1024)
+        .unwrap_or(DEFAULT_SESSION_MAX_FRAME_BYTES)
+}
+
+fn provider_session_payload_chunk_bytes(max_frame_bytes: usize) -> usize {
+    let safe_raw = max_frame_bytes.saturating_sub(4096) / 3;
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES.min(safe_raw.max(1024))
+}
+
+fn provider_session_frame_json_len(frame: &Value) -> Result<usize> {
+    serde_json::to_vec(frame)
+        .map(|bytes| bytes.len())
+        .context("serializing provider session frame")
+}
+
+fn provider_session_final_delta_frames(
+    request_id: &str,
+    start_index: u64,
+    output: &ProviderSessionOutput,
+    token_ids_sent_in_deltas: bool,
+    max_frame_bytes: usize,
+) -> Result<Vec<Value>> {
+    let mut final_frame = json!({
+        "t": "s.delta",
+        "rid": request_id,
+        "i": start_index,
+        "d": "",
+        "tool": output.tool.as_ref(),
+        "embeddings": output.embeddings.as_ref(),
+        "fin": output.finish_reason,
+        "usage": output.usage,
+        "token_ids": (!token_ids_sent_in_deltas).then_some(&output.token_ids),
+        "artifacts": provider_session_artifact_summaries(&output.artifacts),
+    });
+    if provider_session_frame_json_len(&final_frame)? <= max_frame_bytes {
+        return Ok(vec![final_frame]);
+    }
+
+    let mut frames = Vec::new();
+    let mut next_index = start_index;
+    if let Some(tool) = &output.tool {
+        provider_session_add_delta_ref_frames(
+            &mut frames,
+            &mut final_frame,
+            request_id,
+            "tool",
+            tool.clone(),
+            &mut next_index,
+            max_frame_bytes,
+        )?;
+    }
+    if let Some(embeddings) = &output.embeddings {
+        provider_session_add_delta_ref_frames(
+            &mut frames,
+            &mut final_frame,
+            request_id,
+            "embeddings",
+            json!(embeddings),
+            &mut next_index,
+            max_frame_bytes,
+        )?;
+    }
+    if !token_ids_sent_in_deltas && !output.token_ids.is_empty() {
+        provider_session_add_delta_ref_frames(
+            &mut frames,
+            &mut final_frame,
+            request_id,
+            "token_ids",
+            json!(output.token_ids),
+            &mut next_index,
+            max_frame_bytes,
+        )?;
+    }
+    final_frame["i"] = json!(next_index);
+    let final_len = provider_session_frame_json_len(&final_frame)?;
+    if final_len > max_frame_bytes {
+        bail!(
+            "final provider s.delta frame {final_len} bytes exceeds session max {max_frame_bytes} bytes after chunking large fields"
+        );
+    }
+    frames.push(final_frame);
+    Ok(frames)
+}
+
+fn provider_session_add_delta_ref_frames(
+    frames: &mut Vec<Value>,
+    final_frame: &mut Value,
+    request_id: &str,
+    field: &'static str,
+    value: Value,
+    next_index: &mut u64,
+    max_frame_bytes: usize,
+) -> Result<()> {
+    let (manifest, chunks) = chunk_json_payload(
+        &value,
+        provider_session_payload_chunk_bytes(max_frame_bytes),
+    )
+    .with_context(|| format!("chunking provider session {field} field"))?;
+    let payload_id = manifest.blake3.clone();
+    for chunk in chunks {
+        let frame = json!({
+            "t": "s.delta_chunk",
+            "v": 1,
+            "rid": request_id,
+            "i": *next_index,
+            "field": field,
+            "payload_id": payload_id.clone(),
+            "chunk": chunk,
+        });
+        let len = provider_session_frame_json_len(&frame)?;
+        if len > max_frame_bytes {
+            bail!(
+                "chunked provider s.delta {field} frame {len} bytes exceeds session max {max_frame_bytes} bytes"
+            );
+        }
+        frames.push(frame);
+        *next_index = next_index.saturating_add(1);
+    }
+    let object = final_frame
+        .as_object_mut()
+        .context("final provider s.delta frame must be an object")?;
+    object.insert(field.to_owned(), Value::Null);
+    object.insert(format!("{field}_ref"), json!(manifest));
+    Ok(())
 }
 
 fn provider_session_receipt_ack_timeout(active: &ActiveProviderSession) -> Duration {
@@ -33202,6 +33328,65 @@ mod tests {
         }
 
         assert_eq!(observed, token_ids);
+    }
+
+    #[test]
+    fn provider_session_final_delta_frames_chunk_large_fields_under_transport_limit() {
+        let output = ProviderSessionOutput {
+            content: String::new(),
+            tool: Some(json!({
+                "id": "call-large",
+                "name": "write_file",
+                "arguments": "x".repeat(20_000),
+            })),
+            embeddings: Some(vec![vec![0.25_f32; 2048], vec![0.5_f32; 2048]]),
+            artifacts: Vec::new(),
+            finish_reason: "tool_calls".to_owned(),
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            token_ids: (0..5000).collect::<Vec<i32>>(),
+            usage: ReceiptUsage::text(3, 4),
+        };
+        let max_frame_bytes = 12 * 1024;
+
+        let frames =
+            provider_session_final_delta_frames("rid-large", 7, &output, false, max_frame_bytes)
+                .unwrap();
+
+        assert!(frames.len() > 3);
+        assert!(frames
+            .iter()
+            .all(|frame| provider_session_frame_json_len(frame).unwrap() <= max_frame_bytes));
+        assert!(frames[..frames.len() - 1]
+            .iter()
+            .all(|frame| { frame.get("t").and_then(Value::as_str) == Some("s.delta_chunk") }));
+        let final_frame = frames.last().unwrap();
+        assert_eq!(
+            final_frame.get("t").and_then(Value::as_str),
+            Some("s.delta")
+        );
+        assert!(final_frame["tool"].is_null());
+        assert!(final_frame["embeddings"].is_null());
+        assert!(final_frame["token_ids"].is_null());
+        for field in ["tool", "embeddings", "token_ids"] {
+            let manifest_key = format!("{field}_ref");
+            let manifest: PayloadChunkManifest =
+                serde_json::from_value(final_frame[manifest_key.as_str()].clone()).unwrap();
+            let chunks = frames[..frames.len() - 1]
+                .iter()
+                .filter(|frame| frame.get("field").and_then(Value::as_str) == Some(field))
+                .map(|frame| {
+                    serde_json::from_value::<PayloadChunk>(frame["chunk"].clone()).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
+            match field {
+                "tool" => assert_eq!(restored["arguments"], json!("x".repeat(20_000))),
+                "embeddings" => assert_eq!(restored.as_array().unwrap().len(), 2),
+                "token_ids" => assert_eq!(restored.as_array().unwrap().len(), 5000),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
