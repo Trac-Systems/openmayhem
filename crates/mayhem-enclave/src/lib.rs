@@ -25,6 +25,7 @@ use sha2::Sha256;
 use thiserror::Error;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const DEFAULT_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 pub const MERKLE_KIND: &str = "blake3_merkle_v1";
 pub const SEALED_STORE_MANIFEST: &str = "sealed-manifest.json";
 pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
@@ -358,6 +359,21 @@ pub struct DownloadReport {
     pub bytes_written: u64,
     pub total_bytes: u64,
     pub merkle: MerkleManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressPhase {
+    Download,
+    Verify,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgressEvent {
+    pub phase: ProgressPhase,
+    pub path: PathBuf,
+    pub position: u64,
+    pub total: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -824,6 +840,16 @@ pub fn calculate_saturation(input: &SaturationInput) -> SaturationBreakdown {
 }
 
 pub fn download_resumable(request: &DownloadRequest) -> Result<DownloadReport> {
+    download_resumable_with_progress(request, |_| {})
+}
+
+pub fn download_resumable_with_progress<F>(
+    request: &DownloadRequest,
+    mut progress: F,
+) -> Result<DownloadReport>
+where
+    F: FnMut(ProgressEvent),
+{
     validate_chunk_size(request.chunk_size)?;
     if let Some(parent) = request.destination.parent() {
         fs::create_dir_all(parent)?;
@@ -838,15 +864,30 @@ pub fn download_resumable(request: &DownloadRequest) -> Result<DownloadReport> {
 
     match &request.source {
         DownloadSource::File(path) => {
-            append_file_range(path, &part_path, resumed_from, request.chunk_size)?;
+            append_file_range(
+                path,
+                &part_path,
+                resumed_from,
+                request.chunk_size,
+                &mut progress,
+            )?;
         }
         DownloadSource::Http { url, bearer_token } => {
-            download_http_range(url, bearer_token.as_deref(), &part_path, resumed_from)?;
+            download_http_range(
+                url,
+                bearer_token.as_deref(),
+                &part_path,
+                resumed_from,
+                &mut progress,
+            )?;
         }
     }
 
     fs::rename(&part_path, &request.destination)?;
-    let merkle = build_merkle_manifest(&request.destination, request.chunk_size)?;
+    let merkle =
+        build_merkle_manifest_with_progress(&request.destination, request.chunk_size, |event| {
+            progress(event)
+        })?;
     if let Some(expected) = &request.expected_merkle_root {
         ensure_merkle_root(expected, &merkle.root)?;
     }
@@ -861,11 +902,29 @@ pub fn download_resumable(request: &DownloadRequest) -> Result<DownloadReport> {
 }
 
 pub fn build_merkle_manifest(path: &Path, chunk_size: usize) -> Result<MerkleManifest> {
+    build_merkle_manifest_with_progress(path, chunk_size, |_| {})
+}
+
+pub fn build_merkle_manifest_with_progress<F>(
+    path: &Path,
+    chunk_size: usize,
+    mut progress: F,
+) -> Result<MerkleManifest>
+where
+    F: FnMut(ProgressEvent),
+{
     validate_chunk_size(chunk_size)?;
     let mut reader = BufReader::new(File::open(path)?);
     let mut buffer = vec![0_u8; chunk_size];
     let mut chunks = Vec::new();
     let mut total_bytes = 0_u64;
+    let total = fs::metadata(path).ok().map(|metadata| metadata.len());
+    progress(ProgressEvent {
+        phase: ProgressPhase::Verify,
+        path: path.to_path_buf(),
+        position: 0,
+        total,
+    });
 
     loop {
         let read = reader.read(&mut buffer)?;
@@ -881,6 +940,12 @@ pub fn build_merkle_manifest(path: &Path, chunk_size: usize) -> Result<MerkleMan
             blake3: hex::encode(hash),
         });
         total_bytes = total_bytes.saturating_add(read as u64);
+        progress(ProgressEvent {
+            phase: ProgressPhase::Verify,
+            path: path.to_path_buf(),
+            position: total_bytes,
+            total,
+        });
     }
 
     let leaves = decode_chunk_hashes(&chunks)?;
@@ -1633,6 +1698,7 @@ fn append_file_range(
     part_path: &Path,
     start: u64,
     buffer_size: usize,
+    progress: &mut dyn FnMut(ProgressEvent),
 ) -> Result<()> {
     let mut source_file = BufReader::new(File::open(source)?);
     source_file.seek(SeekFrom::Start(start))?;
@@ -1641,12 +1707,27 @@ fn append_file_range(
         .append(true)
         .open(part_path)?;
     let mut buffer = vec![0_u8; buffer_size];
+    let total = fs::metadata(source).ok().map(|metadata| metadata.len());
+    let mut written = start;
+    progress(ProgressEvent {
+        phase: ProgressPhase::Download,
+        path: part_path.to_path_buf(),
+        position: written,
+        total,
+    });
     loop {
         let read = source_file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         destination.write_all(&buffer[..read])?;
+        written = written.saturating_add(read as u64);
+        progress(ProgressEvent {
+            phase: ProgressPhase::Download,
+            path: part_path.to_path_buf(),
+            position: written,
+            total,
+        });
     }
     destination.flush()?;
     Ok(())
@@ -1657,6 +1738,7 @@ fn download_http_range(
     bearer_token: Option<&str>,
     part_path: &Path,
     start: u64,
+    progress: &mut dyn FnMut(ProgressEvent),
 ) -> Result<()> {
     let client = reqwest::blocking::Client::new();
     let mut request = client.get(url);
@@ -1679,6 +1761,13 @@ fn download_http_range(
             status,
         });
     };
+    let total = response.content_length().map(|remaining| {
+        if append {
+            start.saturating_add(remaining)
+        } else {
+            remaining
+        }
+    });
 
     let mut destination = OpenOptions::new()
         .create(true)
@@ -1686,7 +1775,28 @@ fn download_http_range(
         .append(append)
         .truncate(!append)
         .open(part_path)?;
-    std::io::copy(&mut response, &mut destination)?;
+    let mut buffer = vec![0_u8; DEFAULT_COPY_BUFFER_SIZE];
+    let mut written = if append { start } else { 0 };
+    progress(ProgressEvent {
+        phase: ProgressPhase::Download,
+        path: part_path.to_path_buf(),
+        position: written,
+        total,
+    });
+    loop {
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..read])?;
+        written = written.saturating_add(read as u64);
+        progress(ProgressEvent {
+            phase: ProgressPhase::Download,
+            path: part_path.to_path_buf(),
+            position: written,
+            total,
+        });
+    }
     destination.flush()?;
     Ok(())
 }
@@ -2541,6 +2651,36 @@ mod tests {
         assert_eq!(report.resumed_from, 11);
         assert_eq!(fs::read(&destination)?, payload);
         assert_eq!(report.merkle.root, expected.root);
+        Ok(())
+    }
+
+    #[test]
+    fn download_progress_reports_copy_and_verify_totals() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("download.bin");
+        let payload = b"progress-events-are-byte-accounted";
+        fs::write(&source, payload)?;
+        let expected = build_merkle_manifest(&source, 5)?;
+        let mut request =
+            DownloadRequest::new(DownloadSource::File(source.clone()), destination.clone());
+        request.chunk_size = 5;
+        request.expected_merkle_root = Some(expected.root.clone());
+
+        let mut events = Vec::new();
+        let report = download_resumable_with_progress(&request, |event| events.push(event))?;
+
+        assert_eq!(report.total_bytes, payload.len() as u64);
+        assert!(events
+            .iter()
+            .any(|event| event.phase == ProgressPhase::Download
+                && event.position == payload.len() as u64
+                && event.total == Some(payload.len() as u64)));
+        assert!(events
+            .iter()
+            .any(|event| event.phase == ProgressPhase::Verify
+                && event.position == payload.len() as u64
+                && event.total == Some(payload.len() as u64)));
         Ok(())
     }
 

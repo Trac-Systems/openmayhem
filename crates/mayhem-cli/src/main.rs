@@ -22,17 +22,19 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
 use mayhem_bridge::{
     BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL,
     DEFAULT_SC_BRIDGE_URL,
 };
 use mayhem_enclave::{
-    build_merkle_manifest, download_resumable, finalize_tier1_attestation_report,
-    load_or_create_runtime_keypair_store, measure_binary, prepare_tier1_attestation_report,
-    read_sealed_manifest, seal_artifact, DownloadReport, DownloadRequest, DownloadSource,
-    KeyContext, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions,
-    Tier1AttestationDraft, Tier1AttestationReport, Tier1ExternalProviderAttestationOptions,
-    DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
+    build_merkle_manifest, build_merkle_manifest_with_progress, download_resumable_with_progress,
+    finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
+    prepare_tier1_attestation_report, read_sealed_manifest, seal_artifact, DownloadReport,
+    DownloadRequest, DownloadSource, KeyContext, ProgressEvent, ProgressPhase, RuntimeKeyContext,
+    RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationDraft,
+    Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
+    SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
@@ -22947,6 +22949,125 @@ fn provider_log(args: &ProviderStartArgs, message: &str) {
     }
 }
 
+fn provider_progress_enabled(args: &ProviderStartArgs) -> bool {
+    !args.print_json
+        && (io::stderr().is_terminal() || env::var_os("MAYHEM_PROVIDER_START_PROGRESS").is_some())
+}
+
+struct ProviderProgressBars {
+    enabled: bool,
+    label: String,
+    phase: Option<ProgressPhase>,
+    bar: Option<ProgressBar>,
+}
+
+impl ProviderProgressBars {
+    fn new(args: &ProviderStartArgs, label: impl Into<String>) -> Self {
+        Self {
+            enabled: provider_progress_enabled(args),
+            label: label.into(),
+            phase: None,
+            bar: None,
+        }
+    }
+
+    fn update(&mut self, event: ProgressEvent) {
+        if !self.enabled {
+            return;
+        }
+        if self.phase != Some(event.phase) {
+            self.finish_current();
+            self.phase = Some(event.phase);
+            self.bar = Some(provider_progress_bar(
+                event.total,
+                format!("{} {}", self.label, progress_phase_label(event.phase)),
+            ));
+        }
+        if let Some(bar) = &self.bar {
+            if let Some(total) = event.total {
+                bar.set_length(total);
+            }
+            bar.set_position(event.position);
+        }
+    }
+
+    fn finish_current(&mut self) {
+        if let Some(bar) = self.bar.take() {
+            bar.finish_and_clear();
+        }
+    }
+
+    fn finish(mut self) {
+        self.finish_current();
+    }
+}
+
+fn progress_phase_label(phase: ProgressPhase) -> &'static str {
+    match phase {
+        ProgressPhase::Download => "download",
+        ProgressPhase::Verify => "verify",
+    }
+}
+
+fn provider_progress_bar(total: Option<u64>, message: String) -> ProgressBar {
+    let bar = match total {
+        Some(total) => ProgressBar::new(total),
+        None => ProgressBar::new_spinner(),
+    };
+    if total.is_some() {
+        let style = ProgressStyle::with_template(
+            "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} eta {eta_precise}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> ");
+        bar.set_style(style);
+    } else {
+        let style =
+            ProgressStyle::with_template("{spinner:.green} {msg} {bytes} {elapsed_precise}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner());
+        bar.set_style(style);
+        bar.enable_steady_tick(Duration::from_millis(100));
+    }
+    bar.set_message(message);
+    bar
+}
+
+fn provider_progress_spinner(
+    args: &ProviderStartArgs,
+    message: impl Into<String>,
+) -> Option<ProgressBar> {
+    if !provider_progress_enabled(args) {
+        return None;
+    }
+    let bar = ProgressBar::new_spinner();
+    let style = ProgressStyle::with_template("{spinner:.green} {msg} {elapsed_precise}")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner());
+    bar.set_style(style);
+    bar.set_message(message.into());
+    bar.enable_steady_tick(Duration::from_millis(100));
+    Some(bar)
+}
+
+fn with_provider_progress_spinner<T, F>(
+    args: &ProviderStartArgs,
+    message: impl Into<String>,
+    run: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let bar = provider_progress_spinner(args, message);
+    let result = run();
+    if let Some(bar) = bar {
+        if result.is_ok() {
+            bar.finish_and_clear();
+        } else {
+            bar.abandon();
+        }
+    }
+    result
+}
+
 fn validate_provider_start_security_mode(
     args: &ProviderStartArgs,
     debug_build: bool,
@@ -24224,12 +24345,18 @@ fn download_provider_artifact_blocking(
     require_provider_merkle_artifact(selected)?;
     let primary = if let Some(path) = &args.artifact {
         let source = absolutize(path.clone())?;
-        let merkle = build_merkle_manifest(&source, args.chunk_size).with_context(|| {
+        let mut progress =
+            ProviderProgressBars::new(args, format!("{} local artifact", selected.artifact_name));
+        let merkle = build_merkle_manifest_with_progress(&source, args.chunk_size, |event| {
+            progress.update(event);
+        })
+        .with_context(|| {
             format!(
                 "verifying local admin-approved artifact {}",
                 source.display()
             )
         })?;
+        progress.finish();
         if merkle.root != selected.enclave.artifact_root {
             bail!(
                 "local artifact root mismatch for {}; expected admin enclave artifact_root {}, got {}",
@@ -24243,13 +24370,17 @@ fn download_provider_artifact_blocking(
     } else {
         let artifact_file = provider_primary_cache_file(selected);
         let destination = downloads_dir.join(artifact_file);
+        let mut progress =
+            ProviderProgressBars::new(args, format!("{} cached artifact", selected.artifact_name));
         if cached_provider_file_matches(
             &destination,
             args.chunk_size,
             &selected.enclave.artifact_root,
             selected.artifact.source_sha256.as_deref(),
             selected.artifact.weights_bytes,
+            Some(&mut progress),
         )? {
+            progress.finish();
             destination
         } else if let Some(cached) = find_cached_provider_download(
             downloads_dir,
@@ -24259,8 +24390,10 @@ fn download_provider_artifact_blocking(
             selected.artifact.weights_bytes,
             &[&selected.artifact_name],
         )? {
+            progress.finish();
             cached
         } else {
+            progress.finish();
             download_provider_primary_artifact(args, selected, destination)?
         }
     };
@@ -24309,12 +24442,18 @@ fn download_provider_primary_artifact(
     let mut request = DownloadRequest::new(source, destination.clone());
     request.chunk_size = args.chunk_size;
     request.expected_merkle_root = Some(selected.enclave.artifact_root.clone());
-    download_resumable(&request).with_context(|| {
+    let mut progress =
+        ProviderProgressBars::new(args, format!("{} artifact", selected.artifact_name));
+    download_resumable_with_progress(&request, |event| {
+        progress.update(event);
+    })
+    .with_context(|| {
         format!(
             "downloading and verifying artifact root {}",
             selected.enclave.artifact_root
         )
     })?;
+    progress.finish();
     verify_artifact_sha256(&destination, &selected.artifact)?;
     Ok(destination)
 }
@@ -24338,15 +24477,22 @@ fn download_provider_sidecar_artifact(
     }
     let artifact_file = provider_sidecar_cache_file(selected, name, ledger_sidecar);
     let destination = downloads_dir.join(artifact_file);
+    let mut progress = ProviderProgressBars::new(
+        args,
+        format!("{}/{} cached sidecar", selected.artifact_name, name),
+    );
     if cached_provider_file_matches(
         &destination,
         args.chunk_size,
         &ledger_sidecar.artifact_root,
         Some(&sidecar.source_sha256),
         ledger_sidecar.weights_bytes,
+        Some(&mut progress),
     )? {
+        progress.finish();
         return Ok(destination);
     }
+    progress.finish();
     if let Some(cached) = find_cached_provider_download(
         downloads_dir,
         args.chunk_size,
@@ -24372,12 +24518,18 @@ fn download_provider_sidecar_artifact(
     let mut request = DownloadRequest::new(source, destination.clone());
     request.chunk_size = args.chunk_size;
     request.expected_merkle_root = Some(ledger_sidecar.artifact_root.clone());
-    download_resumable(&request).with_context(|| {
+    let mut progress =
+        ProviderProgressBars::new(args, format!("{}/{} sidecar", selected.artifact_name, name));
+    download_resumable_with_progress(&request, |event| {
+        progress.update(event);
+    })
+    .with_context(|| {
         format!(
             "downloading and verifying sidecar {name} root {}",
             ledger_sidecar.artifact_root
         )
     })?;
+    progress.finish();
     let actual = file_sha256_hex(&destination)?;
     if !actual.eq_ignore_ascii_case(&sidecar.source_sha256) {
         bail!(
@@ -24424,6 +24576,7 @@ fn cached_provider_file_matches(
     expected_root: &str,
     expected_sha256: Option<&str>,
     expected_bytes: u64,
+    progress: Option<&mut ProviderProgressBars>,
 ) -> Result<bool> {
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(false);
@@ -24434,7 +24587,13 @@ fn cached_provider_file_matches(
     if expected_bytes > 0 && metadata.len() != expected_bytes {
         return Ok(false);
     }
-    let merkle = build_merkle_manifest(path, chunk_size)?;
+    let merkle = if let Some(progress) = progress {
+        build_merkle_manifest_with_progress(path, chunk_size, |event| {
+            progress.update(event);
+        })?
+    } else {
+        build_merkle_manifest(path, chunk_size)?
+    };
     if merkle.root != expected_root {
         return Ok(false);
     }
@@ -24476,6 +24635,7 @@ fn find_cached_provider_download(
             expected_root,
             expected_sha256,
             expected_bytes,
+            None,
         )? {
             return Ok(Some(path));
         }
@@ -26862,9 +27022,11 @@ fn provider_session_responder(
         "llama.cpp" => {
             let mut backend = mayhem_engine::LlamaCppBackend::new()
                 .context("initializing llama.cpp provider session engine")?;
-            backend
-                .load(load_config)
-                .context("loading llama.cpp provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "llama.cpp engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading llama.cpp provider session engine")
+            })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
             }))
@@ -26872,9 +27034,11 @@ fn provider_session_responder(
         "mlx" => {
             let mut backend = mayhem_engine::MlxBackend::new()
                 .context("initializing MLX provider session engine")?;
-            backend
-                .load(load_config)
-                .context("loading MLX provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "MLX engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading MLX provider session engine")
+            })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
             }))
@@ -26882,9 +27046,11 @@ fn provider_session_responder(
         "trt-llm" => {
             let mut backend = mayhem_engine::TrtLlmBackend::new()
                 .context("initializing TensorRT-LLM provider session engine")?;
-            backend
-                .load(load_config)
-                .context("loading TensorRT-LLM provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "TensorRT-LLM engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading TensorRT-LLM provider session engine")
+            })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
             }))
@@ -26892,9 +27058,11 @@ fn provider_session_responder(
         "vllm" => {
             let mut backend = mayhem_engine::VllmBackend::new()
                 .context("initializing vLLM provider session engine")?;
-            backend
-                .load(load_config)
-                .context("loading vLLM provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "vLLM engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading vLLM provider session engine")
+            })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
             }))
@@ -26902,9 +27070,11 @@ fn provider_session_responder(
         "stable-diffusion.cpp" => {
             let mut backend = mayhem_engine::StableDiffusionCppBackend::new()
                 .context("initializing stable-diffusion.cpp provider session engine")?;
-            backend
-                .load(load_config)
-                .context("loading stable-diffusion.cpp provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "stable-diffusion.cpp engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading stable-diffusion.cpp provider session engine")
+            })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
             }))
@@ -26912,9 +27082,11 @@ fn provider_session_responder(
         "whisper.cpp" => {
             let mut backend = mayhem_engine::WhisperCppBackend::new()
                 .context("initializing whisper.cpp provider session engine")?;
-            backend
-                .load(load_config)
-                .context("loading whisper.cpp provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "whisper.cpp engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading whisper.cpp provider session engine")
+            })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
             }))
@@ -26922,9 +27094,11 @@ fn provider_session_responder(
         "piper" => {
             let mut backend = mayhem_engine::PiperBackend::new()
                 .context("initializing piper provider session engine")?;
-            backend
-                .load(load_config)
-                .context("loading piper provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "piper engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading piper provider session engine")
+            })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
             }))
