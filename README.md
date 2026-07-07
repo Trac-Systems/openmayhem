@@ -1,8 +1,10 @@
 # Mayhem
 
-Mayhem lets you use admin-approved AI enclaves through a local OpenAI-compatible endpoint while providers supply compute over Trac Intercom. Users run one local gateway, point tools such as opencode at it, and receive signed receipts for the work. Providers opt into canonical enclaves and rooms that the Mayhem admin created; they do not set prices, create canonical rooms, or submit arbitrary models.
+Mayhem is a local OpenAI-compatible gateway for a public, admin-canonical inference network. Users keep their tools pointed at `127.0.0.1`, providers contribute compute by joining approved enclaves, and the Trac ledger records the evidence: catalog anchors, terms, joins, receipts, disputes, and settlement roots.
 
-The contract is the public evidence ledger. It records canonical catalog anchors, admin-created enclaves and rooms, provider opt-ins, prices, rules, balances, receipts, disputes, and settlement roots. The actual prompts and model responses travel over direct provider sessions, not through the ledger.
+The important boundary is simple: **the admin controls the economy and catalog; providers only opt in or out**. Providers cannot set prices, create canonical rooms, or submit arbitrary models. Users choose models and rails, send requests through the local gateway, and receive signed receipts for the work.
+
+Prompts and model responses do not go through the ledger. They travel over direct Intercom sessions between the local gateway and selected providers. The contract is the public evidence layer that lets everyone audit what was offered, served, billed, disputed, and settled.
 
 Deposit credits are admin-oracle evidence from watchers/paygate, not arbitrary
 provider or user writes. The trust boundary and key separation are documented in
@@ -10,6 +12,27 @@ provider or user writes. The trust boundary and key separation are documented in
 
 > [!TIP]
 > If you are not comfortable installing developer tools by hand, open this repository in a frontier AI assistant and ask it to guide you through a real Mayhem install for your OS. Have it read this README, run the commands with you, explain each prompt before you approve it, and keep the terminal copy/paste paths and URLs visible. This is the normal install flow with an assistant beside you, not a separate simplified app.
+
+## Quickstart
+
+```bash
+./install.sh --from-source
+mayhem up --yes
+curl http://127.0.0.1:11435/v1/models
+opencode run --model mayhem/<model-id> "Say hello from Mayhem."
+mayhem down
+```
+
+Provider machine:
+
+```bash
+./install.sh --from-source
+mayhem up --provider --yes
+mayhem provider health
+mayhem down
+```
+
+`mayhem up` is the normal entry point. It starts the supervised Pear/Intercom peer, local bridge, gateway, and optional provider worker; prints copy/paste endpoint and dashboard URLs; and works from a terminal even when no browser is available.
 
 ## How It Works
 
@@ -250,6 +273,25 @@ Providers choose which admin-supported rails they accept; they do not set prices
 
 The server binds `127.0.0.1` only, uses short-lived local tokens, and serves assets locally.
 
+## Reference
+
+The full knob inventory is generated from the current code, not maintained by hand:
+
+| Reference | Covers |
+|-----------|--------|
+| [docs/reference/knob-inventory.md](docs/reference/knob-inventory.md) | Every public CLI help page and flag from the local binaries, plus source-scanned environment variables, TOML config keys, Mayhem HTTP headers, and operational defaults. |
+| [docs/operator-runbook.md](docs/operator-runbook.md) | Admin/operator procedures, key handling, settlement, catalog publication, and production rehearsals. |
+| [docs/provider-guide.md](docs/provider-guide.md) | Provider serving workflow and operational checks. |
+| [docs/user-guide.md](docs/user-guide.md) | User gateway, payments, balances, and client setup. |
+
+Regenerate and verify the inventory after changing knobs:
+
+```bash
+cargo build -p mayhem-cli -p mayhemd -p mayhem-enclave -p mayhem-gateway -p mayhem-paygate
+node scripts/knob-inventory.mjs --write
+node scripts/knob-inventory.mjs --check
+```
+
 ## Updates And Versioning
 
 `mayhem update` stages release artifacts only after verifying the signed release manifest, SHA-256s, and release signing key. Applying a staged update has a delay window, health check, and rollback path.
@@ -288,4 +330,4 @@ MAYHEM_RUN_INTERCOM_TESTS=1 cargo test -p mayhem-bridge --test sc_bridge -- --no
 
 Standalone `mayhem-gateway` is a raw development smoke binary and must be started with `--dev-embedded-catalog`. Production/user/provider flows should use `mayhem up` and `mayhem down`.
 
-Operator, provider, and user docs live in `docs/operator-runbook.md`, `docs/provider-guide.md`, and `docs/user-guide.md`. The iteration plans and trackers in `docs/` record the implementation history.
+The iteration plans and trackers in `docs/` record the implementation history.
