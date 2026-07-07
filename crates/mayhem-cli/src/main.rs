@@ -17217,6 +17217,8 @@ async fn receipts_publish(args: ReceiptsPublishArgs) -> Result<()> {
         .then(|| Instant::now() + Duration::from_secs(args.timeout_seconds));
     let mut seen = BTreeSet::new();
     let mut published = 0usize;
+    let mut messages_sent = 0usize;
+    let max_message_bytes = epoch_receipt_max_message_bytes();
 
     loop {
         let receipts = fetch_gateway_receipts(&gateway_url).await?;
@@ -17225,11 +17227,15 @@ async fn receipts_publish(args: ReceiptsPublishArgs) -> Result<()> {
             if !seen.insert(receipt_id.clone()) {
                 continue;
             }
-            let message = epoch_receipt_message(args.epoch, receipt_id, receipt)?;
-            bridge
-                .send(&channel, &message)
-                .await
-                .with_context(|| format!("publishing receipt to {channel}"))?;
+            let messages =
+                epoch_receipt_messages(args.epoch, receipt_id, receipt, max_message_bytes)?;
+            for message in messages {
+                bridge
+                    .send(&channel, &message)
+                    .await
+                    .with_context(|| format!("publishing receipt to {channel}"))?;
+                messages_sent += 1;
+            }
             published += 1;
             if args.max_receipts.is_some_and(|max| published >= max) {
                 break;
@@ -17251,6 +17257,8 @@ async fn receipts_publish(args: ReceiptsPublishArgs) -> Result<()> {
         "gateway_url": gateway_url,
         "published": published,
         "seen": seen.len(),
+        "messages_sent": messages_sent,
+        "max_message_bytes": max_message_bytes,
         "watch": args.watch,
     });
 
@@ -17288,13 +17296,19 @@ async fn receipts_collect(args: ReceiptsCollectArgs) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.timeout_seconds);
     let mut seen = BTreeSet::new();
     let mut receipts = Vec::new();
+    let mut pending_payloads = PendingEpochReceiptPayloads::default();
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match bridge.next_sidechannel_message(remaining).await {
             Ok(event) => {
                 let Some((receipt_id, receipt)) =
-                    epoch_receipt_from_sidechannel_event(&event, args.epoch, &channel)
+                    collect_epoch_receipt_from_sidechannel_event_with_pending(
+                        &event,
+                        args.epoch,
+                        &channel,
+                        &mut pending_payloads,
+                    )?
                 else {
                     continue;
                 };
@@ -17370,6 +17384,81 @@ fn receipt_id(receipt: &Value) -> String {
         .to_string()
 }
 
+fn epoch_receipt_max_message_bytes() -> usize {
+    std::env::var("MAYHEM_EPOCH_RECEIPT_MAX_MESSAGE_BYTES")
+        .ok()
+        .or_else(|| std::env::var("MAYHEM_SESSION_MAX_FRAME_BYTES").ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 8 * 1024)
+        .unwrap_or(DEFAULT_SESSION_MAX_FRAME_BYTES)
+}
+
+fn epoch_receipt_payload_chunk_bytes(max_message_bytes: usize) -> usize {
+    let safe_raw = max_message_bytes.saturating_sub(4096) / 3;
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES.min(safe_raw.max(1024))
+}
+
+fn epoch_receipt_message_json_len(message: &Value) -> Result<usize> {
+    serde_json::to_vec(message)
+        .map(|bytes| bytes.len())
+        .context("serializing epoch receipt sidechannel message")
+}
+
+fn epoch_receipt_messages(
+    epoch: u64,
+    receipt_id: String,
+    receipt: Value,
+    max_message_bytes: usize,
+) -> Result<Vec<Value>> {
+    let inline = epoch_receipt_message(epoch, receipt_id.clone(), receipt.clone())?;
+    if epoch_receipt_message_json_len(&inline)? <= max_message_bytes {
+        return Ok(vec![inline]);
+    }
+
+    let (manifest, chunks) = chunk_json_payload(
+        &receipt,
+        epoch_receipt_payload_chunk_bytes(max_message_bytes),
+    )
+    .context("chunking epoch receipt payload")?;
+    let payload_id = manifest.blake3.clone();
+    let mut messages = Vec::with_capacity(chunks.len().saturating_add(1));
+    for chunk in chunks {
+        let message = json!({
+            "t": "epoch.receipt_chunk",
+            "v": 1,
+            "epoch": epoch,
+            "receipt_id": receipt_id,
+            "payload_id": payload_id,
+            "chunk": chunk,
+        });
+        let len = epoch_receipt_message_json_len(&message)?;
+        if len > max_message_bytes {
+            bail!(
+                "chunked epoch receipt message {len} bytes exceeds max {max_message_bytes} bytes"
+            );
+        }
+        messages.push(message);
+    }
+
+    let ref_message = json!({
+        "t": "epoch.receipt_ref",
+        "v": 1,
+        "epoch": epoch,
+        "receipt_id": receipt_id,
+        "payload_id": payload_id,
+        "published_at_ms": unix_epoch_millis()?,
+        "receipt_ref": manifest,
+    });
+    let ref_len = epoch_receipt_message_json_len(&ref_message)?;
+    if ref_len > max_message_bytes {
+        bail!(
+            "epoch receipt manifest message {ref_len} bytes exceeds max {max_message_bytes} bytes"
+        );
+    }
+    messages.push(ref_message);
+    Ok(messages)
+}
+
 fn epoch_receipt_message(epoch: u64, receipt_id: String, receipt: Value) -> Result<Value> {
     Ok(json!({
         "t": "epoch.receipt",
@@ -17381,29 +17470,116 @@ fn epoch_receipt_message(epoch: u64, receipt_id: String, receipt: Value) -> Resu
     }))
 }
 
-fn epoch_receipt_from_sidechannel_event(
+#[derive(Default)]
+struct PendingEpochReceiptPayloads {
+    chunks: BTreeMap<String, BTreeMap<u64, PayloadChunk>>,
+    manifests: BTreeMap<String, PayloadChunkManifest>,
+}
+
+fn collect_epoch_receipt_from_sidechannel_event_with_pending(
     event: &Value,
     epoch: u64,
     channel: &str,
-) -> Option<(String, Value)> {
+    pending: &mut PendingEpochReceiptPayloads,
+) -> Result<Option<(String, Value)>> {
     if event.get("channel").and_then(Value::as_str) != Some(channel) {
-        return None;
+        return Ok(None);
     }
-    let message = event.get("message")?;
-    if message.get("t").and_then(Value::as_str) != Some("epoch.receipt") {
-        return None;
-    }
+    let Some(message) = event.get("message") else {
+        return Ok(None);
+    };
     if message.get("epoch").and_then(Value::as_u64) != Some(epoch) {
-        return None;
+        return Ok(None);
     }
-    let receipt = message.get("receipt")?.clone();
-    let receipt_id = message
-        .get("receipt_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| receipt_id(&receipt));
-    Some((receipt_id, receipt))
+    match message.get("t").and_then(Value::as_str) {
+        Some("epoch.receipt") => {
+            let Some(receipt) = message
+                .get("receipt")
+                .filter(|value| !value.is_null())
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let receipt_id = message
+                .get("receipt_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| receipt_id(&receipt));
+            Ok(Some((receipt_id, receipt)))
+        }
+        Some("epoch.receipt_chunk") => {
+            let receipt_id =
+                required_json_string_for(message, "receipt_id", "epoch receipt chunk")?;
+            let payload_id =
+                required_json_string_for(message, "payload_id", "epoch receipt chunk")?;
+            let chunk: PayloadChunk = serde_json::from_value(
+                message
+                    .get("chunk")
+                    .cloned()
+                    .context("epoch receipt chunk missing chunk")?,
+            )
+            .context("decoding epoch receipt chunk")?;
+            let key = epoch_receipt_payload_key(epoch, &receipt_id, &payload_id);
+            let by_index = pending.chunks.entry(key.clone()).or_default();
+            if let Some(existing) = by_index.get(&chunk.i) {
+                if existing != &chunk {
+                    bail!("conflicting epoch receipt chunk {} for {key}", chunk.i);
+                }
+            } else {
+                by_index.insert(chunk.i, chunk);
+            }
+            try_reassemble_epoch_receipt_payload(pending, epoch, &receipt_id, &payload_id)
+        }
+        Some("epoch.receipt_ref") => {
+            let receipt_id = required_json_string_for(message, "receipt_id", "epoch receipt ref")?;
+            let payload_id = required_json_string_for(message, "payload_id", "epoch receipt ref")?;
+            let manifest: PayloadChunkManifest = serde_json::from_value(
+                message
+                    .get("receipt_ref")
+                    .cloned()
+                    .context("epoch receipt ref missing receipt_ref")?,
+            )
+            .context("decoding epoch receipt ref manifest")?;
+            if manifest.blake3 != payload_id {
+                bail!("epoch receipt ref payload_id does not match manifest blake3");
+            }
+            let key = epoch_receipt_payload_key(epoch, &receipt_id, &payload_id);
+            pending.manifests.insert(key, manifest);
+            try_reassemble_epoch_receipt_payload(pending, epoch, &receipt_id, &payload_id)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn epoch_receipt_payload_key(epoch: u64, receipt_id: &str, payload_id: &str) -> String {
+    format!("{epoch}:{receipt_id}:{payload_id}")
+}
+
+fn try_reassemble_epoch_receipt_payload(
+    pending: &mut PendingEpochReceiptPayloads,
+    epoch: u64,
+    receipt_id: &str,
+    payload_id: &str,
+) -> Result<Option<(String, Value)>> {
+    let key = epoch_receipt_payload_key(epoch, receipt_id, payload_id);
+    let Some(manifest) = pending.manifests.get(&key) else {
+        return Ok(None);
+    };
+    let Some(chunks_by_index) = pending.chunks.get(&key) else {
+        return Ok(None);
+    };
+    let expected_count =
+        usize::try_from(manifest.chunk_count).context("epoch receipt chunk count overflow")?;
+    if chunks_by_index.len() < expected_count {
+        return Ok(None);
+    }
+    let chunks = chunks_by_index.values().cloned().collect::<Vec<_>>();
+    let receipt = reassemble_json_payload(manifest, &chunks)
+        .with_context(|| format!("reassembling epoch receipt {receipt_id} payload"))?;
+    pending.manifests.remove(&key);
+    pending.chunks.remove(&key);
+    Ok(Some((receipt_id.to_owned(), receipt)))
 }
 
 fn resolve_cli_sc_bridge(
@@ -33769,7 +33945,10 @@ mod tests {
         let id = receipt_id(&receipt);
         assert_eq!(id, "s1:2");
 
-        let message = epoch_receipt_message(7, id.clone(), receipt.clone()).unwrap();
+        let message = epoch_receipt_messages(7, id.clone(), receipt.clone(), usize::MAX)
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(message["t"], "epoch.receipt");
         assert_eq!(message["epoch"], 7);
         assert_eq!(message["receipt_id"], id);
@@ -33779,8 +33958,15 @@ mod tests {
             "channel": "mx/epoch/7",
             "message": message,
         });
-        let (extracted_id, extracted) =
-            epoch_receipt_from_sidechannel_event(&event, 7, "mx/epoch/7").unwrap();
+        let mut pending = PendingEpochReceiptPayloads::default();
+        let (extracted_id, extracted) = collect_epoch_receipt_from_sidechannel_event_with_pending(
+            &event,
+            7,
+            "mx/epoch/7",
+            &mut pending,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(extracted_id, "s1:2");
         assert_eq!(extracted, receipt);
     }
@@ -33788,22 +33974,154 @@ mod tests {
     #[test]
     fn epoch_receipt_collector_filters_wrong_channel_epoch_and_type() {
         let receipt = json!({ "receipt": { "session_id": "s1", "seq": 1 } });
-        let message = epoch_receipt_message(7, receipt_id(&receipt), receipt).unwrap();
+        let message = epoch_receipt_messages(7, receipt_id(&receipt), receipt, usize::MAX)
+            .unwrap()
+            .pop()
+            .unwrap();
         let event = json!({
             "type": "sidechannel_message",
             "channel": "mx/epoch/7",
             "message": message,
         });
-        assert!(epoch_receipt_from_sidechannel_event(&event, 7, "mx/epoch/7").is_some());
-        assert!(epoch_receipt_from_sidechannel_event(&event, 8, "mx/epoch/7").is_none());
-        assert!(epoch_receipt_from_sidechannel_event(&event, 7, "mx/epoch/8").is_none());
+        let mut pending = PendingEpochReceiptPayloads::default();
+        assert!(collect_epoch_receipt_from_sidechannel_event_with_pending(
+            &event,
+            7,
+            "mx/epoch/7",
+            &mut pending,
+        )
+        .unwrap()
+        .is_some());
+        assert!(collect_epoch_receipt_from_sidechannel_event_with_pending(
+            &event,
+            8,
+            "mx/epoch/7",
+            &mut pending,
+        )
+        .unwrap()
+        .is_none());
+        assert!(collect_epoch_receipt_from_sidechannel_event_with_pending(
+            &event,
+            7,
+            "mx/epoch/8",
+            &mut pending,
+        )
+        .unwrap()
+        .is_none());
 
         let wrong_type = json!({
             "type": "sidechannel_message",
             "channel": "mx/epoch/7",
             "message": { "t": "hb", "epoch": 7, "receipt": {} },
         });
-        assert!(epoch_receipt_from_sidechannel_event(&wrong_type, 7, "mx/epoch/7").is_none());
+        assert!(collect_epoch_receipt_from_sidechannel_event_with_pending(
+            &wrong_type,
+            7,
+            "mx/epoch/7",
+            &mut pending,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn epoch_receipt_messages_chunk_large_receipts_under_transport_limit() {
+        let receipt = json!({
+            "receipt": {
+                "schema_version": 1,
+                "session_id": "large-session",
+                "seq": 9,
+                "final": true,
+                "user": "u",
+                "provider": "p",
+                "mu_owed_cum": 100
+            },
+            "receipt_ack": { "session_id": "large-session", "seq": 9, "user_sig": "sig" },
+            "metadata": "x".repeat(96 * 1024),
+        });
+        let id = receipt_id(&receipt);
+        let max_message_bytes = 12 * 1024;
+        let messages =
+            epoch_receipt_messages(9, id.clone(), receipt.clone(), max_message_bytes).unwrap();
+        assert!(messages.len() > 2);
+        assert!(messages
+            .iter()
+            .all(|message| epoch_receipt_message_json_len(message).unwrap() <= max_message_bytes));
+        assert!(messages[..messages.len() - 1]
+            .iter()
+            .all(|message| message["t"] == "epoch.receipt_chunk"));
+        assert_eq!(messages.last().unwrap()["t"], "epoch.receipt_ref");
+
+        let mut pending = PendingEpochReceiptPayloads::default();
+        let mut extracted = None;
+        for message in messages {
+            let event = json!({
+                "type": "sidechannel_message",
+                "channel": "mx/epoch/9",
+                "message": message,
+            });
+            if let Some(result) = collect_epoch_receipt_from_sidechannel_event_with_pending(
+                &event,
+                9,
+                "mx/epoch/9",
+                &mut pending,
+            )
+            .unwrap()
+            {
+                extracted = Some(result);
+            }
+        }
+        let (extracted_id, extracted_receipt) = extracted.unwrap();
+        assert_eq!(extracted_id, id);
+        assert_eq!(extracted_receipt, receipt);
+    }
+
+    #[test]
+    fn epoch_receipt_collector_accepts_manifest_before_chunks() {
+        let receipt = json!({
+            "receipt": { "session_id": "large-session", "seq": 10 },
+            "metadata": "y".repeat(64 * 1024),
+        });
+        let id = receipt_id(&receipt);
+        let mut messages =
+            epoch_receipt_messages(10, id.clone(), receipt.clone(), 12 * 1024).unwrap();
+        let ref_message = messages.pop().unwrap();
+        let mut pending = PendingEpochReceiptPayloads::default();
+        let ref_event = json!({
+            "type": "sidechannel_message",
+            "channel": "mx/epoch/10",
+            "message": ref_message,
+        });
+        assert!(collect_epoch_receipt_from_sidechannel_event_with_pending(
+            &ref_event,
+            10,
+            "mx/epoch/10",
+            &mut pending,
+        )
+        .unwrap()
+        .is_none());
+
+        let mut extracted = None;
+        for message in messages {
+            let event = json!({
+                "type": "sidechannel_message",
+                "channel": "mx/epoch/10",
+                "message": message,
+            });
+            if let Some(result) = collect_epoch_receipt_from_sidechannel_event_with_pending(
+                &event,
+                10,
+                "mx/epoch/10",
+                &mut pending,
+            )
+            .unwrap()
+            {
+                extracted = Some(result);
+            }
+        }
+        let (extracted_id, extracted_receipt) = extracted.unwrap();
+        assert_eq!(extracted_id, id);
+        assert_eq!(extracted_receipt, receipt);
     }
 
     #[test]
@@ -34068,6 +34386,14 @@ mod tests {
             json!({
                 "checkout_url": "https://checkout.stripe.com/c/pay/cs_test",
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn pay_checkout_no_open_is_non_fatal_for_terminal_users() {
+        assert!(
+            !open_checkout_url("https://checkout.stripe.com/c/pay/cs_test", true).await,
+            "disabled browser launch should stay on the copy/paste URL path"
         );
     }
 
