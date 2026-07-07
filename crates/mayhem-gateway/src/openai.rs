@@ -56,14 +56,15 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{stream, Stream};
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    chunk_json_payload, default_model_class, migrate_receipt_body, reassemble_json_payload,
-    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, supported_receipt_signing_bytes, AttestationReport,
-    CheckpointPolicy, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    chunk_json_payload, ctx_bracket_for_tokens, default_model_class, migrate_receipt_body,
+    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
+    AttestationReport, CheckpointPolicy, PayloadChunk, PayloadChunkManifest, ReceiptAck,
+    ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, CTX_BRACKET_TABLE_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -79,6 +80,7 @@ const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.wof
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
 const X_MAYHEM_MAX_PRICE_MU_HEADER: &str = "x-mayhem-max-price-mu";
+const X_MAYHEM_MIN_CTX_HEADER: &str = "x-mayhem-min-ctx";
 const X_MAYHEM_QUANT_HEADER: &str = "x-mayhem-quant";
 const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
 const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
@@ -123,6 +125,7 @@ pub struct GatewayState {
     epoch_seconds: u64,
     failover_policy: GatewayFailoverPolicyConfig,
     default_max_price_mu: Option<u64>,
+    default_min_ctx: Option<u32>,
     dev_session_shim: bool,
 }
 
@@ -818,6 +821,9 @@ pub struct GatewaySessionInvocation {
     pub provider_pubkey: Option<String>,
     pub enclave_id: String,
     pub price_ver: u64,
+    pub served_ctx: u32,
+    pub ctx_bracket: String,
+    pub ctx_bracket_table_ver: u32,
     pub rules_ver: u64,
     pub spend_voucher: SpendVoucher,
     pub attestation: Option<GatewaySessionAttestation>,
@@ -1059,6 +1065,7 @@ impl GatewayState {
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
             failover_policy: GatewayFailoverPolicyConfig::default(),
             default_max_price_mu: None,
+            default_min_ctx: None,
             dev_session_shim: false,
         }
     }
@@ -1154,6 +1161,11 @@ impl GatewayState {
         self
     }
 
+    pub fn with_default_min_ctx(mut self, min_ctx: Option<u32>) -> Self {
+        self.default_min_ctx = min_ctx.filter(|value| *value > 0);
+        self
+    }
+
     fn request_options_from_headers(
         &self,
         headers: &HeaderMap,
@@ -1161,6 +1173,9 @@ impl GatewayState {
         let mut options = GatewayRequestOptions::from_headers(headers)?;
         if options.max_price_mu.is_none() {
             options.max_price_mu = self.default_max_price_mu;
+        }
+        if options.min_ctx.is_none() {
+            options.min_ctx = self.default_min_ctx;
         }
         Ok(options)
     }
@@ -3166,6 +3181,7 @@ struct GatewayRequestOptions {
     hedge_requested: bool,
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
+    min_ctx: Option<u32>,
     quant: Option<String>,
     failover_overrides: GatewayFailoverPolicyConfig,
 }
@@ -3604,6 +3620,14 @@ fn heartbeat_caps_for_route(
     }
 }
 
+fn route_caps_ctx(model: &GatewayModel, candidate: &GatewayRouteCandidate) -> u32 {
+    heartbeat_caps_for_route(model, candidate).ctx
+}
+
+fn model_served_ctx(model: &GatewayModel) -> u32 {
+    model.mayhem.caps.ctx
+}
+
 fn sanitize_gateway_models(models: Vec<GatewayModel>) -> Vec<GatewayModel> {
     models
         .into_iter()
@@ -3699,6 +3723,7 @@ impl GatewayRequestOptions {
             hedge_requested: parse_x_mayhem_hedge(headers)?,
             min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
             max_price_mu: parse_x_mayhem_max_price_mu(headers)?,
+            min_ctx: parse_x_mayhem_min_ctx(headers)?,
             quant: parse_x_mayhem_quant(headers)?,
             failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
         })
@@ -3725,6 +3750,37 @@ fn parse_x_mayhem_max_price_mu(headers: &HeaderMap) -> Result<Option<u64>, ApiEr
         return Err(ApiError::bad_request(
             "X-Mayhem-Max-Price-Mu must be greater than 0",
             Some("X-Mayhem-Max-Price-Mu"),
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_x_mayhem_min_ctx(headers: &HeaderMap) -> Result<Option<u32>, ApiError> {
+    let Some(value) = headers.get(X_MAYHEM_MIN_CTX_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Min-Ctx must be an ASCII positive integer token count",
+            Some("X-Mayhem-Min-Ctx"),
+        )
+    })?;
+    let parsed = value.trim().parse::<u64>().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Min-Ctx must be a positive integer token count",
+            Some("X-Mayhem-Min-Ctx"),
+        )
+    })?;
+    let parsed = u32::try_from(parsed).map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Min-Ctx must fit in a u32 token count",
+            Some("X-Mayhem-Min-Ctx"),
+        )
+    })?;
+    if parsed == 0 {
+        return Err(ApiError::bad_request(
+            "X-Mayhem-Min-Ctx must be greater than 0",
+            Some("X-Mayhem-Min-Ctx"),
         ));
     }
     Ok(Some(parsed))
@@ -4159,6 +4215,9 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "served_ctx": invocation.served_ctx,
+            "ctx_bracket": invocation.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
@@ -4375,6 +4434,9 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "served_ctx": invocation.served_ctx,
+            "ctx_bracket": invocation.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
@@ -4547,6 +4609,9 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "served_ctx": invocation.served_ctx,
+            "ctx_bracket": invocation.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
@@ -4719,6 +4784,9 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "served_ctx": invocation.served_ctx,
+            "ctx_bracket": invocation.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
@@ -4881,6 +4949,9 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "served_ctx": invocation.served_ctx,
+            "ctx_bracket": invocation.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
@@ -7227,6 +7298,22 @@ fn validate_provider_receipt(
             "provider receipt locked_min_session_mu mismatch",
         ),
         (
+            body.served_ctx == invocation.served_ctx
+                && body.served_ctx == invocation.spend_voucher.body.served_ctx,
+            "provider receipt served_ctx mismatch",
+        ),
+        (
+            body.ctx_bracket == invocation.ctx_bracket
+                && body.ctx_bracket == invocation.spend_voucher.body.ctx_bracket,
+            "provider receipt ctx_bracket mismatch",
+        ),
+        (
+            body.ctx_bracket_table_ver == invocation.ctx_bracket_table_ver
+                && body.ctx_bracket_table_ver
+                    == invocation.spend_voucher.body.ctx_bracket_table_ver,
+            "provider receipt ctx_bracket_table_ver mismatch",
+        ),
+        (
             body.rules_ver == invocation.rules_ver,
             "provider receipt rules_ver mismatch",
         ),
@@ -7992,6 +8079,9 @@ async fn open_live_direct_chat_session(
         "user": invocation.user_pubkey.clone(),
         "enclave_id": invocation.enclave_id.clone(),
         "price_ver": invocation.price_ver,
+        "served_ctx": invocation.served_ctx,
+        "ctx_bracket": invocation.ctx_bracket.clone(),
+        "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
         "rules_ver": invocation.rules_ver,
         "voucher": invocation.spend_voucher.clone(),
         "att_nonce": att_nonce,
@@ -9066,6 +9156,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
         request,
         options.min_att_tier,
         options.max_price_mu,
+        options.min_ctx,
         options.quant.as_deref(),
         state.generation_floor_tok_s_for_model(model, options),
         seed,
@@ -9214,6 +9305,7 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
         min_att_tier,
         None,
         None,
+        None,
         state.generation_floor_tok_s_for_model(model, &GatewayRequestOptions::default()),
         seed,
     )
@@ -9225,6 +9317,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     request: &ChatCompletionRequest,
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
+    min_ctx: Option<u32>,
     quant: Option<&str>,
     min_throughput: Option<f64>,
     seed: u64,
@@ -9246,6 +9339,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
         request,
         now_millis,
         max_price_mu,
+        min_ctx,
         min_throughput,
     );
     let route_by_key = eligible_routes
@@ -9626,6 +9720,27 @@ impl GatewayState {
             .is_some_and(|cooled_until| *cooled_until > now_millis)
     }
 
+    fn served_ctx_for_route(
+        &self,
+        model: &GatewayModel,
+        route: Option<&GatewayRouteCandidate>,
+    ) -> u32 {
+        let Some(route) = route else {
+            return model_served_ctx(model);
+        };
+        let key = route_key(route);
+        let now = now_millis_u64();
+        self.provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .entries(now)
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.heartbeat.map(|heartbeat| heartbeat.caps.ctx))
+            .filter(|ctx| *ctx > 0)
+            .unwrap_or_else(|| route_caps_ctx(model, route))
+    }
+
     fn apply_chat_affinity<'a>(
         &self,
         model: &GatewayModel,
@@ -9747,11 +9862,15 @@ fn request_requirements_for_chat(
     request: &ChatCompletionRequest,
     now_millis: u64,
     max_price_mu: Option<u64>,
+    explicit_min_ctx: Option<u32>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let prompt_text = chat_prompt_text(request);
     let input_tokens = rough_tokens(&prompt_text);
     let output_tokens = u64::from(request.max_tokens.unwrap_or(1024).max(1));
+    let prompt_min_ctx = input_tokens
+        .saturating_add(output_tokens)
+        .min(u64::from(u32::MAX)) as u32;
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_tools: request
@@ -9760,9 +9879,7 @@ fn request_requirements_for_chat(
             .is_some_and(|tools| !tools.is_empty()),
         requires_json: request.response_format.is_some(),
         requires_vision: chat_input_modalities(&request.messages).image,
-        min_ctx: input_tokens
-            .saturating_add(output_tokens)
-            .min(u64::from(u32::MAX)) as u32,
+        min_ctx: explicit_min_ctx.unwrap_or(0).max(prompt_min_ctx),
         input_tokens,
         output_tokens,
         min_throughput,
@@ -11110,6 +11227,9 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let served_ctx = self.served_ctx_for_route(model, route);
+        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
+        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11118,6 +11238,9 @@ impl GatewayState {
             locked_rate_map: locked_rate_map.clone(),
             locked_per_req_mu: price.per_req_mu,
             locked_min_session_mu: price.min_session_mu,
+            served_ctx,
+            ctx_bracket: ctx_bracket.clone(),
+            ctx_bracket_table_ver,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11131,6 +11254,9 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            served_ctx: voucher_body.served_ctx,
+            ctx_bracket,
+            ctx_bracket_table_ver,
             rules_ver: self.receipt_config.rules_ver,
             spend_voucher: SpendVoucher {
                 body: voucher_body,
@@ -11194,6 +11320,9 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let served_ctx = self.served_ctx_for_route(model, route);
+        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
+        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11202,6 +11331,9 @@ impl GatewayState {
             locked_rate_map: locked_rate_map.clone(),
             locked_per_req_mu: price.per_req_mu,
             locked_min_session_mu: price.min_session_mu,
+            served_ctx,
+            ctx_bracket: ctx_bracket.clone(),
+            ctx_bracket_table_ver,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11215,6 +11347,9 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            served_ctx: voucher_body.served_ctx,
+            ctx_bracket,
+            ctx_bracket_table_ver,
             rules_ver: self.receipt_config.rules_ver,
             spend_voucher: SpendVoucher {
                 body: voucher_body,
@@ -11278,6 +11413,9 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let served_ctx = self.served_ctx_for_route(model, route);
+        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
+        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11286,6 +11424,9 @@ impl GatewayState {
             locked_rate_map: locked_rate_map.clone(),
             locked_per_req_mu: price.per_req_mu,
             locked_min_session_mu: price.min_session_mu,
+            served_ctx,
+            ctx_bracket: ctx_bracket.clone(),
+            ctx_bracket_table_ver,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11299,6 +11440,9 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            served_ctx: voucher_body.served_ctx,
+            ctx_bracket,
+            ctx_bracket_table_ver,
             rules_ver: self.receipt_config.rules_ver,
             spend_voucher: SpendVoucher {
                 body: voucher_body,
@@ -11362,6 +11506,9 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let served_ctx = self.served_ctx_for_route(model, route);
+        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
+        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11370,6 +11517,9 @@ impl GatewayState {
             locked_rate_map: locked_rate_map.clone(),
             locked_per_req_mu: price.per_req_mu,
             locked_min_session_mu: price.min_session_mu,
+            served_ctx,
+            ctx_bracket: ctx_bracket.clone(),
+            ctx_bracket_table_ver,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11383,6 +11533,9 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            served_ctx: voucher_body.served_ctx,
+            ctx_bracket,
+            ctx_bracket_table_ver,
             rules_ver: self.receipt_config.rules_ver,
             spend_voucher: SpendVoucher {
                 body: voucher_body,
@@ -11446,6 +11599,9 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let served_ctx = self.served_ctx_for_route(model, route);
+        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
+        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11454,6 +11610,9 @@ impl GatewayState {
             locked_rate_map: locked_rate_map.clone(),
             locked_per_req_mu: price.per_req_mu,
             locked_min_session_mu: price.min_session_mu,
+            served_ctx,
+            ctx_bracket: ctx_bracket.clone(),
+            ctx_bracket_table_ver,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11467,6 +11626,9 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            served_ctx: voucher_body.served_ctx,
+            ctx_bracket,
+            ctx_bracket_table_ver,
             rules_ver: self.receipt_config.rules_ver,
             spend_voucher: SpendVoucher {
                 body: voucher_body,
@@ -11585,6 +11747,9 @@ impl GatewayState {
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
                 locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                served_ctx: invocation.served_ctx,
+                ctx_bracket: invocation.ctx_bracket.clone(),
+                ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11676,6 +11841,9 @@ impl GatewayState {
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
                 locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                served_ctx: invocation.served_ctx,
+                ctx_bracket: invocation.ctx_bracket.clone(),
+                ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11767,6 +11935,9 @@ impl GatewayState {
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
                 locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                served_ctx: invocation.served_ctx,
+                ctx_bracket: invocation.ctx_bracket.clone(),
+                ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11919,6 +12090,9 @@ impl GatewayState {
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
                 locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                served_ctx: invocation.served_ctx,
+                ctx_bracket: invocation.ctx_bracket.clone(),
+                ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -12010,6 +12184,9 @@ impl GatewayState {
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
                 locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                served_ctx: invocation.served_ctx,
+                ctx_bracket: invocation.ctx_bracket.clone(),
+                ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -14477,6 +14654,9 @@ mod tests {
             locked_rate_map: text_generation_rate_map(20, 60),
             locked_per_req_mu: 0,
             locked_min_session_mu: 0,
+            served_ctx: 4096,
+            ctx_bracket: ctx_bracket_for_tokens(4096).to_owned(),
+            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
             max_spend_mu: 1000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 128,
@@ -14491,6 +14671,9 @@ mod tests {
             provider_pubkey: Some(verifying_key_hex(&test_provider_seed())),
             enclave_id,
             price_ver: 7,
+            served_ctx: voucher_body.served_ctx,
+            ctx_bracket: voucher_body.ctx_bracket.clone(),
+            ctx_bracket_table_ver: voucher_body.ctx_bracket_table_ver,
             rules_ver: 3,
             spend_voucher: SpendVoucher {
                 body: voucher_body,
@@ -15270,6 +15453,7 @@ mod tests {
             Some(1),
             None,
             None,
+            None,
             0xfeed,
         );
         assert!(priced_out.is_empty());
@@ -15280,6 +15464,7 @@ mod tests {
             &request,
             None,
             Some(u64::MAX),
+            None,
             None,
             None,
             0xfeed,
@@ -15550,6 +15735,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            None,
             0xfeed,
         );
         assert_eq!(selected.len(), 1);
@@ -15602,6 +15788,7 @@ mod tests {
             &request,
             None,
             Some(u64::MAX),
+            None,
             Some("fp16"),
             None,
             0xfeed,
@@ -15615,6 +15802,7 @@ mod tests {
             &request,
             None,
             Some(u64::MAX),
+            None,
             Some("fp8"),
             None,
             0xfeed,
@@ -16139,6 +16327,9 @@ mod tests {
             locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
             locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
             locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+            served_ctx: invocation.served_ctx,
+            ctx_bracket: invocation.ctx_bracket.clone(),
+            ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
             mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
@@ -16175,6 +16366,9 @@ mod tests {
             locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
             locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
             locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+            served_ctx: invocation.served_ctx,
+            ctx_bracket: invocation.ctx_bracket.clone(),
+            ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
             mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),

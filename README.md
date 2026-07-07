@@ -147,14 +147,16 @@ mayhem models --gateway --quant int4
 
 `--min-att-tier 3` asks for prompt-private routing. `--require-kyb` asks for Tier 4 identity; it does not make prompts private. `--quant` filters live admin enclave routes by their pinned artifact bucket; it is not a separate price key. You can also send routing preferences through OpenAI-compatible request headers, for example `X-Mayhem-Min-Att-Tier: 3`, `X-Mayhem-Quant: int4`, `X-Mayhem-Hedge: 1`, or failover thresholds such as `X-Mayhem-Min-Tok-S`.
 
-Inspect the live market price and set a local user ceiling:
+Inspect the live market price and set local user ceilings:
 
 ```bash
 mayhem price show <model-id> --tier 1
 mayhem config max-price 250000
+mayhem config set --key min-ctx --value 128000
 ```
 
 `mayhem config max-price` is a persistent default for the local gateway. Per-request clients can override it with `X-Mayhem-Max-Price-Mu`.
+`min-ctx` is a persistent context-floor default for `mayhem use`; per-request clients can override it with `X-Mayhem-Min-Ctx`, and terminal users can run `mayhem use --min-ctx 128000`.
 
 Stop Mayhem:
 

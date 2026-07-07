@@ -7,6 +7,19 @@ const ROOT_KINDS = ['dep', 'use', 'earn', 'fee', 'price'];
 const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 5_000;
+const SESSION_RECEIPT_SCHEMA_VERSION = 6;
+const CTX_BRACKET_TABLE_VERSION = 1;
+
+function ctxBracketForTokens(tokens) {
+  if (!Number.isSafeInteger(tokens) || tokens < 0) {
+    throw new Error('receipt served_ctx is invalid');
+  }
+  if (tokens <= 8_192) return 'le8k';
+  if (tokens <= 32_768) return 'le32k';
+  if (tokens <= 131_072) return 'le128k';
+  if (tokens <= 262_144) return 'le256k';
+  return 'gt256k';
+}
 
 export const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
@@ -153,7 +166,7 @@ function normalizeReceiptUsage(usageSource) {
   return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
 }
 
-function migrateReceiptBody(body, targetSchemaVersion = 4) {
+function migrateReceiptBody(body, targetSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
   if (!Number.isSafeInteger(body.schema_version) || body.schema_version < 1) {
     throw new Error('receipt schema_version is unsupported');
   }
@@ -173,6 +186,13 @@ function migrateReceiptBody(body, targetSchemaVersion = 4) {
       migrated.locked_per_req_mu ??= 0;
       migrated.locked_min_session_mu ??= 0;
       migrated.schema_version = 4;
+    } else if (migrated.schema_version === 4) {
+      migrated.served_ctx ??= 0;
+      migrated.schema_version = 5;
+    } else if (migrated.schema_version === 5) {
+      migrated.ctx_bracket ??= ctxBracketForTokens(migrated.served_ctx ?? 0);
+      migrated.ctx_bracket_table_ver ??= CTX_BRACKET_TABLE_VERSION;
+      migrated.schema_version = 6;
     } else {
       throw new Error(`unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}`);
     }

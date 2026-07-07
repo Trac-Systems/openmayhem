@@ -8,10 +8,23 @@ pub const CRATE_NAME: &str = "mayhem-proto";
 pub const CONTRACT_VERSION: u32 = 2;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 4;
-pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 5;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 6;
+pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 7;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
+pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
+pub const CTX_BRACKETS: &[(u32, &str)] = &[
+    (8_192, "le8k"),
+    (32_768, "le32k"),
+    (131_072, "le128k"),
+    (262_144, "le256k"),
+];
+pub fn ctx_bracket_for_tokens(tokens: u32) -> &'static str {
+    CTX_BRACKETS
+        .iter()
+        .find_map(|(max_ctx, bracket)| (tokens <= *max_ctx).then_some(*bracket))
+        .unwrap_or("gt256k")
+}
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
 pub const DEFAULT_MODEL_CLASS: &str = "text-generation";
@@ -174,6 +187,9 @@ pub struct SpendVoucherBody {
     pub locked_rate_map: Vec<RateMapEntry>,
     pub locked_per_req_mu: u64,
     pub locked_min_session_mu: u64,
+    pub served_ctx: u32,
+    pub ctx_bracket: String,
+    pub ctx_bracket_table_ver: u32,
     pub max_spend_mu: u64,
     pub checkpoint_every: CheckpointPolicy,
 }
@@ -316,6 +332,9 @@ pub struct ReceiptBody {
     pub locked_rate_map: Vec<RateMapEntry>,
     pub locked_per_req_mu: u64,
     pub locked_min_session_mu: u64,
+    pub served_ctx: u32,
+    pub ctx_bracket: String,
+    pub ctx_bracket_table_ver: u32,
     pub rules_ver: u64,
     pub usage: ReceiptUsage,
     pub mu_owed_cum: u64,
@@ -374,6 +393,17 @@ pub fn migrate_receipt_body_to_schema(
             }
             2 => migrated.schema_version = 3,
             3 => migrated.schema_version = 4,
+            4 => migrated.schema_version = 5,
+            5 => {
+                if migrated.ctx_bracket.is_empty() {
+                    migrated.ctx_bracket = ctx_bracket_for_tokens(migrated.served_ctx).to_owned();
+                }
+                if migrated.ctx_bracket_table_ver == 0 {
+                    migrated.ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
+                }
+                migrated.schema_version = 6;
+            }
+            6 => migrated.schema_version = 7,
             from => {
                 return Err(ReceiptSchemaMigrationError::Unsupported {
                     from,
@@ -1145,6 +1175,9 @@ mod tests {
             locked_rate_map: locked_rate_map(),
             locked_per_req_mu: 7,
             locked_min_session_mu: 11,
+            served_ctx: 8192,
+            ctx_bracket: "le8k".to_owned(),
+            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
             max_spend_mu: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
@@ -1172,6 +1205,9 @@ mod tests {
             locked_rate_map: locked_rate_map(),
             locked_per_req_mu: 7,
             locked_min_session_mu: 11,
+            served_ctx: voucher.served_ctx,
+            ctx_bracket: voucher.ctx_bracket.clone(),
+            ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
@@ -1180,6 +1216,18 @@ mod tests {
         };
         let mut changed = receipt.clone();
         changed.mu_owed_cum = 2;
+        assert_ne!(
+            receipt_signing_bytes(&receipt).unwrap(),
+            receipt_signing_bytes(&changed).unwrap()
+        );
+        changed = receipt.clone();
+        changed.served_ctx = 4096;
+        assert_ne!(
+            receipt_signing_bytes(&receipt).unwrap(),
+            receipt_signing_bytes(&changed).unwrap()
+        );
+        changed = receipt.clone();
+        changed.ctx_bracket = "le32k".to_owned();
         assert_ne!(
             receipt_signing_bytes(&receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
@@ -1218,6 +1266,9 @@ mod tests {
             locked_rate_map: locked_rate_map(),
             locked_per_req_mu: 0,
             locked_min_session_mu: 0,
+            served_ctx: 8192,
+            ctx_bracket: "le8k".to_owned(),
+            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
@@ -1263,6 +1314,9 @@ mod tests {
             locked_rate_map: locked_rate_map(),
             locked_per_req_mu: 7,
             locked_min_session_mu: 11,
+            served_ctx: 8192,
+            ctx_bracket: "le8k".to_owned(),
+            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
             max_spend_mu: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
@@ -1297,6 +1351,9 @@ mod tests {
             locked_rate_map: locked_rate_map(),
             locked_per_req_mu: 7,
             locked_min_session_mu: 11,
+            served_ctx: voucher.served_ctx,
+            ctx_bracket: voucher.ctx_bracket.clone(),
+            ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,

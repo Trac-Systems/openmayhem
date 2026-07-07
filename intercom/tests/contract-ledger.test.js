@@ -23,6 +23,14 @@ const TEXT_LOCKED_RATE_MAP = Object.freeze([
   { unit: 'input_token', per_unit_mu: 20, granularity: 1_000 },
   { unit: 'output_token', per_unit_mu: 60, granularity: 1_000 },
 ]);
+const CTX_BRACKET_TABLE_VERSION = 1;
+const ctxBracketForTokens = (tokens) => {
+  if (tokens <= 8_192) return 'le8k';
+  if (tokens <= 32_768) return 'le32k';
+  if (tokens <= 131_072) return 'le128k';
+  if (tokens <= 262_144) return 'le256k';
+  return 'gt256k';
+};
 
 const providerRegistration = {
   op: 'register_provider',
@@ -173,6 +181,9 @@ function signedSpendReservation(
     lockedRateMap = TEXT_LOCKED_RATE_MAP,
     lockedPerReqMu = 0,
     lockedMinSessionMu = 100,
+    servedCtx = 8192,
+    ctxBracket = ctxBracketForTokens(servedCtx),
+    ctxBracketTableVer = CTX_BRACKET_TABLE_VERSION,
   } = {}
 ) {
   const voucherBody = {
@@ -183,6 +194,9 @@ function signedSpendReservation(
     locked_rate_map: lockedRateMap,
     locked_per_req_mu: lockedPerReqMu,
     locked_min_session_mu: lockedMinSessionMu,
+    served_ctx: servedCtx,
+    ctx_bracket: ctxBracket,
+    ctx_bracket_table_ver: ctxBracketTableVer,
     max_spend_mu: maxSpendMu,
     checkpoint_every: { tokens: 8192, ms: 30_000 },
   };
@@ -198,6 +212,9 @@ function signedSpendReservation(
     enclave_id: enclaveId,
     price_ver: priceVer,
     rules_ver: 1,
+    served_ctx: servedCtx,
+    ctx_bracket: ctxBracket,
+    ctx_bracket_table_ver: ctxBracketTableVer,
     max_spend_mu: maxSpendMu,
     voucher: {
       ...voucherBody,
@@ -470,6 +487,9 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
   assert.equal(hold.sessions[0].session_id, 'a1'.repeat(32));
   assert.equal(hold.sessions[0].provider, ctx.provider.publicKey);
   assert.equal(hold.sessions[0].feature_key, firstKey);
+  assert.equal(hold.sessions[0].served_ctx, 8192);
+  assert.equal(hold.sessions[0].ctx_bracket, 'le8k');
+  assert.equal(hold.sessions[0].ctx_bracket_table_ver, CTX_BRACKET_TABLE_VERSION);
   assert.match(hold.sessions[0].voucher_hash, /^[0-9a-f]{64}$/);
 
   const replay = await executeSpendReservationFeature(
@@ -542,6 +562,9 @@ test('MayhemContract spend reservation keeps the locked quote after market price
   assert.deepEqual(hold.sessions[0].locked_rate_map, TEXT_LOCKED_RATE_MAP);
   assert.equal(hold.sessions[0].locked_per_req_mu, 0);
   assert.equal(hold.sessions[0].locked_min_session_mu, 100);
+  assert.equal(hold.sessions[0].served_ctx, 8192);
+  assert.equal(hold.sessions[0].ctx_bracket, 'le8k');
+  assert.equal(hold.sessions[0].ctx_bracket_table_ver, CTX_BRACKET_TABLE_VERSION);
 
   const forgedV1Quote = signedSpendReservation(ctx, {
     provider: ctx.provider,
@@ -932,6 +955,44 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
     admin.publicKey
   );
   assert.match(tooLarge.message, /max_apply_batch/i);
+  assert.equal(storage.snapshotBytes(), before);
+});
+
+test('MayhemContract epochApply uses the active admin max_apply_batch param', async () => {
+  const { admin, provider, storage, contract } = await setupLedgerContract();
+  const tuned = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: 86_400,
+      values: { max_apply_batch: 3 },
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(tuned.ok, true, tuned.message);
+
+  const before = storage.snapshotBytes();
+  const tunedTooLarge = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 86_400,
+      debits: [
+        { rail: 'fiat', user: 'user-a', mu: 1 },
+        { rail: 'fiat', user: 'user-b', mu: 1 },
+        { rail: 'fiat', user: 'user-c', mu: 1 },
+      ],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 3 }],
+    },
+    admin.publicKey
+  );
+  assert.match(tunedTooLarge.message, /max_apply_batch/i);
   assert.equal(storage.snapshotBytes(), before);
 });
 

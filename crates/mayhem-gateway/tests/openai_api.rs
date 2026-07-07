@@ -2083,6 +2083,9 @@ fn signed_image_provider_receipt(
         locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
         locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
         locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+        served_ctx: invocation.served_ctx,
+        ctx_bracket: invocation.ctx_bracket.clone(),
+        ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
         mu_owed_cum: priced_usage_mu(
@@ -2157,6 +2160,9 @@ fn signed_provider_receipt_for_test(
         locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
         locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
         locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+        served_ctx: invocation.served_ctx,
+        ctx_bracket: invocation.ctx_bracket.clone(),
+        ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
         mu_owed_cum: priced_usage_mu(

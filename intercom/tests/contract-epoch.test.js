@@ -313,6 +313,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
   assert.deepEqual((await storage.get('ev/dep/1')).value, {
     type: 'deposit_root',
     epoch: 1,
+    epoch_seconds: 3_600,
     merkle_root: roll.roots.dep,
     count: 0,
     mu_total: 0,
@@ -322,6 +323,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
   assert.deepEqual((await storage.get('ev/use/1')).value, {
     type: 'usage_root',
     epoch: 1,
+    epoch_seconds: 3_600,
     merkle_root: roll.roots.use,
     sessions: 1,
     mu_total: 2_000,
@@ -332,6 +334,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
   assert.deepEqual((await storage.get('ev/earn/1')).value, {
     type: 'earn_root',
     epoch: 1,
+    epoch_seconds: 3_600,
     merkle_root: roll.roots.earn,
     provider_count: 1,
     mu_cum_total: 1_700,
@@ -341,6 +344,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
   assert.deepEqual((await storage.get('ev/fee/1')).value, {
     type: 'fee_root',
     epoch: 1,
+    epoch_seconds: 3_600,
     merkle_root: roll.roots.fee,
     mu_fee_epoch: 300,
     mu_fee_cum: 300,
@@ -349,6 +353,94 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     updated_at: applyKey,
   });
   assert.equal(await storage.get('ev/pay/1'), null);
+});
+
+test('MayhemContract binds active admin epoch timing into commit and apply evidence', async () => {
+  const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
+  const tuned = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: 86_400,
+      values: {
+        epoch_seconds: 7_200,
+        challenge_epochs: 2,
+      },
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(tuned.ok, true, tuned.message);
+
+  const roll = await recomputeEpoch(receiptBundle(user, provider));
+  const commit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 1,
+      at: 86_400,
+      roots: roll.roots,
+      totals: roll.totals,
+    },
+    submitter.publicKey,
+    5
+  );
+  assert.equal(commit.ok, true, commit.message);
+  assert.deepEqual((await storage.get('epoch/commit/1')).value, {
+    type: 'epoch_commit',
+    epoch: 1,
+    epoch_seconds: 7_200,
+    roots: roll.roots,
+    totals: roll.totals,
+    status: 'provisional',
+    challenge_epochs: 2,
+    provisional_until_epoch: 3,
+    commit_hash: commit.commit_hash,
+    submitted_by: submitter.publicKey,
+    submitted_at: makeTxKey(5),
+    at: 86_400,
+  });
+
+  const staleTimingApply = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 86_399,
+      debits: roll.debits,
+      earnings: roll.earnings,
+      roots: roll.roots,
+      totals: roll.totals,
+    },
+    admin.publicKey
+  );
+  assert.match(staleTimingApply.message, /epoch_seconds does not match/i);
+  assert.equal((await storage.get('ev/use/1')), null);
+
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 86_400,
+    debits: roll.debits,
+    earnings: roll.earnings,
+    roots: roll.roots,
+    totals: roll.totals,
+  };
+  const applyKey = await epochApplyFeatureKey(contract, applyValue);
+  const applied = await executeEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal((await storage.get('epoch/apply/state')).value.last_epoch_seconds, 7_200);
+  assert.equal((await storage.get('ev/dep/1')).value.epoch_seconds, 7_200);
+  assert.equal((await storage.get('ev/use/1')).value.epoch_seconds, 7_200);
+  assert.equal((await storage.get('ev/earn/1')).value.epoch_seconds, 7_200);
+  assert.equal((await storage.get('ev/fee/1')).value.epoch_seconds, 7_200);
+  assert.equal((await storage.get('ev/use/1')).value.updated_at, applyKey);
 });
 
 test('MayhemContract fraudProof voids an inflated single-receipt commit and bans submitter', async () => {

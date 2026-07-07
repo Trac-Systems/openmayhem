@@ -44,8 +44,17 @@ const DEFAULT_DISPUTE_DEPOSIT_MU = 1_000_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 4;
-export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 5;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 6;
+export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 7;
+const CTX_BRACKET_TABLE_VERSION = 1;
+const CTX_BRACKETS = Object.freeze([
+  { id: 'le8k', max_ctx: 8_192 },
+  { id: 'le32k', max_ctx: 32_768 },
+  { id: 'le128k', max_ctx: 131_072 },
+  { id: 'le256k', max_ctx: 262_144 },
+  { id: 'gt256k', max_ctx: null },
+]);
+const CTX_BRACKET_IDS = new Set(CTX_BRACKETS.map((entry) => entry.id));
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
@@ -294,6 +303,9 @@ export const spendReservationEvidence = (value) => ({
   enclave_id: value.enclave_id,
   price_ver: value.price_ver,
   rules_ver: value.rules_ver,
+  served_ctx: value.served_ctx,
+  ctx_bracket: value.ctx_bracket,
+  ctx_bracket_table_ver: value.ctx_bracket_table_ver,
   max_spend_mu: value.max_spend_mu,
   voucher: stableValue(value.voucher),
 });
@@ -355,6 +367,18 @@ const stableValue = (value) => {
   return value;
 };
 const stableJson = (value) => JSON.stringify(stableValue(value));
+
+export const contractParamDefinitions = () => cloneValue(PARAM_DEFINITIONS);
+export const contractCtxBracketTable = () => ({
+  ver: CTX_BRACKET_TABLE_VERSION,
+  brackets: cloneValue(CTX_BRACKETS),
+});
+
+const ctxBracketForTokens = (tokens) => {
+  if (!Number.isSafeInteger(tokens) || tokens < 0) return null;
+  const bracket = CTX_BRACKETS.find((entry) => entry.max_ctx === null || tokens <= entry.max_ctx);
+  return bracket?.id ?? null;
+};
 
 class MayhemContract extends Contract {
   constructor(protocol, options = {}) {
@@ -1059,6 +1083,9 @@ class MayhemContract extends Contract {
         stableJson(existing.locked_rate_map) !== stableJson(normalized.locked_rate_map) ||
         existing.locked_per_req_mu !== normalized.locked_per_req_mu ||
         existing.locked_min_session_mu !== normalized.locked_min_session_mu ||
+        existing.served_ctx !== normalized.served_ctx ||
+        existing.ctx_bracket !== normalized.ctx_bracket ||
+        existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
         existing.max_spend_mu !== normalized.max_spend_mu ||
         existing.voucher_hash !== normalized.voucher_hash
       ) {
@@ -1095,6 +1122,9 @@ class MayhemContract extends Contract {
       locked_rate_map: normalized.locked_rate_map,
       locked_per_req_mu: normalized.locked_per_req_mu,
       locked_min_session_mu: normalized.locked_min_session_mu,
+      served_ctx: normalized.served_ctx,
+      ctx_bracket: normalized.ctx_bracket,
+      ctx_bracket_table_ver: normalized.ctx_bracket_table_ver,
       rules_ver: normalized.rules_ver,
       max_spend_mu: normalized.max_spend_mu,
       voucher_hash: normalized.voucher_hash,
@@ -2615,6 +2645,7 @@ class MayhemContract extends Contract {
     }
 
     const params = await this.activeParamsAt(this.value.at, [
+      'epoch_seconds',
       'fee_bps',
       'max_apply_batch',
       'holdback_epochs',
@@ -2664,6 +2695,7 @@ class MayhemContract extends Contract {
       page,
       last_page: lastPage,
       at: this.value.at,
+      epoch_seconds: params.epoch_seconds,
       fee_bps: params.fee_bps,
       debits: this.mapRailEntriesForHash(debitMap, 'user', 'mu'),
       earnings: this.mapRailEntriesForHash(grossEarningMap, 'provider', 'gross_mu'),
@@ -2831,12 +2863,17 @@ class MayhemContract extends Contract {
 
     let marketPriceUpdates = [];
     if (marketUsageProvided) {
-      marketPriceUpdates = await this.computeMarketPriceUpdates(marketUsageMap);
+      marketPriceUpdates = await this.computeMarketPriceUpdates(marketUsageMap, {
+        epoch: this.value.epoch,
+        at: this.value.at,
+        epochSeconds: params.epoch_seconds,
+      });
       if (marketPriceUpdates instanceof Error) return marketPriceUpdates;
     }
     const priceDerivations = await this.priceDerivationsFromMarketUpdates(marketPriceUpdates, {
       epoch: this.value.epoch,
       at: this.value.at,
+      epochSeconds: params.epoch_seconds,
       usageRoot: roots?.use ?? null,
     });
     if (priceDerivations instanceof Error) return priceDerivations;
@@ -2851,6 +2888,7 @@ class MayhemContract extends Contract {
         nextFeeCum: nextFeeCumTotal,
         providerCount: grossEarningMap.size,
         earnCumTotal,
+        epochSeconds: params.epoch_seconds,
         priceDerivations,
       });
       if (totalsError) return totalsError;
@@ -2875,11 +2913,13 @@ class MayhemContract extends Contract {
       page,
       lastPage,
       applyHash,
+      epochSeconds: params.epoch_seconds,
     }));
     if (totals) {
       await this.writeEpochEvidenceRoots({
         epoch: this.value.epoch,
         at: this.value.at,
+        epoch_seconds: params.epoch_seconds,
         roots,
         totals,
         feeDeltaMu: feeDeltaTotalMu,
@@ -2890,6 +2930,7 @@ class MayhemContract extends Contract {
       await this.writePriceDerivationEvidence({
         epoch: this.value.epoch,
         at: this.value.at,
+        epoch_seconds: params.epoch_seconds,
         root: await this.priceDerivationRoot(priceDerivations),
         count: priceDerivations.length,
         derivations: priceDerivations,
@@ -2941,9 +2982,10 @@ class MayhemContract extends Contract {
     if (roots instanceof Error) return roots;
     const totals = this.normalizeEpochTotals(this.value.totals);
     if (totals instanceof Error) return totals;
-    const params = await this.activeParamsAt(this.value.at, ['challenge_epochs']);
+    const params = await this.activeParamsAt(this.value.at, ['challenge_epochs', 'epoch_seconds']);
     const normalized = {
       epoch: this.value.epoch,
+      epoch_seconds: params.epoch_seconds,
       roots,
       totals,
     };
@@ -2966,6 +3008,7 @@ class MayhemContract extends Contract {
     const record = {
       type: 'epoch_commit',
       epoch: this.value.epoch,
+      epoch_seconds: params.epoch_seconds,
       roots,
       totals,
       status: 'provisional',
@@ -5076,6 +5119,7 @@ class MayhemContract extends Contract {
   async computeMarketPriceUpdates(marketUsageMap, context = {}) {
     const at = context.at ?? this.value.at;
     const epoch = context.epoch ?? this.value.epoch;
+    const epochSeconds = context.epochSeconds ?? null;
     const tx = context.tx ?? this.tx;
     const marketParams = await this.activeParamsAt(at, this.marketPriceParamKeys());
     const constants = this.marketPriceConstants(marketParams);
@@ -5147,6 +5191,7 @@ class MayhemContract extends Contract {
           schema_version: 1,
           source: 'settled_epoch_usage',
           epoch,
+          epoch_seconds: epochSeconds,
           active_supply: activeSupply,
           active_demand_mu: usage.demand_mu,
           session_count: usage.session_count,
@@ -5405,6 +5450,9 @@ class MayhemContract extends Contract {
         'locked_rate_map',
         'locked_per_req_mu',
         'locked_min_session_mu',
+        'served_ctx',
+        'ctx_bracket',
+        'ctx_bracket_table_ver',
         'max_spend_mu',
         'checkpoint_every',
         'user_sig',
@@ -5433,6 +5481,18 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(voucher.locked_min_session_mu) || voucher.locked_min_session_mu < 0) {
       return new Error('Invalid spend voucher locked minimum session price.');
     }
+    if (!Number.isSafeInteger(voucher.served_ctx) || voucher.served_ctx < 0) {
+      return new Error('Invalid spend voucher served context.');
+    }
+    if (typeof voucher.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(voucher.ctx_bracket)) {
+      return new Error('Invalid spend voucher context bracket.');
+    }
+    if (voucher.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
+      return new Error('Unsupported spend voucher context bracket table version.');
+    }
+    if (ctxBracketForTokens(voucher.served_ctx) !== voucher.ctx_bracket) {
+      return new Error('Spend voucher context bracket does not match served context.');
+    }
     if (!Number.isSafeInteger(voucher.max_spend_mu) || voucher.max_spend_mu < 1) {
       return new Error('Invalid spend voucher max spend.');
     }
@@ -5451,6 +5511,9 @@ class MayhemContract extends Contract {
       locked_rate_map: lockedRateMap,
       locked_per_req_mu: voucher.locked_per_req_mu,
       locked_min_session_mu: voucher.locked_min_session_mu,
+      served_ctx: voucher.served_ctx,
+      ctx_bracket: voucher.ctx_bracket,
+      ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
       max_spend_mu: voucher.max_spend_mu,
       checkpoint_every: {
         tokens: voucher.checkpoint_every.tokens,
@@ -5479,6 +5542,9 @@ class MayhemContract extends Contract {
         'enclave_id',
         'price_ver',
         'rules_ver',
+        'served_ctx',
+        'ctx_bracket',
+        'ctx_bracket_table_ver',
         'max_spend_mu',
         'voucher',
         'provider_sig',
@@ -5502,6 +5568,18 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.rules_ver) || value.rules_ver < 1) {
       return new Error('Invalid spend reservation rules version.');
     }
+    if (!Number.isSafeInteger(value.served_ctx) || value.served_ctx < 0) {
+      return new Error('Invalid spend reservation served context.');
+    }
+    if (typeof value.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(value.ctx_bracket)) {
+      return new Error('Invalid spend reservation context bracket.');
+    }
+    if (value.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
+      return new Error('Unsupported spend reservation context bracket table version.');
+    }
+    if (ctxBracketForTokens(value.served_ctx) !== value.ctx_bracket) {
+      return new Error('Spend reservation context bracket does not match served context.');
+    }
     if (!Number.isSafeInteger(value.max_spend_mu) || value.max_spend_mu < 1) {
       return new Error('Invalid spend reservation max spend.');
     }
@@ -5520,6 +5598,15 @@ class MayhemContract extends Contract {
     if (voucher.price_ver !== value.price_ver) {
       return new Error('Spend reservation voucher price mismatch.');
     }
+    if (voucher.body.served_ctx !== value.served_ctx) {
+      return new Error('Spend reservation voucher served context mismatch.');
+    }
+    if (voucher.body.ctx_bracket !== value.ctx_bracket) {
+      return new Error('Spend reservation voucher context bracket mismatch.');
+    }
+    if (voucher.body.ctx_bracket_table_ver !== value.ctx_bracket_table_ver) {
+      return new Error('Spend reservation voucher context bracket table version mismatch.');
+    }
     if (voucher.max_spend_mu !== value.max_spend_mu) {
       return new Error('Spend reservation voucher max spend mismatch.');
     }
@@ -5537,6 +5624,9 @@ class MayhemContract extends Contract {
       locked_rate_map: voucher.body.locked_rate_map,
       locked_per_req_mu: voucher.body.locked_per_req_mu,
       locked_min_session_mu: voucher.body.locked_min_session_mu,
+      served_ctx: value.served_ctx,
+      ctx_bracket: value.ctx_bracket,
+      ctx_bracket_table_ver: value.ctx_bracket_table_ver,
       rules_ver: value.rules_ver,
       max_spend_mu: value.max_spend_mu,
       voucher: {
@@ -5547,6 +5637,9 @@ class MayhemContract extends Contract {
         locked_rate_map: voucher.body.locked_rate_map,
         locked_per_req_mu: voucher.body.locked_per_req_mu,
         locked_min_session_mu: voucher.body.locked_min_session_mu,
+        served_ctx: voucher.body.served_ctx,
+        ctx_bracket: voucher.body.ctx_bracket,
+        ctx_bracket_table_ver: voucher.body.ctx_bracket_table_ver,
         max_spend_mu: voucher.body.max_spend_mu,
         checkpoint_every: voucher.body.checkpoint_every,
         user_sig: voucher.user_sig,
@@ -5603,6 +5696,18 @@ class MayhemContract extends Contract {
       }
       if (!Number.isSafeInteger(session.locked_min_session_mu) || session.locked_min_session_mu < 0) {
         return new Error('Invalid spend hold locked minimum session price.');
+      }
+      if (!Number.isSafeInteger(session.served_ctx) || session.served_ctx < 0) {
+        return new Error('Invalid spend hold served context.');
+      }
+      if (typeof session.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(session.ctx_bracket)) {
+        return new Error('Invalid spend hold context bracket.');
+      }
+      if (session.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
+        return new Error('Unsupported spend hold context bracket table version.');
+      }
+      if (ctxBracketForTokens(session.served_ctx) !== session.ctx_bracket) {
+        return new Error('Spend hold context bracket does not match served context.');
       }
       if (!Number.isSafeInteger(session.max_spend_mu) || session.max_spend_mu < 1) {
         return new Error('Invalid spend hold max spend.');
@@ -5728,11 +5833,12 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  nextEpochApplyState({ applyState, epoch, page, lastPage, applyHash }) {
+  nextEpochApplyState({ applyState, epoch, page, lastPage, applyHash, epochSeconds }) {
     const base = {
       ...applyState,
       updated_at: this.tx,
       last_apply_hash: applyHash,
+      last_epoch_seconds: epochSeconds,
     };
     if (lastPage) {
       return {
@@ -6718,6 +6824,11 @@ class MayhemContract extends Contract {
     };
     if (hasOwn(bodySource, 'locked_per_req_mu')) body.locked_per_req_mu = bodySource.locked_per_req_mu;
     if (hasOwn(bodySource, 'locked_min_session_mu')) body.locked_min_session_mu = bodySource.locked_min_session_mu;
+    if (hasOwn(bodySource, 'served_ctx')) body.served_ctx = bodySource.served_ctx;
+    if (hasOwn(bodySource, 'ctx_bracket')) body.ctx_bracket = bodySource.ctx_bracket;
+    if (hasOwn(bodySource, 'ctx_bracket_table_ver')) {
+      body.ctx_bracket_table_ver = bodySource.ctx_bracket_table_ver;
+    }
 
     const migratedBody = this.migrateReceiptBody(body, targetSchemaVersion);
     if (migratedBody instanceof Error) return migratedBody;
@@ -6770,7 +6881,14 @@ class MayhemContract extends Contract {
         migrated.locked_min_session_mu ??= 0;
         migrated.schema_version = 4;
       } else if (migrated.schema_version === 4) {
+        migrated.served_ctx ??= 0;
         migrated.schema_version = 5;
+      } else if (migrated.schema_version === 5) {
+        migrated.ctx_bracket ??= ctxBracketForTokens(migrated.served_ctx ?? 0);
+        migrated.ctx_bracket_table_ver ??= CTX_BRACKET_TABLE_VERSION;
+        migrated.schema_version = 6;
+      } else if (migrated.schema_version === 6) {
+        migrated.schema_version = 7;
       } else {
         return new Error(
           `Unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}.`
@@ -6809,6 +6927,18 @@ class MayhemContract extends Contract {
     }
     if (!Number.isSafeInteger(body.locked_min_session_mu) || body.locked_min_session_mu < 0) {
       return new Error('Invalid receipt locked minimum session price.');
+    }
+    if (!Number.isSafeInteger(body.served_ctx) || body.served_ctx < 0) {
+      return new Error('Invalid receipt served context.');
+    }
+    if (typeof body.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(body.ctx_bracket)) {
+      return new Error('Invalid receipt context bracket.');
+    }
+    if (body.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
+      return new Error('Unsupported receipt context bracket table version.');
+    }
+    if (ctxBracketForTokens(body.served_ctx) !== body.ctx_bracket) {
+      return new Error('Receipt context bracket does not match served context.');
     }
     if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
       return new Error('Invalid receipt rules version.');
@@ -6932,7 +7062,7 @@ class MayhemContract extends Contract {
     return leaf;
   }
 
-  priceDerivationFromMarketUpdate(update, { epoch, at, usageRoot = null } = {}) {
+  priceDerivationFromMarketUpdate(update, { epoch, at, epochSeconds = null, usageRoot = null } = {}) {
     const record = update.record;
     const market = record.market;
     if (!record || !market || typeof market !== 'object') {
@@ -6943,6 +7073,7 @@ class MayhemContract extends Contract {
       schema_version: 1,
       epoch,
       at,
+      epoch_seconds: epochSeconds,
       enclave_id: record.enclave_id,
       model_id: record.model_id,
       denom: record.denom,
@@ -7055,12 +7186,14 @@ class MayhemContract extends Contract {
     const updates = await this.computeMarketPriceUpdates(usageMap, {
       epoch: commit.epoch,
       at: commit.at,
+      epochSeconds: commit.epoch_seconds ?? null,
       tx: commit.submitted_at,
     });
     if (updates instanceof Error) return updates;
     const derivations = await this.priceDerivationsFromMarketUpdates(updates, {
       epoch: commit.epoch,
       at: commit.at,
+      epochSeconds: commit.epoch_seconds ?? null,
       usageRoot: commit.roots.use,
     });
     if (derivations instanceof Error) return derivations;
@@ -7090,11 +7223,15 @@ class MayhemContract extends Contract {
     nextFeeCum,
     providerCount,
     earnCumTotal,
+    epochSeconds,
     priceDerivations,
   }) {
     const commit = await this.get(`epoch/commit/${epoch}`);
     if (!commit) return new Error('Epoch commit required before applying evidence roots.');
     if (commit.status === 'void') return new Error('Epoch commit is void.');
+    if (commit.epoch_seconds !== epochSeconds) {
+      return new Error('Epoch apply epoch_seconds does not match committed epoch timing.');
+    }
     if (
       stableJson(commit.roots) !== stableJson(roots) ||
       stableJson(commit.totals) !== stableJson(totals)
@@ -7139,10 +7276,11 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async writePriceDerivationEvidence({ epoch, at, root, count, derivations }) {
+  async writePriceDerivationEvidence({ epoch, at, epoch_seconds, root, count, derivations }) {
     await this.put(`ev/price/${epoch}`, {
       type: 'price_root',
       epoch,
+      epoch_seconds,
       merkle_root: root,
       price_count: count,
       ts: at,
@@ -7157,11 +7295,12 @@ class MayhemContract extends Contract {
     }
   }
 
-  async writeEpochEvidenceRoots({ epoch, at, roots, totals, feeDeltaMu, feeCumMu, priceDerivations }) {
+  async writeEpochEvidenceRoots({ epoch, at, epoch_seconds, roots, totals, feeDeltaMu, feeCumMu, priceDerivations }) {
     if ((await this.get(`ev/dep/${epoch}`)) === null) {
       await this.put(`ev/dep/${epoch}`, {
         type: 'deposit_root',
         epoch,
+        epoch_seconds,
         merkle_root: roots.dep,
         count: totals.dep_count,
         mu_total: totals.dep_mu,
@@ -7172,6 +7311,7 @@ class MayhemContract extends Contract {
     await this.put(`ev/use/${epoch}`, {
       type: 'usage_root',
       epoch,
+      epoch_seconds,
       merkle_root: roots.use,
       sessions: totals.use_count,
       mu_total: totals.use_mu,
@@ -7182,6 +7322,7 @@ class MayhemContract extends Contract {
     await this.put(`ev/earn/${epoch}`, {
       type: 'earn_root',
       epoch,
+      epoch_seconds,
       merkle_root: roots.earn,
       provider_count: totals.provider_count,
       mu_cum_total: totals.earn_mu,
@@ -7191,6 +7332,7 @@ class MayhemContract extends Contract {
     await this.put(`ev/fee/${epoch}`, {
       type: 'fee_root',
       epoch,
+      epoch_seconds,
       merkle_root: roots.fee,
       mu_fee_epoch: feeDeltaMu,
       mu_fee_cum: feeCumMu,
@@ -7201,6 +7343,7 @@ class MayhemContract extends Contract {
     await this.writePriceDerivationEvidence({
       epoch,
       at,
+      epoch_seconds,
       root: roots.price,
       count: totals.price_count,
       derivations: priceDerivations,

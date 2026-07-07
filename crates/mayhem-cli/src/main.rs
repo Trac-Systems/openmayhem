@@ -58,13 +58,14 @@ use mayhem_hwprobe::{
     ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
-    chunk_json_payload, reassemble_json_payload, receipt_signing_bytes,
+    chunk_json_payload, ctx_bracket_for_tokens, reassemble_json_payload, receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, supported_receipt_signing_bytes,
     supported_spend_voucher_signing_bytes, AttestationRuntimeConfig, CatalogEnclaveIdentity,
     CheckpointPolicy, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    SpendVoucher, CONTRACT_VERSION, CTX_BRACKET_TABLE_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -983,6 +984,10 @@ struct UseArgs {
     /// Gateway-default user max-bid ceiling in µUSD. Overrides config for this gateway process.
     #[arg(long)]
     max_price_mu: Option<u64>,
+
+    /// Gateway-default minimum context tokens for route selection. Overrides config for this gateway process.
+    #[arg(long)]
+    min_ctx: Option<u64>,
 
     /// Provider receipt checkpoint window in output tokens. Bounds unpaid streamed output.
     #[arg(long)]
@@ -3974,6 +3979,10 @@ struct ProviderStartArgs {
     #[arg(long, default_value_t = 0)]
     min_ask_mu: u64,
 
+    /// Maximum context tokens this provider commits to serve for this enclave.
+    #[arg(long)]
+    ctx: Option<u64>,
+
     /// Local hard cap for concurrently accepted direct sessions. Defaults to the hwprobe cap.
     #[arg(long, value_name = "N")]
     max_sessions: Option<u32>,
@@ -4203,6 +4212,7 @@ struct ConfigProviderLimits {
 #[derive(Debug, Deserialize)]
 struct ConfigUser {
     max_price_mu: Option<u64>,
+    min_ctx: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -15794,12 +15804,30 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     if args.max_price_mu == Some(0) {
         bail!("--max-price-mu must be greater than zero");
     }
+    if args.min_ctx == Some(0) {
+        bail!("--min-ctx must be greater than zero");
+    }
     let default_max_price_mu = args.max_price_mu.or_else(|| {
         config
             .as_ref()
             .and_then(|config| config.user.as_ref())
             .and_then(|user| user.max_price_mu)
     });
+    let default_min_ctx = args
+        .min_ctx
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.user.as_ref())
+                .and_then(|user| user.min_ctx)
+        })
+        .map(|value| {
+            if value == 0 {
+                bail!("user.min_ctx must be greater than zero when set");
+            }
+            u32::try_from(value).context("user.min_ctx exceeds supported token count")
+        })
+        .transpose()?;
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
@@ -16064,6 +16092,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state
         .with_default_max_price_mu(default_max_price_mu)
+        .with_default_min_ctx(default_min_ctx)
         .with_receipt_rail(args.rail.as_str())
         .with_provider_load_progress_dir(home.join("provider-load-progress"));
     let dashboard_url = state.dashboard_url(&gateway_url);
@@ -16092,6 +16121,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             "ms": receipt_checkpoint_every.ms,
         },
         "default_max_price_mu": default_max_price_mu,
+        "default_min_ctx": default_min_ctx,
         "models": model_count,
         "version_gates": &blocked_version_gates,
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
@@ -16139,6 +16169,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             }
             if let Some(mu) = default_max_price_mu {
                 println!("Default max-price ceiling: {mu} mu_usd.");
+            }
+            if let Some(ctx) = default_min_ctx {
+                println!("Default minimum context: {ctx} tokens.");
             }
             if args.apple_app_attest_jwks_file.is_some() {
                 println!("Tier 2 Apple App Attest verification: trusted JWKS loaded.");
@@ -16825,14 +16858,14 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
     let path = config_path_for_home(&home);
     let key = canonical_config_key(&args.key)?;
     let mut config = read_config_toml_value(&path)?;
-    if key == "user.max_price_mu" {
+    if matches!(key, "user.max_price_mu" | "user.min_ctx") {
         let value = args
             .value
             .trim()
             .parse::<u64>()
-            .context("user.max_price_mu must be an integer mu_usd value")?;
+            .with_context(|| format!("{key} must be an integer value"))?;
         if value == 0 {
-            bail!("user.max_price_mu must be greater than zero; use `mayhem config max-price --clear` to remove it");
+            bail!("{key} must be greater than zero");
         }
         toml_set_u64(&mut config, key, value)?;
     } else {
@@ -22015,6 +22048,7 @@ struct ProviderCandidate {
     artifact: catalog::CatalogArtifact,
     verdict: BackendVerdict,
     price: Option<LedgerPriceSchedule>,
+    served_ctx: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -22497,6 +22531,9 @@ struct ActiveProviderSession {
     locked_rate_map: Vec<RateMapEntry>,
     locked_per_req_mu: u64,
     locked_min_session_mu: u64,
+    served_ctx: u32,
+    ctx_bracket: String,
+    ctx_bracket_table_ver: u32,
     checkpoint_every: CheckpointPolicy,
 }
 
@@ -22520,6 +22557,8 @@ struct ProviderSessionTerms {
     min_ask_mu: u64,
     rules_ver: u64,
     ctx: u64,
+    ctx_bracket: String,
+    ctx_bracket_table_ver: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -22698,6 +22737,13 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &format!(
             "Selected {} via {} ({})",
             selected.enclave.model_id, selected.enclave.backend, selected.artifact_name
+        ),
+    );
+    provider_log(
+        &args,
+        &format!(
+            "Serving context window: {} tokens (catalog max {})",
+            selected.served_ctx, selected.model.caps.ctx_max
         ),
     );
     let provider_secret = derive_provider_secret(&keypair_path, &password, &wallet).await?;
@@ -22952,6 +22998,11 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "market": {
             "min_ask_mu": args.min_ask_mu,
         },
+        "context": {
+            "served_ctx": selected.served_ctx,
+            "catalog_ctx_max": selected.model.caps.ctx_max,
+            "source": if args.ctx.is_some() { "cli" } else { "default" },
+        },
         "protection": {
             "max_sessions": protection_config.max_sessions,
             "accept_rate_per_minute": protection_config.accept_rate_per_minute,
@@ -22980,6 +23031,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         println!("Provider start complete: heartbeats flowing.");
         println!("Enclave: {}", selected.enclave.enclave_id);
         println!("Model: {}", selected.enclave.model_id);
+        println!("Context: {} tokens", selected.served_ctx);
         println!(
             "Rooms: {}",
             rooms
@@ -25797,6 +25849,24 @@ fn caps_output_modalities(caps: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn default_provider_served_ctx(ctx_max: u64) -> u64 {
+    if ctx_max == 0 {
+        return 0;
+    }
+    let half = ctx_max.div_ceil(2);
+    half.min(128_000).clamp(1, ctx_max)
+}
+
+fn resolve_provider_served_ctx(model: &catalog::CatalogModel, requested_ctx: Option<u64>) -> u64 {
+    let ctx_max = model.caps.ctx_max;
+    if ctx_max == 0 {
+        return 0;
+    }
+    requested_ctx
+        .unwrap_or_else(|| default_provider_served_ctx(ctx_max))
+        .clamp(1, ctx_max)
+}
+
 fn enclave_cap_u32(caps: &Value, key: &'static str, default: u32) -> Result<u32> {
     match caps.get(key) {
         None => Ok(default),
@@ -26052,6 +26122,7 @@ fn build_provider_candidates(
             artifact,
             verdict: verdict.clone(),
             price: Some(price),
+            served_ctx: resolve_provider_served_ctx(model, args.ctx),
         });
     }
     if let Some(requested) = requested_enclave {
@@ -27297,9 +27368,7 @@ fn provider_saturation(active_slots: u64, max_sessions: u32) -> f64 {
 
 fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
     let mut caps = gateway_caps_from_contract(&selected.enclave.caps);
-    if caps.ctx == 0 {
-        caps.ctx = u32::try_from(selected.model.caps.ctx_max).unwrap_or(u32::MAX);
-    }
+    caps.ctx = u32::try_from(selected.served_ctx).unwrap_or(u32::MAX);
     if !backend_supports_tool_calls(&selected.enclave.backend) {
         caps.tools = false;
     }
@@ -27818,6 +27887,9 @@ async fn handle_provider_session_frame(
                             ),
                             locked_per_req_mu: spend_voucher.body.locked_per_req_mu,
                             locked_min_session_mu: spend_voucher.body.locked_min_session_mu,
+                            served_ctx: spend_voucher.body.served_ctx,
+                            ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
+                            ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
                             checkpoint_every,
                         },
                     );
@@ -29025,6 +29097,9 @@ fn provider_session_receipt_for_usage(
         locked_rate_map: active.locked_rate_map.clone(),
         locked_per_req_mu: active.locked_per_req_mu,
         locked_min_session_mu: active.locked_min_session_mu,
+        served_ctx: active.served_ctx,
+        ctx_bracket: active.ctx_bracket.clone(),
+        ctx_bracket_table_ver: active.ctx_bracket_table_ver,
         rules_ver: terms.rules_ver,
         usage: usage.clone(),
         mu_owed_cum: provider_session_mu_owed(active, &usage),
@@ -29289,10 +29364,10 @@ fn provider_engine_load_config(
     selected: &ProviderCandidate,
     artifact_paths: &ProviderArtifactPaths,
 ) -> Result<LoadConfig> {
-    let ctx_size = u32::try_from(selected.model.caps.ctx_max).with_context(|| {
+    let ctx_size = u32::try_from(selected.served_ctx).with_context(|| {
         format!(
-            "catalog ctx_max {} for {} exceeds engine ctx_size range",
-            selected.model.caps.ctx_max, selected.model.model_id
+            "served ctx {} for {} exceeds engine ctx_size range",
+            selected.served_ctx, selected.model.model_id
         )
     })?;
     let mut artifact_path_buf = artifact_paths.primary.clone();
@@ -29626,10 +29701,10 @@ fn same_canonical_path(left: &Path, right: &Path) -> bool {
 fn provider_attestation_runtime_config(
     selected: &ProviderCandidate,
 ) -> Result<AttestationRuntimeConfig> {
-    let ctx = u32::try_from(selected.model.caps.ctx_max).with_context(|| {
+    let ctx = u32::try_from(selected.served_ctx).with_context(|| {
         format!(
-            "catalog ctx_max {} for {} exceeds attestation runtime config range",
-            selected.model.caps.ctx_max, selected.model.model_id
+            "served ctx {} for {} exceeds attestation runtime config range",
+            selected.served_ctx, selected.model.model_id
         )
     })?;
     let tp_degree = if matches!(selected.artifact.engine.as_str(), "trt-llm" | "vllm") {
@@ -29720,6 +29795,8 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         .as_ref()
         .and_then(current_mu_usd_price)
         .context("selected provider enclave has no current admin price")?;
+    let ctx_bracket =
+        ctx_bracket_for_tokens(u32::try_from(ctx.selected.served_ctx).unwrap_or(u32::MAX));
     Ok(ProviderSessionTerms {
         contract_version: CONTRACT_VERSION,
         provider: ctx.wallet.public_key.clone(),
@@ -29733,7 +29810,9 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         min_session_mu: price.min_session_mu,
         min_ask_mu: ctx.args.min_ask_mu,
         rules_ver: ctx.rules.ver,
-        ctx: ctx.selected.model.caps.ctx_max,
+        ctx: ctx.selected.served_ctx,
+        ctx_bracket: ctx_bracket.to_owned(),
+        ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
     })
 }
 
@@ -29983,6 +30062,9 @@ fn provider_session_spend_reservation_value(
         "enclave_id": terms.enclave_id,
         "price_ver": spend_voucher.body.price_ver,
         "rules_ver": terms.rules_ver,
+        "served_ctx": spend_voucher.body.served_ctx,
+        "ctx_bracket": spend_voucher.body.ctx_bracket,
+        "ctx_bracket_table_ver": spend_voucher.body.ctx_bracket_table_ver,
         "max_spend_mu": spend_voucher.body.max_spend_mu,
         "voucher": voucher,
         "provider_sig": "",
@@ -30001,6 +30083,9 @@ fn spend_reservation_evidence(value: &Value) -> Value {
         "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
         "price_ver": value.get("price_ver").cloned().unwrap_or(Value::Null),
         "rules_ver": value.get("rules_ver").cloned().unwrap_or(Value::Null),
+        "served_ctx": value.get("served_ctx").cloned().unwrap_or(Value::Null),
+        "ctx_bracket": value.get("ctx_bracket").cloned().unwrap_or(Value::Null),
+        "ctx_bracket_table_ver": value.get("ctx_bracket_table_ver").cloned().unwrap_or(Value::Null),
         "max_spend_mu": value.get("max_spend_mu").cloned().unwrap_or(Value::Null),
         "voucher": stable_json_value(value.get("voucher").unwrap_or(&Value::Null)),
     })
@@ -30147,6 +30232,30 @@ fn provider_session_open_decision(
         return reject(
             "VOUCHER",
             "voucher locked_min_session_mu does not match admin price".to_owned(),
+        );
+    }
+    if u64::from(voucher.body.served_ctx) != terms.ctx {
+        return reject(
+            "VOUCHER",
+            "voucher served_ctx does not match provider committed context".to_owned(),
+        );
+    }
+    if voucher.body.ctx_bracket != terms.ctx_bracket {
+        return reject(
+            "VOUCHER",
+            "voucher ctx_bracket does not match provider committed context".to_owned(),
+        );
+    }
+    if voucher.body.ctx_bracket_table_ver != terms.ctx_bracket_table_ver {
+        return reject(
+            "VOUCHER",
+            "voucher ctx_bracket_table_ver does not match provider committed context".to_owned(),
+        );
+    }
+    if voucher.body.ctx_bracket != ctx_bracket_for_tokens(voucher.body.served_ctx) {
+        return reject(
+            "VOUCHER",
+            "voucher ctx_bracket does not match served_ctx".to_owned(),
         );
     }
     if voucher.body.max_spend_mu == 0 {
@@ -31550,9 +31659,10 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "max_price" | "max_price_mu" | "user.max_price" | "user.max_price_mu" => {
             Ok("user.max_price_mu")
         }
+        "min_ctx" | "user.min_ctx" => Ok("user.min_ctx"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, user.max_price_mu, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, user.max_price_mu, user.min_ctx, and role.mode"),
     }
 }
 
@@ -32773,6 +32883,21 @@ mod tests {
             canonical_config_key("msb-bootstrap").unwrap(),
             "network.msb_bootstrap"
         );
+        assert_eq!(canonical_config_key("min-ctx").unwrap(), "user.min_ctx");
+        config_set(ConfigSetArgs {
+            home: Some(home.clone()),
+            key: "min-ctx".to_owned(),
+            value: "128000".to_owned(),
+            json: true,
+        })
+        .unwrap();
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        assert_eq!(
+            toml_get_path(&config, "user.min_ctx").and_then(toml::Value::as_integer),
+            Some(128_000)
+        );
+        let typed = read_mayhem_config(&home).unwrap().unwrap();
+        assert_eq!(typed.user.and_then(|user| user.min_ctx), Some(128_000));
         assert!(canonical_config_key("home").is_err());
         fs::remove_dir_all(&home).unwrap();
     }
@@ -32865,6 +32990,7 @@ mod tests {
                 kv_cache_bytes_budget: 0,
             },
             price: contract.prices.first().cloned(),
+            served_ctx: 4096,
         };
         let config: MayhemConfig = toml::from_str(
             r#"
@@ -36474,6 +36600,9 @@ mod tests {
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             locked_per_req_mu: terms.per_req_mu,
             locked_min_session_mu: terms.min_session_mu,
+            served_ctx: u32::try_from(terms.ctx).unwrap(),
+            ctx_bracket: terms.ctx_bracket.clone(),
+            ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
@@ -36511,6 +36640,7 @@ mod tests {
             receipt.body.locked_min_session_mu,
             active.locked_min_session_mu
         );
+        assert_eq!(receipt.body.served_ctx, active.served_ctx);
         assert_eq!(receipt.body.rules_ver, terms.rules_ver);
         assert_eq!(receipt.body.usage.input_tokens(), 3);
         assert_eq!(receipt.body.usage.output_tokens(), 4);
@@ -36543,6 +36673,9 @@ mod tests {
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             locked_per_req_mu: terms.per_req_mu,
             locked_min_session_mu: terms.min_session_mu,
+            served_ctx: u32::try_from(terms.ctx).unwrap(),
+            ctx_bracket: terms.ctx_bracket.clone(),
+            ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
         };
         let body = json!({
@@ -36598,6 +36731,9 @@ mod tests {
             locked_rate_map: text_generation_rate_map(1, 2),
             locked_per_req_mu: 0,
             locked_min_session_mu: 0,
+            served_ctx: 8192,
+            ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
+            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
         };
         assert_eq!(
@@ -36630,6 +36766,9 @@ mod tests {
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             locked_per_req_mu: terms.per_req_mu,
             locked_min_session_mu: terms.min_session_mu,
+            served_ctx: u32::try_from(terms.ctx).unwrap(),
+            ctx_bracket: terms.ctx_bracket.clone(),
+            ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
@@ -37666,6 +37805,7 @@ mod tests {
                 kv_cache_bytes_budget: 0,
             },
             price: None,
+            served_ctx: 1,
         };
         let artifact_paths = ProviderArtifactPaths {
             primary: PathBuf::from("/tmp/admin-approved-voice"),
@@ -37743,6 +37883,7 @@ mod tests {
             artifact,
             verdict,
             price: contract.prices.first().cloned(),
+            served_ctx: 4096,
         };
         selected.enclave.caps = json!({ "tools": true, "json": true, "ctx": 4096 });
 
@@ -37774,6 +37915,9 @@ mod tests {
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_mu: 0,
                     locked_min_session_mu: 0,
+                    served_ctx: 8192,
+                    ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
+                    ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -37805,6 +37949,9 @@ mod tests {
                     locked_rate_map: text_generation_rate_map(1, 2),
                     locked_per_req_mu: 0,
                     locked_min_session_mu: 0,
+                    served_ctx: 8192,
+                    ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
+                    ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -39133,6 +39280,8 @@ mod tests {
             "secret",
             "--rail",
             "tnk",
+            "--min-ctx",
+            "128000",
             "--canary-probe-min-interval-sessions",
             "1",
             "--canary-probe-max-interval-sessions",
@@ -39154,6 +39303,7 @@ mod tests {
                 assert_eq!(args.peer_store_name, "terminal");
                 assert_eq!(args.wallet_password.as_deref(), Some("secret"));
                 assert_eq!(args.rail, GatewayLedgerRail::Tnk);
+                assert_eq!(args.min_ctx, Some(128_000));
                 assert_eq!(args.canary_probe_min_interval_sessions, Some(1));
                 assert_eq!(args.canary_probe_max_interval_sessions, Some(1));
                 assert_eq!(args.canary_probe_epoch, Some(7));
@@ -41356,6 +41506,7 @@ mod tests {
             no_heartbeat: true,
             heartbeat_count: 1,
             min_ask_mu: 0,
+            ctx: None,
             max_sessions: None,
             accept_rate_per_minute: 0,
             serve_budget_mu: 0,
@@ -41435,6 +41586,8 @@ mod tests {
             min_ask_mu: 0,
             rules_ver: 3,
             ctx: 8192,
+            ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
+            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
         }
     }
 
@@ -41450,6 +41603,9 @@ mod tests {
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             locked_per_req_mu: terms.per_req_mu,
             locked_min_session_mu: terms.min_session_mu,
+            served_ctx: u32::try_from(terms.ctx).unwrap(),
+            ctx_bracket: terms.ctx_bracket.clone(),
+            ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             max_spend_mu: 1000,
             checkpoint_every: mayhem_proto::CheckpointPolicy {
                 tokens: 8192,
@@ -41471,6 +41627,9 @@ mod tests {
             "enclave_id": &terms.enclave_id,
             "price_ver": terms.price_ver,
             "rules_ver": terms.rules_ver,
+            "served_ctx": voucher_body.served_ctx,
+            "ctx_bracket": voucher_body.ctx_bracket.clone(),
+            "ctx_bracket_table_ver": voucher_body.ctx_bracket_table_ver,
             "voucher": {
                 "session_id": voucher_body.session_id,
                 "rail": voucher_body.rail,
@@ -41479,6 +41638,9 @@ mod tests {
                 "locked_rate_map": voucher_body.locked_rate_map,
                 "locked_per_req_mu": voucher_body.locked_per_req_mu,
                 "locked_min_session_mu": voucher_body.locked_min_session_mu,
+                "served_ctx": voucher_body.served_ctx,
+                "ctx_bracket": voucher_body.ctx_bracket.clone(),
+                "ctx_bracket_table_ver": voucher_body.ctx_bracket_table_ver,
                 "max_spend_mu": voucher_body.max_spend_mu,
                 "checkpoint_every": {
                     "tokens": voucher_body.checkpoint_every.tokens,

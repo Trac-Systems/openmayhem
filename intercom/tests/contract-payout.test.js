@@ -256,6 +256,7 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
   assert.deepEqual((await storage.get('ev/earn/1')).value, {
     type: 'earn_root',
     epoch: 1,
+    epoch_seconds: 3_600,
     merkle_root: roll.roots.earn,
     provider_count: 1,
     mu_cum_total: 1_700_000,
@@ -265,6 +266,7 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
   assert.deepEqual((await storage.get('ev/fee/1')).value, {
     type: 'fee_root',
     epoch: 1,
+    epoch_seconds: 3_600,
     merkle_root: roll.roots.fee,
     mu_fee_epoch: 300_000,
     mu_fee_cum: 300_000,
