@@ -12,6 +12,8 @@ import { createHash, jsonStringify } from '../intercom/trac/trac-peer/src/utils/
 
 const DEFAULT_STRIPE_ENV_FILE = '/Applications/MAMP/htdocs/gpd/stripe.txt';
 const DEFAULT_MU = 1_000_000;
+const DEFAULT_CONTRACT_EPOCH_SECONDS = 3_600;
+const DEFAULT_SMOKE_ADMIN_EPOCH_SECONDS = 7_200;
 const ZERO_HEX = '0'.repeat(64);
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,6 +51,8 @@ Options:
   --who <hex-pubkey>         64-hex test user id (default: random)
   --paygate-port <port>      Local paygate port (default: auto)
   --contract-port <port>     Local contract RPC port (default: auto)
+  --epoch-seconds <seconds>  Admin params/epoch_seconds to seed in the local contract
+                             (default: ${DEFAULT_SMOKE_ADMIN_EPOCH_SECONDS})
   --include-dispute          Also post a signed charge.dispute.created replay and
                              verify clawback/freeze evidence
   --keep-temp                Keep .mayhem-local smoke directory for inspection
@@ -64,6 +68,7 @@ function parseArgs(argv) {
     who: randomBytes(32).toString('hex'),
     paygatePort: null,
     contractPort: null,
+    epochSeconds: DEFAULT_SMOKE_ADMIN_EPOCH_SECONDS,
     includeDispute: false,
     keepTemp: false,
     json: false,
@@ -81,6 +86,7 @@ function parseArgs(argv) {
     else if (arg === '--who') args.who = next();
     else if (arg === '--paygate-port') args.paygatePort = Number.parseInt(next(), 10);
     else if (arg === '--contract-port') args.contractPort = Number.parseInt(next(), 10);
+    else if (arg === '--epoch-seconds') args.epochSeconds = Number.parseInt(next(), 10);
     else if (arg === '--include-dispute') args.includeDispute = true;
     else if (arg === '--keep-temp') args.keepTemp = true;
     else if (arg === '--json') args.json = true;
@@ -95,6 +101,9 @@ function parseArgs(argv) {
   if (args.mu % 10_000 !== 0) throw new Error('--mu must be whole-cent aligned');
   if (!['usd', 'eur'].includes(args.currency)) throw new Error('--currency must be usd or eur');
   if (!/^[0-9a-f]{64}$/i.test(args.who)) throw new Error('--who must be 64 hex characters');
+  if (!Number.isSafeInteger(args.epochSeconds) || args.epochSeconds < 60) {
+    throw new Error('--epoch-seconds must be a safe integer >= 60');
+  }
   for (const [name, port] of [['--paygate-port', args.paygatePort], ['--contract-port', args.contractPort]]) {
     if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65_535)) {
       throw new Error(`${name} must be a TCP port`);
@@ -268,7 +277,7 @@ bind = "${tomlString(bind)}"
 [contract]
 rpc_url = "${tomlString(contractRpc)}"
 simulate = false
-epoch_seconds = 3600
+epoch_seconds = ${DEFAULT_CONTRACT_EPOCH_SECONDS}
 
 [oracle]
 key_path = "${tomlString(oracleKey)}"
@@ -284,6 +293,21 @@ webhook_tolerance_seconds = 300
 [coinbase]
 enabled = false
 `, { mode: 0o600 });
+}
+
+async function seedAdminEpochSeconds(storage, epochSeconds) {
+  await storage.put('params/epoch_seconds', {
+    key: 'epoch_seconds',
+    current: {
+      value: epochSeconds,
+      ver: 1,
+      submitted_at: 0,
+      effective_at: 0,
+      set_by_role: 'admin',
+      set_at: 'stripe-sandbox-credit-smoke',
+    },
+    pending: null,
+  });
 }
 
 function spawnPaygate(configPath) {
@@ -429,6 +453,7 @@ async function main() {
     paygate = spawnPaygate(configPath);
     const health = await waitForHealth(paygateBase, paygate);
     await contract.storage.put('admin', health.oracle_pubkey);
+    await seedAdminEpochSeconds(contract.storage, args.epochSeconds);
 
     const idempotencyKey = `mayhem-stripe-smoke-${Date.now()}`;
     const created = await postJson(`${paygateBase}/v1/stripe/payment-intents`, {
@@ -444,7 +469,7 @@ async function main() {
     const eventId = `evt_mayhem_smoke_${Date.now()}_${randomBytes(4).toString('hex')}`;
     const chargeId = `ch_${eventId.slice(-8)}`;
     const at = Math.floor(Date.now() / 1000);
-    const epoch = Math.floor(at / 3600) + 1;
+    const epoch = Math.floor(at / args.epochSeconds) + 1;
     const payload = JSON.stringify({
       id: eventId,
       object: 'event',
@@ -571,6 +596,7 @@ async function main() {
       contract: {
         oracle_pubkey: health.oracle_pubkey,
         who: args.who,
+        epoch_seconds: args.epochSeconds,
         epoch,
         balance_mu: balanceMu,
         deposit_count: dep?.count ?? null,
