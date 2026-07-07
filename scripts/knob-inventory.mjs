@@ -254,6 +254,8 @@ const contractParamDescriptions = new Map([
   ['canary_probe_release_min_passes', 'Probe passes needed for gated holdback release.'],
   ['probe_reward_mu', 'Auditor probe reward.'],
   ['uptime_tick_seconds', 'Uptime probe cadence.'],
+  ['fraud_slash_bps', 'Slash percentage for canary mismatch and fraud-proof provider penalties.'],
+  ['dispute_lost_slash_bps', 'Slash percentage for provider-fault dispute losses.'],
   ['rate_staleness_seconds', 'Maximum accepted TNK/TAP oracle price age.'],
   ['price_min_bps', 'Admin seed price lower bound versus model reference.'],
   ['price_max_bps', 'Admin seed price upper bound versus model reference.'],

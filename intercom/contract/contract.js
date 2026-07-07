@@ -36,8 +36,8 @@ const DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS = 2_500;
 const DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS = 15_000;
 const DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS = DAY_SECONDS;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
-const FULL_SLASH_BPS = 10_000;
-const DISPUTE_LOST_SLASH_BPS = 2_000;
+const DEFAULT_FRAUD_SLASH_BPS = 10_000;
+const DEFAULT_DISPUTE_LOST_SLASH_BPS = 2_000;
 const MAX_OPERATOR_FEE_BPS = 5_000;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 1;
 const DEFAULT_DISPUTE_DEPOSIT_MU = 1_000_000;
@@ -71,6 +71,8 @@ const PARAM_DEFINITIONS = Object.freeze({
   canary_probe_release_min_passes: { default: 1, min: 0, max: 1_000_000 },
   probe_reward_mu: { default: 5_000, min: 0, max: Number.MAX_SAFE_INTEGER },
   uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
+  fraud_slash_bps: { default: DEFAULT_FRAUD_SLASH_BPS, min: 0, max: 10_000 },
+  dispute_lost_slash_bps: { default: DEFAULT_DISPUTE_LOST_SLASH_BPS, min: 0, max: 10_000 },
   holdback_epochs: { default: 24, min: 0, max: 1_000_000 },
   fee_bps: { default: 1_500, min: 0, max: MAX_OPERATOR_FEE_BPS },
   dispute_deposit_mu: { default: DEFAULT_DISPUTE_DEPOSIT_MU, min: 1, max: Number.MAX_SAFE_INTEGER },
@@ -2480,6 +2482,7 @@ class MayhemContract extends Contract {
 
     let slash = null;
     if (this.value.kind === 'dispute_lost') {
+      const params = await this.activeParamsAt(this.value.at, ['dispute_lost_slash_bps']);
       slash = await this.applyProviderSlash({
         providerId: this.value.provider,
         source: 'dispute',
@@ -2487,7 +2490,7 @@ class MayhemContract extends Contract {
         evidenceHash: this.value.evidence_hash ?? null,
         epoch: this.value.epoch,
         at: this.value.at,
-        slashBps: DISPUTE_LOST_SLASH_BPS,
+        slashBps: params.dispute_lost_slash_bps,
         beneficiary: this.value.beneficiary ?? null,
         enclaveId: this.value.enclave_id ?? null,
         banProvider: false,
@@ -2654,6 +2657,7 @@ class MayhemContract extends Contract {
       'canary_match_min_bps',
       'probe_reward_mu',
       'uptime_tick_seconds',
+      'fraud_slash_bps',
     ]);
     const pass = this.probePass(this.value, params);
     if (this.value.pass !== undefined && this.value.pass !== pass) {
@@ -2699,7 +2703,7 @@ class MayhemContract extends Contract {
         evidenceHash: this.value.evidence_hash ?? null,
         epoch: this.value.epoch,
         at: this.value.at,
-        slashBps: FULL_SLASH_BPS,
+        slashBps: params.fraud_slash_bps,
         beneficiary: this.address,
         enclaveId: this.value.enclave_id ?? null,
         probeId: this.value.probe_id,
@@ -3304,6 +3308,7 @@ class MayhemContract extends Contract {
 
     let slash = null;
     if ((await this.get(`prov/${commit.submitted_by}`)) !== null) {
+      const params = await this.activeParamsAt(this.value.at, ['fraud_slash_bps']);
       slash = await this.applyProviderSlash({
         providerId: commit.submitted_by,
         source: 'fraud_proof',
@@ -3311,7 +3316,7 @@ class MayhemContract extends Contract {
         evidenceHash: proofHash,
         epoch: this.value.epoch,
         at: this.value.at,
-        slashBps: FULL_SLASH_BPS,
+        slashBps: params.fraud_slash_bps,
         beneficiary: this.address,
         enclaveId: slashEnclaveId,
         banProvider: true,
@@ -3491,6 +3496,7 @@ class MayhemContract extends Contract {
       if (reputationEvent instanceof Error) return reputationEvent;
 
       if (this.value.slash === true) {
+        const params = await this.activeParamsAt(this.value.at, ['dispute_lost_slash_bps']);
         slash = await this.applyProviderSlash({
           providerId: dispute.provider,
           source: 'dispute',
@@ -3498,7 +3504,7 @@ class MayhemContract extends Contract {
           evidenceHash: this.value.rationale_hash,
           epoch: dispute.epoch ?? 0,
           at: this.value.at,
-          slashBps: DISPUTE_LOST_SLASH_BPS,
+          slashBps: params.dispute_lost_slash_bps,
           beneficiary: this.value.beneficiary ?? dispute.opened_by,
           enclaveId: dispute.enclave_id,
           eventId: reputationEvent.event_id,

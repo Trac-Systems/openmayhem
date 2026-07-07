@@ -15,6 +15,7 @@ import {
 const rulesHash = '8'.repeat(64);
 const enclaveId = '7'.repeat(64);
 const modelId = 'mayhem/qwen3.5-4b@q4';
+const DAY_SECONDS = 24 * 60 * 60;
 
 async function setupSlashContract() {
   const admin = await makeIdentity();
@@ -291,6 +292,61 @@ test('MayhemContract canary mismatch slashes held earnings, tombstones serving, 
   assert.equal(slash.slash_hash.length, 64);
 });
 
+test('MayhemContract canary mismatch uses admin-governed fraud_slash_bps', async () => {
+  const ctx = await setupSlashContract();
+  await setupProviderServing(ctx);
+  await seedHeldEarnings(ctx.storage, ctx.provider);
+
+  const registeredAuditor = await execute(
+    ctx.contract,
+    ctx.storage,
+    'auditorRegister',
+    { op: 'auditor_register', auditor: ctx.auditor.publicKey },
+    ctx.admin.publicKey,
+    9
+  );
+  assert.equal(registeredAuditor.ok, true, registeredAuditor.message);
+
+  const scheduled = await execute(
+    ctx.contract,
+    ctx.storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: { fraud_slash_bps: 5_000 },
+    },
+    ctx.admin.publicKey,
+    10
+  );
+  assert.equal(scheduled.ok, true, scheduled.message);
+
+  const result = await execute(
+    ctx.contract,
+    ctx.storage,
+    'probeResult',
+    signedCanaryProbe(ctx, { at: DAY_SECONDS, epoch: 24, probe_id: 'canary-admin-slash' }),
+    ctx.auditor.publicKey,
+    11
+  );
+  assert.equal(result.ok, true, result.message);
+
+  const slash = (await ctx.storage.get(`ev/slash/${ctx.provider.publicKey}/${makeTxKey(11)}`)).value;
+  assert.equal(slash.slash_bps, 5_000);
+  assert.equal(slash.forfeited_mu, 3_000);
+  assert.equal(slash.beneficiary_mu, 1_500);
+  assert.equal(slash.treasury_mu, 1_500);
+
+  const earning = (await ctx.storage.get(`earn/fiat/${ctx.provider.publicKey}`)).value;
+  assert.equal(earning.total_mu, 7_000);
+  assert.equal(earning.held_mu, 3_000);
+  assert.deepEqual(earning.holdbacks, [
+    { epoch: 1, mu: 2_000 },
+    { epoch: 2, mu: 1_000 },
+  ]);
+});
+
 test('MayhemContract dispute_lost reputation event partially slashes held earnings without ban', async () => {
   const ctx = await setupSlashContract();
   await seedHeldEarnings(ctx.storage, ctx.provider, {
@@ -348,4 +404,55 @@ test('MayhemContract dispute_lost reputation event partially slashes held earnin
   assert.equal(slash.source, 'dispute');
   assert.equal(slash.provider_banned, false);
   assert.equal(slash.slash_bps, 2_000);
+});
+
+test('MayhemContract dispute_lost reputation event uses admin-governed dispute_lost_slash_bps', async () => {
+  const ctx = await setupSlashContract();
+  await seedHeldEarnings(ctx.storage, ctx.provider, {
+    total_mu: 20_000,
+    held_mu: 10_000,
+    paid_cum_mu: 2_000,
+    holdbacks: [
+      { epoch: 1, mu: 4_000 },
+      { epoch: 2, mu: 6_000 },
+    ],
+  });
+
+  const scheduled = await execute(
+    ctx.contract,
+    ctx.storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: { dispute_lost_slash_bps: 1_000 },
+    },
+    ctx.admin.publicKey,
+    5
+  );
+  assert.equal(scheduled.ok, true, scheduled.message);
+
+  const result = await execute(
+    ctx.contract,
+    ctx.storage,
+    'recordReputationEvent',
+    {
+      op: 'record_rep_event',
+      provider: ctx.provider.publicKey,
+      event_id: 'dispute-lost-admin-slash',
+      kind: 'dispute_lost',
+      epoch: 24,
+      at: DAY_SECONDS,
+      evidence_hash: 'f'.repeat(64),
+      beneficiary: ctx.admin.publicKey,
+    },
+    ctx.admin.publicKey,
+    6
+  );
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.slash.slash_bps, 1_000);
+  assert.equal(result.slash.forfeited_mu, 1_000);
+  assert.equal(result.slash.beneficiary_mu, 500);
+  assert.equal(result.slash.treasury_mu, 500);
 });

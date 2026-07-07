@@ -22,6 +22,7 @@ import {
 const rulesHash = '6'.repeat(64);
 const enclaveId = 'e'.repeat(64);
 const modelId = 'meta/llama-3.1-8b-instruct@4bit';
+const DAY_SECONDS = 24 * 60 * 60;
 
 const textLockedRateMapFor = (mu) => [
   { unit: 'input_token', per_unit_mu: mu, granularity: 350 },
@@ -607,7 +608,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
 });
 
 test('MayhemContract fraudProof slashes a registered provider committer', async () => {
-  const { provider, user, storage, contract } = await setupEpochContract();
+  const { admin, provider, user, storage, contract } = await setupEpochContract();
   const enclave = await makeIdentity();
   const prover = await makeIdentity();
   const receipt = signedReceipt(user, provider, enclave, { mu_owed_cum: 1_000 });
@@ -659,6 +660,21 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
   );
   assert.equal(commit.ok, true, commit.message);
 
+  const scheduled = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: { fraud_slash_bps: 5_000 },
+    },
+    admin.publicKey,
+    5
+  );
+  assert.equal(scheduled.ok, true, scheduled.message);
+
   const proof = await execute(
     contract,
     storage,
@@ -667,41 +683,42 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
       op: 'fraud_proof',
       epoch: 1,
       proof_epoch: 2,
-      at: 7_200,
+      at: DAY_SECONDS,
       reason: 'over_credit',
       receipt,
       claimed_mu_owed_cum: 2_000,
     },
     prover.publicKey,
-    5
+    6
   );
   assert.equal(proof.ok, true, proof.message);
   assert.equal(proof.slash.reason, 'receipt_forgery');
-  assert.equal(proof.slash.forfeited_mu, 8_500);
-  assert.equal(proof.slash.beneficiary_mu, 4_250);
-  assert.equal(proof.slash.treasury_mu, 4_250);
+  assert.equal(proof.slash.slash_bps, 5_000);
+  assert.equal(proof.slash.forfeited_mu, 4_250);
+  assert.equal(proof.slash.beneficiary_mu, 2_125);
+  assert.equal(proof.slash.treasury_mu, 2_125);
 
   assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     rail: 'fiat',
     denom: 'mu_usd',
-    total_mu: 0,
-    held_mu: 0,
+    total_mu: 4_250,
+    held_mu: 4_250,
     paid_cum_mu: 0,
-    holdbacks: [],
+    holdbacks: [{ epoch: 1, mu: 4_250 }],
     updated_epoch: 1,
-    updated_at: makeTxKey(5),
-    slashed_cum_mu: 8_500,
-    last_slash_at: makeTxKey(5),
+    updated_at: makeTxKey(6),
+    slashed_cum_mu: 4_250,
+    last_slash_at: makeTxKey(6),
   });
-  assert.equal((await storage.get(`bal/${prover.publicKey}/fiat`)).value.mu, 4_250);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 4_250);
+  assert.equal((await storage.get(`bal/${prover.publicKey}/fiat`)).value.mu, 2_125);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 2_125);
   assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'banned');
   assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.status, 'tombstoned');
 
   const fraudRecord = (await storage.get(`ev/fraud/1/${proof.proof_hash}`)).value;
   assert.equal(fraudRecord.slash.reason, 'receipt_forgery');
-  const slash = (await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(5)}`)).value;
+  const slash = (await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(6)}`)).value;
   assert.equal(slash.source, 'fraud_proof');
   assert.equal(slash.provider_banned, true);
 });

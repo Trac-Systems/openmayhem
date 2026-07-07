@@ -12,6 +12,7 @@ import {
 
 const rulesHash = '7'.repeat(64);
 const enclaveId = '6'.repeat(64);
+const DAY_SECONDS = 24 * 60 * 60;
 
 async function setupDisputeContract() {
   const admin = await makeIdentity();
@@ -241,6 +242,59 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
     8
   );
   assert.match(duplicate.message, /not open/i);
+});
+
+test('MayhemContract dispute resolution uses admin-governed dispute_lost_slash_bps', async () => {
+  const { admin, user, provider, storage, contract } = await setupDisputeContract();
+  await seedProviderHoldback(storage, provider);
+
+  const scheduled = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: { dispute_lost_slash_bps: 1_000 },
+    },
+    admin.publicKey,
+    5
+  );
+  assert.equal(scheduled.ok, true, scheduled.message);
+
+  const opened = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider),
+    user.publicKey,
+    6
+  );
+  assert.equal(opened.ok, true, opened.message);
+
+  const resolved = await execute(
+    contract,
+    storage,
+    'disputeResolve',
+    {
+      op: 'dispute_resolve',
+      dispute_id: 1,
+      outcome: 'provider_fault',
+      deposit_action: 'refund',
+      rationale_hash: 'c'.repeat(64),
+      slash: true,
+      at: DAY_SECONDS,
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(resolved.ok, true, resolved.message);
+  assert.equal(resolved.slash.slash_bps, 1_000);
+  assert.equal(resolved.slash.forfeited_mu, 1_000);
+  assert.equal(resolved.slash.beneficiary_mu, 500);
+  assert.equal(resolved.slash.treasury_mu, 500);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 2_000_500);
 });
 
 test('MayhemContract dispute resolution validates slash target before mutating funds', async () => {
