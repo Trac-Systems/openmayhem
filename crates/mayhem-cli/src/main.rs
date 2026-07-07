@@ -1891,19 +1891,19 @@ struct DoctorArgs {
 
 #[derive(Debug, Parser)]
 struct CatalogListArgs {
-    /// Path to catalog/models.json. Defaults to the repo catalog.
+    /// Local catalog/models.json override. Defaults to the ledger-pinned catalog/current release.
     #[arg(long, value_name = "PATH")]
     catalog_path: Option<PathBuf>,
 
-    /// Path to the detached catalog signature JSON.
+    /// Local detached catalog signature JSON override.
     #[arg(long, value_name = "PATH")]
     signature_path: Option<PathBuf>,
 
-    /// Directory containing catalog maintainer public keys.
+    /// Local directory containing catalog maintainer public keys.
     #[arg(long, value_name = "PATH")]
     keys_dir: Option<PathBuf>,
 
-    /// Directory containing canary set JSON files.
+    /// Local directory containing canary set JSON files.
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
@@ -15905,6 +15905,13 @@ struct CatalogReleaseFiles {
     signature_path: PathBuf,
 }
 
+struct ProviderResolvedCatalog {
+    catalog_path: PathBuf,
+    catalog_hash: String,
+    catalog_doc: catalog::CatalogDocument,
+    source: String,
+}
+
 async fn read_catalog_release_anchor(rpc: &PeerRpcClient) -> Result<CatalogReleaseAnchor> {
     let value = read_state_value(rpc, "catalog/current").await?.context(
         "catalog/current not found; ask the admin to run `mayhem admin publish-catalog`",
@@ -19937,18 +19944,12 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "Reading admin catalog and canonical rooms from contract state",
     );
     let contract = read_contract_catalog(&rpc).await?;
-    let catalog_path = args
-        .catalog_path
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
-    let catalog_path = absolutize(catalog_path)?;
-    let catalog_hash = verify_or_hash_catalog(&args, &catalog_path)?;
-    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let provider_catalog = resolve_provider_start_catalog(&args, &home, &rpc, &rpc_url).await?;
 
     provider_log(&args, "Running hwprobe and selecting a backend");
     let hardware = provider_hwprobe(&args)?;
-    let candidates = build_provider_candidates(&contract, &catalog_doc, &hardware, &args)?;
+    let candidates =
+        build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
     let selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
     let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
     if rooms.is_empty() {
@@ -20160,8 +20161,9 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "home": home,
         "provider": wallet.public_key.clone(),
         "catalog": {
-            "path": catalog_path,
-            "hash": catalog_hash,
+            "path": provider_catalog.catalog_path,
+            "hash": provider_catalog.catalog_hash,
+            "source": provider_catalog.source,
         },
         "hardware": {
             "source": hardware.source,
@@ -21597,6 +21599,62 @@ fn verify_or_hash_catalog(args: &ProviderStartArgs, catalog_path: &Path) -> Resu
         bail!("catalog verification failed: {}", report.errors.join("; "));
     }
     Ok(report.catalog_hash)
+}
+
+fn provider_start_uses_local_catalog(args: &ProviderStartArgs) -> bool {
+    args.dev_skip_catalog_verify
+        || args.catalog_path.is_some()
+        || args.signature_path.is_some()
+        || args.keys_dir.is_some()
+        || args.canaries_dir.is_some()
+}
+
+async fn resolve_provider_start_catalog(
+    args: &ProviderStartArgs,
+    home: &Path,
+    rpc: &PeerRpcClient,
+    rpc_url: &str,
+) -> Result<ProviderResolvedCatalog> {
+    if provider_start_uses_local_catalog(args) {
+        let catalog_path = args
+            .catalog_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+        let catalog_path = absolutize(catalog_path)?;
+        let catalog_hash = verify_or_hash_catalog(args, &catalog_path)?;
+        let catalog_doc = catalog::load_document(&catalog_path)?;
+        let trust = if args.dev_skip_catalog_verify {
+            "local-unverified-dev"
+        } else {
+            "local-signed-override"
+        };
+        return Ok(ProviderResolvedCatalog {
+            catalog_path,
+            catalog_hash,
+            catalog_doc,
+            source: format!("{trust}:{rpc_url}"),
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building provider catalog release HTTP client")?;
+    let release = read_catalog_release_anchor(rpc).await?;
+    let files = fetch_catalog_release_files(&client, home, &release).await?;
+    let catalog_doc = catalog::load_document(&files.catalog_path).with_context(|| {
+        format!(
+            "loading verified ledger catalog {}",
+            files.catalog_path.display()
+        )
+    })?;
+    Ok(ProviderResolvedCatalog {
+        catalog_path: files.catalog_path,
+        catalog_hash: release.catalog_hash.clone(),
+        catalog_doc,
+        source: format!("ledger-catalog-current:{rpc_url}:{}", release.catalog_hash),
+    })
 }
 
 fn provider_hwprobe(args: &ProviderStartArgs) -> Result<HardwareReport> {
@@ -36497,6 +36555,25 @@ mod tests {
             validate_provider_start_security_mode(&args, false).is_ok(),
             "release serving with a signed catalog is allowed"
         );
+    }
+
+    #[test]
+    fn provider_start_defaults_to_ledger_catalog_unless_local_override_is_explicit() {
+        let mut args = test_provider_start_args();
+        args.dev_skip_catalog_verify = false;
+
+        assert!(!provider_start_uses_local_catalog(&args));
+
+        args.catalog_path = Some(PathBuf::from("catalog/models.json"));
+        assert!(provider_start_uses_local_catalog(&args));
+
+        args.catalog_path = None;
+        args.signature_path = Some(PathBuf::from("catalog/signatures/models.json.sig"));
+        assert!(provider_start_uses_local_catalog(&args));
+
+        args.signature_path = None;
+        args.dev_skip_catalog_verify = true;
+        assert!(provider_start_uses_local_catalog(&args));
     }
 
     fn test_provider_session_terms() -> ProviderSessionTerms {
