@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import MayhemContract, { contractParamDefinitions } from '../contract/contract.js';
+import MayhemContract, {
+  contractEpochAdminParamDefinitions,
+  contractEpochAdminParamKeys,
+  contractParamDefinitions,
+} from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
@@ -17,12 +21,20 @@ const EPOCH_OPERATING_PARAM_VALUES = {
   max_apply_batch: 2_500,
   max_market_usage_entries: 750,
   max_tnk_settlement_outputs: 100,
+  fee_bps: 1_200,
   param_activation_delay_seconds: 3_600,
   rules_grace_seconds: 300,
   rate_staleness_seconds: 120,
+  price_min_bps: 2_000,
+  price_max_bps: 30_000,
   uptime_tick_seconds: 1_800,
+  canary_match_min_bps: 8_500,
+  canary_probe_holdback_bps: 1_500,
+  canary_probe_release_min_passes: 2,
+  probe_reward_mu: 6_000,
   fraud_slash_bps: 5_000,
   dispute_lost_slash_bps: 1_000,
+  dispute_deposit_mu: 2_000_000,
   price_rate_limit_seconds: 900,
   market_target_utilization_bps: 7_500,
   market_ema_alpha_bps: 4_000,
@@ -316,10 +328,20 @@ test('MayhemContract epoch and market epoch controls are admin-governed params',
   const storage = new MemoryStorage({ admin: admin.publicKey });
   const contract = new MayhemContract({}, {});
   const definitions = contractParamDefinitions();
+  const epochDefinitions = contractEpochAdminParamDefinitions();
+  assert.deepEqual(
+    contractEpochAdminParamKeys().sort(),
+    Object.keys(EPOCH_OPERATING_PARAM_VALUES).sort()
+  );
+  assert.deepEqual(
+    Object.keys(epochDefinitions).sort(),
+    Object.keys(EPOCH_OPERATING_PARAM_VALUES).sort()
+  );
 
   for (const [key, value] of Object.entries(EPOCH_OPERATING_PARAM_VALUES)) {
     const definition = definitions[key];
     assert.ok(definition, `${key} must be registered in contract PARAM_DEFINITIONS`);
+    assert.deepEqual(epochDefinitions[key], definition, `${key} must be exported in the epoch admin map`);
     assert.equal(Number.isInteger(definition.default), true, `${key} default must be integer`);
     assert.equal(Number.isInteger(definition.min), true, `${key} min must be integer`);
     assert.equal(Number.isInteger(definition.max), true, `${key} max must be integer`);

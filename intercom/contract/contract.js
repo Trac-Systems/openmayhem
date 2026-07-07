@@ -100,6 +100,38 @@ const PARAM_DEFINITIONS = Object.freeze({
   max_tnk_settlement_outputs: { default: DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS, min: 1, max: Number.MAX_SAFE_INTEGER },
   param_activation_delay_seconds: { default: DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS, min: 0, max: 30 * DAY_SECONDS },
 });
+const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
+  'epoch_seconds',
+  'challenge_epochs',
+  'holdback_epochs',
+  'max_apply_batch',
+  'max_market_usage_entries',
+  'max_tnk_settlement_outputs',
+  'fee_bps',
+  'rate_staleness_seconds',
+  'param_activation_delay_seconds',
+  'rules_grace_seconds',
+  'price_rate_limit_seconds',
+  'price_min_bps',
+  'price_max_bps',
+  'market_target_utilization_bps',
+  'market_ema_alpha_bps',
+  'market_gain_bps',
+  'market_max_step_bps',
+  'market_cold_start_min_providers',
+  'market_provider_epoch_target_mu',
+  'market_max_utilization_bps',
+  'market_below_target_discount_bps',
+  'market_above_target_slope_bps',
+  'canary_match_min_bps',
+  'canary_probe_holdback_bps',
+  'canary_probe_release_min_passes',
+  'probe_reward_mu',
+  'uptime_tick_seconds',
+  'fraud_slash_bps',
+  'dispute_lost_slash_bps',
+  'dispute_deposit_mu',
+]);
 const REPUTATION_EVENT_KINDS = new Set([
   'session_ok',
   'session_partial',
@@ -375,6 +407,10 @@ const stableValue = (value) => {
 const stableJson = (value) => JSON.stringify(stableValue(value));
 
 export const contractParamDefinitions = () => cloneValue(PARAM_DEFINITIONS);
+export const contractEpochAdminParamKeys = () => [...EPOCH_ADMIN_PARAM_KEYS];
+export const contractEpochAdminParamDefinitions = () => Object.fromEntries(
+  EPOCH_ADMIN_PARAM_KEYS.map((key) => [key, cloneValue(PARAM_DEFINITIONS[key])])
+);
 export const contractCtxBracketTable = () => ({
   ver: CTX_BRACKET_TABLE_VERSION,
   brackets: cloneValue(CTX_BRACKETS),
