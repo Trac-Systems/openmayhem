@@ -698,6 +698,7 @@ class MayhemContract extends Contract {
         per_req_mu: { type: 'number', integer: true, min: 0 },
         min_session_mu: { type: 'number', integer: true, min: 0 },
         effective_at: { type: 'number', integer: true, min: 0 },
+        ctx_bracket: { type: 'string', min: 1, max: 64, optional: true },
       },
     });
 
@@ -708,6 +709,7 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
         at: { type: 'number', integer: true, min: 0 },
+        ctx_bracket: { type: 'string', min: 1, max: 64, optional: true },
       },
     });
 
@@ -1058,14 +1060,22 @@ class MayhemContract extends Contract {
     if (!serve || serve.status !== 'active') {
       return new Error('Provider is not actively serving this admin enclave.');
     }
-    const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id);
+    const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id, normalized.ctx_bracket);
     if (priceError) return priceError;
-    const lockedPrice = await this.get(`price/${normalized.enclave_id}/v/${normalized.price_ver}`);
+    const lockedPrice = await this.get(
+      this.priceRecordKey(normalized.enclave_id, normalized.price_ver, normalized.ctx_bracket)
+    );
     if (!lockedPrice || lockedPrice.denom !== PRICE_DENOMINATION) {
       return new Error('Spend reservation locked price version is not known.');
     }
     if (lockedPrice.set_by_role !== 'admin') {
       return new Error('Spend reservation locked price is not admin-set.');
+    }
+    if (lockedPrice.ctx_bracket !== normalized.ctx_bracket) {
+      return new Error('Spend reservation locked price context bracket mismatch.');
+    }
+    if (lockedPrice.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver) {
+      return new Error('Spend reservation locked price context bracket table mismatch.');
     }
     if (stableJson(normalized.locked_rate_map) !== stableJson(lockedPrice.rate_map)) {
       return new Error('Spend reservation locked rate_map does not match price version.');
@@ -2344,8 +2354,10 @@ class MayhemContract extends Contract {
     const boundsError = this.validateRateMapBounds(priceRateMap, modelRef.rate_map, params);
     if (boundsError) return boundsError;
 
-    const key = `price/${this.value.enclave_id}`;
-    const schedule = await this.priceSchedule(key, enclave);
+    const ctxMeta = await this.priceCtxMetaForEnclave(enclave, this.value.ctx_bracket, this.value.effective_at, 'Enclave price');
+    if (ctxMeta instanceof Error) return ctxMeta;
+    const key = this.priceScheduleKey(this.value.enclave_id, ctxMeta?.ctx_bracket ?? null);
+    const schedule = await this.priceSchedule(key, enclave, ctxMeta);
     const latest = this.priceLatestEntry(schedule);
     const latestSeed = this.priceLatestSeedEntry(schedule);
     if (
@@ -2368,12 +2380,20 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
       set_by: this.address,
       set_by_role: 'admin',
+      ...(ctxMeta ? {
+        ctx_bracket: ctxMeta.ctx_bracket,
+        ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+      } : {}),
     };
 
     const updated = {
       enclave_id: this.value.enclave_id,
       model_id: enclave.model_id,
       denom: PRICE_DENOMINATION,
+      ...(ctxMeta ? {
+        ctx_bracket: ctxMeta.ctx_bracket,
+        ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+      } : {}),
       current: schedule.current,
       pending: schedule.pending,
     };
@@ -2389,19 +2409,51 @@ class MayhemContract extends Contract {
     }
 
     await this.put(key, updated);
-    await this.put(`price/${this.value.enclave_id}/v/${record.ver}`, record);
+    await this.put(this.priceRecordKey(this.value.enclave_id, record.ver, ctxMeta?.ctx_bracket ?? null), record);
     console.log('mayhem setPrice', { schedule: updated, record });
-    return { ok: true, op: 'setPrice', enclave_id: record.enclave_id, ver: record.ver };
+    return {
+      ok: true,
+      op: 'setPrice',
+      enclave_id: record.enclave_id,
+      ver: record.ver,
+    };
   }
 
   async readPrice() {
     if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
-    const schedule = await this.get(`price/${this.value.enclave_id}`);
-    if (!schedule) return { ok: true, op: 'readPrice', enclave_id: this.value.enclave_id, at: this.value.at, price: null };
+    const enclave = await this.get(`enclave/${this.value.enclave_id}`);
+    if (!enclave) return new Error('Enclave not found.');
+    const ctxMeta = await this.priceCtxMetaForEnclave(enclave, this.value.ctx_bracket, this.value.at, 'Enclave price');
+    if (ctxMeta instanceof Error) return ctxMeta;
+    const key = this.priceScheduleKey(this.value.enclave_id, ctxMeta?.ctx_bracket ?? null);
+    const schedule = await this.get(key);
+    if (!schedule) {
+      return {
+        ok: true,
+        op: 'readPrice',
+        enclave_id: this.value.enclave_id,
+        at: this.value.at,
+        ...(ctxMeta ? {
+          ctx_bracket: ctxMeta.ctx_bracket,
+          ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+        } : {}),
+        price: null,
+      };
+    }
 
     const price = this.priceActiveEntry(schedule, this.value.at);
     console.log('mayhem readPrice', { enclave_id: this.value.enclave_id, at: this.value.at, price });
-    return { ok: true, op: 'readPrice', enclave_id: this.value.enclave_id, at: this.value.at, price };
+    return {
+      ok: true,
+      op: 'readPrice',
+      enclave_id: this.value.enclave_id,
+      at: this.value.at,
+      ...(ctxMeta ? {
+        ctx_bracket: ctxMeta.ctx_bracket,
+        ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+      } : {}),
+      price,
+    };
   }
 
   async recordReputationEvent() {
@@ -3041,6 +3093,10 @@ class MayhemContract extends Contract {
     if (marketPriceUpdates.length > 0) {
       result.market_prices = marketPriceUpdates.map((update) => ({
         enclave_id: update.enclave_id,
+        ...(update.ctx_bracket ? {
+          ctx_bracket: update.ctx_bracket,
+          ctx_bracket_table_ver: update.ctx_bracket_table_ver,
+        } : {}),
         ver: update.ver,
         utilization_bps: update.utilization_bps,
         ema_utilization_bps: update.ema_utilization_bps,
@@ -4494,8 +4550,15 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async requireCurrentAdminPrice(enclaveId) {
-    const schedule = await this.get(`price/${enclaveId}`);
+  async requireCurrentAdminPrice(enclaveId, ctxBracket = null) {
+    const enclave = await this.get(`enclave/${enclaveId}`);
+    const resolvedCtxBracket =
+      ctxBracket ??
+      (enclave && this.enclaveUsesCtxPrice(enclave)
+        ? await this.defaultPriceCtxBracketForEnclave(enclave, 0)
+        : null);
+    if (resolvedCtxBracket instanceof Error) return resolvedCtxBracket;
+    const schedule = await this.get(this.priceScheduleKey(enclaveId, resolvedCtxBracket));
     const current = schedule?.current;
     if (!current) {
       return new Error('Current admin price required before provider serving.');
@@ -4505,6 +4568,9 @@ class MayhemContract extends Contract {
     }
     if (current.enclave_id !== enclaveId) {
       return new Error('Provider serving requires a current admin-set enclave price.');
+    }
+    if ((current.ctx_bracket ?? null) !== (resolvedCtxBracket ?? null)) {
+      return new Error('Provider serving requires a current admin-set enclave price for the context bracket.');
     }
     if (!current.set_by || typeof current.set_by !== 'string') {
       return new Error('Provider serving requires a current admin-set enclave price.');
@@ -4520,6 +4586,61 @@ class MayhemContract extends Contract {
       return new Error('Provider serving requires a current admin-set enclave price.');
     }
     return null;
+  }
+
+  enclaveUsesCtxPrice(enclave) {
+    return this.modelClassFor(enclave) === DEFAULT_MODEL_CLASS;
+  }
+
+  enclaveCtxCapacity(enclave) {
+    const caps = enclave?.caps && typeof enclave.caps === 'object' && !Array.isArray(enclave.caps)
+      ? enclave.caps
+      : {};
+    const value = caps.ctx_max ?? caps.ctx ?? 0;
+    if (!Number.isSafeInteger(value) || value < 0) {
+      return new Error('Invalid enclave context capacity.');
+    }
+    return value;
+  }
+
+  async defaultPriceCtxBracketForEnclave(enclave, at) {
+    const table = await this.ctxBracketTableAt(at);
+    if (table instanceof Error) return table;
+    const ctx = this.enclaveCtxCapacity(enclave);
+    if (ctx instanceof Error) return ctx;
+    const bracket = ctxBracketForTokens(ctx, table.brackets);
+    if (!bracket) return new Error('No context bracket covers enclave context capacity.');
+    return bracket;
+  }
+
+  async priceCtxMetaForEnclave(enclave, ctxBracket, at, label = 'Price') {
+    if (!this.enclaveUsesCtxPrice(enclave)) {
+      if (ctxBracket !== undefined && ctxBracket !== null) {
+        return new Error(`${label} context bracket is only valid for text-generation enclaves.`);
+      }
+      return null;
+    }
+    const table = await this.ctxBracketTableAt(at);
+    if (table instanceof Error) return table;
+    const bracket = ctxBracket ?? await this.defaultPriceCtxBracketForEnclave(enclave, at);
+    if (bracket instanceof Error) return bracket;
+    if (!this.isSafeKeyPart(bracket)) return new Error(`Invalid ${label} context bracket.`);
+    if (!Array.isArray(table.brackets) || !table.brackets.some((entry) => entry.id === bracket)) {
+      return new Error(`${label} context bracket is not in the active admin table.`);
+    }
+    return { ctx_bracket: bracket, ctx_bracket_table_ver: table.ver };
+  }
+
+  priceScheduleKey(enclaveId, ctxBracket = null) {
+    return ctxBracket ? `price/${enclaveId}/${ctxBracket}` : `price/${enclaveId}`;
+  }
+
+  priceRecordKey(enclaveId, ver, ctxBracket = null) {
+    return ctxBracket ? `price/${enclaveId}/${ctxBracket}/v/${ver}` : `price/${enclaveId}/v/${ver}`;
+  }
+
+  priceMarketKey(enclaveId, ctxBracket = null) {
+    return stableJson([enclaveId, ctxBracket ?? null]);
   }
 
   requireAdminCreatedEnclave(enclave) {
@@ -5101,13 +5222,17 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async priceSchedule(key, enclave) {
+  async priceSchedule(key, enclave, ctxMeta = null) {
     const existing = await this.get(key);
     if (existing) return existing;
     return {
       enclave_id: enclave.enclave_id,
       model_id: enclave.model_id,
       denom: PRICE_DENOMINATION,
+      ...(ctxMeta ? {
+        ctx_bracket: ctxMeta.ctx_bracket,
+        ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+      } : {}),
       current: null,
       pending: null,
     };
@@ -5138,6 +5263,8 @@ class MayhemContract extends Contract {
       model_id: record.model_id,
       denom: record.denom,
       ver: record.seed_ver ?? record.ver,
+      ...(record.ctx_bracket ? { ctx_bracket: record.ctx_bracket } : {}),
+      ...(record.ctx_bracket_table_ver ? { ctx_bracket_table_ver: record.ctx_bracket_table_ver } : {}),
       rate_map: cloneValue(record.seed_rate_map ?? record.rate_map),
       per_req_mu: record.seed_per_req_mu ?? record.per_req_mu,
       min_session_mu: record.seed_min_session_mu ?? record.min_session_mu,
@@ -5302,8 +5429,13 @@ class MayhemContract extends Contract {
     for (const usage of this.mapMarketUsageEntriesForHash(marketUsageMap)) {
       const enclave = await this.get(`enclave/${usage.enclave_id}`);
       if (!enclave || enclave.status !== 'active') return new Error('Market usage enclave is not active.');
-      const scheduleKey = `price/${usage.enclave_id}`;
-      const storedSchedule = await this.priceSchedule(scheduleKey, enclave);
+      const ctxMeta = await this.priceCtxMetaForEnclave(enclave, usage.ctx_bracket, at, 'Market usage');
+      if (ctxMeta instanceof Error) return ctxMeta;
+      if (ctxMeta && usage.ctx_bracket_table_ver !== undefined && usage.ctx_bracket_table_ver !== ctxMeta.ctx_bracket_table_ver) {
+        return new Error('Market usage context bracket table version is not active for the epoch.');
+      }
+      const scheduleKey = this.priceScheduleKey(usage.enclave_id, ctxMeta?.ctx_bracket ?? null);
+      const storedSchedule = await this.priceSchedule(scheduleKey, enclave, ctxMeta);
       const schedule = this.priceScheduleAt(storedSchedule, at);
       const current = this.priceActiveEntry(schedule, at);
       if (!current) return new Error('Market usage enclave has no admin price seed.');
@@ -5360,6 +5492,10 @@ class MayhemContract extends Contract {
         updated_at: tx,
         set_by: seed.set_by,
         set_by_role: 'admin',
+        ...(ctxMeta ? {
+          ctx_bracket: ctxMeta.ctx_bracket,
+          ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+        } : {}),
         price_source: frozen ? 'admin_seed_cold_start' : 'market_float',
         seed,
         market: {
@@ -5370,6 +5506,10 @@ class MayhemContract extends Contract {
           active_supply: activeSupply,
           active_demand_mu: usage.demand_mu,
           session_count: usage.session_count,
+          ...(ctxMeta ? {
+            ctx_bracket: ctxMeta.ctx_bracket,
+            ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+          } : {}),
           utilization_bps: utilizationBps,
           ema_utilization_bps: emaUtilizationBps,
           multiplier_bps: multiplierBps,
@@ -5392,6 +5532,11 @@ class MayhemContract extends Contract {
       };
       updates.push({
         enclave_id: usage.enclave_id,
+        ...(ctxMeta ? {
+          ctx_bracket: ctxMeta.ctx_bracket,
+          ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+        } : {}),
+        market_key: this.priceMarketKey(usage.enclave_id, ctxMeta?.ctx_bracket ?? null),
         ver: record.ver,
         rate_map: record.rate_map,
         utilization_bps: utilizationBps,
@@ -5401,7 +5546,7 @@ class MayhemContract extends Contract {
         frozen,
         schedule_key: scheduleKey,
         schedule: updatedSchedule,
-        record_key: `price/${usage.enclave_id}/v/${record.ver}`,
+        record_key: this.priceRecordKey(usage.enclave_id, record.ver, ctxMeta?.ctx_bracket ?? null),
         record,
       });
     }
@@ -7228,6 +7373,8 @@ class MayhemContract extends Contract {
   priceTermsSnapshot(record) {
     return {
       ver: record.ver,
+      ...(record.ctx_bracket ? { ctx_bracket: record.ctx_bracket } : {}),
+      ...(record.ctx_bracket_table_ver ? { ctx_bracket_table_ver: record.ctx_bracket_table_ver } : {}),
       rate_map: cloneValue(record.rate_map),
       per_req_mu: record.per_req_mu,
       min_session_mu: record.min_session_mu,
@@ -7257,6 +7404,10 @@ class MayhemContract extends Contract {
       at,
       epoch_seconds: epochSeconds,
       enclave_id: record.enclave_id,
+      ...(record.ctx_bracket ? {
+        ctx_bracket: record.ctx_bracket,
+        ctx_bracket_table_ver: record.ctx_bracket_table_ver,
+      } : {}),
       model_id: record.model_id,
       denom: record.denom,
       price_ver: record.ver,
@@ -7265,6 +7416,10 @@ class MayhemContract extends Contract {
         usage_root: usageRoot,
         active_demand_mu: market.active_demand_mu,
         session_count: market.session_count,
+        ...(record.ctx_bracket ? {
+          ctx_bracket: record.ctx_bracket,
+          ctx_bracket_table_ver: record.ctx_bracket_table_ver,
+        } : {}),
       },
       controller: {
         source: market.source,
@@ -7294,7 +7449,10 @@ class MayhemContract extends Contract {
 
   async priceDerivationsFromMarketUpdates(updates, context = {}) {
     const derivations = [];
-    const sorted = updates.slice().sort((left, right) => compareCodepoint(left.enclave_id, right.enclave_id));
+    const sorted = updates.slice().sort((left, right) => (
+      compareCodepoint(left.enclave_id, right.enclave_id) ||
+      compareCodepoint(left.ctx_bracket ?? '', right.ctx_bracket ?? '')
+    ));
     for (const update of sorted) {
       const derivation = this.priceDerivationFromMarketUpdate(update, context);
       if (derivation instanceof Error) return derivation;
@@ -7364,7 +7522,7 @@ class MayhemContract extends Contract {
       return new Error('Price derivation proof session count does not match committed usage count.');
     }
 
-    const usageMap = new Map([[priceUsage.enclave_id, priceUsage]]);
+    const usageMap = new Map([[this.priceMarketKey(priceUsage.enclave_id, priceUsage.ctx_bracket ?? null), priceUsage]]);
     const updates = await this.computeMarketPriceUpdates(usageMap, {
       epoch: commit.epoch,
       at: commit.at,
@@ -7389,6 +7547,10 @@ class MayhemContract extends Contract {
     return {
       price_usage: priceUsage,
       enclave_id: priceUsage.enclave_id,
+      ...(priceUsage.ctx_bracket ? {
+        ctx_bracket: priceUsage.ctx_bracket,
+        ctx_bracket_table_ver: priceUsage.ctx_bracket_table_ver,
+      } : {}),
       expected_price_root: expectedPriceRoot,
       committed_price_root: commit.roots.price,
       price_derivation_hash: derivations[0].derivation_hash,
@@ -7469,7 +7631,10 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
     });
     for (const derivation of derivations) {
-      await this.put(`ev/price/${epoch}/${derivation.enclave_id}`, {
+      const key = derivation.ctx_bracket
+        ? `ev/price/${epoch}/${derivation.enclave_id}/${derivation.ctx_bracket}`
+        : `ev/price/${epoch}/${derivation.enclave_id}`;
+      await this.put(key, {
         ...derivation,
         price_root: root,
         updated_at: this.tx,
@@ -7580,31 +7745,57 @@ class MayhemContract extends Contract {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
         return new Error('Invalid market usage entry.');
       }
-      const shapeError = this.validateExactObjectKeys(
-        entry,
-        ['enclave_id', 'demand_mu', 'session_count'],
-        'market usage entry'
-      );
-      if (shapeError) return shapeError;
+      const allowed = new Set([
+        'enclave_id',
+        'ctx_bracket',
+        'ctx_bracket_table_ver',
+        'demand_mu',
+        'session_count',
+      ]);
+      const unknown = Object.keys(entry).filter((key) => !allowed.has(key)).sort();
+      if (unknown.length > 0) {
+        return new Error(`market usage entry does not accept fields: ${unknown.join(', ')}.`);
+      }
+      for (const key of ['enclave_id', 'demand_mu', 'session_count']) {
+        if (!hasOwn(entry, key)) return new Error(`market usage entry is missing ${key}.`);
+      }
       const enclaveId = entry.enclave_id;
       if (!this.isSafeKeyPart(enclaveId)) return new Error('Invalid market usage enclave_id.');
+      const ctxBracket = entry.ctx_bracket ?? null;
+      if (ctxBracket !== null && !this.isSafeKeyPart(ctxBracket)) {
+        return new Error('Invalid market usage context bracket.');
+      }
+      if (
+        hasOwn(entry, 'ctx_bracket_table_ver') &&
+        (!Number.isSafeInteger(entry.ctx_bracket_table_ver) || entry.ctx_bracket_table_ver < 1)
+      ) {
+        return new Error('Invalid market usage context bracket table version.');
+      }
       if (!Number.isSafeInteger(entry.demand_mu) || entry.demand_mu <= 0) {
         return new Error('Invalid market usage demand.');
       }
       if (!Number.isSafeInteger(entry.session_count) || entry.session_count <= 0) {
         return new Error('Invalid market usage session_count.');
       }
-      const current = out.get(enclaveId) ?? {
+      const key = this.priceMarketKey(enclaveId, ctxBracket);
+      const current = out.get(key) ?? {
         enclave_id: enclaveId,
+        ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
+        ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
         demand_mu: 0,
         session_count: 0,
       };
+      if ((current.ctx_bracket_table_ver ?? null) !== (entry.ctx_bracket_table_ver ?? current.ctx_bracket_table_ver ?? null)) {
+        return new Error('Market usage context bracket table version mismatch.');
+      }
       const demandMu = this.safeAddMu(current.demand_mu, entry.demand_mu);
       if (demandMu instanceof Error) return demandMu;
       const sessionCount = this.safeAddMu(current.session_count, entry.session_count);
       if (sessionCount instanceof Error) return sessionCount;
-      out.set(enclaveId, {
+      out.set(key, {
         enclave_id: enclaveId,
+        ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
+        ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
         demand_mu: demandMu,
         session_count: sessionCount,
       });
@@ -7781,9 +7972,14 @@ class MayhemContract extends Contract {
 
   mapMarketUsageEntriesForHash(map) {
     return Array.from(map.values())
-      .sort((left, right) => compareCodepoint(left.enclave_id, right.enclave_id))
+      .sort((left, right) => (
+        compareCodepoint(left.enclave_id, right.enclave_id) ||
+        compareCodepoint(left.ctx_bracket ?? '', right.ctx_bracket ?? '')
+      ))
       .map((entry) => ({
         enclave_id: entry.enclave_id,
+        ...(entry.ctx_bracket ? { ctx_bracket: entry.ctx_bracket } : {}),
+        ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
         demand_mu: entry.demand_mu,
         session_count: entry.session_count,
       }));

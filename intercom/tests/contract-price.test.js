@@ -16,6 +16,10 @@ const rulesHash = '8'.repeat(64);
 const enclaveId = '9'.repeat(64);
 const modelId = 'meta/llama-3.1-8b-instruct@4bit';
 const DAY_SECONDS = 24 * 60 * 60;
+const priceCtxBracket = 'le32k';
+const priceCtxBracketTableVer = 1;
+const priceKey = `price/${enclaveId}/${priceCtxBracket}`;
+const priceEvidenceKey = `ev/price/1/${enclaveId}/${priceCtxBracket}`;
 
 const providerRegistration = {
   op: 'register_provider',
@@ -63,6 +67,16 @@ const makePrice = (overrides = {}) => ({
   per_req_mu: 0,
   min_session_mu: 100,
   effective_at: 21_600,
+  ctx_bracket: priceCtxBracket,
+  ...overrides,
+});
+
+const makeMarketUsage = (demandMu, sessionCount, overrides = {}) => ({
+  enclave_id: enclaveId,
+  ctx_bracket: priceCtxBracket,
+  ctx_bracket_table_ver: priceCtxBracketTableVer,
+  demand_mu: demandMu,
+  session_count: sessionCount,
   ...overrides,
 });
 
@@ -224,16 +238,20 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     ver: 2,
   });
 
-  const price = await storage.get(`price/${enclaveId}`);
+  const price = await storage.get(priceKey);
   assert.deepEqual(price.value, {
     enclave_id: enclaveId,
     model_id: modelId,
     denom: 'mu_usd',
+    ctx_bracket: priceCtxBracket,
+    ctx_bracket_table_ver: priceCtxBracketTableVer,
     current: {
       enclave_id: enclaveId,
       model_id: modelId,
       denom: 'mu_usd',
       ver: 1,
+      ctx_bracket: priceCtxBracket,
+      ctx_bracket_table_ver: priceCtxBracketTableVer,
       rate_map: textRateMap(18, 55),
       per_req_mu: 0,
       min_session_mu: 100,
@@ -248,6 +266,8 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
       model_id: modelId,
       denom: 'mu_usd',
       ver: 2,
+      ctx_bracket: priceCtxBracket,
+      ctx_bracket_table_ver: priceCtxBracketTableVer,
       rate_map: textRateMap(19, 56),
       per_req_mu: 0,
       min_session_mu: 100,
@@ -306,7 +326,7 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
       at: 43_201,
       debits: [{ rail: 'fiat', user: user.publicKey, mu: 10_000_000 }],
       earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 10_000_000 }],
-      market_usage: [{ enclave_id: enclaveId, demand_mu: 10_000_000, session_count: 4 }],
+      market_usage: [makeMarketUsage(10_000_000, 4)],
     },
     admin.publicKey
   );
@@ -316,6 +336,8 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
     { ...applied.market_prices[0], derivation_hash: '<hash>' },
     {
       enclave_id: enclaveId,
+      ctx_bracket: priceCtxBracket,
+      ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
       utilization_bps: 50_000,
       ema_utilization_bps: 8_500,
@@ -328,14 +350,14 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
   assertHash(applied.market_prices[0].derivation_hash);
   assert.equal(applied.price_root, applied.market_prices[0].derivation_hash);
 
-  const schedule = await storage.get(`price/${enclaveId}`);
+  const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
   assert.equal(schedule.value.current.price_source, 'admin_seed_cold_start');
   assert.deepEqual(schedule.value.current.rate_map, textRateMap(18, 55));
   const priceRoot = (await storage.get('ev/price/1')).value;
   assert.equal(priceRoot.merkle_root, applied.price_root);
   assert.equal(priceRoot.price_count, 1);
-  const derivation = (await storage.get(`ev/price/1/${enclaveId}`)).value;
+  const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.equal(derivation.price_root, applied.price_root);
   assert.equal(derivation.controller.frozen, true);
 });
@@ -368,7 +390,7 @@ test('MayhemContract epochApply floats market price from settled usage with clam
       at: 43_201,
       debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
       earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
-      market_usage: [{ enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 4 }],
+      market_usage: [makeMarketUsage(2_000_000, 4)],
     },
     admin.publicKey
   );
@@ -377,6 +399,8 @@ test('MayhemContract epochApply floats market price from settled usage with clam
     { ...highDemand.market_prices[0], derivation_hash: '<hash>' },
     {
       enclave_id: enclaveId,
+      ctx_bracket: priceCtxBracket,
+      ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
       utilization_bps: 10_000,
       ema_utilization_bps: 8_875,
@@ -387,7 +411,7 @@ test('MayhemContract epochApply floats market price from settled usage with clam
     }
   );
   assertHash(highDemand.market_prices[0].derivation_hash);
-  let schedule = await storage.get(`price/${enclaveId}`);
+  let schedule = await storage.get(priceKey);
   const raised = schedule.value.current;
   assert.equal(raised.ver, 2);
   assert.equal(raised.price_source, 'market_float');
@@ -406,12 +430,12 @@ test('MayhemContract epochApply floats market price from settled usage with clam
       at: 46_801,
       debits: [{ rail: 'fiat', user: user.publicKey, mu: 10_000 }],
       earnings: [{ rail: 'fiat', provider: providerTwo.publicKey, gross_mu: 10_000 }],
-      market_usage: [{ enclave_id: enclaveId, demand_mu: 10_000, session_count: 1 }],
+      market_usage: [makeMarketUsage(10_000, 1)],
     },
     admin.publicKey
   );
   assert.equal(lowDemand.ok, true, lowDemand.message);
-  schedule = await storage.get(`price/${enclaveId}`);
+  schedule = await storage.get(priceKey);
   const lowered = schedule.value.current;
   assert.equal(lowered.ver, 3);
   assert.equal(rateFor(lowered.rate_map, 'input_token'), 18);
@@ -427,6 +451,81 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   );
   assert.equal(reseed.ok, true, reseed.message);
   assert.equal(reseed.ver, 4);
+});
+
+test('MayhemContract keeps context brackets as independent price markets', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+  const providerTwo = await makeIdentity();
+
+  const shortSeed = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(shortSeed.ok, true, shortSeed.message);
+  const longSeed = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({
+      ctx_bracket: 'le128k',
+      rate_map: textRateMap(30, 90),
+      min_session_mu: 150,
+    }),
+    admin.publicKey,
+    6
+  );
+  assert.equal(longSeed.ok, true, longSeed.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    7
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 8);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
+
+  const applied = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 43_201,
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 3_000_000 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 3_000_000 }],
+      market_usage: [
+        makeMarketUsage(1_000_000, 2),
+        makeMarketUsage(2_000_000, 3, { ctx_bracket: 'le128k' }),
+      ],
+    },
+    admin.publicKey
+  );
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(applied.market_prices.length, 2);
+  const byBracket = new Map(applied.market_prices.map((entry) => [entry.ctx_bracket, entry]));
+  assert.equal(byBracket.get(priceCtxBracket).ver, 2);
+  assert.equal(byBracket.get('le128k').ver, 2);
+  assert.equal(byBracket.get(priceCtxBracket).active_demand_mu, 1_000_000);
+  assert.equal(byBracket.get('le128k').active_demand_mu, 2_000_000);
+  assertHash(byBracket.get(priceCtxBracket).derivation_hash);
+  assertHash(byBracket.get('le128k').derivation_hash);
+
+  const shortSchedule = (await storage.get(priceKey)).value;
+  const longSchedule = (await storage.get(`price/${enclaveId}/le128k`)).value;
+  assert.equal(shortSchedule.current.ctx_bracket, priceCtxBracket);
+  assert.equal(longSchedule.current.ctx_bracket, 'le128k');
+  assert.notDeepEqual(shortSchedule.current.rate_map, longSchedule.current.rate_map);
+  assert.equal(rateFor(shortSchedule.current.seed.rate_map, 'input_token'), 18);
+  assert.equal(rateFor(longSchedule.current.seed.rate_map, 'input_token'), 30);
+
+  const shortDerivation = (await storage.get(priceEvidenceKey)).value;
+  const longDerivation = (await storage.get(`ev/price/1/${enclaveId}/le128k`)).value;
+  assert.equal(shortDerivation.ctx_bracket, priceCtxBracket);
+  assert.equal(longDerivation.ctx_bracket, 'le128k');
+  assert.equal(shortDerivation.usage.active_demand_mu, 1_000_000);
+  assert.equal(longDerivation.usage.active_demand_mu, 2_000_000);
+  assert.equal(shortDerivation.price_root, longDerivation.price_root);
 });
 
 test('MayhemContract market price derivation uses active admin-tuned epoch params', async () => {
@@ -477,12 +576,12 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
       at: DAY_SECONDS + 1,
       debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
       earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
-      market_usage: [{ enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 4 }],
+      market_usage: [makeMarketUsage(2_000_000, 4)],
     },
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
-  const derivation = (await storage.get(`ev/price/1/${enclaveId}`)).value;
+  const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.deepEqual(derivation.controller.constants, {
     target_utilization_bps: 7_500,
     ema_alpha_bps: 2_500,
@@ -523,7 +622,7 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
     at: 43_201,
     debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
     earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
-    market_usage: [{ enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 1 }],
+    market_usage: [makeMarketUsage(2_000_000, 1)],
   };
   const usageRoot = '2'.repeat(64);
   const roots = {
@@ -548,7 +647,7 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
   const simStorage = MemoryStorage.fromSnapshotBytes(storage.snapshotBytes());
   const simApply = await executeEpochApplyFeature(contract, simStorage, applyValue, admin.publicKey);
   assert.equal(simApply.ok, true, simApply.message);
-  const simDerivation = (await simStorage.get(`ev/price/1/${enclaveId}`)).value;
+  const simDerivation = (await simStorage.get(priceEvidenceKey)).value;
   roots.price = await contract.priceDerivationRoot([
     {
       ...simDerivation,
@@ -582,7 +681,7 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
   assert.equal(priceRoot.type, 'price_root');
   assert.equal(priceRoot.merkle_root, roots.price);
   assert.equal(priceRoot.price_count, 1);
-  const derivation = (await storage.get(`ev/price/1/${enclaveId}`)).value;
+  const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.equal(derivation.price_root, roots.price);
   assert.equal(derivation.usage.usage_root, usageRoot);
   assert.equal(derivation.controller.utilization_bps, 10_000);
@@ -645,7 +744,7 @@ test('MayhemContract fraudProof voids a fabricated price derivation root', async
       proof_epoch: 2,
       at: 46_801,
       reason: 'price_derivation',
-      price_usage: { enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 1 },
+      price_usage: makeMarketUsage(2_000_000, 1),
     },
     prover.publicKey,
     21
@@ -661,6 +760,7 @@ test('MayhemContract fraudProof voids a fabricated price derivation root', async
   assertHash(fraudRecord.expected_price_root);
   assertHash(fraudRecord.price_derivation_hash);
   assert.equal(fraudRecord.price_derivation.enclave_id, enclaveId);
+  assert.equal(fraudRecord.price_derivation.ctx_bracket, priceCtxBracket);
   assert.equal(fraudRecord.price_derivation.usage.active_demand_mu, 2_000_000);
 });
 
@@ -710,7 +810,7 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
         { rail: 'fiat', provider: provider.publicKey, gross_mu: 500_000 },
         { rail: 'tap', provider: tapProvider.publicKey, gross_mu: 500_000 },
       ],
-      market_usage: [{ enclave_id: enclaveId, demand_mu: 1_000_000, session_count: 2 }],
+      market_usage: [makeMarketUsage(1_000_000, 2)],
     },
     admin.publicKey
   );
@@ -719,6 +819,8 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
   assert.deepEqual(applied.market_prices, [
     {
       enclave_id: enclaveId,
+      ctx_bracket: priceCtxBracket,
+      ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
       utilization_bps: 5_000,
       ema_utilization_bps: 7_625,
@@ -730,11 +832,12 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
   ]);
   assertHash(applied.market_prices[0].derivation_hash);
 
-  const schedule = await storage.get(`price/${enclaveId}`);
+  const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
   assert.equal(schedule.value.current.price_source, 'market_float');
   assert.equal(await storage.get(`price/${enclaveId}/fiat`), null);
   assert.equal(await storage.get(`price/${enclaveId}/tap`), null);
+  assert.equal(await storage.get(`price/${enclaveId}`), null);
   assert.equal((await storage.get(`bal/${fiatUser.publicKey}/fiat`)).value.mu, 1_500_000);
   assert.equal((await storage.get(`bal/${tapUser.publicKey}/tap`)).value.mu, 1_500_000);
   assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_mu, 425_000);
@@ -751,7 +854,7 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       at: 46_801,
       debits: [{ rail: 'fiat', user: fiatUser.publicKey, mu: 100 }],
       earnings: [{ rail: 'tap', provider: tapProvider.publicKey, gross_mu: 100 }],
-      market_usage: [{ enclave_id: enclaveId, demand_mu: 100, session_count: 1 }],
+      market_usage: [makeMarketUsage(100, 1)],
     },
     admin.publicKey
   );
@@ -774,7 +877,7 @@ test('MayhemContract epochApply rejects market usage that does not reconcile to 
       at: 43_201,
       debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000 }],
       earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000 }],
-      market_usage: [{ enclave_id: enclaveId, demand_mu: 1_999, session_count: 1 }],
+      market_usage: [makeMarketUsage(1_999, 1)],
     },
     admin.publicKey
   );

@@ -548,7 +548,7 @@ test('MayhemContract spend reservation keeps the locked quote after market price
     minSessionMu: 100,
     effectiveAt: 3_600,
   });
-  assert.equal((await ctx.storage.get(`price/${enclaveId}`)).value.current.ver, 2);
+  assert.equal((await ctx.storage.get(`price/${enclaveId}/le8k`)).value.current.ver, 2);
 
   const result = await executeSpendReservationFeature(
     ctx.contract,

@@ -3012,6 +3012,10 @@ struct AdminSetPriceArgs {
     /// Contract timestamp/slot at which the new price becomes active.
     #[arg(long)]
     effective_at: u64,
+
+    /// Context bracket to price for text-generation enclaves (for example le32k).
+    #[arg(long)]
+    ctx_bracket: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -3036,6 +3040,10 @@ struct AdminPriceSeedArgs {
     /// Contract timestamp/slot at which the seed becomes active. Defaults to now.
     #[arg(long)]
     effective_at: Option<u64>,
+
+    /// Context bracket to price for text-generation enclaves (for example le32k).
+    #[arg(long)]
+    ctx_bracket: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -11991,26 +11999,34 @@ fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Result<Value> {
         true,
         "price rate_map",
     )?;
-    Ok(json!({
+    let mut payload = json!({
         "op": "set_price",
         "enclave_id": &args.enclave_id,
         "rate_map": rate_map,
         "per_req_mu": args.per_req_mu,
         "min_session_mu": args.min_session_mu,
         "effective_at": args.effective_at,
-    }))
+    });
+    if let Some(ctx_bracket) = &args.ctx_bracket {
+        payload["ctx_bracket"] = json!(ctx_bracket);
+    }
+    Ok(payload)
 }
 
 fn admin_price_seed_payload(args: &AdminPriceSeedArgs) -> Result<Value> {
     let effective_at = args.effective_at.unwrap_or(unix_epoch_seconds()?);
-    Ok(json!({
+    let mut payload = json!({
         "op": "set_price",
         "enclave_id": &args.enclave_id,
         "rate_map": text_generation_rate_map(args.p0_mu, args.p0_mu),
         "per_req_mu": args.per_req_mu,
         "min_session_mu": args.min_session_mu,
         "effective_at": effective_at,
-    }))
+    });
+    if let Some(ctx_bracket) = &args.ctx_bracket {
+        payload["ctx_bracket"] = json!(ctx_bracket);
+    }
+    Ok(payload)
 }
 
 fn admin_fee_set_payload(args: &AdminFeeSetArgs) -> Result<Value> {
@@ -21832,6 +21848,10 @@ struct LedgerPriceSchedule {
     enclave_id: String,
     model_id: String,
     denom: String,
+    #[serde(default)]
+    ctx_bracket: Option<String>,
+    #[serde(default)]
+    ctx_bracket_table_ver: Option<u32>,
     current: Option<LedgerPriceRecord>,
     pending: Option<LedgerPriceRecord>,
 }
@@ -21840,6 +21860,10 @@ struct LedgerPriceSchedule {
 struct LedgerPriceRecord {
     ver: u64,
     denom: String,
+    #[serde(default)]
+    ctx_bracket: Option<String>,
+    #[serde(default)]
+    ctx_bracket_table_ver: Option<u32>,
     rate_map: Vec<RateMapEntry>,
     per_req_mu: u64,
     min_session_mu: u64,
@@ -24190,9 +24214,57 @@ fn current_mu_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRe
     let current = schedule.current.as_ref()?;
     (schedule.denom == "mu_usd"
         && current.denom == "mu_usd"
+        && schedule.ctx_bracket.as_deref() == current.ctx_bracket.as_deref()
+        && schedule.ctx_bracket_table_ver == current.ctx_bracket_table_ver
         && !current.rate_map.is_empty()
         && admin_role_marker_ok(current.set_by_role.as_deref()))
     .then_some(current)
+}
+
+fn ledger_price_market_key(enclave_id: &str, ctx_bracket: Option<&str>) -> String {
+    match ctx_bracket {
+        Some(ctx_bracket) => format!("{enclave_id}/{ctx_bracket}"),
+        None => enclave_id.to_owned(),
+    }
+}
+
+fn current_mu_usd_price_for_ctx<'a>(
+    schedule: &'a LedgerPriceSchedule,
+    ctx_bracket: Option<&str>,
+) -> Option<&'a LedgerPriceRecord> {
+    let current = current_mu_usd_price(schedule)?;
+    (schedule.ctx_bracket.as_deref() == ctx_bracket
+        && current.ctx_bracket.as_deref() == ctx_bracket)
+        .then_some(current)
+}
+
+fn find_current_mu_usd_price_schedule<'a>(
+    prices: &'a [LedgerPriceSchedule],
+    enclave_id: &str,
+    ctx_bracket: Option<&str>,
+) -> Option<&'a LedgerPriceSchedule> {
+    prices.iter().find(|price| {
+        price.enclave_id == enclave_id && current_mu_usd_price_for_ctx(price, ctx_bracket).is_some()
+    })
+}
+
+fn price_ctx_bracket_for_model_class(
+    model_class: &str,
+    served_ctx: u64,
+    schedule: &CtxBracketSchedule,
+    at: u64,
+) -> Result<Option<String>> {
+    if model_class != DEFAULT_MODEL_CLASS {
+        return Ok(None);
+    }
+    let served_ctx = u32::try_from(served_ctx).unwrap_or(u32::MAX);
+    let (ctx_bracket, _ctx_bracket_table_ver) =
+        ctx_bracket_for_tokens_in_schedule(served_ctx, schedule, at).with_context(|| {
+            format!(
+                "served context {served_ctx} is not covered by the active context bracket table"
+            )
+        })?;
+    Ok(Some(ctx_bracket))
 }
 
 fn admin_role_marker_ok(role: Option<&str>) -> bool {
@@ -25254,7 +25326,7 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
             entry
                 .key
                 .strip_prefix("price/")
-                .is_some_and(|tail| !tail.contains('/'))
+                .is_some_and(is_price_schedule_tail)
         })
         .map(|entry| serde_json::from_value(entry.value).context("parsing price schedule"))
         .collect::<Result<Vec<LedgerPriceSchedule>>>()?;
@@ -25262,16 +25334,10 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         .await?
         .into_iter()
         .filter(|entry| {
-            entry.key.strip_prefix("ev/price/").is_some_and(|tail| {
-                let mut parts = tail.split('/');
-                parts
-                    .next()
-                    .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
-                    && parts
-                        .next()
-                        .is_some_and(|enclave_id| is_hex_len(enclave_id, 32))
-                    && parts.next().is_none()
-            })
+            entry
+                .key
+                .strip_prefix("ev/price/")
+                .is_some_and(is_price_derivation_tail)
         })
         .map(|entry| entry.value)
         .collect::<Vec<_>>();
@@ -25293,6 +25359,26 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
             .transpose()
             .context("parsing rules/current")?,
     })
+}
+
+fn is_price_schedule_tail(tail: &str) -> bool {
+    let parts = tail.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [enclave] => !enclave.is_empty(),
+        [enclave, ctx_bracket] => !enclave.is_empty() && !ctx_bracket.is_empty(),
+        _ => false,
+    }
+}
+
+fn is_price_derivation_tail(tail: &str) -> bool {
+    let parts = tail.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [epoch, enclave] => epoch.parse::<u64>().is_ok() && !enclave.is_empty(),
+        [epoch, enclave, ctx_bracket] => {
+            epoch.parse::<u64>().is_ok() && !enclave.is_empty() && !ctx_bracket.is_empty()
+        }
+        _ => false,
+    }
 }
 
 async fn read_ctx_bracket_schedule(rpc: &PeerRpcClient) -> Result<CtxBracketSchedule> {
@@ -25350,6 +25436,7 @@ async fn read_prefix_entries(rpc: &PeerRpcClient, prefix: &str) -> Result<Vec<Pr
 }
 
 fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<GatewayModel>> {
+    let now = unix_epoch_seconds()?;
     let active_enclaves = contract
         .enclaves
         .iter()
@@ -25399,33 +25486,38 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         *count = count.saturating_add(1);
     }
 
-    let mut price_derivation_by_enclave: BTreeMap<String, Value> = BTreeMap::new();
+    let mut price_derivation_by_market: BTreeMap<String, Value> = BTreeMap::new();
     for derivation in &contract.price_derivations {
         let Some(enclave_id) = derivation.get("enclave_id").and_then(Value::as_str) else {
             continue;
         };
+        let ctx_bracket = derivation.get("ctx_bracket").and_then(Value::as_str);
+        let market_key = ledger_price_market_key(enclave_id, ctx_bracket);
         let candidate_key = price_derivation_sort_key(derivation);
-        let should_replace = price_derivation_by_enclave
-            .get(enclave_id)
+        let should_replace = price_derivation_by_market
+            .get(market_key.as_str())
             .map(|existing| candidate_key > price_derivation_sort_key(existing))
             .unwrap_or(true);
         if should_replace {
-            price_derivation_by_enclave.insert(enclave_id.to_owned(), derivation.clone());
+            price_derivation_by_market.insert(market_key, derivation.clone());
         }
     }
 
-    let mut prices_by_enclave = BTreeMap::new();
+    let mut prices_by_market = BTreeMap::new();
     for schedule in &contract.prices {
         let Some(price) = current_mu_usd_price(schedule) else {
             continue;
         };
         let mut price = price.clone();
         if price.derivation.is_none() {
-            price.derivation = price_derivation_by_enclave
-                .get(schedule.enclave_id.as_str())
-                .cloned();
+            let market_key =
+                ledger_price_market_key(&schedule.enclave_id, schedule.ctx_bracket.as_deref());
+            price.derivation = price_derivation_by_market.get(market_key.as_str()).cloned();
         }
-        prices_by_enclave.insert(schedule.enclave_id.clone(), price);
+        prices_by_market.insert(
+            ledger_price_market_key(&schedule.enclave_id, schedule.ctx_bracket.as_deref()),
+            price,
+        );
     }
 
     let mut caps_by_model: BTreeMap<String, ModelCaps> = BTreeMap::new();
@@ -25434,7 +25526,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if rooms_by_model.get(&enclave.model_id).copied().unwrap_or(0) == 0 {
             continue;
         }
-        if !prices_by_enclave.contains_key(&enclave.enclave_id) {
+        if !contract.prices.iter().any(|price| {
+            price.enclave_id == enclave.enclave_id && current_mu_usd_price(price).is_some()
+        }) {
             continue;
         };
         class_by_model
@@ -25464,7 +25558,15 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if !room_matches_enclave(room, enclave) {
             continue;
         }
-        let Some(serving_price) = prices_by_enclave.get(&serving.enclave_id) else {
+        let route_caps = gateway_caps_from_contract(&enclave.caps);
+        let price_ctx_bracket = price_ctx_bracket_for_model_class(
+            &enclave.model_class,
+            u64::from(route_caps.ctx),
+            &contract.ctx_bracket_schedule,
+            now,
+        )?;
+        let market_key = ledger_price_market_key(&serving.enclave_id, price_ctx_bracket.as_deref());
+        let Some(serving_price) = prices_by_market.get(&market_key) else {
             continue;
         };
         if enclave.model_id != serving.model_id {
@@ -25503,7 +25605,15 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if !room_matches_enclave(room, enclave) {
             continue;
         }
-        let Some(serving_price) = prices_by_enclave.get(&serving.enclave_id) else {
+        let route_caps = gateway_caps_from_contract(&enclave.caps);
+        let price_ctx_bracket = price_ctx_bracket_for_model_class(
+            &enclave.model_class,
+            u64::from(route_caps.ctx),
+            &contract.ctx_bracket_schedule,
+            now,
+        )?;
+        let market_key = ledger_price_market_key(&serving.enclave_id, price_ctx_bracket.as_deref());
+        let Some(serving_price) = prices_by_market.get(&market_key) else {
             continue;
         };
         if enclave.model_id != serving.model_id {
@@ -25946,6 +26056,7 @@ fn build_provider_candidates(
     let mut candidates = Vec::new();
     let mut rejections = Vec::new();
     let mut version_gates = BTreeMap::new();
+    let now = unix_epoch_seconds()?;
     for enclave in contract.enclaves.iter().filter(|enclave| {
         enclave.status == "active" && admin_role_marker_ok(enclave.created_by_role.as_deref())
     }) {
@@ -26120,16 +26231,27 @@ fn build_provider_candidates(
             ));
             continue;
         }
-        let Some(price) = contract
-            .prices
-            .iter()
-            .find(|price| price.enclave_id == enclave.enclave_id)
-            .filter(|price| current_mu_usd_price(price).is_some())
-            .cloned()
-        else {
+        let served_ctx = resolve_provider_served_ctx(model, args.ctx);
+        let price_ctx_bracket = price_ctx_bracket_for_model_class(
+            &enclave.model_class,
+            served_ctx,
+            &contract.ctx_bracket_schedule,
+            now,
+        )?;
+        let Some(price) = find_current_mu_usd_price_schedule(
+            &contract.prices,
+            &enclave.enclave_id,
+            price_ctx_bracket.as_deref(),
+        )
+        .cloned() else {
             rejections.push(provider_rejection(
                 enclave,
-                "missing current mu_usd admin price for this enclave".to_owned(),
+                match price_ctx_bracket.as_deref() {
+                    Some(ctx_bracket) => format!(
+                        "missing current mu_usd admin price for context bracket {ctx_bracket}"
+                    ),
+                    None => "missing current mu_usd admin price for this enclave".to_owned(),
+                },
                 None,
             ));
             continue;
@@ -26141,7 +26263,7 @@ fn build_provider_candidates(
             artifact,
             verdict: verdict.clone(),
             price: Some(price),
-            served_ctx: resolve_provider_served_ctx(model, args.ctx),
+            served_ctx,
             ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
         });
     }
@@ -29831,6 +29953,16 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         started_at,
     )
     .context("selected provider context is not covered by the active context bracket table")?;
+    if ctx.selected.enclave.model_class == DEFAULT_MODEL_CLASS {
+        if price.ctx_bracket.as_deref() != Some(ctx_bracket.as_str()) {
+            bail!(
+                "selected provider enclave price is for context {:?}, but served context resolves to {ctx_bracket}",
+                price.ctx_bracket
+            );
+        }
+    } else if price.ctx_bracket.is_some() {
+        bail!("selected non-text provider enclave has an unexpected context-bracket price");
+    }
     Ok(ProviderSessionTerms {
         contract_version: CONTRACT_VERSION,
         provider: ctx.wallet.public_key.clone(),
@@ -33652,6 +33784,8 @@ mod tests {
             "100",
             "--effective-at",
             "21600",
+            "--ctx-bracket",
+            "le32k",
             "--json",
         ])
         .unwrap();
@@ -33671,6 +33805,7 @@ mod tests {
         assert_eq!(args.per_req_mu, 1);
         assert_eq!(args.min_session_mu, 100);
         assert_eq!(args.effective_at, 21600);
+        assert_eq!(args.ctx_bracket.as_deref(), Some("le32k"));
         assert!(args.tx.json);
     }
 
@@ -33687,6 +33822,7 @@ mod tests {
             per_req_mu: 0,
             min_session_mu: 100,
             effective_at: 21_600,
+            ctx_bracket: Some("le32k".to_owned()),
         };
 
         assert_eq!(
@@ -33701,6 +33837,7 @@ mod tests {
                 "per_req_mu": 0,
                 "min_session_mu": 100,
                 "effective_at": 21_600,
+                "ctx_bracket": "le32k",
             })
         );
     }
@@ -33714,6 +33851,7 @@ mod tests {
             per_req_mu: 3,
             min_session_mu: 100,
             effective_at: Some(10),
+            ctx_bracket: Some("le32k".to_owned()),
         };
         assert_eq!(
             admin_price_seed_payload(&seed).unwrap(),
@@ -33727,6 +33865,7 @@ mod tests {
                 "per_req_mu": 3,
                 "min_session_mu": 100,
                 "effective_at": 10,
+                "ctx_bracket": "le32k",
             })
         );
 
@@ -35330,9 +35469,13 @@ mod tests {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             denom: "mu_usd".to_owned(),
+            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 1,
                 denom: "mu_usd".to_owned(),
+                ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(1, 2),
                 per_req_mu: 0,
                 min_session_mu: 0,
@@ -35408,9 +35551,13 @@ mod tests {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
             denom: "mu_usd".to_owned(),
+            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 1,
                 denom: "mu_usd".to_owned(),
+                ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(1, 2),
                 per_req_mu: 0,
                 min_session_mu: 0,
@@ -35674,6 +35821,8 @@ mod tests {
             "schema_version": 1,
             "epoch": 7u64,
             "enclave_id": "11".repeat(32),
+            "ctx_bracket": ctx_bracket_for_tokens(8192),
+            "ctx_bracket_table_ver": CTX_BRACKET_TABLE_VERSION,
             "model_id": "test/model@4bit",
             "denom": "mu_usd",
             "price_ver": 1u64,
@@ -35691,8 +35840,22 @@ mod tests {
                 "frozen": true,
                 "frozen_reason": "cold_start"
             },
-            "seed_price": { "ver": 1u64, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
-            "result_price": { "ver": 1u64, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
+            "seed_price": {
+                "ver": 1u64,
+                "ctx_bracket": ctx_bracket_for_tokens(8192),
+                "ctx_bracket_table_ver": CTX_BRACKET_TABLE_VERSION,
+                "rate_map": [],
+                "per_req_mu": 0u64,
+                "min_session_mu": 0u64
+            },
+            "result_price": {
+                "ver": 1u64,
+                "ctx_bracket": ctx_bracket_for_tokens(8192),
+                "ctx_bracket_table_ver": CTX_BRACKET_TABLE_VERSION,
+                "rate_map": [],
+                "per_req_mu": 0u64,
+                "min_session_mu": 0u64
+            },
             "derivation_hash": "77".repeat(32),
             "price_root": "88".repeat(32)
         }));
@@ -35950,9 +36113,13 @@ mod tests {
             enclave_id: second_enclave_id.clone(),
             model_id: second_model_id.clone(),
             denom: "mu_usd".to_owned(),
+            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 2,
                 denom: "mu_usd".to_owned(),
+                ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(3, 5),
                 per_req_mu: 0,
                 min_session_mu: 0,
@@ -36055,9 +36222,13 @@ mod tests {
             enclave_id: tier3_enclave_id.clone(),
             model_id: model_id.clone(),
             denom: "mu_usd".to_owned(),
+            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 9,
                 denom: "mu_usd".to_owned(),
+                ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(90, 180),
                 per_req_mu: 123,
                 min_session_mu: 456,
@@ -37484,7 +37655,8 @@ mod tests {
         let catalog = test_catalog(&root);
         let contract = test_contract(&root);
         let hardware = test_hardware(FixtureProfile::CpuOnly);
-        let args = test_provider_start_args();
+        let mut args = test_provider_start_args();
+        args.ctx = Some(8192);
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
@@ -37571,7 +37743,8 @@ mod tests {
             .artifacts
             .insert("nvfp4".to_owned(), trt_artifact);
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
-        let args = test_provider_start_args();
+        let mut args = test_provider_start_args();
+        args.ctx = Some(8192);
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
@@ -37704,7 +37877,8 @@ mod tests {
             .artifacts
             .insert("vllm-fp16".to_owned(), vllm_artifact);
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
-        let args = test_provider_start_args();
+        let mut args = test_provider_start_args();
+        args.ctx = Some(8192);
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
@@ -42527,9 +42701,13 @@ mod tests {
                 enclave_id: "11".repeat(32),
                 model_id: "test/model@4bit".to_owned(),
                 denom: "mu_usd".to_owned(),
+                ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 current: Some(LedgerPriceRecord {
                     ver: 1,
                     denom: "mu_usd".to_owned(),
+                    ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                    ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     rate_map: text_generation_rate_map(1, 2),
                     per_req_mu: 0,
                     min_session_mu: 0,

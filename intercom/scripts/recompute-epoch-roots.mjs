@@ -78,23 +78,45 @@ function addRailAmount(map, rail, id, amount, label) {
   map.set(key, { ...current, mu: next });
 }
 
-function addMarketUsage(map, enclaveId, sessionId, amount) {
+function marketUsageKey(enclaveId, ctxBracket) {
+  return JSON.stringify([enclaveId, ctxBracket ?? null]);
+}
+
+function addMarketUsage(map, body, sessionId, amount) {
+  const enclaveId = body.enclave_id;
   if (typeof enclaveId !== 'string' || enclaveId.length === 0) {
     throw new Error('receipt enclave_id is required');
+  }
+  const ctxBracket = body.ctx_bracket ?? null;
+  if (ctxBracket !== null && (typeof ctxBracket !== 'string' || ctxBracket.length === 0)) {
+    throw new Error('receipt ctx_bracket is invalid');
+  }
+  const ctxBracketTableVer = body.ctx_bracket_table_ver ?? null;
+  if (
+    ctxBracketTableVer !== null &&
+    (!Number.isSafeInteger(ctxBracketTableVer) || ctxBracketTableVer < 1)
+  ) {
+    throw new Error('receipt ctx_bracket_table_ver is invalid');
   }
   if (typeof sessionId !== 'string' || sessionId.length === 0) {
     throw new Error('receipt session_id is required');
   }
-  const current = map.get(enclaveId) ?? {
+  const key = marketUsageKey(enclaveId, ctxBracket);
+  const current = map.get(key) ?? {
     enclave_id: enclaveId,
+    ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
+    ...(ctxBracketTableVer ? { ctx_bracket_table_ver: ctxBracketTableVer } : {}),
     demand_mu: 0,
     sessions: new Set(),
   };
+  if ((current.ctx_bracket_table_ver ?? null) !== (ctxBracketTableVer ?? current.ctx_bracket_table_ver ?? null)) {
+    throw new Error('receipt ctx_bracket_table_ver mismatch within market usage bucket');
+  }
   const next = current.demand_mu + amount;
   safeAmount(next, 'market demand_mu', { allowZero: true });
   current.demand_mu = next;
   current.sessions.add(sessionId);
-  map.set(enclaveId, current);
+  map.set(key, current);
 }
 
 function sortedRailEntries(map) {
@@ -107,9 +129,14 @@ function sortedRailEntries(map) {
 
 function sortedMarketUsageEntries(map) {
   return Array.from(map.values())
-    .sort((a, b) => a.enclave_id.localeCompare(b.enclave_id))
+    .sort((a, b) => (
+      a.enclave_id.localeCompare(b.enclave_id) ||
+      String(a.ctx_bracket ?? '').localeCompare(String(b.ctx_bracket ?? ''))
+    ))
     .map((entry) => ({
       enclave_id: entry.enclave_id,
+      ...(entry.ctx_bracket ? { ctx_bracket: entry.ctx_bracket } : {}),
+      ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
       demand_mu: entry.demand_mu,
       session_count: entry.sessions.size,
     }));
@@ -323,7 +350,7 @@ export async function recomputeEpoch(bundle) {
     sessions.add(body.session_id);
     addRailAmount(debitMap, rail, body.user, settleMu, 'debit');
     addRailAmount(grossEarningMap, rail, body.provider, settleMu, 'earning');
-    addMarketUsage(marketUsageMap, body.enclave_id, body.session_id, settleMu);
+    addMarketUsage(marketUsageMap, body, body.session_id, settleMu);
     usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', receiptLeafEnvelope(envelope)));
   }
 

@@ -17,6 +17,14 @@ export const textRateMap = (inPer1kMu = 20, outPer1kMu = 60) => [
   { unit: 'output_token', per_unit_mu: outPer1kMu, granularity: 1000 },
 ];
 
+const ctxBracketForTokens = (tokens) => {
+  if (tokens <= 8_192) return 'le8k';
+  if (tokens <= 32_768) return 'le32k';
+  if (tokens <= 131_072) return 'le128k';
+  if (tokens <= 262_144) return 'le256k';
+  return 'gt256k';
+};
+
 export class MemoryStorage {
   constructor(initial = {}) {
     this.values = new Map(Object.entries(initial));
@@ -207,8 +215,20 @@ export async function seedCurrentAdminPrice(
     perReqMu = 0,
     minSessionMu = 0,
     effectiveAt = 0,
+    ctxBracket,
+    ctxBracketTableVer = 1,
   }
 ) {
+  let resolvedCtxBracket = ctxBracket;
+  if (resolvedCtxBracket === undefined) {
+    const enclave = (await storage.get(`enclave/${enclaveId}`))?.value;
+    if (!enclave || enclave.model_class === 'text-generation') {
+      const cap = Number(enclave?.caps?.ctx_max ?? enclave?.caps?.ctx ?? 8_192);
+      resolvedCtxBracket = ctxBracketForTokens(Number.isFinite(cap) && cap > 0 ? cap : 8_192);
+    } else {
+      resolvedCtxBracket = null;
+    }
+  }
   const record = {
     enclave_id: enclaveId,
     model_id: modelId,
@@ -223,14 +243,24 @@ export async function seedCurrentAdminPrice(
     set_by: admin,
     set_by_role: 'admin',
   };
-  await storage.put(`price/${enclaveId}`, {
+  if (resolvedCtxBracket) {
+    record.ctx_bracket = resolvedCtxBracket;
+    record.ctx_bracket_table_ver = ctxBracketTableVer;
+  }
+  const scheduleKey = resolvedCtxBracket
+    ? `price/${enclaveId}/${resolvedCtxBracket}`
+    : `price/${enclaveId}`;
+  await storage.put(scheduleKey, {
     enclave_id: enclaveId,
     model_id: modelId,
     denom: 'mu_usd',
+    ...(resolvedCtxBracket
+      ? { ctx_bracket: resolvedCtxBracket, ctx_bracket_table_ver: ctxBracketTableVer }
+      : {}),
     current: record,
     pending: null,
   });
-  await storage.put(`price/${enclaveId}/v/${ver}`, record);
+  await storage.put(`${scheduleKey}/v/${ver}`, record);
   return record;
 }
 
