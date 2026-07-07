@@ -2145,7 +2145,12 @@ fn dashboard_route_status(
         .map(|_| "attested")
         .unwrap_or("attestation pending");
     details.push(att.to_owned());
-    let label = if entry.is_some_and(dashboard_entry_has_live_heartbeat) {
+    let label = if entry
+        .and_then(|entry| entry.heartbeat.as_ref())
+        .is_some_and(|heartbeat| !heartbeat.accepting_new)
+    {
+        r#"<span class="status-dot muted">Draining</span>"#
+    } else if entry.is_some_and(dashboard_entry_has_live_heartbeat) {
         r#"<span class="status-dot">Online</span>"#
     } else if model.mayhem.route_candidates.is_empty() {
         r#"<span class="status-dot muted">Unavailable</span>"#
@@ -3372,6 +3377,7 @@ fn heartbeat_for_route(
         },
         price_ver: candidate.price_ver,
         min_ask_mu: candidate.min_ask_mu,
+        accepting_new: true,
         caps: heartbeat_caps_for_route(model, candidate),
         att: HeartbeatAttestation {
             epoch: 0,

@@ -112,6 +112,7 @@ pub enum IneligibilityReason {
     Reputation,
     HeartbeatMissing,
     HeartbeatStale,
+    Draining,
     Saturated,
     Capabilities,
     Price,
@@ -478,6 +479,9 @@ pub fn evaluate_eligibility(
         .ok_or(IneligibilityReason::HeartbeatMissing)?;
     if heartbeat_age >= request.heartbeat_ttl_millis {
         return Err(IneligibilityReason::HeartbeatStale);
+    }
+    if !heartbeat.accepting_new {
+        return Err(IneligibilityReason::Draining);
     }
     if heartbeat.sat >= request.saturation_cutoff {
         return Err(IneligibilityReason::Saturated);
@@ -875,6 +879,7 @@ mod tests {
             },
             price_ver: 5,
             min_ask_mu: 0,
+            accepting_new: true,
             caps: caps(),
             att: HeartbeatAttestation {
                 epoch,
@@ -908,6 +913,7 @@ mod tests {
             },
             price_ver: 5,
             min_ask_mu: 0,
+            accepting_new: true,
             caps: caps(),
             att: HeartbeatAttestation {
                 epoch,
@@ -1229,6 +1235,13 @@ mod tests {
         assert_eq!(
             evaluate_eligibility(&bad, &request),
             Err(IneligibilityReason::HeartbeatStale)
+        );
+
+        let mut bad = good.clone();
+        bad.heartbeat.as_mut().expect("heartbeat").accepting_new = false;
+        assert_eq!(
+            evaluate_eligibility(&bad, &request),
+            Err(IneligibilityReason::Draining)
         );
 
         let mut bad = good.clone();

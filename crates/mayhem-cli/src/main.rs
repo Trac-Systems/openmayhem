@@ -21169,7 +21169,7 @@ struct HeartbeatContext<'a> {
     attestation_head: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderLoadSnapshot {
     active_slots: u64,
     active_requests: u64,
@@ -21177,6 +21177,21 @@ struct ProviderLoadSnapshot {
     est_wait_ms: u64,
     ttft_ms: u64,
     measured_tok_s_milli: Option<u64>,
+    accepting_new: bool,
+}
+
+impl Default for ProviderLoadSnapshot {
+    fn default() -> Self {
+        Self {
+            active_slots: 0,
+            active_requests: 0,
+            queue_depth: 0,
+            est_wait_ms: 0,
+            ttft_ms: 0,
+            measured_tok_s_milli: None,
+            accepting_new: true,
+        }
+    }
 }
 
 impl ProviderLoadSnapshot {
@@ -21189,18 +21204,34 @@ impl ProviderLoadSnapshot {
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,
+            accepting_new: true,
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ProviderHeartbeatLoad {
     active_slots: Arc<AtomicU64>,
     active_requests: Arc<AtomicU64>,
     rolling_turn_ms: Arc<AtomicU64>,
     rolling_ttft_ms: Arc<AtomicU64>,
     rolling_tok_s_milli: Arc<AtomicU64>,
+    accepting_new: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+}
+
+impl Default for ProviderHeartbeatLoad {
+    fn default() -> Self {
+        Self {
+            active_slots: Arc::new(AtomicU64::new(0)),
+            active_requests: Arc::new(AtomicU64::new(0)),
+            rolling_turn_ms: Arc::new(AtomicU64::new(0)),
+            rolling_ttft_ms: Arc::new(AtomicU64::new(0)),
+            rolling_tok_s_milli: Arc::new(AtomicU64::new(0)),
+            accepting_new: Arc::new(AtomicBool::new(true)),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl ProviderHeartbeatLoad {
@@ -21229,6 +21260,7 @@ impl ProviderHeartbeatLoad {
             est_wait_ms,
             ttft_ms: self.rolling_ttft_ms.load(Ordering::Relaxed),
             measured_tok_s_milli,
+            accepting_new: self.accepting_new.load(Ordering::Relaxed),
         }
     }
 
@@ -21259,6 +21291,14 @@ impl ProviderHeartbeatLoad {
             .min(u128::from(u64::MAX)) as u64;
             self.store_rolling_ms(&self.rolling_tok_s_milli, tok_s_milli.max(1));
         }
+    }
+
+    fn set_accepting_new(&self, accepting_new: bool) {
+        self.accepting_new.store(accepting_new, Ordering::Relaxed);
+    }
+
+    fn is_accepting_new(&self) -> bool {
+        self.accepting_new.load(Ordering::Relaxed)
     }
 
     fn finish_request(&self) {
@@ -25657,6 +25697,7 @@ async fn send_provider_heartbeat_round(
             "enclave_id": selected.enclave.enclave_id,
             "model_id": selected.enclave.model_id,
             "room_id": room.room_id,
+            "accepting_new": load.accepting_new,
             "sat": provider_saturation(load.active_slots, max_sessions),
             "slots": {
                 "active": load.active_slots,
@@ -25706,6 +25747,7 @@ async fn send_provider_heartbeat_round(
             "seq": seq,
             "min_ask_mu": min_ask_mu,
             "max_sessions": max_sessions,
+            "accepting_new": load.accepting_new,
         }));
     }
     Ok(sent)
@@ -25828,6 +25870,7 @@ async fn serve_provider_sessions(
     let mut pending_requests = HashMap::new();
     let mut pending_payloads = HashMap::new();
     let mut protection = ProviderProtectionState::new(protection_config);
+    let mut draining = false;
     let serve_result: Result<()> = async {
         loop {
             expire_provider_pending_sessions(
@@ -25838,13 +25881,27 @@ async fn serve_provider_sessions(
                 &heartbeat_load,
             )
             .await;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                if !draining {
+                    provider_session_debug(
+                        "serve window elapsed; entering graceful drain and refusing new sessions",
+                    );
+                    heartbeat_load.set_accepting_new(false);
+                    draining = true;
+                }
+                if sessions.is_empty() {
+                    break;
+                }
+            }
             let wait = deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .filter(|remaining| !remaining.is_zero())
                 .unwrap_or_else(|| Duration::from_secs(1));
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                break;
-            }
+            let wait = if draining {
+                Duration::from_secs(1)
+            } else {
+                wait
+            };
             if wait.is_zero() {
                 continue;
             }
@@ -25885,7 +25942,7 @@ async fn serve_provider_sessions(
                         &heartbeat_load,
                     )
                     .await;
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    if draining && sessions.is_empty() {
                         break;
                     }
                 }
@@ -26176,7 +26233,16 @@ async fn handle_provider_session_frame(
             let static_decision = provider_session_open_decision(&frame, terms);
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
-                    let protection_decision = protection.acceptance_decision(sessions.len());
+                    let protection_decision = if heartbeat_load.is_accepting_new() {
+                        protection.acceptance_decision(sessions.len())
+                    } else {
+                        ProviderSessionDecision::Reject {
+                            code: "DRAINING",
+                            reason:
+                                "provider is gracefully draining and not accepting new sessions"
+                                    .to_owned(),
+                        }
+                    };
                     if !matches!(protection_decision, ProviderSessionDecision::Accept) {
                         protection_decision
                     } else {
@@ -35863,9 +35929,12 @@ mod tests {
                 queue_depth: 0,
                 est_wait_ms: 0,
                 ttft_ms: 0,
-                measured_tok_s_milli: None
+                measured_tok_s_milli: None,
+                accepting_new: true
             }
         );
+        load.set_accepting_new(false);
+        assert!(!load.snapshot().accepting_new);
         assert!(!load.is_stopped());
         load.stop();
         assert!(load.is_stopped());
@@ -35969,6 +36038,7 @@ mod tests {
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,
+            accepting_new: true,
         };
 
         assert_eq!(

@@ -177,11 +177,17 @@ pub struct ProviderHeartbeat {
     pub price_ver: u64,
     #[serde(default)]
     pub min_ask_mu: u64,
+    #[serde(default = "default_heartbeat_accepting_new")]
+    pub accepting_new: bool,
     pub caps: HeartbeatCaps,
     pub att: HeartbeatAttestation,
     pub ts: u64,
     pub nonce: String,
     pub sig: String,
+}
+
+fn default_heartbeat_accepting_new() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

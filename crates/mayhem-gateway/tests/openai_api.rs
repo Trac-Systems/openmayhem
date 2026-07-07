@@ -2377,6 +2377,7 @@ fn test_provider_heartbeat(
         perf: HeartbeatPerf { tok_s, ttft_ms },
         price_ver: candidate.price_ver,
         min_ask_mu: 0,
+        accepting_new: true,
         caps: HeartbeatCaps {
             tools: candidate
                 .caps
