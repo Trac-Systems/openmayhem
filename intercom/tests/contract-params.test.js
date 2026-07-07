@@ -15,26 +15,26 @@ import {
 const DAY_SECONDS = 24 * 60 * 60;
 const rulesHash = 'd'.repeat(64);
 const EPOCH_OPERATING_PARAM_VALUES = {
-  epoch_seconds: 7_200,
-  challenge_epochs: 3,
-  holdback_epochs: 12,
-  max_apply_batch: 2_500,
-  max_market_usage_entries: 750,
-  max_tnk_settlement_outputs: 100,
-  fee_bps: 1_200,
-  param_activation_delay_seconds: 3_600,
-  rules_grace_seconds: 300,
-  rate_staleness_seconds: 120,
-  price_min_bps: 2_000,
-  price_max_bps: 30_000,
-  uptime_tick_seconds: 1_800,
+  probation_successful_sessions: 10,
+  probation_seconds: 300,
+  probation_max_concurrent_sessions_per_user: 4,
+  probation_price_max_bps: 12_000,
+  probation_weight_bps: 6_000,
+  auditor_min_reputation_bps: 7_500,
+  auditor_min_age_seconds: 600,
   canary_match_min_bps: 8_500,
   canary_probe_holdback_bps: 1_500,
   canary_probe_release_min_passes: 2,
   probe_reward_mu: 6_000,
+  uptime_tick_seconds: 1_800,
   fraud_slash_bps: 5_000,
   dispute_lost_slash_bps: 1_000,
+  holdback_epochs: 12,
+  fee_bps: 1_200,
   dispute_deposit_mu: 2_000_000,
+  payout_min_mu: 500_000,
+  price_min_bps: 2_000,
+  price_max_bps: 30_000,
   price_rate_limit_seconds: 900,
   market_target_utilization_bps: 7_500,
   market_ema_alpha_bps: 4_000,
@@ -45,6 +45,14 @@ const EPOCH_OPERATING_PARAM_VALUES = {
   market_max_utilization_bps: 60_000,
   market_below_target_discount_bps: 1_000,
   market_above_target_slope_bps: 20_000,
+  epoch_seconds: 7_200,
+  challenge_epochs: 3,
+  max_apply_batch: 2_500,
+  max_market_usage_entries: 750,
+  max_tnk_settlement_outputs: 100,
+  param_activation_delay_seconds: 3_600,
+  rules_grace_seconds: 300,
+  rate_staleness_seconds: 120,
 };
 
 const makeSetParams = (overrides = {}) => ({
@@ -332,6 +340,10 @@ test('MayhemContract epoch and market epoch controls are admin-governed params',
   assert.deepEqual(
     contractEpochAdminParamKeys().sort(),
     Object.keys(EPOCH_OPERATING_PARAM_VALUES).sort()
+  );
+  assert.deepEqual(
+    contractEpochAdminParamKeys().sort(),
+    Object.keys(definitions).sort()
   );
   assert.deepEqual(
     Object.keys(epochDefinitions).sort(),
