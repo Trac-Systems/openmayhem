@@ -1,6 +1,6 @@
 {
   "set_id": "canary-dev-v1",
-  "description": "Small local dev canaries for Qwen3.5-4B MLX/GGUF bring-up. Fingerprints are placeholders until backend calibration in P2b.4.",
+  "description": "Small local dev canaries for Qwen3.5-4B MLX/GGUF bring-up with calibrated token fingerprints.",
   "prompts": [
     {
       "id": "dev-arithmetic-json",

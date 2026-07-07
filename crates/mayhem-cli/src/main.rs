@@ -8632,6 +8632,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         )
     })?;
     validate_calibration_args_for_artifact(artifact, &args)?;
+    verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
     let prompts = load_canary_prompts(
         Some(&canaries_dir),
         &model.canary.set_id,
@@ -8704,6 +8705,46 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     }
     if args.require_match {
         ensure_calibration_matches_catalog(&report)?;
+    }
+    Ok(())
+}
+
+fn verify_calibration_artifact_matches_catalog(
+    artifact: &catalog::CatalogArtifact,
+    artifact_path: &Path,
+) -> Result<()> {
+    if artifact.artifact_root_kind != "blake3_merkle_v1" {
+        bail!(
+            "canary calibration requires admin artifact_root_kind blake3_merkle_v1 for {}; catalog has {}",
+            artifact_path.display(),
+            artifact.artifact_root_kind
+        );
+    }
+    let metadata =
+        fs::metadata(artifact_path).with_context(|| format!("stat {}", artifact_path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "canary calibration requires a local file artifact matching the admin catalog: {}",
+            artifact_path.display()
+        );
+    }
+    if metadata.len() != artifact.weights_bytes {
+        bail!(
+            "local artifact size mismatch for {}; expected admin catalog weights_bytes {}, got {}",
+            artifact_path.display(),
+            artifact.weights_bytes,
+            metadata.len()
+        );
+    }
+    let merkle = build_merkle_manifest(artifact_path, DEFAULT_CHUNK_SIZE)
+        .with_context(|| format!("Merkle-verifying {}", artifact_path.display()))?;
+    if merkle.root != artifact.artifact_root {
+        bail!(
+            "local artifact root mismatch for {}; expected admin catalog artifact_root {}, got {}",
+            artifact_path.display(),
+            artifact.artifact_root,
+            merkle.root
+        );
     }
     Ok(())
 }
@@ -8862,11 +8903,12 @@ fn catalog_canary_matrix(args: CatalogCanaryMatrixArgs) -> Result<()> {
         );
         for entry in &report.entries {
             println!(
-                "- {} / {} ({}) [{}]: {}",
+                "- {} / {} ({}) [{} {}]: {}",
                 entry.model_id,
                 entry.artifact,
                 entry.engine,
                 entry.canary_set,
+                entry.verification_method,
                 entry.calibration_status
             );
             for error in &entry.errors {
@@ -9211,7 +9253,10 @@ fn catalog_canary_evidence_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
-        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id);
+        if model.canary.verification_method != "token_fingerprint" {
+            continue;
+        }
+        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id, true);
         let canary_set_sha256 = match canary_set_file_sha256(&canaries_dir, &model.canary.set_id) {
             Ok(hash) => Some(hash),
             Err(err) => {
@@ -9253,7 +9298,7 @@ fn catalog_canary_evidence_report(
                     )),
                 }
             }
-            let prompt_count = canary_check.as_ref().ok().copied();
+            let prompt_count = canary_check.as_ref().ok().map(|info| info.prompt_count);
             let key = (model.model_id.clone(), artifact_name.clone());
             entry_index.insert(key, entries.len());
             entries.push(CatalogCanaryEvidenceEntry {
@@ -9482,7 +9527,9 @@ fn catalog_canary_evidence_report(
 
     for entry in &mut entries {
         if entry.report_path.is_none() {
-            entry.errors.push("missing calibration report".to_owned());
+            if mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
+                entry.errors.push("missing calibration report".to_owned());
+            }
         }
         entry.ok = entry.errors.is_empty();
         if !entry.ok {
@@ -9624,7 +9671,10 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
         if launch_only && model.tier != "launch" {
             continue;
         }
-        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id);
+        if model.canary.verification_method != "token_fingerprint" {
+            continue;
+        }
+        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id, true);
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
             if let Err(err) = &canary_check {
@@ -9652,6 +9702,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
             let calibration_status = match artifact.engine.as_str() {
                 "llama.cpp" | "mlx" => "ready",
                 "trt-llm" => "requires-prebuilt-trt-engine",
+                "vllm" => "requires-vllm-reference-host",
                 other => {
                     entry_errors.push(format!("unsupported calibration engine {other}"));
                     "unsupported-calibration-engine"
@@ -9677,7 +9728,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                 artifact: artifact_name.clone(),
                 engine: artifact.engine.clone(),
                 canary_set: model.canary.set_id.clone(),
-                prompt_count: canary_check.as_ref().ok().copied(),
+                prompt_count: canary_check.as_ref().ok().map(|info| info.prompt_count),
                 artifact_path,
                 report_path,
                 trt_engine_dir,
@@ -9925,28 +9976,93 @@ fn catalog_canary_matrix_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
-        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id);
+        let canary_check = canary_set_matrix_check(
+            &canaries_dir,
+            &model.canary.set_id,
+            model.canary.verification_method.as_str() == "token_fingerprint",
+        );
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
             if let Err(err) = &canary_check {
                 entry_errors.push(err.clone());
             }
+            let prompt_ids = canary_check
+                .as_ref()
+                .map(|info| info.prompt_ids.as_slice())
+                .unwrap_or(&[]);
             let fingerprint = model.canary.fingerprints.get(artifact_name).cloned();
-            match fingerprint.as_deref() {
-                Some(value) if is_hex_len(value, 64) => {}
-                Some(_) => entry_errors.push(format!(
-                    "canary fingerprint for {artifact_name} must be 32-byte hex"
-                )),
-                None => entry_errors.push(format!(
-                    "canary fingerprint missing artifact {artifact_name}"
-                )),
-            }
-            let calibration_status = match artifact.engine.as_str() {
-                "llama.cpp" | "mlx" => "local-calibration-supported",
-                "trt-llm" | "vllm" => "hardware-gated-calibration",
+            let mut token_prefix_count = None;
+            let mut perceptual_hash_count = None;
+            let calibration_status = match model.canary.verification_method.as_str() {
+                "token_fingerprint" => {
+                    match fingerprint.as_deref() {
+                        Some(value) if is_hex_len(value, 64) => {}
+                        Some(_) => entry_errors.push(format!(
+                            "canary fingerprint for {artifact_name} must be 32-byte hex"
+                        )),
+                        None => entry_errors
+                            .push(format!("canary fingerprint missing artifact {artifact_name}")),
+                    }
+                    match model.canary.token_prefixes.get(artifact_name) {
+                        Some(prefixes) => {
+                            token_prefix_count = Some(prefixes.len());
+                            for prompt_id in prompt_ids {
+                                match prefixes.get(prompt_id) {
+                                    Some(tokens) if !tokens.is_empty() => {}
+                                    Some(_) => entry_errors.push(format!(
+                                        "canary token_prefixes for {artifact_name} prompt {prompt_id} must not be empty"
+                                    )),
+                                    None => entry_errors.push(format!(
+                                        "canary token_prefixes missing prompt {prompt_id} for artifact {artifact_name}"
+                                    )),
+                                }
+                            }
+                        }
+                        None => entry_errors.push(format!(
+                            "canary token_prefixes missing artifact {artifact_name}"
+                        )),
+                    }
+                    match artifact.engine.as_str() {
+                        "llama.cpp" | "mlx" => "token-prefix-local-calibration",
+                        "trt-llm" | "vllm" => "token-prefix-hardware-calibration",
+                        other => {
+                            entry_errors.push(format!(
+                                "unsupported token-fingerprint calibration engine {other}"
+                            ));
+                            "unsupported-token-calibration-engine"
+                        }
+                    }
+                }
+                "seed_perceptual_hash" => {
+                    match model.canary.perceptual_hashes.get(artifact_name) {
+                        Some(hashes) => {
+                            perceptual_hash_count = Some(hashes.len());
+                            if hashes.is_empty() {
+                                entry_errors.push(format!(
+                                    "canary perceptual_hashes for {artifact_name} must not be empty"
+                                ));
+                            }
+                        }
+                        None => entry_errors.push(format!(
+                            "canary perceptual_hashes missing artifact {artifact_name}"
+                        )),
+                    }
+                    "seed-perceptual-hash-calibrated"
+                }
+                "attestation_of_compute" => {
+                    if fingerprint.is_some()
+                        || model.canary.token_prefixes.contains_key(artifact_name)
+                        || model.canary.perceptual_hashes.contains_key(artifact_name)
+                    {
+                        entry_errors.push(format!(
+                            "attestation_of_compute canary for {artifact_name} must not carry token/pHash calibration blobs"
+                        ));
+                    }
+                    "attestation-of-compute-descriptor"
+                }
                 other => {
-                    entry_errors.push(format!("unsupported calibration engine {other}"));
-                    "unsupported-calibration-engine"
+                    entry_errors.push(format!("unsupported canary verification_method {other}"));
+                    "unsupported-verification-method"
                 }
             }
             .to_owned();
@@ -9957,8 +10073,11 @@ fn catalog_canary_matrix_report(
                 artifact: artifact_name.clone(),
                 engine: artifact.engine.clone(),
                 canary_set: model.canary.set_id.clone(),
-                prompt_count: canary_check.as_ref().ok().copied(),
+                verification_method: model.canary.verification_method.clone(),
+                prompt_count: canary_check.as_ref().ok().map(|info| info.prompt_count),
                 fingerprint,
+                token_prefix_count,
+                perceptual_hash_count,
                 calibration_status,
                 ok,
                 errors: entry_errors,
@@ -9998,23 +10117,52 @@ fn catalog_canary_matrix_report(
     }
 }
 
+struct CanarySetMatrixInfo {
+    prompt_count: usize,
+    prompt_ids: Vec<String>,
+}
+
 fn canary_set_matrix_check(
     canaries_dir: &Path,
     set_id: &str,
-) -> std::result::Result<usize, String> {
-    load_canary_prompts(Some(canaries_dir), set_id, None)
-        .map_err(|err| err.to_string())
-        .and_then(|prompts| {
-            for prompt in &prompts {
-                if prompt.temperature.unwrap_or(0.0).abs() > f64::EPSILON {
-                    return Err(format!(
-                        "canary prompt {} in {set_id} must use temperature 0",
-                        prompt.id
-                    ));
-                }
-            }
-            Ok(prompts.len())
-        })
+    require_messages: bool,
+) -> std::result::Result<CanarySetMatrixInfo, String> {
+    let path = canaries_dir.join(format!("{set_id}.json"));
+    let doc: CanarySetDocument = serde_json::from_value(
+        read_json_file(&path)
+            .map_err(|err| format!("reading canary set {}: {err}", path.display()))?,
+    )
+    .map_err(|err| format!("parsing canary set {}: {err}", path.display()))?;
+    if doc.set_id != set_id {
+        return Err(format!(
+            "canary file {} declares set {}",
+            path.display(),
+            doc.set_id
+        ));
+    }
+    if doc.prompts.is_empty() {
+        return Err(format!("canary set {set_id} has no prompts"));
+    }
+    let mut prompt_ids = Vec::with_capacity(doc.prompts.len());
+    for prompt in doc.prompts {
+        if prompt.id.trim().is_empty() {
+            return Err(format!("canary set {set_id} has an empty prompt id"));
+        }
+        if require_messages && prompt.messages.is_empty() {
+            return Err(format!("canary prompt {} has no messages", prompt.id));
+        }
+        if prompt.temperature.unwrap_or(0.0).abs() > f64::EPSILON {
+            return Err(format!(
+                "canary prompt {} in {set_id} must use temperature 0",
+                prompt.id
+            ));
+        }
+        prompt_ids.push(prompt.id);
+    }
+    Ok(CanarySetMatrixInfo {
+        prompt_count: prompt_ids.len(),
+        prompt_ids,
+    })
 }
 
 fn canary_set_file_sha256(
@@ -15211,8 +15359,11 @@ struct CatalogCanaryMatrixEntry {
     artifact: String,
     engine: String,
     canary_set: String,
+    verification_method: String,
     prompt_count: Option<usize>,
     fingerprint: Option<String>,
+    token_prefix_count: Option<usize>,
+    perceptual_hash_count: Option<usize>,
     calibration_status: String,
     ok: bool,
     errors: Vec<String>,
@@ -33835,6 +33986,34 @@ mod tests {
     }
 
     #[test]
+    fn calibration_artifact_guard_accepts_matching_admin_merkle_root() {
+        let dir = test_temp_dir("mayhem-calibration-artifact-match");
+        let artifact_path = dir.join("model.gguf");
+        fs::write(&artifact_path, b"admin-approved-bytes").unwrap();
+        let merkle = build_merkle_manifest(&artifact_path, DEFAULT_CHUNK_SIZE).unwrap();
+        let mut artifact = test_catalog(&merkle.root).models[0].artifacts["gguf-q4_k_m"].clone();
+        artifact.weights_bytes = merkle.total_bytes;
+
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+    }
+
+    #[test]
+    fn calibration_artifact_guard_rejects_wrong_local_bytes() {
+        let dir = test_temp_dir("mayhem-calibration-artifact-mismatch");
+        let artifact_path = dir.join("model.gguf");
+        fs::write(&artifact_path, b"provider-substituted-bytes").unwrap();
+        let merkle = build_merkle_manifest(&artifact_path, DEFAULT_CHUNK_SIZE).unwrap();
+        let mut artifact =
+            test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
+        artifact.weights_bytes = merkle.total_bytes;
+
+        let err =
+            verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap_err();
+
+        assert!(err.to_string().contains("local artifact root mismatch"));
+    }
+
+    #[test]
     fn calibration_args_restrict_trt_knobs_to_trt_artifacts() {
         let catalog = test_catalog(&"aa".repeat(32));
         let artifact = &catalog.models[0].artifacts["gguf-q4_k_m"];
@@ -33867,10 +34046,18 @@ mod tests {
             .canary
             .fingerprints
             .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        catalog.models[0].canary.token_prefixes.insert(
+            "gguf-q4_k_m".to_owned(),
+            BTreeMap::from([("p1".to_owned(), vec![1])]),
+        );
         catalog.models[0]
             .canary
             .fingerprints
             .insert("nvfp4".to_owned(), "bb".repeat(32));
+        catalog.models[0].canary.token_prefixes.insert(
+            "nvfp4".to_owned(),
+            BTreeMap::from([("p1".to_owned(), vec![2])]),
+        );
         let canaries_dir = test_canary_dir("test-canary-zero", 0.0);
 
         let report = catalog_canary_matrix_report(
@@ -33884,7 +34071,8 @@ mod tests {
         assert_eq!(report.model_count, 1);
         assert_eq!(report.artifact_count, 2);
         assert!(report.entries.iter().any(|entry| {
-            entry.artifact == "nvfp4" && entry.calibration_status == "hardware-gated-calibration"
+            entry.artifact == "nvfp4"
+                && entry.calibration_status == "token-prefix-hardware-calibration"
         }));
     }
 
@@ -33920,6 +34108,77 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.contains("must use temperature 0")));
+    }
+
+    #[test]
+    fn canary_matrix_requires_token_prefixes_for_runtime_token_canaries() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].canary.set_id = "test-canary-zero".to_owned();
+        catalog.models[0]
+            .canary
+            .fingerprints
+            .insert("gguf-q4_k_m".to_owned(), "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary-zero", 0.0);
+
+        let report = catalog_canary_matrix_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("token_prefixes missing artifact gguf-q4_k_m")));
+    }
+
+    #[test]
+    fn canary_matrix_accepts_seed_phash_and_attestation_descriptors() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].model_class = "image-generation".to_owned();
+        catalog.models[0].canary.set_id = "test-image-canary".to_owned();
+        catalog.models[0].canary.verification_method = "seed_perceptual_hash".to_owned();
+        catalog.models[0].canary.verification_tolerance_bps = Some(1_500);
+        catalog.models[0].canary.perceptual_hashes.insert(
+            "gguf-q4_k_m".to_owned(),
+            BTreeMap::from([("p1".to_owned(), "e0e0d8d8d8f83e56".to_owned())]),
+        );
+        let canaries_dir = test_canary_dir("test-image-canary", 0.0);
+
+        let report = catalog_canary_matrix_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir.clone(),
+            true,
+        );
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(
+            report.entries[0].calibration_status,
+            "seed-perceptual-hash-calibrated"
+        );
+        assert_eq!(report.entries[0].perceptual_hash_count, Some(1));
+
+        catalog.models[0].model_class = "stt".to_owned();
+        catalog.models[0].canary.verification_method = "attestation_of_compute".to_owned();
+        catalog.models[0].canary.verification_tolerance_bps = None;
+        catalog.models[0].canary.perceptual_hashes.clear();
+        let report = catalog_canary_matrix_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+        );
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(
+            report.entries[0].calibration_status,
+            "attestation-of-compute-descriptor"
+        );
     }
 
     #[test]
@@ -34115,6 +34374,41 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.contains("missing calibration report")));
+    }
+
+    #[test]
+    fn canary_apply_allows_partial_report_set_for_launch_artifacts() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let mut mlx_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        mlx_artifact.engine = "mlx".to_owned();
+        mlx_artifact.artifact_root = "bb".repeat(32);
+        catalog.models[0]
+            .artifacts
+            .insert("mlx-4bit".to_owned(), mlx_artifact);
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        insert_test_canary_expectation(&mut catalog.models[0], "mlx-4bit", "bb".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert_eq!(report.artifact_count, 2);
+        assert_eq!(report.report_count, 1);
+        assert!(report.entries.iter().any(|entry| {
+            entry.artifact == "mlx-4bit" && entry.report_path.is_none() && entry.ok
+        }));
     }
 
     #[test]

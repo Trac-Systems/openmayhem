@@ -1,6 +1,6 @@
 {
   "set_id": "canary-launch-v1",
-  "description": "Launch-model canary prompts shared across llama.cpp, MLX, and TensorRT-LLM artifacts. Per-backend numeric fingerprints are calibrated in P2b.4.",
+  "description": "Launch-model temperature-0 canary prompts for calibrated per-backend token-prefix fingerprints.",
   "prompts": [
     {
       "id": "launch-instruction-following",
