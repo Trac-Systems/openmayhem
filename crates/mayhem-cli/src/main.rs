@@ -88,6 +88,9 @@ const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_LENGTH_MILLIS: u64 = 3_600_000;
+const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
+const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
+const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
 const DEFAULT_RELEASE_FEED_URL: &str =
     "https://api.github.com/repos/Trac-Systems/operationmayhem/releases/latest";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
@@ -147,6 +150,8 @@ enum Commands {
     },
     /// Start the local Mayhem peer, bridge, gateway, and optional provider worker.
     Up(UpArgs),
+    /// Stop the local Mayhem supervisor and all supervised children.
+    Down(DownArgs),
     /// Start the local OpenAI-compatible user gateway.
     Use(UseArgs),
     /// List models from the ledger-anchored admin catalog release.
@@ -589,6 +594,25 @@ struct StatusArgs {
 }
 
 #[derive(Debug, Parser)]
+struct DownArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Maximum seconds to wait for the supervisor to stop.
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+
+    /// Send a hard kill if graceful shutdown does not complete before the timeout.
+    #[arg(long)]
+    force: bool,
+
+    /// Print a machine-readable shutdown report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct SessionHistoryArgs {
     /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
     #[arg(long)]
@@ -689,6 +713,14 @@ struct ResetArgs {
     /// Required confirmation for removing local state.
     #[arg(long)]
     yes: bool,
+
+    /// Stop a live mayhemd stack before removing local state.
+    #[arg(long)]
+    force: bool,
+
+    /// Maximum seconds to wait for a forced live-stack shutdown.
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
 
     /// Print a machine-readable removal report.
     #[arg(long)]
@@ -3895,8 +3927,9 @@ async fn main() -> Result<()> {
             ConfigCommands::Get(args) => config_get(args),
             ConfigCommands::Set(args) => config_set(args),
         },
-        Commands::Reset(args) => reset(args, "reset"),
-        Commands::Uninstall(args) => reset(args, "uninstall"),
+        Commands::Down(args) => down(args).await,
+        Commands::Reset(args) => reset(args, "reset").await,
+        Commands::Uninstall(args) => reset(args, "uninstall").await,
         Commands::Opencode(args) => opencode(args).await,
         Commands::Auditor { command } => match command {
             AuditorCommands::Canary(args) => auditor_canary(args).await,
@@ -14701,6 +14734,295 @@ fn mayhemd_launcher_command(mayhemd_path: &Path) -> Result<std::process::Command
     }
 }
 
+fn mayhemd_pid_path(home: &Path) -> PathBuf {
+    home.join(MAYHEMD_PID_FILE)
+}
+
+fn mayhemd_state_path(home: &Path) -> PathBuf {
+    home.join(MAYHEMD_STATE_FILE)
+}
+
+fn mayhemd_up_config_path(home: &Path) -> PathBuf {
+    home.join(MAYHEMD_UP_CONFIG_FILE)
+}
+
+fn read_pid_file(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{} is empty", path.display());
+    }
+    let pid = trimmed
+        .parse::<u32>()
+        .with_context(|| format!("parsing pid from {}", path.display()))?;
+    Ok(Some(pid))
+}
+
+fn process_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        return std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        return std::process::Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn send_process_signal(pid: u32, force: bool) -> Result<bool> {
+    if pid == 0 {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        let signal = if force { "-KILL" } else { "-TERM" };
+        let status = std::process::Command::new("kill")
+            .arg(signal)
+            .arg(pid.to_string())
+            .status()
+            .with_context(|| format!("sending {signal} to pid {pid}"))?;
+        return Ok(status.success());
+    }
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("taskkill");
+        command.arg("/PID").arg(pid.to_string()).arg("/T");
+        if force {
+            command.arg("/F");
+        }
+        let status = command
+            .status()
+            .with_context(|| format!("stopping process pid {pid}"))?;
+        return Ok(status.success());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = force;
+        Ok(false)
+    }
+}
+
+async fn wait_for_process_stop(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_is_running(pid) {
+            return true;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    !process_is_running(pid)
+}
+
+fn read_json_file_if_exists(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn supervisor_bind_from_home(home: &Path, state: Option<&Value>) -> Option<String> {
+    state
+        .and_then(|value| value.get("bind"))
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)
+        .or_else(|| {
+            read_config_toml_value(&mayhemd_up_config_path(home))
+                .ok()
+                .and_then(|config| {
+                    toml_get_path(&config, "supervisor.bind")
+                        .and_then(toml::Value::as_str)
+                        .and_then(non_empty_string)
+                })
+        })
+}
+
+fn supervisor_child_processes(state: Option<&Value>) -> Vec<Value> {
+    state
+        .and_then(|value| value.get("children"))
+        .and_then(Value::as_object)
+        .map(|children| {
+            children
+                .values()
+                .map(|child| {
+                    let pid = child.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    json!({
+                        "name": child.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "pid": if pid == 0 { Value::Null } else { json!(pid) },
+                        "running": pid != 0 && process_is_running(pid),
+                        "last_exit": child.get("last_exit").cloned().unwrap_or(Value::Null),
+                        "last_error": child.get("last_error").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn down_home(home: &Path, timeout_seconds: u64, force: bool) -> Result<Value> {
+    if timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    let pid_file = mayhemd_pid_path(home);
+    let state_file = mayhemd_state_path(home);
+    let state = read_json_file_if_exists(&state_file)?;
+    let pid = read_pid_file(&pid_file)?;
+    let mut term_sent = false;
+    let mut kill_sent = false;
+    let mut stale_pidfile_removed = false;
+    let mut pidfile_removed = false;
+    let mut running = pid.map(process_is_running).unwrap_or(false);
+
+    if let Some(pid) = pid {
+        if running {
+            term_sent = send_process_signal(pid, false)?;
+            let stopped = wait_for_process_stop(pid, Duration::from_secs(timeout_seconds)).await;
+            running = !stopped && process_is_running(pid);
+            if running && force {
+                kill_sent = send_process_signal(pid, true)?;
+                let stopped =
+                    wait_for_process_stop(pid, Duration::from_secs(timeout_seconds)).await;
+                running = !stopped && process_is_running(pid);
+            }
+            if running {
+                bail!(
+                    "mayhemd pid {pid} is still running after {timeout_seconds}s; pass --force to send a hard kill"
+                );
+            }
+        } else {
+            stale_pidfile_removed = true;
+        }
+    }
+
+    if pid_file.exists() && !running {
+        fs::remove_file(&pid_file).with_context(|| format!("removing {}", pid_file.display()))?;
+        pidfile_removed = true;
+    }
+
+    let children = supervisor_child_processes(state.as_ref());
+    let leftover_children = children
+        .iter()
+        .filter(|child| child.get("running").and_then(Value::as_bool) == Some(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !leftover_children.is_empty() {
+        bail!(
+            "mayhemd stopped but supervised child process(es) are still running: {}",
+            serde_json::to_string(&leftover_children)?
+        );
+    }
+
+    Ok(json!({
+        "ok": true,
+        "home": home,
+        "pid_file": pid_file,
+        "state_file": state_file,
+        "pid": pid,
+        "running": running,
+        "stopped": pid.is_some() && !running,
+        "term_sent": term_sent,
+        "kill_sent": kill_sent,
+        "pidfile_removed": pidfile_removed,
+        "stale_pidfile_removed": stale_pidfile_removed,
+        "children": children,
+    }))
+}
+
+async fn mayhemd_status_report(home: &Path, client: &reqwest::Client) -> Value {
+    let pid_file = mayhemd_pid_path(home);
+    let state_file = mayhemd_state_path(home);
+    let config_path = mayhemd_up_config_path(home);
+    let pid = match read_pid_file(&pid_file) {
+        Ok(pid) => pid,
+        Err(err) => {
+            return json!({
+                "ok": false,
+                "expected": true,
+                "pid_file": pid_file,
+                "state_file": state_file,
+                "config_path": config_path,
+                "error": err.to_string(),
+            });
+        }
+    };
+    let state = match read_json_file_if_exists(&state_file) {
+        Ok(state) => state,
+        Err(err) => {
+            return json!({
+                "ok": false,
+                "expected": true,
+                "pid_file": pid_file,
+                "state_file": state_file,
+                "config_path": config_path,
+                "pid": pid,
+                "error": err.to_string(),
+            });
+        }
+    };
+    let running = pid.map(process_is_running).unwrap_or(false);
+    let expected = pid.is_some() || state.is_some() || config_path.exists();
+    let bind = supervisor_bind_from_home(home, state.as_ref());
+    let url = bind.as_ref().map(|bind| format!("http://{bind}"));
+    let http_status = if running {
+        match url.as_ref() {
+            Some(url) => fetch_gateway_json(client, &format!("{url}/status"))
+                .await
+                .unwrap_or_else(component_error),
+            None => component_error("mayhemd bind address is unknown"),
+        }
+    } else if expected {
+        component_error("mayhemd is not running")
+    } else {
+        Value::Null
+    };
+    let http_ok = http_status.get("ok").and_then(Value::as_bool) == Some(true);
+    let children = supervisor_child_processes(state.as_ref());
+    json!({
+        "ok": if expected { running && http_ok } else { true },
+        "expected": expected,
+        "pid_file": pid_file,
+        "pid_file_present": pid.is_some(),
+        "state_file": state_file,
+        "state_file_present": state.is_some(),
+        "config_path": config_path,
+        "config_present": config_path.exists(),
+        "pid": pid,
+        "running": running,
+        "bind": bind,
+        "url": url,
+        "status": http_status,
+        "state": state,
+        "children": children,
+    })
+}
+
 async fn wait_until_ready<F, Fut>(label: &str, deadline: Instant, mut check: F) -> Result<Value>
 where
     F: FnMut() -> Fut,
@@ -15398,11 +15720,17 @@ async fn status(args: StatusArgs) -> Result<()> {
         "status": gateway_status.unwrap_or_else(component_error),
         "receipts": gateway_receipts.unwrap_or_else(component_error),
     });
+    let supervisor = mayhemd_status_report(&home, &client).await;
+    let supervisor_expected = supervisor
+        .get("expected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let report = json!({
         "ok": wallet.get("ok").and_then(Value::as_bool) == Some(true)
             && peer.get("ok").and_then(Value::as_bool) == Some(true)
-            && gateway.get("ok").and_then(Value::as_bool) == Some(true),
+            && gateway.get("ok").and_then(Value::as_bool) == Some(true)
+            && (!supervisor_expected || supervisor.get("ok").and_then(Value::as_bool) == Some(true)),
         "node": {
             "home": home,
             "config_present": config.is_some(),
@@ -15413,6 +15741,7 @@ async fn status(args: StatusArgs) -> Result<()> {
                 .unwrap_or("unknown"),
         },
         "wallet": wallet,
+        "supervisor": supervisor,
         "peer": peer,
         "gateway": gateway,
     });
@@ -15421,6 +15750,25 @@ async fn status(args: StatusArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_status_report(&report);
+    }
+    Ok(())
+}
+
+async fn down(args: DownArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let report = down_home(&home, args.timeout_seconds, args.force).await?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report["pid"].is_null() {
+        println!("Mayhem is already down.");
+    } else if report["stopped"].as_bool() == Some(true) {
+        println!(
+            "Mayhem down OK: stopped mayhemd pid {}.",
+            report["pid"].as_u64().unwrap_or(0)
+        );
+    } else {
+        println!("Mayhem down OK.");
     }
     Ok(())
 }
@@ -15627,6 +15975,32 @@ fn print_status_report(report: &Value) {
             report["wallet"]["error"].as_str().unwrap_or("unavailable")
         }
     );
+    let supervisor = &report["supervisor"];
+    if supervisor["expected"].as_bool() == Some(true) {
+        if supervisor["ok"].as_bool() == Some(true) {
+            let child_count = supervisor["status"]["children"]
+                .as_object()
+                .map(|children| children.len())
+                .or_else(|| supervisor["children"].as_array().map(Vec::len))
+                .unwrap_or(0);
+            println!(
+                "Mayhemd: ok pid={} children={}",
+                supervisor["pid"].as_u64().unwrap_or(0),
+                child_count
+            );
+        } else if supervisor["running"].as_bool() == Some(true) {
+            println!(
+                "Mayhemd: running but unhealthy ({})",
+                supervisor["status"]["error"]
+                    .as_str()
+                    .unwrap_or("status unavailable")
+            );
+        } else {
+            println!("Mayhemd: stopped");
+        }
+    } else {
+        println!("Mayhemd: not started");
+    }
     println!(
         "Peer RPC: {}",
         if report["peer"]["ok"].as_bool() == Some(true) {
@@ -15777,7 +16151,10 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
     Ok(())
 }
 
-fn reset(args: ResetArgs, action: &'static str) -> Result<()> {
+async fn reset(args: ResetArgs, action: &'static str) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     if !args.yes {
@@ -15786,11 +16163,32 @@ fn reset(args: ResetArgs, action: &'static str) -> Result<()> {
             home.display()
         );
     }
+    let pid_file = mayhemd_pid_path(&home);
+    let pid = read_pid_file(&pid_file)?;
+    let running = pid.map(process_is_running).unwrap_or(false);
+    if running && !args.force {
+        let down_cmd = format!(
+            "mayhem down --home {}",
+            shell_single_quote(&home.display().to_string())
+        );
+        bail!(
+            "refusing to {action} {} while mayhemd pid {} is running; run `{}` first or pass --force",
+            home.display(),
+            pid.unwrap_or_default(),
+            down_cmd
+        );
+    }
+    let down = if pid.is_some() {
+        Some(down_home(&home, args.timeout_seconds, args.force).await?)
+    } else {
+        None
+    };
     let removed = remove_local_state_path(&home)?;
     let report = json!({
         "ok": true,
         "action": action,
         "home": home,
+        "down": down,
         "removed": removed,
     });
 
@@ -29732,6 +30130,25 @@ mod tests {
         assert_eq!(args.timeout_seconds, 2);
         assert!(args.json);
 
+        let down = Cli::try_parse_from([
+            "mayhem",
+            "down",
+            "--home",
+            "/tmp/mayhem-down",
+            "--timeout-seconds",
+            "7",
+            "--force",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Down(args) = down.command else {
+            panic!("expected down command");
+        };
+        assert_eq!(args.home.as_deref(), Some(Path::new("/tmp/mayhem-down")));
+        assert_eq!(args.timeout_seconds, 7);
+        assert!(args.force);
+        assert!(args.json);
+
         let history = Cli::try_parse_from([
             "mayhem",
             "history",
@@ -29822,13 +30239,23 @@ mod tests {
         assert_eq!(args.key, "sc-bridge-url");
         assert_eq!(args.value, "ws://127.0.0.1:8001");
 
-        let reset =
-            Cli::try_parse_from(["mayhem", "reset", "--home", "/tmp/mayhem-reset", "--yes"])
-                .unwrap();
+        let reset = Cli::try_parse_from([
+            "mayhem",
+            "reset",
+            "--home",
+            "/tmp/mayhem-reset",
+            "--yes",
+            "--force",
+            "--timeout-seconds",
+            "4",
+        ])
+        .unwrap();
         let Commands::Reset(args) = reset.command else {
             panic!("expected reset command");
         };
         assert!(args.yes);
+        assert!(args.force);
+        assert_eq!(args.timeout_seconds, 4);
 
         let uninstall = Cli::try_parse_from([
             "mayhem",
@@ -29843,6 +30270,7 @@ mod tests {
             panic!("expected uninstall command");
         };
         assert!(args.yes);
+        assert!(!args.force);
         assert!(args.json);
 
         let opencode = Cli::try_parse_from([
@@ -29909,8 +30337,8 @@ mod tests {
         fs::remove_dir_all(&home).unwrap();
     }
 
-    #[test]
-    fn reset_requires_confirmation_and_removes_home() {
+    #[tokio::test]
+    async fn reset_requires_confirmation_and_removes_home() {
         let home = test_temp_dir("mayhem-reset");
         fs::create_dir_all(home.join("nested")).unwrap();
         fs::write(home.join("nested").join("state.json"), "{}").unwrap();
@@ -29918,22 +30346,61 @@ mod tests {
             ResetArgs {
                 home: Some(home.clone()),
                 yes: false,
+                force: false,
+                timeout_seconds: 1,
                 json: false,
             },
             "reset",
         )
+        .await
         .is_err());
         assert!(home.exists());
         reset(
             ResetArgs {
                 home: Some(home.clone()),
                 yes: true,
+                force: false,
+                timeout_seconds: 1,
                 json: false,
             },
             "reset",
         )
+        .await
         .unwrap();
         assert!(!home.exists());
+    }
+
+    #[tokio::test]
+    async fn down_removes_stale_pidfile() {
+        let home = test_temp_dir("mayhem-down-stale");
+        fs::write(mayhemd_pid_path(&home), "999999999").unwrap();
+        let report = down_home(&home, 1, false).await.unwrap();
+        assert_eq!(report["ok"].as_bool(), Some(true));
+        assert_eq!(report["stale_pidfile_removed"].as_bool(), Some(true));
+        assert!(!mayhemd_pid_path(&home).exists());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_refuses_live_mayhemd_without_force() {
+        let home = test_temp_dir("mayhem-reset-live");
+        fs::write(mayhemd_pid_path(&home), std::process::id().to_string()).unwrap();
+        fs::write(home.join("state.json"), "{}").unwrap();
+        let err = reset(
+            ResetArgs {
+                home: Some(home.clone()),
+                yes: true,
+                force: false,
+                timeout_seconds: 1,
+                json: false,
+            },
+            "reset",
+        )
+        .await
+        .expect_err("reset must refuse a live mayhemd pid without --force");
+        assert!(format!("{err:#}").contains("refusing to reset"), "{err:#}");
+        assert!(home.exists());
+        fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
