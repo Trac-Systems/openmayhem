@@ -94,6 +94,7 @@ const PARAM_DEFINITIONS = Object.freeze({
   rules_grace_seconds: { default: 14 * 24 * 60 * 60, min: 0, max: 365 * 24 * 60 * 60 },
   challenge_epochs: { default: 6, min: 0, max: 1_000_000 },
   max_apply_batch: { default: 2_000, min: 1, max: 5_000 },
+  max_tnk_settlement_outputs: { default: LEDGER_BATCH_SCHEMA_MAX, min: 1, max: LEDGER_BATCH_SCHEMA_MAX },
   param_activation_delay_seconds: { default: DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS, min: 0, max: 30 * DAY_SECONDS },
 });
 const REPUTATION_EVENT_KINDS = new Set([
@@ -3644,6 +3645,10 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     const shapeError = this.validateTnkSettlementValue(this.value);
     if (shapeError) return shapeError;
+    const settlementParams = await this.activeParamsAt(this.value.at, ['max_tnk_settlement_outputs']);
+    if (this.value.outputs.length > settlementParams.max_tnk_settlement_outputs) {
+      return new Error('TNK settlement output batch exceeds max_tnk_settlement_outputs.');
+    }
 
     const outputs = this.normalizeTnkSettlementOutputs(this.value.outputs);
     if (outputs instanceof Error) return outputs;

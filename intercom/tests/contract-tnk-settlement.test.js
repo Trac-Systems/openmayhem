@@ -24,7 +24,7 @@ const rate = {
 
 const tnkE18 = (whole) => `${whole}000000000000000000`;
 
-async function setupTnkSettlementContract() {
+async function setupTnkSettlementContract(paramOverrides = {}) {
   const admin = await makeIdentity();
   const providers = [
     { identity: await makeIdentity(), target: 'testtrac1providerone', gross_mu: 2_000_000 },
@@ -51,7 +51,7 @@ async function setupTnkSettlementContract() {
         op: 'set_params',
         submitted_at: 0,
         effective_at: 86_400,
-        values: { holdback_epochs: 0, challenge_epochs: 0 },
+        values: { holdback_epochs: 0, challenge_epochs: 0, ...paramOverrides },
       },
       sender: admin.publicKey,
       txNo: 2,
@@ -273,4 +273,18 @@ test('MayhemContract tnkSettlement records one real batch and is idempotent', as
   );
   assert.match(changed.message, /already exists/i);
   assert.equal(ctx.storage.snapshotBytes(), snapshot);
+});
+
+test('MayhemContract tnkSettlement uses the active admin max_tnk_settlement_outputs param', async () => {
+  const ctx = await setupTnkSettlementContract({ max_tnk_settlement_outputs: 2 });
+  const settlement = await settlementValue(ctx);
+
+  const tooManyOutputs = await executeTnkSettlementFeature(
+    ctx.contract,
+    ctx.storage,
+    settlement,
+    ctx.admin.publicKey
+  );
+  assert.match(tooManyOutputs.message, /max_tnk_settlement_outputs/i);
+  assert.equal(await ctx.storage.get('settle/tnk/1'), null);
 });
