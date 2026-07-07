@@ -15875,6 +15875,63 @@ mod tests {
                 .status,
             StatusCode::UNAUTHORIZED
         );
+
+        let rejected_token = |mut token: GatewayTokenRecord| {
+            token.token_hash = gateway_token_hash("sk-mayhem-rejected");
+            let store = GatewayTokenStore {
+                version: 1,
+                tokens: vec![token],
+            };
+            let access = GatewayAccessControl::new(true, store, None);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer sk-mayhem-rejected"),
+            );
+            access
+                .authorize(&headers, Some("mayhem/dev-chat-tools"))
+                .unwrap_err()
+                .status
+        };
+        let base = GatewayTokenRecord {
+            name: "agent".to_owned(),
+            token_hash: gateway_token_hash("unused"),
+            token_id: "tok_rejected".to_owned(),
+            created_at: 1,
+            expires_at: None,
+            budget_mu: None,
+            budget_period: None,
+            spent_total_mu: 0,
+            spent_period_mu: 0,
+            period_started_at: Some(1),
+            max_rate_per_minute: None,
+            models: Vec::new(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        assert_eq!(
+            rejected_token(GatewayTokenRecord {
+                revoked_at: Some(2),
+                ..base.clone()
+            }),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            rejected_token(GatewayTokenRecord {
+                expires_at: Some(1),
+                ..base.clone()
+            }),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            rejected_token(GatewayTokenRecord {
+                budget_mu: Some(7),
+                budget_period: Some(GatewayTokenBudgetPeriod::Total),
+                spent_total_mu: 7,
+                ..base
+            }),
+            StatusCode::PAYMENT_REQUIRED
+        );
     }
 
     #[test]

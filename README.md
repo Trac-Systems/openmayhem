@@ -141,10 +141,10 @@ Share one funded gateway with another machine or agent only after creating a bea
 
 ```bash
 mayhem tokens create --name laptop --budget 10/day --max-rate 60
-mayhem use --bind 0.0.0.0:11435
+mayhem up --gateway-bind 0.0.0.0:11435
 ```
 
-`mayhem tokens create` prints `sk-mayhem-...` once and stores only a hash in your Mayhem home. Non-loopback binds refuse to start until at least one active token exists, then require `Authorization: Bearer sk-mayhem-...` on OpenAI-compatible requests. Loopback stays token-optional unless you add `--require-auth`. Tokens partition access, budgets, rate limits, model allowlists, and spend attribution; all usage still settles from the gateway owner's single balance and identity. WAN exposure should go through a TLS reverse proxy or Tailscale/VPN; the gateway itself serves plain HTTP.
+`mayhem tokens create` prints `sk-mayhem-...` once and stores only a hash in your Mayhem home. Non-loopback binds refuse to start until at least one active token exists, then require `Authorization: Bearer sk-mayhem-...` on OpenAI-compatible requests. Loopback stays token-optional unless you add `--gateway-require-auth` to `mayhem up` or `--require-auth` to `mayhem use`. Tokens partition access, budgets, rate limits, model allowlists, and spend attribution; all usage still settles from the gateway owner's single balance and identity. WAN exposure should go through a TLS reverse proxy or Tailscale/VPN; the gateway itself serves plain HTTP.
 
 For sensitive prompts, inspect available trust tiers before choosing a route:
 
@@ -296,7 +296,7 @@ Providers choose which admin-supported rails they accept; they do not set prices
 | User | `/mayhem/dashboard` | Balance, sessions, spend history, local gateway status, and model catalog. |
 | Provider | `/mayhem/dashboard/provider` | Enclave status, live sessions, earnings, reputation/holdback, and claim commands. |
 
-The default server bind is `127.0.0.1`. A user gateway can be shared on a LAN with `mayhem use --bind <addr:port>` only when hashed bearer tokens are configured; non-loopback startup prints copy/paste URLs plus a plain HTTP/TLS-or-VPN notice. Dashboard pages still use their short-lived dashboard session token, and assets are served locally.
+The default server bind is `127.0.0.1`. A user gateway can be shared on a LAN with `mayhem up --gateway-bind <addr:port>` or the lower-level `mayhem use --bind <addr:port>` only when hashed bearer tokens are configured; non-loopback startup prints copy/paste URLs plus a plain HTTP/TLS-or-VPN notice. Dashboard pages still use their short-lived dashboard session token, and assets are served locally.
 
 ## Reference
 

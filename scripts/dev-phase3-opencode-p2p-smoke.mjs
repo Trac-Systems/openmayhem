@@ -78,6 +78,12 @@ Environment:
   MAYHEM_PHASE3_CHAT_MAX_TOKENS Curl-compatible chat max_tokens (default: 32)
   MAYHEM_PHASE3_CHAT_ATTEMPTS Curl-compatible chat attempts after provider is ready (default: 3)
   MAYHEM_PHASE3_CHAT_RETRY_DELAY_SECONDS Delay between chat retries (default: 35; gateway cooloff is 30s)
+  MAYHEM_PHASE3_SERVED_CTX    Context tokens pinned across admin caps, provider terms, and gateway route (default: 8192)
+  MAYHEM_PHASE3_SHARED_GATEWAY Start the gateway on 0.0.0.0 with bearer-token auth (default: 0)
+  MAYHEM_PHASE3_SHARED_GATEWAY_BIND_HOST Shared gateway bind host (default: 0.0.0.0)
+  MAYHEM_PHASE3_REMOTE_GATEWAY_CLIENT Run a Mac mini stock OpenAI SDK client against the shared gateway (default: shared flag)
+  MAYHEM_PHASE3_REMOTE_INSTALL_OPENAI Create a remote venv and pip install openai if missing (default: 1)
+  MAYHEM_PHASE3_SETTLE_EPOCH Run epoch commit/apply after chat (default: 1)
   MAYHEM_PHASE3_LONG_STREAM    Also run a long streaming memory probe (default: 0)
   MAYHEM_PHASE3_LONG_CHAT_MAX_TOKENS Long streaming probe max_tokens (default: 2048)
   MAYHEM_PHASE3_LONG_MEMORY_MAX_DELTA_KIB Max gateway RSS delta during long probe (default: 131072)
@@ -166,6 +172,10 @@ function envFlag(name, fallback = false) {
   return /^(1|true|yes)$/i.test(raw);
 }
 
+function bearerHeaders(token) {
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
 function sampleRssKiB(pid) {
   if (!pid) return null;
   const result = spawnSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' });
@@ -223,6 +233,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
   memoryLabel = 'gateway',
   memorySampleIntervalMs = 1000,
   memoryMaxDeltaKiB = null,
+  bearerToken = null,
 } = {}) {
   const rawPath = path.join(runDir, `${fileStem}.sse`);
   const summaryPath = path.join(runDir, `${fileStem}.json`);
@@ -247,7 +258,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
   try {
     const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...bearerHeaders(bearerToken) },
       body: JSON.stringify({
         model: modelId,
         stream: true,
@@ -331,6 +342,7 @@ async function runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
     data_events: dataEvents,
     json_events: jsonEvents,
     done_seen: doneSeen,
+    auth: bearerToken ? 'bearer' : 'none',
     timing_ms: {
       response_headers: responseHeadersAt === null ? null : responseHeadersAt - startedAt,
       first_chunk: firstChunkAt === null ? null : firstChunkAt - startedAt,
@@ -577,8 +589,10 @@ async function settleGatewayReceiptEpoch({
   };
 }
 
-async function fetchGatewayReceipts(gatewayUrl) {
-  const response = await fetch(`${gatewayUrl}/mayhem/receipts`);
+async function fetchGatewayReceipts(gatewayUrl, bearerToken = null) {
+  const response = await fetch(`${gatewayUrl}/mayhem/receipts`, {
+    headers: bearerHeaders(bearerToken),
+  });
   if (!response.ok) {
     fail(`gateway receipt fetch failed with HTTP ${response.status}`);
   }
@@ -611,6 +625,10 @@ function gatewayNewReceipts(receipts, previousKeys) {
 function gatewayReceiptIsFinal(entry) {
   const body = gatewayReceiptBody(entry);
   return body?.final === true || body?.final_receipt === true;
+}
+
+function gatewayReceiptAccessToken(entry) {
+  return entry?.access_token || null;
 }
 
 function gatewayReceiptOutputTokens(entry) {
@@ -987,12 +1005,12 @@ async function waitForFilePattern(file, pattern, timeoutMs, label, processCheck)
   fail(`timed out waiting for ${label}; last log tail:\n${last.split('\n').slice(-40).join('\n')}`);
 }
 
-async function waitHttp(url, timeoutMs, label, processCheck) {
+async function waitHttp(url, timeoutMs, label, processCheck, init = {}) {
   const deadline = Date.now() + timeoutMs;
   let lastErr = '';
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, init);
       if (response.ok) return;
       lastErr = `${response.status} ${response.statusText}`;
     } catch (err) {
@@ -1201,6 +1219,135 @@ async function waitReverseTunnel(remote, passFile, url, tunnel, tunnelLog, label
   fail(`${label} reverse tunnel did not answer ${url}: ${lastErr}; see ${tunnelLog}`);
 }
 
+async function ensureRemoteOpenAiPython(remote, passFile, remoteRun, remoteLogs) {
+  const systemPython = '/usr/bin/python3';
+  try {
+    await ssh(remote, passFile, `${systemPython} -c 'import openai'`, { timeoutMs: 20_000 });
+    return { python: systemPython, installed: false, source: 'system' };
+  } catch (err) {
+    if (!envFlag('MAYHEM_PHASE3_REMOTE_INSTALL_OPENAI', true)) {
+      fail(`remote Python cannot import the stock OpenAI SDK and MAYHEM_PHASE3_REMOTE_INSTALL_OPENAI=0: ${err.message}`);
+    }
+  }
+
+  const venv = path.posix.join(remoteRun, 'openai-sdk-venv');
+  const python = path.posix.join(venv, 'bin/python');
+  const installLog = path.posix.join(remoteLogs, 'openai-sdk-install.log');
+  const command = [
+    `${systemPython} -m venv ${sh(venv)}`,
+    `${sh(python)} -m pip install --upgrade pip openai > ${sh(installLog)} 2>&1`,
+    `${sh(python)} -c 'import openai'`,
+  ].join(' && ');
+  await ssh(remote, passFile, command, { timeoutMs: 240_000, attempts: 2 });
+  return { python, installed: true, source: 'venv', install_log: installLog };
+}
+
+async function waitRemoteGatewayStatus(remote, passFile, gatewayUrl, bearerToken, timeoutMs) {
+  const script = [
+    'import os, sys, urllib.request',
+    'req = urllib.request.Request(os.environ["MAYHEM_GATEWAY_STATUS_URL"])',
+    'token = os.environ.get("MAYHEM_GATEWAY_TOKEN")',
+    'if token:',
+    '    req.add_header("Authorization", "Bearer " + token)',
+    'with urllib.request.urlopen(req, timeout=5) as response:',
+    '    sys.exit(0 if 200 <= response.status < 300 else 1)',
+  ].join('\n');
+  const deadline = Date.now() + timeoutMs;
+  let lastErr = '';
+  while (Date.now() < deadline) {
+    try {
+      await ssh(
+        remote,
+        passFile,
+        [
+          `MAYHEM_GATEWAY_STATUS_URL=${sh(`${gatewayUrl}/mayhem/status`)}`,
+          `MAYHEM_GATEWAY_TOKEN=${sh(bearerToken || '')}`,
+          `/usr/bin/python3 -c ${sh(script)}`,
+        ].join(' '),
+        { timeoutMs: 15_000 }
+      );
+      return;
+    } catch (err) {
+      lastErr = err.message;
+    }
+    await sleep(1_000);
+  }
+  fail(`timed out waiting for remote gateway status at ${gatewayUrl}: ${lastErr}`);
+}
+
+async function runRemoteOpenAiSdkChat(remote, passFile, {
+  gatewayUrl,
+  bearerToken,
+  modelId,
+  remoteRun,
+  remoteLogs,
+  maxTokens,
+  timeoutSeconds,
+}) {
+  const sdk = await ensureRemoteOpenAiPython(remote, passFile, remoteRun, remoteLogs);
+  const script = [
+    'import json, os, time',
+    'from openai import OpenAI',
+    'client = OpenAI(base_url=os.environ["MAYHEM_OPENAI_BASE_URL"], api_key=os.environ["MAYHEM_GATEWAY_TOKEN"])',
+    'started = time.time()',
+    'first_content = None',
+    'chunks = 0',
+    'content = ""',
+    'stream = client.chat.completions.create(',
+    '    model=os.environ["MAYHEM_MODEL"],',
+    '    messages=[{"role": "user", "content": "Write one short sentence proving a remote OpenAI SDK reached Mayhem. Include mayhem and the word green."}],',
+    '    stream=True,',
+    '    temperature=0.7,',
+    '    max_tokens=int(os.environ["MAYHEM_MAX_TOKENS"]),',
+    ')',
+    'for chunk in stream:',
+    '    chunks += 1',
+    '    choice = chunk.choices[0] if chunk.choices else None',
+    '    delta = getattr(getattr(choice, "delta", None), "content", None) if choice else None',
+    '    if delta:',
+    '        if first_content is None:',
+    '            first_content = time.time()',
+    '        content += delta',
+    'elapsed = time.time() - started',
+    'print(json.dumps({',
+    '    "ok": True,',
+    '    "client": "openai-python-sdk",',
+    '    "sdk_source": os.environ["MAYHEM_SDK_SOURCE"],',
+    '    "model": os.environ["MAYHEM_MODEL"],',
+    '    "chunks": chunks,',
+    '    "content": content.strip(),',
+    '    "content_chars": len(content.strip()),',
+    '    "timing_ms": {',
+    '        "first_content": None if first_content is None else int((first_content - started) * 1000),',
+    '        "total": int(elapsed * 1000),',
+    '    },',
+    '}))',
+  ].join('\n');
+  const command = [
+    `MAYHEM_OPENAI_BASE_URL=${sh(`${gatewayUrl}/v1`)}`,
+    `MAYHEM_GATEWAY_TOKEN=${sh(bearerToken)}`,
+    `MAYHEM_MODEL=${sh(modelId)}`,
+    `MAYHEM_MAX_TOKENS=${String(maxTokens)}`,
+    `MAYHEM_SDK_SOURCE=${sh(sdk.source)}`,
+    `${sh(sdk.python)} -c ${sh(script)}`,
+  ].join(' ');
+  const result = await ssh(remote, passFile, command, {
+    timeoutMs: timeoutSeconds * 1_000,
+    attempts: 1,
+  });
+  const parsed = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1));
+  if (!parsed.ok || !parsed.content_chars) {
+    fail(`remote OpenAI SDK chat returned no content: ${result.stdout}`);
+  }
+  return {
+    ...parsed,
+    gateway_url: gatewayUrl,
+    openai_base_url: `${gatewayUrl}/v1`,
+    sdk_installed: sdk.installed,
+    install_log: sdk.install_log || null,
+  };
+}
+
 async function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
     usage();
@@ -1229,6 +1376,7 @@ async function main() {
     );
   }
   const opencodeBin = process.env.MAYHEM_PHASE3_OPENCODE_BIN || 'opencode';
+  const servedCtx = envPositiveInt('MAYHEM_PHASE3_SERVED_CTX', 8192);
   const macminiFile = path.resolve(ROOT, process.env.MAYHEM_PHASE3_MACMINI_FILE || '../gpd/macmini.txt');
 
   if (!fs.existsSync(artifactPath)) fail(`missing artifact ${artifactPath}`);
@@ -1557,7 +1705,7 @@ async function main() {
     '--dev-skip-catalog-verify',
     '--manifest-hash', manifestHash,
     '--binary-hash', binaryHash,
-    '--caps-json', '{"chat":true,"tools":true,"json":true,"ctx":8192}',
+    '--caps-json', JSON.stringify({ chat: true, tools: true, json: true, ctx: servedCtx }),
   ]);
   adminRun('admin-set-price', [
     'set-price',
@@ -1695,6 +1843,7 @@ async function main() {
     `--catalog-path ${sh(remoteCatalog)}`,
     `--artifact ${sh(remoteArtifact)}`,
     '--engine-backend llama.cpp',
+    `--ctx ${servedCtx}`,
     '--skip-disk-bench',
     `--chunk-size ${CHUNK_SIZE}`,
     '--serve-sessions',
@@ -1732,6 +1881,14 @@ async function main() {
   log('starting local contract-backed gateway');
   const gatewayPort = await freePort();
   const gatewayUrl = `http://127.0.0.1:${gatewayPort}`;
+  const sharedGateway = envFlag('MAYHEM_PHASE3_SHARED_GATEWAY');
+  const remoteGatewayClient = envFlag('MAYHEM_PHASE3_REMOTE_GATEWAY_CLIENT', sharedGateway);
+  if (remoteGatewayClient && !sharedGateway) {
+    fail('MAYHEM_PHASE3_REMOTE_GATEWAY_CLIENT requires MAYHEM_PHASE3_SHARED_GATEWAY=1');
+  }
+  const sharedGatewayBindHost = (process.env.MAYHEM_PHASE3_SHARED_GATEWAY_BIND_HOST || '0.0.0.0').trim() || '0.0.0.0';
+  const gatewayBind = `${sharedGateway ? sharedGatewayBindHost : '127.0.0.1'}:${gatewayPort}`;
+  const remoteGatewayUrl = sharedGateway ? `http://${localPeerDhtHost(remote.host)}:${gatewayPort}` : null;
   const gatewayLog = path.join(logsDir, 'gateway.log');
   const gatewayHome = path.join(runDir, 'gateway-home');
   await fsp.mkdir(path.join(gatewayHome, 'stores'), { recursive: true });
@@ -1758,6 +1915,28 @@ async function main() {
     mode === 'real' ? 420 : 120
   );
   const chatMaxTokens = envPositiveInt('MAYHEM_PHASE3_CHAT_MAX_TOKENS', 32);
+  let gatewayBearerToken = null;
+  let gatewayTokenPublic = null;
+  if (sharedGateway) {
+    log('creating hashed bearer token for shared gateway smoke');
+    const tokenCreate = await run(
+      mayhemBin,
+      [
+        'tokens',
+        'create',
+        '--home', gatewayHome,
+        '--name', 'phase3-lan',
+        '--budget', process.env.MAYHEM_PHASE3_SHARED_GATEWAY_BUDGET || '100/total',
+        '--max-rate', process.env.MAYHEM_PHASE3_SHARED_GATEWAY_MAX_RATE || '120',
+        '--models', modelId,
+        '--json',
+      ],
+      { timeoutMs: 30_000 }
+    );
+    const parsed = JSON.parse(tokenCreate.stdout);
+    gatewayBearerToken = parsed.token;
+    gatewayTokenPublic = { ...parsed, token: undefined };
+  }
   const gateway = spawnLogged(
     mayhemBin,
     [
@@ -1771,15 +1950,39 @@ async function main() {
       '--session-frame-timeout-seconds', String(sessionFrameTimeoutSeconds),
       '--receipt-checkpoint-tokens', String(receiptCheckpointTokens),
       '--receipt-checkpoint-ms', String(receiptCheckpointMs),
+      '--min-ctx', String(servedCtx),
       '--dev-catalog-path', tempCatalogPath,
       '--dev-skip-catalog-verify',
-      '--bind', `127.0.0.1:${gatewayPort}`,
+      '--bind', gatewayBind,
       '--json',
     ],
     gatewayLog
   );
   cleanupState.localChildren.push(gateway);
-  await waitHttp(`${gatewayUrl}/mayhem/status`, 120_000, 'local gateway', async () => gateway.exitCode === null);
+  await waitHttp(
+    `${gatewayUrl}/mayhem/status`,
+    120_000,
+    'local gateway',
+    async () => gateway.exitCode === null,
+    { headers: bearerHeaders(gatewayBearerToken) }
+  );
+  let sharedGatewayChecks = null;
+  if (sharedGateway) {
+    const missing = await fetch(`${gatewayUrl}/v1/models`);
+    const wrong = await fetch(`${gatewayUrl}/v1/models`, {
+      headers: { authorization: 'Bearer sk-mayhem-invalid-phase3-smoke-token' },
+    });
+    if (missing.status !== 401) fail(`shared gateway missing bearer returned HTTP ${missing.status}, expected 401`);
+    if (wrong.status !== 401) fail(`shared gateway wrong bearer returned HTTP ${wrong.status}, expected 401`);
+    sharedGatewayChecks = {
+      missing_bearer_status: missing.status,
+      wrong_bearer_status: wrong.status,
+    };
+    if (remoteGatewayClient) {
+      log(`waiting for Mac mini to reach shared gateway ${remoteGatewayUrl}`);
+      await waitRemoteGatewayStatus(remote, passFile, remoteGatewayUrl, gatewayBearerToken, 120_000);
+    }
+  }
 
   log('running streaming curl-compatible chat through the gateway');
   await waitReverseTunnel(
@@ -1793,8 +1996,22 @@ async function main() {
   const chatStream = await runStreamingChatSmokeWithRetries(gatewayUrl, modelId, runDir, {
     timeoutMs: chatTimeoutSeconds * 1_000,
     maxTokens: chatMaxTokens,
+    bearerToken: gatewayBearerToken,
   });
-  const receiptsBeforeLong = await fetchGatewayReceipts(gatewayUrl);
+  let remoteGatewayChat = null;
+  if (remoteGatewayClient) {
+    log('running Mac mini stock OpenAI SDK chat through the shared gateway');
+    remoteGatewayChat = await runRemoteOpenAiSdkChat(remote, passFile, {
+      gatewayUrl: remoteGatewayUrl,
+      bearerToken: gatewayBearerToken,
+      modelId,
+      remoteRun,
+      remoteLogs,
+      maxTokens: chatMaxTokens,
+      timeoutSeconds: chatTimeoutSeconds,
+    });
+  }
+  const receiptsBeforeLong = await fetchGatewayReceipts(gatewayUrl, gatewayBearerToken);
   const receiptKeysBeforeLong = gatewayReceiptKeySet(receiptsBeforeLong);
   if (!Array.isArray(receiptsBeforeLong.data) || receiptsBeforeLong.data.length === 0) {
     fail('streaming chat completed but no gateway receipt was recorded before the long probe');
@@ -1821,6 +2038,7 @@ async function main() {
       memoryPid: gateway.pid,
       memoryLabel: 'local-gateway',
       memoryMaxDeltaKiB: envPositiveInt('MAYHEM_PHASE3_LONG_MEMORY_MAX_DELTA_KIB', 131072),
+      bearerToken: gatewayBearerToken,
     });
   }
 
@@ -1831,6 +2049,9 @@ async function main() {
   writeJson(opencodeConfig, { $schema: 'https://opencode.ai/config.json' });
   const testJsonPath = path.join(runDir, 'mayhem-test.json');
   let testJson;
+  if (runOpencode && sharedGateway) {
+    fail('MAYHEM_PHASE3_RUN_OPENCODE=1 is not supported with MAYHEM_PHASE3_SHARED_GATEWAY=1 until mayhem test accepts a gateway bearer token');
+  }
   if (runOpencode) {
     log('running optional mayhem test with opencode through the gateway');
     const test = await run(
@@ -1871,10 +2092,16 @@ async function main() {
       'opencode skipped; set MAYHEM_PHASE3_RUN_OPENCODE=1 to run the tool-call smoke\n'
     );
   }
-  const receipts = await fetchGatewayReceipts(gatewayUrl);
+  const receipts = await fetchGatewayReceipts(gatewayUrl, gatewayBearerToken);
   const receiptsPath = path.join(runDir, 'gateway-receipts.json');
   writeJson(receiptsPath, receipts);
-  const modelsJson = await (await fetch(`${gatewayUrl}/v1/models`)).json();
+  const modelsJsonResponse = await fetch(`${gatewayUrl}/v1/models`, {
+    headers: bearerHeaders(gatewayBearerToken),
+  });
+  if (!modelsJsonResponse.ok) {
+    fail(`gateway models fetch failed with HTTP ${modelsJsonResponse.status}`);
+  }
+  const modelsJson = await modelsJsonResponse.json();
   const modelsPath = path.join(runDir, 'gateway-models.json');
   writeJson(modelsPath, modelsJson);
 
@@ -1908,18 +2135,61 @@ async function main() {
     receiptBody = gatewayReceiptBody(latestReceipt);
     longReceiptBody = receiptBody;
   }
-  log('settling the streamed receipt through epoch commit/apply');
-  const epochSettlement = await settleGatewayReceiptEpoch({
-    mayhemBin,
-    adminHome,
-    adminRpcUrl,
-    receiptsPath,
-    runDir,
-    user: userPubkey[1],
-    provider: providerPubkey,
-    epoch: 1,
-    feeBps: 1500,
-  });
+  let sharedGatewayEvidence = null;
+  if (sharedGateway) {
+    const tokenStorePath = path.join(gatewayHome, 'gateway-tokens.json');
+    const tokenStoreText = fs.readFileSync(tokenStorePath, 'utf8');
+    const rawTokenCount = (tokenStoreText.match(/sk-mayhem-/g) || []).length;
+    if (rawTokenCount !== 0) fail(`gateway token store contains ${rawTokenCount} raw sk-mayhem token(s)`);
+    const gatewayLogText = fs.existsSync(gatewayLog) ? fs.readFileSync(gatewayLog, 'utf8') : '';
+    const noticeCount = (gatewayLogText.match(/Shared gateway notice:/g) || []).length;
+    if (noticeCount !== 1) fail(`shared gateway startup notice count ${noticeCount}, expected 1`);
+    const accessToken = gatewayReceiptAccessToken(latestReceipt);
+    if (!accessToken || accessToken.name !== 'phase3-lan') {
+      fail('latest shared-gateway receipt is missing phase3-lan token attribution');
+    }
+    const tokenList = await run(mayhemBin, ['tokens', 'list', '--home', gatewayHome, '--json'], {
+      timeoutMs: 30_000,
+    });
+    const tokenListJson = JSON.parse(tokenList.stdout);
+    sharedGatewayEvidence = {
+      enabled: true,
+      bind: gatewayBind,
+      local_gateway_url: gatewayUrl,
+      remote_gateway_url: remoteGatewayUrl,
+      token: gatewayTokenPublic,
+      token_store: path.relative(ROOT, tokenStorePath),
+      token_store_raw_token_count: rawTokenCount,
+      startup_notice_count: noticeCount,
+      auth_checks: sharedGatewayChecks,
+      latest_receipt_access_token: accessToken,
+      token_list: tokenListJson.tokens,
+      remote_openai_sdk_chat: remoteGatewayChat,
+    };
+  }
+  let epochSettlement;
+  if (envFlag('MAYHEM_PHASE3_SETTLE_EPOCH', true)) {
+    log('settling the streamed receipt through epoch commit/apply');
+    epochSettlement = await settleGatewayReceiptEpoch({
+      mayhemBin,
+      adminHome,
+      adminRpcUrl,
+      receiptsPath,
+      runDir,
+      user: userPubkey[1],
+      provider: providerPubkey,
+      epoch: 1,
+      feeBps: 1500,
+    });
+  } else {
+    log('skipping epoch commit/apply because MAYHEM_PHASE3_SETTLE_EPOCH=0');
+    epochSettlement = {
+      skipped: true,
+      reason: 'MAYHEM_PHASE3_SETTLE_EPOCH=0',
+      receipt_count: Array.isArray(receipts.data) ? receipts.data.length : 0,
+      receipts: path.relative(ROOT, receiptsPath),
+    };
+  }
 
   const report = {
     ok: true,
@@ -1934,6 +2204,8 @@ async function main() {
       user_sc_bridge_url: userScBridge.url,
       subnet_channel: subnetChannel,
       peer_dht_bootstrap: peerDhtBootstrap,
+      shared_gateway: sharedGatewayEvidence,
+      served_ctx: servedCtx,
       receipt_checkpoint_every: {
         tokens: receiptCheckpointTokens,
         ms: receiptCheckpointMs,

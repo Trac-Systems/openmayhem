@@ -933,6 +933,14 @@ struct UpArgs {
     #[arg(long, default_value_t = 11_435)]
     gateway_port: u16,
 
+    /// OpenAI-compatible gateway bind address. Defaults to 127.0.0.1:<gateway-port>.
+    #[arg(long)]
+    gateway_bind: Option<String>,
+
+    /// Require gateway bearer tokens even on loopback.
+    #[arg(long)]
+    gateway_require_auth: bool,
+
     /// mayhemd loopback status port.
     #[arg(long, default_value_t = 11_437)]
     supervisor_port: u16,
@@ -14968,7 +14976,10 @@ struct UpPlan {
     dashboard_url: String,
     supervisor_bind: String,
     supervisor_url: String,
-    gateway_port: u16,
+    gateway_bind: SocketAddr,
+    gateway_require_auth: bool,
+    gateway_token_count: usize,
+    gateway_active_token_count: usize,
     timeout: Duration,
     dev_embedded_catalog: bool,
 }
@@ -15054,11 +15065,17 @@ async fn up(args: UpArgs) -> Result<()> {
             "health": bridge_health,
         },
         "gateway": {
+            "bind": plan.gateway_bind.to_string(),
             "url": plan.gateway_url,
             "openai_base_url": plan.openai_base_url,
             "dashboard_url": dashboard_url.clone(),
             "provider_dashboard_url": provider_dashboard_url.clone(),
             "models": models,
+            "access": {
+                "require_auth": plan.gateway_require_auth,
+                "token_count": plan.gateway_token_count,
+                "active_token_count": plan.gateway_active_token_count,
+            },
         },
         "provider": plan.provider,
         "role": plan.role.as_str(),
@@ -15081,6 +15098,7 @@ async fn up(args: UpArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("Mayhem is up.");
+        println!("Gateway bind: {}", plan.gateway_bind);
         println!("Copy/paste OpenAI base URL: {}", plan.openai_base_url);
         println!("Copy/paste dashboard URL: {dashboard_url}");
         if plan.provider {
@@ -15090,6 +15108,19 @@ async fn up(args: UpArgs) -> Result<()> {
             "Copy/paste status command: mayhem status --home {}",
             plan.home.display()
         );
+        println!(
+            "Gateway access: {}.",
+            if plan.gateway_require_auth {
+                "bearer token required"
+            } else {
+                "loopback token optional"
+            }
+        );
+        if !gateway_bind_is_loopback(plan.gateway_bind) {
+            println!(
+                "Shared gateway notice: serving unencrypted HTTP on this network bind; use a TLS reverse proxy or Tailscale/VPN for WAN exposure."
+            );
+        }
         if plan.provider {
             println!("Provider serving was requested and is supervised by mayhemd.");
         }
@@ -15109,13 +15140,28 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     };
     let rpc_url = format!("http://127.0.0.1:{}/v1", args.rpc_port);
     let sc_bridge_url = format!("ws://127.0.0.1:{}", args.sc_bridge_port);
-    let gateway_url = format!("http://127.0.0.1:{}", args.gateway_port);
-    let openai_base_url = gateway_v1_url(&gateway_url);
-    let dashboard_url = format!("{gateway_url}/mayhem/dashboard");
     let supervisor_bind = format!("127.0.0.1:{}", args.supervisor_port);
     let supervisor_url = format!("http://{supervisor_bind}");
     let config_path = config_path_for_home(&home);
     let mut config = read_config_toml_value(&config_path)?;
+    let gateway_bind =
+        up_gateway_bind_addr(&config, args.gateway_bind.as_deref(), args.gateway_port)?;
+    let shared_gateway_bind = !gateway_bind_is_loopback(gateway_bind);
+    let gateway_require_auth = args.gateway_require_auth || shared_gateway_bind;
+    let gateway_token_store_path = gateway_token_store_path(&home);
+    let gateway_token_store = read_gateway_token_store(&gateway_token_store_path)?;
+    let gateway_token_count = gateway_token_store.tokens.len();
+    let gateway_active_token_count = gateway_token_store.active_token_count(unix_epoch_seconds()?);
+    if let Err(err) = validate_gateway_bind_access(
+        gateway_bind,
+        gateway_require_auth,
+        gateway_active_token_count > 0,
+    ) {
+        bail!("{err}");
+    }
+    let gateway_url = gateway_public_url(gateway_bind);
+    let openai_base_url = gateway_v1_url(&gateway_url);
+    let dashboard_url = format!("{gateway_url}/mayhem/dashboard");
     let network = resolve_up_network(args, &config)?;
     let subnet_channel = resolve_up_config_value(
         args.subnet_channel.as_deref(),
@@ -15169,6 +15215,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
             network: &network,
             rpc_url: &rpc_url,
             gateway_url: &gateway_url,
+            gateway_bind: &gateway_bind.to_string(),
             sc_bridge_url: &sc_bridge_url,
             sc_bridge_token: &sc_bridge_token,
             subnet_channel: subnet_channel.as_deref(),
@@ -15208,7 +15255,10 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         dashboard_url,
         supervisor_bind,
         supervisor_url,
-        gateway_port: args.gateway_port,
+        gateway_bind,
+        gateway_require_auth,
+        gateway_token_count,
+        gateway_active_token_count,
         timeout: Duration::from_secs(args.timeout_seconds),
         dev_embedded_catalog: args.dev_embedded_catalog,
     })
@@ -15219,6 +15269,7 @@ struct UpConfigPatch<'a> {
     network: &'a str,
     rpc_url: &'a str,
     gateway_url: &'a str,
+    gateway_bind: &'a str,
     sc_bridge_url: &'a str,
     sc_bridge_token: &'a str,
     subnet_channel: Option<&'a str>,
@@ -15300,6 +15351,11 @@ fn repair_up_config(
     toml_set_string(config, "network.name", patch.network.to_owned())?;
     toml_set_string(config, "network.rpc_url", patch.rpc_url.to_owned())?;
     toml_set_string(config, "network.gateway_url", patch.gateway_url.to_owned())?;
+    toml_set_string(
+        config,
+        "network.gateway_bind",
+        patch.gateway_bind.to_owned(),
+    )?;
     toml_set_string(
         config,
         "network.sc_bridge_url",
@@ -15497,9 +15553,12 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         plan.sc_bridge_url.clone(),
         "--sc-bridge-token".to_owned(),
         plan.sc_bridge_token.clone(),
-        "--port".to_owned(),
-        plan.gateway_port.to_string(),
+        "--bind".to_owned(),
+        plan.gateway_bind.to_string(),
     ];
+    if plan.gateway_require_auth {
+        gateway_args.push("--require-auth".to_owned());
+    }
     if plan.dev_embedded_catalog {
         gateway_args.push("--dev-embedded-catalog".to_owned());
     }
@@ -19656,6 +19715,31 @@ fn gateway_bind_addr(
     let port = config
         .and_then(|config| config.network.as_ref())
         .and_then(|network| network.gateway_url.as_deref())
+        .and_then(gateway_port_from_url)
+        .unwrap_or(port);
+    Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+}
+
+fn up_gateway_bind_addr(config: &toml::Value, bind: Option<&str>, port: u16) -> Result<SocketAddr> {
+    if let Some(bind) = bind {
+        let bind = bind.trim();
+        if !bind.is_empty() {
+            return bind
+                .parse()
+                .with_context(|| format!("parsing gateway bind address {bind}"));
+        }
+    }
+    if let Some(bind) = toml_get_path(config, "network.gateway_bind")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|bind| !bind.is_empty())
+    {
+        return bind
+            .parse()
+            .with_context(|| format!("parsing network.gateway_bind address {bind}"));
+    }
+    let port = toml_get_path(config, "network.gateway_url")
+        .and_then(toml::Value::as_str)
         .and_then(gateway_port_from_url)
         .unwrap_or(port);
     Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
@@ -43894,7 +43978,10 @@ mod tests {
             dashboard_url: "http://127.0.0.1:11435/mayhem/dashboard".to_owned(),
             supervisor_bind: "127.0.0.1:11437".to_owned(),
             supervisor_url: "http://127.0.0.1:11437".to_owned(),
-            gateway_port: 11_435,
+            gateway_bind: "0.0.0.0:11435".parse().unwrap(),
+            gateway_require_auth: true,
+            gateway_token_count: 1,
+            gateway_active_token_count: 1,
             timeout: Duration::from_secs(1),
             dev_embedded_catalog: false,
         };
@@ -43920,6 +44007,9 @@ mod tests {
         assert!(text.contains(&"b".repeat(64)));
         assert!(text.contains("--msb-channel"));
         assert!(text.contains("mayhem-msb-mainnet-v1"));
+        assert!(text.contains("--bind"));
+        assert!(text.contains("0.0.0.0:11435"));
+        assert!(text.contains("--require-auth"));
         assert!(text.contains("--serve-sessions"));
         assert!(!text.contains("--peer-dht-bootstrap"));
     }
@@ -43941,6 +44031,7 @@ mod tests {
                 network: "testnet1",
                 rpc_url: "http://127.0.0.1:50001/v1",
                 gateway_url: "http://127.0.0.1:50002",
+                gateway_bind: "127.0.0.1:50002",
                 sc_bridge_url: "ws://127.0.0.1:50003",
                 sc_bridge_token: "bridge-token",
                 subnet_channel: Some("mayhem-test-subnet"),
@@ -43962,6 +44053,10 @@ mod tests {
         assert_eq!(
             toml_get_path(&saved, "network.rpc_url").and_then(toml::Value::as_str),
             Some("http://127.0.0.1:50001/v1")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "network.gateway_bind").and_then(toml::Value::as_str),
+            Some("127.0.0.1:50002")
         );
         assert_eq!(
             toml_get_path(&saved, "network.sc_bridge_token").and_then(toml::Value::as_str),
@@ -44015,6 +44110,8 @@ mod tests {
             rpc_port: 51_001,
             sc_bridge_port: 51_002,
             gateway_port: 51_003,
+            gateway_bind: None,
+            gateway_require_auth: false,
             supervisor_port: 51_004,
             sc_bridge_token: None,
             timeout_seconds: 1,
@@ -44038,6 +44135,7 @@ mod tests {
                 network: "local",
                 rpc_url: "http://127.0.0.1:51001/v1",
                 gateway_url: "http://127.0.0.1:51003",
+                gateway_bind: "127.0.0.1:51003",
                 sc_bridge_url: "ws://127.0.0.1:51002",
                 sc_bridge_token: "bridge-token",
                 subnet_channel: Some("mayhem-b2-test"),
