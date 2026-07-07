@@ -27,8 +27,9 @@ use crate::{
     pricing::{normalize_rate_map, priced_usage_mu, text_generation_rate_map, RateMapEntry},
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ProviderObservationSample, ProviderTable,
-        ProviderTableEntry, RequestRequirements, SelectionWeights,
-        DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
+        ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements, SelectionWeights,
+        DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR, DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
+        DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
@@ -87,6 +88,7 @@ const ROUTE_REPUTATION_PRIORITY_BPS_DELTA: u32 = 500;
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const DEFAULT_CANARY_SEED: i64 = 7;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
+const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
 const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
@@ -104,6 +106,7 @@ pub struct GatewayState {
     models: Arc<Vec<GatewayModel>>,
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
+    reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<Vec<PausedSession>>>,
     receipt_config: ReceiptConfig,
     session_backend: Arc<dyn GatewaySessionBackend>,
@@ -117,6 +120,7 @@ pub struct GatewayState {
     provider_table: Arc<Mutex<ProviderTable>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
+    epoch_seconds: u64,
     failover_policy: GatewayFailoverPolicyConfig,
     default_max_price_mu: Option<u64>,
     dev_session_shim: bool,
@@ -421,6 +425,18 @@ pub struct StoredProbeEvent {
     pub evidence_hash: String,
     pub evidence: Value,
     pub probe_command: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StoredReputationEvent {
+    pub provider: String,
+    pub event_id: String,
+    pub kind: String,
+    pub epoch: u64,
+    pub at: u64,
+    pub evidence_hash: String,
+    pub evidence: Value,
+    pub command: Value,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1026,6 +1042,7 @@ impl GatewayState {
             models: Arc::new(models),
             receipts: Arc::new(Mutex::new(Vec::new())),
             probes: Arc::new(Mutex::new(Vec::new())),
+            reputation_events: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(Vec::new())),
             receipt_config,
             session_backend: Arc::new(NoProviderSessionBackend),
@@ -1039,6 +1056,7 @@ impl GatewayState {
             provider_table: Arc::new(Mutex::new(provider_table)),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
+            epoch_seconds: DEFAULT_EPOCH_SECONDS,
             failover_policy: GatewayFailoverPolicyConfig::default(),
             default_max_price_mu: None,
             dev_session_shim: false,
@@ -1122,6 +1140,15 @@ impl GatewayState {
         self
     }
 
+    pub fn with_epoch_seconds(mut self, epoch_seconds: u64) -> Self {
+        self.epoch_seconds = epoch_seconds.max(1);
+        self
+    }
+
+    pub fn epoch_seconds(&self) -> u64 {
+        self.epoch_seconds
+    }
+
     pub fn with_default_max_price_mu(mut self, max_price_mu: Option<u64>) -> Self {
         self.default_max_price_mu = max_price_mu.filter(|value| *value > 0);
         self
@@ -1189,6 +1216,13 @@ impl GatewayState {
         self.probes.lock().expect("probe store poisoned").clone()
     }
 
+    pub fn reputation_events(&self) -> Vec<StoredReputationEvent> {
+        self.reputation_events
+            .lock()
+            .expect("reputation event store poisoned")
+            .clone()
+    }
+
     pub fn paused_sessions(&self) -> Vec<PausedSession> {
         self.paused_sessions
             .lock()
@@ -1219,6 +1253,19 @@ impl GatewayState {
             .lock()
             .expect("probe store poisoned")
             .push(probe);
+    }
+
+    fn record_reputation_event(&self, event: StoredReputationEvent) {
+        let mut events = self
+            .reputation_events
+            .lock()
+            .expect("reputation event store poisoned");
+        if events.iter().any(|existing| {
+            existing.provider == event.provider && existing.event_id == event.event_id
+        }) {
+            return;
+        }
+        events.push(event);
     }
 
     fn pause_session(&self, paused: PausedSession) {
@@ -1291,6 +1338,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/status", get(mayhem_status))
         .route("/mayhem/receipts", get(mayhem_receipts))
         .route("/mayhem/probes", get(mayhem_probes))
+        .route("/mayhem/reputation-events", get(mayhem_reputation_events))
         .route("/mayhem/balance", get(mayhem_balance))
         .route("/mayhem/dashboard", get(mayhem_dashboard))
         .route("/mayhem/dashboard/network", get(mayhem_dashboard_network))
@@ -1591,6 +1639,14 @@ async fn mayhem_probes(State(state): State<SharedState>) -> Response {
     Json(json!({
         "object": "list",
         "data": state.probes(),
+    }))
+    .into_response()
+}
+
+async fn mayhem_reputation_events(State(state): State<SharedState>) -> Response {
+    Json(json!({
+        "object": "list",
+        "data": state.reputation_events(),
     }))
     .into_response()
 }
@@ -5529,6 +5585,30 @@ fn generated_tokens_per_second(
     tok_s.is_finite().then_some(tok_s)
 }
 
+fn units_per_second(units: u64, started_at_millis: u64, completed_at_millis: u64) -> Option<f64> {
+    if units == 0 {
+        return None;
+    }
+    let elapsed_millis = completed_at_millis.saturating_sub(started_at_millis).max(1);
+    let per_second = units as f64 * 1000.0 / elapsed_millis as f64;
+    per_second.is_finite().then_some(per_second)
+}
+
+fn quality_from_session_delta(frame: &Value) -> Option<GatewaySessionQuality> {
+    let quality = frame.get("quality")?;
+    let ttft_ms = quality
+        .get("ttft_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| quality.get("compute_ms").and_then(Value::as_u64))?
+        .max(1);
+    let tok_s = quality
+        .get("tok_s")
+        .or_else(|| quality.get("throughput"))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    Some(GatewaySessionQuality { ttft_ms, tok_s })
+}
+
 #[derive(Debug, Default)]
 struct SessionDeltaPayloadChunks {
     chunks: BTreeMap<String, Vec<PayloadChunk>>,
@@ -5627,6 +5707,7 @@ async fn collect_direct_session_output(
     let mut token_ids = Vec::new();
     let mut artifact_builders = BTreeMap::new();
     let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
+    let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -5744,6 +5825,8 @@ async fn collect_direct_session_output(
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
                     finish_reason = Some(fin.to_owned());
                     claimed_usage = usage_from_session_delta(&frame);
+                    provider_quality =
+                        provider_quality.or_else(|| quality_from_session_delta(&frame));
                 }
                 if finish_reason.is_none() {
                     let output_tokens = streamed_output_token_count(&content, &token_ids);
@@ -5871,7 +5954,7 @@ async fn collect_direct_session_output(
         }
     }
     let completed_at_millis = now_millis_u64();
-    let quality =
+    let quality = provider_quality.or_else(|| {
         watchdog
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
@@ -5881,7 +5964,8 @@ async fn collect_direct_session_output(
                     first_delta_at_millis,
                     completed_at_millis,
                 ),
-            });
+            })
+    });
     let artifacts = finish_session_artifacts(artifact_builders)?;
     Ok(DirectSessionCollected {
         output: ChatOutput {
@@ -5919,6 +6003,7 @@ async fn collect_direct_session_embedding_output(
     let mut usage = None;
     let mut provider_receipt = None;
     let mut delta_payload_chunks = SessionDeltaPayloadChunks::default();
+    let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -5962,6 +6047,7 @@ async fn collect_direct_session_embedding_output(
                 if usage.is_none() {
                     usage = usage_from_session_delta(&frame);
                 }
+                provider_quality = provider_quality.or_else(|| quality_from_session_delta(&frame));
             }
             Some("s.receipt") => {
                 provider_receipt = Some(provider_signed_receipt_from_frame(
@@ -5996,18 +6082,25 @@ async fn collect_direct_session_embedding_output(
         }
     }
 
-    let quality =
+    let completed_at_millis = now_millis_u64();
+    let output = EmbeddingOutput {
+        embeddings: embeddings.expect("loop ended with embeddings"),
+        usage: usage.unwrap_or_else(|| embedding_usage_for_inputs(inputs)),
+    };
+    let quality = provider_quality.or_else(|| {
         watchdog
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-                tok_s: None,
-            });
+                tok_s: units_per_second(
+                    output.usage.prompt_tokens,
+                    started_at_millis,
+                    completed_at_millis,
+                ),
+            })
+    });
     Ok(DirectEmbeddingSessionCollected {
-        output: EmbeddingOutput {
-            embeddings: embeddings.expect("loop ended with embeddings"),
-            usage: usage.unwrap_or_else(|| embedding_usage_for_inputs(inputs)),
-        },
+        output,
         provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
         quality,
     })
@@ -6025,6 +6118,7 @@ async fn collect_direct_session_image_generation_output(
     let mut usage = None;
     let mut provider_receipt = None;
     let mut artifact_builders = BTreeMap::new();
+    let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -6053,6 +6147,8 @@ async fn collect_direct_session_image_generation_output(
                 if frame.get("fin").and_then(Value::as_str).is_some() {
                     finish_seen = true;
                     usage = receipt_usage_from_session_delta(&frame);
+                    provider_quality =
+                        provider_quality.or_else(|| quality_from_session_delta(&frame));
                 }
             }
             Some("s.receipt") => {
@@ -6088,13 +6184,7 @@ async fn collect_direct_session_image_generation_output(
         }
     }
 
-    let quality =
-        watchdog
-            .first_delta_at_millis
-            .map(|first_delta_at_millis| GatewaySessionQuality {
-                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-                tok_s: None,
-            });
+    let completed_at_millis = now_millis_u64();
     let artifacts = finish_session_artifacts(artifact_builders)?;
     if artifacts.is_empty() {
         return Err(GatewaySessionError::new(format!(
@@ -6103,6 +6193,18 @@ async fn collect_direct_session_image_generation_output(
     }
     let usage =
         usage.unwrap_or_else(|| image_generation_usage_for_observed(request, artifacts.len()));
+    let quality = provider_quality.or_else(|| {
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: units_per_second(
+                    usage.get(USAGE_IMAGE),
+                    started_at_millis,
+                    completed_at_millis,
+                ),
+            })
+    });
     Ok(DirectImageGenerationSessionCollected {
         output: ImageGenerationOutput { artifacts, usage },
         provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
@@ -6122,6 +6224,7 @@ async fn collect_direct_session_audio_speech_output(
     let mut usage = None;
     let mut provider_receipt = None;
     let mut artifact_builders = BTreeMap::new();
+    let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -6150,6 +6253,8 @@ async fn collect_direct_session_audio_speech_output(
                 if frame.get("fin").and_then(Value::as_str).is_some() {
                     finish_seen = true;
                     usage = receipt_usage_from_session_delta(&frame);
+                    provider_quality =
+                        provider_quality.or_else(|| quality_from_session_delta(&frame));
                 }
             }
             Some("s.receipt") => {
@@ -6185,13 +6290,7 @@ async fn collect_direct_session_audio_speech_output(
         }
     }
 
-    let quality =
-        watchdog
-            .first_delta_at_millis
-            .map(|first_delta_at_millis| GatewaySessionQuality {
-                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-                tok_s: None,
-            });
+    let completed_at_millis = now_millis_u64();
     let artifacts = finish_session_artifacts(artifact_builders)?;
     if artifacts.is_empty() {
         return Err(GatewaySessionError::new(format!(
@@ -6199,6 +6298,18 @@ async fn collect_direct_session_audio_speech_output(
         )));
     }
     let usage = usage.unwrap_or_else(|| audio_speech_usage_for_observed(request, &artifacts));
+    let quality = provider_quality.or_else(|| {
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: units_per_second(
+                    usage.get(USAGE_AUDIO_SECOND),
+                    started_at_millis,
+                    completed_at_millis,
+                ),
+            })
+    });
     Ok(DirectAudioSpeechSessionCollected {
         output: AudioSpeechOutput { artifacts, usage },
         provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
@@ -6218,6 +6329,7 @@ async fn collect_direct_session_audio_transcription_output(
     let mut finish_seen = false;
     let mut usage = None;
     let mut provider_receipt = None;
+    let mut provider_quality = None;
     let started_at_millis = now_millis_u64();
     let mut watchdog = DirectSessionWatchdog::new(
         started_at_millis,
@@ -6248,6 +6360,8 @@ async fn collect_direct_session_audio_transcription_output(
                 if frame.get("fin").and_then(Value::as_str).is_some() {
                     finish_seen = true;
                     usage = receipt_usage_from_session_delta(&frame);
+                    provider_quality =
+                        provider_quality.or_else(|| quality_from_session_delta(&frame));
                 }
             }
             Some("s.receipt") => {
@@ -6289,18 +6403,22 @@ async fn collect_direct_session_audio_transcription_output(
             "provider audio transcription session {session_id} finished with empty transcript"
         )));
     }
-    let quality =
+    let completed_at_millis = now_millis_u64();
+    let usage = usage.unwrap_or_else(|| audio_transcription_usage_for_request(request));
+    let quality = provider_quality.or_else(|| {
         watchdog
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-                tok_s: None,
-            });
+                tok_s: units_per_second(
+                    usage.get(USAGE_AUDIO_SECOND),
+                    started_at_millis,
+                    completed_at_millis,
+                ),
+            })
+    });
     Ok(DirectAudioTranscriptionSessionCollected {
-        output: AudioTranscriptionOutput {
-            text,
-            usage: usage.unwrap_or_else(|| audio_transcription_usage_for_request(request)),
-        },
+        output: AudioTranscriptionOutput { text, usage },
         provider_receipt: provider_receipt.expect("loop ended with provider receipt"),
         quality,
     })
@@ -8968,6 +9086,11 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
         options.min_att_tier,
         options.max_price_mu,
         options.quant.as_deref(),
+        state.throughput_floor_for_model(
+            model,
+            options,
+            DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
+        ),
         seed,
     )
 }
@@ -8986,6 +9109,7 @@ fn ordered_route_candidates_for_image_generation_with_options<'a>(
         options.min_att_tier,
         options.max_price_mu,
         options.quant.as_deref(),
+        state.throughput_floor_for_model(model, options, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S),
         seed,
     )
 }
@@ -9010,6 +9134,7 @@ fn ordered_route_candidates_for_audio_speech_with_options<'a>(
             request,
             now_millis,
             options.max_price_mu,
+            state.throughput_floor_for_model(model, options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
         ),
         now_millis,
     )
@@ -9035,6 +9160,7 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
             request,
             now_millis,
             options.max_price_mu,
+            state.throughput_floor_for_model(model, options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
         ),
         now_millis,
     )
@@ -9100,7 +9226,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
     quant: Option<&str>,
-    min_generation_tok_s: Option<f64>,
+    min_throughput: Option<f64>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -9120,7 +9246,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
         request,
         now_millis,
         max_price_mu,
-        min_generation_tok_s,
+        min_throughput,
     );
     let route_by_key = eligible_routes
         .iter()
@@ -9197,6 +9323,7 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
     quant: Option<&str>,
+    min_throughput: Option<f64>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -9210,8 +9337,14 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     }
 
     state.refresh_provider_table_routes(model);
-    let requirements =
-        request_requirements_for_embedding(state, model, inputs, now_millis, max_price_mu);
+    let requirements = request_requirements_for_embedding(
+        state,
+        model,
+        inputs,
+        now_millis,
+        max_price_mu,
+        min_throughput,
+    );
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
@@ -9287,6 +9420,7 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
     quant: Option<&str>,
+    min_throughput: Option<f64>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -9300,8 +9434,14 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
     }
 
     state.refresh_provider_table_routes(model);
-    let requirements =
-        request_requirements_for_image_generation(state, model, request, now_millis, max_price_mu);
+    let requirements = request_requirements_for_image_generation(
+        state,
+        model,
+        request,
+        now_millis,
+        max_price_mu,
+        min_throughput,
+    );
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
@@ -9607,7 +9747,7 @@ fn request_requirements_for_chat(
     request: &ChatCompletionRequest,
     now_millis: u64,
     max_price_mu: Option<u64>,
-    min_generation_tok_s: Option<f64>,
+    min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let prompt_text = chat_prompt_text(request);
     let input_tokens = rough_tokens(&prompt_text);
@@ -9625,7 +9765,7 @@ fn request_requirements_for_chat(
             .min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens,
-        min_generation_tok_s,
+        min_throughput,
         now_millis,
         max_price_mu,
         ..RequestRequirements::default()
@@ -9638,6 +9778,7 @@ fn request_requirements_for_embedding(
     inputs: &[String],
     now_millis: u64,
     max_price_mu: Option<u64>,
+    min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = embedding_input_token_count(inputs);
     RequestRequirements {
@@ -9648,6 +9789,7 @@ fn request_requirements_for_embedding(
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
+        min_throughput,
         now_millis,
         max_price_mu,
         ..RequestRequirements::default()
@@ -9660,6 +9802,7 @@ fn request_requirements_for_image_generation(
     request: &ImageGenerationRequest,
     now_millis: u64,
     max_price_mu: Option<u64>,
+    min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
     RequestRequirements {
@@ -9670,6 +9813,7 @@ fn request_requirements_for_image_generation(
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
+        min_throughput,
         now_millis,
         max_price_mu,
         ..RequestRequirements::default()
@@ -9682,6 +9826,7 @@ fn request_requirements_for_audio_speech(
     request: &AudioSpeechRequest,
     now_millis: u64,
     max_price_mu: Option<u64>,
+    min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.input);
     RequestRequirements {
@@ -9692,6 +9837,7 @@ fn request_requirements_for_audio_speech(
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
+        min_throughput,
         now_millis,
         max_price_mu,
         ..RequestRequirements::default()
@@ -9704,6 +9850,7 @@ fn request_requirements_for_audio_transcription(
     request: &AudioTranscriptionRequest,
     now_millis: u64,
     max_price_mu: Option<u64>,
+    min_throughput: Option<f64>,
 ) -> RequestRequirements {
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
@@ -9713,6 +9860,7 @@ fn request_requirements_for_audio_transcription(
         min_ctx: 1,
         input_tokens: audio_transcription_seconds(request),
         output_tokens: 0,
+        min_throughput,
         now_millis,
         max_price_mu,
         ..RequestRequirements::default()
@@ -9799,11 +9947,66 @@ fn record_route_observation(
     let Some(route) = route else {
         return;
     };
-    state
+    let key = route_key(route);
+    let maybe_event = state
         .provider_table
         .lock()
         .expect("provider table poisoned")
-        .record_observation_at(&route_key(route), sample, now_millis_u64());
+        .record_observation_at(&key, sample, now_millis_u64());
+    if let Some(event) = maybe_event {
+        state.record_reputation_event(stored_underdelivery_reputation_event(
+            event,
+            state.epoch_seconds,
+        ));
+    }
+}
+
+fn stored_underdelivery_reputation_event(
+    event: ProviderUnderdeliveryEvent,
+    epoch_seconds: u64,
+) -> StoredReputationEvent {
+    let at = event.observed_at_millis / 1_000;
+    let epoch_seconds = epoch_seconds.max(1);
+    let epoch = at / epoch_seconds + 1;
+    let provider = event.key.provider.clone();
+    let enclave_id = event.key.enclave_id.clone();
+    let evidence = json!({
+        "source": "mayhem-gateway-throughput-fairness-v1",
+        "provider": provider,
+        "enclave_id": enclave_id,
+        "room_id": event.key.room_id,
+        "epoch_seconds": epoch_seconds,
+        "advertised_throughput": event.advertised_throughput,
+        "measured_throughput": event.measured_throughput,
+        "ratio": event.ratio,
+        "streak": event.streak,
+        "observed_at_millis": event.observed_at_millis,
+    });
+    let evidence_hash = stable_value_hash(&evidence);
+    let event_id = format!(
+        "underdelivery-{}",
+        evidence_hash.get(..32).unwrap_or(evidence_hash.as_str())
+    );
+    let command = json!({
+        "op": "record_rep_event",
+        "provider": provider.clone(),
+        "event_id": event_id.clone(),
+        "kind": "underdelivery",
+        "epoch": epoch,
+        "at": at,
+        "evidence_hash": evidence_hash.clone(),
+        "enclave_id": enclave_id,
+    });
+    StoredReputationEvent {
+        provider,
+        event_id,
+        kind: "underdelivery".to_owned(),
+        epoch,
+        at,
+        evidence_hash,
+        evidence,
+        command,
+    }
 }
 
 fn record_route_failure_attempt(
@@ -9854,12 +10057,19 @@ fn observation_sample_from_embedding_success(
     result: &GatewayEmbeddingResult,
     elapsed: Duration,
 ) -> ProviderObservationSample {
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
     ProviderObservationSample {
         ttft_ms: result
             .quality
             .map(|quality| quality.ttft_ms)
             .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
-        tok_s: None,
+        tok_s: result
+            .quality
+            .and_then(|quality| quality.tok_s)
+            .or_else(|| {
+                Some(result.output.usage.prompt_tokens as f64 / elapsed_seconds)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            }),
         error: false,
     }
 }
@@ -9868,12 +10078,19 @@ fn observation_sample_from_image_generation_success(
     result: &GatewayImageGenerationResult,
     elapsed: Duration,
 ) -> ProviderObservationSample {
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
     ProviderObservationSample {
         ttft_ms: result
             .quality
             .map(|quality| quality.ttft_ms)
             .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
-        tok_s: None,
+        tok_s: result
+            .quality
+            .and_then(|quality| quality.tok_s)
+            .or_else(|| {
+                Some(result.output.usage.get(USAGE_IMAGE) as f64 / elapsed_seconds)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            }),
         error: false,
     }
 }
@@ -9882,12 +10099,19 @@ fn observation_sample_from_audio_speech_success(
     result: &GatewayAudioSpeechResult,
     elapsed: Duration,
 ) -> ProviderObservationSample {
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
     ProviderObservationSample {
         ttft_ms: result
             .quality
             .map(|quality| quality.ttft_ms)
             .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
-        tok_s: None,
+        tok_s: result
+            .quality
+            .and_then(|quality| quality.tok_s)
+            .or_else(|| {
+                Some(result.output.usage.get(USAGE_AUDIO_SECOND) as f64 / elapsed_seconds)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            }),
         error: false,
     }
 }
@@ -9896,12 +10120,19 @@ fn observation_sample_from_audio_transcription_success(
     result: &GatewayAudioTranscriptionResult,
     elapsed: Duration,
 ) -> ProviderObservationSample {
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
     ProviderObservationSample {
         ttft_ms: result
             .quality
             .map(|quality| quality.ttft_ms)
             .unwrap_or_else(|| duration_millis_u64(elapsed).max(1)),
-        tok_s: None,
+        tok_s: result
+            .quality
+            .and_then(|quality| quality.tok_s)
+            .or_else(|| {
+                Some(result.output.usage.get(USAGE_AUDIO_SECOND) as f64 / elapsed_seconds)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+            }),
         error: false,
     }
 }
@@ -10921,8 +11152,11 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = embedding_prompt_text(inputs);
-        let input_tokens = embedding_input_token_count(inputs);
-        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
+        let failover = self.failover_thresholds_for_model(
+            model,
+            options,
+            embedding_failover_work_units(inputs),
+        );
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -11002,8 +11236,11 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = image_generation_prompt_text(request);
-        let input_tokens = rough_tokens(&prompt_text);
-        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
+        let failover = self.failover_thresholds_for_model(
+            model,
+            options,
+            image_generation_failover_work_units(request)?,
+        );
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -11083,8 +11320,11 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = audio_speech_prompt_hash(request);
-        let input_tokens = rough_tokens(&request.input);
-        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
+        let failover = self.failover_thresholds_for_model(
+            model,
+            options,
+            audio_speech_failover_work_units(request),
+        );
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -11164,7 +11404,11 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = audio_transcription_prompt_hash(request);
-        let failover = self.failover_thresholds_for_model(model, options, 0);
+        let failover = self.failover_thresholds_for_model(
+            model,
+            options,
+            audio_transcription_failover_work_units(request),
+        );
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -11257,6 +11501,15 @@ impl GatewayState {
         model: &GatewayModel,
         options: &GatewayRequestOptions,
     ) -> Option<f64> {
+        self.throughput_floor_for_model(model, options, DEFAULT_LLM_GENERATION_FLOOR_TOK_S)
+    }
+
+    fn throughput_floor_for_model(
+        &self,
+        model: &GatewayModel,
+        options: &GatewayRequestOptions,
+        default_floor: f64,
+    ) -> Option<f64> {
         if let Some(user_floor) = options.failover_overrides.min_tok_s {
             return (user_floor > 0.0).then_some(user_floor);
         }
@@ -11265,7 +11518,7 @@ impl GatewayState {
             .failover
             .min_tok_s
             .or(self.failover_policy.min_tok_s)
-            .or(Some(DEFAULT_LLM_GENERATION_FLOOR_TOK_S))
+            .or(Some(default_floor))
             .filter(|value| value.is_finite() && *value > 0.0)
     }
 
@@ -13052,6 +13305,21 @@ fn parse_image_generation_size(request: &ImageGenerationRequest) -> Result<(u32,
     Ok((width, height))
 }
 
+fn embedding_failover_work_units(inputs: &[String]) -> u64 {
+    embedding_input_token_count(inputs).max(u64::try_from(inputs.len()).unwrap_or(u64::MAX))
+}
+
+fn image_generation_failover_work_units(request: &ImageGenerationRequest) -> Result<u64, ApiError> {
+    let (width, height) = parse_image_generation_size(request)?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height)).max(1);
+    let resolution_scale = pixels.div_ceil(512 * 512).max(1);
+    let image_work = u64::from(image_generation_count(request))
+        .saturating_mul(image_generation_steps(request).max(1))
+        .saturating_mul(resolution_scale)
+        .saturating_mul(1_000);
+    Ok(rough_tokens(&request.prompt).saturating_add(image_work))
+}
+
 fn image_generation_usage_for_request(request: &ImageGenerationRequest) -> ReceiptUsage {
     image_generation_usage_for_count(
         u64::from(image_generation_count(request)),
@@ -13122,6 +13390,10 @@ fn estimate_audio_speech_seconds(request: &AudioSpeechRequest) -> u64 {
         .max(1)
 }
 
+fn audio_speech_failover_work_units(request: &AudioSpeechRequest) -> u64 {
+    estimate_audio_speech_seconds(request).saturating_mul(1_000)
+}
+
 fn audio_speech_usage_for_observed(
     request: &AudioSpeechRequest,
     artifacts: &[GatewayArtifactOutput],
@@ -13145,6 +13417,10 @@ fn audio_transcription_usage_for_request(request: &AudioTranscriptionRequest) ->
 
 fn audio_transcription_seconds(request: &AudioTranscriptionRequest) -> u64 {
     wav_duration_seconds_ceil(&request.audio).unwrap_or(1)
+}
+
+fn audio_transcription_failover_work_units(request: &AudioTranscriptionRequest) -> u64 {
+    audio_transcription_seconds(request).saturating_mul(1_000)
 }
 
 fn embedding_input_token_count(inputs: &[String]) -> u64 {
@@ -13550,6 +13826,101 @@ mod tests {
         assert_eq!(invocation.failover.open_timeout_ms, 10_000);
         assert_eq!(invocation.failover.stall_timeout_ms, 30_000);
         assert_eq!(invocation.failover.ttft_timeout_ms, 130_000);
+    }
+
+    #[test]
+    fn one_shot_failover_deadlines_scale_with_work_size() {
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+
+        let small_image = ImageGenerationRequest {
+            model: model.id.clone(),
+            prompt: "small".to_owned(),
+            n: Some(1),
+            size: Some("512x512".to_owned()),
+            response_format: None,
+            steps: Some(1),
+            cfg_scale: None,
+            seed: None,
+            user: None,
+        };
+        let mut large_image = small_image.clone();
+        large_image.n = Some(4);
+        large_image.size = Some("1024x1024".to_owned());
+        large_image.steps = Some(40);
+        let small_image_invocation = state
+            .prepare_image_generation_invocation_for_route(
+                &model,
+                &small_image,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("small image invocation");
+        let large_image_invocation = state
+            .prepare_image_generation_invocation_for_route(
+                &model,
+                &large_image,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("large image invocation");
+        assert!(
+            large_image_invocation.failover.ttft_timeout_ms
+                > small_image_invocation.failover.ttft_timeout_ms
+        );
+
+        let small_embedding = vec!["alpha".to_owned()];
+        let large_embedding = vec!["alpha ".repeat(5_000)];
+        let small_embedding_invocation = state
+            .prepare_embedding_invocation_for_route(
+                &model,
+                &small_embedding,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("small embedding invocation");
+        let large_embedding_invocation = state
+            .prepare_embedding_invocation_for_route(
+                &model,
+                &large_embedding,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("large embedding invocation");
+        assert!(
+            large_embedding_invocation.failover.ttft_timeout_ms
+                > small_embedding_invocation.failover.ttft_timeout_ms
+        );
+
+        let small_audio = AudioSpeechRequest {
+            model: model.id.clone(),
+            input: "short".to_owned(),
+            voice: None,
+            response_format: Some("wav".to_owned()),
+            speed: None,
+        };
+        let mut large_audio = small_audio.clone();
+        large_audio.input = "long ".repeat(1_000);
+        let small_audio_invocation = state
+            .prepare_audio_speech_invocation_for_route(
+                &model,
+                &small_audio,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("small audio invocation");
+        let large_audio_invocation = state
+            .prepare_audio_speech_invocation_for_route(
+                &model,
+                &large_audio,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("large audio invocation");
+        assert!(
+            large_audio_invocation.failover.ttft_timeout_ms
+                > small_audio_invocation.failover.ttft_timeout_ms
+        );
     }
 
     #[test]
@@ -14962,6 +15333,179 @@ mod tests {
             .len(),
             2
         );
+    }
+
+    #[test]
+    fn route_selection_applies_modality_throughput_floors() {
+        let model = test_routed_model(2);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let inputs = vec!["alpha beta".to_owned(), "gamma".to_owned()];
+
+        assert_eq!(
+            ordered_route_candidates_for_embedding_with_options(
+                &state,
+                &model,
+                &inputs,
+                &GatewayRequestOptions::default(),
+            )
+            .len(),
+            2
+        );
+
+        let strict = GatewayRequestOptions {
+            failover_overrides: GatewayFailoverPolicyConfig {
+                min_tok_s: Some(60.0),
+                ..GatewayFailoverPolicyConfig::default()
+            },
+            ..GatewayRequestOptions::default()
+        };
+        assert!(ordered_route_candidates_for_embedding_with_options(
+            &state, &model, &inputs, &strict,
+        )
+        .is_empty());
+
+        let image_request = ImageGenerationRequest {
+            model: model.id.clone(),
+            prompt: "quiet launch panel".to_owned(),
+            n: Some(1),
+            size: Some("512x512".to_owned()),
+            response_format: None,
+            steps: Some(4),
+            cfg_scale: None,
+            seed: None,
+            user: None,
+        };
+        assert_eq!(
+            ordered_route_candidates_for_image_generation_with_options(
+                &state,
+                &model,
+                &image_request,
+                &GatewayRequestOptions::default(),
+            )
+            .len(),
+            2
+        );
+        assert!(ordered_route_candidates_for_image_generation_with_options(
+            &state,
+            &model,
+            &image_request,
+            &strict,
+        )
+        .is_empty());
+
+        let audio_request = AudioSpeechRequest {
+            model: model.id.clone(),
+            input: "hello from mayhem".to_owned(),
+            voice: None,
+            response_format: Some("wav".to_owned()),
+            speed: None,
+        };
+        assert_eq!(
+            ordered_route_candidates_for_audio_speech_with_options(
+                &state,
+                &model,
+                &audio_request,
+                &GatewayRequestOptions::default(),
+            )
+            .len(),
+            2
+        );
+        assert!(ordered_route_candidates_for_audio_speech_with_options(
+            &state,
+            &model,
+            &audio_request,
+            &strict,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn modality_observations_use_natural_throughput_units() {
+        let embedding = GatewayEmbeddingResult {
+            output: EmbeddingOutput {
+                embeddings: vec![vec![0.1, 0.2]],
+                usage: Usage {
+                    prompt_tokens: 40,
+                    completion_tokens: 0,
+                    total_tokens: 40,
+                },
+            },
+            backend: "direct".to_owned(),
+            direct_session: true,
+            provider_receipt: None,
+            quality: None,
+        };
+        let sample = observation_sample_from_embedding_success(&embedding, Duration::from_secs(2));
+        assert_eq!(sample.tok_s, Some(20.0));
+
+        let image = GatewayImageGenerationResult {
+            output: ImageGenerationOutput {
+                artifacts: vec![GatewayArtifactOutput {
+                    id: "img".to_owned(),
+                    content_type: "image/png".to_owned(),
+                    bytes: vec![1, 2, 3],
+                    blake3: "00".repeat(32),
+                }],
+                usage: ReceiptUsage::from_units([(USAGE_IMAGE, 2), (USAGE_STEP, 8)]),
+            },
+            backend: "direct".to_owned(),
+            direct_session: true,
+            provider_receipt: None,
+            quality: None,
+        };
+        let sample =
+            observation_sample_from_image_generation_success(&image, Duration::from_secs(4));
+        assert_eq!(sample.tok_s, Some(0.5));
+
+        let audio = GatewayAudioTranscriptionResult {
+            output: AudioTranscriptionOutput {
+                text: "hello".to_owned(),
+                usage: ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, 6)]),
+            },
+            backend: "direct".to_owned(),
+            direct_session: true,
+            provider_receipt: None,
+            quality: Some(GatewaySessionQuality {
+                ttft_ms: 250,
+                tok_s: Some(3.0),
+            }),
+        };
+        let sample =
+            observation_sample_from_audio_transcription_success(&audio, Duration::from_secs(99));
+        assert_eq!(sample.ttft_ms, 250);
+        assert_eq!(sample.tok_s, Some(3.0));
+    }
+
+    #[test]
+    fn underdelivery_streak_emits_contract_ready_reputation_event() {
+        let model = test_routed_model(1);
+        let state = GatewayState::from_models(vec![model.clone()]).with_epoch_seconds(7_200);
+        let route = &model.mayhem.route_candidates[0];
+
+        for _ in 0..3 {
+            record_route_observation(
+                &state,
+                Some(route),
+                ProviderObservationSample {
+                    ttft_ms: 100,
+                    tok_s: Some(10.0),
+                    error: false,
+                },
+            );
+        }
+
+        let events = state.reputation_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind, "underdelivery");
+        assert_eq!(event.command["op"], json!("record_rep_event"));
+        assert_eq!(event.command["provider"], json!(route.provider));
+        assert_eq!(event.command["kind"], json!("underdelivery"));
+        assert_eq!(event.command["evidence_hash"], json!(event.evidence_hash));
+        assert_eq!(event.command["epoch"], json!(event.at / 7_200 + 1));
+        assert_eq!(event.evidence["epoch_seconds"], json!(7_200));
+        assert_eq!(event.evidence["streak"], json!(3));
+        assert_eq!(event.evidence["ratio"], json!(0.2));
     }
 
     #[test]

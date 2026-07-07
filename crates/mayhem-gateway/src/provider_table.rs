@@ -20,6 +20,9 @@ pub const DEFAULT_UNDERDELIVERY_RATIO: f64 = 0.5;
 pub const DEFAULT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.5;
 pub const DEFAULT_LLM_GENERATION_FLOOR_TOK_S: f64 = 5.0;
 pub const DEFAULT_LLM_PREFILL_FLOOR_TOK_S: f64 = 100.0;
+pub const DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S: f64 = 10.0;
+pub const DEFAULT_IMAGE_FLOOR_IMAGES_PER_S: f64 = 1.0 / 300.0;
+pub const DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR: f64 = 0.05;
 const P2C_REPUTATION_DECISION_DELTA: f64 = 0.05;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_MIN_SAMPLES: u64 = 3;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_EWMA_THRESHOLD: f64 = 0.8;
@@ -58,6 +61,8 @@ pub struct ContractProviderSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderObservationSample {
     pub ttft_ms: u64,
+    /// Legacy field name, generic meaning: the modality's natural throughput
+    /// unit, e.g. output tok/s, embedding input tok/s, images/s, or audio RTF.
     pub tok_s: Option<f64>,
     pub error: bool,
 }
@@ -73,9 +78,21 @@ pub struct ProviderObservation {
     pub consecutive_failures: u32,
     #[serde(default)]
     pub underdelivery_streak: u32,
+    #[serde(default)]
+    pub underdelivery_event_emitted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_open_until_millis: Option<u64>,
     pub samples: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderUnderdeliveryEvent {
+    pub key: ProviderKey,
+    pub advertised_throughput: f64,
+    pub measured_throughput: f64,
+    pub ratio: f64,
+    pub streak: u32,
+    pub observed_at_millis: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,7 +125,8 @@ pub struct RequestRequirements {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub max_price_mu: Option<u64>,
-    pub min_generation_tok_s: Option<f64>,
+    /// Minimum acceptable throughput in the request modality's natural unit.
+    pub min_throughput: Option<f64>,
     pub now_millis: u64,
     pub max_attestation_head_age_millis: u64,
     pub heartbeat_ttl_millis: u64,
@@ -233,7 +251,7 @@ impl Default for RequestRequirements {
             input_tokens: 0,
             output_tokens: 0,
             max_price_mu: None,
-            min_generation_tok_s: None,
+            min_throughput: None,
             now_millis: 0,
             max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
             heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
@@ -347,8 +365,12 @@ impl ProviderTable {
         self.upsert_heartbeat(heartbeat, received_at_millis);
     }
 
-    pub fn record_observation(&mut self, key: &ProviderKey, sample: ProviderObservationSample) {
-        self.record_observation_at(key, sample, 0);
+    pub fn record_observation(
+        &mut self,
+        key: &ProviderKey,
+        sample: ProviderObservationSample,
+    ) -> Option<ProviderUnderdeliveryEvent> {
+        self.record_observation_at(key, sample, 0)
     }
 
     pub fn record_observation_at(
@@ -356,7 +378,7 @@ impl ProviderTable {
         key: &ProviderKey,
         sample: ProviderObservationSample,
         now_millis: u64,
-    ) {
+    ) -> Option<ProviderUnderdeliveryEvent> {
         let alpha = self.observation_alpha;
         let advertised_tok_s = self
             .heartbeats
@@ -364,6 +386,7 @@ impl ProviderTable {
             .and_then(|live| live.heartbeat.perf.tok_s)
             .filter(|value| value.is_finite() && *value > 0.0);
         let observed = self.observations.entry(key.clone()).or_default();
+        let mut underdelivery_event = None;
         observed.ewma_ttft_ms = Some(update_ewma(
             observed.ewma_ttft_ms,
             sample.ttft_ms as f64,
@@ -380,8 +403,20 @@ impl ProviderTable {
                     Some(update_ewma(observed.ewma_throughput_ratio, ratio, alpha));
                 if ratio < DEFAULT_UNDERDELIVERY_RATIO {
                     observed.underdelivery_streak = observed.underdelivery_streak.saturating_add(1);
+                    if observed.underdelivery_streak >= 3 && !observed.underdelivery_event_emitted {
+                        observed.underdelivery_event_emitted = true;
+                        underdelivery_event = Some(ProviderUnderdeliveryEvent {
+                            key: key.clone(),
+                            advertised_throughput: advertised_tok_s,
+                            measured_throughput: tok_s,
+                            ratio,
+                            streak: observed.underdelivery_streak,
+                            observed_at_millis: now_millis,
+                        });
+                    }
                 } else if ratio >= DEFAULT_THROUGHPUT_RATIO_GRACE {
                     observed.underdelivery_streak = 0;
+                    observed.underdelivery_event_emitted = false;
                 }
             }
         }
@@ -408,6 +443,7 @@ impl ProviderTable {
             observed.circuit_open_until_millis = None;
         }
         observed.samples += 1;
+        underdelivery_event
     }
 
     pub fn entries(&self, now_millis: u64) -> Vec<ProviderTableEntry> {
@@ -533,9 +569,9 @@ pub fn evaluate_eligibility(
         return Err(IneligibilityReason::ProviderMinAsk);
     }
     if request
-        .min_generation_tok_s
+        .min_throughput
         .filter(|value| value.is_finite() && *value > 0.0)
-        .is_some_and(|floor| effective_generation_tok_s(entry).unwrap_or(0.0) < floor)
+        .is_some_and(|floor| effective_throughput(entry).unwrap_or(0.0) < floor)
     {
         return Err(IneligibilityReason::ThroughputFloor);
     }
@@ -715,7 +751,7 @@ fn effective_ttft_ms(entry: &ProviderTableEntry) -> f64 {
         .unwrap_or(1.0)
 }
 
-fn effective_generation_tok_s(entry: &ProviderTableEntry) -> Option<f64> {
+fn effective_throughput(entry: &ProviderTableEntry) -> Option<f64> {
     entry
         .observed
         .ewma_tok_s
@@ -1371,12 +1407,12 @@ mod tests {
         assert_eq!(evaluate_eligibility(&ask_limited, &request), Ok(80));
 
         let mut throughput_limited = request.clone();
-        throughput_limited.min_generation_tok_s = Some(60.0);
+        throughput_limited.min_throughput = Some(60.0);
         assert_eq!(
             evaluate_eligibility(&good, &throughput_limited),
             Err(IneligibilityReason::ThroughputFloor)
         );
-        throughput_limited.min_generation_tok_s = Some(50.0);
+        throughput_limited.min_throughput = Some(50.0);
         assert_eq!(evaluate_eligibility(&good, &throughput_limited), Ok(80));
 
         let mut bad = good.clone();
@@ -1438,7 +1474,7 @@ mod tests {
         }
 
         let request = RequestRequirements {
-            min_generation_tok_s: None,
+            min_throughput: None,
             ..eligible_request(now + 10)
         };
         let entries = table.entries(now + 10);

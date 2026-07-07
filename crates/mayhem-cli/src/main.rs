@@ -15861,6 +15861,14 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         } else {
             let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
             let rpc = PeerRpcClient::new(&rpc_url)?;
+            let contract_param_at = unix_epoch_seconds()?;
+            let gateway_epoch_seconds = read_param_u64_at(
+                &rpc,
+                "epoch_seconds",
+                DEFAULT_EPOCH_SECONDS,
+                contract_param_at,
+            )
+            .await?;
             let (catalog_doc, catalog_json, catalog_source) =
                 if let Some(dev_catalog_path) = args.dev_catalog_path.clone() {
                     let catalog_path = absolutize(dev_catalog_path)?;
@@ -16024,6 +16032,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                     .with_canary_registry(canary_registry)
                     .with_provider_earnings(provider_earnings)
                     .with_failover_policy(failover_policy)
+                    .with_epoch_seconds(gateway_epoch_seconds)
                     .with_receipt_user_seed(user_seed)
                     .with_receipt_balance_mu(balance_mu)
                     .with_session_backend(Arc::new(backend)),
@@ -16071,6 +16080,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "dashboard_session_expires_in_seconds": dashboard_session_expires_in_seconds,
         "source": source,
         "backend": backend,
+        "epoch_seconds": state.epoch_seconds(),
         "rail": args.rail.as_str(),
         "wallet": wallet_public_key.as_ref().map(|public_key| json!({
             "public_key": public_key,
@@ -22159,11 +22169,11 @@ impl ProviderHeartbeatLoad {
         self.store_rolling_ms(&self.rolling_ttft_ms, ttft_ms.max(1));
     }
 
-    fn record_turn_result(&self, elapsed: Duration, output_tokens: u64) {
+    fn record_turn_result(&self, elapsed: Duration, throughput_units: u64) {
         let elapsed_ms = duration_millis_u64(elapsed).max(1);
         self.store_rolling_ms(&self.rolling_turn_ms, elapsed_ms);
-        if output_tokens > 0 {
-            let tok_s_milli = ((u128::from(output_tokens) * 1_000_000_u128)
+        if throughput_units > 0 {
+            let tok_s_milli = ((u128::from(throughput_units) * 1_000_000_u128)
                 / u128::from(elapsed_ms))
             .min(u128::from(u64::MAX)) as u64;
             self.store_rolling_ms(&self.rolling_tok_s_milli, tok_s_milli.max(1));
@@ -22356,6 +22366,51 @@ fn provider_session_usage_units(usage: &ReceiptUsage) -> u64 {
         .fold(0_u64, u64::saturating_add)
 }
 
+fn provider_session_throughput_units(usage: &ReceiptUsage) -> u64 {
+    for unit in [
+        mayhem_proto::USAGE_OUTPUT_TOKEN,
+        USAGE_IMAGE,
+        USAGE_AUDIO_SECOND,
+        mayhem_proto::USAGE_INPUT_TOKEN,
+    ] {
+        let value = usage.get(unit);
+        if value > 0 {
+            return value;
+        }
+    }
+    provider_session_usage_units(usage)
+}
+
+fn provider_session_throughput_unit(usage: &ReceiptUsage) -> &'static str {
+    if usage.output_tokens() > 0 {
+        "output_tok_s"
+    } else if usage.get(USAGE_IMAGE) > 0 {
+        "images_s"
+    } else if usage.get(USAGE_AUDIO_SECOND) > 0 {
+        "audio_rtf"
+    } else if usage.input_tokens() > 0 {
+        "input_tok_s"
+    } else {
+        "usage_units_s"
+    }
+}
+
+fn provider_session_quality_value(
+    output: &ProviderSessionOutput,
+    elapsed: Duration,
+    first_ttft_ms: Option<u64>,
+) -> Value {
+    let elapsed_ms = duration_millis_u64(elapsed).max(1);
+    let throughput_units = provider_session_throughput_units(&output.usage);
+    let throughput = throughput_units as f64 * 1000.0 / elapsed_ms as f64;
+    json!({
+        "ttft_ms": first_ttft_ms.unwrap_or(elapsed_ms),
+        "compute_ms": elapsed_ms,
+        "throughput": throughput,
+        "unit": provider_session_throughput_unit(&output.usage),
+    })
+}
+
 struct ProviderRequestLoadGuard {
     load: ProviderHeartbeatLoad,
     started: Instant,
@@ -22368,8 +22423,10 @@ impl ProviderRequestLoadGuard {
     }
 
     fn finish_with_output(&mut self, output: &ProviderSessionOutput) {
-        self.load
-            .record_turn_result(self.started.elapsed(), output.usage.output_tokens());
+        self.load.record_turn_result(
+            self.started.elapsed(),
+            provider_session_throughput_units(&output.usage),
+        );
         self.finish();
     }
 
@@ -28017,6 +28074,13 @@ async fn handle_provider_session_frame(
                     return Ok(());
                 }
             };
+            let provider_quality = provider_session_quality_value(
+                &output,
+                request_started.elapsed(),
+                live_stream
+                    .as_ref()
+                    .and_then(|stream| stream.first_ttft_ms()),
+            );
             let live_stream_state = live_stream.and_then(ProviderSessionLiveStream::into_state);
             provider_session_debug(format!(
                 "sending response for session {session_id} request {request_id}"
@@ -28030,6 +28094,7 @@ async fn handle_provider_session_frame(
                 &output,
                 runtime.runtime_keypair,
                 live_stream_state,
+                provider_quality,
             )
             .await
             {
@@ -28296,6 +28361,7 @@ async fn send_provider_session_output(
     output: &ProviderSessionOutput,
     runtime_keypair: &RuntimeKeypair,
     live_stream_state: Option<ProviderSessionLiveStreamState>,
+    provider_quality: Value,
 ) -> Result<ProviderSignedSessionReceipt> {
     let mut index = live_stream_state
         .as_ref()
@@ -28393,6 +28459,7 @@ async fn send_provider_session_output(
         index,
         output,
         token_ids_sent_in_deltas,
+        &provider_quality,
         provider_session_max_frame_bytes(),
     )? {
         provider_session_debug(format!(
@@ -28457,6 +28524,7 @@ fn provider_session_final_delta_frames(
     start_index: u64,
     output: &ProviderSessionOutput,
     token_ids_sent_in_deltas: bool,
+    provider_quality: &Value,
     max_frame_bytes: usize,
 ) -> Result<Vec<Value>> {
     let mut final_frame = json!({
@@ -28468,6 +28536,7 @@ fn provider_session_final_delta_frames(
         "embeddings": output.embeddings.as_ref(),
         "fin": output.finish_reason,
         "usage": output.usage,
+        "quality": provider_quality,
         "token_ids": (!token_ids_sent_in_deltas).then_some(&output.token_ids),
         "artifacts": provider_session_artifact_summaries(&output.artifacts),
     });
@@ -37882,9 +37951,20 @@ mod tests {
         };
         let max_frame_bytes = 12 * 1024;
 
-        let frames =
-            provider_session_final_delta_frames("rid-large", 7, &output, false, max_frame_bytes)
-                .unwrap();
+        let frames = provider_session_final_delta_frames(
+            "rid-large",
+            7,
+            &output,
+            false,
+            &json!({
+                "ttft_ms": 50,
+                "compute_ms": 100,
+                "throughput": 40.0,
+                "unit": "output_tok_s",
+            }),
+            max_frame_bytes,
+        )
+        .unwrap();
 
         assert!(frames.len() > 3);
         assert!(frames
@@ -37901,6 +37981,7 @@ mod tests {
         assert!(final_frame["tool"].is_null());
         assert!(final_frame["embeddings"].is_null());
         assert!(final_frame["token_ids"].is_null());
+        assert_eq!(final_frame["quality"]["unit"], json!("output_tok_s"));
         for field in ["tool", "embeddings", "token_ids"] {
             let manifest_key = format!("{field}_ref");
             let manifest: PayloadChunkManifest =
@@ -37971,6 +38052,25 @@ mod tests {
             provider_heartbeat_tok_s(measured, Some(30.0)),
             (Some(20.0), "measured")
         );
+    }
+
+    #[test]
+    fn provider_throughput_units_follow_modality_usage() {
+        let text = ReceiptUsage::text(40, 8);
+        assert_eq!(provider_session_throughput_units(&text), 8);
+        assert_eq!(provider_session_throughput_unit(&text), "output_tok_s");
+
+        let image = ReceiptUsage::from_units([(USAGE_IMAGE, 2), (USAGE_STEP, 40)]);
+        assert_eq!(provider_session_throughput_units(&image), 2);
+        assert_eq!(provider_session_throughput_unit(&image), "images_s");
+
+        let audio = ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, 6)]);
+        assert_eq!(provider_session_throughput_units(&audio), 6);
+        assert_eq!(provider_session_throughput_unit(&audio), "audio_rtf");
+
+        let embedding = ReceiptUsage::text(128, 0);
+        assert_eq!(provider_session_throughput_units(&embedding), 128);
+        assert_eq!(provider_session_throughput_unit(&embedding), "input_tok_s");
     }
 
     #[test]
