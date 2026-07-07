@@ -58,6 +58,7 @@ const enclaveRegistration = {
   artifact_source: artifactSource,
   manifest_hash: manifestHash,
   att_tier: 1,
+  quant: 'INT4',
   binary_hash: binaryHash,
   caps: {
     chat: true,
@@ -261,6 +262,7 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   assert.equal(enclaveEntry.value.created_by, admin.publicKey);
   assert.equal(enclaveEntry.value.created_by_role, 'admin');
   assert.equal(enclaveEntry.value.model_class, 'text-generation');
+  assert.equal(enclaveEntry.value.quant, 'int4');
   assert.equal(enclaveEntry.value.artifact_root, updatedArtifactRoot);
   assert.equal(enclaveEntry.value.artifact_root_kind, 'blake3_merkle_v1');
   assert.deepEqual(enclaveEntry.value.artifact_source, enclaveUpdate.artifact_source);

@@ -75,6 +75,7 @@ use tokio::time::sleep;
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
+const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
 const DEFAULT_HOLDBACK_EPOCHS: u64 = 168;
 const DEFAULT_CHALLENGE_EPOCHS: u64 = 6;
@@ -998,6 +999,10 @@ struct ModelsArgs {
     /// Minimum live provider attestation tier to show; requires --gateway.
     #[arg(long)]
     min_att_tier: Option<u8>,
+
+    /// Show only live models with at least one route in this quant bucket; requires --gateway.
+    #[arg(long)]
+    quant: Option<String>,
 
     /// Show only live models with at least one admin-KYB'd provider; requires --gateway.
     #[arg(long)]
@@ -2801,6 +2806,10 @@ struct AdminRegisterEnclaveArgs {
 
     #[arg(long, default_value_t = 1)]
     att_tier: u8,
+
+    /// Enclave-intrinsic quant bucket; defaults to the signed catalog artifact label.
+    #[arg(long)]
+    quant: Option<String>,
 
     /// JSON object for enclave caps, e.g. '{"tools":true,"json":true,"ctx":8192}'.
     #[arg(long)]
@@ -11335,6 +11344,7 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         },
         "manifest_hash": &args.manifest_hash,
         "att_tier": args.att_tier,
+        "quant": binding.quant,
         "binary_hash": &args.binary_hash,
         "caps": caps,
     });
@@ -11378,6 +11388,7 @@ fn backend_supports_tool_calls(backend: &str) -> bool {
 #[derive(Debug)]
 struct AdminEnclaveCatalogBinding {
     model_class: String,
+    quant: String,
     artifact_sidecars: BTreeMap<String, CatalogSidecarPayload>,
 }
 
@@ -11451,7 +11462,7 @@ fn validate_admin_enclave_catalog_binding(
                 catalog_path.display()
             )
         })?;
-    let Some((_, artifact)) = model.artifacts.iter().find(|(_, artifact)| {
+    let Some((artifact_name, artifact)) = model.artifacts.iter().find(|(_, artifact)| {
         artifact.engine == args.backend
             && artifact.source.kind == "huggingface"
             && artifact.source.repo == args.artifact_repo
@@ -11485,8 +11496,22 @@ fn validate_admin_enclave_catalog_binding(
         args.source_sha256.as_deref(),
         artifact.source_sha256.as_deref(),
     )?;
+    let catalog_quant = quant_bucket_from_catalog_artifact(artifact_name, artifact);
+    let quant = match args.quant.as_deref() {
+        Some(requested) => {
+            let requested = normalize_quant_bucket(requested)?;
+            if catalog_quant != DEFAULT_QUANT_BUCKET && requested != catalog_quant {
+                bail!(
+                    "register-enclave quant mismatch: requested {requested}, signed catalog artifact {artifact_name} implies {catalog_quant}"
+                );
+            }
+            requested
+        }
+        None => catalog_quant,
+    };
     Ok(AdminEnclaveCatalogBinding {
         model_class: model.model_class.clone(),
+        quant,
         artifact_sidecars: artifact
             .sidecars
             .iter()
@@ -11543,6 +11568,63 @@ fn ensure_catalog_optional_hex_match(
         (Some(left), None) => bail!(
             "register-enclave {label} mismatch: requested {left}, signed catalog has <missing>"
         ),
+    }
+}
+
+fn normalize_quant_bucket(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    if normalized.is_empty() {
+        bail!("quant bucket must not be empty");
+    }
+    if matches!(
+        normalized.as_str(),
+        "unknown" | "fp32" | "fp16" | "bf16" | "fp8" | "nvfp4" | "int8" | "int4"
+    ) {
+        return Ok(normalized);
+    }
+    let inferred = quant_bucket_from_descriptor(&normalized);
+    if inferred != DEFAULT_QUANT_BUCKET {
+        return Ok(inferred);
+    }
+    bail!("quant bucket must be one of fp32, fp16, bf16, fp8, nvfp4, int8, int4, unknown")
+}
+
+fn default_quant_bucket() -> String {
+    DEFAULT_QUANT_BUCKET.to_owned()
+}
+
+fn quant_bucket_from_catalog_artifact(name: &str, artifact: &catalog::CatalogArtifact) -> String {
+    let descriptor = format!(
+        "{} {} {}",
+        name.to_ascii_lowercase(),
+        artifact.engine.to_ascii_lowercase(),
+        artifact.path.to_ascii_lowercase()
+    );
+    quant_bucket_from_descriptor(&descriptor)
+}
+
+fn quant_bucket_from_descriptor(descriptor: &str) -> String {
+    let descriptor = descriptor.replace('_', "-");
+    if descriptor.contains("nvfp4") {
+        "nvfp4".to_owned()
+    } else if descriptor.contains("fp8") {
+        "fp8".to_owned()
+    } else if descriptor.contains("bf16") {
+        "bf16".to_owned()
+    } else if descriptor.contains("fp16") || descriptor.contains("f16") {
+        "fp16".to_owned()
+    } else if descriptor.contains("int8")
+        || descriptor.contains("8bit")
+        || descriptor.contains("q8")
+    {
+        "int8".to_owned()
+    } else if descriptor.contains("int4")
+        || descriptor.contains("4bit")
+        || descriptor.contains("q4")
+    {
+        "int4".to_owned()
+    } else {
+        DEFAULT_QUANT_BUCKET.to_owned()
     }
 }
 
@@ -15715,6 +15797,15 @@ async fn models(args: ModelsArgs) -> Result<()> {
     if args.require_kyb && !args.gateway {
         bail!("--require-kyb requires --gateway because KYB is live provider capacity");
     }
+    let quant_filter = match args.quant.as_deref() {
+        Some(quant) => {
+            if !args.gateway {
+                bail!("--quant requires --gateway because quant is a live admin enclave route");
+            }
+            Some(normalize_quant_bucket(quant)?)
+        }
+        None => None,
+    };
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
@@ -15725,9 +15816,12 @@ async fn models(args: ModelsArgs) -> Result<()> {
         let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
         let models = fetch_gateway_models(&client, &gateway_root).await?;
         let summaries = filter_model_summaries_by_require_kyb(
-            filter_model_summaries_by_min_att_tier(
-                gateway_model_summaries(&models)?,
-                args.min_att_tier,
+            filter_model_summaries_by_quant(
+                filter_model_summaries_by_min_att_tier(
+                    gateway_model_summaries(&models)?,
+                    args.min_att_tier,
+                ),
+                quant_filter.as_deref(),
             ),
             args.require_kyb,
         );
@@ -15736,6 +15830,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
             "source": "gateway_live",
             "gateway_url": gateway_root,
             "min_att_tier": args.min_att_tier,
+            "quant": quant_filter,
             "require_kyb": args.require_kyb,
             "models": summaries,
         });
@@ -16655,6 +16750,7 @@ struct ModelSummary {
     output_modalities: Vec<String>,
     attestation_tiers: BTreeMap<String, u64>,
     attestation_tier_labels: BTreeMap<String, String>,
+    quant_buckets: BTreeMap<String, u64>,
     kyb_identities: Vec<ProviderKybInfo>,
     max_attestation_tier: u8,
     prompt_confidential: bool,
@@ -17572,6 +17668,19 @@ fn filter_model_summaries_by_min_att_tier(
         .collect()
 }
 
+fn filter_model_summaries_by_quant(
+    summaries: Vec<ModelSummary>,
+    quant: Option<&str>,
+) -> Vec<ModelSummary> {
+    let Some(quant) = quant else {
+        return summaries;
+    };
+    summaries
+        .into_iter()
+        .filter(|summary| summary.quant_buckets.get(quant).copied().unwrap_or(0) > 0)
+        .collect()
+}
+
 fn filter_model_summaries_by_require_kyb(
     summaries: Vec<ModelSummary>,
     require_kyb: bool,
@@ -17616,6 +17725,7 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_else(|| attestation_tier_labels_for_counts(&attestation_tiers));
+    let quant_buckets = quant_buckets_from_mayhem(mayhem);
     let max_attestation_tier = max_attestation_tier(&attestation_tiers);
     let prompt_confidential = attestation_tiers
         .get("T3")
@@ -17656,6 +17766,7 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         output_modalities: caps_output_modalities(caps),
         attestation_tiers,
         attestation_tier_labels,
+        quant_buckets,
         kyb_identities,
         max_attestation_tier,
         prompt_confidential,
@@ -17677,6 +17788,40 @@ fn gateway_price_rate_map(price: &Value) -> Vec<RateMapEntry> {
         price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
         price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
     )
+}
+
+fn quant_buckets_from_mayhem(mayhem: &Value) -> BTreeMap<String, u64> {
+    if let Some(object) = mayhem.get("quant_buckets").and_then(Value::as_object) {
+        let buckets = object
+            .iter()
+            .filter_map(|(bucket, count)| {
+                let bucket = normalize_quant_bucket(bucket).ok()?;
+                let count = count.as_u64()?;
+                Some((bucket, count))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !buckets.is_empty() {
+            return buckets;
+        }
+    }
+    let mut buckets = BTreeMap::new();
+    for candidate in mayhem
+        .get("route_candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let bucket = candidate
+            .get("quant")
+            .and_then(Value::as_str)
+            .and_then(|quant| normalize_quant_bucket(quant).ok())
+            .unwrap_or_else(|| DEFAULT_QUANT_BUCKET.to_owned());
+        *buckets.entry(bucket).or_insert(0) += 1;
+    }
+    if buckets.is_empty() {
+        buckets.insert(DEFAULT_QUANT_BUCKET.to_owned(), 0);
+    }
+    buckets
 }
 
 fn max_attestation_tier(tiers: &BTreeMap<String, u64>) -> u8 {
@@ -18309,6 +18454,9 @@ fn print_models_report(report: &Value) -> Result<()> {
     if let Some(min_att_tier) = report["min_att_tier"].as_u64() {
         println!("Filter: minimum attestation tier T{min_att_tier}");
     }
+    if let Some(quant) = report["quant"].as_str() {
+        println!("Filter: quant {quant}");
+    }
     if report["require_kyb"].as_bool() == Some(true) {
         println!("Filter: admin-KYB'd provider required");
     }
@@ -18316,8 +18464,8 @@ fn print_models_report(report: &Value) -> Result<()> {
         "Prompt privacy: only Tier 3 is prompt-confidential; Tier 1, Tier 2, and Tier 4 providers can read prompts in memory."
     );
     println!(
-        "{:<44} {:>9} {:>5} {:>23} {:>7} {:>5} {:>5}  {:<44}",
-        "MODEL", "PROVIDERS", "ROOMS", "RATE MAP", "CTX", "TOOLS", "JSON", "ATTESTATION"
+        "{:<44} {:>9} {:>5} {:>23} {:>10} {:>7} {:>5} {:>5}  {:<44}",
+        "MODEL", "PROVIDERS", "ROOMS", "RATE MAP", "QUANT", "CTX", "TOOLS", "JSON", "ATTESTATION"
     );
     for model in report["models"]
         .as_array()
@@ -18332,16 +18480,18 @@ fn print_models_report(report: &Value) -> Result<()> {
             .and_then(|value| serde_json::from_value::<Vec<RateMapEntry>>(Value::Array(value)).ok())
             .unwrap_or_default();
         let price = format_rate_map(&rate_map);
+        let quant = quant_summary_for_model(model);
         let context = model["context"].as_u64().unwrap_or(0);
         let tools = bool_mark(model["tools"].as_bool().unwrap_or(false));
         let json = bool_mark(model["json"].as_bool().unwrap_or(false));
         let attestation = attestation_summary_for_model(model);
         println!(
-            "{:<44} {:>9} {:>5} {:>23} {:>7} {:>5} {:>5}  {:<44}",
+            "{:<44} {:>9} {:>5} {:>23} {:>10} {:>7} {:>5} {:>5}  {:<44}",
             truncate_for_table(id, 44),
             providers,
             rooms,
             truncate_for_table(&price, 23),
+            truncate_for_table(&quant, 10),
             context,
             tools,
             json,
@@ -18423,6 +18573,40 @@ fn print_balance_report(report: &Value) {
         println!("Frozen: {status}");
     } else {
         println!("Frozen: no");
+    }
+}
+
+fn quant_summary_for_model(model: &Value) -> String {
+    let buckets = model
+        .get("quant_buckets")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut parts = buckets
+        .iter()
+        .filter_map(|(bucket, count)| count.as_u64().map(|count| format!("{bucket}:{count}")))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        parts = model
+            .get("route_candidates")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|candidate| {
+                candidate
+                    .get("quant")
+                    .and_then(Value::as_str)
+                    .and_then(|quant| normalize_quant_bucket(quant).ok())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    if parts.is_empty() {
+        DEFAULT_QUANT_BUCKET.to_owned()
+    } else {
+        parts.sort();
+        parts.join(",")
     }
 }
 
@@ -20816,6 +21000,8 @@ struct LedgerEnclave {
     source_sha256: Option<String>,
     manifest_hash: String,
     att_tier: u8,
+    #[serde(default = "default_quant_bucket")]
+    quant: String,
     binary_hash: String,
     #[serde(default)]
     caps: Value,
@@ -23220,6 +23406,7 @@ fn provider_gateway_route_summaries(models: &[Value], provider: &str) -> Vec<Val
                     "room_id": candidate.get("room_id").cloned().unwrap_or(Value::Null),
                     "price_ver": candidate.get("price_ver").cloned().unwrap_or(Value::Null),
                     "att_tier": candidate.get("att_tier").cloned().unwrap_or(Value::Null),
+                    "quant": candidate.get("quant").cloned().unwrap_or(Value::Null),
                     "kyb": candidate.get("kyb").cloned().unwrap_or(Value::Null),
                 }));
             }
@@ -23996,6 +24183,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
 
     let mut providers_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut tiers_by_model: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    let mut quants_by_model: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
     let mut kyb_by_model: BTreeMap<String, BTreeMap<String, ProviderKybInfo>> = BTreeMap::new();
     let mut route_candidates_by_model: BTreeMap<String, BTreeMap<String, GatewayRouteCandidate>> =
         BTreeMap::new();
@@ -24016,15 +24204,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if !room_matches_enclave(room, enclave) {
             continue;
         }
-        let Some(selected_price) = served_price_by_model.get(&enclave.model_id) else {
-            continue;
-        };
         let Some(serving_price) = prices_by_enclave.get(&serving.enclave_id) else {
             continue;
         };
-        if enclave.model_id != serving.model_id
-            || !same_gateway_price_terms(serving_price, selected_price)
-        {
+        if enclave.model_id != serving.model_id {
             continue;
         }
         providers_by_model
@@ -24057,8 +24240,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
+                    price_ref_mu: Some(gateway_price_ref_from_ledger(serving_price)),
                     min_ask_mu: 0,
                     att_tier: effective_att_tier,
+                    quant: normalize_ledger_quant(&enclave.quant),
                     admin_pubkey: enclave.created_by.clone(),
                     artifact_root: enclave.artifact_root.clone(),
                     artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
@@ -24077,6 +24262,13 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .entry(enclave.model_id.clone())
             .or_default()
             .entry(tier)
+            .or_default()
+            .insert(serving.provider.clone());
+        let quant = normalize_ledger_quant(&enclave.quant);
+        quants_by_model
+            .entry(enclave.model_id.clone())
+            .or_default()
+            .entry(quant)
             .or_default()
             .insert(serving.provider.clone());
     }
@@ -24107,6 +24299,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .into_iter()
             .map(|(tier, providers)| (tier, usize_to_u32(providers.len())))
             .collect::<BTreeMap<_, _>>();
+        let quant_buckets = quants_by_model
+            .remove(&model_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(quant, providers)| (quant, usize_to_u32(providers.len())))
+            .collect::<BTreeMap<_, _>>();
         models.push(GatewayModel {
             id: model_id.clone(),
             created: 1_782_950_400,
@@ -24117,18 +24315,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .unwrap_or_else(|| DEFAULT_MODEL_CLASS.to_owned()),
                 providers_online,
                 rooms,
-                price_ref_mu: PriceRefMu {
-                    denom: "mu_usd".to_owned(),
-                    ver: price.ver,
-                    rate_map: normalize_rate_map(price.rate_map.clone()),
-                    per_req_mu: price.per_req_mu,
-                    min_session_mu: price.min_session_mu,
-                    derivation: price.derivation.clone(),
-                },
+                price_ref_mu: gateway_price_ref_from_ledger(&price),
                 attestation_tier_labels: gateway_attestation_tier_labels_for_counts(
                     &attestation_tiers,
                 ),
                 attestation_tiers,
+                quant_buckets,
                 min_app_version: None,
                 caps: caps_by_model
                     .remove(&model_id)
@@ -24271,6 +24463,21 @@ fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64, u64, u64) {
     )
 }
 
+fn gateway_price_ref_from_ledger(price: &LedgerPriceRecord) -> PriceRefMu {
+    PriceRefMu {
+        denom: "mu_usd".to_owned(),
+        ver: price.ver,
+        rate_map: normalize_rate_map(price.rate_map.clone()),
+        per_req_mu: price.per_req_mu,
+        min_session_mu: price.min_session_mu,
+        derivation: price.derivation.clone(),
+    }
+}
+
+fn normalize_ledger_quant(value: &str) -> String {
+    normalize_quant_bucket(value).unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned())
+}
+
 fn price_derivation_sort_key(derivation: &Value) -> (u64, u64, String) {
     (
         derivation.get("epoch").and_then(Value::as_u64).unwrap_or(0),
@@ -24290,14 +24497,6 @@ fn price_derivation_sort_key(derivation: &Value) -> (u64, u64, String) {
             .unwrap_or("")
             .to_owned(),
     )
-}
-
-fn same_gateway_price_terms(left: &LedgerPriceRecord, right: &LedgerPriceRecord) -> bool {
-    left.ver == right.ver
-        && left.denom == right.denom
-        && left.per_req_mu == right.per_req_mu
-        && left.min_session_mu == right.min_session_mu
-        && normalize_rate_map(left.rate_map.clone()) == normalize_rate_map(right.rate_map.clone())
 }
 
 fn room_matches_enclave(room: &LedgerRoom, enclave: &LedgerEnclave) -> bool {
@@ -32072,6 +32271,7 @@ mod tests {
             manifest_hash: "55".repeat(32),
             binary_hash: "66".repeat(32),
             att_tier: 1,
+            quant: None,
             caps_json: Some(r#"{"tools":true,"json":true,"ctx":8192}"#.to_owned()),
             caps_file: None,
         };
@@ -32080,6 +32280,7 @@ mod tests {
         assert_eq!(payload["artifact_source"]["repo"], "admin/model");
         assert_eq!(payload["artifact_root"], artifact_root);
         assert_eq!(payload["model_class"], DEFAULT_MODEL_CLASS);
+        assert_eq!(payload["quant"], "int4");
 
         let mut tier2_args = args;
         tier2_args.att_tier = 2;
@@ -32716,6 +32917,7 @@ mod tests {
             source_sha256: None,
             manifest_hash: "cc".repeat(32),
             att_tier: 1,
+            quant: "int4".to_owned(),
             binary_hash: "dd".repeat(32),
             caps: json!({}),
             status: "active".to_owned(),
@@ -32796,6 +32998,7 @@ mod tests {
             source_sha256: None,
             manifest_hash: "cc".repeat(32),
             att_tier: 1,
+            quant: "int4".to_owned(),
             binary_hash: "dd".repeat(32),
             caps: json!({}),
             status: "retired".to_owned(),
@@ -33299,6 +33502,7 @@ mod tests {
         trt_enclave.backend = "trt-llm".to_owned();
         trt_enclave.artifact_root = trt_root;
         trt_enclave.artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        trt_enclave.quant = "nvfp4".to_owned();
         trt_enclave.caps = json!({
             "chat": true,
             "tools": false,
@@ -33373,6 +33577,7 @@ mod tests {
         vllm_enclave.backend = "vllm".to_owned();
         vllm_enclave.artifact_root = vllm_root;
         vllm_enclave.artifact_source.path = "model.safetensors".to_owned();
+        vllm_enclave.quant = "bf16".to_owned();
         vllm_enclave.caps = json!({
             "chat": true,
             "tools": true,
@@ -33507,6 +33712,7 @@ mod tests {
         contract.enclaves[0].backend = "mlx".to_owned();
         contract.enclaves[0].artifact_root = mlx_root;
         contract.enclaves[0].artifact_source.path = "model.safetensors".to_owned();
+        contract.enclaves[0].quant = "int4".to_owned();
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
         let mut args = test_provider_start_args();
         args.enclave = Some("test/model@4bit".to_owned());
@@ -33550,6 +33756,7 @@ mod tests {
         contract.enclaves[0].backend = "trt-llm".to_owned();
         contract.enclaves[0].artifact_root = trt_root;
         contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        contract.enclaves[0].quant = "nvfp4".to_owned();
         let hardware = test_hardware(FixtureProfile::AppleSilicon);
         let mut args = test_provider_start_args();
         args.enclave = Some("test/model@4bit".to_owned());
@@ -33715,6 +33922,7 @@ mod tests {
             Some(expected_price_root.as_str())
         );
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
+        assert_eq!(models[0].mayhem.quant_buckets["int4"], 1);
         assert!(models[0].mayhem.kyb_identities.is_empty());
         assert!(models[0].mayhem.caps.tools);
         assert_eq!(models[0].mayhem.caps.ctx, 8192);
@@ -33736,6 +33944,18 @@ mod tests {
             "aa".repeat(16)
         );
         assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 1);
+        assert_eq!(models[0].mayhem.route_candidates[0].quant, "int4");
+        let route_price = models[0].mayhem.route_candidates[0]
+            .price_ref_mu
+            .as_ref()
+            .expect("route carries its own enclave market price");
+        assert_eq!(route_price.denom, "mu_usd");
+        assert_eq!(route_price.ver, 1);
+        assert_eq!(route_price.rate_map, text_generation_rate_map(1, 2));
+        assert_eq!(
+            route_price.derivation.as_ref().unwrap()["epoch"].as_u64(),
+            Some(7)
+        );
         assert_eq!(
             models[0].mayhem.route_candidates[0].admin_pubkey,
             "44".repeat(32)
@@ -33975,6 +34195,124 @@ mod tests {
         assert_eq!(
             helper.mayhem.route_candidates[0].accepted_rails,
             vec!["tap".to_owned()]
+        );
+    }
+
+    #[test]
+    fn gateway_models_keep_per_enclave_tier_market_prices_for_same_model() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+
+        let second_provider = "66".repeat(32);
+        let tier3_enclave_id = "77".repeat(32);
+        let tier3_room_id = "dd".repeat(16);
+        let model_id = "test/model@4bit".to_owned();
+
+        contract.providers.push(LedgerProvider {
+            provider: second_provider.clone(),
+            status: "active".to_owned(),
+            accepted_rails: vec!["fiat".to_owned()],
+        });
+
+        let mut tier3_enclave = contract.enclaves[0].clone();
+        tier3_enclave.enclave_id = tier3_enclave_id.clone();
+        tier3_enclave.att_tier = 3;
+        tier3_enclave.quant = "fp16".to_owned();
+        tier3_enclave.artifact_root = "78".repeat(32);
+        tier3_enclave.manifest_hash = "79".repeat(32);
+        tier3_enclave.binary_hash = "7a".repeat(32);
+        contract.enclaves.push(tier3_enclave);
+
+        contract.rooms.push(LedgerRoom {
+            room_id: tier3_room_id.clone(),
+            sidechannel: format!("mx/room/{tier3_room_id}"),
+            enclave_id: Some(tier3_enclave_id.clone()),
+            model_id: model_id.clone(),
+            label: "tier 3 test".to_owned(),
+            status: "open".to_owned(),
+            creator_role: Some("admin".to_owned()),
+        });
+        contract.roomserve.push(LedgerRoomServe {
+            room_id: tier3_room_id.clone(),
+            provider: second_provider.clone(),
+            enclave_id: tier3_enclave_id.clone(),
+            model_id: model_id.clone(),
+            status: "active".to_owned(),
+        });
+        contract.serves.push(LedgerServe {
+            provider: second_provider.clone(),
+            enclave_id: tier3_enclave_id.clone(),
+            model_id: model_id.clone(),
+            status: "active".to_owned(),
+            rooms: vec![tier3_room_id],
+        });
+        contract.prices.push(LedgerPriceSchedule {
+            enclave_id: tier3_enclave_id.clone(),
+            model_id: model_id.clone(),
+            denom: "mu_usd".to_owned(),
+            current: Some(LedgerPriceRecord {
+                ver: 9,
+                denom: "mu_usd".to_owned(),
+                rate_map: text_generation_rate_map(90, 180),
+                per_req_mu: 123,
+                min_session_mu: 456,
+                effective_at: 0,
+                set_by_role: Some("admin".to_owned()),
+                derivation: Some(json!({
+                    "epoch": 12u64,
+                    "enclave_id": tier3_enclave_id,
+                    "price_root": "99".repeat(32)
+                })),
+            }),
+            pending: None,
+        });
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.id, model_id);
+        assert_eq!(model.mayhem.price_ref_mu.ver, 1);
+        assert_eq!(model.mayhem.providers_online, 2);
+        assert_eq!(model.mayhem.rooms, 2);
+        assert_eq!(model.mayhem.attestation_tiers["T1"], 1);
+        assert_eq!(model.mayhem.attestation_tiers["T3"], 1);
+        assert_eq!(model.mayhem.quant_buckets["int4"], 1);
+        assert_eq!(model.mayhem.quant_buckets["fp16"], 1);
+        assert_eq!(model.mayhem.route_candidates.len(), 2);
+
+        let by_tier = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .map(|candidate| (candidate.att_tier, candidate))
+            .collect::<BTreeMap<_, _>>();
+        let tier1 = by_tier[&1];
+        let tier1_price = tier1
+            .price_ref_mu
+            .as_ref()
+            .expect("tier-1 route has its own price");
+        assert_eq!(tier1.enclave_id, "11".repeat(32));
+        assert_eq!(tier1.quant, "int4");
+        assert_eq!(tier1.price_ver, 1);
+        assert_eq!(tier1_price.ver, 1);
+        assert_eq!(tier1_price.rate_map, text_generation_rate_map(1, 2));
+
+        let tier3 = by_tier[&3];
+        let tier3_price = tier3
+            .price_ref_mu
+            .as_ref()
+            .expect("tier-3 route has its own price");
+        assert_eq!(tier3.enclave_id, "77".repeat(32));
+        assert_eq!(tier3.provider, second_provider);
+        assert_eq!(tier3.quant, "fp16");
+        assert_eq!(tier3.price_ver, 9);
+        assert_eq!(tier3_price.ver, 9);
+        assert_eq!(tier3_price.rate_map, text_generation_rate_map(90, 180));
+        assert_eq!(tier3_price.per_req_mu, 123);
+        assert_eq!(tier3_price.min_session_mu, 456);
+        assert_eq!(
+            tier3_price.derivation.as_ref().unwrap()["epoch"].as_u64(),
+            Some(12)
         );
     }
 
@@ -35313,6 +35651,7 @@ mod tests {
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "trt-llm".to_owned();
         contract.enclaves[0].artifact_source.path = "rank0.safetensors".to_owned();
+        contract.enclaves[0].quant = "nvfp4".to_owned();
         contract.enclaves[0].caps = json!({
             "tools": false,
             "json": true,
@@ -35446,6 +35785,7 @@ mod tests {
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "vllm".to_owned();
         contract.enclaves[0].artifact_source.path = "model.safetensors".to_owned();
+        contract.enclaves[0].quant = "bf16".to_owned();
         contract.enclaves[0].caps = json!({
             "tools": true,
             "json": true,
@@ -35669,6 +36009,7 @@ mod tests {
         enclave.model_class = "tts".to_owned();
         enclave.backend = "piper".to_owned();
         enclave.artifact_source.path = "voice.onnx".to_owned();
+        enclave.quant = "fp16".to_owned();
         enclave.source_sha256 = artifact.source_sha256.clone();
         enclave.artifact_sidecars.insert(
             "piper_config".to_owned(),
@@ -36190,6 +36531,7 @@ mod tests {
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "trt-llm".to_owned();
         contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
+        contract.enclaves[0].quant = "nvfp4".to_owned();
         contract.enclaves[0].caps = json!({
             "tools": true,
             "json": true,
@@ -37180,6 +37522,7 @@ mod tests {
                     ]
                 },
                 "attestation_tiers": { "T1": 2, "T2": 1 },
+                "quant_buckets": { "int4": 2, "fp16": 1 },
                 "attestation_tier_labels": {
                     "T2": "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
                 },
@@ -37212,6 +37555,8 @@ mod tests {
         assert_eq!(summaries[0].output_modality.as_deref(), Some("image"));
         assert_eq!(summaries[0].output_modalities, vec!["image".to_owned()]);
         assert_eq!(summaries[0].attestation_tiers["T2"], 1);
+        assert_eq!(summaries[0].quant_buckets["int4"], 2);
+        assert_eq!(summaries[0].quant_buckets["fp16"], 1);
         assert!(summaries[0].attestation_tier_labels["T2"].contains("GB10"));
         assert_eq!(summaries[0].max_attestation_tier, 2);
         assert!(!summaries[0].prompt_confidential);
@@ -37236,6 +37581,7 @@ mod tests {
                         ]
                     },
                     "attestation_tiers": { "T1": 1 },
+                    "quant_buckets": { "int4": 1 },
                     "caps": { "tools": false, "json": false, "ctx": 4096 }
                 }
             }),
@@ -37252,6 +37598,7 @@ mod tests {
                         ]
                     },
                     "attestation_tiers": { "T3": 1, "T4": 1 },
+                    "quant_buckets": { "fp16": 1 },
                     "caps": { "tools": false, "json": false, "ctx": 4096 }
                 }
             }),
@@ -37267,6 +37614,10 @@ mod tests {
         assert!(filtered[0]
             .prompt_confidentiality_note
             .contains("Tier 3 route available"));
+
+        let quant_filtered = filter_model_summaries_by_quant(filtered, Some("fp16"));
+        assert_eq!(quant_filtered.len(), 1);
+        assert_eq!(quant_filtered[0].id, "mayhem/t3");
     }
 
     #[test]
@@ -40187,6 +40538,7 @@ mod tests {
             source_sha256: None,
             manifest_hash: "22".repeat(32),
             att_tier: 1,
+            quant: "int4".to_owned(),
             binary_hash: "33".repeat(32),
             caps: json!({ "tools": true, "json": true, "ctx": 8192 }),
             status: "active".to_owned(),

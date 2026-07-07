@@ -115,6 +115,7 @@ const ENCLAVE_UPDATE_FIELDS = [
   'source_sha256',
   'manifest_hash',
   'att_tier',
+  'quant',
   'binary_hash',
   'caps',
 ];
@@ -129,6 +130,16 @@ const ENCLAVE_BACKENDS = new Set([
   'whisper.cpp',
   'piper',
   'kokoro',
+]);
+const ENCLAVE_QUANT_BUCKETS = new Set([
+  'unknown',
+  'fp32',
+  'fp16',
+  'bf16',
+  'fp8',
+  'nvfp4',
+  'int8',
+  'int4',
 ]);
 const DEFAULT_MODEL_CLASS = 'text-generation';
 const MODEL_CLASSES = new Set([
@@ -524,6 +535,7 @@ class MayhemContract extends Contract {
         source_sha256: { type: 'string', min: 1, max: 128, optional: true },
         manifest_hash: { type: 'string', min: 1, max: 128 },
         att_tier: { type: 'number', integer: true, min: 1, max: 4 },
+        quant: { type: 'string', min: 1, max: 32, optional: true },
         binary_hash: { type: 'string', min: 1, max: 128 },
         caps: { type: 'any' },
       },
@@ -544,6 +556,7 @@ class MayhemContract extends Contract {
         source_sha256: { type: 'string', min: 1, max: 128, optional: true },
         manifest_hash: { type: 'string', min: 1, max: 128, optional: true },
         att_tier: { type: 'number', integer: true, min: 1, max: 4, optional: true },
+        quant: { type: 'string', min: 1, max: 32, optional: true },
         binary_hash: { type: 'string', min: 1, max: 128, optional: true },
         caps: { type: 'any', optional: true },
       },
@@ -1725,6 +1738,9 @@ class MayhemContract extends Contract {
     if (capsError) return capsError;
     const artifactError = this.validateEnclaveArtifactBinding(this.value);
     if (artifactError) return artifactError;
+    const quant = this.normalizeEnclaveQuant(this.value.quant ?? 'unknown');
+    const quantError = this.validateEnclaveQuant(quant);
+    if (quantError) return quantError;
 
     const record = {
       enclave_id: this.value.enclave_id,
@@ -1738,6 +1754,7 @@ class MayhemContract extends Contract {
       source_sha256: this.value.source_sha256 ?? null,
       manifest_hash: this.value.manifest_hash,
       att_tier: this.value.att_tier,
+      quant,
       binary_hash: this.value.binary_hash,
       caps: cloneValue(this.value.caps),
       status: 'active',
@@ -1771,6 +1788,9 @@ class MayhemContract extends Contract {
       changed = true;
     }
     if (!changed) return new Error('No enclave fields to update.');
+    if (hasOwn(this.value, 'quant')) {
+      updated.quant = this.normalizeEnclaveQuant(updated.quant);
+    }
     const modelClass = this.modelClassFor(updated);
     const classError = this.validateModelClass(modelClass, 'Enclave model_class');
     if (classError) return classError;
@@ -1780,6 +1800,9 @@ class MayhemContract extends Contract {
     if (capsError) return capsError;
     const artifactError = this.validateEnclaveArtifactBinding(updated);
     if (artifactError) return artifactError;
+    const quantError = this.validateEnclaveQuant(updated.quant ?? 'unknown');
+    if (quantError) return quantError;
+    updated.quant = this.normalizeEnclaveQuant(updated.quant ?? 'unknown');
 
     updated.updated_by = this.address;
     updated.updated_by_role = 'admin';
@@ -4674,6 +4697,31 @@ class MayhemContract extends Contract {
     const sourceError = this.validateHuggingFaceArtifactSource(value.artifact_source, 'enclave artifact_source');
     if (sourceError) return sourceError;
     return this.validateEnclaveArtifactSidecars(value.artifact_sidecars ?? {});
+  }
+
+  normalizeEnclaveQuant(value) {
+    const normalized = String(value ?? 'unknown').trim().toLowerCase().replace(/_/g, '-');
+    if (ENCLAVE_QUANT_BUCKETS.has(normalized)) return normalized;
+    return this.quantBucketFromDescriptor(normalized);
+  }
+
+  quantBucketFromDescriptor(descriptor) {
+    if (descriptor.includes('nvfp4')) return 'nvfp4';
+    if (descriptor.includes('fp8')) return 'fp8';
+    if (descriptor.includes('bf16')) return 'bf16';
+    if (descriptor.includes('fp16') || descriptor.includes('f16')) return 'fp16';
+    if (descriptor.includes('int8') || descriptor.includes('8bit') || descriptor.includes('q8')) return 'int8';
+    if (descriptor.includes('int4') || descriptor.includes('4bit') || descriptor.includes('q4')) return 'int4';
+    return descriptor;
+  }
+
+  validateEnclaveQuant(value) {
+    if (typeof value !== 'string') return new Error('Enclave quant must be a string.');
+    const quant = this.normalizeEnclaveQuant(value);
+    if (!ENCLAVE_QUANT_BUCKETS.has(quant)) {
+      return new Error('Enclave quant must be one of unknown, fp32, fp16, bf16, fp8, nvfp4, int8, int4.');
+    }
+    return null;
   }
 
   validateEnclaveArtifactSidecars(sidecars) {

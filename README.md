@@ -142,9 +142,10 @@ For sensitive prompts, inspect available trust tiers before choosing a route:
 ```bash
 mayhem models --gateway --min-att-tier 3
 mayhem models --gateway --require-kyb
+mayhem models --gateway --quant int4
 ```
 
-`--min-att-tier 3` asks for prompt-private routing. `--require-kyb` asks for Tier 4 identity; it does not make prompts private. You can also send routing preferences through OpenAI-compatible request headers, for example `X-Mayhem-Min-Att-Tier: 3`, `X-Mayhem-Hedge: 1`, or failover thresholds such as `X-Mayhem-Min-Tok-S`.
+`--min-att-tier 3` asks for prompt-private routing. `--require-kyb` asks for Tier 4 identity; it does not make prompts private. `--quant` filters live admin enclave routes by their pinned artifact bucket; it is not a separate price key. You can also send routing preferences through OpenAI-compatible request headers, for example `X-Mayhem-Min-Att-Tier: 3`, `X-Mayhem-Quant: int4`, `X-Mayhem-Hedge: 1`, or failover thresholds such as `X-Mayhem-Min-Tok-S`.
 
 Stop Mayhem:
 

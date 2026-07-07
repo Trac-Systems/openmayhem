@@ -76,11 +76,13 @@ const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.wof
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
 const X_MAYHEM_MAX_PRICE_MU_HEADER: &str = "x-mayhem-max-price-mu";
+const X_MAYHEM_QUANT_HEADER: &str = "x-mayhem-quant";
 const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
 const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
 const X_MAYHEM_STALL_TIMEOUT_MS_HEADER: &str = "x-mayhem-stall-timeout-ms";
 const X_MAYHEM_MIN_TOK_S_HEADER: &str = "x-mayhem-min-tok-s";
 const ROUTE_REPUTATION_PRIORITY_BPS_DELTA: u32 = 500;
+const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const DEFAULT_CANARY_SEED: i64 = 7;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
@@ -176,6 +178,8 @@ pub struct MayhemModelInfo {
     pub attestation_tiers: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attestation_tier_labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quant_buckets: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_app_version: Option<String>,
     pub caps: ModelCaps,
@@ -207,9 +211,13 @@ pub struct GatewayRouteCandidate {
     pub enclave_id: String,
     pub room_id: String,
     pub price_ver: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_ref_mu: Option<PriceRefMu>,
     #[serde(default)]
     pub min_ask_mu: u64,
     pub att_tier: u8,
+    #[serde(default = "default_quant_bucket")]
+    pub quant: String,
     pub admin_pubkey: String,
     pub artifact_root: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -230,7 +238,11 @@ fn default_reputation_bps() -> u32 {
     10_000
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+fn default_quant_bucket() -> String {
+    DEFAULT_QUANT_BUCKET.to_owned()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PriceRefMu {
     pub denom: String,
     pub ver: u64,
@@ -970,6 +982,7 @@ impl GatewayState {
                     "T1".to_owned(),
                     1,
                 )])),
+                quant_buckets: BTreeMap::from([(DEFAULT_QUANT_BUCKET.to_owned(), 1)]),
                 min_app_version: None,
                 caps: ModelCaps {
                     tools: true,
@@ -1923,6 +1936,7 @@ fn dashboard_network_provider_rows(
             let rails = dashboard_route_rails(candidate);
             let quality = dashboard_route_quality(entry);
             let status = dashboard_route_status(model, candidate, entry);
+            let price = route_price_ref_mu(model, Some(candidate));
             rows.push_str(&format!(
                 r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">room {}</p></td><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">{} · price v{}</p></td><td>{}<p class="privacy-note">{}</p></td></tr>"#,
                 html_escape(short_text(&candidate.provider, 18).as_ref()),
@@ -1932,8 +1946,8 @@ fn dashboard_network_provider_rows(
                 html_escape(&backend),
                 dashboard_badges(&dashboard_route_abilities(model, candidate, entry), "badge"),
                 html_escape(&rails),
-                html_escape(&dashboard_model_price(model)),
-                candidate.price_ver,
+                html_escape(&dashboard_price(price)),
+                price.ver,
                 status,
                 html_escape(&quality),
             ));
@@ -2129,6 +2143,7 @@ fn dashboard_route_status(
 ) -> String {
     let mut details = vec![
         format!("T{}", candidate.att_tier),
+        candidate.quant.clone(),
         format!(
             "rep {}",
             format_bps_percent(candidate.reputation_bps.min(10_000))
@@ -2884,9 +2899,11 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
 }
 
 fn dashboard_model_price(model: &GatewayModel) -> String {
-    let entries = model
-        .mayhem
-        .price_ref_mu
+    dashboard_price(&model.mayhem.price_ref_mu)
+}
+
+fn dashboard_price(price: &PriceRefMu) -> String {
+    let entries = price
         .rate_map
         .iter()
         .take(3)
@@ -3068,11 +3085,12 @@ struct ResponseMayhemMeta<'a> {
     hedge: GatewayHedgeInvocation,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct GatewayRequestOptions {
     hedge_requested: bool,
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
+    quant: Option<String>,
     failover_overrides: GatewayFailoverPolicyConfig,
 }
 
@@ -3406,6 +3424,7 @@ fn contract_snapshot_for_route(
     candidate: &GatewayRouteCandidate,
     rules_ver: u64,
 ) -> ContractProviderSnapshot {
+    let price = route_price_ref_mu(model, Some(candidate));
     ContractProviderSnapshot {
         provider: candidate.provider.clone(),
         provider_status: Some("active".to_owned()),
@@ -3414,11 +3433,11 @@ fn contract_snapshot_for_route(
         room_id: candidate.room_id.clone(),
         consent_ver: rules_ver,
         reputation: f64::from(candidate.reputation_bps.min(10_000)) / 10_000.0,
-        price_ver: candidate.price_ver,
-        rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
-        per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
-        min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
-        ref_rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
+        price_ver: price.ver,
+        rate_map: price.rate_map.clone(),
+        per_req_mu: price.per_req_mu,
+        min_session_mu: price.min_session_mu,
+        ref_rate_map: price.rate_map.clone(),
         probation: candidate.probation.clone(),
         caps: heartbeat_caps_for_route(model, candidate),
         attestation_head: Some(candidate.binary_hash.clone()),
@@ -3430,6 +3449,7 @@ fn heartbeat_for_route(
     candidate: &GatewayRouteCandidate,
     now_millis: u64,
 ) -> ProviderHeartbeat {
+    let price = route_price_ref_mu(model, Some(candidate));
     ProviderHeartbeat {
         t: "hb".to_owned(),
         v: crate::HEARTBEAT_SCHEMA_VERSION,
@@ -3448,7 +3468,7 @@ fn heartbeat_for_route(
             tok_s: Some(50.0),
             ttft_ms: 150,
         },
-        price_ver: candidate.price_ver,
+        price_ver: price.ver,
         min_ask_mu: candidate.min_ask_mu,
         accepting_new: true,
         caps: heartbeat_caps_for_route(model, candidate),
@@ -3603,6 +3623,7 @@ impl GatewayRequestOptions {
             hedge_requested: parse_x_mayhem_hedge(headers)?,
             min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
             max_price_mu: parse_x_mayhem_max_price_mu(headers)?,
+            quant: parse_x_mayhem_quant(headers)?,
             failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
         })
     }
@@ -3744,6 +3765,42 @@ fn parse_x_mayhem_min_att_tier(headers: &HeaderMap) -> Result<Option<u8>, ApiErr
             Some("X-Mayhem-Min-Att-Tier"),
         ))
     }
+}
+
+fn parse_x_mayhem_quant(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(X_MAYHEM_QUANT_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Quant must be an ASCII quant bucket",
+            Some("X-Mayhem-Quant"),
+        )
+    })?;
+    normalize_quant_bucket(value)
+        .map(Some)
+        .map_err(|message| ApiError::bad_request(message, Some("X-Mayhem-Quant")))
+}
+
+fn normalize_quant_bucket(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    if normalized.is_empty() {
+        return Err("X-Mayhem-Quant must not be empty".to_owned());
+    }
+    if matches!(
+        normalized.as_str(),
+        "unknown" | "fp32" | "fp16" | "bf16" | "fp8" | "nvfp4" | "int8" | "int4"
+    ) {
+        return Ok(normalized);
+    }
+    let inferred = quant_bucket_from_descriptor(&normalized);
+    if inferred != DEFAULT_QUANT_BUCKET {
+        return Ok(inferred);
+    }
+    Err(
+        "X-Mayhem-Quant must be one of fp32, fp16, bf16, fp8, nvfp4, int8, int4, unknown"
+            .to_owned(),
+    )
 }
 
 fn parse_x_mayhem_hedge(headers: &HeaderMap) -> Result<bool, ApiError> {
@@ -7132,9 +7189,9 @@ async fn run_embedding_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayEmbeddingRun, ApiError> {
     let eligible_routes =
-        ordered_route_candidates_for_embedding_with_options(state, model, inputs, options);
+        ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        return Err(no_eligible_route_error(state, model, options));
+        return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7155,7 +7212,7 @@ async fn run_embedding_with_route_retry(
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
         let invocation =
-            state.prepare_embedding_invocation_for_route(model, inputs, route, options)?;
+            state.prepare_embedding_invocation_for_route(model, inputs, route, &options)?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -7203,9 +7260,9 @@ async fn run_image_generation_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayImageGenerationRun, ApiError> {
     let eligible_routes =
-        ordered_route_candidates_for_image_generation_with_options(state, model, request, options);
+        ordered_route_candidates_for_image_generation_with_options(state, model, request, &options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        return Err(no_eligible_route_error(state, model, options));
+        return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7226,7 +7283,7 @@ async fn run_image_generation_with_route_retry(
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
         let invocation =
-            state.prepare_image_generation_invocation_for_route(model, request, route, options)?;
+            state.prepare_image_generation_invocation_for_route(model, request, route, &options)?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -7278,9 +7335,9 @@ async fn run_audio_speech_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioSpeechRun, ApiError> {
     let eligible_routes =
-        ordered_route_candidates_for_audio_speech_with_options(state, model, request, options);
+        ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        return Err(no_eligible_route_error(state, model, options));
+        return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7300,7 +7357,7 @@ async fn run_audio_speech_with_route_retry(
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
         let invocation =
-            state.prepare_audio_speech_invocation_for_route(model, request, route, options)?;
+            state.prepare_audio_speech_invocation_for_route(model, request, route, &options)?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -7351,10 +7408,10 @@ async fn run_audio_transcription_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioTranscriptionRun, ApiError> {
     let eligible_routes = ordered_route_candidates_for_audio_transcription_with_options(
-        state, model, request, options,
+        state, model, request, &options,
     );
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        return Err(no_eligible_route_error(state, model, options));
+        return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7374,7 +7431,7 @@ async fn run_audio_transcription_with_route_retry(
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
         let invocation = state
-            .prepare_audio_transcription_invocation_for_route(model, request, route, options)?;
+            .prepare_audio_transcription_invocation_for_route(model, request, route, &options)?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -7421,7 +7478,7 @@ async fn run_audio_transcription_with_route_retry(
 fn no_eligible_route_error(
     state: &GatewayState,
     model: &GatewayModel,
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
 ) -> ApiError {
     let rail = state.receipt_config.rail.clone();
     let rail_candidates = model
@@ -7457,8 +7514,25 @@ fn no_eligible_route_error(
             Some("X-Mayhem-Min-Att-Tier"),
         );
     }
+    let quant_candidates = att_candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            options
+                .quant
+                .as_deref()
+                .map(|quant| candidate.quant.eq_ignore_ascii_case(quant))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if quant_candidates.is_empty() {
+        return ApiError::bad_request(
+            "no provider route satisfies X-Mayhem-Quant",
+            Some("X-Mayhem-Quant"),
+        );
+    }
     let now_millis = now_millis_u64();
-    if att_candidates
+    if quant_candidates
         .iter()
         .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
     {
@@ -7640,9 +7714,9 @@ async fn prepare_live_direct_chat_session(
     config: ScBridgeGatewaySessionConfig,
 ) -> Result<LiveDirectChatSession, ApiError> {
     let mut eligible_route_refs =
-        ordered_route_candidates_for_request_with_options(&state, &model, &request, options);
+        ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
-        return Err(no_eligible_route_error(&state, &model, options));
+        return Err(no_eligible_route_error(&state, &model, &options));
     }
     if eligible_route_refs.is_empty() {
         return Err(ApiError::service_unavailable(
@@ -7651,7 +7725,7 @@ async fn prepare_live_direct_chat_session(
         ));
     }
     let hedge_probe =
-        run_hedge_probes_if_requested(&state, &model, &request, &eligible_route_refs, options)
+        run_hedge_probes_if_requested(&state, &model, &request, &eligible_route_refs, &options)
             .await?;
     if let Some(winner) = hedge_probe.winner.as_ref() {
         if let Some(winner_index) = eligible_route_refs
@@ -7671,7 +7745,7 @@ async fn prepare_live_direct_chat_session(
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index);
         let invocation =
-            state.prepare_chat_invocation_for_route(&model, &request, route, options)?;
+            state.prepare_chat_invocation_for_route(&model, &request, route, &options)?;
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match open_live_direct_chat_session(&config, &request, &invocation).await {
@@ -7995,7 +8069,7 @@ async fn recover_live_direct_chat_after_partial(
         &session.state,
         &session.model,
         &retry_request,
-        session.options,
+        session.options.clone(),
     )
     .await
     .map_err(|err| GatewaySessionError::new(err.message))?;
@@ -8712,9 +8786,9 @@ async fn run_chat_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewaySessionRun, ApiError> {
     let mut eligible_routes =
-        ordered_route_candidates_for_request_with_options(state, model, request, options);
+        ordered_route_candidates_for_request_with_options(state, model, request, &options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        return Err(no_eligible_route_error(state, model, options));
+        return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -8724,7 +8798,7 @@ async fn run_chat_with_route_retry(
     }
     let mut attempt_request = request.clone();
     let hedge_probe =
-        run_hedge_probes_if_requested(state, model, &attempt_request, &eligible_routes, options)
+        run_hedge_probes_if_requested(state, model, &attempt_request, &eligible_routes, &options)
             .await?;
     if let Some(winner) = hedge_probe.winner.as_ref() {
         if let Some(winner_index) = eligible_routes
@@ -8748,7 +8822,7 @@ async fn run_chat_with_route_retry(
     for attempt_index in 0..attempt_count {
         let route = eligible_routes.get(attempt_index).copied();
         let invocation =
-            state.prepare_chat_invocation_for_route(model, &attempt_request, route, options)?;
+            state.prepare_chat_invocation_for_route(model, &attempt_request, route, &options)?;
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match state
@@ -8831,7 +8905,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &ChatCompletionRequest,
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = route_selection_seed(model, request, now_millis_u64());
     ordered_route_candidates_for_request_with_max_price_seed(
@@ -8840,6 +8914,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
         request,
         options.min_att_tier,
         options.max_price_mu,
+        options.quant.as_deref(),
         seed,
     )
 }
@@ -8848,7 +8923,7 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     inputs: &[String],
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = embedding_route_selection_seed(model, inputs, now_millis_u64());
     ordered_route_candidates_for_embedding_with_max_price_seed(
@@ -8857,6 +8932,7 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
         inputs,
         options.min_att_tier,
         options.max_price_mu,
+        options.quant.as_deref(),
         seed,
     )
 }
@@ -8865,7 +8941,7 @@ fn ordered_route_candidates_for_image_generation_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &ImageGenerationRequest,
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = image_generation_route_selection_seed(model, request, now_millis_u64());
     ordered_route_candidates_for_image_generation_with_max_price_seed(
@@ -8874,6 +8950,7 @@ fn ordered_route_candidates_for_image_generation_with_options<'a>(
         request,
         options.min_att_tier,
         options.max_price_mu,
+        options.quant.as_deref(),
         seed,
     )
 }
@@ -8882,7 +8959,7 @@ fn ordered_route_candidates_for_audio_speech_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &AudioSpeechRequest,
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = audio_speech_route_selection_seed(model, request, now_millis_u64());
     let now_millis = now_millis_u64();
@@ -8890,6 +8967,7 @@ fn ordered_route_candidates_for_audio_speech_with_options<'a>(
         state,
         model,
         options.min_att_tier,
+        options.quant.as_deref(),
         seed,
         request_requirements_for_audio_speech(
             state,
@@ -8906,7 +8984,7 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &AudioTranscriptionRequest,
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = audio_transcription_route_selection_seed(model, request, now_millis_u64());
     let now_millis = now_millis_u64();
@@ -8914,6 +8992,7 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
         state,
         model,
         options.min_att_tier,
+        options.quant.as_deref(),
         seed,
         request_requirements_for_audio_transcription(
             state,
@@ -8931,7 +9010,7 @@ async fn run_hedge_probes_if_requested(
     model: &GatewayModel,
     request: &ChatCompletionRequest,
     routes: &[&GatewayRouteCandidate],
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
 ) -> Result<GatewayHedgeProbeOutcome, ApiError> {
     if !options.hedge_requested || routes.len() < 2 {
         return Ok(GatewayHedgeProbeOutcome::default());
@@ -8973,6 +9052,7 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
         request,
         min_att_tier,
         None,
+        None,
         seed,
     )
 }
@@ -8983,11 +9063,12 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     request: &ChatCompletionRequest,
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
+    quant: Option<&str>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
     let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
             .into_iter()
             .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
             .collect::<Vec<_>>();
@@ -9072,11 +9153,12 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     inputs: &[String],
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
+    quant: Option<&str>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
     let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
             .into_iter()
             .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
             .collect::<Vec<_>>();
@@ -9161,11 +9243,12 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
     request: &ImageGenerationRequest,
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
+    quant: Option<&str>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
     let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
             .into_iter()
             .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
             .collect::<Vec<_>>();
@@ -9248,12 +9331,13 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     min_att_tier: Option<u8>,
+    quant: Option<&str>,
     seed: u64,
     requirements: RequestRequirements,
     now_millis: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, &state.receipt_config.rail)
+        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
             .into_iter()
             .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
             .collect::<Vec<_>>();
@@ -9881,6 +9965,7 @@ fn partial_text(partials: &[GatewaySessionPartial]) -> String {
 fn eligible_route_candidates<'a>(
     model: &'a GatewayModel,
     min_att_tier: Option<u8>,
+    quant: Option<&str>,
     rail: &str,
 ) -> Vec<&'a GatewayRouteCandidate> {
     model
@@ -9894,6 +9979,9 @@ fn eligible_route_candidates<'a>(
                 .any(|candidate_rail| candidate_rail == rail)
                 && min_att_tier
                     .map(|min_tier| candidate.att_tier >= min_tier)
+                    .unwrap_or(true)
+                && quant
+                    .map(|quant| candidate.quant.eq_ignore_ascii_case(quant))
                     .unwrap_or(true)
         })
         .collect()
@@ -10560,7 +10648,7 @@ impl GatewayState {
                 model,
                 &request,
                 route.as_ref(),
-                GatewayRequestOptions::default(),
+                &GatewayRequestOptions::default(),
             )?;
             let result = self
                 .session_backend
@@ -10704,7 +10792,7 @@ impl GatewayState {
         model: &GatewayModel,
         request: &ChatCompletionRequest,
         route: Option<&GatewayRouteCandidate>,
-        options: GatewayRequestOptions,
+        options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
         let failover = self.failover_thresholds_for_model(model, options);
@@ -10712,10 +10800,9 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price_ver = route
-            .map(|candidate| candidate.price_ver)
-            .unwrap_or(model.mayhem.price_ref_mu.ver);
-        let locked_rate_map = session_locked_rate_map(model);
+        let price = route_price_ref_mu(model, route);
+        let price_ver = price.ver;
+        let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10738,7 +10825,7 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_max_spend_mu(model, request, &prompt_text);
+        let max_spend_mu = estimate_max_spend_mu(price, request, &prompt_text);
         ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
@@ -10752,8 +10839,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
-            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
+            locked_per_req_mu: price.per_req_mu,
+            locked_min_session_mu: price.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10785,7 +10872,7 @@ impl GatewayState {
         model: &GatewayModel,
         inputs: &[String],
         route: Option<&GatewayRouteCandidate>,
-        options: GatewayRequestOptions,
+        options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = embedding_prompt_text(inputs);
         let failover = self.failover_thresholds_for_model(model, options);
@@ -10793,10 +10880,9 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price_ver = route
-            .map(|candidate| candidate.price_ver)
-            .unwrap_or(model.mayhem.price_ref_mu.ver);
-        let locked_rate_map = session_locked_rate_map(model);
+        let price = route_price_ref_mu(model, route);
+        let price_ver = price.ver;
+        let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10819,7 +10905,7 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_embedding_max_spend_mu(model, inputs);
+        let max_spend_mu = estimate_embedding_max_spend_mu(price, inputs);
         ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
@@ -10833,8 +10919,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
-            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
+            locked_per_req_mu: price.per_req_mu,
+            locked_min_session_mu: price.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10866,7 +10952,7 @@ impl GatewayState {
         model: &GatewayModel,
         request: &ImageGenerationRequest,
         route: Option<&GatewayRouteCandidate>,
-        options: GatewayRequestOptions,
+        options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = image_generation_prompt_text(request);
         let failover = self.failover_thresholds_for_model(model, options);
@@ -10874,10 +10960,9 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price_ver = route
-            .map(|candidate| candidate.price_ver)
-            .unwrap_or(model.mayhem.price_ref_mu.ver);
-        let locked_rate_map = session_locked_rate_map(model);
+        let price = route_price_ref_mu(model, route);
+        let price_ver = price.ver;
+        let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10900,7 +10985,7 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_image_generation_max_spend_mu(model, request);
+        let max_spend_mu = estimate_image_generation_max_spend_mu(price, request);
         ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
@@ -10914,8 +10999,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
-            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
+            locked_per_req_mu: price.per_req_mu,
+            locked_min_session_mu: price.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10947,7 +11032,7 @@ impl GatewayState {
         model: &GatewayModel,
         request: &AudioSpeechRequest,
         route: Option<&GatewayRouteCandidate>,
-        options: GatewayRequestOptions,
+        options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = audio_speech_prompt_hash(request);
         let failover = self.failover_thresholds_for_model(model, options);
@@ -10955,10 +11040,9 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price_ver = route
-            .map(|candidate| candidate.price_ver)
-            .unwrap_or(model.mayhem.price_ref_mu.ver);
-        let locked_rate_map = session_locked_rate_map(model);
+        let price = route_price_ref_mu(model, route);
+        let price_ver = price.ver;
+        let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10981,7 +11065,7 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_audio_speech_max_spend_mu(model, request);
+        let max_spend_mu = estimate_audio_speech_max_spend_mu(price, request);
         ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
@@ -10995,8 +11079,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
-            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
+            locked_per_req_mu: price.per_req_mu,
+            locked_min_session_mu: price.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11028,7 +11112,7 @@ impl GatewayState {
         model: &GatewayModel,
         request: &AudioTranscriptionRequest,
         route: Option<&GatewayRouteCandidate>,
-        options: GatewayRequestOptions,
+        options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = audio_transcription_prompt_hash(request);
         let failover = self.failover_thresholds_for_model(model, options);
@@ -11036,10 +11120,9 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price_ver = route
-            .map(|candidate| candidate.price_ver)
-            .unwrap_or(model.mayhem.price_ref_mu.ver);
-        let locked_rate_map = session_locked_rate_map(model);
+        let price = route_price_ref_mu(model, route);
+        let price_ver = price.ver;
+        let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -11062,7 +11145,7 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_audio_transcription_max_spend_mu(model, request);
+        let max_spend_mu = estimate_audio_transcription_max_spend_mu(price, request);
         ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
@@ -11076,8 +11159,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
-            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
+            locked_per_req_mu: price.per_req_mu,
+            locked_min_session_mu: price.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11107,7 +11190,7 @@ impl GatewayState {
     fn failover_thresholds_for_model(
         &self,
         model: &GatewayModel,
-        options: GatewayRequestOptions,
+        options: &GatewayRequestOptions,
     ) -> GatewayFailoverInvocation {
         let config = self
             .failover_policy
@@ -11841,7 +11924,7 @@ fn failed_canary_runtime_probe(
 
 fn hedge_invocation_for_model(
     model: &GatewayModel,
-    options: GatewayRequestOptions,
+    options: &GatewayRequestOptions,
     failover: GatewayFailoverInvocation,
 ) -> GatewayHedgeInvocation {
     let candidates = model
@@ -12249,6 +12332,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
             attestation_tier_labels: attestation_tier_labels_from_catalog_value(model)
                 .unwrap_or_else(|| attestation_tier_labels_for_counts(&tiers)),
             attestation_tiers: tiers,
+            quant_buckets: quant_buckets_from_catalog_value(model),
             min_app_version: model
                 .get("min_app_version")
                 .and_then(Value::as_str)
@@ -12421,6 +12505,71 @@ fn attestation_tiers_from_catalog_value(model: &Value) -> BTreeMap<String, u32> 
     tiers
 }
 
+fn quant_buckets_from_catalog_value(model: &Value) -> BTreeMap<String, u32> {
+    if let Some(object) = model.get("quant_buckets").and_then(Value::as_object) {
+        let buckets = object
+            .iter()
+            .filter_map(|(bucket, count)| {
+                let bucket = normalize_quant_bucket(bucket).ok()?;
+                let count = count.as_u64().and_then(|count| u32::try_from(count).ok())?;
+                Some((bucket, count))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !buckets.is_empty() {
+            return buckets;
+        }
+    }
+    let mut buckets = BTreeMap::new();
+    if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
+        for (name, artifact) in artifacts {
+            let bucket = quant_bucket_from_catalog_artifact(name, artifact);
+            *buckets.entry(bucket).or_insert(0) += 1;
+        }
+    }
+    if buckets.is_empty() {
+        buckets.insert(DEFAULT_QUANT_BUCKET.to_owned(), 0);
+    }
+    buckets
+}
+
+fn quant_bucket_from_catalog_artifact(name: &str, artifact: &Value) -> String {
+    let mut descriptor = name.to_ascii_lowercase();
+    if let Some(engine) = artifact.get("engine").and_then(Value::as_str) {
+        descriptor.push(' ');
+        descriptor.push_str(&engine.to_ascii_lowercase());
+    }
+    if let Some(path) = artifact.get("path").and_then(Value::as_str) {
+        descriptor.push(' ');
+        descriptor.push_str(&path.to_ascii_lowercase());
+    }
+    quant_bucket_from_descriptor(&descriptor)
+}
+
+fn quant_bucket_from_descriptor(descriptor: &str) -> String {
+    let descriptor = descriptor.replace('_', "-");
+    if descriptor.contains("nvfp4") {
+        "nvfp4".to_owned()
+    } else if descriptor.contains("fp8") {
+        "fp8".to_owned()
+    } else if descriptor.contains("bf16") {
+        "bf16".to_owned()
+    } else if descriptor.contains("fp16") || descriptor.contains("f16") {
+        "fp16".to_owned()
+    } else if descriptor.contains("int8")
+        || descriptor.contains("8bit")
+        || descriptor.contains("q8")
+    {
+        "int8".to_owned()
+    } else if descriptor.contains("int4")
+        || descriptor.contains("4bit")
+        || descriptor.contains("q4")
+    {
+        "int4".to_owned()
+    } else {
+        DEFAULT_QUANT_BUCKET.to_owned()
+    }
+}
+
 fn attestation_tier_labels_from_catalog_value(model: &Value) -> Option<BTreeMap<String, String>> {
     let object = model
         .get("attestation_tier_labels")
@@ -12477,8 +12626,17 @@ fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiE
     })
 }
 
-fn session_locked_rate_map(model: &GatewayModel) -> Vec<RateMapEntry> {
-    normalize_rate_map(model.mayhem.price_ref_mu.rate_map.clone())
+fn route_price_ref_mu<'a>(
+    model: &'a GatewayModel,
+    route: Option<&'a GatewayRouteCandidate>,
+) -> &'a PriceRefMu {
+    route
+        .and_then(|candidate| candidate.price_ref_mu.as_ref())
+        .unwrap_or(&model.mayhem.price_ref_mu)
+}
+
+fn session_locked_rate_map(price: &PriceRefMu) -> Vec<RateMapEntry> {
+    normalize_rate_map(price.rate_map.clone())
 }
 
 fn calculate_locked_mu_owed(invocation: &GatewaySessionInvocation, usage: &ReceiptUsage) -> u64 {
@@ -13020,7 +13178,7 @@ fn embedding_usage_for_inputs(inputs: &[String]) -> Usage {
 }
 
 fn estimate_max_spend_mu(
-    model: &GatewayModel,
+    price: &PriceRefMu,
     request: &ChatCompletionRequest,
     prompt_text: &str,
 ) -> u64 {
@@ -13028,42 +13186,30 @@ fn estimate_max_spend_mu(
         rough_tokens(prompt_text),
         u64::from(request.max_tokens.unwrap_or(1024).max(1)),
     );
-    calculate_mu_owed(&model.mayhem.price_ref_mu, &usage).max(1_000)
+    calculate_mu_owed(price, &usage).max(1_000)
 }
 
-fn estimate_embedding_max_spend_mu(model: &GatewayModel, inputs: &[String]) -> u64 {
+fn estimate_embedding_max_spend_mu(price: &PriceRefMu, inputs: &[String]) -> u64 {
     let usage = ReceiptUsage::text(embedding_input_token_count(inputs), 0);
-    calculate_mu_owed(&model.mayhem.price_ref_mu, &usage).max(1_000)
+    calculate_mu_owed(price, &usage).max(1_000)
 }
 
 fn estimate_image_generation_max_spend_mu(
-    model: &GatewayModel,
+    price: &PriceRefMu,
     request: &ImageGenerationRequest,
 ) -> u64 {
-    calculate_mu_owed(
-        &model.mayhem.price_ref_mu,
-        &image_generation_usage_for_request(request),
-    )
-    .max(1_000)
+    calculate_mu_owed(price, &image_generation_usage_for_request(request)).max(1_000)
 }
 
-fn estimate_audio_speech_max_spend_mu(model: &GatewayModel, request: &AudioSpeechRequest) -> u64 {
-    calculate_mu_owed(
-        &model.mayhem.price_ref_mu,
-        &audio_speech_usage_for_request(request),
-    )
-    .max(1_000)
+fn estimate_audio_speech_max_spend_mu(price: &PriceRefMu, request: &AudioSpeechRequest) -> u64 {
+    calculate_mu_owed(price, &audio_speech_usage_for_request(request)).max(1_000)
 }
 
 fn estimate_audio_transcription_max_spend_mu(
-    model: &GatewayModel,
+    price: &PriceRefMu,
     request: &AudioTranscriptionRequest,
 ) -> u64 {
-    calculate_mu_owed(
-        &model.mayhem.price_ref_mu,
-        &audio_transcription_usage_for_request(request),
-    )
-    .max(1_000)
+    calculate_mu_owed(price, &audio_transcription_usage_for_request(request)).max(1_000)
 }
 
 fn rough_tokens(text: &str) -> u64 {
@@ -13301,7 +13447,7 @@ mod tests {
         };
         let request = test_chat_request(&model.id);
         let invocation = state
-            .prepare_chat_invocation_for_route(&model, &request, None, options)
+            .prepare_chat_invocation_for_route(&model, &request, None, &options)
             .expect("invocation");
 
         assert_eq!(invocation.failover.open_timeout_ms, 4_000);
@@ -13324,7 +13470,7 @@ mod tests {
                 &model,
                 &request,
                 None,
-                GatewayRequestOptions::default(),
+                &GatewayRequestOptions::default(),
             )
             .expect("configured wallet has enough balance");
 
@@ -13343,7 +13489,7 @@ mod tests {
                 &model,
                 &request,
                 None,
-                GatewayRequestOptions::default(),
+                &GatewayRequestOptions::default(),
             )
             .expect("configured checkpoint policy should be accepted");
         assert_eq!(checkpointed.spend_voucher.body.checkpoint_every.tokens, 32);
@@ -13357,7 +13503,7 @@ mod tests {
                 &model,
                 &request,
                 None,
-                GatewayRequestOptions::default(),
+                &GatewayRequestOptions::default(),
             )
             .expect_err("gateway rejects spend vouchers above the startup balance snapshot");
         assert!(err.message.contains("insufficient local balance"));
@@ -13367,7 +13513,7 @@ mod tests {
             ..GatewayRequestOptions::default()
         };
         let err = state
-            .prepare_chat_invocation_for_route(&model, &request, None, max_bid)
+            .prepare_chat_invocation_for_route(&model, &request, None, &max_bid)
             .expect_err("gateway rejects quotes above the user max-bid");
         assert_eq!(err.param, Some("X-Mayhem-Max-Price-Mu"));
     }
@@ -13405,12 +13551,14 @@ mod tests {
         );
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
+        headers.insert("x-mayhem-quant", HeaderValue::from_static("Q4_K_M"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("headers parse");
         assert_eq!(options.failover_overrides.open_timeout_ms, Some(2_500));
         assert_eq!(options.failover_overrides.ttft_timeout_ms, Some(4_000));
         assert_eq!(options.failover_overrides.stall_timeout_ms, Some(9_000));
         assert_eq!(options.failover_overrides.min_tok_s, Some(17.5));
         assert_eq!(options.max_price_mu, Some(1_234));
+        assert_eq!(options.quant.as_deref(), Some("int4"));
 
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("0"));
         let err =
@@ -13421,6 +13569,11 @@ mod tests {
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("0"));
         let err = GatewayRequestOptions::from_headers(&headers).expect_err("zero floor rejects");
         assert_eq!(err.param, Some("X-Mayhem-Min-Tok-S"));
+        headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
+
+        headers.insert("x-mayhem-quant", HeaderValue::from_static("potato"));
+        let err = GatewayRequestOptions::from_headers(&headers).expect_err("bad quant rejects");
+        assert_eq!(err.param, Some("X-Mayhem-Quant"));
     }
 
     #[test]
@@ -13894,6 +14047,7 @@ mod tests {
                     "T1".to_owned(),
                     1,
                 )])),
+                quant_buckets: BTreeMap::from([(DEFAULT_QUANT_BUCKET.to_owned(), 1)]),
                 min_app_version: None,
                 caps: ModelCaps {
                     tools: true,
@@ -14042,8 +14196,10 @@ mod tests {
             enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
             room_id: format!("{:02x}", idx.wrapping_add(160)).repeat(16),
             price_ver: 7,
+            price_ref_mu: None,
             min_ask_mu: 0,
             att_tier: 1,
+            quant: DEFAULT_QUANT_BUCKET.to_owned(),
             admin_pubkey: "33".repeat(32),
             artifact_root: format!("{:02x}", idx.wrapping_add(180)).repeat(32),
             artifact_sidecar_roots: BTreeMap::new(),
@@ -14626,6 +14782,7 @@ mod tests {
             &request,
             None,
             Some(1),
+            None,
             0xfeed,
         );
         assert!(priced_out.is_empty());
@@ -14636,9 +14793,121 @@ mod tests {
             &request,
             None,
             Some(u64::MAX),
+            None,
             0xfeed,
         );
         assert_eq!(clearing.len(), 1);
+    }
+
+    #[test]
+    fn route_selection_locks_matching_tier_market_price() {
+        let mut model = test_routed_model(2);
+        let request = test_chat_request(&model.id);
+        model.mayhem.price_ref_mu = PriceRefMu {
+            denom: "mu_usd".to_owned(),
+            ver: 1,
+            rate_map: text_generation_rate_map(10, 20),
+            per_req_mu: 0,
+            min_session_mu: 0,
+            derivation: None,
+        };
+        model.mayhem.route_candidates[0].att_tier = 1;
+        model.mayhem.route_candidates[0].quant = "int4".to_owned();
+        model.mayhem.route_candidates[0].price_ref_mu = Some(PriceRefMu {
+            denom: "mu_usd".to_owned(),
+            ver: 1,
+            rate_map: text_generation_rate_map(10, 20),
+            per_req_mu: 0,
+            min_session_mu: 0,
+            derivation: None,
+        });
+        model.mayhem.route_candidates[1].att_tier = 3;
+        model.mayhem.route_candidates[1].quant = "fp16".to_owned();
+        model.mayhem.route_candidates[1].price_ref_mu = Some(PriceRefMu {
+            denom: "mu_usd".to_owned(),
+            ver: 9,
+            rate_map: text_generation_rate_map(90, 180),
+            per_req_mu: 123,
+            min_session_mu: 456,
+            derivation: None,
+        });
+        let state = GatewayState::from_models(vec![model.clone()]).with_receipt_balance_mu(10_000);
+
+        let selected = ordered_route_candidates_for_request_with_max_price_seed(
+            &state,
+            &model,
+            &request,
+            Some(3),
+            Some(u64::MAX),
+            None,
+            0xfeed,
+        );
+        assert_eq!(selected.len(), 1);
+        let route = selected[0];
+        assert_eq!(route.att_tier, 3);
+        assert_eq!(route.quant, "fp16");
+
+        let snapshot = contract_snapshot_for_route(&model, route, state.receipt_config.rules_ver);
+        assert_eq!(snapshot.price_ver, 9);
+        assert_eq!(snapshot.rate_map, text_generation_rate_map(90, 180));
+        assert_eq!(snapshot.per_req_mu, 123);
+        assert_eq!(snapshot.min_session_mu, 456);
+
+        let heartbeat = heartbeat_for_route(&model, route, now_millis_u64());
+        assert_eq!(heartbeat.price_ver, 9);
+
+        let invocation = state
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                Some(route),
+                &GatewayRequestOptions {
+                    min_att_tier: Some(3),
+                    max_price_mu: Some(u64::MAX),
+                    ..GatewayRequestOptions::default()
+                },
+            )
+            .expect("tier-3 route price clears max bid");
+        assert_eq!(invocation.enclave_id, route.enclave_id);
+        assert_eq!(invocation.price_ver, 9);
+        assert_eq!(
+            invocation.spend_voucher.body.locked_rate_map,
+            text_generation_rate_map(90, 180)
+        );
+        assert_eq!(invocation.spend_voucher.body.locked_per_req_mu, 123);
+        assert_eq!(invocation.spend_voucher.body.locked_min_session_mu, 456);
+    }
+
+    #[test]
+    fn route_selection_filters_by_enclave_quant_bucket() {
+        let mut model = test_routed_model(2);
+        let request = test_chat_request(&model.id);
+        model.mayhem.route_candidates[0].quant = "int4".to_owned();
+        model.mayhem.route_candidates[1].quant = "fp16".to_owned();
+        let state = GatewayState::from_models(vec![model.clone()]);
+
+        let selected = ordered_route_candidates_for_request_with_max_price_seed(
+            &state,
+            &model,
+            &request,
+            None,
+            Some(u64::MAX),
+            Some("fp16"),
+            0xfeed,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].quant, "fp16");
+
+        let missing = ordered_route_candidates_for_request_with_max_price_seed(
+            &state,
+            &model,
+            &request,
+            None,
+            Some(u64::MAX),
+            Some("fp8"),
+            0xfeed,
+        );
+        assert!(missing.is_empty());
     }
 
     #[test]

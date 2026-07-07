@@ -1794,6 +1794,86 @@ async fn chat_completion_min_att_tier_rejects_when_no_route_meets_pin() {
     assert!(state.receipts().is_empty());
 }
 
+#[tokio::test]
+async fn chat_completion_quant_filters_route_candidates() {
+    let first_provider = "55".repeat(32);
+    let second_provider = "66".repeat(32);
+    let mut model =
+        routed_test_model_with_providers(&[first_provider.clone(), second_provider.clone()]);
+    model.mayhem.route_candidates[0].quant = "int4".to_owned();
+    model.mayhem.route_candidates[1].quant = "fp16".to_owned();
+    model.mayhem.quant_buckets = BTreeMap::from([("int4".to_owned(), 1), ("fp16".to_owned(), 1)]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![model]).with_session_backend(Arc::new(
+        RetryThenDirectSessionBackend {
+            retry_provider: "ff".repeat(32),
+            calls: calls.clone(),
+        },
+    ));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Use the fp16 enclave." }]
+    });
+
+    let (status, body) = json_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/chat/completions",
+        request,
+        &[("X-Mayhem-Quant", "FP16")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        calls.lock().expect("calls lock").clone(),
+        vec![second_provider.clone()]
+    );
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("assistant content")
+        .contains(&second_provider));
+    assert_eq!(state.receipts().len(), 1);
+    assert_eq!(state.receipts()[0].receipt.body.provider, second_provider);
+}
+
+#[tokio::test]
+async fn chat_completion_quant_rejects_when_no_route_matches() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![routed_test_model_with_providers(&[
+        "55".repeat(32),
+        "66".repeat(32),
+    ])])
+    .with_session_backend(Arc::new(RetryThenDirectSessionBackend {
+        retry_provider: "ff".repeat(32),
+        calls: calls.clone(),
+    }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Need fp16." }]
+    });
+
+    let (status, body) = json_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/chat/completions",
+        request,
+        &[("X-Mayhem-Quant", "fp16")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "X-Mayhem-Quant");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("no provider route"));
+    assert!(calls.lock().expect("calls lock").is_empty());
+    assert!(state.receipts().is_empty());
+}
+
 fn routed_test_model() -> GatewayModel {
     routed_test_model_with_providers(&["55".repeat(32)])
 }
@@ -2305,6 +2385,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 "T1".to_owned(),
                 "Tier 1 - software self-attestation; economic/trust only".to_owned(),
             )]),
+            quant_buckets: BTreeMap::from([("int4".to_owned(), providers.len() as u32)]),
             min_app_version: None,
             caps: ModelCaps {
                 tools: true,
@@ -2339,8 +2420,10 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         enclave_id: catalog_enclave_id(&identity),
         room_id,
         price_ver: 7,
+        price_ref_mu: None,
         min_ask_mu: 0,
         att_tier: 1,
+        quant: "int4".to_owned(),
         admin_pubkey: identity.admin_pubkey,
         artifact_root: identity.artifact_root,
         artifact_sidecar_roots: BTreeMap::new(),
