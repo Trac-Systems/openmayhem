@@ -47,6 +47,7 @@ use mayhem_gateway::{
         serve as serve_gateway, validate_loopback_dashboard_bind, GatewayCanaryProbePolicy,
         GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
         ProviderKybInfo, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
+        DEFAULT_ROUTE_MAX_WAIT_MS, MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_mu, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu,
     ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry, ReputationEvent,
@@ -995,6 +996,10 @@ struct UseArgs {
     /// Gateway-default user max-bid ceiling in µUSD. Overrides config for this gateway process.
     #[arg(long)]
     max_price_mu: Option<u64>,
+
+    /// Gateway-default maximum route wait in seconds. 0 keeps instant-fail behavior.
+    #[arg(long)]
+    max_wait: Option<u64>,
 
     /// Gateway-default minimum context tokens for route selection. Overrides config for this gateway process.
     #[arg(long)]
@@ -4249,6 +4254,7 @@ struct ConfigProviderLimits {
 #[derive(Debug, Deserialize)]
 struct ConfigUser {
     max_price_mu: Option<u64>,
+    max_wait_seconds: Option<u64>,
     min_ctx: Option<u64>,
 }
 
@@ -15938,6 +15944,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     if args.max_price_mu == Some(0) {
         bail!("--max-price-mu must be greater than zero");
     }
+    if args
+        .max_wait
+        .is_some_and(|seconds| seconds > MAX_ROUTE_MAX_WAIT_MS / 1_000)
+    {
+        bail!(
+            "--max-wait must be <= {} seconds",
+            MAX_ROUTE_MAX_WAIT_MS / 1_000
+        );
+    }
     if args.min_ctx == Some(0) {
         bail!("--min-ctx must be greater than zero");
     }
@@ -15947,6 +15962,19 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             .and_then(|config| config.user.as_ref())
             .and_then(|user| user.max_price_mu)
     });
+    let default_max_wait_seconds = args.max_wait.or_else(|| {
+        config
+            .as_ref()
+            .and_then(|config| config.user.as_ref())
+            .and_then(|user| user.max_wait_seconds)
+    });
+    if default_max_wait_seconds.is_some_and(|seconds| seconds > MAX_ROUTE_MAX_WAIT_MS / 1_000) {
+        bail!(
+            "user.max_wait_seconds must be <= {} when set",
+            MAX_ROUTE_MAX_WAIT_MS / 1_000
+        );
+    }
+    let default_max_wait_ms = default_max_wait_seconds.map(|seconds| seconds.saturating_mul(1_000));
     let default_min_ctx = args
         .min_ctx
         .or_else(|| {
@@ -16227,6 +16255,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state
         .with_default_max_price_mu(default_max_price_mu)
+        .with_default_max_wait_ms(default_max_wait_ms)
         .with_default_min_ctx(default_min_ctx)
         .with_receipt_rail(args.rail.as_str())
         .with_provider_load_progress_dir(home.join("provider-load-progress"));
@@ -16256,6 +16285,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             "ms": receipt_checkpoint_every.ms,
         },
         "default_max_price_mu": default_max_price_mu,
+        "default_max_wait_ms": default_max_wait_ms.unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS),
         "default_min_ctx": default_min_ctx,
         "models": model_count,
         "version_gates": &blocked_version_gates,
@@ -16305,6 +16335,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             if let Some(mu) = default_max_price_mu {
                 println!("Default max-price ceiling: {mu} mu_usd.");
             }
+            println!(
+                "Default max-wait: {}s.",
+                default_max_wait_ms.unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS) / 1_000
+            );
             if let Some(ctx) = default_min_ctx {
                 println!("Default minimum context: {ctx} tokens.");
             }
@@ -16993,14 +17027,23 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
     let path = config_path_for_home(&home);
     let key = canonical_config_key(&args.key)?;
     let mut config = read_config_toml_value(&path)?;
-    if matches!(key, "user.max_price_mu" | "user.min_ctx") {
+    if matches!(
+        key,
+        "user.max_price_mu" | "user.min_ctx" | "user.max_wait_seconds"
+    ) {
         let value = args
             .value
             .trim()
             .parse::<u64>()
             .with_context(|| format!("{key} must be an integer value"))?;
-        if value == 0 {
+        if matches!(key, "user.max_price_mu" | "user.min_ctx") && value == 0 {
             bail!("{key} must be greater than zero");
+        }
+        if key == "user.max_wait_seconds" && value > MAX_ROUTE_MAX_WAIT_MS / 1_000 {
+            bail!(
+                "user.max_wait_seconds must be <= {}",
+                MAX_ROUTE_MAX_WAIT_MS / 1_000
+            );
         }
         toml_set_u64(&mut config, key, value)?;
     } else {
@@ -22352,7 +22395,8 @@ struct HeartbeatContext<'a> {
 struct ProviderLoadSnapshot {
     active_slots: u64,
     active_requests: u64,
-    queue_depth: u64,
+    free_slots: u64,
+    engine_backlog: u64,
     est_wait_ms: u64,
     ttft_ms: u64,
     measured_tok_s_milli: Option<u64>,
@@ -22364,7 +22408,8 @@ impl Default for ProviderLoadSnapshot {
         Self {
             active_slots: 0,
             active_requests: 0,
-            queue_depth: 0,
+            free_slots: 0,
+            engine_backlog: 0,
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,
@@ -22379,7 +22424,8 @@ impl ProviderLoadSnapshot {
         Self {
             active_slots: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
             active_requests: 0,
-            queue_depth: 0,
+            free_slots: 0,
+            engine_backlog: 0,
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,
@@ -22417,14 +22463,11 @@ impl ProviderHeartbeatLoad {
     fn snapshot(&self) -> ProviderLoadSnapshot {
         let active_slots = self.active_slots.load(Ordering::Relaxed);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
-        let queue_depth = if active_requests > 0 {
-            active_slots.saturating_sub(active_requests)
-        } else {
-            0
-        };
+        let free_slots = active_slots.saturating_sub(active_requests);
+        let engine_backlog = active_requests.saturating_sub(active_slots);
         let rolling_turn_ms = self.rolling_turn_ms.load(Ordering::Relaxed);
-        let est_wait_ms = if queue_depth > 0 && rolling_turn_ms > 0 {
-            rolling_turn_ms.saturating_mul(queue_depth)
+        let est_wait_ms = if engine_backlog > 0 && rolling_turn_ms > 0 {
+            rolling_turn_ms.saturating_mul(engine_backlog)
         } else {
             0
         };
@@ -22435,7 +22478,8 @@ impl ProviderHeartbeatLoad {
         ProviderLoadSnapshot {
             active_slots,
             active_requests,
-            queue_depth,
+            free_slots,
+            engine_backlog,
             est_wait_ms,
             ttft_ms: self.rolling_ttft_ms.load(Ordering::Relaxed),
             measured_tok_s_milli,
@@ -26228,6 +26272,9 @@ fn empty_gateway_caps() -> ModelCaps {
         image: false,
         video: false,
         audio: false,
+        max_image_width: None,
+        max_image_height: None,
+        max_image_steps: None,
         output_modality: None,
         output_modalities: Vec::new(),
     }
@@ -26247,6 +26294,15 @@ fn gateway_caps_from_contract(caps: &Value) -> ModelCaps {
         image: caps.get("image").and_then(Value::as_bool).unwrap_or(false),
         video: caps.get("video").and_then(Value::as_bool).unwrap_or(false),
         audio: caps.get("audio").and_then(Value::as_bool).unwrap_or(false),
+        max_image_width: caps
+            .get("max_image_width")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        max_image_height: caps
+            .get("max_image_height")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        max_image_steps: caps.get("max_image_steps").and_then(Value::as_u64),
         output_modality: caps
             .get("output_modality")
             .and_then(Value::as_str)
@@ -28215,7 +28271,8 @@ async fn send_provider_heartbeat_round(
                 "max": max_sessions,
             },
             "q": {
-                "depth": load.queue_depth,
+                "free_slots": load.free_slots,
+                "engine_backlog": load.engine_backlog,
                 "est_wait_ms": load.est_wait_ms,
             },
             "perf": {
@@ -32658,10 +32715,13 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "max_price" | "max_price_mu" | "user.max_price" | "user.max_price_mu" => {
             Ok("user.max_price_mu")
         }
+        "max_wait" | "max_wait_seconds" | "user.max_wait" | "user.max_wait_seconds" => {
+            Ok("user.max_wait_seconds")
+        }
         "min_ctx" | "user.min_ctx" => Ok("user.min_ctx"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_mu, user.min_ctx, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_mu, user.max_wait_seconds, user.min_ctx, and role.mode"),
     }
 }
 
@@ -33958,11 +34018,24 @@ mod tests {
             json: true,
         })
         .unwrap();
+        config_set(ConfigSetArgs {
+            home: Some(home.clone()),
+            key: "max-wait".to_owned(),
+            value: "0".to_owned(),
+            json: true,
+        })
+        .unwrap();
         let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
         assert_eq!(
             toml_get_path(&config, "user.max_price_mu").and_then(toml::Value::as_integer),
             Some(54_321)
         );
+        assert_eq!(
+            toml_get_path(&config, "user.max_wait_seconds").and_then(toml::Value::as_integer),
+            Some(0)
+        );
+        let typed = read_mayhem_config(&home).unwrap().unwrap();
+        assert_eq!(typed.user.and_then(|user| user.max_wait_seconds), Some(0));
 
         config_max_price(ConfigMaxPriceArgs {
             home: Some(home.clone()),
@@ -39142,7 +39215,8 @@ mod tests {
         let snapshot = ProviderLoadSnapshot::from_sessions(&sessions);
 
         assert_eq!(snapshot.active_slots, 2);
-        assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(snapshot.free_slots, 0);
+        assert_eq!(snapshot.engine_backlog, 0);
         assert_eq!(snapshot.est_wait_ms, 0);
         assert_eq!(provider_saturation(snapshot.active_slots, 4), 0.5);
         assert_eq!(provider_saturation(snapshot.active_slots, 0), 0.0);
@@ -39376,7 +39450,8 @@ mod tests {
             ProviderLoadSnapshot {
                 active_slots: 2,
                 active_requests: 0,
-                queue_depth: 0,
+                free_slots: 2,
+                engine_backlog: 0,
                 est_wait_ms: 0,
                 ttft_ms: 0,
                 measured_tok_s_milli: None,
@@ -39399,7 +39474,8 @@ mod tests {
         let busy = load.snapshot();
         assert_eq!(busy.active_slots, 3);
         assert_eq!(busy.active_requests, 1);
-        assert_eq!(busy.queue_depth, 2);
+        assert_eq!(busy.free_slots, 2);
+        assert_eq!(busy.engine_backlog, 0);
         assert_eq!(busy.ttft_ms, 0);
 
         load.record_ttft_ms(125);
@@ -39408,7 +39484,8 @@ mod tests {
 
         let measured = load.snapshot();
         assert_eq!(measured.active_requests, 0);
-        assert_eq!(measured.queue_depth, 0);
+        assert_eq!(measured.free_slots, 3);
+        assert_eq!(measured.engine_backlog, 0);
         assert_eq!(measured.ttft_ms, 125);
         assert_eq!(measured.measured_tok_s_milli, Some(20_000));
         assert_eq!(
@@ -39503,7 +39580,8 @@ mod tests {
         let snapshot = ProviderLoadSnapshot {
             active_slots: 0,
             active_requests: 0,
-            queue_depth: 0,
+            free_slots: 0,
+            engine_backlog: 0,
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,

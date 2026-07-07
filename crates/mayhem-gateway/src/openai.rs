@@ -26,10 +26,11 @@ use crate::{
     },
     pricing::{normalize_rate_map, priced_usage_mu, text_generation_rate_map, RateMapEntry},
     provider_table::{
-        ContractProviderSnapshot, LcgBalancerRng, ProviderObservationSample, ProviderTable,
-        ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements, SelectionWeights,
-        DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR, DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
-        DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
+        ContractProviderSnapshot, LcgBalancerRng, ProviderCapacityMismatchEvent,
+        ProviderObservationSample, ProviderTable, ProviderTableEntry, ProviderUnderdeliveryEvent,
+        RequestRequirements, SelectionWeights, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR,
+        DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S,
+        DEFAULT_LLM_GENERATION_FLOOR_TOK_S, DEFAULT_SATURATION_CUTOFF,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
@@ -80,12 +81,16 @@ const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.wof
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
 const X_MAYHEM_MAX_PRICE_MU_HEADER: &str = "x-mayhem-max-price-mu";
+const X_MAYHEM_MAX_WAIT_MS_HEADER: &str = "x-mayhem-max-wait-ms";
 const X_MAYHEM_MIN_CTX_HEADER: &str = "x-mayhem-min-ctx";
 const X_MAYHEM_QUANT_HEADER: &str = "x-mayhem-quant";
 const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
 const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
 const X_MAYHEM_STALL_TIMEOUT_MS_HEADER: &str = "x-mayhem-stall-timeout-ms";
 const X_MAYHEM_MIN_TOK_S_HEADER: &str = "x-mayhem-min-tok-s";
+pub const DEFAULT_ROUTE_MAX_WAIT_MS: u64 = 10_000;
+pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
+const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const ROUTE_REPUTATION_PRIORITY_BPS_DELTA: u32 = 500;
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const DEFAULT_CANARY_SEED: i64 = 7;
@@ -129,6 +134,7 @@ pub struct GatewayState {
     ctx_bracket_schedule: Arc<CtxBracketSchedule>,
     failover_policy: GatewayFailoverPolicyConfig,
     default_max_price_mu: Option<u64>,
+    default_max_wait_ms: u64,
     default_min_ctx: Option<u32>,
     dev_session_shim: bool,
 }
@@ -885,6 +891,7 @@ pub struct GatewaySessionError {
     pub message: String,
     pub retryable: bool,
     pub clean_refusal: bool,
+    pub clean_refusal_code: Option<String>,
     pub partial: Option<Box<GatewaySessionPartial>>,
 }
 
@@ -1080,6 +1087,7 @@ impl GatewayState {
             ctx_bracket_schedule: Arc::new(default_ctx_bracket_schedule()),
             failover_policy: GatewayFailoverPolicyConfig::default(),
             default_max_price_mu: None,
+            default_max_wait_ms: DEFAULT_ROUTE_MAX_WAIT_MS,
             default_min_ctx: None,
             dev_session_shim: false,
         }
@@ -1185,6 +1193,13 @@ impl GatewayState {
         self
     }
 
+    pub fn with_default_max_wait_ms(mut self, max_wait_ms: Option<u64>) -> Self {
+        self.default_max_wait_ms = max_wait_ms
+            .unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS)
+            .min(MAX_ROUTE_MAX_WAIT_MS);
+        self
+    }
+
     pub fn with_default_min_ctx(mut self, min_ctx: Option<u32>) -> Self {
         self.default_min_ctx = min_ctx.filter(|value| *value > 0);
         self
@@ -1197,6 +1212,9 @@ impl GatewayState {
         let mut options = GatewayRequestOptions::from_headers(headers)?;
         if options.max_price_mu.is_none() {
             options.max_price_mu = self.default_max_price_mu;
+        }
+        if !headers.contains_key(X_MAYHEM_MAX_WAIT_MS_HEADER) {
+            options.max_wait_ms = self.default_max_wait_ms;
         }
         if options.min_ctx.is_none() {
             options.min_ctx = self.default_min_ctx;
@@ -3200,14 +3218,29 @@ struct ResponseMayhemMeta<'a> {
     hedge: GatewayHedgeInvocation,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct GatewayRequestOptions {
     hedge_requested: bool,
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
+    max_wait_ms: u64,
     min_ctx: Option<u32>,
     quant: Option<String>,
     failover_overrides: GatewayFailoverPolicyConfig,
+}
+
+impl Default for GatewayRequestOptions {
+    fn default() -> Self {
+        Self {
+            hedge_requested: false,
+            min_att_tier: None,
+            max_price_mu: None,
+            max_wait_ms: DEFAULT_ROUTE_MAX_WAIT_MS,
+            min_ctx: None,
+            quant: None,
+            failover_overrides: GatewayFailoverPolicyConfig::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3575,9 +3608,14 @@ fn heartbeat_for_route(
         model_id: model.id.clone(),
         room_id: candidate.room_id.clone(),
         sat: 0.0,
-        slots: HeartbeatSlots { active: 0, max: 1 },
+        slots: HeartbeatSlots {
+            active: 0,
+            active_requests: 0,
+            max: 1,
+        },
         q: HeartbeatQueue {
-            depth: 0,
+            free_slots: 0,
+            engine_backlog: 0,
             est_wait_ms: 0,
         },
         perf: HeartbeatPerf {
@@ -3704,6 +3742,7 @@ impl GatewaySessionError {
             message: message.into(),
             retryable: false,
             clean_refusal: false,
+            clean_refusal_code: None,
             partial: None,
         }
     }
@@ -3713,15 +3752,21 @@ impl GatewaySessionError {
             message: message.into(),
             retryable: true,
             clean_refusal: false,
+            clean_refusal_code: None,
             partial: None,
         }
     }
 
     pub fn clean_refusal(message: impl Into<String>) -> Self {
+        Self::clean_refusal_with_code(message, None)
+    }
+
+    pub fn clean_refusal_with_code(message: impl Into<String>, code: Option<&str>) -> Self {
         Self {
             message: message.into(),
             retryable: true,
             clean_refusal: true,
+            clean_refusal_code: code.map(str::to_owned),
             partial: None,
         }
     }
@@ -3731,6 +3776,7 @@ impl GatewaySessionError {
             message: message.into(),
             retryable: true,
             clean_refusal: false,
+            clean_refusal_code: None,
             partial: Some(Box::new(partial)),
         }
     }
@@ -3747,11 +3793,37 @@ impl GatewayRequestOptions {
             hedge_requested: parse_x_mayhem_hedge(headers)?,
             min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
             max_price_mu: parse_x_mayhem_max_price_mu(headers)?,
+            max_wait_ms: parse_x_mayhem_max_wait_ms(headers)?,
             min_ctx: parse_x_mayhem_min_ctx(headers)?,
             quant: parse_x_mayhem_quant(headers)?,
             failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
         })
     }
+}
+
+fn parse_x_mayhem_max_wait_ms(headers: &HeaderMap) -> Result<u64, ApiError> {
+    let Some(value) = headers.get(X_MAYHEM_MAX_WAIT_MS_HEADER) else {
+        return Ok(DEFAULT_ROUTE_MAX_WAIT_MS);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Max-Wait-Ms must be an ASCII integer millisecond value",
+            Some("X-Mayhem-Max-Wait-Ms"),
+        )
+    })?;
+    let parsed = value.trim().parse::<u64>().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Max-Wait-Ms must be an integer millisecond value",
+            Some("X-Mayhem-Max-Wait-Ms"),
+        )
+    })?;
+    if parsed > MAX_ROUTE_MAX_WAIT_MS {
+        return Err(ApiError::bad_request(
+            "X-Mayhem-Max-Wait-Ms must be <= 60000",
+            Some("X-Mayhem-Max-Wait-Ms"),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_x_mayhem_max_price_mu(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
@@ -5215,7 +5287,7 @@ fn provider_reject_session_error(frame: &Value, session_id: &str) -> GatewaySess
         .unwrap_or("no reason provided");
     let message = format!("provider rejected session {session_id} with {code}: {reason}");
     if clean_provider_reject_code(code) {
-        GatewaySessionError::clean_refusal(message)
+        GatewaySessionError::clean_refusal_with_code(message, Some(code))
     } else {
         GatewaySessionError::retryable(message)
     }
@@ -7482,7 +7554,17 @@ async fn run_embedding_with_route_retry(
 ) -> Result<GatewayEmbeddingRun, ApiError> {
     let eligible_routes =
         ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options);
+    let RouteWaitOutcome {
+        routes: eligible_routes,
+        waited,
+    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
+        ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options)
+    })
+    .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        if waited {
+            return Err(route_wait_expired_error(&options));
+        }
         return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -7553,7 +7635,17 @@ async fn run_image_generation_with_route_retry(
 ) -> Result<GatewayImageGenerationRun, ApiError> {
     let eligible_routes =
         ordered_route_candidates_for_image_generation_with_options(state, model, request, &options);
+    let RouteWaitOutcome {
+        routes: eligible_routes,
+        waited,
+    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
+        ordered_route_candidates_for_image_generation_with_options(state, model, request, &options)
+    })
+    .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        if waited {
+            return Err(route_wait_expired_error(&options));
+        }
         return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -7628,7 +7720,17 @@ async fn run_audio_speech_with_route_retry(
 ) -> Result<GatewayAudioSpeechRun, ApiError> {
     let eligible_routes =
         ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options);
+    let RouteWaitOutcome {
+        routes: eligible_routes,
+        waited,
+    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
+        ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options)
+    })
+    .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        if waited {
+            return Err(route_wait_expired_error(&options));
+        }
         return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -7702,7 +7804,19 @@ async fn run_audio_transcription_with_route_retry(
     let eligible_routes = ordered_route_candidates_for_audio_transcription_with_options(
         state, model, request, &options,
     );
+    let RouteWaitOutcome {
+        routes: eligible_routes,
+        waited,
+    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
+        ordered_route_candidates_for_audio_transcription_with_options(
+            state, model, request, &options,
+        )
+    })
+    .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        if waited {
+            return Err(route_wait_expired_error(&options));
+        }
         return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -7837,6 +7951,109 @@ fn no_eligible_route_error(
         return no_price_band_route_error();
     }
     ApiError::bad_request("no provider route is currently eligible", Some("model"))
+}
+
+struct RouteWaitOutcome<'a> {
+    routes: Vec<&'a GatewayRouteCandidate>,
+    waited: bool,
+}
+
+async fn wait_for_eligible_routes<'a, F>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    options: &GatewayRequestOptions,
+    routes: Vec<&'a GatewayRouteCandidate>,
+    refresh: F,
+) -> RouteWaitOutcome<'a>
+where
+    F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
+{
+    wait_for_eligible_routes_with_poll(
+        state,
+        model,
+        options,
+        routes,
+        refresh,
+        Duration::from_millis(ROUTE_WAIT_POLL_MS),
+    )
+    .await
+}
+
+async fn wait_for_eligible_routes_with_poll<'a, F>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    options: &GatewayRequestOptions,
+    mut routes: Vec<&'a GatewayRouteCandidate>,
+    mut refresh: F,
+    poll_interval: Duration,
+) -> RouteWaitOutcome<'a>
+where
+    F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
+{
+    if model.mayhem.route_candidates.is_empty()
+        || !routes.is_empty()
+        || options.max_wait_ms == 0
+        || !route_static_filters_have_candidates(state, model, options)
+    {
+        return RouteWaitOutcome {
+            routes,
+            waited: false,
+        };
+    }
+    let max_wait = Duration::from_millis(options.max_wait_ms.min(MAX_ROUTE_MAX_WAIT_MS));
+    let started = Instant::now();
+    let mut waited = false;
+    while started.elapsed() < max_wait {
+        waited = true;
+        let remaining = max_wait.saturating_sub(started.elapsed());
+        let nap = remaining.min(poll_interval.max(Duration::from_millis(1)));
+        tokio::time::sleep(nap).await;
+        routes = refresh();
+        if !routes.is_empty() {
+            break;
+        }
+    }
+    RouteWaitOutcome { routes, waited }
+}
+
+fn route_static_filters_have_candidates(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+) -> bool {
+    model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .accepted_rails
+                .iter()
+                .any(|rail| rail == &state.receipt_config.rail)
+        })
+        .filter(|candidate| {
+            options
+                .min_att_tier
+                .map(|min_tier| candidate.att_tier >= min_tier)
+                .unwrap_or(true)
+        })
+        .any(|candidate| {
+            options
+                .quant
+                .as_deref()
+                .map(|quant| candidate.quant.eq_ignore_ascii_case(quant))
+                .unwrap_or(true)
+        })
+}
+
+fn route_wait_expired_error(options: &GatewayRequestOptions) -> ApiError {
+    ApiError::service_unavailable(
+        format!(
+            "network busy: no provider capacity became available before X-Mayhem-Max-Wait-Ms ({})",
+            options.max_wait_ms
+        ),
+        Some("model"),
+    )
 }
 
 fn no_price_band_route_error() -> ApiError {
@@ -8005,9 +8222,19 @@ async fn prepare_live_direct_chat_session(
     created: u64,
     config: ScBridgeGatewaySessionConfig,
 ) -> Result<LiveDirectChatSession, ApiError> {
-    let mut eligible_route_refs =
+    let eligible_route_refs =
         ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+    let RouteWaitOutcome {
+        routes: mut eligible_route_refs,
+        waited,
+    } = wait_for_eligible_routes(&state, &model, &options, eligible_route_refs, || {
+        ordered_route_candidates_for_request_with_options(&state, &model, &request, &options)
+    })
+    .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
+        if waited {
+            return Err(route_wait_expired_error(&options));
+        }
         return Err(no_eligible_route_error(&state, &model, &options));
     }
     if eligible_route_refs.is_empty() {
@@ -9085,9 +9312,19 @@ async fn run_chat_with_route_retry(
     request: &ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewaySessionRun, ApiError> {
-    let mut eligible_routes =
+    let eligible_routes =
         ordered_route_candidates_for_request_with_options(state, model, request, &options);
+    let RouteWaitOutcome {
+        routes: mut eligible_routes,
+        waited,
+    } = wait_for_eligible_routes(state, model, &options, eligible_routes, || {
+        ordered_route_candidates_for_request_with_options(state, model, request, &options)
+    })
+    .await;
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
+        if waited {
+            return Err(route_wait_expired_error(&options));
+        }
         return Err(no_eligible_route_error(state, model, &options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -10199,6 +10436,54 @@ fn stored_underdelivery_reputation_event(
     }
 }
 
+fn stored_capacity_mismatch_reputation_event(
+    event: ProviderCapacityMismatchEvent,
+    epoch_seconds: u64,
+) -> StoredReputationEvent {
+    let at = event.observed_at_millis / 1_000;
+    let epoch_seconds = epoch_seconds.max(1);
+    let epoch = at / epoch_seconds + 1;
+    let provider = event.key.provider.clone();
+    let enclave_id = event.key.enclave_id.clone();
+    let evidence = json!({
+        "source": "mayhem-gateway-capacity-mismatch-v1",
+        "provider": provider,
+        "enclave_id": enclave_id,
+        "room_id": event.key.room_id,
+        "epoch_seconds": epoch_seconds,
+        "advertised_free_slots": event.advertised_free_slots,
+        "advertised_engine_backlog": event.advertised_engine_backlog,
+        "refusal_code": "CAPACITY",
+        "streak": event.streak,
+        "observed_at_millis": event.observed_at_millis,
+    });
+    let evidence_hash = stable_value_hash(&evidence);
+    let event_id = format!(
+        "capacity-mismatch-{}",
+        evidence_hash.get(..32).unwrap_or(evidence_hash.as_str())
+    );
+    let command = json!({
+        "op": "record_rep_event",
+        "provider": provider.clone(),
+        "event_id": event_id.clone(),
+        "kind": "underdelivery",
+        "epoch": epoch,
+        "at": at,
+        "evidence_hash": evidence_hash.clone(),
+        "enclave_id": enclave_id,
+    });
+    StoredReputationEvent {
+        provider,
+        event_id,
+        kind: "underdelivery".to_owned(),
+        epoch,
+        at,
+        evidence_hash,
+        evidence,
+        command,
+    }
+}
+
 fn record_route_failure_attempt(
     state: &GatewayState,
     route: Option<&GatewayRouteCandidate>,
@@ -10216,8 +10501,54 @@ fn record_retryable_route_attempt(
     elapsed: Duration,
     err: &GatewaySessionError,
 ) {
+    if err.clean_refusal
+        && err
+            .clean_refusal_code
+            .as_deref()
+            .is_some_and(|code| code == "CAPACITY")
+    {
+        record_capacity_mismatch_if_advertised(state, route);
+    }
     if !err.clean_refusal {
         record_route_failure_attempt(state, route, elapsed);
+    }
+}
+
+fn record_capacity_mismatch_if_advertised(
+    state: &GatewayState,
+    route: Option<&GatewayRouteCandidate>,
+) {
+    let Some(route) = route else {
+        return;
+    };
+    let key = route_key(route);
+    let now_millis = now_millis_u64();
+    let maybe_event = {
+        let mut table = state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned");
+        let advertised_free_capacity = table
+            .entries(now_millis)
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.heartbeat)
+            .is_some_and(|heartbeat| {
+                heartbeat.accepting_new
+                    && heartbeat.sat < DEFAULT_SATURATION_CUTOFF
+                    && (heartbeat.q.free_slots > 0 || heartbeat.slots.active < heartbeat.slots.max)
+            });
+        if advertised_free_capacity {
+            table.record_capacity_mismatch_at(&key, now_millis)
+        } else {
+            None
+        }
+    };
+    if let Some(event) = maybe_event {
+        state.record_reputation_event(stored_capacity_mismatch_reputation_event(
+            event,
+            state.epoch_seconds,
+        ));
     }
 }
 
@@ -14746,6 +15077,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
+        headers.insert("x-mayhem-max-wait-ms", HeaderValue::from_static("0"));
         headers.insert("x-mayhem-quant", HeaderValue::from_static("Q4_K_M"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("headers parse");
         assert_eq!(options.failover_overrides.open_timeout_ms, None);
@@ -14753,6 +15085,7 @@ mod tests {
         assert_eq!(options.failover_overrides.stall_timeout_ms, None);
         assert_eq!(options.failover_overrides.min_tok_s, Some(17.5));
         assert_eq!(options.max_price_mu, Some(1_234));
+        assert_eq!(options.max_wait_ms, 0);
         assert_eq!(options.quant.as_deref(), Some("int4"));
 
         headers.insert("x-mayhem-open-timeout-ms", HeaderValue::from_static("2500"));
@@ -14768,6 +15101,11 @@ mod tests {
         assert_eq!(err.param, Some("X-Mayhem-Max-Price-Mu"));
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
 
+        headers.insert("x-mayhem-max-wait-ms", HeaderValue::from_static("60001"));
+        let err = GatewayRequestOptions::from_headers(&headers).expect_err("too-long wait rejects");
+        assert_eq!(err.param, Some("X-Mayhem-Max-Wait-Ms"));
+        headers.insert("x-mayhem-max-wait-ms", HeaderValue::from_static("1000"));
+
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("0"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("zero floor disables");
         assert_eq!(options.failover_overrides.min_tok_s, Some(0.0));
@@ -14780,20 +15118,69 @@ mod tests {
 
     #[test]
     fn gateway_default_max_price_applies_when_header_is_absent() {
-        let state =
-            GatewayState::from_models(vec![test_model()]).with_default_max_price_mu(Some(777));
+        let state = GatewayState::from_models(vec![test_model()])
+            .with_default_max_price_mu(Some(777))
+            .with_default_max_wait_ms(Some(3_000));
         let headers = HeaderMap::new();
         let options = state
             .request_options_from_headers(&headers)
             .expect("empty headers parse");
         assert_eq!(options.max_price_mu, Some(777));
+        assert_eq!(options.max_wait_ms, 3_000);
 
         let mut headers = HeaderMap::new();
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
+        headers.insert("x-mayhem-max-wait-ms", HeaderValue::from_static("0"));
         let options = state
             .request_options_from_headers(&headers)
             .expect("headers parse");
         assert_eq!(options.max_price_mu, Some(1_234));
+        assert_eq!(options.max_wait_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn route_wait_rechecks_until_route_becomes_eligible_or_expires() {
+        let model = test_routed_model(1);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let options = GatewayRequestOptions {
+            max_wait_ms: 40,
+            ..GatewayRequestOptions::default()
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_refresh = calls.clone();
+        let outcome = wait_for_eligible_routes_with_poll(
+            &state,
+            &model,
+            &options,
+            Vec::new(),
+            || {
+                if calls_for_refresh.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    vec![&model.mayhem.route_candidates[0]]
+                } else {
+                    Vec::new()
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(outcome.waited);
+        assert_eq!(outcome.routes.len(), 1);
+
+        let instant = GatewayRequestOptions {
+            max_wait_ms: 0,
+            ..GatewayRequestOptions::default()
+        };
+        let outcome = wait_for_eligible_routes_with_poll(
+            &state,
+            &model,
+            &instant,
+            Vec::new(),
+            || vec![&model.mayhem.route_candidates[0]],
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(!outcome.waited);
+        assert!(outcome.routes.is_empty());
     }
 
     #[test]
@@ -16579,7 +16966,14 @@ mod tests {
 
     #[test]
     fn provider_reject_session_error_marks_self_protection_codes_clean() {
-        for code in ["CAPACITY", "BUSY", "RATE", "QUOTA", "PRICE_FLOOR"] {
+        for code in [
+            "CAPACITY",
+            "BUSY",
+            "RATE",
+            "QUOTA",
+            "PRICE_FLOOR",
+            "DRAINING",
+        ] {
             let err = provider_reject_session_error(
                 &json!({
                     "t": "s.reject",
@@ -16590,6 +16984,7 @@ mod tests {
             );
             assert!(err.retryable);
             assert!(err.clean_refusal, "{code} should be a clean refusal");
+            assert_eq!(err.clean_refusal_code.as_deref(), Some(code));
         }
 
         let err = provider_reject_session_error(
@@ -16602,6 +16997,65 @@ mod tests {
         );
         assert!(err.retryable);
         assert!(!err.clean_refusal);
+        assert_eq!(err.clean_refusal_code, None);
+    }
+
+    #[test]
+    fn capacity_refusal_only_penalizes_sustained_false_free_capacity() {
+        let model = test_routed_model(1);
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let route = model.mayhem.route_candidates.first().expect("route");
+        let capacity = GatewaySessionError::clean_refusal_with_code(
+            "provider rejected session session-a with CAPACITY: full",
+            Some("CAPACITY"),
+        );
+
+        record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
+        record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
+        assert!(state.reputation_events().is_empty());
+        record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
+
+        let events = state.reputation_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].event_id.starts_with("capacity-mismatch-"));
+        assert_eq!(events[0].kind, "underdelivery");
+        assert_eq!(
+            events[0].evidence["source"],
+            json!("mayhem-gateway-capacity-mismatch-v1")
+        );
+
+        let honest_state = GatewayState::from_models(vec![model.clone()]);
+        let mut saturated = heartbeat_for_route(&model, route, now_millis_u64());
+        saturated.sat = 1.0;
+        saturated.slots.active = 1;
+        saturated.slots.active_requests = 1;
+        saturated.slots.max = 1;
+        saturated.q.free_slots = 0;
+        saturated.q.engine_backlog = 0;
+        honest_state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .upsert_heartbeat(saturated, now_millis_u64());
+        for _ in 0..3 {
+            record_retryable_route_attempt(
+                &honest_state,
+                Some(route),
+                Duration::from_millis(5),
+                &capacity,
+            );
+        }
+        assert!(honest_state.reputation_events().is_empty());
+        let entry = honest_state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .entries(now_millis_u64())
+            .into_iter()
+            .next()
+            .expect("provider entry");
+        assert_eq!(entry.observed.capacity_mismatch_streak, 0);
+        assert_eq!(entry.observed.consecutive_failures, 0);
     }
 
     #[tokio::test]

@@ -2708,10 +2708,12 @@ fn test_provider_heartbeat(
         sat,
         slots: HeartbeatSlots {
             active: active_slots,
+            active_requests: active_slots.saturating_sub(1),
             max: max_slots,
         },
         q: HeartbeatQueue {
-            depth: 1,
+            free_slots: 1,
+            engine_backlog: 0,
             est_wait_ms: 250,
         },
         perf: HeartbeatPerf { tok_s, ttft_ms },

@@ -193,12 +193,14 @@ fn default_heartbeat_accepting_new() -> bool {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatSlots {
     pub active: u32,
+    pub active_requests: u32,
     pub max: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatQueue {
-    pub depth: u32,
+    pub free_slots: u32,
+    pub engine_backlog: u32,
     pub est_wait_ms: u64,
 }
 
@@ -1322,6 +1324,18 @@ fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
             reason: "must not exceed slots.max".to_owned(),
         });
     }
+    if heartbeat.slots.active_requests > heartbeat.slots.active {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "slots.active_requests",
+            reason: "must not exceed slots.active".to_owned(),
+        });
+    }
+    if heartbeat.q.free_slots > heartbeat.slots.max {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "q.free_slots",
+            reason: "must not exceed slots.max".to_owned(),
+        });
+    }
     if heartbeat.caps.ctx == 0 {
         return Err(GatewayError::BadHeartbeatField {
             field: "caps.ctx",
@@ -1740,8 +1754,8 @@ mod tests {
             "model_id": "model/test@4bit",
             "room_id": "22".repeat(16),
             "sat": 0.1,
-            "slots": { "active": 1, "max": 4 },
-            "q": { "depth": 0, "est_wait_ms": 0 },
+            "slots": { "active": 1, "active_requests": 0, "max": 4 },
+            "q": { "free_slots": 1, "engine_backlog": 0, "est_wait_ms": 0 },
             "perf": { "tok_s": 42.0, "ttft_ms": 120 },
             "price_ver": 3,
             "min_ask_mu": 0,

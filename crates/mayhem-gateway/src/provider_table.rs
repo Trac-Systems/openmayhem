@@ -28,6 +28,8 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_MIN_SAMPLES: u64 = 3;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_EWMA_THRESHOLD: f64 = 0.8;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES: u32 = 3;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_COOLOFF_MILLIS: u64 = 30_000;
+pub const DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK: u32 = 3;
+pub const DEFAULT_CAPACITY_MISMATCH_FACTOR_FLOOR: f64 = 0.5;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ProviderKey {
@@ -80,6 +82,10 @@ pub struct ProviderObservation {
     pub underdelivery_streak: u32,
     #[serde(default)]
     pub underdelivery_event_emitted: bool,
+    #[serde(default)]
+    pub capacity_mismatch_streak: u32,
+    #[serde(default)]
+    pub capacity_mismatch_event_emitted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_open_until_millis: Option<u64>,
     pub samples: u64,
@@ -91,6 +97,15 @@ pub struct ProviderUnderdeliveryEvent {
     pub advertised_throughput: f64,
     pub measured_throughput: f64,
     pub ratio: f64,
+    pub streak: u32,
+    pub observed_at_millis: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCapacityMismatchEvent {
+    pub key: ProviderKey,
+    pub advertised_free_slots: u32,
+    pub advertised_engine_backlog: u32,
     pub streak: u32,
     pub observed_at_millis: u64,
 }
@@ -169,6 +184,10 @@ pub struct SelectionCandidate {
     pub price_norm: f64,
     pub throughput_ratio: Option<f64>,
     pub throughput_factor: f64,
+    pub free_slots: u32,
+    pub engine_backlog: u32,
+    pub engine_backlog_factor: f64,
+    pub capacity_mismatch_factor: f64,
     pub weight: f64,
 }
 
@@ -441,9 +460,38 @@ impl ProviderTable {
         } else {
             observed.consecutive_failures = 0;
             observed.circuit_open_until_millis = None;
+            observed.capacity_mismatch_streak = 0;
+            observed.capacity_mismatch_event_emitted = false;
         }
         observed.samples += 1;
         underdelivery_event
+    }
+
+    pub fn record_capacity_mismatch_at(
+        &mut self,
+        key: &ProviderKey,
+        now_millis: u64,
+    ) -> Option<ProviderCapacityMismatchEvent> {
+        let observed = self.observations.entry(key.clone()).or_default();
+        observed.capacity_mismatch_streak = observed.capacity_mismatch_streak.saturating_add(1);
+        if observed.capacity_mismatch_streak < DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK
+            || observed.capacity_mismatch_event_emitted
+        {
+            return None;
+        }
+        observed.capacity_mismatch_event_emitted = true;
+        let heartbeat = self.heartbeats.get(key).map(|live| &live.heartbeat);
+        Some(ProviderCapacityMismatchEvent {
+            key: key.clone(),
+            advertised_free_slots: heartbeat
+                .map(|heartbeat| heartbeat.q.free_slots)
+                .unwrap_or(0),
+            advertised_engine_backlog: heartbeat
+                .map(|heartbeat| heartbeat.q.engine_backlog)
+                .unwrap_or(0),
+            streak: observed.capacity_mismatch_streak,
+            observed_at_millis: now_millis,
+        })
     }
 
     pub fn entries(&self, now_millis: u64) -> Vec<ProviderTableEntry> {
@@ -652,12 +700,18 @@ pub fn eligible_candidates(
             let error_factor = (1.0 - entry.observed.ewma_error_rate).clamp(0.05, 1.0);
             let throughput_ratio = throughput_delivery_ratio(&entry);
             let throughput_factor = throughput_standing_factor(throughput_ratio);
+            let free_slots = heartbeat.q.free_slots;
+            let engine_backlog = heartbeat.q.engine_backlog;
+            let engine_backlog_factor = engine_backlog_factor(engine_backlog);
+            let capacity_mismatch_factor = capacity_mismatch_factor(&entry);
             let weight = reputation.powf(weights.reputation_alpha)
                 * available.powf(weights.saturation_beta)
                 * (1.0 / price_norm).powf(weights.price_gamma)
                 * latency_factor
                 * throughput_factor
                 * error_factor
+                * engine_backlog_factor
+                * capacity_mismatch_factor
                 * probation_weight_multiplier(&entry);
             SelectionCandidate {
                 entry,
@@ -667,6 +721,10 @@ pub fn eligible_candidates(
                 price_norm,
                 throughput_ratio,
                 throughput_factor,
+                free_slots,
+                engine_backlog,
+                engine_backlog_factor,
+                capacity_mismatch_factor,
                 weight,
             }
         })
@@ -788,6 +846,22 @@ fn throughput_standing_factor(ratio: Option<f64>) -> f64 {
     DEFAULT_THROUGHPUT_FACTOR_FLOOR + (1.0 - DEFAULT_THROUGHPUT_FACTOR_FLOOR) * progress
 }
 
+fn engine_backlog_factor(backlog: u32) -> f64 {
+    1.0 / (1.0 + f64::from(backlog))
+}
+
+fn capacity_mismatch_factor(entry: &ProviderTableEntry) -> f64 {
+    if entry.observed.capacity_mismatch_streak < DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK {
+        return 1.0;
+    }
+    let excess = entry
+        .observed
+        .capacity_mismatch_streak
+        .saturating_sub(DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK)
+        .saturating_add(1);
+    (1.0 / (1.0 + f64::from(excess) * 0.25)).clamp(DEFAULT_CAPACITY_MISMATCH_FACTOR_FLOOR, 1.0)
+}
+
 fn probation_weight_multiplier(entry: &ProviderTableEntry) -> f64 {
     entry
         .contract
@@ -892,6 +966,14 @@ fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize
         std::cmp::Ordering::Less => left,
         std::cmp::Ordering::Greater => right,
         std::cmp::Ordering::Equal => {
+            match candidates[left]
+                .engine_backlog
+                .cmp(&candidates[right].engine_backlog)
+            {
+                std::cmp::Ordering::Less => return left,
+                std::cmp::Ordering::Greater => return right,
+                std::cmp::Ordering::Equal => {}
+            }
             if candidates[left].effective_ttft_ms <= candidates[right].effective_ttft_ms {
                 left
             } else {
@@ -990,9 +1072,14 @@ mod tests {
             model_id: "model/test@4bit".to_owned(),
             room_id: key.room_id,
             sat,
-            slots: HeartbeatSlots { active: 1, max: 8 },
+            slots: HeartbeatSlots {
+                active: 1,
+                active_requests: 0,
+                max: 8,
+            },
             q: HeartbeatQueue {
-                depth: 0,
+                free_slots: 1,
+                engine_backlog: 0,
                 est_wait_ms: 0,
             },
             perf: HeartbeatPerf {
@@ -1024,9 +1111,14 @@ mod tests {
             model_id: "model/test@4bit".to_owned(),
             room_id: key.room_id,
             sat: 0.25,
-            slots: HeartbeatSlots { active: 2, max: 8 },
+            slots: HeartbeatSlots {
+                active: 2,
+                active_requests: 1,
+                max: 8,
+            },
             q: HeartbeatQueue {
-                depth: 1,
+                free_slots: 1,
+                engine_backlog: 0,
                 est_wait_ms: 50,
             },
             perf: HeartbeatPerf {
@@ -1499,6 +1591,82 @@ mod tests {
             select_weighted_p2c(&entries, &request, &SelectionWeights::default(), &mut rng)
                 .expect("provider selected");
         assert_eq!(selected.selected.entry.key, honest_key);
+    }
+
+    #[test]
+    fn engine_backlog_downweights_and_breaks_equal_saturation_ties() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let weights = SelectionWeights::default();
+        let idle = entry_for(1, now, 0.2, 100);
+        let mut backed_up = entry_for(2, now, 0.2, 100);
+        backed_up.heartbeat.as_mut().unwrap().q.engine_backlog = 3;
+        let entries = vec![idle.clone(), backed_up.clone()];
+
+        let candidates = eligible_candidates(&entries, &request, &weights);
+        let idle_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.entry.key == idle.key)
+            .expect("idle candidate");
+        let backed_up_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.entry.key == backed_up.key)
+            .expect("backed-up candidate");
+        assert_eq!(idle_candidate.engine_backlog_factor, 1.0);
+        assert!(backed_up_candidate.engine_backlog_factor < 1.0);
+        assert!(idle_candidate.weight > backed_up_candidate.weight);
+
+        let mut rng = ScriptedRng::new([0.0, 0.0]);
+        let selected =
+            select_weighted_p2c(&entries, &request, &weights, &mut rng).expect("provider selected");
+        assert_eq!(selected.selected.entry.key, idle.key);
+    }
+
+    #[test]
+    fn sustained_capacity_mismatch_emits_once_and_downweights_without_circuiting() {
+        let now = 1_000_000;
+        let mut table = ProviderTable::new();
+        let mismatch_record = contract_record_for(1);
+        let honest_record = contract_record_for(2);
+        let mismatch_key = ProviderKey::from_contract(&mismatch_record);
+        let honest_key = ProviderKey::from_contract(&honest_record);
+        table.upsert_contract(mismatch_record);
+        table.upsert_contract(honest_record);
+        table.upsert_heartbeat(heartbeat_for(1, now, 0.2, 100, 9, "44"), now);
+        table.upsert_heartbeat(heartbeat_for(2, now, 0.2, 100, 9, "55"), now);
+
+        assert!(table
+            .record_capacity_mismatch_at(&mismatch_key, now + 1)
+            .is_none());
+        assert!(table
+            .record_capacity_mismatch_at(&mismatch_key, now + 2)
+            .is_none());
+        let event = table
+            .record_capacity_mismatch_at(&mismatch_key, now + 3)
+            .expect("third mismatch emits");
+        assert_eq!(event.key, mismatch_key);
+        assert_eq!(event.advertised_free_slots, 1);
+        assert_eq!(event.streak, DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK);
+        assert!(table
+            .record_capacity_mismatch_at(&mismatch_key, now + 4)
+            .is_none());
+
+        let request = eligible_request(now + 10);
+        let entries = table.entries(now + 10);
+        let candidates = eligible_candidates(&entries, &request, &SelectionWeights::default());
+        let mismatch = candidates
+            .iter()
+            .find(|candidate| candidate.entry.key == mismatch_key)
+            .expect("mismatch candidate");
+        let honest = candidates
+            .iter()
+            .find(|candidate| candidate.entry.key == honest_key)
+            .expect("honest candidate");
+        assert!(mismatch.capacity_mismatch_factor < 1.0);
+        assert!(honest.capacity_mismatch_factor == 1.0);
+        assert!(honest.weight > mismatch.weight);
+        assert_eq!(mismatch.entry.observed.consecutive_failures, 0);
+        assert_eq!(mismatch.entry.observed.circuit_open_until_millis, None);
     }
 
     #[test]
