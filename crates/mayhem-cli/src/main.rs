@@ -744,13 +744,25 @@ struct UpArgs {
     #[arg(long)]
     provider: bool,
 
-    /// Intercom/Pear network: mainnet, testnet1, local, or development.
-    #[arg(long, default_value = "local")]
-    network: String,
+    /// Intercom/Pear network: mainnet, testnet1, local, or development. Defaults to config, env, or mainnet.
+    #[arg(long)]
+    network: Option<String>,
 
     /// Canonical Intercom subnet channel. Defaults to the app default.
     #[arg(long)]
     subnet_channel: Option<String>,
+
+    /// Canonical Intercom subnet bootstrap hex. Defaults to config or the peer store.
+    #[arg(long)]
+    subnet_bootstrap: Option<String>,
+
+    /// Main Settlement Bus bootstrap hex for networks without compiled defaults.
+    #[arg(long)]
+    msb_bootstrap: Option<String>,
+
+    /// Main Settlement Bus channel for networks without compiled defaults.
+    #[arg(long)]
+    msb_channel: Option<String>,
 
     /// Intercom peer store name for the supervised Pear peer.
     #[arg(long, default_value = "mayhem-up-main")]
@@ -14031,6 +14043,9 @@ struct UpPlan {
     provider: bool,
     network: String,
     subnet_channel: Option<String>,
+    subnet_bootstrap: Option<String>,
+    msb_bootstrap: Option<String>,
+    msb_channel: Option<String>,
     peer_store_name: String,
     msb_store_name: String,
     rpc_url: String,
@@ -14133,6 +14148,13 @@ async fn up(args: UpArgs) -> Result<()> {
         },
         "provider": plan.provider,
         "role": plan.role.as_str(),
+        "network": {
+            "name": &plan.network,
+            "subnet_channel": &plan.subnet_channel,
+            "subnet_bootstrap_configured": plan.subnet_bootstrap.is_some(),
+            "msb_bootstrap_configured": plan.msb_bootstrap.is_some(),
+            "msb_channel": &plan.msb_channel,
+        },
         "copy_paste": {
             "openai_base_url": plan.openai_base_url,
             "dashboard_url": dashboard_url.clone(),
@@ -14176,6 +14198,37 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let supervisor_url = format!("http://{supervisor_bind}");
     let config_path = config_path_for_home(&home);
     let mut config = read_config_toml_value(&config_path)?;
+    let network = resolve_up_network(args, &config)?;
+    let subnet_channel = resolve_up_config_value(
+        args.subnet_channel.as_deref(),
+        &config,
+        "network.subnet_channel",
+    );
+    let subnet_bootstrap = resolve_up_config_value(
+        args.subnet_bootstrap.as_deref(),
+        &config,
+        "network.subnet_bootstrap",
+    );
+    let msb_bootstrap = resolve_up_config_value(
+        args.msb_bootstrap.as_deref(),
+        &config,
+        "network.msb_bootstrap",
+    );
+    let msb_channel =
+        resolve_up_config_value(args.msb_channel.as_deref(), &config, "network.msb_channel");
+    validate_hex32_config("network.subnet_bootstrap", subnet_bootstrap.as_deref())?;
+    validate_hex32_config("network.msb_bootstrap", msb_bootstrap.as_deref())?;
+    if let (Some(subnet), Some(msb)) = (subnet_bootstrap.as_deref(), msb_bootstrap.as_deref()) {
+        if subnet.eq_ignore_ascii_case(msb) {
+            bail!("network.subnet_bootstrap cannot equal network.msb_bootstrap");
+        }
+    }
+    if network == "testnet1" && (msb_bootstrap.is_none() || msb_channel.is_none()) {
+        bail!(
+            "testnet1 requires network.msb_bootstrap and network.msb_channel; set them with `mayhem config set` or pass --msb-bootstrap/--msb-channel"
+        );
+    }
+
     let sc_bridge_token = args
         .sc_bridge_token
         .as_ref()
@@ -14189,19 +14242,21 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         })
         .unwrap_or_else(|| generate_sc_bridge_token(&home));
 
-    if !config_path.exists() {
-        write_first_run_up_config(&home, role, &rpc_url, args).await?;
-        config = read_config_toml_value(&config_path)?;
-    }
+    ensure_up_identity_config(&home, role, &rpc_url, args, &mut config).await?;
     repair_up_config(
         &config_path,
         &mut config,
         UpConfigPatch {
             role,
+            network: &network,
             rpc_url: &rpc_url,
             gateway_url: &gateway_url,
             sc_bridge_url: &sc_bridge_url,
             sc_bridge_token: &sc_bridge_token,
+            subnet_channel: subnet_channel.as_deref(),
+            subnet_bootstrap: subnet_bootstrap.as_deref(),
+            msb_bootstrap: msb_bootstrap.as_deref(),
+            msb_channel: msb_channel.as_deref(),
         },
     )?;
 
@@ -14220,8 +14275,11 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         intercom_dir,
         role,
         provider: args.provider,
-        network: args.network.clone(),
-        subnet_channel: args.subnet_channel.clone(),
+        network,
+        subnet_channel,
+        subnet_bootstrap,
+        msb_bootstrap,
+        msb_channel,
         peer_store_name: args.peer_store_name.clone(),
         msb_store_name: format!("{}-msb", args.peer_store_name),
         rpc_url,
@@ -14240,21 +14298,39 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
 
 struct UpConfigPatch<'a> {
     role: Role,
+    network: &'a str,
     rpc_url: &'a str,
     gateway_url: &'a str,
     sc_bridge_url: &'a str,
     sc_bridge_token: &'a str,
+    subnet_channel: Option<&'a str>,
+    subnet_bootstrap: Option<&'a str>,
+    msb_bootstrap: Option<&'a str>,
+    msb_channel: Option<&'a str>,
 }
 
-async fn write_first_run_up_config(
+async fn ensure_up_identity_config(
     home: &Path,
     role: Role,
     rpc_url: &str,
     args: &UpArgs,
+    config: &mut toml::Value,
 ) -> Result<()> {
-    let wallet_store_name = "main";
+    let configured_store_name = toml_get_path(config, "identity.store_name")
+        .and_then(toml::Value::as_str)
+        .and_then(non_empty_string);
+    let wallet_store_name = configured_store_name.as_deref().unwrap_or("main");
     let store_path = home.join("stores").join(wallet_store_name);
-    let keypair_path = store_path.join("db").join("keypair.json");
+    let keypair_path = toml_get_path(config, "identity.keypair_path")
+        .and_then(toml::Value::as_str)
+        .and_then(non_empty_string)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| store_path.join("db").join("keypair.json"));
+    let keypair_path = if keypair_path.is_absolute() {
+        keypair_path
+    } else {
+        home.join(keypair_path)
+    };
     fs::create_dir_all(keypair_path.parent().expect("keypair has parent"))
         .with_context(|| format!("creating {}", keypair_path.display()))?;
     let wallet_args = SetupArgs {
@@ -14276,7 +14352,24 @@ async fn write_first_run_up_config(
     };
     let password = args.wallet_password.as_deref().unwrap_or("");
     let wallet = materialize_wallet(&wallet_args, &keypair_path, password).await?;
-    write_config(home, &store_path, &wallet, role, wallet_store_name, rpc_url)?;
+    let address = wallet.address.as_deref().unwrap_or("");
+    let derivation_path = wallet.derivation_path.as_deref().unwrap_or("");
+    toml_set_string(config, "identity.public_key", wallet.public_key.clone())?;
+    toml_set_string(config, "identity.address", address.to_owned())?;
+    toml_set_string(
+        config,
+        "identity.derivation_path",
+        derivation_path.to_owned(),
+    )?;
+    toml_set_string(config, "identity.keypair_path", wallet.keypair_path.clone())?;
+    toml_set_string(config, "identity.store_name", wallet_store_name.to_owned())?;
+    toml_set_string(
+        config,
+        "identity.store_path",
+        store_path.display().to_string(),
+    )?;
+    toml_set_string(config, "role.mode", role.as_str().to_owned())?;
+    toml_set_string(config, "network.rpc_url", rpc_url.to_owned())?;
     Ok(())
 }
 
@@ -14286,6 +14379,7 @@ fn repair_up_config(
     patch: UpConfigPatch<'_>,
 ) -> Result<()> {
     toml_set_string(config, "role.mode", patch.role.as_str().to_owned())?;
+    toml_set_string(config, "network.name", patch.network.to_owned())?;
     toml_set_string(config, "network.rpc_url", patch.rpc_url.to_owned())?;
     toml_set_string(config, "network.gateway_url", patch.gateway_url.to_owned())?;
     toml_set_string(
@@ -14298,7 +14392,90 @@ fn repair_up_config(
         "network.sc_bridge_token",
         patch.sc_bridge_token.to_owned(),
     )?;
+    if let Some(value) = optional_non_empty_string(patch.subnet_channel) {
+        toml_set_string(config, "network.subnet_channel", value)?;
+    }
+    if let Some(value) = optional_non_empty_string(patch.subnet_bootstrap) {
+        toml_set_string(config, "network.subnet_bootstrap", value)?;
+    }
+    if let Some(value) = optional_non_empty_string(patch.msb_bootstrap) {
+        toml_set_string(config, "network.msb_bootstrap", value)?;
+    }
+    if let Some(value) = optional_non_empty_string(patch.msb_channel) {
+        toml_set_string(config, "network.msb_channel", value)?;
+    }
     write_config_toml_value(config_path, config)?;
+    Ok(())
+}
+
+fn resolve_up_network(args: &UpArgs, config: &toml::Value) -> Result<String> {
+    let raw = args
+        .network
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| toml_non_empty_string(config, "network.name"))
+        .or_else(|| {
+            env::var("MAYHEM_NETWORK")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            env::var("TRAC_NETWORK_ENV")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "mainnet".to_owned());
+    normalize_intercom_network(&raw)
+}
+
+fn normalize_intercom_network(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "mainnet" => Ok("mainnet".to_owned()),
+        "local" => Ok("local".to_owned()),
+        "development" | "dev" => Ok("development".to_owned()),
+        "testnet" | "testnet1" => Ok("testnet1".to_owned()),
+        "" => bail!("network must not be empty"),
+        _ => bail!("unsupported network {raw}; expected mainnet, testnet1, local, or development"),
+    }
+}
+
+fn resolve_up_config_value(
+    cli_value: Option<&str>,
+    config: &toml::Value,
+    key: &str,
+) -> Option<String> {
+    cli_value
+        .and_then(non_empty_string)
+        .or_else(|| toml_non_empty_string(config, key))
+}
+
+fn toml_non_empty_string(config: &toml::Value, key: &str) -> Option<String> {
+    toml_get_path(config, key)
+        .and_then(toml::Value::as_str)
+        .and_then(non_empty_string)
+}
+
+fn optional_non_empty_string(value: Option<&str>) -> Option<String> {
+    value.and_then(non_empty_string)
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    Some(value)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn validate_hex32_config(name: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = value.trim();
+    if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        bail!("{name} must be 32-byte lowercase/uppercase hex (64 chars)");
+    }
     Ok(())
 }
 
@@ -14332,6 +14509,27 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         .filter(|value| !value.trim().is_empty())
     {
         peer_args.extend(["--subnet-channel".to_owned(), channel.to_owned()]);
+    }
+    if let Some(bootstrap) = plan
+        .subnet_bootstrap
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        peer_args.extend(["--subnet-bootstrap".to_owned(), bootstrap.to_owned()]);
+    }
+    if let Some(bootstrap) = plan
+        .msb_bootstrap
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        peer_args.extend(["--msb-bootstrap".to_owned(), bootstrap.to_owned()]);
+    }
+    if let Some(channel) = plan
+        .msb_channel
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        peer_args.extend(["--msb-channel".to_owned(), channel.to_owned()]);
     }
     peer_args.extend([
         "--headless".to_owned(),
@@ -28549,6 +28747,9 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "home" | "mayhem_home" => {
             bail!("home selects the config location and is not stored inside config.toml")
         }
+        "network" | "network.name" | "trac_network" | "network.trac_network" => {
+            Ok("network.name")
+        }
         "rpc_url" | "network.rpc_url" => Ok("network.rpc_url"),
         "gateway_url" | "network.gateway_url" => Ok("network.gateway_url"),
         "paygate_url" | "network.paygate_url" => Ok("network.paygate_url"),
@@ -28557,12 +28758,16 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "tnk_treasury_address" | "network.tnk_treasury_address" => {
             Ok("network.tnk_treasury_address")
         }
+        "subnet_channel" | "network.subnet_channel" => Ok("network.subnet_channel"),
+        "subnet_bootstrap" | "network.subnet_bootstrap" => Ok("network.subnet_bootstrap"),
+        "msb_channel" | "network.msb_channel" => Ok("network.msb_channel"),
+        "msb_bootstrap" | "network.msb_bootstrap" => Ok("network.msb_bootstrap"),
         "keypair_path" | "identity.keypair_path" => Ok("identity.keypair_path"),
         "store_name" | "identity.store_name" => Ok("identity.store_name"),
         "engine_backend" | "provider.engine_backend" => Ok("provider.engine_backend"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, identity.keypair_path, identity.store_name, provider.engine_backend, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, and role.mode"),
     }
 }
 
@@ -29690,6 +29895,15 @@ mod tests {
         assert_eq!(
             canonical_config_key("sc-bridge-token").unwrap(),
             "network.sc_bridge_token"
+        );
+        assert_eq!(canonical_config_key("network").unwrap(), "network.name");
+        assert_eq!(
+            canonical_config_key("subnet-bootstrap").unwrap(),
+            "network.subnet_bootstrap"
+        );
+        assert_eq!(
+            canonical_config_key("msb-bootstrap").unwrap(),
+            "network.msb_bootstrap"
         );
         assert!(canonical_config_key("home").is_err());
         fs::remove_dir_all(&home).unwrap();
@@ -37991,7 +38205,10 @@ mod tests {
             role: Role::Both,
             provider: true,
             network: "mainnet".to_owned(),
-            subnet_channel: None,
+            subnet_channel: Some("mayhem-mainnet-v1".to_owned()),
+            subnet_bootstrap: Some("a".repeat(64)),
+            msb_bootstrap: Some("b".repeat(64)),
+            msb_channel: Some("mayhem-msb-mainnet-v1".to_owned()),
             peer_store_name: "mayhem-up-main".to_owned(),
             msb_store_name: "mayhem-up-main-msb".to_owned(),
             rpc_url: "http://127.0.0.1:49223/v1".to_owned(),
@@ -38020,6 +38237,14 @@ mod tests {
         assert_eq!(names, vec!["peer", "gateway", "provider"]);
         assert!(text.contains("--sc-bridge-token"));
         assert!(text.contains("test-token"));
+        assert!(text.contains("--subnet-channel"));
+        assert!(text.contains("mayhem-mainnet-v1"));
+        assert!(text.contains("--subnet-bootstrap"));
+        assert!(text.contains(&"a".repeat(64)));
+        assert!(text.contains("--msb-bootstrap"));
+        assert!(text.contains(&"b".repeat(64)));
+        assert!(text.contains("--msb-channel"));
+        assert!(text.contains("mayhem-msb-mainnet-v1"));
         assert!(text.contains("--serve-sessions"));
         assert!(!text.contains("--peer-dht-bootstrap"));
     }
@@ -38038,10 +38263,15 @@ mod tests {
             &mut config,
             UpConfigPatch {
                 role: Role::User,
+                network: "testnet1",
                 rpc_url: "http://127.0.0.1:50001/v1",
                 gateway_url: "http://127.0.0.1:50002",
                 sc_bridge_url: "ws://127.0.0.1:50003",
                 sc_bridge_token: "bridge-token",
+                subnet_channel: Some("mayhem-test-subnet"),
+                subnet_bootstrap: Some("c"),
+                msb_bootstrap: Some("d"),
+                msb_channel: Some("mayhem-test-msb"),
             },
         )
         .unwrap();
@@ -38051,6 +38281,10 @@ mod tests {
             Some("user")
         );
         assert_eq!(
+            toml_get_path(&saved, "network.name").and_then(toml::Value::as_str),
+            Some("testnet1")
+        );
+        assert_eq!(
             toml_get_path(&saved, "network.rpc_url").and_then(toml::Value::as_str),
             Some("http://127.0.0.1:50001/v1")
         );
@@ -38058,6 +38292,103 @@ mod tests {
             toml_get_path(&saved, "network.sc_bridge_token").and_then(toml::Value::as_str),
             Some("bridge-token")
         );
+        assert_eq!(
+            toml_get_path(&saved, "network.subnet_channel").and_then(toml::Value::as_str),
+            Some("mayhem-test-subnet")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "network.subnet_bootstrap").and_then(toml::Value::as_str),
+            Some("c")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "network.msb_bootstrap").and_then(toml::Value::as_str),
+            Some("d")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "network.msb_channel").and_then(toml::Value::as_str),
+            Some("mayhem-test-msb")
+        );
+    }
+
+    #[tokio::test]
+    async fn up_identity_init_preserves_preseeded_network_manifest() {
+        let home = test_temp_dir("mayhem-up-identity-config");
+        let config_path = home.join("config.toml");
+        let bootstrap = "e".repeat(64);
+        let mut config = toml::Value::Table(toml::map::Map::new());
+        toml_set_string(&mut config, "network.name", "local".to_owned()).unwrap();
+        toml_set_string(
+            &mut config,
+            "network.subnet_channel",
+            "mayhem-b2-test".to_owned(),
+        )
+        .unwrap();
+        toml_set_string(&mut config, "network.subnet_bootstrap", bootstrap.clone()).unwrap();
+        write_config_toml_value(&config_path, &config).unwrap();
+
+        let args = UpArgs {
+            home: Some(home.clone()),
+            provider: false,
+            network: None,
+            subnet_channel: None,
+            subnet_bootstrap: None,
+            msb_bootstrap: None,
+            msb_channel: None,
+            peer_store_name: "mayhem-up-test".to_owned(),
+            wallet_password: None,
+            yes: true,
+            rpc_port: 51_001,
+            sc_bridge_port: 51_002,
+            gateway_port: 51_003,
+            supervisor_port: 51_004,
+            sc_bridge_token: None,
+            timeout_seconds: 1,
+            json: true,
+            dev_embedded_catalog: false,
+        };
+        ensure_up_identity_config(
+            &home,
+            Role::User,
+            "http://127.0.0.1:51001/v1",
+            &args,
+            &mut config,
+        )
+        .await
+        .unwrap();
+        repair_up_config(
+            &config_path,
+            &mut config,
+            UpConfigPatch {
+                role: Role::User,
+                network: "local",
+                rpc_url: "http://127.0.0.1:51001/v1",
+                gateway_url: "http://127.0.0.1:51003",
+                sc_bridge_url: "ws://127.0.0.1:51002",
+                sc_bridge_token: "bridge-token",
+                subnet_channel: Some("mayhem-b2-test"),
+                subnet_bootstrap: Some(&bootstrap),
+                msb_bootstrap: None,
+                msb_channel: None,
+            },
+        )
+        .unwrap();
+
+        let saved = read_config_toml_value(&config_path).unwrap();
+        assert_eq!(
+            toml_get_path(&saved, "network.subnet_channel").and_then(toml::Value::as_str),
+            Some("mayhem-b2-test")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "network.subnet_bootstrap").and_then(toml::Value::as_str),
+            Some(bootstrap.as_str())
+        );
+        let keypair_path = PathBuf::from(
+            toml_get_path(&saved, "identity.keypair_path")
+                .and_then(toml::Value::as_str)
+                .expect("identity keypair path"),
+        );
+        assert!(keypair_path.exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
