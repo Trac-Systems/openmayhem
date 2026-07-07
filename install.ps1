@@ -16,6 +16,7 @@ param(
     [switch]$ForceOpencode,
     [switch]$NoPathUpdate,
     [switch]$AllowUnverified,
+    [string]$LlamaCppFeatures = $env:MAYHEM_LLAMA_CPP_FEATURES,
     [string]$NpmPrefix = $(if ($env:MAYHEM_NPM_PREFIX) { $env:MAYHEM_NPM_PREFIX } else { Join-Path (Join-Path $HOME ".mayhem") "node" })
 )
 
@@ -59,6 +60,83 @@ function Fail {
 function Test-Command {
     param([string]$Name)
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Get-LlamaCppFeatureName {
+    param([string]$Token)
+
+    $normalized = $Token.Trim().ToLowerInvariant()
+    switch ($normalized) {
+        "cpu" { return "" }
+        "none" { return "" }
+        "cuda" { return "mayhem-cli/llama-cpp-cuda" }
+        "llama-cpp-cuda" { return "mayhem-cli/llama-cpp-cuda" }
+        "vulkan" { return "mayhem-cli/llama-cpp-vulkan" }
+        "llama-cpp-vulkan" { return "mayhem-cli/llama-cpp-vulkan" }
+        "openmp" { return "mayhem-cli/llama-cpp-openmp" }
+        "llama-cpp-openmp" { return "mayhem-cli/llama-cpp-openmp" }
+        "static-openmp" { return "mayhem-cli/llama-cpp-static-openmp" }
+        "llama-cpp-static-openmp" { return "mayhem-cli/llama-cpp-static-openmp" }
+        default {
+            Fail "unknown MAYHEM_LLAMA_CPP_FEATURES entry '$Token' (expected cuda, vulkan, openmp, static-openmp, or cpu)"
+        }
+    }
+}
+
+function Get-LlamaCppFeatures {
+    $features = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($LlamaCppFeatures)) {
+        foreach ($token in ($LlamaCppFeatures -split "[,; ]+")) {
+            if ([string]::IsNullOrWhiteSpace($token)) {
+                continue
+            }
+            $feature = Get-LlamaCppFeatureName -Token $token
+            if (-not [string]::IsNullOrWhiteSpace($feature) -and $features -notcontains $feature) {
+                $features += $feature
+            }
+        }
+        return $features
+    }
+
+    if ((Test-Command "nvcc") -or -not [string]::IsNullOrWhiteSpace($env:CUDA_PATH) -or -not [string]::IsNullOrWhiteSpace($env:CUDA_HOME)) {
+        $features += "mayhem-cli/llama-cpp-cuda"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:VULKAN_SDK)) {
+        $features += "mayhem-cli/llama-cpp-vulkan"
+    }
+
+    return $features
+}
+
+function Assert-LlamaCppFeaturePrereqs {
+    param([string[]]$Features)
+
+    if ($Features -contains "mayhem-cli/llama-cpp-cuda") {
+        if (-not (Test-Command "nvcc") -and [string]::IsNullOrWhiteSpace($env:CUDA_PATH) -and [string]::IsNullOrWhiteSpace($env:CUDA_HOME)) {
+            Fail "llama.cpp CUDA source build requested, but CUDA Toolkit was not found; install CUDA Toolkit or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
+        }
+    }
+
+    if ($Features -contains "mayhem-cli/llama-cpp-vulkan") {
+        if ([string]::IsNullOrWhiteSpace($env:VULKAN_SDK)) {
+            Fail "llama.cpp Vulkan source build requested, but VULKAN_SDK is not set; install the Vulkan SDK or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
+        }
+    }
+}
+
+function Get-LlamaCppFeatureArgs {
+    $features = @(Get-LlamaCppFeatures)
+    Assert-LlamaCppFeaturePrereqs -Features $features
+
+    if ($features.Count -eq 0) {
+        Write-Log "building llama.cpp CPU fallback; set MAYHEM_LLAMA_CPP_FEATURES=cuda or vulkan for GPU source builds"
+        return @()
+    }
+
+    Write-Log ("building llama.cpp provider feature(s): " + ($features -join ", "))
+    return @("--features", ($features -join ","))
 }
 
 function New-TempDir {
@@ -392,7 +470,8 @@ function Install-FromSource {
     Write-Log "building release binaries from $SourceDir"
     Push-Location $SourceDir
     try {
-        & cargo build --release --workspace --bins
+        $featureArgs = @(Get-LlamaCppFeatureArgs)
+        & cargo build --release --workspace --bins @featureArgs
         if ($LASTEXITCODE -ne 0) {
             Fail "cargo build failed"
         }

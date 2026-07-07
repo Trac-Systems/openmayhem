@@ -9,6 +9,13 @@ license.workspace = true
 name = "mayhem"
 path = "src/main.rs"
 
+[features]
+default = []
+llama-cpp-cuda = ["mayhem-engine/llama-cpp-cuda"]
+llama-cpp-openmp = ["mayhem-engine/llama-cpp-openmp"]
+llama-cpp-static-openmp = ["mayhem-engine/llama-cpp-static-openmp"]
+llama-cpp-vulkan = ["mayhem-engine/llama-cpp-vulkan"]
+
 [dependencies]
 anyhow = "1"
 blake3 = "1"

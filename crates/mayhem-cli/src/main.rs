@@ -18,6 +18,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "windows")]
+use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -105,6 +107,7 @@ const F13_UNIFIED_MEMORY_RESERVE_MIN_BYTES: u64 = 4 * GIB_BYTES;
 const F13_MEMORY_RESERVE_FLOOR_BYTES: u64 = GIB_BYTES;
 const F13_DISK_RESERVE_DEFAULT_BYTES: u64 = 10 * GIB_BYTES;
 const F13_DISK_RESERVE_FLOOR_BYTES: u64 = 2 * GIB_BYTES;
+#[cfg(any(target_os = "macos", test))]
 const PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL: i32 = 2;
 const PROVIDER_ENGINE_WATCHDOG_SUSTAINED_SAMPLES: u32 = 3;
 const PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_SECONDS: u64 = 30;
@@ -4356,8 +4359,38 @@ struct ConfigRole {
     mode: Option<String>,
 }
 
+#[cfg(not(target_os = "windows"))]
 #[tokio::main]
 async fn main() -> Result<()> {
+    mayhem_main().await
+}
+
+#[cfg(target_os = "windows")]
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("mayhem-main".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building Windows CLI runtime")?
+                .block_on(mayhem_main())
+        })
+        .context("spawning Windows CLI main thread")?
+        .join()
+        .map_err(|panic| {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                anyhow!("Windows CLI main thread panicked: {message}")
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                anyhow!("Windows CLI main thread panicked: {message}")
+            } else {
+                anyhow!("Windows CLI main thread panicked")
+            }
+        })?
+}
+
+async fn mayhem_main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Setup(args) => setup(args).await,
@@ -23734,6 +23767,7 @@ enum ProviderRuntimeMemoryObservation {
         available_bytes: Option<u64>,
         reserve_bytes: u64,
     },
+    #[cfg(any(target_os = "macos", test))]
     MacosPressure {
         level: Option<i32>,
         stop_level: i32,
@@ -23963,6 +23997,7 @@ fn provider_runtime_floor_rejection_from_observations(
                 human_bytes(reserve_bytes)
             ),
         }),
+        #[cfg(any(target_os = "macos", test))]
         ProviderRuntimeMemoryObservation::MacosPressure {
             level: Some(level),
             stop_level,
