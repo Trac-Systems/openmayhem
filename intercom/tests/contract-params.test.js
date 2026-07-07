@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import MayhemContract from '../contract/contract.js';
+import MayhemContract, { contractParamDefinitions } from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
@@ -10,6 +10,26 @@ import {
 
 const DAY_SECONDS = 24 * 60 * 60;
 const rulesHash = 'd'.repeat(64);
+const EPOCH_OPERATING_PARAM_VALUES = {
+  epoch_seconds: 7_200,
+  challenge_epochs: 3,
+  holdback_epochs: 12,
+  max_apply_batch: 2_500,
+  param_activation_delay_seconds: 3_600,
+  rules_grace_seconds: 300,
+  rate_staleness_seconds: 120,
+  uptime_tick_seconds: 1_800,
+  price_rate_limit_seconds: 900,
+  market_target_utilization_bps: 7_500,
+  market_ema_alpha_bps: 4_000,
+  market_gain_bps: 6_000,
+  market_max_step_bps: 1_500,
+  market_cold_start_min_providers: 5,
+  market_provider_epoch_target_mu: 2_000_000,
+  market_max_utilization_bps: 60_000,
+  market_below_target_discount_bps: 1_000,
+  market_above_target_slope_bps: 20_000,
+};
 
 const makeSetParams = (overrides = {}) => ({
   op: 'set_params',
@@ -270,4 +290,77 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     market_provider_epoch_target_mu: 2_000_000,
     param_activation_delay_seconds: 3_600,
   });
+});
+
+test('MayhemContract epoch and market epoch controls are admin-governed params', async () => {
+  const admin = await makeIdentity();
+  const outsider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const contract = new MayhemContract({}, {});
+  const definitions = contractParamDefinitions();
+
+  for (const [key, value] of Object.entries(EPOCH_OPERATING_PARAM_VALUES)) {
+    const definition = definitions[key];
+    assert.ok(definition, `${key} must be registered in contract PARAM_DEFINITIONS`);
+    assert.equal(Number.isInteger(definition.default), true, `${key} default must be integer`);
+    assert.equal(Number.isInteger(definition.min), true, `${key} min must be integer`);
+    assert.equal(Number.isInteger(definition.max), true, `${key} max must be integer`);
+    assert.ok(value >= definition.min && value <= definition.max, `${key} test value must fit bounds`);
+  }
+
+  const providerAttempt = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: EPOCH_OPERATING_PARAM_VALUES,
+    },
+    outsider.publicKey,
+    1
+  );
+  assert.match(providerAttempt.message, /admin required/i);
+
+  const scheduled = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: EPOCH_OPERATING_PARAM_VALUES,
+    },
+    admin.publicKey,
+    2
+  );
+  assert.deepEqual(scheduled, {
+    ok: true,
+    op: 'setParams',
+    ver: 1,
+    effective_at: DAY_SECONDS,
+    keys: Object.keys(EPOCH_OPERATING_PARAM_VALUES).sort(),
+  });
+
+  const inactive = await execute(
+    contract,
+    storage,
+    'readParams',
+    readParams(DAY_SECONDS - 1, Object.keys(EPOCH_OPERATING_PARAM_VALUES)),
+    outsider.publicKey,
+    3
+  );
+  assert.notDeepEqual(inactive.params, EPOCH_OPERATING_PARAM_VALUES);
+
+  const active = await execute(
+    contract,
+    storage,
+    'readParams',
+    readParams(DAY_SECONDS, Object.keys(EPOCH_OPERATING_PARAM_VALUES)),
+    outsider.publicKey,
+    4
+  );
+  assert.deepEqual(active.params, EPOCH_OPERATING_PARAM_VALUES);
 });
