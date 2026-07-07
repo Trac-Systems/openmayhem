@@ -43,9 +43,18 @@ fn requested_currency(body: &str) -> &'static str {
 struct RecordingContractPoster {
     deposits: Arc<Mutex<Vec<FiatDepositFeature>>>,
     chargebacks: Arc<Mutex<Vec<FiatChargebackFeature>>>,
+    epoch_seconds: Arc<Mutex<Option<u64>>>,
 }
 
 impl ContractPoster for RecordingContractPoster {
+    fn epoch_seconds_at<'a>(
+        &'a self,
+        _at: u64,
+        fallback: u64,
+    ) -> BoxFuture<'a, mayhem_paygate::Result<u64>> {
+        Box::pin(async move { Ok((*self.epoch_seconds.lock().await).unwrap_or(fallback)) })
+    }
+
     fn post_fiat_deposit<'a>(
         &'a self,
         _oracle: &'a OracleKeypair,
@@ -448,6 +457,66 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
         std::fs::read_to_string(temp.path().join("stripe-events.jsonl")).expect("event log");
     assert_eq!(event_log.lines().count(), 1);
     assert!(event_log.contains("evt_test_replay"));
+}
+
+#[tokio::test]
+async fn stripe_webhook_uses_contract_epoch_seconds_for_deposit_epoch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let poster = Arc::new(RecordingContractPoster::default());
+    *poster.epoch_seconds.lock().await = Some(7_200);
+    let state = PaygateState::try_new_with_contract_poster(
+        test_config(
+            "http://127.0.0.1:9".to_owned(),
+            temp.path().join("stripe-events.jsonl"),
+        ),
+        OracleKeypair::from_seed_hex(&"44".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+    let app = paygate_router(state);
+    let payload = json!({
+        "id": "evt_test_admin_epoch_seconds",
+        "object": "event",
+        "type": "payment_intent.succeeded",
+        "created": 3_600,
+        "data": {
+            "object": {
+                "id": "pi_test_admin_epoch_seconds",
+                "object": "payment_intent",
+                "latest_charge": "ch_test_admin_epoch_seconds",
+                "amount_received": 250,
+                "currency": "usd",
+                "metadata": {
+                    "mayhem_who": "e".repeat(64),
+                    "mayhem_mu": "2500000",
+                    "mayhem_denom": "mu_usd",
+                    "mayhem_fiat_currency": "usd",
+                    "mayhem_fiat_amount_minor": "250"
+                }
+            }
+        }
+    })
+    .to_string();
+    let signature =
+        stripe_signature_header("whsec_test", payload.as_bytes(), now_seconds()).expect("sig");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/stripe/webhook")
+                .header("stripe-signature", &signature)
+                .body(Body::from(payload))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let deposits = poster.deposits.lock().await;
+    assert_eq!(deposits.len(), 1);
+    assert_eq!(deposits[0].epoch, 1);
+    assert_eq!(deposits[0].at, 3_600);
 }
 
 #[tokio::test]

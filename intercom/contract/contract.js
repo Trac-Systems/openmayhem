@@ -93,6 +93,7 @@ const REPUTATION_EVENT_KINDS = new Set([
   'probe_ok',
   'probe_fail',
   'uptime_tick',
+  'underdelivery',
   'dispute_lost',
   'provenance_violation',
 ]);

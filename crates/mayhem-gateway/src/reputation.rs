@@ -27,6 +27,7 @@ pub enum ReputationEventKind {
     ProbeOk,
     ProbeFail,
     UptimeTick,
+    Underdelivery,
     DisputeLost,
     ProvenanceViolation,
 }
@@ -126,6 +127,7 @@ impl ReputationEventKind {
             Self::ProbeOk => Some((0.5, 1.0)),
             Self::ProbeFail => Some((-6.0, 1.0)),
             Self::UptimeTick => Some((0.1, 1.0)),
+            Self::Underdelivery => Some((-2.0, 1.0)),
             Self::DisputeLost => Some((-20.0, 1.0)),
             Self::ProvenanceViolation => None,
         }
@@ -268,6 +270,24 @@ mod tests {
         .unwrap();
 
         assert!((folded.raw - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn underdelivery_is_a_soft_negative_reputation_event() {
+        let folded = fold_reputation(
+            PROVIDER,
+            &[event("under-1", 0, ReputationEventKind::Underdelivery)],
+            0,
+            1,
+            0,
+            0,
+            &ProbationPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(folded.raw_milli, -2_000);
+        assert_eq!(folded.r_bps, 4800);
+        assert!(!folded.provenance_violation);
     }
 
     #[test]

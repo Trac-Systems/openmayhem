@@ -28,6 +28,7 @@ use crate::{
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ProviderObservationSample, ProviderTable,
         ProviderTableEntry, RequestRequirements, SelectionWeights,
+        DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
@@ -3695,7 +3696,7 @@ fn parse_x_mayhem_failover_overrides(
         open_timeout_ms: None,
         ttft_timeout_ms: None,
         stall_timeout_ms: None,
-        min_tok_s: parse_positive_float_header(
+        min_tok_s: parse_nonnegative_float_header(
             headers,
             X_MAYHEM_MIN_TOK_S_HEADER,
             "X-Mayhem-Min-Tok-S",
@@ -3717,7 +3718,7 @@ fn reject_admin_controlled_timeout_header(
     Ok(())
 }
 
-fn parse_positive_float_header(
+fn parse_nonnegative_float_header(
     headers: &HeaderMap,
     key: &'static str,
     display: &'static str,
@@ -3727,19 +3728,19 @@ fn parse_positive_float_header(
     };
     let value = value.to_str().map_err(|_| {
         ApiError::bad_request(
-            format!("{display} must be an ASCII positive token-per-second value"),
+            format!("{display} must be an ASCII non-negative number"),
             Some(display),
         )
     })?;
     let parsed = value.trim().parse::<f64>().map_err(|_| {
         ApiError::bad_request(
-            format!("{display} must be a positive token-per-second value"),
+            format!("{display} must be a non-negative number"),
             Some(display),
         )
     })?;
-    if !parsed.is_finite() || parsed <= 0.0 {
+    if !parsed.is_finite() || parsed < 0.0 {
         return Err(ApiError::bad_request(
-            format!("{display} must be greater than 0"),
+            format!("{display} must be a finite non-negative number"),
             Some(display),
         ));
     }
@@ -5468,7 +5469,8 @@ impl DirectSessionWatchdog {
         if output_tokens == 0 {
             return None;
         }
-        let elapsed_millis = now_millis.saturating_sub(self.started_at_millis).max(1);
+        let first_delta_at_millis = self.first_delta_at_millis?;
+        let elapsed_millis = now_millis.saturating_sub(first_delta_at_millis).max(1);
         if elapsed_millis < DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS {
             return None;
         }
@@ -5510,6 +5512,21 @@ fn streamed_output_token_count(content: &str, token_ids: &[i32]) -> u64 {
     } else {
         u64::try_from(token_ids.len()).unwrap_or(u64::MAX)
     }
+}
+
+fn generated_tokens_per_second(
+    output_tokens: u64,
+    first_delta_at_millis: u64,
+    completed_at_millis: u64,
+) -> Option<f64> {
+    if output_tokens == 0 {
+        return None;
+    }
+    let elapsed_millis = completed_at_millis
+        .saturating_sub(first_delta_at_millis)
+        .max(1);
+    let tok_s = output_tokens as f64 * 1000.0 / elapsed_millis as f64;
+    tok_s.is_finite().then_some(tok_s)
 }
 
 #[derive(Debug, Default)]
@@ -5854,13 +5871,17 @@ async fn collect_direct_session_output(
         }
     }
     let completed_at_millis = now_millis_u64();
-    let quality = watchdog.first_delta_at_millis.map(|first_delta_at_millis| {
-        let elapsed_millis = completed_at_millis.saturating_sub(started_at_millis).max(1);
-        GatewaySessionQuality {
-            ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-            tok_s: Some((usage.completion_tokens as f64) * 1000.0 / (elapsed_millis as f64)),
-        }
-    });
+    let quality =
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: generated_tokens_per_second(
+                    usage.completion_tokens,
+                    first_delta_at_millis,
+                    completed_at_millis,
+                ),
+            });
     let artifacts = finish_session_artifacts(artifact_builders)?;
     Ok(DirectSessionCollected {
         output: ChatOutput {
@@ -6326,9 +6347,10 @@ fn interrupted_direct_session_partial(
     let usage = usage_from_receipt_usage(&provider_receipt.body.usage);
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
-        tok_s: Some(
-            (usage.completion_tokens as f64) * 1000.0
-                / now_millis.saturating_sub(watchdog.started_at_millis).max(1) as f64,
+        tok_s: generated_tokens_per_second(
+            usage.completion_tokens,
+            first_delta_at_millis,
+            now_millis,
         ),
     });
     Some(GatewaySessionPartial {
@@ -6406,9 +6428,10 @@ fn direct_session_checkpoint_partial(
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
-                tok_s: Some(
-                    (usage.completion_tokens as f64) * 1000.0
-                        / now_millis.saturating_sub(watchdog.started_at_millis).max(1) as f64,
+                tok_s: generated_tokens_per_second(
+                    usage.completion_tokens,
+                    first_delta_at_millis,
+                    now_millis,
                 ),
             });
     GatewaySessionPartial {
@@ -8486,13 +8509,17 @@ async fn run_live_direct_chat_sse_inner(
         }
     }
     let completed_at_millis = now_millis_u64();
-    let quality = watchdog.first_delta_at_millis.map(|first_delta_at_millis| {
-        let elapsed_millis = completed_at_millis.saturating_sub(started_at_millis).max(1);
-        GatewaySessionQuality {
-            ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-            tok_s: Some((usage.completion_tokens as f64) * 1000.0 / (elapsed_millis as f64)),
-        }
-    });
+    let quality =
+        watchdog
+            .first_delta_at_millis
+            .map(|first_delta_at_millis| GatewaySessionQuality {
+                ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
+                tok_s: generated_tokens_per_second(
+                    usage.completion_tokens,
+                    first_delta_at_millis,
+                    completed_at_millis,
+                ),
+            });
     let artifacts = finish_session_artifacts(artifact_builders)?;
     let output = ChatOutput {
         content: tool_call.is_none().then_some(content),
@@ -8922,6 +8949,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
         options.min_att_tier,
         options.max_price_mu,
         options.quant.as_deref(),
+        state.generation_floor_tok_s_for_model(model, options),
         seed,
     )
 }
@@ -9060,6 +9088,7 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
         min_att_tier,
         None,
         None,
+        state.generation_floor_tok_s_for_model(model, &GatewayRequestOptions::default()),
         seed,
     )
 }
@@ -9071,6 +9100,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     min_att_tier: Option<u8>,
     max_price_mu: Option<u64>,
     quant: Option<&str>,
+    min_generation_tok_s: Option<f64>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -9084,8 +9114,14 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     }
 
     state.refresh_provider_table_routes(model);
-    let requirements =
-        request_requirements_for_chat(state, model, request, now_millis, max_price_mu);
+    let requirements = request_requirements_for_chat(
+        state,
+        model,
+        request,
+        now_millis,
+        max_price_mu,
+        min_generation_tok_s,
+    );
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
@@ -9571,6 +9607,7 @@ fn request_requirements_for_chat(
     request: &ChatCompletionRequest,
     now_millis: u64,
     max_price_mu: Option<u64>,
+    min_generation_tok_s: Option<f64>,
 ) -> RequestRequirements {
     let prompt_text = chat_prompt_text(request);
     let input_tokens = rough_tokens(&prompt_text);
@@ -9588,6 +9625,7 @@ fn request_requirements_for_chat(
             .min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens,
+        min_generation_tok_s,
         now_millis,
         max_price_mu,
         ..RequestRequirements::default()
@@ -11212,6 +11250,23 @@ impl GatewayState {
                 ..GatewayFailoverPolicyConfig::default()
             });
         GatewayFailoverInvocation::from_config_for_prompt(config, prompt_tokens)
+    }
+
+    fn generation_floor_tok_s_for_model(
+        &self,
+        model: &GatewayModel,
+        options: &GatewayRequestOptions,
+    ) -> Option<f64> {
+        if let Some(user_floor) = options.failover_overrides.min_tok_s {
+            return (user_floor > 0.0).then_some(user_floor);
+        }
+        model
+            .mayhem
+            .failover
+            .min_tok_s
+            .or(self.failover_policy.min_tok_s)
+            .or(Some(DEFAULT_LLM_GENERATION_FLOOR_TOK_S))
+            .filter(|value| value.is_finite() && *value > 0.0)
     }
 
     fn meter_chat_session(
@@ -13422,7 +13477,8 @@ mod tests {
         );
         watchdog.record_delta(100);
         assert_eq!(watchdog.throughput_floor_violation(1, 999), None);
-        assert_eq!(watchdog.throughput_floor_violation(1, 1_000), Some(1.0));
+        assert_eq!(watchdog.throughput_floor_violation(1, 1_000), None);
+        assert_eq!(watchdog.throughput_floor_violation(1, 1_100), Some(1.0));
         assert_eq!(watchdog.throughput_floor_violation(5, 1_000), None);
     }
 
@@ -13608,8 +13664,8 @@ mod tests {
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
 
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("0"));
-        let err = GatewayRequestOptions::from_headers(&headers).expect_err("zero floor rejects");
-        assert_eq!(err.param, Some("X-Mayhem-Min-Tok-S"));
+        let options = GatewayRequestOptions::from_headers(&headers).expect("zero floor disables");
+        assert_eq!(options.failover_overrides.min_tok_s, Some(0.0));
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
 
         headers.insert("x-mayhem-quant", HeaderValue::from_static("potato"));
@@ -14842,6 +14898,7 @@ mod tests {
             None,
             Some(1),
             None,
+            None,
             0xfeed,
         );
         assert!(priced_out.is_empty());
@@ -14853,9 +14910,58 @@ mod tests {
             None,
             Some(u64::MAX),
             None,
+            None,
             0xfeed,
         );
         assert_eq!(clearing.len(), 1);
+    }
+
+    #[test]
+    fn route_selection_honors_user_generation_throughput_floor() {
+        let model = test_routed_model(2);
+        let request = test_chat_request(&model.id);
+        let state = GatewayState::from_models(vec![model.clone()]);
+
+        let default_routes = ordered_route_candidates_for_request_with_options(
+            &state,
+            &model,
+            &request,
+            &GatewayRequestOptions::default(),
+        );
+        assert_eq!(default_routes.len(), 2);
+
+        let strict_floor = GatewayRequestOptions {
+            failover_overrides: GatewayFailoverPolicyConfig {
+                min_tok_s: Some(60.0),
+                ..GatewayFailoverPolicyConfig::default()
+            },
+            ..GatewayRequestOptions::default()
+        };
+        assert!(ordered_route_candidates_for_request_with_options(
+            &state,
+            &model,
+            &request,
+            &strict_floor,
+        )
+        .is_empty());
+
+        let disabled_floor = GatewayRequestOptions {
+            failover_overrides: GatewayFailoverPolicyConfig {
+                min_tok_s: Some(0.0),
+                ..GatewayFailoverPolicyConfig::default()
+            },
+            ..GatewayRequestOptions::default()
+        };
+        assert_eq!(
+            ordered_route_candidates_for_request_with_options(
+                &state,
+                &model,
+                &request,
+                &disabled_floor,
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
@@ -14898,6 +15004,7 @@ mod tests {
             &request,
             Some(3),
             Some(u64::MAX),
+            None,
             None,
             0xfeed,
         );
@@ -14952,6 +15059,7 @@ mod tests {
             None,
             Some(u64::MAX),
             Some("fp16"),
+            None,
             0xfeed,
         );
         assert_eq!(selected.len(), 1);
@@ -14964,6 +15072,7 @@ mod tests {
             None,
             Some(u64::MAX),
             Some("fp8"),
+            None,
             0xfeed,
         );
         assert!(missing.is_empty());

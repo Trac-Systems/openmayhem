@@ -90,7 +90,7 @@ const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
 const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
-const DEFAULT_EPOCH_LENGTH_MILLIS: u64 = 3_600_000;
+const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
@@ -11304,6 +11304,7 @@ fn contract_reputation_event_to_fold_event(entry: &PrefixStateEntry) -> Result<R
         "probe_ok" => ReputationEventKind::ProbeOk,
         "probe_fail" => ReputationEventKind::ProbeFail,
         "uptime_tick" => ReputationEventKind::UptimeTick,
+        "underdelivery" => ReputationEventKind::Underdelivery,
         "dispute_lost" => ReputationEventKind::DisputeLost,
         "provenance_violation" => ReputationEventKind::ProvenanceViolation,
         other => bail!(
@@ -17095,14 +17096,23 @@ async fn mayhem_test(args: TestArgs) -> Result<()> {
         run_gateway_tool_smoke(&client, &gateway_root, &selected_model.id).await?
     };
 
+    let mut receipt_epoch_seconds = DEFAULT_EPOCH_SECONDS;
     let peer_health = if args.skip_peer_health {
         json!({ "skipped": true })
     } else {
         let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
         let rpc = PeerRpcClient::new(&rpc_url)?;
+        receipt_epoch_seconds = read_param_u64_at(
+            &rpc,
+            "epoch_seconds",
+            DEFAULT_EPOCH_SECONDS,
+            unix_epoch_seconds()?,
+        )
+        .await?;
         json!({
             "skipped": false,
             "rpc_url": rpc_url,
+            "epoch_seconds": receipt_epoch_seconds,
             "health": rpc.health().await.context("checking peer RPC health")?,
         })
     };
@@ -17153,7 +17163,7 @@ async fn mayhem_test(args: TestArgs) -> Result<()> {
     let receipt = latest_gateway_receipt(&receipts);
     let expected_evidence_key = receipt
         .as_ref()
-        .and_then(expected_usage_evidence_key)
+        .and_then(|receipt| expected_usage_evidence_key(receipt, receipt_epoch_seconds))
         .unwrap_or_else(|| "ev/use/<epoch>".to_owned());
 
     let report = json!({
@@ -18882,10 +18892,14 @@ fn latest_gateway_receipt(receipts: &Value) -> Option<Value> {
         .cloned()
 }
 
-fn expected_usage_evidence_key(receipt: &Value) -> Option<String> {
+fn expected_usage_evidence_key(receipt: &Value, epoch_seconds: u64) -> Option<String> {
     let body = receipt_body(receipt)?;
     let ts = body.get("ts")?.as_u64()?;
-    Some(format!("ev/use/{}", ts / DEFAULT_EPOCH_LENGTH_MILLIS))
+    let epoch_millis = epoch_seconds.checked_mul(1_000)?;
+    if epoch_millis == 0 {
+        return None;
+    }
+    Some(format!("ev/use/{}", ts / epoch_millis))
 }
 
 fn receipt_body(receipt: &Value) -> Option<&Value> {
@@ -23565,7 +23579,7 @@ fn parse_provider_budget(value: &str) -> Result<ParsedProviderBudget> {
     })?;
     let period_seconds = match period.trim().to_ascii_lowercase().as_str() {
         "day" | "daily" => 86_400,
-        "epoch" => DEFAULT_EPOCH_LENGTH_MILLIS / 1000,
+        "epoch" => DEFAULT_EPOCH_SECONDS,
         other => other
             .strip_suffix('s')
             .unwrap_or(other)
@@ -32761,7 +32775,7 @@ mod tests {
             parse_provider_budget("42tokens/epoch")
                 .unwrap()
                 .period_seconds,
-            DEFAULT_EPOCH_LENGTH_MILLIS / 1000
+            DEFAULT_EPOCH_SECONDS
         );
 
         let root = "aa".repeat(32);

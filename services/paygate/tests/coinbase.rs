@@ -20,6 +20,14 @@ struct RecordingContractPoster {
 }
 
 impl ContractPoster for RecordingContractPoster {
+    fn epoch_seconds_at<'a>(
+        &'a self,
+        _at: u64,
+        fallback: u64,
+    ) -> BoxFuture<'a, mayhem_paygate::Result<u64>> {
+        Box::pin(async move { Ok(fallback) })
+    }
+
     fn post_fiat_deposit<'a>(
         &'a self,
         _oracle: &'a OracleKeypair,

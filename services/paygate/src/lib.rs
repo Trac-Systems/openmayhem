@@ -188,6 +188,8 @@ pub struct OracleKeypair {
 }
 
 pub trait ContractPoster: Send + Sync {
+    fn epoch_seconds_at<'a>(&'a self, at: u64, fallback: u64) -> BoxFuture<'a, Result<u64>>;
+
     fn post_fiat_deposit<'a>(
         &'a self,
         oracle: &'a OracleKeypair,
@@ -918,6 +920,46 @@ impl PeerRpcContractPoster {
         )
     }
 
+    async fn read_state_value(&self, key: &str) -> Result<Option<Value>> {
+        let url = format!(
+            "{}?key={}&confirmed=false",
+            self.endpoint("state"),
+            query_escape(key)
+        );
+        let state: Value = self
+            .http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(state.get("value").cloned().filter(|value| !value.is_null()))
+    }
+
+    async fn read_param_u64_at(&self, key: &str, fallback: u64, at: u64) -> Result<u64> {
+        let Some(record) = self.read_state_value(&format!("params/{key}")).await? else {
+            return Ok(fallback);
+        };
+        let active = match record.get("pending") {
+            Some(pending)
+                if !pending.is_null()
+                    && pending
+                        .get("effective_at")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|effective_at| effective_at <= at) =>
+            {
+                pending
+            }
+            _ => record.get("current").ok_or_else(|| {
+                PaygateError::Contract(format!("params/{key} missing current entry"))
+            })?,
+        };
+        active.get("value").and_then(Value::as_u64).ok_or_else(|| {
+            PaygateError::Contract(format!("params/{key} active value is not a u64"))
+        })
+    }
+
     async fn post_feature_value(
         &self,
         oracle: &OracleKeypair,
@@ -998,6 +1040,20 @@ impl PeerRpcContractPoster {
 }
 
 impl ContractPoster for PeerRpcContractPoster {
+    fn epoch_seconds_at<'a>(&'a self, at: u64, fallback: u64) -> BoxFuture<'a, Result<u64>> {
+        Box::pin(async move {
+            let epoch_seconds = self
+                .read_param_u64_at("epoch_seconds", fallback, at)
+                .await?;
+            if epoch_seconds == 0 {
+                return Err(PaygateError::Contract(
+                    "params/epoch_seconds active value cannot be zero".to_owned(),
+                ));
+            }
+            Ok(epoch_seconds)
+        })
+    }
+
     fn post_fiat_deposit<'a>(
         &'a self,
         oracle: &'a OracleKeypair,
@@ -1574,6 +1630,10 @@ async fn handle_stripe_payment_intent_succeeded(
         ));
     }
     let at = event.created.unwrap_or(unix_epoch_seconds()?);
+    let epoch_seconds = state
+        .contract
+        .epoch_seconds_at(at, state.config.epoch_seconds)
+        .await?;
     let ext_ref_hash = stripe_ext_ref_hash(&event.id, &object.id);
     let charge = payment_intent_charge_id(&object);
     let feature = FiatDepositFeature {
@@ -1584,7 +1644,7 @@ async fn handle_stripe_payment_intent_succeeded(
         ext_ref_hash: ext_ref_hash.clone(),
         fiat_currency: currency.clone(),
         fiat_amount_minor: amount_cents,
-        epoch: epoch_for_at(at, state.config.epoch_seconds),
+        epoch: epoch_for_at(at, epoch_seconds),
         at,
     };
     let contract = state
@@ -1656,6 +1716,10 @@ async fn handle_stripe_dispute_created(
         .created
         .or_else(|| object.get("created").and_then(Value::as_u64))
         .unwrap_or(unix_epoch_seconds()?);
+    let epoch_seconds = state
+        .contract
+        .epoch_seconds_at(at, state.config.epoch_seconds)
+        .await?;
     let dispute_ref_hash = stripe_dispute_ref_hash(
         &event.id,
         &dispute,
@@ -1673,7 +1737,7 @@ async fn handle_stripe_dispute_created(
         dispute_ref_hash: dispute_ref_hash.clone(),
         fiat_currency: currency.clone(),
         fiat_amount_minor: amount_cents,
-        epoch: epoch_for_at(at, state.config.epoch_seconds),
+        epoch: epoch_for_at(at, epoch_seconds),
         at,
     };
     let contract = state
@@ -2170,6 +2234,24 @@ fn payment_intent_charge_id(object: &StripePaymentIntentObject) -> Option<String
 
 fn default_stripe_event_record_kind() -> String {
     "deposit".to_owned()
+}
+
+fn query_escape(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(byte >> 4) as usize]));
+                out.push(char::from(HEX[(byte & 0x0f) as usize]));
+            }
+        }
+    }
+    out
 }
 
 fn epoch_for_at(at: u64, epoch_seconds: u64) -> u64 {

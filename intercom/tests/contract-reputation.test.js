@@ -251,6 +251,33 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
   assert.equal(providerEntry.value.probation.since_seconds, 0);
 });
 
+test('MayhemContract records underdelivery reputation events for throughput fairness', async () => {
+  const { admin, provider, storage, contract } = await setupReputationContract();
+
+  const result = await recordEvent(
+    contract,
+    storage,
+    admin,
+    provider,
+    {
+      op: 'record_rep_event',
+      event_id: 'underdelivery-1',
+      kind: 'underdelivery',
+    },
+    4
+  );
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.event_id, 'underdelivery-1');
+  assert.equal(result.head.length, 64);
+
+  const stored = await storage.get(`ev/rep/${provider.publicKey}/underdelivery-1`);
+  assert.equal(stored.value.kind, 'underdelivery');
+  assert.equal(stored.value.provider, provider.publicKey);
+  const head = await storage.get(`ev/rep/head/${provider.publicKey}`);
+  assert.equal(head.value.count, 1);
+  assert.equal(head.value.head, result.head);
+});
+
 test('MayhemContract applies reputation anchors through free admin feature records', async () => {
   const { admin, provider, outsider, storage, contract } = await setupReputationContract();
   const event = await recordEvent(

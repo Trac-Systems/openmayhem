@@ -15,6 +15,11 @@ pub const DEFAULT_SATURATION_CUTOFF: f64 = 0.85;
 pub const DEFAULT_REPUTATION_ALPHA: f64 = 1.5;
 pub const DEFAULT_SATURATION_BETA: f64 = 1.0;
 pub const DEFAULT_PRICE_GAMMA: f64 = 0.7;
+pub const DEFAULT_THROUGHPUT_RATIO_GRACE: f64 = 0.8;
+pub const DEFAULT_UNDERDELIVERY_RATIO: f64 = 0.5;
+pub const DEFAULT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.5;
+pub const DEFAULT_LLM_GENERATION_FLOOR_TOK_S: f64 = 5.0;
+pub const DEFAULT_LLM_PREFILL_FLOOR_TOK_S: f64 = 100.0;
 const P2C_REPUTATION_DECISION_DELTA: f64 = 0.05;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_MIN_SAMPLES: u64 = 3;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_EWMA_THRESHOLD: f64 = 0.8;
@@ -61,9 +66,13 @@ pub struct ProviderObservationSample {
 pub struct ProviderObservation {
     pub ewma_ttft_ms: Option<f64>,
     pub ewma_tok_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ewma_throughput_ratio: Option<f64>,
     pub ewma_error_rate: f64,
     #[serde(default)]
     pub consecutive_failures: u32,
+    #[serde(default)]
+    pub underdelivery_streak: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_open_until_millis: Option<u64>,
     pub samples: u64,
@@ -99,6 +108,7 @@ pub struct RequestRequirements {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub max_price_mu: Option<u64>,
+    pub min_generation_tok_s: Option<f64>,
     pub now_millis: u64,
     pub max_attestation_head_age_millis: u64,
     pub heartbeat_ttl_millis: u64,
@@ -122,6 +132,7 @@ pub enum IneligibilityReason {
     AttestationMissing,
     AttestationStale,
     CircuitOpen,
+    ThroughputFloor,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -138,6 +149,8 @@ pub struct SelectionCandidate {
     pub effective_ttft_ms: f64,
     pub latency_factor: f64,
     pub price_norm: f64,
+    pub throughput_ratio: Option<f64>,
+    pub throughput_factor: f64,
     pub weight: f64,
 }
 
@@ -220,6 +233,7 @@ impl Default for RequestRequirements {
             input_tokens: 0,
             output_tokens: 0,
             max_price_mu: None,
+            min_generation_tok_s: None,
             now_millis: 0,
             max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
             heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
@@ -344,6 +358,11 @@ impl ProviderTable {
         now_millis: u64,
     ) {
         let alpha = self.observation_alpha;
+        let advertised_tok_s = self
+            .heartbeats
+            .get(key)
+            .and_then(|live| live.heartbeat.perf.tok_s)
+            .filter(|value| value.is_finite() && *value > 0.0);
         let observed = self.observations.entry(key.clone()).or_default();
         observed.ewma_ttft_ms = Some(update_ewma(
             observed.ewma_ttft_ms,
@@ -355,6 +374,16 @@ impl ProviderTable {
             .filter(|value| value.is_finite() && *value >= 0.0)
         {
             observed.ewma_tok_s = Some(update_ewma(observed.ewma_tok_s, tok_s, alpha));
+            if let Some(advertised_tok_s) = advertised_tok_s {
+                let ratio = (tok_s / advertised_tok_s).clamp(0.0, 10.0);
+                observed.ewma_throughput_ratio =
+                    Some(update_ewma(observed.ewma_throughput_ratio, ratio, alpha));
+                if ratio < DEFAULT_UNDERDELIVERY_RATIO {
+                    observed.underdelivery_streak = observed.underdelivery_streak.saturating_add(1);
+                } else if ratio >= DEFAULT_THROUGHPUT_RATIO_GRACE {
+                    observed.underdelivery_streak = 0;
+                }
+            }
         }
         observed.ewma_error_rate = update_ewma(
             if observed.samples == 0 {
@@ -503,6 +532,13 @@ pub fn evaluate_eligibility(
     if heartbeat.min_ask_mu > estimated_price_mu {
         return Err(IneligibilityReason::ProviderMinAsk);
     }
+    if request
+        .min_generation_tok_s
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .is_some_and(|floor| effective_generation_tok_s(entry).unwrap_or(0.0) < floor)
+    {
+        return Err(IneligibilityReason::ThroughputFloor);
+    }
     if let Some(probation) = entry
         .contract
         .probation
@@ -578,10 +614,13 @@ pub fn eligible_candidates(
             let price_norm = ((estimated_price_mu.max(1) as f64) / median_price).max(f64::EPSILON);
             let latency_factor = (median_ttft / effective_ttft_ms).clamp(0.25, 4.0);
             let error_factor = (1.0 - entry.observed.ewma_error_rate).clamp(0.05, 1.0);
+            let throughput_ratio = throughput_delivery_ratio(&entry);
+            let throughput_factor = throughput_standing_factor(throughput_ratio);
             let weight = reputation.powf(weights.reputation_alpha)
                 * available.powf(weights.saturation_beta)
                 * (1.0 / price_norm).powf(weights.price_gamma)
                 * latency_factor
+                * throughput_factor
                 * error_factor
                 * probation_weight_multiplier(&entry);
             SelectionCandidate {
@@ -590,6 +629,8 @@ pub fn eligible_candidates(
                 effective_ttft_ms,
                 latency_factor,
                 price_norm,
+                throughput_ratio,
+                throughput_factor,
                 weight,
             }
         })
@@ -674,6 +715,43 @@ fn effective_ttft_ms(entry: &ProviderTableEntry) -> f64 {
         .unwrap_or(1.0)
 }
 
+fn effective_generation_tok_s(entry: &ProviderTableEntry) -> Option<f64> {
+    entry
+        .observed
+        .ewma_tok_s
+        .or_else(|| {
+            entry
+                .heartbeat
+                .as_ref()
+                .and_then(|heartbeat| heartbeat.perf.tok_s)
+        })
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn throughput_delivery_ratio(entry: &ProviderTableEntry) -> Option<f64> {
+    entry.observed.ewma_throughput_ratio.or_else(|| {
+        let measured = entry.observed.ewma_tok_s?;
+        let advertised = entry.heartbeat.as_ref()?.perf.tok_s?;
+        (advertised.is_finite() && advertised > 0.0 && measured.is_finite() && measured >= 0.0)
+            .then_some((measured / advertised).clamp(0.0, 10.0))
+    })
+}
+
+fn throughput_standing_factor(ratio: Option<f64>) -> f64 {
+    let Some(ratio) = ratio.filter(|value| value.is_finite()) else {
+        return 1.0;
+    };
+    if ratio >= DEFAULT_THROUGHPUT_RATIO_GRACE {
+        return 1.0;
+    }
+    if ratio <= DEFAULT_UNDERDELIVERY_RATIO {
+        return DEFAULT_THROUGHPUT_FACTOR_FLOOR;
+    }
+    let span = DEFAULT_THROUGHPUT_RATIO_GRACE - DEFAULT_UNDERDELIVERY_RATIO;
+    let progress = (ratio - DEFAULT_UNDERDELIVERY_RATIO) / span;
+    DEFAULT_THROUGHPUT_FACTOR_FLOOR + (1.0 - DEFAULT_THROUGHPUT_FACTOR_FLOOR) * progress
+}
+
 fn probation_weight_multiplier(entry: &ProviderTableEntry) -> f64 {
     entry
         .contract
@@ -750,6 +828,14 @@ fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize
         * probation_weight_multiplier(&candidates[right].entry);
     if (left_reputation - right_reputation).abs() >= P2C_REPUTATION_DECISION_DELTA {
         if left_reputation > right_reputation {
+            return left;
+        }
+        return right;
+    }
+    let left_throughput = candidates[left].throughput_factor;
+    let right_throughput = candidates[right].throughput_factor;
+    if (left_throughput - right_throughput).abs() >= 0.05 {
+        if left_throughput > right_throughput {
             return left;
         }
         return right;
@@ -1019,6 +1105,8 @@ mod tests {
         assert_eq!(entry.observed.samples, 2);
         assert_eq!(entry.observed.ewma_ttft_ms, Some(180.0));
         assert_eq!(entry.observed.ewma_tok_s, Some(48.0));
+        assert!((entry.observed.ewma_throughput_ratio.unwrap() - 1.0).abs() < 1e-12);
+        assert_eq!(entry.observed.underdelivery_streak, 0);
         assert!((entry.observed.ewma_error_rate - 0.2).abs() < f64::EPSILON);
     }
 
@@ -1282,6 +1370,15 @@ mod tests {
             .min_ask_mu = 80;
         assert_eq!(evaluate_eligibility(&ask_limited, &request), Ok(80));
 
+        let mut throughput_limited = request.clone();
+        throughput_limited.min_generation_tok_s = Some(60.0);
+        assert_eq!(
+            evaluate_eligibility(&good, &throughput_limited),
+            Err(IneligibilityReason::ThroughputFloor)
+        );
+        throughput_limited.min_generation_tok_s = Some(50.0);
+        assert_eq!(evaluate_eligibility(&good, &throughput_limited), Ok(80));
+
         let mut bad = good.clone();
         bad.attestation_head = None;
         assert_eq!(
@@ -1300,6 +1397,72 @@ mod tests {
             evaluate_eligibility(&bad, &stale_attestation),
             Err(IneligibilityReason::AttestationStale)
         );
+    }
+
+    #[test]
+    fn throughput_standing_rewards_honest_slow_and_downweights_overadvertised_providers() {
+        let now = 1_000_000;
+        let mut table = ProviderTable::new();
+        let over_record = contract_record_for(1);
+        let honest_record = contract_record_for(2);
+        let over_key = ProviderKey::from_contract(&over_record);
+        let honest_key = ProviderKey::from_contract(&honest_record);
+        table.upsert_contract(over_record);
+        table.upsert_contract(honest_record);
+        let mut over_heartbeat = heartbeat_for(1, now, 0.2, 100, 9, "44");
+        over_heartbeat.perf.tok_s = Some(100.0);
+        table.upsert_heartbeat(over_heartbeat, now);
+        let mut honest_heartbeat = heartbeat_for(2, now, 0.2, 100, 9, "55");
+        honest_heartbeat.perf.tok_s = Some(15.0);
+        table.upsert_heartbeat(honest_heartbeat, now);
+
+        for offset in 0..3 {
+            table.record_observation_at(
+                &over_key,
+                ProviderObservationSample {
+                    ttft_ms: 100,
+                    tok_s: Some(40.0),
+                    error: false,
+                },
+                now + offset,
+            );
+            table.record_observation_at(
+                &honest_key,
+                ProviderObservationSample {
+                    ttft_ms: 100,
+                    tok_s: Some(15.0),
+                    error: false,
+                },
+                now + offset,
+            );
+        }
+
+        let request = RequestRequirements {
+            min_generation_tok_s: None,
+            ..eligible_request(now + 10)
+        };
+        let entries = table.entries(now + 10);
+        let candidates = eligible_candidates(&entries, &request, &SelectionWeights::default());
+        let over = candidates
+            .iter()
+            .find(|candidate| candidate.entry.key == over_key)
+            .expect("overadvertised candidate");
+        let honest = candidates
+            .iter()
+            .find(|candidate| candidate.entry.key == honest_key)
+            .expect("honest candidate");
+        assert!(over.throughput_ratio.unwrap() < DEFAULT_UNDERDELIVERY_RATIO);
+        assert_eq!(over.throughput_factor, DEFAULT_THROUGHPUT_FACTOR_FLOOR);
+        assert_eq!(over.entry.observed.underdelivery_streak, 3);
+        assert_eq!(honest.throughput_ratio, Some(1.0));
+        assert_eq!(honest.throughput_factor, 1.0);
+        assert!(honest.weight > over.weight);
+
+        let mut rng = ScriptedRng::new([0.0, 0.0]);
+        let selected =
+            select_weighted_p2c(&entries, &request, &SelectionWeights::default(), &mut rng)
+                .expect("provider selected");
+        assert_eq!(selected.selected.entry.key, honest_key);
     }
 
     #[test]
