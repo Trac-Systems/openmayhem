@@ -142,6 +142,9 @@ enum Commands {
     },
     /// Provider serving lifecycle commands.
     Provider {
+        /// Show the full technical error chain for provider commands.
+        #[arg(long, global = true)]
+        verbose: bool,
         #[command(subcommand)]
         command: Box<ProviderCommands>,
     },
@@ -3897,22 +3900,7 @@ async fn main() -> Result<()> {
             CatalogCommands::CanaryMatrix(args) => catalog_canary_matrix(args),
             CatalogCommands::CanaryPlan(args) => catalog_canary_plan(args),
         },
-        Commands::Provider { command } => match *command {
-            ProviderCommands::List(args) => provider_list(args).await,
-            ProviderCommands::Health(args) => provider_health(args).await,
-            ProviderCommands::Rails { command } => match command {
-                ProviderRailsCommands::Get(args) => provider_rails_get(args).await,
-                ProviderRailsCommands::Set(args) => provider_rails_set(args).await,
-            },
-            ProviderCommands::Start(args) => provider_start(*args).await,
-            ProviderCommands::Join(args) => provider_join(args).await,
-            ProviderCommands::Leave(args) => provider_leave(args).await,
-            ProviderCommands::Stop(args) => provider_stop(args).await,
-            ProviderCommands::Rooms { command } => match command {
-                ProviderRoomsCommands::Join(args) => provider_room_join(args).await,
-                ProviderRoomsCommands::Leave(args) => provider_room_leave(args).await,
-            },
-        },
+        Commands::Provider { verbose, command } => provider_command(*command, verbose).await,
         Commands::Admin { command } => admin(*command).await,
         Commands::Up(args) => up(args).await,
         Commands::Use(args) => use_gateway(args).await,
@@ -3952,6 +3940,135 @@ async fn main() -> Result<()> {
         Commands::Update(args) => update(args).await,
         Commands::ReleaseSign(args) => release_sign(args),
     }
+}
+
+async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()> {
+    let result = match command {
+        ProviderCommands::List(args) => provider_list(args).await,
+        ProviderCommands::Health(args) => provider_health(args).await,
+        ProviderCommands::Rails { command } => match command {
+            ProviderRailsCommands::Get(args) => provider_rails_get(args).await,
+            ProviderRailsCommands::Set(args) => provider_rails_set(args).await,
+        },
+        ProviderCommands::Start(args) => provider_start(*args).await,
+        ProviderCommands::Join(args) => provider_join(args).await,
+        ProviderCommands::Leave(args) => provider_leave(args).await,
+        ProviderCommands::Stop(args) => provider_stop(args).await,
+        ProviderCommands::Rooms { command } => match command {
+            ProviderRoomsCommands::Join(args) => provider_room_join(args).await,
+            ProviderRoomsCommands::Leave(args) => provider_room_leave(args).await,
+        },
+    };
+    if verbose {
+        result
+    } else {
+        result.map_err(|err| anyhow::anyhow!(provider_friendly_error(&err)))
+    }
+}
+
+fn provider_friendly_error(error: &anyhow::Error) -> String {
+    let raw = format!("{error:#}");
+    let lower = raw.to_lowercase();
+    let detail = |message: &str| {
+        format!("{message} Run the same provider command with `--verbose` for technical details.")
+    };
+    if lower.contains("outofmemory")
+        || lower.contains("out of memory")
+        || lower.contains("cuda oom")
+        || lower.contains("cuda out of memory")
+        || lower.contains("not enough memory")
+    {
+        return detail(
+            "Not enough memory to load this admin-approved model; close other GPU jobs or choose a smaller model from `mayhem models`.",
+        );
+    }
+    if lower.contains("no space left")
+        || lower.contains("disk full")
+        || lower.contains("not enough disk")
+        || lower.contains("insufficient disk")
+    {
+        return detail(
+            "Not enough disk space to prepare this enclave; free space in the Mayhem home/downloads directory or choose another disk path.",
+        );
+    }
+    if lower.contains("address already in use")
+        || lower.contains("eaddrinuse")
+        || lower.contains("port already in use")
+        || (lower.contains("bind")
+            && (lower.contains("in use") || lower.contains("permission denied")))
+    {
+        return detail(
+            "A local Mayhem port is already in use; stop the other Mayhem process with `mayhem down` or choose different ports.",
+        );
+    }
+    if lower.contains("wallet")
+        || lower.contains("keypair")
+        || lower.contains("password")
+        || lower.contains("credential")
+        || lower.contains("sc-bridge token")
+        || lower.contains("token is required")
+    {
+        return detail(
+            "Mayhem could not unlock the provider credentials; check the wallet password, keypair path, and local bridge token.",
+        );
+    }
+    if lower.contains("hash")
+        && (lower.contains("does not match")
+            || lower.contains("mismatch")
+            || lower.contains("artifact_root")
+            || lower.contains("merkle")
+            || lower.contains("sha"))
+    {
+        return detail(
+            "The model artifact does not match the admin-signed enclave; delete the partial download/cache and try again.",
+        );
+    }
+    if lower.contains("download")
+        || lower.contains("huggingface")
+        || lower.contains("http status")
+        || lower.contains("fetching")
+        || lower.contains("request failed")
+    {
+        return detail(
+            "Mayhem could not download the admin-approved model artifact; check network access or provide an HF token file.",
+        );
+    }
+    if lower.contains("mlx requires")
+        || lower.contains("tensorrt-llm requires")
+        || lower.contains("vllm launch artifacts require")
+        || lower.contains("unsupported backend")
+        || lower.contains("no feasible provider candidate")
+        || lower.contains("backend mismatch")
+        || lower.contains("architecture mismatch")
+    {
+        return detail(
+            "This machine cannot serve the selected enclave/backend; run `mayhem models` to pick a compatible admin-approved model.",
+        );
+    }
+    if lower.contains("sc-bridge")
+        || lower.contains("websocket")
+        || lower.contains("connection refused")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("peer")
+        || lower.contains("rpc")
+        || lower.contains("unreachable")
+    {
+        return detail(
+            "Mayhem could not reach the local peer or bridge; run `mayhem status`, then `mayhem up --provider --yes` after it is healthy.",
+        );
+    }
+    if lower.contains("no open admin-created canonical rooms") {
+        return detail(
+            "No canonical room is open for this admin enclave; ask the admin to open a room before serving.",
+        );
+    }
+    if lower.contains("binary hash") || lower.contains("measured enclave binary") {
+        return detail(
+            "This Mayhem binary does not match the admin-signed enclave; update or rebuild Mayhem, then retry.",
+        );
+    }
+    detail("Provider setup could not complete.")
 }
 
 async fn setup(args: SetupArgs) -> Result<()> {
@@ -32417,9 +32534,10 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        let Commands::Provider { command } = join.command else {
+        let Commands::Provider { verbose, command } = join.command else {
             panic!("expected provider command");
         };
+        assert!(!verbose);
         let ProviderCommands::Join(args) = *command else {
             panic!("expected provider join command");
         };
@@ -32439,7 +32557,7 @@ mod tests {
             "enclave-a",
         ])
         .unwrap();
-        let Commands::Provider { command } = rooms.command else {
+        let Commands::Provider { command, .. } = rooms.command else {
             panic!("expected provider command");
         };
         let ProviderCommands::Rooms { command } = *command else {
@@ -32454,7 +32572,7 @@ mod tests {
         let list =
             Cli::try_parse_from(["mayhem", "provider", "list", "--provider", "55", "--json"])
                 .unwrap();
-        let Commands::Provider { command } = list.command else {
+        let Commands::Provider { command, .. } = list.command else {
             panic!("expected provider command");
         };
         let ProviderCommands::List(args) = *command else {
@@ -32475,7 +32593,7 @@ mod tests {
             "2",
         ])
         .unwrap();
-        let Commands::Provider { command } = health.command else {
+        let Commands::Provider { command, .. } = health.command else {
             panic!("expected provider command");
         };
         let ProviderCommands::Health(args) = *command else {
@@ -32500,7 +32618,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        let Commands::Provider { command } = rails.command else {
+        let Commands::Provider { command, .. } = rails.command else {
             panic!("expected provider command");
         };
         let ProviderCommands::Rails { command } = *command else {
@@ -32522,6 +32640,75 @@ mod tests {
         assert!(normalize_provider_accepted_rails_arg("coinbase").is_err());
 
         assert!(Cli::try_parse_from(["mayhem", "pay", "coinbase"]).is_err());
+    }
+
+    #[test]
+    fn provider_cli_parses_verbose_for_technical_errors() {
+        let cli =
+            Cli::try_parse_from(["mayhem", "provider", "--verbose", "start", "--sim"]).unwrap();
+        let Commands::Provider { verbose, command } = cli.command else {
+            panic!("expected provider command");
+        };
+        assert!(verbose);
+        assert!(matches!(*command, ProviderCommands::Start(_)));
+
+        let cli =
+            Cli::try_parse_from(["mayhem", "provider", "start", "--verbose", "--sim"]).unwrap();
+        let Commands::Provider { verbose, command } = cli.command else {
+            panic!("expected provider command");
+        };
+        assert!(verbose);
+        assert!(matches!(*command, ProviderCommands::Start(_)));
+    }
+
+    #[test]
+    fn provider_friendly_error_hides_raw_backend_failures_by_default() {
+        let cases = [
+            (
+                "loading vLLM provider session engine: could not import vLLM API: Traceback ... OutOfMemoryError: CUDA out of memory. Tried to allocate 12.50 GiB",
+                "Not enough memory",
+            ),
+            (
+                "download failed from HuggingFace: HTTP status 503 while fetching model.safetensors",
+                "could not download",
+            ),
+            (
+                "artifact hash does not match admin artifact_root sha256 mismatch",
+                "does not match the admin-signed enclave",
+            ),
+            (
+                "binding provider gateway failed: address already in use",
+                "port is already in use",
+            ),
+            (
+                "TensorRT-LLM requires a compatible NVIDIA GPU",
+                "cannot serve the selected enclave/backend",
+            ),
+            (
+                "connecting to SC-Bridge for provider heartbeats: connection refused",
+                "could not reach the local peer or bridge",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let err = anyhow::anyhow!(raw);
+            let friendly = provider_friendly_error(&err);
+            assert!(
+                friendly.contains(expected),
+                "expected {expected:?} in {friendly:?}"
+            );
+            for leaked in [
+                "Traceback",
+                "CUDA out of memory",
+                "OutOfMemoryError",
+                "safetensors",
+            ] {
+                assert!(
+                    !friendly.contains(leaked),
+                    "friendly error leaked raw detail {leaked:?}: {friendly}"
+                );
+            }
+            assert!(friendly.contains("--verbose"));
+        }
     }
 
     #[test]
