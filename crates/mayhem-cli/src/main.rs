@@ -7,9 +7,11 @@ use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::fs;
+use std::future::Future;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -143,6 +145,8 @@ enum Commands {
         #[command(subcommand)]
         command: Box<AdminCommands>,
     },
+    /// Start the local Mayhem peer, bridge, gateway, and optional provider worker.
+    Up(UpArgs),
     /// Start the local OpenAI-compatible user gateway.
     Use(UseArgs),
     /// List models from the ledger-anchored admin catalog release.
@@ -728,6 +732,69 @@ struct OpencodeArgs {
     /// Print a machine-readable opencode report.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct UpArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Also start provider serving for the first feasible admin-created enclave.
+    #[arg(long)]
+    provider: bool,
+
+    /// Intercom/Pear network: mainnet, testnet1, local, or development.
+    #[arg(long, default_value = "local")]
+    network: String,
+
+    /// Canonical Intercom subnet channel. Defaults to the app default.
+    #[arg(long)]
+    subnet_channel: Option<String>,
+
+    /// Intercom peer store name for the supervised Pear peer.
+    #[arg(long, default_value = "mayhem-up-main")]
+    peer_store_name: String,
+
+    /// Mayhem wallet password for gateway/provider signing.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Accept first-run setup defaults in non-interactive terminals.
+    #[arg(long)]
+    yes: bool,
+
+    /// Peer JSON-RPC loopback port.
+    #[arg(long, default_value_t = 49_223)]
+    rpc_port: u16,
+
+    /// SC-Bridge websocket loopback port.
+    #[arg(long, default_value_t = 49_222)]
+    sc_bridge_port: u16,
+
+    /// OpenAI-compatible gateway loopback port.
+    #[arg(long, default_value_t = 11_435)]
+    gateway_port: u16,
+
+    /// mayhemd loopback status port.
+    #[arg(long, default_value_t = 11_437)]
+    supervisor_port: u16,
+
+    /// SC-Bridge token. Generated and persisted when omitted.
+    #[arg(long)]
+    sc_bridge_token: Option<String>,
+
+    /// Seconds to wait for peer, bridge, and gateway health gates.
+    #[arg(long, default_value_t = 120)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable readiness report.
+    #[arg(long)]
+    json: bool,
+
+    /// Development smoke only: start the gateway with the embedded dev catalog.
+    #[arg(long, hide = true)]
+    dev_embedded_catalog: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -3798,6 +3865,7 @@ async fn main() -> Result<()> {
             },
         },
         Commands::Admin { command } => admin(*command).await,
+        Commands::Up(args) => up(args).await,
         Commands::Use(args) => use_gateway(args).await,
         Commands::Models(args) => models(args).await,
         Commands::Pay { command } => match command {
@@ -13948,6 +14016,572 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct UpPlan {
+    home: PathBuf,
+    config_path: PathBuf,
+    supervisor_config_path: PathBuf,
+    mayhemd_path: PathBuf,
+    mayhem_path: PathBuf,
+    pear_runtime: PathBuf,
+    intercom_dir: PathBuf,
+    role: Role,
+    provider: bool,
+    network: String,
+    subnet_channel: Option<String>,
+    peer_store_name: String,
+    msb_store_name: String,
+    rpc_url: String,
+    sc_bridge_url: String,
+    sc_bridge_token: String,
+    gateway_url: String,
+    openai_base_url: String,
+    dashboard_url: String,
+    supervisor_bind: String,
+    supervisor_url: String,
+    gateway_port: u16,
+    timeout: Duration,
+    dev_embedded_catalog: bool,
+}
+
+async fn up(args: UpArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    let plan = prepare_up_plan(&args).await?;
+    write_up_supervisor_config(&plan)?;
+    start_mayhemd_for_up(&plan)?;
+
+    let deadline = Instant::now() + plan.timeout;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("building health-check HTTP client")?;
+
+    let supervisor_health = wait_until_ready("mayhemd supervisor", deadline, || {
+        let client = client.clone();
+        let url = format!("{}/health", plan.supervisor_url);
+        async move { fetch_gateway_json(&client, &url).await }
+    })
+    .await?;
+    let peer_health = wait_until_ready("peer RPC", deadline, || {
+        let rpc_url = plan.rpc_url.clone();
+        async move {
+            let rpc = PeerRpcClient::new(&rpc_url)?;
+            rpc.health()
+                .await
+                .map_err(|err| anyhow::anyhow!(err.to_string()))
+        }
+    })
+    .await?;
+    let bridge_health = wait_until_ready("SC-Bridge", deadline, || {
+        let url = plan.sc_bridge_url.clone();
+        let token = plan.sc_bridge_token.clone();
+        async move {
+            let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(url, token)?)
+                .await
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            bridge
+                .ping()
+                .await
+                .map_err(|err| anyhow::anyhow!(err.to_string()))
+        }
+    })
+    .await?;
+    let models = wait_until_ready("gateway /v1/models", deadline, || {
+        let client = client.clone();
+        let gateway_url = plan.gateway_url.clone();
+        async move {
+            let models = fetch_gateway_models(&client, &gateway_url).await?;
+            Ok(json!({
+                "count": models.len(),
+                "ids": models
+                    .iter()
+                    .filter_map(|model| model.get("id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+    })
+    .await?;
+    let dashboard_url =
+        read_up_logged_dashboard_url(&plan.home).unwrap_or_else(|| plan.dashboard_url.clone());
+
+    let report = json!({
+        "ok": true,
+        "home": plan.home,
+        "config_path": plan.config_path,
+        "supervisor_config_path": plan.supervisor_config_path,
+        "supervisor": {
+            "url": plan.supervisor_url,
+            "health": supervisor_health,
+        },
+        "peer": {
+            "rpc_url": plan.rpc_url,
+            "health": peer_health,
+        },
+        "sc_bridge": {
+            "url": plan.sc_bridge_url,
+            "health": bridge_health,
+        },
+        "gateway": {
+            "url": plan.gateway_url,
+            "openai_base_url": plan.openai_base_url,
+            "dashboard_url": dashboard_url.clone(),
+            "models": models,
+        },
+        "provider": plan.provider,
+        "role": plan.role.as_str(),
+        "copy_paste": {
+            "openai_base_url": plan.openai_base_url,
+            "dashboard_url": dashboard_url.clone(),
+            "status": format!("mayhem status --home {}", shell_single_quote(&plan.home.display().to_string())),
+        },
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Mayhem is up.");
+        println!("Copy/paste OpenAI base URL: {}", plan.openai_base_url);
+        println!("Copy/paste dashboard URL: {dashboard_url}");
+        println!(
+            "Copy/paste status command: mayhem status --home {}",
+            plan.home.display()
+        );
+        if plan.provider {
+            println!("Provider serving was requested and is supervised by mayhemd.");
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+
+    let role = if args.provider {
+        Role::Both
+    } else {
+        Role::User
+    };
+    let rpc_url = format!("http://127.0.0.1:{}/v1", args.rpc_port);
+    let sc_bridge_url = format!("ws://127.0.0.1:{}", args.sc_bridge_port);
+    let gateway_url = format!("http://127.0.0.1:{}", args.gateway_port);
+    let openai_base_url = gateway_v1_url(&gateway_url);
+    let dashboard_url = format!("{gateway_url}/mayhem/dashboard");
+    let supervisor_bind = format!("127.0.0.1:{}", args.supervisor_port);
+    let supervisor_url = format!("http://{supervisor_bind}");
+    let config_path = config_path_for_home(&home);
+    let mut config = read_config_toml_value(&config_path)?;
+    let sc_bridge_token = args
+        .sc_bridge_token
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .or_else(|| {
+            toml_get_path(&config, "network.sc_bridge_token")
+                .and_then(toml::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| generate_sc_bridge_token(&home));
+
+    if !config_path.exists() {
+        write_first_run_up_config(&home, role, &rpc_url, args).await?;
+        config = read_config_toml_value(&config_path)?;
+    }
+    repair_up_config(
+        &config_path,
+        &mut config,
+        UpConfigPatch {
+            role,
+            rpc_url: &rpc_url,
+            gateway_url: &gateway_url,
+            sc_bridge_url: &sc_bridge_url,
+            sc_bridge_token: &sc_bridge_token,
+        },
+    )?;
+
+    let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
+    let mayhemd_path = sibling_binary_path(&mayhem_path, "mayhemd");
+    let pear_runtime = resolve_pear_runtime_path()?;
+    let intercom_dir = repo_path("intercom")?;
+    let supervisor_config_path = home.join("mayhemd-up.toml");
+    Ok(UpPlan {
+        home,
+        config_path,
+        supervisor_config_path,
+        mayhemd_path,
+        mayhem_path,
+        pear_runtime,
+        intercom_dir,
+        role,
+        provider: args.provider,
+        network: args.network.clone(),
+        subnet_channel: args.subnet_channel.clone(),
+        peer_store_name: args.peer_store_name.clone(),
+        msb_store_name: format!("{}-msb", args.peer_store_name),
+        rpc_url,
+        sc_bridge_url,
+        sc_bridge_token,
+        gateway_url,
+        openai_base_url,
+        dashboard_url,
+        supervisor_bind,
+        supervisor_url,
+        gateway_port: args.gateway_port,
+        timeout: Duration::from_secs(args.timeout_seconds),
+        dev_embedded_catalog: args.dev_embedded_catalog,
+    })
+}
+
+struct UpConfigPatch<'a> {
+    role: Role,
+    rpc_url: &'a str,
+    gateway_url: &'a str,
+    sc_bridge_url: &'a str,
+    sc_bridge_token: &'a str,
+}
+
+async fn write_first_run_up_config(
+    home: &Path,
+    role: Role,
+    rpc_url: &str,
+    args: &UpArgs,
+) -> Result<()> {
+    let wallet_store_name = "main";
+    let store_path = home.join("stores").join(wallet_store_name);
+    let keypair_path = store_path.join("db").join("keypair.json");
+    fs::create_dir_all(keypair_path.parent().expect("keypair has parent"))
+        .with_context(|| format!("creating {}", keypair_path.display()))?;
+    let wallet_args = SetupArgs {
+        home: Some(home.to_path_buf()),
+        role: Some(role),
+        wallet: WalletMode::Auto,
+        mnemonic: None,
+        wallet_password: args.wallet_password.clone(),
+        peer_store_name: wallet_store_name.to_owned(),
+        rpc_url: Some(rpc_url.to_owned()),
+        no_consent: true,
+        sim: false,
+        rules_ver: None,
+        rules_hash: None,
+        rules_path: None,
+        yes: args.yes,
+        force: false,
+        print_json: false,
+    };
+    let password = args.wallet_password.as_deref().unwrap_or("");
+    let wallet = materialize_wallet(&wallet_args, &keypair_path, password).await?;
+    write_config(home, &store_path, &wallet, role, wallet_store_name, rpc_url)?;
+    Ok(())
+}
+
+fn repair_up_config(
+    config_path: &Path,
+    config: &mut toml::Value,
+    patch: UpConfigPatch<'_>,
+) -> Result<()> {
+    toml_set_string(config, "role.mode", patch.role.as_str().to_owned())?;
+    toml_set_string(config, "network.rpc_url", patch.rpc_url.to_owned())?;
+    toml_set_string(config, "network.gateway_url", patch.gateway_url.to_owned())?;
+    toml_set_string(
+        config,
+        "network.sc_bridge_url",
+        patch.sc_bridge_url.to_owned(),
+    )?;
+    toml_set_string(
+        config,
+        "network.sc_bridge_token",
+        patch.sc_bridge_token.to_owned(),
+    )?;
+    write_config_toml_value(config_path, config)?;
+    Ok(())
+}
+
+fn write_up_supervisor_config(plan: &UpPlan) -> Result<()> {
+    if let Some(parent) = plan.supervisor_config_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(&plan.supervisor_config_path, up_supervisor_config(plan)?)
+        .with_context(|| format!("writing {}", plan.supervisor_config_path.display()))
+}
+
+fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
+    let mut out = String::new();
+    writeln!(&mut out, "[supervisor]")?;
+    writeln!(&mut out, "bind = {}", toml_string(&plan.supervisor_bind))?;
+    writeln!(&mut out)?;
+
+    let mut peer_args = vec![
+        "run".to_owned(),
+        ".".to_owned(),
+        "--network".to_owned(),
+        plan.network.clone(),
+        "--peer-store-name".to_owned(),
+        plan.peer_store_name.clone(),
+        "--msb-store-name".to_owned(),
+        plan.msb_store_name.clone(),
+    ];
+    if let Some(channel) = plan
+        .subnet_channel
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        peer_args.extend(["--subnet-channel".to_owned(), channel.to_owned()]);
+    }
+    peer_args.extend([
+        "--headless".to_owned(),
+        "1".to_owned(),
+        "--peer-interactive".to_owned(),
+        "0".to_owned(),
+        "--peer-replicate".to_owned(),
+        "1".to_owned(),
+        "--sidechannel-quiet".to_owned(),
+        "1".to_owned(),
+        "--sc-bridge".to_owned(),
+        "1".to_owned(),
+        "--sc-bridge-host".to_owned(),
+        "127.0.0.1".to_owned(),
+        "--sc-bridge-port".to_owned(),
+        sc_bridge_port_from_url(&plan.sc_bridge_url)?.to_string(),
+        "--sc-bridge-token".to_owned(),
+        plan.sc_bridge_token.clone(),
+        "--sc-bridge-cli".to_owned(),
+        "1".to_owned(),
+        "--rpc".to_owned(),
+        "1".to_owned(),
+        "--rpc-host".to_owned(),
+        "127.0.0.1".to_owned(),
+        "--rpc-port".to_owned(),
+        rpc_port_from_url(&plan.rpc_url)?.to_string(),
+        "--api-tx-exposed".to_owned(),
+        "1".to_owned(),
+        "--api-tx-local-apply".to_owned(),
+        "1".to_owned(),
+    ]);
+    write_supervisor_child(
+        &mut out,
+        "peer",
+        &plan.pear_runtime,
+        &peer_args,
+        Some(&plan.intercom_dir),
+    )?;
+
+    let mut gateway_args = vec![
+        "use".to_owned(),
+        "--home".to_owned(),
+        plan.home.display().to_string(),
+        "--rpc-url".to_owned(),
+        plan.rpc_url.clone(),
+        "--sc-bridge-url".to_owned(),
+        plan.sc_bridge_url.clone(),
+        "--sc-bridge-token".to_owned(),
+        plan.sc_bridge_token.clone(),
+        "--port".to_owned(),
+        plan.gateway_port.to_string(),
+    ];
+    if plan.dev_embedded_catalog {
+        gateway_args.push("--dev-embedded-catalog".to_owned());
+    }
+    write_supervisor_child(&mut out, "gateway", &plan.mayhem_path, &gateway_args, None)?;
+
+    if plan.provider {
+        let provider_args = vec![
+            "provider".to_owned(),
+            "start".to_owned(),
+            "--home".to_owned(),
+            plan.home.display().to_string(),
+            "--rpc-url".to_owned(),
+            plan.rpc_url.clone(),
+            "--sc-bridge-url".to_owned(),
+            plan.sc_bridge_url.clone(),
+            "--sc-bridge-token".to_owned(),
+            plan.sc_bridge_token.clone(),
+            "--serve-sessions".to_owned(),
+        ];
+        write_supervisor_child(
+            &mut out,
+            "provider",
+            &plan.mayhem_path,
+            &provider_args,
+            None,
+        )?;
+    }
+    Ok(out)
+}
+
+fn write_supervisor_child(
+    out: &mut String,
+    name: &str,
+    command: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<()> {
+    writeln!(out, "[[supervisor.children]]")?;
+    writeln!(out, "name = {}", toml_string(name))?;
+    writeln!(
+        out,
+        "command = {}",
+        toml_string(&command.display().to_string())
+    )?;
+    writeln!(out, "args = [{}]", toml_string_array(args))?;
+    if let Some(cwd) = cwd {
+        writeln!(out, "cwd = {}", toml_string(&cwd.display().to_string()))?;
+    }
+    writeln!(out, "restart = true")?;
+    writeln!(out, "restart_backoff_ms = 1000")?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| toml_string(value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn start_mayhemd_for_up(plan: &UpPlan) -> Result<()> {
+    let log_path = plan.home.join("mayhemd-up.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("cloning {}", log_path.display()))?;
+    let mut command = mayhemd_launcher_command(&plan.mayhemd_path)?;
+    command
+        .arg("--home")
+        .arg(&plan.home)
+        .arg("--config")
+        .arg(&plan.supervisor_config_path)
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    command.spawn().with_context(|| {
+        format!(
+            "starting mayhemd {}; logs at {}",
+            plan.mayhemd_path.display(),
+            log_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn read_up_logged_dashboard_url(home: &Path) -> Option<String> {
+    let log = fs::read_to_string(home.join("mayhemd-up.log")).ok()?;
+    log.lines().rev().find_map(|line| {
+        line.strip_prefix("Copy/paste dashboard URL: ")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn mayhemd_launcher_command(mayhemd_path: &Path) -> Result<std::process::Command> {
+    #[cfg(unix)]
+    {
+        let nohup = command_from_path("nohup")
+            .context("nohup was not found; cannot keep mayhemd running after the terminal exits")?;
+        let mut command = std::process::Command::new(nohup);
+        command.arg(mayhemd_path);
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        return Ok(command);
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(std::process::Command::new(mayhemd_path))
+    }
+}
+
+async fn wait_until_ready<F, Fut>(label: &str, deadline: Instant, mut check: F) -> Result<Value>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Value>>,
+{
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match check().await {
+            Ok(value) => return Ok(value),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    bail!(
+        "timed out waiting for {label}; last error: {}",
+        last_error.unwrap_or_else(|| "not ready".to_owned())
+    )
+}
+
+fn generate_sc_bridge_token(home: &Path) -> String {
+    let seed = format!(
+        "mayhem-sc-bridge:{}:{}:{}",
+        home.display(),
+        std::process::id(),
+        unix_epoch_millis().unwrap_or(0)
+    );
+    blake3::hash(seed.as_bytes()).to_hex().to_string()
+}
+
+fn sibling_binary_path(current_exe: &Path, name: &str) -> PathBuf {
+    let candidate = current_exe.with_file_name(name);
+    if candidate.exists() {
+        candidate
+    } else {
+        PathBuf::from(name)
+    }
+}
+
+fn resolve_pear_runtime_path() -> Result<PathBuf> {
+    if let Ok(path) = env::var("MAYHEM_PEAR_RUNTIME") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    if cfg!(target_os = "macos") {
+        if let Ok(home) = env::var("HOME") {
+            let path = PathBuf::from(home).join(
+                "Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime",
+            );
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+    command_from_path("pear-runtime").or_else(|| command_from_path("pear")).context(
+        "pear-runtime was not found; install Pear or set MAYHEM_PEAR_RUNTIME to the pear-runtime binary",
+    )
+}
+
+fn command_from_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn rpc_port_from_url(url: &str) -> Result<u16> {
+    reqwest::Url::parse(url)
+        .with_context(|| format!("parsing RPC URL {url}"))?
+        .port()
+        .context("RPC URL must include an explicit loopback port")
+}
+
+fn sc_bridge_port_from_url(url: &str) -> Result<u16> {
+    reqwest::Url::parse(url)
+        .with_context(|| format!("parsing SC-Bridge URL {url}"))?
+        .port()
+        .context("SC-Bridge URL must include an explicit loopback port")
 }
 
 async fn use_gateway(args: UseArgs) -> Result<()> {
@@ -37337,6 +37971,112 @@ mod tests {
         ));
         write_json_file(&path, report).unwrap();
         path
+    }
+
+    #[test]
+    fn up_supervisor_config_contains_peer_gateway_and_provider_children() {
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-up-config-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let plan = UpPlan {
+            home: home.clone(),
+            config_path: home.join("config.toml"),
+            supervisor_config_path: home.join("mayhemd-up.toml"),
+            mayhemd_path: PathBuf::from("/tmp/mayhemd"),
+            mayhem_path: PathBuf::from("/tmp/mayhem"),
+            pear_runtime: PathBuf::from("/tmp/pear-runtime"),
+            intercom_dir: PathBuf::from("/tmp/intercom"),
+            role: Role::Both,
+            provider: true,
+            network: "mainnet".to_owned(),
+            subnet_channel: None,
+            peer_store_name: "mayhem-up-main".to_owned(),
+            msb_store_name: "mayhem-up-main-msb".to_owned(),
+            rpc_url: "http://127.0.0.1:49223/v1".to_owned(),
+            sc_bridge_url: "ws://127.0.0.1:49222".to_owned(),
+            sc_bridge_token: "test-token".to_owned(),
+            gateway_url: "http://127.0.0.1:11435".to_owned(),
+            openai_base_url: "http://127.0.0.1:11435/v1".to_owned(),
+            dashboard_url: "http://127.0.0.1:11435/mayhem/dashboard".to_owned(),
+            supervisor_bind: "127.0.0.1:11437".to_owned(),
+            supervisor_url: "http://127.0.0.1:11437".to_owned(),
+            gateway_port: 11_435,
+            timeout: Duration::from_secs(1),
+            dev_embedded_catalog: false,
+        };
+        let text = up_supervisor_config(&plan).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let children = parsed
+            .get("supervisor")
+            .and_then(|value| value.get("children"))
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        let names = children
+            .iter()
+            .filter_map(|child| child.get("name").and_then(toml::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["peer", "gateway", "provider"]);
+        assert!(text.contains("--sc-bridge-token"));
+        assert!(text.contains("test-token"));
+        assert!(text.contains("--serve-sessions"));
+        assert!(!text.contains("--peer-dht-bootstrap"));
+    }
+
+    #[test]
+    fn repair_up_config_persists_runtime_endpoints() {
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-up-repair-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let config_path = home.join("config.toml");
+        let mut config = toml::Value::Table(toml::map::Map::new());
+        repair_up_config(
+            &config_path,
+            &mut config,
+            UpConfigPatch {
+                role: Role::User,
+                rpc_url: "http://127.0.0.1:50001/v1",
+                gateway_url: "http://127.0.0.1:50002",
+                sc_bridge_url: "ws://127.0.0.1:50003",
+                sc_bridge_token: "bridge-token",
+            },
+        )
+        .unwrap();
+        let saved = read_config_toml_value(&config_path).unwrap();
+        assert_eq!(
+            toml_get_path(&saved, "role.mode").and_then(toml::Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "network.rpc_url").and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:50001/v1")
+        );
+        assert_eq!(
+            toml_get_path(&saved, "network.sc_bridge_token").and_then(toml::Value::as_str),
+            Some("bridge-token")
+        );
+    }
+
+    #[test]
+    fn read_up_logged_dashboard_url_returns_tokenized_copy_paste_url() {
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-up-dashboard-url-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("mayhemd-up.log"),
+            "Copy/paste dashboard URL: http://127.0.0.1:11435/mayhem/dashboard?token=abc\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_up_logged_dashboard_url(&home).as_deref(),
+            Some("http://127.0.0.1:11435/mayhem/dashboard?token=abc")
+        );
     }
 
     fn test_catalog(root: &str) -> catalog::CatalogDocument {

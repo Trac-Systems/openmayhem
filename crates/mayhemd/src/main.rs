@@ -249,8 +249,8 @@ async fn run_supervisor(
     }
 
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("waiting for shutdown signal")?;
+        signal = wait_for_shutdown_signal() => {
+            signal?;
         }
         _ = async {
             if let Some(ms) = exit_after_ms {
@@ -268,6 +268,28 @@ async fn run_supervisor(
         }
     }
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("installing SIGTERM handler")?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("waiting for Ctrl-C shutdown signal")?;
+            }
+            _ = terminate.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("waiting for Ctrl-C shutdown signal")
+    }
 }
 
 async fn supervise_child(
