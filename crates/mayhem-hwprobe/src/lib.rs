@@ -271,6 +271,12 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
     if nvidia.is_empty() {
         return insufficient("vllm", "no NVIDIA GPU detected");
     }
+    if profile.host.os == "windows" {
+        return insufficient(
+            "vllm",
+            "vLLM is not selected on Windows provider builds yet; Mayhem uses llama.cpp there until a supported Windows vLLM runtime is verified",
+        );
+    }
 
     let total_cuda_memory = nvidia_usable_memory_bytes(profile, &nvidia);
     let best_cc = nvidia
@@ -430,6 +436,12 @@ fn trt_llm_verdict(profile: &HardwareProfile) -> BackendVerdict {
         .collect::<Vec<_>>();
     if nvidia.is_empty() {
         return insufficient("trt-llm", "no NVIDIA GPU detected");
+    }
+    if profile.host.os == "windows" {
+        return insufficient(
+            "trt-llm",
+            "TensorRT-LLM is not selected on Windows provider builds yet; Mayhem uses llama.cpp there until a supported Windows TensorRT-LLM runtime is verified",
+        );
     }
 
     let total_vram = nvidia
@@ -2235,13 +2247,27 @@ AMD Radeon(TM) Graphics|Advanced Micro Devices, Inc.|536870912
             .iter()
             .find(|verdict| verdict.backend == "vllm")
             .unwrap();
+        let trt = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "trt-llm")
+            .unwrap();
+        let llama = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "llama.cpp")
+            .unwrap();
 
-        assert_eq!(vllm.kv_cache_bytes_budget, 12 * GIB);
+        assert_eq!(report.selected_backend.as_deref(), Some("llama.cpp"));
+        assert_eq!(vllm.status, VerdictStatus::Insufficient);
+        assert_eq!(trt.status, VerdictStatus::Insufficient);
+        assert_eq!(llama.status, VerdictStatus::PartialOffload);
+        assert_eq!(llama.kv_cache_bytes_budget, 8 * GIB);
         assert!(vllm
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("dedicated VRAM only"));
+            .contains("not selected on Windows"));
         let human = human_report(&report);
         assert!(human.contains("dedicated=24.0 GiB"));
         assert!(human.contains("shared=32.0 GiB"));
