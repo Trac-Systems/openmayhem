@@ -84,6 +84,7 @@ const DEFAULT_CHALLENGE_EPOCHS: u64 = 6;
 const DEFAULT_CANARY_PROBE_HOLDBACK_BPS: u64 = 0;
 const DEFAULT_CANARY_PROBE_RELEASE_MIN_PASSES: u64 = 1;
 const DEFAULT_RATE_STALENESS_SECONDS: u64 = 45 * 60;
+const DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS: u64 = 86_400;
 const OPENCODE_PROVIDER_ID: &str = "mayhem";
 const OPENCODE_PROVIDER_NAME: &str = "Mayhem P2P";
 const OPENCODE_PROVIDER_NPM: &str = "@ai-sdk/openai-compatible";
@@ -2797,7 +2798,7 @@ struct AdminSetParamsArgs {
     #[arg(long)]
     submitted_at: u64,
 
-    /// Contract timestamp/slot when the change becomes active. Must be at least 24h later.
+    /// Contract timestamp/slot when the change becomes active. Must satisfy active param_activation_delay_seconds.
     #[arg(long)]
     effective_at: u64,
 
@@ -3067,7 +3068,7 @@ struct AdminFeeSetArgs {
     #[arg(long)]
     submitted_at: Option<u64>,
 
-    /// Contract timestamp/slot when the change becomes active. Defaults to submitted_at + 86400.
+    /// Contract timestamp/slot when the change becomes active. Defaults to submitted_at + active param_activation_delay_seconds.
     #[arg(long)]
     effective_at: Option<u64>,
 }
@@ -10998,9 +10999,20 @@ async fn admin(command: AdminCommands) -> Result<()> {
         _ => {}
     }
     let tx_args = admin_tx_args(&command);
-    let (tx_type, mut value) = admin_command_payload(&command)?;
+    let (tx_type, mut value, schedule_meta) = match &command {
+        AdminCommands::Fee {
+            command: AdminFeeCommands::Set(args),
+        } => {
+            let (value, schedule_meta) = admin_fee_set_payload_resolved(args).await?;
+            ("setParams", value, schedule_meta)
+        }
+        _ => {
+            let (tx_type, value) = admin_command_payload(&command)?;
+            (tx_type, value, None)
+        }
+    };
     ensure_admin_command_signatures(tx_args, &mut value).await?;
-    run_admin_command(tx_args, tx_type, value).await
+    run_admin_command(tx_args, tx_type, value, schedule_meta).await
 }
 
 async fn run_admin_epoch_apply_feature(args: &AdminEpochApplyArgs) -> Result<()> {
@@ -12056,14 +12068,21 @@ fn admin_price_seed_payload(args: &AdminPriceSeedArgs) -> Result<Value> {
     Ok(payload)
 }
 
-fn admin_fee_set_payload(args: &AdminFeeSetArgs) -> Result<Value> {
+fn admin_fee_submitted_at(args: &AdminFeeSetArgs) -> Result<u64> {
+    args.submitted_at.map(Ok).unwrap_or_else(unix_epoch_seconds)
+}
+
+fn admin_fee_set_payload_with_delay(
+    args: &AdminFeeSetArgs,
+    submitted_at: u64,
+    activation_delay_seconds: u64,
+) -> Result<Value> {
     if args.bps > 5_000 {
         bail!("admin fee bps must be between 0 and 5000");
     }
-    let submitted_at = args.submitted_at.unwrap_or(unix_epoch_seconds()?);
     let effective_at = args
         .effective_at
-        .unwrap_or_else(|| submitted_at.saturating_add(86_400));
+        .unwrap_or_else(|| submitted_at.saturating_add(activation_delay_seconds));
     Ok(json!({
         "op": "set_params",
         "submitted_at": submitted_at,
@@ -12072,6 +12091,58 @@ fn admin_fee_set_payload(args: &AdminFeeSetArgs) -> Result<Value> {
             "fee_bps": args.bps,
         },
     }))
+}
+
+fn admin_fee_set_payload(args: &AdminFeeSetArgs) -> Result<Value> {
+    let submitted_at = admin_fee_submitted_at(args)?;
+    admin_fee_set_payload_with_delay(args, submitted_at, DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS)
+}
+
+async fn admin_fee_set_payload_resolved(args: &AdminFeeSetArgs) -> Result<(Value, Option<Value>)> {
+    let submitted_at = admin_fee_submitted_at(args)?;
+    if args.effective_at.is_some() {
+        return Ok((
+            admin_fee_set_payload_with_delay(args, submitted_at, 0)?,
+            None,
+        ));
+    }
+
+    let (activation_delay_seconds, source, fallback_reason) =
+        match read_admin_param_activation_delay_seconds(&args.tx, submitted_at).await {
+            Ok(value) => (value, "contract", None),
+            Err(err) if args.tx.submit => {
+                return Err(err).context("reading active param_activation_delay_seconds");
+            }
+            Err(err) => (
+                DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS,
+                "contract_default_offline_fallback",
+                Some(err.to_string()),
+            ),
+        };
+    let payload = admin_fee_set_payload_with_delay(args, submitted_at, activation_delay_seconds)?;
+    Ok((
+        payload,
+        Some(json!({
+            "param": "param_activation_delay_seconds",
+            "value": activation_delay_seconds,
+            "source": source,
+            "fallback_reason": fallback_reason,
+        })),
+    ))
+}
+
+async fn read_admin_param_activation_delay_seconds(args: &AdminTxArgs, at: u64) -> Result<u64> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    read_param_u64_at(
+        &rpc,
+        "param_activation_delay_seconds",
+        DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS,
+        at,
+    )
+    .await
 }
 
 fn rate_map_arg_or_file(
@@ -12847,7 +12918,12 @@ fn json_arg_or_file_array(
     Ok(value)
 }
 
-async fn run_admin_command(args: &AdminTxArgs, tx_type: &'static str, value: Value) -> Result<()> {
+async fn run_admin_command(
+    args: &AdminTxArgs,
+    tx_type: &'static str,
+    value: Value,
+    schedule_meta: Option<Value>,
+) -> Result<()> {
     let compact_command = serde_json::to_string(&value)?;
     let copy_paste = format!(
         "/tx --command {} --sim 1",
@@ -12862,6 +12938,9 @@ async fn run_admin_command(args: &AdminTxArgs, tx_type: &'static str, value: Val
             "intercom_sim": copy_paste,
         },
     });
+    if let Some(schedule_meta) = schedule_meta {
+        report["schedule"] = schedule_meta;
+    }
 
     if args.submit {
         let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
@@ -13029,6 +13108,17 @@ fn print_admin_report(report: &Value) -> Result<()> {
     println!("Tx type: {}", report["tx_type"].as_str().unwrap_or(""));
     println!("Command JSON:");
     println!("{}", serde_json::to_string_pretty(&report["command"])?);
+    if let Some(schedule) = report.get("schedule").filter(|value| !value.is_null()) {
+        println!(
+            "Schedule: {}={} source={}",
+            schedule["param"].as_str().unwrap_or(""),
+            schedule["value"].as_u64().unwrap_or(0),
+            schedule["source"].as_str().unwrap_or("")
+        );
+        if let Some(reason) = schedule["fallback_reason"].as_str() {
+            println!("Schedule fallback reason: {reason}");
+        }
+    }
     println!("Copy/paste Intercom sim command:");
     println!(
         "{}",
@@ -34654,6 +34744,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("between 0 and 5000"));
+    }
+
+    #[test]
+    fn admin_fee_shortcut_default_effective_at_uses_resolved_activation_delay() {
+        let fee = AdminFeeSetArgs {
+            tx: test_admin_tx_args(),
+            bps: 1_500,
+            submitted_at: Some(10_000),
+            effective_at: None,
+        };
+
+        assert_eq!(
+            admin_fee_set_payload_with_delay(&fee, 10_000, 3_600).unwrap(),
+            json!({
+                "op": "set_params",
+                "submitted_at": 10_000,
+                "effective_at": 13_600,
+                "values": { "fee_bps": 1500 },
+            })
+        );
+
+        assert_eq!(
+            admin_fee_set_payload(&fee).unwrap()["effective_at"],
+            json!(10_000 + DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS)
+        );
     }
 
     #[test]
