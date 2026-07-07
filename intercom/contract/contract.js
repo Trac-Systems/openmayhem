@@ -30,6 +30,7 @@ const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const FULL_SLASH_BPS = 10_000;
 const DISPUTE_LOST_SLASH_BPS = 2_000;
 const MAX_OPERATOR_FEE_BPS = 5_000;
+const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 1;
 const DISPUTE_DEPOSIT_MU = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
@@ -1680,6 +1681,8 @@ class MayhemContract extends Contract {
     const modelClass = this.modelClassFor(this.value);
     const classError = this.validateModelClass(modelClass, 'Enclave model_class');
     if (classError) return classError;
+    const tierError = this.validateLaunchEnclaveAttestationTier(this.value.att_tier);
+    if (tierError) return tierError;
     const capsError = this.validateEnclaveCaps(this.value.caps, modelClass);
     if (capsError) return capsError;
     const artifactError = this.validateEnclaveArtifactBinding(this.value);
@@ -1733,6 +1736,8 @@ class MayhemContract extends Contract {
     const modelClass = this.modelClassFor(updated);
     const classError = this.validateModelClass(modelClass, 'Enclave model_class');
     if (classError) return classError;
+    const tierError = this.validateLaunchEnclaveAttestationTier(updated.att_tier);
+    if (tierError) return tierError;
     const capsError = this.validateEnclaveCaps(updated.caps, modelClass);
     if (capsError) return capsError;
     const artifactError = this.validateEnclaveArtifactBinding(updated);
@@ -4664,6 +4669,13 @@ class MayhemContract extends Contract {
     }
     if (!MODEL_CLASSES.has(modelClass)) return new Error(`Unsupported ${label}.`);
     return null;
+  }
+
+  validateLaunchEnclaveAttestationTier(attTier) {
+    if (attTier <= MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER) return null;
+    return new Error(
+      `Hardware attestation tiers above ${MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER} are not launch-advertisable until Mayhem provider quote generation is wired; register a Tier 1 enclave instead.`
+    );
   }
 
   validateRateMap(rateMap, modelClass, label, { allowZeroPrice = false } = {}) {

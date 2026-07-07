@@ -11042,6 +11042,7 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
 }
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
+    validate_launch_enclave_attestation_tier(args.att_tier)?;
     let binding = validate_admin_enclave_catalog_binding(args)?;
     let mut caps = json_arg_or_file_object(
         args.caps_json.as_deref(),
@@ -11076,6 +11077,16 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         payload["artifact_sidecars"] = json!(binding.artifact_sidecars);
     }
     Ok(payload)
+}
+
+fn validate_launch_enclave_attestation_tier(att_tier: u8) -> Result<()> {
+    if att_tier <= mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER {
+        return Ok(());
+    }
+    bail!(
+        "hardware attestation tiers above {} are not launch-advertisable until Mayhem provider quote generation is wired; register a Tier 1 enclave instead",
+        mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER
+    )
 }
 
 fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
@@ -22187,6 +22198,7 @@ fn build_provider_candidates(
 ) -> Result<Vec<ProviderCandidate>> {
     let requested_backend = requested_backend(args, hardware)?;
     let requested_enclave = args.enclave.as_deref();
+    let provider_attestation_tier = provider_quote_generation_attestation_tier();
     let mut candidates = Vec::new();
     let mut rejections = Vec::new();
     let mut version_gates = BTreeMap::new();
@@ -22206,12 +22218,12 @@ fn build_provider_candidates(
                 continue;
             }
         }
-        if enclave.att_tier > hardware.tee.tier {
+        if enclave.att_tier > provider_attestation_tier {
             rejections.push(provider_rejection(
                 enclave,
                 format!(
-                    "attestation tier mismatch: enclave requires tier {}, local hardware reports tier {}",
-                    enclave.att_tier, hardware.tee.tier
+                    "attestation tier mismatch: enclave requires tier {}, but this provider path can currently generate verified Tier {} reports; hardware probe tier {} is only a signal and is not advertised without real quote generation",
+                    enclave.att_tier, provider_attestation_tier, hardware.tee.tier
                 ),
                 None,
             ));
@@ -22446,6 +22458,10 @@ fn build_provider_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn provider_quote_generation_attestation_tier() -> u8 {
+    mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER
 }
 
 fn requested_provider_enclave_matches(requested: &str, enclave: &LedgerEnclave) -> bool {
@@ -29200,7 +29216,18 @@ mod tests {
         assert_eq!(payload["artifact_root"], artifact_root);
         assert_eq!(payload["model_class"], DEFAULT_MODEL_CLASS);
 
-        let mut fake_repo = args;
+        let mut tier2_args = args;
+        tier2_args.att_tier = 2;
+        let err = admin_register_enclave_payload(&tier2_args).expect_err(
+            "Tier-2 enclave registration must stay disabled until quote generation is wired",
+        );
+        assert!(
+            err.to_string().contains("not launch-advertisable"),
+            "{err:#}"
+        );
+
+        let mut fake_repo = tier2_args;
+        fake_repo.att_tier = 1;
         fake_repo.artifact_repo = "provider/fake-model".to_owned();
         let err = admin_register_enclave_payload(&fake_repo)
             .expect_err("fake provider model must not be greenlit");
@@ -30642,10 +30669,10 @@ mod tests {
     }
 
     #[test]
-    fn provider_candidates_require_hardware_tier_for_tier2_enclave() {
+    fn provider_candidates_require_producible_quote_tier_for_tier2_enclave() {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
-        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let mut hardware = test_hardware(FixtureProfile::CpuOnly);
         let args = test_provider_start_args();
         let mut contract = test_contract(&root);
 
@@ -30659,7 +30686,26 @@ mod tests {
 
         contract.enclaves[0].att_tier = 2;
         let err = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap_err();
-        assert!(err.to_string().contains("active admin-created enclaves"));
+        assert!(err
+            .to_string()
+            .contains("provider path can currently generate verified Tier 1"));
+
+        hardware.tee.tier = 2;
+        hardware
+            .tee
+            .notes
+            .push("synthetic Tier 2 hardware signal".to_owned());
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .expect_err("Tier-2-looking hardware still needs real quote generation");
+        let message = err.to_string();
+        assert!(
+            message.contains("provider path can currently generate verified Tier 1"),
+            "{message}"
+        );
+        assert!(
+            message.contains("hardware probe tier 2 is only a signal"),
+            "{message}"
+        );
     }
 
     #[test]

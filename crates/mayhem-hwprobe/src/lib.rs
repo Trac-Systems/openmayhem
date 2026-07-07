@@ -1133,31 +1133,22 @@ fn probe_tee(gpus: &[GpuInfo]) -> TeeInfo {
             name.contains("gb10") || name.contains("dgx spark")
         }
     });
-    let tier = if sev_snp
-        || tdx
-        || gpu_confidential_compute
-        || apple_device_identity
-        || gb10_device_identity
-    {
-        2
-    } else {
-        1
-    };
+    let tier = 1;
     let mut notes = Vec::new();
     if sev_snp {
-        notes.push("AMD SEV/SEV-SNP signal detected".to_owned());
+        notes.push("AMD SEV/SEV-SNP signal detected; Mayhem launch keeps this at Tier 1 until real vendor quote generation is wired".to_owned());
     }
     if tdx {
-        notes.push("Intel TDX signal detected".to_owned());
+        notes.push("Intel TDX signal detected; Mayhem launch keeps this at Tier 1 until real vendor quote generation is wired".to_owned());
     }
     if gpu_confidential_compute {
-        notes.push("NVIDIA confidential compute enabled".to_owned());
+        notes.push("NVIDIA confidential compute signal detected; Mayhem launch keeps this at Tier 1 until real vendor quote generation is wired".to_owned());
     }
     if apple_device_identity {
-        notes.push("Apple Metal device identity can supply Tier 2 App Attest evidence".to_owned());
+        notes.push("Apple Metal device identity signal detected; not advertised above Tier 1 until real App Attest quote generation is wired".to_owned());
     }
     if gb10_device_identity {
-        notes.push("NVIDIA GB10 device identity can supply Tier 2 evidence".to_owned());
+        notes.push("NVIDIA GB10 device identity signal detected; not advertised above Tier 1 until real device quote generation is wired".to_owned());
     }
     if notes.is_empty() {
         notes.push("hardware TEE not detected; Tier 1 software-rooted attestation".to_owned());
@@ -1233,7 +1224,7 @@ fn fixture_profile(fixture: FixtureProfile, disk_path: &Path) -> HardwareProfile
                 supports_fp8: false,
                 supports_tensor_parallel: false,
             }],
-            tee: fixture_tee(2),
+            tee: fixture_tee(1),
             warnings: Vec::new(),
         },
         FixtureProfile::LinuxNvidia => HardwareProfile {
@@ -1287,7 +1278,7 @@ fn fixture_profile(fixture: FixtureProfile, disk_path: &Path) -> HardwareProfile
                     supports_tensor_parallel: true,
                 },
             ],
-            tee: fixture_tee(2),
+            tee: fixture_tee(1),
             warnings: Vec::new(),
         },
         FixtureProfile::CpuOnly => HardwareProfile {
@@ -1339,9 +1330,9 @@ fn fixture_tee(tier: u8) -> TeeInfo {
         tdx: false,
         gpu_confidential_compute: tier >= 2,
         notes: if tier >= 2 {
-            vec!["fixture Tier 2 hardware attestation signals".to_owned()]
+            vec!["fixture hardware identity signals; launch advertises Tier 1 until real quote generation is wired".to_owned()]
         } else {
-            vec!["fixture Tier 1 software-rooted attestation".to_owned()]
+            vec!["fixture Tier 1 software-rooted attestation; launch advertises Tier 1 until real quote generation is wired".to_owned()]
         },
     }
 }
@@ -1514,7 +1505,12 @@ mod tests {
         assert_eq!(mlx.status, VerdictStatus::FullOffload);
         assert!(report.memory.unified_memory);
         assert_eq!(report.gpus[0].backend, GpuBackend::Metal);
-        assert_eq!(report.tee.tier, 2);
+        assert_eq!(report.tee.tier, 1);
+        assert!(report
+            .tee
+            .notes
+            .iter()
+            .any(|note| note.contains("launch advertises Tier 1")));
     }
 
     #[test]
@@ -1535,7 +1531,12 @@ mod tests {
         assert_eq!(trt.status, VerdictStatus::FullOffload);
         assert!(report.gpus.iter().all(|gpu| gpu.supports_nvfp4));
         assert!(report.gpus.iter().all(|gpu| gpu.supports_tensor_parallel));
-        assert_eq!(report.tee.tier, 2);
+        assert_eq!(report.tee.tier, 1);
+        assert!(report
+            .tee
+            .notes
+            .iter()
+            .any(|note| note.contains("launch advertises Tier 1")));
     }
 
     #[test]
