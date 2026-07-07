@@ -23611,26 +23611,7 @@ async fn serve_provider_sessions(
         ctx.args.sc_bridge_url.as_deref(),
         ctx.args.sc_bridge_token.as_deref(),
     )?;
-    provider_session_debug(format!("connecting to SC-Bridge {sc_bridge_url}"));
-    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-        &sc_bridge_url,
-        sc_bridge_token.clone(),
-    )?)
-    .await
-    .context("connecting to SC-Bridge for provider session serving")?;
-    provider_session_debug("subscribing to all direct session frames");
-    let subscription = bridge
-        .session_subscribe_all()
-        .await
-        .context("subscribing to all direct session frames")?;
-    if !subscription
-        .get("all_sessions")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!("SC-Bridge does not support all-session subscription; update the local Intercom app");
-    }
-    provider_session_debug("session frame subscription ready");
+    let mut bridge = connect_provider_session_bridge(&sc_bridge_url, &sc_bridge_token).await?;
 
     provider_log(
         ctx.args,
@@ -23722,6 +23703,19 @@ async fn serve_provider_sessions(
                         break;
                     }
                 }
+                Err(BridgeError::Closed) => {
+                    let dropped = clear_provider_sessions_after_bridge_drop(
+                        &mut sessions,
+                        &mut pending_requests,
+                        &heartbeat_load,
+                    );
+                    provider_session_debug(format!(
+                        "SC-Bridge closed provider session stream; dropped {dropped} active session(s), reconnecting"
+                    ));
+                    bridge =
+                        reconnect_provider_session_bridge(&sc_bridge_url, &sc_bridge_token, deadline)
+                            .await?;
+                }
                 Err(err) => return Err(err).context("reading provider session frame"),
             }
         }
@@ -23744,6 +23738,77 @@ async fn serve_provider_sessions(
         }
     }
     serve_result
+}
+
+async fn connect_provider_session_bridge(
+    sc_bridge_url: &str,
+    sc_bridge_token: &str,
+) -> Result<ScBridgeClient> {
+    provider_session_debug(format!("connecting to SC-Bridge {sc_bridge_url}"));
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+        sc_bridge_url,
+        sc_bridge_token.to_owned(),
+    )?)
+    .await
+    .context("connecting to SC-Bridge for provider session serving")?;
+    provider_session_debug("subscribing to all direct session frames");
+    let subscription = bridge
+        .session_subscribe_all()
+        .await
+        .context("subscribing to all direct session frames")?;
+    if !subscription
+        .get("all_sessions")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("SC-Bridge does not support all-session subscription; update the local Intercom app");
+    }
+    provider_session_debug("session frame subscription ready");
+    Ok(bridge)
+}
+
+async fn reconnect_provider_session_bridge(
+    sc_bridge_url: &str,
+    sc_bridge_token: &str,
+    deadline: Option<Instant>,
+) -> Result<ScBridgeClient> {
+    let mut delay = Duration::from_millis(250);
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!("provider session serving deadline reached while reconnecting to SC-Bridge");
+        }
+        match connect_provider_session_bridge(sc_bridge_url, sc_bridge_token).await {
+            Ok(bridge) => return Ok(bridge),
+            Err(err) => {
+                provider_session_debug(format!(
+                    "provider session bridge reconnect failed: {err:#}"
+                ));
+                let sleep = deadline
+                    .map(|deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(delay)
+                    })
+                    .unwrap_or(delay);
+                if !sleep.is_zero() {
+                    tokio::time::sleep(sleep).await;
+                }
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+fn clear_provider_sessions_after_bridge_drop(
+    sessions: &mut HashMap<String, ActiveProviderSession>,
+    pending_requests: &mut HashMap<String, Instant>,
+    heartbeat_load: &ProviderHeartbeatLoad,
+) -> usize {
+    let dropped = sessions.len();
+    sessions.clear();
+    pending_requests.clear();
+    heartbeat_load.set_active_sessions(0);
+    dropped
 }
 
 async fn expire_provider_pending_sessions(
@@ -32800,6 +32865,35 @@ mod tests {
         assert_eq!(snapshot.est_wait_ms, 0);
         assert_eq!(provider_saturation(snapshot.active_slots, 4), 0.5);
         assert_eq!(provider_saturation(snapshot.active_slots, 0), 0.0);
+    }
+
+    #[test]
+    fn provider_bridge_drop_clears_active_session_slots_without_exiting() {
+        let mut sessions = HashMap::new();
+        let mut pending_requests = HashMap::new();
+        for id in ["s1", "s2"] {
+            sessions.insert(
+                id.to_owned(),
+                ActiveProviderSession {
+                    remote: format!("remote-{id}"),
+                    rail: "fiat".to_owned(),
+                    user_pubkey: "aa".repeat(32),
+                    session_id: id.to_owned(),
+                    checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+                },
+            );
+            pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
+        }
+        let load = ProviderHeartbeatLoad::default();
+        load.set_active_sessions(sessions.len());
+
+        let dropped =
+            clear_provider_sessions_after_bridge_drop(&mut sessions, &mut pending_requests, &load);
+
+        assert_eq!(dropped, 2);
+        assert!(sessions.is_empty());
+        assert!(pending_requests.is_empty());
+        assert_eq!(load.snapshot().active_slots, 0);
     }
 
     #[test]

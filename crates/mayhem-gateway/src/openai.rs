@@ -4378,6 +4378,13 @@ async fn next_session_frame(
                     session_id
                 )));
             }
+            Err(BridgeError::Closed) => {
+                return Err(GatewaySessionError::retryable(format!(
+                    "SC-Bridge closed while waiting for {} on session {}",
+                    expected_types.join("|"),
+                    session_id
+                )));
+            }
             Err(err) => return Err(err.into()),
         }
     }
@@ -4719,6 +4726,19 @@ async fn collect_direct_session_output(
                     ));
                 }
                 return Err(timeout);
+            }
+            Err(err) if err.retryable => {
+                let now = now_millis_u64();
+                return Err(retryable_interrupted_direct_session_error(
+                    err,
+                    &content,
+                    tool_call.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now,
+                    "bridge_closed",
+                ));
             }
             Err(err) => return Err(err),
         };
@@ -5363,6 +5383,50 @@ fn interrupted_direct_session_partial(
         reason: reason.to_owned(),
         redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
     })
+}
+
+fn retryable_interrupted_direct_session_error(
+    err: GatewaySessionError,
+    content: &str,
+    tool_call: Option<ToolCallOutput>,
+    provider_receipt: Option<&ProviderSignedReceipt>,
+    token_ids: &[i32],
+    watchdog: &DirectSessionWatchdog,
+    now_millis: u64,
+    reason: &str,
+) -> GatewaySessionError {
+    if let Some(partial) = interrupted_direct_session_partial(
+        content,
+        tool_call,
+        provider_receipt,
+        token_ids,
+        watchdog,
+        now_millis,
+        reason,
+    ) {
+        return GatewaySessionError::retryable_partial(err.message, partial);
+    }
+    err
+}
+
+fn client_disconnect_direct_session_error(
+    content: &str,
+    tool_call: Option<ToolCallOutput>,
+    provider_receipt: Option<&ProviderSignedReceipt>,
+    token_ids: &[i32],
+    watchdog: &DirectSessionWatchdog,
+    now_millis: u64,
+) -> GatewaySessionError {
+    retryable_interrupted_direct_session_error(
+        GatewaySessionError::retryable("end-user disconnected before stream completed"),
+        content,
+        tool_call,
+        provider_receipt,
+        token_ids,
+        watchdog,
+        now_millis,
+        "client_disconnect",
+    )
 }
 
 fn direct_session_checkpoint_partial(
@@ -7017,7 +7081,9 @@ async fn run_live_direct_chat_sse(
             let _ = send_sse_done(&tx).await;
         }
         Err(err) => {
-            let recovered = if err.retryable && err.partial.is_some() {
+            let recovered = if is_client_disconnect_error(&err) {
+                finish_live_direct_chat_after_client_disconnect(&mut session, err).await
+            } else if err.retryable && err.partial.is_some() {
                 recover_live_direct_chat_after_partial(&mut session, &tx, err).await
             } else {
                 Err(err)
@@ -7051,6 +7117,45 @@ async fn run_live_direct_chat_sse(
             }
         }
     }
+}
+
+fn is_client_disconnect_error(err: &GatewaySessionError) -> bool {
+    err.message.contains("end-user disconnected")
+        || err
+            .partial
+            .as_ref()
+            .is_some_and(|partial| partial.reason == "client_disconnect")
+}
+
+async fn finish_live_direct_chat_after_client_disconnect(
+    session: &mut LiveDirectChatSession,
+    mut err: GatewaySessionError,
+) -> Result<(), GatewaySessionError> {
+    if let Some(partial) = err.partial.take() {
+        session
+            .state
+            .record_partial_provider_receipt(
+                &session.model,
+                &session.request,
+                &session.invocation,
+                &partial,
+            )
+            .map_err(|err| GatewaySessionError::new(err.message))?;
+    }
+    let _ = session
+        .bridge
+        .session_send(
+            &session.provider,
+            &session.invocation.session_id,
+            json!({
+                "t": "s.close",
+                "v": 1,
+                "session_id": session.invocation.session_id,
+                "reason": "client_disconnect",
+            }),
+        )
+        .await;
+    Ok(())
 }
 
 async fn recover_live_direct_chat_after_partial(
@@ -7171,7 +7276,9 @@ async fn run_live_direct_chat_sse_inner(
     )
     .await
     {
-        return Ok(());
+        return Err(GatewaySessionError::retryable(
+            "end-user disconnected before first stream event",
+        ));
     }
 
     let mut content = String::new();
@@ -7245,6 +7352,19 @@ async fn run_live_direct_chat_sse_inner(
                 }
                 return Err(timeout);
             }
+            Err(err) if err.retryable => {
+                let now = now_millis_u64();
+                return Err(retryable_interrupted_direct_session_error(
+                    err,
+                    &content,
+                    tool_call.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now,
+                    "bridge_closed",
+                ));
+            }
             Err(err) => return Err(err),
         };
         match frame.get("t").and_then(Value::as_str) {
@@ -7257,6 +7377,15 @@ async fn run_live_direct_chat_sse_inner(
                 watchdog.record_delta(now);
                 if let Some(delta) = frame.get("d").and_then(Value::as_str) {
                     content.push_str(delta);
+                }
+                if let Some(ids) = token_ids_from_session_delta(&frame) {
+                    token_ids = ids;
+                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
+                    token_ids.extend(ids);
+                } else if let Some(token_id) = token_id_from_session_delta(&frame) {
+                    token_ids.push(token_id);
+                }
+                if let Some(delta) = frame.get("d").and_then(Value::as_str) {
                     if !delta.is_empty()
                         && !send_sse_value(
                             tx,
@@ -7271,15 +7400,15 @@ async fn run_live_direct_chat_sse_inner(
                         )
                         .await
                     {
-                        return Ok(());
+                        return Err(client_disconnect_direct_session_error(
+                            &content,
+                            tool_call.clone(),
+                            latest_checkpoint_receipt.as_ref(),
+                            &token_ids,
+                            &watchdog,
+                            now,
+                        ));
                     }
-                }
-                if let Some(ids) = token_ids_from_session_delta(&frame) {
-                    token_ids = ids;
-                } else if let Some(ids) = token_ids_delta_from_session_delta(&frame) {
-                    token_ids.extend(ids);
-                } else if let Some(token_id) = token_id_from_session_delta(&frame) {
-                    token_ids.push(token_id);
                 }
                 if let Some(receipt) = pending_checkpoint_receipt.take() {
                     if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
@@ -7319,7 +7448,14 @@ async fn run_live_direct_chat_sse_inner(
                         )
                         .await
                         {
-                            return Ok(());
+                            return Err(client_disconnect_direct_session_error(
+                                &content,
+                                tool_call.clone(),
+                                latest_checkpoint_receipt.as_ref(),
+                                &token_ids,
+                                &watchdog,
+                                now,
+                            ));
                         }
                         tool_call = Some(next_tool_call);
                     }
@@ -12640,6 +12776,45 @@ mod tests {
         )
         .expect_err("inflated partial receipt must not receive a receipt ack");
         assert!(err.message.contains("usage"));
+    }
+
+    #[test]
+    fn client_disconnect_uses_last_checkpoint_partial_without_redispatch_marker() {
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let invocation = test_invocation();
+        let provider_receipt =
+            test_provider_receipt_with_finality(&model, &request, &output, &invocation, 2, false);
+        let mut watchdog = DirectSessionWatchdog::new(
+            1_000,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            None,
+            None,
+        );
+        watchdog.record_delta(1_100);
+
+        let err = client_disconnect_direct_session_error(
+            output.content.as_deref().unwrap(),
+            None,
+            Some(&provider_receipt),
+            &[1, 2, 3],
+            &watchdog,
+            1_250,
+        );
+
+        assert!(err.retryable);
+        assert!(is_client_disconnect_error(&err));
+        let partial = err
+            .partial
+            .expect("checkpointed disconnect should carry partial");
+        assert_eq!(partial.reason, "client_disconnect");
+        assert_eq!(partial.output.content.as_deref(), output.content.as_deref());
+        assert_eq!(partial.output.usage, output.usage);
+        assert_eq!(partial.token_ids, vec![1, 2, 3]);
+        assert_eq!(partial.provider_receipt.body.seq, 2);
+        assert!(!partial.provider_receipt.body.final_receipt);
     }
 
     #[test]
