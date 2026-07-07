@@ -6,7 +6,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Command;
+use std::process::ExitStatus;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2057,10 +2059,18 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (config, command);
-        Err(EnclaveError::SandboxUnsupported(
-            "AppContainer process launch is not implemented in this build".to_owned(),
-        ))
+        use std::os::windows::process::ExitStatusExt;
+
+        let report = mayhem_windows_sandbox::run_appcontainer(
+            &mayhem_windows_sandbox::WindowsSandboxConfig {
+                sealed_store_dir: config.sealed_store_dir.clone(),
+                ipc_socket_path: config.ipc_socket_path.clone(),
+                memory_limit_bytes: None,
+            },
+            command,
+        )
+        .map_err(|err| EnclaveError::SandboxUnsupported(err.to_string()))?;
+        Ok(ExitStatus::from_raw(report.status_code))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -2151,7 +2161,7 @@ fn apply_platform_sandbox(config: &SandboxConfig) -> Result<()> {
     {
         let _ = config;
         Err(EnclaveError::SandboxUnsupported(
-            "Windows AppContainer process launch is not implemented in this build".to_owned(),
+            "Windows AppContainer sandbox must spawn a sandboxed child process".to_owned(),
         ))
     }
 

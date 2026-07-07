@@ -126,7 +126,11 @@ pub struct GpuInfo {
     pub vendor: GpuVendor,
     pub name: String,
     pub backend: GpuBackend,
+    /// Usable memory for provider capacity math. For discrete GPUs this is
+    /// dedicated VRAM; shared/WDDM system memory is reported separately.
     pub memory_bytes: Option<u64>,
+    pub dedicated_memory_bytes: Option<u64>,
+    pub shared_memory_bytes: Option<u64>,
     pub unified_memory: bool,
     pub compute_capability: Option<String>,
     pub supports_nvfp4: bool,
@@ -140,6 +144,7 @@ pub enum GpuVendor {
     Apple,
     Nvidia,
     Amd,
+    Intel,
     Vulkan,
     Unknown,
 }
@@ -279,7 +284,10 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
         return BackendVerdict {
             backend: "vllm".to_owned(),
             status: VerdictStatus::PartialOffload,
-            reason: Some("NVIDIA GPU detected but compute capability is unknown".to_owned()),
+            reason: Some(format!(
+                "NVIDIA GPU detected but compute capability is unknown{}",
+                nvidia_memory_reason_suffix(profile, &nvidia)
+            )),
             est_tok_s: Some(30.0),
             n_layers_gpu: None,
             max_sessions: 2,
@@ -308,14 +316,17 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
         BackendVerdict {
             backend: "vllm".to_owned(),
             status: VerdictStatus::FullOffload,
-            reason: Some(if tensor_parallel {
-                "NVIDIA CUDA GPU set supports vLLM continuous batching and tensor parallelism"
-                    .to_owned()
-            } else if uses_unified_memory {
-                "NVIDIA CUDA GPU with unified memory supports vLLM continuous batching".to_owned()
-            } else {
-                "NVIDIA CUDA GPU supports vLLM continuous batching".to_owned()
-            }),
+            reason: Some(format!(
+                "{}{}",
+                if tensor_parallel {
+                    "NVIDIA CUDA GPU set supports vLLM continuous batching and tensor parallelism"
+                } else if uses_unified_memory {
+                    "NVIDIA CUDA GPU with unified memory supports vLLM continuous batching"
+                } else {
+                    "NVIDIA CUDA GPU supports vLLM continuous batching"
+                },
+                nvidia_memory_reason_suffix(profile, &nvidia)
+            )),
             est_tok_s: Some(if cc >= (10, 0) {
                 if tensor_parallel {
                     300.0
@@ -335,10 +346,10 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
         BackendVerdict {
             backend: "vllm".to_owned(),
             status: VerdictStatus::PartialOffload,
-            reason: Some(
-                "NVIDIA CUDA GPU can run small vLLM launch artifacts with limited concurrency"
-                    .to_owned(),
-            ),
+            reason: Some(format!(
+                "NVIDIA CUDA GPU can run small vLLM launch artifacts with limited concurrency{}",
+                nvidia_memory_reason_suffix(profile, &nvidia)
+            )),
             est_tok_s: Some(45.0),
             n_layers_gpu: None,
             max_sessions: 2,
@@ -355,18 +366,30 @@ fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
 fn nvidia_usable_memory_bytes(profile: &HardwareProfile, gpus: &[&GpuInfo]) -> u64 {
     gpus.iter()
         .map(|gpu| {
-            gpu.memory_bytes.unwrap_or_else(|| {
-                if nvidia_gpu_uses_host_unified_memory(profile, gpu) {
+            if nvidia_gpu_uses_host_unified_memory(profile, gpu) {
+                gpu.memory_bytes.unwrap_or_else(|| {
                     profile
                         .memory
                         .available_bytes
                         .unwrap_or(profile.memory.total_bytes)
-                } else {
-                    0
-                }
-            })
+                })
+            } else {
+                gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
+            }
         })
         .sum()
+}
+
+fn nvidia_memory_reason_suffix(profile: &HardwareProfile, gpus: &[&GpuInfo]) -> &'static str {
+    if profile.host.os == "windows"
+        && gpus
+            .iter()
+            .any(|gpu| gpu.shared_memory_bytes.unwrap_or(0) > 0 && !gpu.unified_memory)
+    {
+        "; Windows WDDM shared GPU memory is reported but capacity uses dedicated VRAM only to avoid silent paging"
+    } else {
+        ""
+    }
 }
 
 fn nvidia_gpu_uses_host_unified_memory(profile: &HardwareProfile, gpu: &GpuInfo) -> bool {
@@ -411,7 +434,7 @@ fn trt_llm_verdict(profile: &HardwareProfile) -> BackendVerdict {
 
     let total_vram = nvidia
         .iter()
-        .filter_map(|gpu| gpu.memory_bytes)
+        .filter_map(|gpu| gpu.dedicated_memory_bytes.or(gpu.memory_bytes))
         .sum::<u64>();
     let best_cc = nvidia
         .iter()
@@ -526,7 +549,7 @@ fn llama_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
         .gpus
         .iter()
         .filter(|gpu| gpu.vendor != GpuVendor::Apple)
-        .filter_map(|gpu| gpu.memory_bytes)
+        .filter_map(|gpu| gpu.dedicated_memory_bytes.or(gpu.memory_bytes))
         .sum::<u64>();
     let has_accel = profile.gpus.iter().any(|gpu| {
         matches!(
@@ -547,6 +570,29 @@ fn llama_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
             n_layers_gpu,
             max_sessions: 2,
             kv_cache_bytes_budget: total_gpu_mem / 3,
+        }
+    } else if windows_wddm_shared_memory_without_dedicated_capacity(profile, total_gpu_mem)
+        && profile.memory.total_bytes >= 8 * GIB
+    {
+        BackendVerdict {
+            backend: "llama.cpp".to_owned(),
+            status: VerdictStatus::CpuOnly,
+            reason: Some(format!(
+                "{}; Windows WDDM shared GPU memory is ignored to avoid silent paging",
+                cpu_reason(&profile.cpu)
+            )),
+            est_tok_s: Some(if profile.cpu.flags.avx2 || profile.cpu.flags.neon {
+                7.0
+            } else {
+                3.5
+            }),
+            n_layers_gpu: Some(0),
+            max_sessions: 1,
+            kv_cache_bytes_budget: profile
+                .memory
+                .available_bytes
+                .unwrap_or(profile.memory.total_bytes)
+                / 5,
         }
     } else if has_accel && profile.memory.total_bytes >= 16 * GIB {
         let unified = profile.memory.unified_memory
@@ -598,6 +644,18 @@ fn llama_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
             "less than 8 GiB RAM available for baseline GGUF serving",
         )
     }
+}
+
+fn windows_wddm_shared_memory_without_dedicated_capacity(
+    profile: &HardwareProfile,
+    total_gpu_mem: u64,
+) -> bool {
+    profile.host.os == "windows"
+        && total_gpu_mem < 8 * GIB
+        && profile
+            .gpus
+            .iter()
+            .any(|gpu| gpu.shared_memory_bytes.unwrap_or(0) > 0 && !gpu.unified_memory)
 }
 
 fn stable_diffusion_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
@@ -733,12 +791,23 @@ fn probe_host(options: ProbeOptions) -> HardwareProfile {
     }
 
     let mut gpus = Vec::new();
+    let windows_gpu_memory = probe_windows_gpu_memory();
     gpus.extend(probe_apple_metal(&host, &memory));
-    gpus.extend(probe_nvidia());
+    gpus.extend(probe_windows_dxdiag_adapters(&windows_gpu_memory));
+    gpus.extend(probe_nvidia(&windows_gpu_memory));
     gpus.extend(probe_rocm());
     gpus.extend(probe_vulkan());
     dedupe_gpus(&mut gpus);
     mark_nvidia_host_unified_memory(&host, &mut memory, &mut gpus);
+    if host.os == "windows"
+        && gpus
+            .iter()
+            .any(|gpu| gpu.shared_memory_bytes.unwrap_or(0) > 0 && !gpu.unified_memory)
+    {
+        warnings.push(
+            "Windows WDDM shared GPU memory detected; provider capacity ignores shared memory to avoid silent paging".to_owned(),
+        );
+    }
 
     let tee = probe_tee(&gpus);
     HardwareProfile {
@@ -879,11 +948,27 @@ fn probe_memory(host: &HostInfo) -> MemoryInfo {
         }
     } else {
         MemoryInfo {
-            total_bytes: 0,
-            available_bytes: None,
+            total_bytes: windows_memory_bytes(0).unwrap_or(0),
+            available_bytes: windows_memory_bytes(1),
             unified_memory: false,
         }
     }
+}
+
+fn windows_memory_bytes(index: usize) -> Option<u64> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let output = command_stdout(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "$m=Get-CimInstance Win32_OperatingSystem; [Console]::WriteLine([string]$m.TotalVisibleMemorySize + ',' + [string]$m.FreePhysicalMemory)",
+        ],
+    )?;
+    let kib = output.split(',').nth(index)?.trim().parse::<u64>().ok()?;
+    kib.checked_mul(1024)
 }
 
 fn meminfo_kib(text: &str, key: &str) -> Option<u64> {
@@ -991,6 +1076,8 @@ fn probe_apple_metal(host: &HostInfo, memory: &MemoryInfo) -> Vec<GpuInfo> {
             .unwrap_or_else(|| "Apple Silicon GPU".to_owned()),
         backend: GpuBackend::Metal,
         memory_bytes: Some(memory.total_bytes),
+        dedicated_memory_bytes: None,
+        shared_memory_bytes: None,
         unified_memory: true,
         compute_capability: None,
         supports_nvfp4: false,
@@ -999,7 +1086,9 @@ fn probe_apple_metal(host: &HostInfo, memory: &MemoryInfo) -> Vec<GpuInfo> {
     }]
 }
 
-fn probe_nvidia() -> Vec<GpuInfo> {
+fn probe_nvidia(
+    windows_memory: &std::collections::BTreeMap<String, WindowsGpuMemorySplit>,
+) -> Vec<GpuInfo> {
     let Some(output) = command_stdout(
         "nvidia-smi",
         &[
@@ -1026,11 +1115,16 @@ fn probe_nvidia() -> Vec<GpuInfo> {
         let cc = compute_capability
             .as_deref()
             .and_then(parse_compute_capability);
+        let split = windows_memory_split_for_name(&windows_memory, parts[0]);
+        let dedicated_memory_bytes =
+            memory_bytes.or_else(|| split.as_ref().and_then(|split| split.dedicated_bytes));
         gpus.push(GpuInfo {
             vendor: GpuVendor::Nvidia,
             name: parts[0].to_owned(),
             backend: GpuBackend::Nvml,
-            memory_bytes,
+            memory_bytes: dedicated_memory_bytes,
+            dedicated_memory_bytes,
+            shared_memory_bytes: split.and_then(|split| split.shared_bytes),
             unified_memory: false,
             compute_capability,
             supports_nvfp4: cc.is_some_and(|cc| cc >= (10, 0)),
@@ -1070,6 +1164,217 @@ fn nvidia_host_unified_memory_signal(host: &HostInfo, gpu: &GpuInfo) -> bool {
         && matches!(host.arch.as_str(), "aarch64" | "arm64")
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WindowsGpuMemorySplit {
+    name: String,
+    manufacturer: Option<String>,
+    dedicated_bytes: Option<u64>,
+    shared_bytes: Option<u64>,
+}
+
+fn windows_memory_split_for_name(
+    memory: &std::collections::BTreeMap<String, WindowsGpuMemorySplit>,
+    name: &str,
+) -> Option<WindowsGpuMemorySplit> {
+    let key = normalize_gpu_name(name);
+    memory.get(&key).cloned().or_else(|| {
+        memory
+            .iter()
+            .find(|(candidate, _)| candidate.contains(&key) || key.contains(*candidate))
+            .map(|(_, split)| split.clone())
+    })
+}
+
+fn normalize_gpu_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn probe_windows_gpu_memory() -> std::collections::BTreeMap<String, WindowsGpuMemorySplit> {
+    let dxdiag = probe_windows_dxdiag_memory();
+    if !dxdiag.is_empty() {
+        return dxdiag;
+    }
+    probe_windows_cim_gpu_memory()
+}
+
+fn probe_windows_dxdiag_memory() -> std::collections::BTreeMap<String, WindowsGpuMemorySplit> {
+    if !cfg!(target_os = "windows") {
+        return std::collections::BTreeMap::new();
+    }
+    let path = env::temp_dir().join(format!(
+        "mayhem-dxdiag-{}-{}.txt",
+        std::process::id(),
+        monotonic_nanos()
+    ));
+    let status = Command::new("dxdiag")
+        .args(["/whql:off", "/t", path.to_string_lossy().as_ref()])
+        .status();
+    if !status.is_ok_and(|status| status.success()) {
+        let _ = fs::remove_file(&path);
+        return std::collections::BTreeMap::new();
+    }
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let _ = fs::remove_file(&path);
+    parse_dxdiag_memory_splits(&text)
+}
+
+fn probe_windows_cim_gpu_memory() -> std::collections::BTreeMap<String, WindowsGpuMemorySplit> {
+    if !cfg!(target_os = "windows") {
+        return std::collections::BTreeMap::new();
+    }
+    let Some(output) = command_stdout(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | ForEach-Object { [Console]::WriteLine(($_.Name -replace '\\|',' ') + '|' + ($_.AdapterCompatibility -replace '\\|',' ') + '|' + [string]$_.AdapterRAM) }",
+        ],
+    ) else {
+        return std::collections::BTreeMap::new();
+    };
+    parse_windows_cim_video_controller_memory(
+        &output,
+        windows_memory_bytes(0).map(|bytes| bytes / 2),
+    )
+}
+
+fn probe_windows_dxdiag_adapters(
+    memory: &std::collections::BTreeMap<String, WindowsGpuMemorySplit>,
+) -> Vec<GpuInfo> {
+    if !cfg!(target_os = "windows") {
+        return Vec::new();
+    }
+    windows_dxdiag_adapters_from_memory(memory)
+}
+
+fn windows_dxdiag_adapters_from_memory(
+    memory: &std::collections::BTreeMap<String, WindowsGpuMemorySplit>,
+) -> Vec<GpuInfo> {
+    memory
+        .values()
+        .filter(|split| !windows_dxdiag_is_software_adapter(split))
+        .map(|split| {
+            let vendor = windows_dxdiag_vendor(split);
+            let cc = None;
+            GpuInfo {
+                vendor,
+                name: split.name.clone(),
+                backend: GpuBackend::Vulkan,
+                memory_bytes: split.dedicated_bytes,
+                dedicated_memory_bytes: split.dedicated_bytes,
+                shared_memory_bytes: split.shared_bytes,
+                unified_memory: false,
+                compute_capability: cc,
+                supports_nvfp4: false,
+                supports_fp8: false,
+                supports_tensor_parallel: false,
+            }
+        })
+        .collect()
+}
+
+fn windows_dxdiag_vendor(split: &WindowsGpuMemorySplit) -> GpuVendor {
+    let haystack = format!(
+        "{} {}",
+        split.name,
+        split.manufacturer.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if haystack.contains("nvidia") {
+        GpuVendor::Nvidia
+    } else if haystack.contains("amd")
+        || haystack.contains("advanced micro devices")
+        || haystack.contains("radeon")
+    {
+        GpuVendor::Amd
+    } else if haystack.contains("intel") || haystack.contains("arc graphics") {
+        GpuVendor::Intel
+    } else {
+        GpuVendor::Unknown
+    }
+}
+
+fn windows_dxdiag_is_software_adapter(split: &WindowsGpuMemorySplit) -> bool {
+    let name = split.name.to_ascii_lowercase();
+    name.contains("microsoft basic render")
+        || name.contains("software")
+        || (split.dedicated_bytes.unwrap_or(0) == 0 && split.shared_bytes.unwrap_or(0) == 0)
+}
+
+fn parse_dxdiag_memory_splits(
+    text: &str,
+) -> std::collections::BTreeMap<String, WindowsGpuMemorySplit> {
+    let mut out = std::collections::BTreeMap::<String, WindowsGpuMemorySplit>::new();
+    let mut current_name: Option<String> = None;
+    let mut current = WindowsGpuMemorySplit::default();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed
+            .strip_prefix("Card name:")
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if let Some(name) = current_name.take() {
+                current.name = name.clone();
+                out.insert(normalize_gpu_name(&name), current);
+                current = WindowsGpuMemorySplit::default();
+            }
+            current_name = Some(name.to_owned());
+            continue;
+        }
+        if current_name.is_none() {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Dedicated Memory:") {
+            current.dedicated_bytes = parse_memory_bytes_line(value.trim());
+        } else if let Some(value) = trimmed.strip_prefix("Shared Memory:") {
+            current.shared_bytes = parse_memory_bytes_line(value.trim());
+        } else if let Some(value) = trimmed.strip_prefix("Manufacturer:") {
+            current.manufacturer = Some(value.trim().to_owned()).filter(|value| !value.is_empty());
+        }
+    }
+    if let Some(name) = current_name.take() {
+        current.name = name.clone();
+        out.insert(normalize_gpu_name(&name), current);
+    }
+    out
+}
+
+fn parse_windows_cim_video_controller_memory(
+    text: &str,
+    shared_bytes: Option<u64>,
+) -> std::collections::BTreeMap<String, WindowsGpuMemorySplit> {
+    let mut out = std::collections::BTreeMap::<String, WindowsGpuMemorySplit>::new();
+    for line in text.lines() {
+        let mut parts = line.split('|').map(str::trim);
+        let Some(name) = parts.next().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let manufacturer = parts
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let dedicated_bytes = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0);
+        out.insert(
+            normalize_gpu_name(name),
+            WindowsGpuMemorySplit {
+                name: name.to_owned(),
+                manufacturer,
+                dedicated_bytes,
+                shared_bytes,
+            },
+        );
+    }
+    out
+}
+
 fn probe_rocm() -> Vec<GpuInfo> {
     let Some(output) = command_stdout("rocm-smi", &["--showproductname"]) else {
         return Vec::new();
@@ -1094,6 +1399,8 @@ fn probe_rocm() -> Vec<GpuInfo> {
                 name,
                 backend: GpuBackend::Rocm,
                 memory_bytes: memory_bytes.get(idx).copied(),
+                dedicated_memory_bytes: memory_bytes.get(idx).copied(),
+                shared_memory_bytes: None,
                 unified_memory: false,
                 compute_capability: None,
                 supports_nvfp4: false,
@@ -1129,6 +1436,8 @@ fn probe_vulkan() -> Vec<GpuInfo> {
                 name: name.to_owned(),
                 backend: GpuBackend::Vulkan,
                 memory_bytes: memory_by_name.get(name).copied(),
+                dedicated_memory_bytes: memory_by_name.get(name).copied(),
+                shared_memory_bytes: None,
                 unified_memory: false,
                 compute_capability: None,
                 supports_nvfp4: false,
@@ -1341,6 +1650,8 @@ fn fixture_profile(fixture: FixtureProfile, disk_path: &Path) -> HardwareProfile
                 name: "Apple M3 Max GPU".to_owned(),
                 backend: GpuBackend::Metal,
                 memory_bytes: Some(64 * GIB),
+                dedicated_memory_bytes: None,
+                shared_memory_bytes: None,
                 unified_memory: true,
                 compute_capability: None,
                 supports_nvfp4: false,
@@ -1383,6 +1694,8 @@ fn fixture_profile(fixture: FixtureProfile, disk_path: &Path) -> HardwareProfile
                     name: "NVIDIA RTX PRO 6000 Blackwell".to_owned(),
                     backend: GpuBackend::Nvml,
                     memory_bytes: Some(96 * GIB),
+                    dedicated_memory_bytes: Some(96 * GIB),
+                    shared_memory_bytes: None,
                     unified_memory: false,
                     compute_capability: Some("10.0".to_owned()),
                     supports_nvfp4: true,
@@ -1394,6 +1707,8 @@ fn fixture_profile(fixture: FixtureProfile, disk_path: &Path) -> HardwareProfile
                     name: "NVIDIA RTX PRO 6000 Blackwell".to_owned(),
                     backend: GpuBackend::Nvml,
                     memory_bytes: Some(96 * GIB),
+                    dedicated_memory_bytes: Some(96 * GIB),
+                    shared_memory_bytes: None,
                     unified_memory: false,
                     compute_capability: Some("10.0".to_owned()),
                     supports_nvfp4: true,
@@ -1522,13 +1837,20 @@ pub fn human_report(report: &HardwareReport) -> String {
         for gpu in &report.gpus {
             let _ = writeln!(
                 out,
-                "  - {:?} {:?}: {} mem={} cc={} nvfp4={} fp8={} tp={}",
+                "  - {:?} {:?}: {} usable={} dedicated={} shared={} unified={} cc={} nvfp4={} fp8={} tp={}",
                 gpu.vendor,
                 gpu.backend,
                 gpu.name,
                 gpu.memory_bytes
                     .map(format_bytes)
                     .unwrap_or_else(|| "unknown".to_owned()),
+                gpu.dedicated_memory_bytes
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                gpu.shared_memory_bytes
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                yes_no(gpu.unified_memory),
                 gpu.compute_capability.as_deref().unwrap_or("n/a"),
                 yes_no(gpu.supports_nvfp4),
                 yes_no(gpu.supports_fp8),
@@ -1672,6 +1994,7 @@ mod tests {
         profile.gpus.truncate(1);
         profile.gpus[0].name = "NVIDIA GB10".to_owned();
         profile.gpus[0].memory_bytes = None;
+        profile.gpus[0].dedicated_memory_bytes = None;
         profile.gpus[0].unified_memory = false;
         profile.gpus[0].compute_capability = Some("12.1".to_owned());
         let report = report_from_profile(profile);
@@ -1697,6 +2020,7 @@ mod tests {
         profile.gpus.truncate(1);
         profile.gpus[0].name = "NVIDIA GB10".to_owned();
         profile.gpus[0].memory_bytes = None;
+        profile.gpus[0].dedicated_memory_bytes = None;
         profile.gpus[0].unified_memory = false;
 
         mark_nvidia_host_unified_memory(&profile.host, &mut profile.memory, &mut profile.gpus);
@@ -1710,6 +2034,7 @@ mod tests {
         let mut small = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
         small.gpus.truncate(1);
         small.gpus[0].memory_bytes = Some(8 * GIB);
+        small.gpus[0].dedicated_memory_bytes = Some(8 * GIB);
         let small_report = report_from_profile(small);
         let small_layers = small_report
             .backend_verdicts
@@ -1721,6 +2046,7 @@ mod tests {
         let mut large = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
         large.gpus.truncate(1);
         large.gpus[0].memory_bytes = Some(24 * GIB);
+        large.gpus[0].dedicated_memory_bytes = Some(24 * GIB);
         let large_report = report_from_profile(large);
         let large_layers = large_report
             .backend_verdicts
@@ -1764,6 +2090,161 @@ VkPhysicalDeviceMemoryProperties:
         let parsed = parse_vulkan_device_local_memory_bytes(output);
         assert_eq!(parsed.get("AMD Radeon Test"), Some(&(8 * GIB)));
         assert!(parsed.get("Software Rasterizer").is_none());
+    }
+
+    #[test]
+    fn parses_dxdiag_dedicated_and_shared_memory() {
+        let output = r#"
+---------------
+Display Devices
+---------------
+           Card name: NVIDIA GeForce RTX 4090
+        Manufacturer: NVIDIA
+        Display Memory: 56950 MB
+      Dedicated Memory: 24142 MB
+          Shared Memory: 32808 MB
+           Card name: Microsoft Basic Render Driver
+        Manufacturer: Microsoft
+      Dedicated Memory: 0 MB
+          Shared Memory: 32768 MB
+"#;
+        let parsed = parse_dxdiag_memory_splits(output);
+        let split = windows_memory_split_for_name(&parsed, "NVIDIA GeForce RTX 4090").unwrap();
+        assert_eq!(split.name, "NVIDIA GeForce RTX 4090");
+        assert_eq!(split.manufacturer.as_deref(), Some("NVIDIA"));
+        assert_eq!(split.dedicated_bytes, Some(24_142 * MIB));
+        assert_eq!(split.shared_bytes, Some(32_808 * MIB));
+    }
+
+    #[test]
+    fn windows_dxdiag_reports_non_nvidia_adapters_without_counting_shared_memory() {
+        let output = r#"
+           Card name: AMD Radeon RX 7900 XTX
+        Manufacturer: Advanced Micro Devices, Inc.
+      Dedicated Memory: 24576 MB
+          Shared Memory: 32768 MB
+           Card name: Intel(R) UHD Graphics
+        Manufacturer: Intel Corporation
+      Dedicated Memory: 128 MB
+          Shared Memory: 32768 MB
+           Card name: Microsoft Basic Render Driver
+        Manufacturer: Microsoft
+      Dedicated Memory: 0 MB
+          Shared Memory: 32768 MB
+"#;
+        let parsed = parse_dxdiag_memory_splits(output);
+        let adapters = windows_dxdiag_adapters_from_memory(&parsed);
+
+        assert_eq!(adapters.len(), 2);
+        let amd = adapters
+            .iter()
+            .find(|gpu| gpu.name.contains("7900"))
+            .expect("amd adapter");
+        assert_eq!(amd.vendor, GpuVendor::Amd);
+        assert_eq!(amd.backend, GpuBackend::Vulkan);
+        assert_eq!(amd.memory_bytes, Some(24_576 * MIB));
+        assert_eq!(amd.shared_memory_bytes, Some(32_768 * MIB));
+
+        let intel = adapters
+            .iter()
+            .find(|gpu| gpu.name.contains("Intel"))
+            .expect("intel adapter");
+        assert_eq!(intel.vendor, GpuVendor::Intel);
+        assert_eq!(intel.memory_bytes, Some(128 * MIB));
+        assert_eq!(intel.shared_memory_bytes, Some(32_768 * MIB));
+    }
+
+    #[test]
+    fn parses_windows_cim_video_controller_memory_with_shared_ceiling() {
+        let output = r#"
+NVIDIA GeForce RTX 4090|NVIDIA|4293918720
+AMD Radeon(TM) Graphics|Advanced Micro Devices, Inc.|536870912
+"#;
+        let parsed = parse_windows_cim_video_controller_memory(output, Some(32 * GIB));
+
+        let nvidia = windows_memory_split_for_name(&parsed, "NVIDIA GeForce RTX 4090").unwrap();
+        assert_eq!(nvidia.manufacturer.as_deref(), Some("NVIDIA"));
+        assert_eq!(nvidia.dedicated_bytes, Some(4_293_918_720));
+        assert_eq!(nvidia.shared_bytes, Some(32 * GIB));
+
+        let amd = windows_memory_split_for_name(&parsed, "AMD Radeon(TM) Graphics").unwrap();
+        assert_eq!(
+            amd.manufacturer.as_deref(),
+            Some("Advanced Micro Devices, Inc.")
+        );
+        assert_eq!(amd.dedicated_bytes, Some(536_870_912));
+        assert_eq!(amd.shared_bytes, Some(32 * GIB));
+    }
+
+    #[test]
+    fn windows_shared_memory_only_gpu_falls_back_to_cpu_not_partial_offload() {
+        let mut profile = fixture_profile(FixtureProfile::CpuOnly, Path::new("."));
+        profile.host.os = "windows".to_owned();
+        profile.host.family = "windows".to_owned();
+        profile.memory.total_bytes = 32 * GIB;
+        profile.memory.available_bytes = Some(24 * GIB);
+        profile.gpus = vec![GpuInfo {
+            vendor: GpuVendor::Unknown,
+            name: "Intel(R) UHD Graphics".to_owned(),
+            backend: GpuBackend::Vulkan,
+            memory_bytes: Some(128 * MIB),
+            dedicated_memory_bytes: Some(128 * MIB),
+            shared_memory_bytes: Some(16 * GIB),
+            unified_memory: false,
+            compute_capability: None,
+            supports_nvfp4: false,
+            supports_fp8: false,
+            supports_tensor_parallel: false,
+        }];
+
+        let report = report_from_profile(profile);
+        let llama = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "llama.cpp")
+            .unwrap();
+        assert_eq!(llama.status, VerdictStatus::CpuOnly);
+        assert_eq!(llama.n_layers_gpu, Some(0));
+        assert!(llama
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("WDDM shared GPU memory is ignored"));
+    }
+
+    #[test]
+    fn windows_wddm_shared_memory_is_reported_but_not_used_for_capacity() {
+        let mut profile = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        profile.host.os = "windows".to_owned();
+        profile.host.family = "windows".to_owned();
+        profile.memory.total_bytes = 64 * GIB;
+        profile.memory.available_bytes = Some(48 * GIB);
+        profile.gpus.truncate(1);
+        profile.gpus[0].name = "NVIDIA GeForce RTX 4090".to_owned();
+        profile.gpus[0].memory_bytes = Some(24 * GIB);
+        profile.gpus[0].dedicated_memory_bytes = Some(24 * GIB);
+        profile.gpus[0].shared_memory_bytes = Some(32 * GIB);
+        profile.gpus[0].compute_capability = Some("8.9".to_owned());
+        profile.warnings.push(
+            "Windows WDDM shared GPU memory detected; provider capacity ignores shared memory to avoid silent paging".to_owned(),
+        );
+
+        let report = report_from_profile(profile);
+        let vllm = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "vllm")
+            .unwrap();
+
+        assert_eq!(vllm.kv_cache_bytes_budget, 12 * GIB);
+        assert!(vllm
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("dedicated VRAM only"));
+        let human = human_report(&report);
+        assert!(human.contains("dedicated=24.0 GiB"));
+        assert!(human.contains("shared=32.0 GiB"));
     }
 
     #[test]

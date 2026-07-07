@@ -745,6 +745,52 @@ exec "$@""#,
     command
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct WorkerContainment {
+    _job: Option<win32job::Job>,
+}
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct WorkerContainment;
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+fn attach_worker_containment(
+    child: &std::process::Child,
+    memory_limit_bytes: Option<u64>,
+) -> Result<WorkerContainment> {
+    use std::os::windows::io::AsRawHandle;
+
+    let Some(bytes) = memory_limit_bytes.filter(|bytes| *bytes > 0) else {
+        return Ok(WorkerContainment::default());
+    };
+    let max = usize::try_from(bytes).map_err(|_| {
+        EngineError::InvalidConfig(format!(
+            "Windows worker memory limit {bytes} exceeds this process address size"
+        ))
+    })?;
+    let mut limit = win32job::ExtendedLimitInfo::new();
+    limit.limit_working_memory(1, max).limit_kill_on_job_close();
+    let job = win32job::Job::create_with_limit_info(&limit)
+        .map_err(|err| EngineError::Io(std::io::Error::from(err)))?;
+    job.assign_process(child.as_raw_handle() as isize)
+        .map_err(|err| EngineError::Io(std::io::Error::from(err)))?;
+    Ok(WorkerContainment { _job: Some(job) })
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn attach_worker_containment(
+    _child: &std::process::Child,
+    _memory_limit_bytes: Option<u64>,
+) -> Result<WorkerContainment> {
+    Ok(WorkerContainment)
+}
+
 pub fn tool_call_json_schema(tools: &[ToolSpec]) -> Result<Value> {
     if tools.is_empty() {
         return Err(EngineError::InvalidConfig(
@@ -2803,9 +2849,10 @@ mod llama_cpp_backend {
 #[cfg(feature = "mlx")]
 mod mlx_backend {
     use super::{
-        engine_worker_command, validate_load_config, verify_artifact, ArtifactFormat,
-        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
-        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        attach_worker_containment, engine_worker_command, validate_load_config, verify_artifact,
+        ArtifactFormat, EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest,
+        LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -2997,6 +3044,7 @@ mod mlx_backend {
 
     struct MlxWorker {
         child: Child,
+        _containment: WorkerContainment,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
     }
@@ -3025,8 +3073,13 @@ mod mlx_backend {
                 .stdout
                 .take()
                 .ok_or_else(|| EngineError::Mlx("opening worker stdout failed".to_owned()))?;
+            let containment =
+                attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
+                    EngineError::Mlx(format!("applying worker containment failed: {err}"))
+                })?;
             Ok(Self {
                 child,
+                _containment: containment,
                 stdin,
                 stdout: BufReader::new(stdout),
             })
@@ -3081,10 +3134,10 @@ mod mlx_backend {
 #[cfg(feature = "vllm")]
 mod vllm_backend {
     use super::{
-        engine_worker_command, validate_load_config, verify_artifact,
+        attach_worker_containment, engine_worker_command, validate_load_config, verify_artifact,
         vllm_safetensors_payload_path, ArtifactFormat, EngineBackend, EngineError, FinishReason,
         GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk,
-        TokenSink, Tokenization, UsageCounters,
+        TokenSink, Tokenization, UsageCounters, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -3282,6 +3335,7 @@ mod vllm_backend {
 
     struct VllmWorker {
         child: Child,
+        _containment: WorkerContainment,
         stdin: ChildStdin,
         stdout_rx: Receiver<WorkerRead>,
         reader: Option<JoinHandle<()>>,
@@ -3321,10 +3375,15 @@ mod vllm_backend {
                 .stdout
                 .take()
                 .ok_or_else(|| EngineError::Vllm("opening worker stdout failed".to_owned()))?;
+            let containment =
+                attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
+                    EngineError::Vllm(format!("applying worker containment failed: {err}"))
+                })?;
             let (stdout_tx, stdout_rx) = mpsc::channel();
             let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
             Ok(Self {
                 child,
+                _containment: containment,
                 stdin,
                 stdout_rx,
                 reader: Some(reader),
@@ -3527,9 +3586,10 @@ mod vllm_backend {
 #[cfg(feature = "trt-llm")]
 mod trt_llm_backend {
     use super::{
-        engine_worker_command, validate_load_config, verify_artifact, ArtifactFormat,
-        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
-        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        attach_worker_containment, engine_worker_command, validate_load_config, verify_artifact,
+        ArtifactFormat, EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest,
+        LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -3740,6 +3800,7 @@ mod trt_llm_backend {
 
     struct TrtLlmWorker {
         child: Child,
+        _containment: WorkerContainment,
         stdin: ChildStdin,
         stdout_rx: Receiver<WorkerRead>,
         reader: Option<JoinHandle<()>>,
@@ -3779,10 +3840,15 @@ mod trt_llm_backend {
                 .stdout
                 .take()
                 .ok_or_else(|| EngineError::TrtLlm("opening worker stdout failed".to_owned()))?;
+            let containment =
+                attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
+                    EngineError::TrtLlm(format!("applying worker containment failed: {err}"))
+                })?;
             let (stdout_tx, stdout_rx) = mpsc::channel();
             let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
             Ok(Self {
                 child,
+                _containment: containment,
                 stdin,
                 stdout_rx,
                 reader: Some(reader),
