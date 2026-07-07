@@ -90,10 +90,10 @@ const PROBE_VERIFICATION_METHODS = new Set([
   'seed_perceptual_hash',
   'attestation_of_compute',
 ]);
-const FRAUD_PROOF_REASONS = new Set(['over_credit']);
+const FRAUD_PROOF_REASONS = new Set(['over_credit', 'price_derivation']);
 const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
 const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit']);
-const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee'];
+const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee', 'price'];
 const EPOCH_TOTAL_KEYS = [
   'dep_count',
   'dep_mu',
@@ -103,6 +103,7 @@ const EPOCH_TOTAL_KEYS = [
   'earn_mu',
   'fee_mu',
   'fee_cum_mu',
+  'price_count',
 ];
 const ENCLAVE_UPDATE_FIELDS = [
   'model_class',
@@ -727,9 +728,10 @@ class MayhemContract extends Contract {
         proof_epoch: { type: 'number', integer: true, min: 1 },
         at: { type: 'number', integer: true, min: 0 },
         reason: { type: 'string', min: 1, max: 64 },
-        receipt: { type: 'any' },
-        claimed_mu_owed_cum: { type: 'number', integer: true, min: 0 },
+        receipt: { type: 'any', optional: true },
+        claimed_mu_owed_cum: { type: 'number', integer: true, min: 0, optional: true },
         previous_mu_owed_cum: { type: 'number', integer: true, min: 0, optional: true },
+        price_usage: { type: 'any', optional: true },
       },
     });
 
@@ -2765,6 +2767,18 @@ class MayhemContract extends Contract {
     });
     if (guardian instanceof Error) return guardian;
 
+    let marketPriceUpdates = [];
+    if (marketUsageProvided) {
+      marketPriceUpdates = await this.computeMarketPriceUpdates(marketUsageMap);
+      if (marketPriceUpdates instanceof Error) return marketPriceUpdates;
+    }
+    const priceDerivations = await this.priceDerivationsFromMarketUpdates(marketPriceUpdates, {
+      epoch: this.value.epoch,
+      at: this.value.at,
+      usageRoot: roots?.use ?? null,
+    });
+    if (priceDerivations instanceof Error) return priceDerivations;
+
     if (totals) {
       const totalsError = await this.validateEpochApplyTotals({
         epoch: this.value.epoch,
@@ -2775,13 +2789,9 @@ class MayhemContract extends Contract {
         nextFeeCum: nextFeeCumTotal,
         providerCount: grossEarningMap.size,
         earnCumTotal,
+        priceDerivations,
       });
       if (totalsError) return totalsError;
-    }
-    let marketPriceUpdates = [];
-    if (marketUsageProvided) {
-      marketPriceUpdates = await this.computeMarketPriceUpdates(marketUsageMap);
-      if (marketPriceUpdates instanceof Error) return marketPriceUpdates;
     }
 
     for (const balance of this.sortedRailRecords(balances, 'user')) {
@@ -2811,6 +2821,15 @@ class MayhemContract extends Contract {
         totals,
         feeDeltaMu: feeDeltaTotalMu,
         feeCumMu: nextFeeCumTotal,
+        priceDerivations,
+      });
+    } else if (priceDerivations.length > 0) {
+      await this.writePriceDerivationEvidence({
+        epoch: this.value.epoch,
+        at: this.value.at,
+        root: await this.priceDerivationRoot(priceDerivations),
+        count: priceDerivations.length,
+        derivations: priceDerivations,
       });
     }
     for (const update of marketPriceUpdates) {
@@ -2839,7 +2858,9 @@ class MayhemContract extends Contract {
         active_supply: update.active_supply,
         active_demand_mu: update.active_demand_mu,
         frozen: update.frozen,
+        derivation_hash: update.derivation_hash,
       }));
+      result.price_root = await this.priceDerivationRoot(priceDerivations);
     }
     console.log('mayhem epochApply', result);
     return result;
@@ -2911,20 +2932,66 @@ class MayhemContract extends Contract {
     const commit = await this.get(commitKey);
     if (!commit) return new Error('Epoch commit not found.');
 
-    const receipt = this.normalizeReceiptEnvelope(this.value.receipt);
-    if (receipt instanceof Error) return receipt;
-    if (!this.verifyReceiptEnvelope(receipt)) {
-      return new Error('Invalid receipt signature.');
+    let proofHashPayload;
+    let proof;
+    let proofHash = null;
+    let slashReason = 'receipt_forgery';
+    let slashEnclaveId = null;
+
+    if (this.value.reason === 'over_credit') {
+      if (!hasOwn(this.value, 'receipt')) return new Error('Over-credit fraud proof requires a receipt.');
+      if (!hasOwn(this.value, 'claimed_mu_owed_cum')) {
+        return new Error('Over-credit fraud proof requires claimed_mu_owed_cum.');
+      }
+      const receipt = this.normalizeReceiptEnvelope(this.value.receipt);
+      if (receipt instanceof Error) return receipt;
+      if (!this.verifyReceiptEnvelope(receipt)) {
+        return new Error('Invalid receipt signature.');
+      }
+      proofHashPayload = {
+        epoch: this.value.epoch,
+        proof_epoch: this.value.proof_epoch,
+        reason: this.value.reason,
+        receipt,
+        claimed_mu_owed_cum: this.value.claimed_mu_owed_cum,
+        previous_mu_owed_cum: this.value.previous_mu_owed_cum ?? 0,
+      };
+      proofHash = await this.fraudProofHash(proofHashPayload);
+      const existingProof = await this.get(`ev/fraud/${this.value.epoch}/${proofHash}`);
+      if (existingProof) {
+        return {
+          ok: true,
+          op: 'fraudProof',
+          epoch: this.value.epoch,
+          idempotent: true,
+          proof_hash: proofHash,
+          voided_commit: commit.commit_hash,
+          banned_submitter: commit.submitted_by,
+        };
+      }
+      proof = await this.validateOverCreditFraudProof(commit, receipt);
+      if (proof instanceof Error) return proof;
+      slashEnclaveId = receipt.body.enclave_id;
+    } else if (this.value.reason === 'price_derivation') {
+      if (!hasOwn(this.value, 'price_usage')) {
+        return new Error('Price derivation fraud proof requires price_usage.');
+      }
+      proof = await this.validatePriceDerivationFraudProof(commit);
+      if (proof instanceof Error) return proof;
+      proofHashPayload = {
+        epoch: this.value.epoch,
+        proof_epoch: this.value.proof_epoch,
+        reason: this.value.reason,
+        price_usage: proof.price_usage,
+        expected_price_root: proof.expected_price_root,
+        committed_price_root: proof.committed_price_root,
+        price_derivation_hash: proof.price_derivation_hash,
+      };
+      slashReason = 'price_forgery';
+      slashEnclaveId = proof.enclave_id;
     }
 
-    const proofHash = await this.fraudProofHash({
-      epoch: this.value.epoch,
-      proof_epoch: this.value.proof_epoch,
-      reason: this.value.reason,
-      receipt,
-      claimed_mu_owed_cum: this.value.claimed_mu_owed_cum,
-      previous_mu_owed_cum: this.value.previous_mu_owed_cum ?? 0,
-    });
+    proofHash ??= await this.fraudProofHash(proofHashPayload);
     const proofKey = `ev/fraud/${this.value.epoch}/${proofHash}`;
     const existingProof = await this.get(proofKey);
     if (existingProof) {
@@ -2939,9 +3006,6 @@ class MayhemContract extends Contract {
       };
     }
 
-    const proof = await this.validateOverCreditFraudProof(commit, receipt);
-    if (proof instanceof Error) return proof;
-
     if (commit.status === 'void') return new Error('Epoch commit is already void.');
     if (this.value.proof_epoch > commit.provisional_until_epoch) {
       return new Error('Epoch commit challenge window has closed.');
@@ -2953,16 +3017,24 @@ class MayhemContract extends Contract {
       proof_epoch: this.value.proof_epoch,
       reason: this.value.reason,
       proof_hash: proofHash,
-      receipt_hash: proof.receipt_hash,
-      actual_mu: proof.actual_mu,
-      claimed_mu: proof.claimed_mu,
-      committed_use_root: commit.roots.use,
       submitted_by: this.address,
       submitted_at: this.tx,
       at: this.value.at,
       voided_commit: commit.commit_hash,
       banned_submitter: commit.submitted_by,
     };
+    if (this.value.reason === 'over_credit') {
+      record.receipt_hash = proof.receipt_hash;
+      record.actual_mu = proof.actual_mu;
+      record.claimed_mu = proof.claimed_mu;
+      record.committed_use_root = commit.roots.use;
+    } else if (this.value.reason === 'price_derivation') {
+      record.price_usage = proof.price_usage;
+      record.committed_price_root = proof.committed_price_root;
+      record.expected_price_root = proof.expected_price_root;
+      record.price_derivation_hash = proof.price_derivation_hash;
+      record.price_derivation = proof.price_derivation;
+    }
     const updatedCommit = {
       ...commit,
       status: 'void',
@@ -2988,13 +3060,13 @@ class MayhemContract extends Contract {
       slash = await this.applyProviderSlash({
         providerId: commit.submitted_by,
         source: 'fraud_proof',
-        reason: 'receipt_forgery',
+        reason: slashReason,
         evidenceHash: proofHash,
         epoch: this.value.epoch,
         at: this.value.at,
         slashBps: FULL_SLASH_BPS,
         beneficiary: this.address,
-        enclaveId: receipt.body.enclave_id,
+        enclaveId: slashEnclaveId,
         banProvider: true,
         tombstoneEnclave: true,
       });
@@ -4890,15 +4962,18 @@ class MayhemContract extends Contract {
     );
   }
 
-  async computeMarketPriceUpdates(marketUsageMap) {
+  async computeMarketPriceUpdates(marketUsageMap, context = {}) {
+    const at = context.at ?? this.value.at;
+    const epoch = context.epoch ?? this.value.epoch;
+    const tx = context.tx ?? this.tx;
     const updates = [];
     for (const usage of this.mapMarketUsageEntriesForHash(marketUsageMap)) {
       const enclave = await this.get(`enclave/${usage.enclave_id}`);
       if (!enclave || enclave.status !== 'active') return new Error('Market usage enclave is not active.');
       const scheduleKey = `price/${usage.enclave_id}`;
       const storedSchedule = await this.priceSchedule(scheduleKey, enclave);
-      const schedule = this.priceScheduleAt(storedSchedule, this.value.at);
-      const current = this.priceActiveEntry(schedule, this.value.at);
+      const schedule = this.priceScheduleAt(storedSchedule, at);
+      const current = this.priceActiveEntry(schedule, at);
       if (!current) return new Error('Market usage enclave has no admin price seed.');
       const seed = this.priceSeedEntry(current);
       if (!seed || seed.set_by_role !== 'admin') {
@@ -4939,8 +5014,6 @@ class MayhemContract extends Contract {
       if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
       if (nextTerms.per_req_mu instanceof Error) return nextTerms.per_req_mu;
       if (nextTerms.min_session_mu instanceof Error) return nextTerms.min_session_mu;
-      if (frozen && this.priceTermsEqual(current, nextTerms)) continue;
-
       const latest = this.priceLatestEntry(schedule);
       const record = {
         enclave_id: current.enclave_id,
@@ -4950,9 +5023,9 @@ class MayhemContract extends Contract {
         rate_map: nextTerms.rate_map,
         per_req_mu: nextTerms.per_req_mu,
         min_session_mu: nextTerms.min_session_mu,
-        effective_at: this.value.at,
-        effective_from: this.tx,
-        updated_at: this.tx,
+        effective_at: at,
+        effective_from: tx,
+        updated_at: tx,
         set_by: seed.set_by,
         set_by_role: 'admin',
         price_source: frozen ? 'admin_seed_cold_start' : 'market_float',
@@ -4960,7 +5033,7 @@ class MayhemContract extends Contract {
         market: {
           schema_version: 1,
           source: 'settled_epoch_usage',
-          epoch: this.value.epoch,
+          epoch,
           active_supply: activeSupply,
           active_demand_mu: usage.demand_mu,
           session_count: usage.session_count,
@@ -4974,6 +5047,9 @@ class MayhemContract extends Contract {
           frozen_reason: frozen ? 'cold_start_min_providers' : null,
           constants: this.marketPriceConstants(),
           previous_price_ver: current.ver,
+          previous_rate_map: cloneValue(current.rate_map),
+          previous_per_req_mu: current.per_req_mu,
+          previous_min_session_mu: current.min_session_mu,
           seed_price_ver: seed.ver,
         },
       };
@@ -6331,7 +6407,7 @@ class MayhemContract extends Contract {
       keys.length !== EPOCH_ROOT_KEYS.length ||
       keys.some((key, idx) => key !== EPOCH_ROOT_KEYS.slice().sort()[idx])
     ) {
-      return new Error('Epoch roots must include dep, use, earn, and fee.');
+      return new Error('Epoch roots must include dep, use, earn, fee, and price.');
     }
     const roots = {};
     for (const key of EPOCH_ROOT_KEYS) {
@@ -6644,6 +6720,174 @@ class MayhemContract extends Contract {
     };
   }
 
+  priceTermsSnapshot(record) {
+    return {
+      ver: record.ver,
+      rate_map: cloneValue(record.rate_map),
+      per_req_mu: record.per_req_mu,
+      min_session_mu: record.min_session_mu,
+    };
+  }
+
+  priceDerivationLeafValue(derivation) {
+    const {
+      derivation_hash: _derivationHash,
+      price_root: _priceRoot,
+      updated_at: _updatedAt,
+      ...leaf
+    } = derivation;
+    return leaf;
+  }
+
+  priceDerivationFromMarketUpdate(update, { epoch, at, usageRoot = null } = {}) {
+    const record = update.record;
+    const market = record.market;
+    if (!record || !market || typeof market !== 'object') {
+      return new Error('Market price update is missing derivation data.');
+    }
+    return {
+      type: 'price_derivation',
+      schema_version: 1,
+      epoch,
+      at,
+      enclave_id: record.enclave_id,
+      model_id: record.model_id,
+      denom: record.denom,
+      price_ver: record.ver,
+      price_source: record.price_source,
+      usage: {
+        usage_root: usageRoot,
+        active_demand_mu: market.active_demand_mu,
+        session_count: market.session_count,
+      },
+      controller: {
+        source: market.source,
+        active_supply: market.active_supply,
+        utilization_bps: market.utilization_bps,
+        ema_utilization_bps: market.ema_utilization_bps,
+        multiplier_bps: market.multiplier_bps,
+        frozen: market.frozen,
+        frozen_reason: market.frozen_reason,
+        constants: cloneValue(market.constants),
+      },
+      seed_price: this.priceTermsSnapshot(record.seed),
+      previous_price: {
+        ver: market.previous_price_ver,
+        rate_map: cloneValue(market.previous_rate_map),
+        per_req_mu: market.previous_per_req_mu,
+        min_session_mu: market.previous_min_session_mu,
+      },
+      desired_price: {
+        rate_map: cloneValue(market.desired_rate_map),
+        per_req_mu: market.desired_per_req_mu,
+        min_session_mu: market.desired_min_session_mu,
+      },
+      result_price: this.priceTermsSnapshot(record),
+    };
+  }
+
+  async priceDerivationsFromMarketUpdates(updates, context = {}) {
+    const derivations = [];
+    const sorted = updates.slice().sort((left, right) => compareCodepoint(left.enclave_id, right.enclave_id));
+    for (const update of sorted) {
+      const derivation = this.priceDerivationFromMarketUpdate(update, context);
+      if (derivation instanceof Error) return derivation;
+      const derivationHash = await this.priceDerivationLeafHash(derivation);
+      update.derivation_hash = derivationHash;
+      derivations.push({
+        ...derivation,
+        derivation_hash: derivationHash,
+      });
+    }
+    const priceRoot = await this.priceDerivationRoot(derivations);
+    for (const derivation of derivations) {
+      derivation.price_root = priceRoot;
+    }
+    return derivations;
+  }
+
+  async priceDerivationLeafHash(derivation) {
+    return await this.opaqueHash('mayhem-price-derivation-leaf-v1', this.priceDerivationLeafValue(derivation));
+  }
+
+  async merkleRoot(kind, leaves) {
+    if (leaves.length === 0) return await this.opaqueHash(`mayhem-${kind}-empty-root-v1`, {});
+    let level = leaves.slice().sort();
+    while (level.length > 1) {
+      const next = [];
+      for (let idx = 0; idx < level.length; idx += 2) {
+        const left = level[idx];
+        const right = idx + 1 < level.length ? level[idx + 1] : left;
+        next.push(await this.opaqueHash(`mayhem-${kind}-node-v1`, { left, right }));
+      }
+      level = next;
+    }
+    return level[0];
+  }
+
+  async priceDerivationRoot(derivations) {
+    const leaves = [];
+    for (const derivation of derivations) {
+      leaves.push(await this.priceDerivationLeafHash(derivation));
+    }
+    return await this.merkleRoot('price', leaves);
+  }
+
+  normalizePriceProofUsage(value) {
+    const usageMap = this.aggregateMarketUsageEntries([value]);
+    if (usageMap instanceof Error) return usageMap;
+    const entries = this.mapMarketUsageEntriesForHash(usageMap);
+    if (entries.length !== 1) return new Error('Price derivation proof requires one market usage entry.');
+    return entries[0];
+  }
+
+  async validatePriceDerivationFraudProof(commit) {
+    if (commit.status === 'void') return new Error('Epoch commit is already void.');
+    if (this.value.proof_epoch > commit.provisional_until_epoch) {
+      return new Error('Epoch commit challenge window has closed.');
+    }
+    if (commit.totals.price_count !== 1) {
+      return new Error('Price derivation proof requires a single committed price derivation.');
+    }
+    const priceUsage = this.normalizePriceProofUsage(this.value.price_usage);
+    if (priceUsage instanceof Error) return priceUsage;
+    if (commit.totals.use_mu !== priceUsage.demand_mu) {
+      return new Error('Price derivation proof usage does not match committed usage total.');
+    }
+    if (commit.totals.use_count !== priceUsage.session_count) {
+      return new Error('Price derivation proof session count does not match committed usage count.');
+    }
+
+    const usageMap = new Map([[priceUsage.enclave_id, priceUsage]]);
+    const updates = await this.computeMarketPriceUpdates(usageMap, {
+      epoch: commit.epoch,
+      at: commit.at,
+      tx: commit.submitted_at,
+    });
+    if (updates instanceof Error) return updates;
+    const derivations = await this.priceDerivationsFromMarketUpdates(updates, {
+      epoch: commit.epoch,
+      at: commit.at,
+      usageRoot: commit.roots.use,
+    });
+    if (derivations instanceof Error) return derivations;
+    if (derivations.length !== 1) {
+      return new Error('Price derivation proof did not produce one expected derivation.');
+    }
+    const expectedPriceRoot = await this.priceDerivationRoot(derivations);
+    if (expectedPriceRoot === commit.roots.price) {
+      return new Error('Price derivation proof does not contradict committed price root.');
+    }
+    return {
+      price_usage: priceUsage,
+      enclave_id: priceUsage.enclave_id,
+      expected_price_root: expectedPriceRoot,
+      committed_price_root: commit.roots.price,
+      price_derivation_hash: derivations[0].derivation_hash,
+      price_derivation: derivations[0],
+    };
+  }
+
   async validateEpochApplyTotals({
     epoch,
     roots,
@@ -6653,6 +6897,7 @@ class MayhemContract extends Contract {
     nextFeeCum,
     providerCount,
     earnCumTotal,
+    priceDerivations,
   }) {
     const commit = await this.get(`epoch/commit/${epoch}`);
     if (!commit) return new Error('Epoch commit required before applying evidence roots.');
@@ -6674,6 +6919,13 @@ class MayhemContract extends Contract {
     if (totals.provider_count !== providerCount) {
       return new Error('Epoch provider count does not match earnings.');
     }
+    if (totals.price_count !== priceDerivations.length) {
+      return new Error('Epoch price derivation count does not match market updates.');
+    }
+    const priceRoot = await this.priceDerivationRoot(priceDerivations);
+    if (roots.price !== priceRoot) {
+      return new Error('Epoch price root does not match recomputed price derivations.');
+    }
 
     const depositRoot = await this.get(`ev/dep/${epoch}`);
     if (depositRoot) {
@@ -6686,7 +6938,7 @@ class MayhemContract extends Contract {
         return new Error('Committed deposit root does not match deposit evidence.');
       }
     }
-    for (const key of ['use', 'earn', 'fee']) {
+    for (const key of ['use', 'earn', 'fee', 'price']) {
       if ((await this.get(`ev/${key}/${epoch}`)) !== null) {
         return new Error(`Epoch ${key} evidence root already exists.`);
       }
@@ -6694,7 +6946,25 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async writeEpochEvidenceRoots({ epoch, at, roots, totals, feeDeltaMu, feeCumMu }) {
+  async writePriceDerivationEvidence({ epoch, at, root, count, derivations }) {
+    await this.put(`ev/price/${epoch}`, {
+      type: 'price_root',
+      epoch,
+      merkle_root: root,
+      price_count: count,
+      ts: at,
+      updated_at: this.tx,
+    });
+    for (const derivation of derivations) {
+      await this.put(`ev/price/${epoch}/${derivation.enclave_id}`, {
+        ...derivation,
+        price_root: root,
+        updated_at: this.tx,
+      });
+    }
+  }
+
+  async writeEpochEvidenceRoots({ epoch, at, roots, totals, feeDeltaMu, feeCumMu, priceDerivations }) {
     if ((await this.get(`ev/dep/${epoch}`)) === null) {
       await this.put(`ev/dep/${epoch}`, {
         type: 'deposit_root',
@@ -6734,6 +7004,13 @@ class MayhemContract extends Contract {
       sweep_msb_tx_hash: null,
       ts: at,
       updated_at: this.tx,
+    });
+    await this.writePriceDerivationEvidence({
+      epoch,
+      at,
+      root: roots.price,
+      count: totals.price_count,
+      derivations: priceDerivations,
     });
   }
 

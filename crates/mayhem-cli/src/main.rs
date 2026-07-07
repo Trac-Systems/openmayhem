@@ -20927,6 +20927,8 @@ struct LedgerPriceRecord {
     effective_at: u64,
     #[serde(default)]
     set_by_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    derivation: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -20979,6 +20981,7 @@ struct ContractCatalog {
     reputations: Vec<LedgerReputationRecord>,
     kyb: Vec<LedgerProviderKyb>,
     prices: Vec<LedgerPriceSchedule>,
+    price_derivations: Vec<Value>,
     rules: Option<RulesRef>,
 }
 
@@ -23783,6 +23786,23 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         })
         .map(|entry| serde_json::from_value(entry.value).context("parsing price schedule"))
         .collect::<Result<Vec<LedgerPriceSchedule>>>()?;
+    let price_derivations = read_prefix_entries(rpc, "ev/price/")
+        .await?
+        .into_iter()
+        .filter(|entry| {
+            entry.key.strip_prefix("ev/price/").is_some_and(|tail| {
+                let mut parts = tail.split('/');
+                parts
+                    .next()
+                    .is_some_and(|epoch| epoch.parse::<u64>().is_ok())
+                    && parts
+                        .next()
+                        .is_some_and(|enclave_id| is_hex_len(enclave_id, 32))
+                    && parts.next().is_none()
+            })
+        })
+        .map(|entry| entry.value)
+        .collect::<Vec<_>>();
     Ok(ContractCatalog {
         enclaves: read_prefix_values_filtered(rpc, "enclave/", |tail| !tail.contains('/')).await?,
         rooms: read_prefix_values_filtered(rpc, "room/", |tail| !tail.contains('/')).await?,
@@ -23792,6 +23812,7 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         reputations: read_prefix_values_filtered(rpc, "rep/", |tail| !tail.contains('/')).await?,
         kyb: read_prefix_values_filtered(rpc, "kyb/", |tail| !tail.contains('/')).await?,
         prices,
+        price_derivations,
         rules: read_state_value(rpc, "rules/current")
             .await?
             .map(serde_json::from_value)
@@ -23892,12 +23913,33 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         *count = count.saturating_add(1);
     }
 
+    let mut price_derivation_by_enclave: BTreeMap<String, Value> = BTreeMap::new();
+    for derivation in &contract.price_derivations {
+        let Some(enclave_id) = derivation.get("enclave_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let candidate_key = price_derivation_sort_key(derivation);
+        let should_replace = price_derivation_by_enclave
+            .get(enclave_id)
+            .map(|existing| candidate_key > price_derivation_sort_key(existing))
+            .unwrap_or(true);
+        if should_replace {
+            price_derivation_by_enclave.insert(enclave_id.to_owned(), derivation.clone());
+        }
+    }
+
     let mut prices_by_enclave = BTreeMap::new();
     for schedule in &contract.prices {
         let Some(price) = current_mu_usd_price(schedule) else {
             continue;
         };
-        prices_by_enclave.insert(schedule.enclave_id.clone(), price.clone());
+        let mut price = price.clone();
+        if price.derivation.is_none() {
+            price.derivation = price_derivation_by_enclave
+                .get(schedule.enclave_id.as_str())
+                .cloned();
+        }
+        prices_by_enclave.insert(schedule.enclave_id.clone(), price);
     }
 
     let mut caps_by_model: BTreeMap<String, ModelCaps> = BTreeMap::new();
@@ -24081,6 +24123,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     rate_map: normalize_rate_map(price.rate_map.clone()),
                     per_req_mu: price.per_req_mu,
                     min_session_mu: price.min_session_mu,
+                    derivation: price.derivation.clone(),
                 },
                 attestation_tier_labels: gateway_attestation_tier_labels_for_counts(
                     &attestation_tiers,
@@ -24225,6 +24268,27 @@ fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64, u64, u64) {
         text_rate_per_1k_mu(&price.rate_map, INPUT_TOKEN_UNIT),
         text_rate_per_1k_mu(&price.rate_map, OUTPUT_TOKEN_UNIT),
         price.ver,
+    )
+}
+
+fn price_derivation_sort_key(derivation: &Value) -> (u64, u64, String) {
+    (
+        derivation.get("epoch").and_then(Value::as_u64).unwrap_or(0),
+        derivation
+            .get("price_ver")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                derivation
+                    .get("result_price")
+                    .and_then(|value| value.get("ver"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0),
+        derivation
+            .get("derivation_hash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
     )
 }
 
@@ -33265,6 +33329,7 @@ mod tests {
                 min_session_mu: 0,
                 effective_at: 0,
                 set_by_role: Some("admin".to_owned()),
+                derivation: None,
             }),
             pending: None,
         });
@@ -33341,6 +33406,7 @@ mod tests {
                 min_session_mu: 0,
                 effective_at: 0,
                 set_by_role: Some("admin".to_owned()),
+                derivation: None,
             }),
             pending: None,
         });
@@ -33591,6 +33657,33 @@ mod tests {
     fn gateway_models_are_built_from_canonical_contract_state() {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
+        contract.price_derivations.push(json!({
+            "type": "price_derivation",
+            "schema_version": 1,
+            "epoch": 7u64,
+            "enclave_id": "11".repeat(32),
+            "model_id": "test/model@4bit",
+            "denom": "mu_usd",
+            "price_ver": 1u64,
+            "usage": {
+                "usage_root": "66".repeat(32),
+                "active_demand_mu": 12_345u64,
+                "session_count": 2u64
+            },
+            "controller": {
+                "source": "admin_seed_cold_start",
+                "active_supply": 1u64,
+                "utilization_bps": 1_000u64,
+                "ema_utilization_bps": 1_000u64,
+                "multiplier_bps": 10_000u64,
+                "frozen": true,
+                "frozen_reason": "cold_start"
+            },
+            "seed_price": { "ver": 1u64, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
+            "result_price": { "ver": 1u64, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
+            "derivation_hash": "77".repeat(32),
+            "price_root": "88".repeat(32)
+        }));
         let models = gateway_models_from_contract(&contract).unwrap();
 
         assert_eq!(models.len(), 1);
@@ -33604,6 +33697,22 @@ mod tests {
         assert_eq!(
             models[0].mayhem.price_ref_mu.rate_map,
             text_generation_rate_map(1, 2)
+        );
+        let derivation = models[0]
+            .mayhem
+            .price_ref_mu
+            .derivation
+            .as_ref()
+            .expect("contract price derivation is surfaced to gateway");
+        assert_eq!(derivation["epoch"].as_u64(), Some(7));
+        assert_eq!(
+            derivation["usage"]["active_demand_mu"].as_u64(),
+            Some(12_345)
+        );
+        let expected_price_root = "88".repeat(32);
+        assert_eq!(
+            derivation["price_root"].as_str(),
+            Some(expected_price_root.as_str())
         );
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
         assert!(models[0].mayhem.kyb_identities.is_empty());
@@ -33824,6 +33933,7 @@ mod tests {
                 min_session_mu: 0,
                 effective_at: 0,
                 set_by_role: Some("admin".to_owned()),
+                derivation: None,
             }),
             pending: None,
         });
@@ -40147,9 +40257,11 @@ mod tests {
                     min_session_mu: 0,
                     effective_at: 0,
                     set_by_role: Some("admin".to_owned()),
+                    derivation: None,
                 }),
                 pending: None,
             }],
+            price_derivations: Vec::new(),
             rules: Some(RulesRef {
                 ver: 3,
                 hash: "99".repeat(32),

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 
-const ROOT_KINDS = ['dep', 'use', 'earn', 'fee'];
+const ROOT_KINDS = ['dep', 'use', 'earn', 'fee', 'price'];
 const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 5_000;
@@ -263,6 +263,7 @@ export async function recomputeEpoch(bundle) {
 
   const deposits = Array.isArray(bundle.deposits) ? bundle.deposits : [];
   const receipts = Array.isArray(bundle.receipts) ? bundle.receipts : [];
+  const priceDerivations = Array.isArray(bundle.price_derivations) ? bundle.price_derivations : [];
   const payouts = Array.isArray(bundle.payouts) ? bundle.payouts : [];
   if (payouts.length > 0) {
     throw new Error('payouts are non-custodial TAP claims; do not include payout entries in epoch bundles');
@@ -334,6 +335,13 @@ export async function recomputeEpoch(bundle) {
       await Promise.all(earningEntries.map((entry) => opaqueHash('mayhem-earn-leaf-v1', entry)))
     ),
     fee: await opaqueHash('mayhem-fee-root-v1', { epoch, fee_mu: feeMu, fee_cum_mu: feeCumMu }),
+    price: await merkleRoot(
+      'price',
+      await Promise.all(priceDerivations.map((entry) => opaqueHash(
+        'mayhem-price-derivation-leaf-v1',
+        stableValue(priceDerivationLeafValue(entry))
+      )))
+    ),
   };
   for (const key of ROOT_KINDS) {
     if (!/^[0-9a-f]{64}$/.test(roots[key])) throw new Error(`invalid ${key} root`);
@@ -354,9 +362,23 @@ export async function recomputeEpoch(bundle) {
     earn_mu: earnCumMu,
     fee_mu: feeMu,
     fee_cum_mu: feeCumMu,
+    price_count: priceDerivations.length,
   };
 
   return { epoch, params: { fee_bps: feeBps }, roots, totals, debits, earnings, market_usage };
+}
+
+function priceDerivationLeafValue(derivation) {
+  if (!derivation || typeof derivation !== 'object' || Array.isArray(derivation)) {
+    throw new Error('price_derivations entries must be objects');
+  }
+  const {
+    derivation_hash: _derivationHash,
+    price_root: _priceRoot,
+    updated_at: _updatedAt,
+    ...leaf
+  } = derivation;
+  return leaf;
 }
 
 function adminFeeBps(bundle) {

@@ -1812,6 +1812,7 @@ fn routed_embedding_test_model() -> GatewayModel {
         }],
         per_req_mu: 0,
         min_session_mu: 0,
+        derivation: None,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -1857,6 +1858,7 @@ fn routed_image_generation_test_model() -> GatewayModel {
         ],
         per_req_mu: 0,
         min_session_mu: 0,
+        derivation: None,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -1905,6 +1907,7 @@ fn routed_audio_speech_test_model() -> GatewayModel {
         ],
         per_req_mu: 0,
         min_session_mu: 0,
+        derivation: None,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -1946,6 +1949,7 @@ fn routed_audio_transcription_test_model() -> GatewayModel {
         }],
         per_req_mu: 0,
         min_session_mu: 0,
+        derivation: None,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -2294,6 +2298,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 rate_map: text_generation_rate_map(20, 60),
                 per_req_mu: 0,
                 min_session_mu: 0,
+                derivation: None,
             },
             attestation_tiers: tiers,
             attestation_tier_labels: BTreeMap::from([(
@@ -2980,6 +2985,38 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     let mut model = routed_test_model_with_providers(&[provider_a.clone(), provider_b.clone()]);
     model.mayhem.providers_online = 2;
     model.mayhem.rooms = 2;
+    model.mayhem.price_ref_mu.derivation = Some(json!({
+        "type": "price_derivation",
+        "schema_version": 1,
+        "epoch": 12,
+        "enclave_id": model.mayhem.route_candidates[0].enclave_id,
+        "model_id": model.id,
+        "denom": "mu_usd",
+        "price_ver": 7,
+        "price_source": "market_float",
+        "usage": {
+            "usage_root": "ab".repeat(32),
+            "active_demand_mu": 2_500_000u64,
+            "session_count": 5u64
+        },
+        "controller": {
+            "source": "market_float",
+            "active_supply": 2u64,
+            "utilization_bps": 8_750u64,
+            "ema_utilization_bps": 8_320u64,
+            "multiplier_bps": 10_550u64,
+            "frozen": false,
+            "frozen_reason": null,
+            "constants": {
+                "target_utilization_bps": 8_500u64,
+                "max_step_bps": 1_000u64
+            }
+        },
+        "seed_price": { "ver": 1, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
+        "result_price": { "ver": 7, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
+        "derivation_hash": "cd".repeat(32),
+        "price_root": "ef".repeat(32)
+    }));
     model.mayhem.route_candidates[0].accepted_rails = vec!["fiat".to_owned(), "tap".to_owned()];
     model.mayhem.route_candidates[0].caps = json!({
         "engine": "vllm",
@@ -3048,6 +3085,10 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     assert!(body.contains("76.5 tok/s"));
     assert!(body.contains("T2"));
     assert!(body.contains("rep 87.50%"));
+    assert!(body.contains("price = f(seed v1, U 87.50%, demand 2500000mu, 5 sessions, supply 2)"));
+    assert!(body.contains("epoch 12"));
+    assert!(body.contains("root efefefefe..."));
+    assert!(body.contains("leaf cdcdcdcdc..."));
     assert!(body.contains("no canonical provider route"));
     assert!(body.contains("ctx 16384"));
     assert!(body.contains("ctx 4096"));

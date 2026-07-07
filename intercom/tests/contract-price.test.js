@@ -31,6 +31,7 @@ const seededBalance = (user, mu, rail = 'fiat') => ({
 });
 
 const rateFor = (rateMap, unit) => rateMap.find((entry) => entry.unit === unit)?.per_unit_mu;
+const assertHash = (value) => assert.match(value, /^[0-9a-f]{64}$/);
 
 const enclaveRegistration = {
   op: 'register_enclave',
@@ -310,11 +311,33 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
-  assert.equal(applied.market_prices, undefined);
+  assert.equal(applied.market_prices.length, 1);
+  assert.deepEqual(
+    { ...applied.market_prices[0], derivation_hash: '<hash>' },
+    {
+      enclave_id: enclaveId,
+      ver: 2,
+      utilization_bps: 50_000,
+      ema_utilization_bps: 8_500,
+      active_supply: 1,
+      active_demand_mu: 10_000_000,
+      frozen: true,
+      derivation_hash: '<hash>',
+    }
+  );
+  assertHash(applied.market_prices[0].derivation_hash);
+  assert.equal(applied.price_root, applied.market_prices[0].derivation_hash);
 
   const schedule = await storage.get(`price/${enclaveId}`);
-  assert.equal(schedule.value.current.ver, 1);
+  assert.equal(schedule.value.current.ver, 2);
+  assert.equal(schedule.value.current.price_source, 'admin_seed_cold_start');
   assert.deepEqual(schedule.value.current.rate_map, textRateMap(18, 55));
+  const priceRoot = (await storage.get('ev/price/1')).value;
+  assert.equal(priceRoot.merkle_root, applied.price_root);
+  assert.equal(priceRoot.price_count, 1);
+  const derivation = (await storage.get(`ev/price/1/${enclaveId}`)).value;
+  assert.equal(derivation.price_root, applied.price_root);
+  assert.equal(derivation.controller.frozen, true);
 });
 
 test('MayhemContract epochApply floats market price from settled usage with clamp and damping', async () => {
@@ -350,7 +373,8 @@ test('MayhemContract epochApply floats market price from settled usage with clam
     admin.publicKey
   );
   assert.equal(highDemand.ok, true, highDemand.message);
-  assert.deepEqual(highDemand.market_prices, [
+  assert.deepEqual(
+    { ...highDemand.market_prices[0], derivation_hash: '<hash>' },
     {
       enclave_id: enclaveId,
       ver: 2,
@@ -359,8 +383,10 @@ test('MayhemContract epochApply floats market price from settled usage with clam
       active_supply: 2,
       active_demand_mu: 2_000_000,
       frozen: false,
-    },
-  ]);
+      derivation_hash: '<hash>',
+    }
+  );
+  assertHash(highDemand.market_prices[0].derivation_hash);
   let schedule = await storage.get(`price/${enclaveId}`);
   const raised = schedule.value.current;
   assert.equal(raised.ver, 2);
@@ -401,6 +427,173 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   );
   assert.equal(reseed.ok, true, reseed.message);
   assert.equal(reseed.ver, 4);
+});
+
+test('MayhemContract anchors committed price derivations with epoch evidence roots', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+  const providerTwo = await makeIdentity();
+  const submitter = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    6
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 7);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
+
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
+    market_usage: [{ enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 1 }],
+  };
+  const usageRoot = '2'.repeat(64);
+  const roots = {
+    dep: '1'.repeat(64),
+    use: usageRoot,
+    earn: '3'.repeat(64),
+    fee: '4'.repeat(64),
+    price: '0'.repeat(64),
+  };
+  const totals = {
+    dep_count: 0,
+    dep_mu: 0,
+    use_count: 1,
+    use_mu: 2_000_000,
+    provider_count: 1,
+    earn_mu: 1_700_000,
+    fee_mu: 300_000,
+    fee_cum_mu: 300_000,
+    price_count: 1,
+  };
+
+  const simStorage = MemoryStorage.fromSnapshotBytes(storage.snapshotBytes());
+  const simApply = await executeEpochApplyFeature(contract, simStorage, applyValue, admin.publicKey);
+  assert.equal(simApply.ok, true, simApply.message);
+  const simDerivation = (await simStorage.get(`ev/price/1/${enclaveId}`)).value;
+  roots.price = await contract.priceDerivationRoot([
+    {
+      ...simDerivation,
+      usage: {
+        ...simDerivation.usage,
+        usage_root: usageRoot,
+      },
+    },
+  ]);
+
+  const commit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    { op: 'epoch_commit', epoch: 1, at: 43_201, roots, totals },
+    submitter.publicKey,
+    20
+  );
+  assert.equal(commit.ok, true, commit.message);
+
+  const applied = await executeEpochApplyFeature(
+    contract,
+    storage,
+    { ...applyValue, roots, totals },
+    admin.publicKey
+  );
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(applied.price_root, roots.price);
+
+  const priceRoot = (await storage.get('ev/price/1')).value;
+  assert.equal(priceRoot.type, 'price_root');
+  assert.equal(priceRoot.merkle_root, roots.price);
+  assert.equal(priceRoot.price_count, 1);
+  const derivation = (await storage.get(`ev/price/1/${enclaveId}`)).value;
+  assert.equal(derivation.price_root, roots.price);
+  assert.equal(derivation.usage.usage_root, usageRoot);
+  assert.equal(derivation.controller.utilization_bps, 10_000);
+});
+
+test('MayhemContract fraudProof voids a fabricated price derivation root', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const providerTwo = await makeIdentity();
+  const submitter = await makeIdentity();
+  const prover = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    6
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 7);
+
+  const roots = {
+    dep: '1'.repeat(64),
+    use: '2'.repeat(64),
+    earn: '3'.repeat(64),
+    fee: '4'.repeat(64),
+    price: 'f'.repeat(64),
+  };
+  const totals = {
+    dep_count: 0,
+    dep_mu: 0,
+    use_count: 1,
+    use_mu: 2_000_000,
+    provider_count: 1,
+    earn_mu: 1_700_000,
+    fee_mu: 300_000,
+    fee_cum_mu: 300_000,
+    price_count: 1,
+  };
+  const commit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    { op: 'epoch_commit', epoch: 1, at: 43_201, roots, totals },
+    submitter.publicKey,
+    20
+  );
+  assert.equal(commit.ok, true, commit.message);
+
+  const proof = await execute(
+    contract,
+    storage,
+    'fraudProof',
+    {
+      op: 'fraud_proof',
+      epoch: 1,
+      proof_epoch: 2,
+      at: 46_801,
+      reason: 'price_derivation',
+      price_usage: { enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 1 },
+    },
+    prover.publicKey,
+    21
+  );
+  assert.equal(proof.ok, true, proof.message);
+  assert.equal(proof.banned_submitter, submitter.publicKey);
+
+  const commitRecord = (await storage.get('epoch/commit/1')).value;
+  assert.equal(commitRecord.status, 'void');
+  assert.equal(commitRecord.fraud_reason, 'price_derivation');
+  const fraudRecord = (await storage.get(`ev/fraud/1/${proof.proof_hash}`)).value;
+  assert.equal(fraudRecord.committed_price_root, roots.price);
+  assertHash(fraudRecord.expected_price_root);
+  assertHash(fraudRecord.price_derivation_hash);
+  assert.equal(fraudRecord.price_derivation.enclave_id, enclaveId);
+  assert.equal(fraudRecord.price_derivation.usage.active_demand_mu, 2_000_000);
 });
 
 test('MayhemContract keeps one enclave price while conserving mixed rail settlement', async () => {
@@ -464,8 +657,10 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       active_supply: 2,
       active_demand_mu: 1_000_000,
       frozen: false,
+      derivation_hash: applied.market_prices[0].derivation_hash,
     },
   ]);
+  assertHash(applied.market_prices[0].derivation_hash);
 
   const schedule = await storage.get(`price/${enclaveId}`);
   assert.equal(schedule.value.current.ver, 2);

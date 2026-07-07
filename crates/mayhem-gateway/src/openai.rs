@@ -237,6 +237,8 @@ pub struct PriceRefMu {
     pub rate_map: Vec<RateMapEntry>,
     pub per_req_mu: u64,
     pub min_session_mu: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -961,6 +963,7 @@ impl GatewayState {
                     rate_map: text_generation_rate_map(20, 60),
                     per_req_mu: 0,
                     min_session_mu: 0,
+                    derivation: None,
                 },
                 attestation_tiers: tiers,
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
@@ -1896,12 +1899,13 @@ fn dashboard_network_model_rows(models: &[GatewayModel], entries: &[ProviderTabl
             };
             let constraints = dashboard_model_constraints(model, route_count, room_count);
             format!(
-                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td>{availability}</td><td>{}</td><td><span class="mono">{}</span><p class="privacy-note">price v{}</p></td><td>{constraints}</td></tr>"#,
+                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td>{availability}</td><td>{}</td><td><span class="mono">{}</span><p class="privacy-note">price v{} · {}</p></td><td>{constraints}</td></tr>"#,
                 html_escape(short_text(&model.id, 34).as_ref()),
                 html_escape(&model.mayhem.source),
                 dashboard_badges(&dashboard_model_abilities(model), "badge"),
                 html_escape(&dashboard_model_price(model)),
                 model.mayhem.price_ref_mu.ver,
+                html_escape(&dashboard_model_price_derivation(model)),
             )
         })
         .collect::<String>()
@@ -2898,6 +2902,75 @@ fn dashboard_model_price(model: &GatewayModel) -> String {
     } else {
         entries.join(" + ")
     }
+}
+
+fn dashboard_model_price_derivation(model: &GatewayModel) -> String {
+    let Some(derivation) = model.mayhem.price_ref_mu.derivation.as_ref() else {
+        return "derivation pending".to_owned();
+    };
+    let epoch = derivation_u64(derivation, &["epoch"])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let seed_ver = derivation_u64(derivation, &["seed_price", "ver"])
+        .map(|value| format!("v{value}"))
+        .unwrap_or_else(|| "?".to_owned());
+    let result_ver = derivation_u64(derivation, &["result_price", "ver"])
+        .or_else(|| derivation_u64(derivation, &["price_ver"]))
+        .map(|value| format!("v{value}"))
+        .unwrap_or_else(|| "price".to_owned());
+    let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
+        .map(format_bps)
+        .unwrap_or_else(|| "?".to_owned());
+    let demand_mu = derivation_u64(derivation, &["usage", "active_demand_mu"])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let sessions = derivation_u64(derivation, &["usage", "session_count"])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let supply = derivation_u64(derivation, &["controller", "active_supply"])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let source = derivation_str(derivation, &["controller", "source"])
+        .or_else(|| derivation_str(derivation, &["price_source"]))
+        .unwrap_or("market");
+    let frozen = if derivation_bool(derivation, &["controller", "frozen"]).unwrap_or(false) {
+        " · frozen"
+    } else {
+        ""
+    };
+    let root = derivation_str(derivation, &["price_root"])
+        .map(|value| format!(" · root {}", short_text(value, 12)))
+        .unwrap_or_default();
+    let leaf = derivation_str(derivation, &["derivation_hash"])
+        .map(|value| format!(" · leaf {}", short_text(value, 12)))
+        .unwrap_or_default();
+    format!(
+        "price = f(seed {seed_ver}, U {utilization}, demand {demand_mu}mu, {sessions} sessions, supply {supply}) -> {result_ver} · epoch {epoch} · {source}{frozen}{root}{leaf}"
+    )
+}
+
+fn derivation_u64<'a>(value: &'a Value, path: &[&str]) -> Option<u64> {
+    derivation_value(value, path)?.as_u64()
+}
+
+fn derivation_bool<'a>(value: &'a Value, path: &[&str]) -> Option<bool> {
+    derivation_value(value, path)?.as_bool()
+}
+
+fn derivation_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    derivation_value(value, path)?.as_str()
+}
+
+fn derivation_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn format_bps(value: u64) -> String {
+    format!("{}.{:02}%", value / 100, value % 100)
 }
 
 fn dashboard_spend_body(receipts: &[StoredReceipt]) -> String {
@@ -12171,6 +12244,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .get("min_session_mu")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
+                derivation: price_derivation_from_catalog_value(price),
             },
             attestation_tier_labels: attestation_tier_labels_from_catalog_value(model)
                 .unwrap_or_else(|| attestation_tier_labels_for_counts(&tiers)),
@@ -12260,6 +12334,16 @@ fn price_rate_map_from_catalog_value(price: &Value) -> Vec<RateMapEntry> {
         price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
         price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
     )
+}
+
+fn price_derivation_from_catalog_value(price: &Value) -> Option<Value> {
+    price
+        .get("derivation")
+        .or_else(|| price.get("price_derivation"))
+        .or_else(|| price.get("market_derivation"))
+        .or_else(|| price.get("market"))
+        .filter(|value| value.is_object())
+        .cloned()
 }
 
 fn caps_output_modalities(caps: &Value) -> Vec<String> {
@@ -13803,6 +13887,7 @@ mod tests {
                     rate_map: text_generation_rate_map(20, 60),
                     per_req_mu: 0,
                     min_session_mu: 0,
+                    derivation: None,
                 },
                 attestation_tiers: BTreeMap::from([("T1".to_owned(), 1)]),
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
