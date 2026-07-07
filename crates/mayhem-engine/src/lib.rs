@@ -243,6 +243,8 @@ pub struct LoadConfig {
     pub use_mmap: bool,
     #[serde(default)]
     pub use_mlock: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
 }
 
 impl LoadConfig {
@@ -315,6 +317,7 @@ impl Default for LoadConfig {
             vllm_dtype: None,
             use_mmap: true,
             use_mlock: false,
+            memory_limit_bytes: None,
         }
     }
 }
@@ -623,6 +626,9 @@ impl ArtifactSink for NoopArtifactSink {
 pub trait EngineBackend {
     fn backend_id(&self) -> &'static str;
     fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo>;
+    fn process_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
     fn tokenize(&self, text: &str) -> Result<Tokenization>;
     fn generate(
         &mut self,
@@ -662,6 +668,81 @@ pub trait EngineBackend {
             self.backend_id()
         )))
     }
+}
+
+#[allow(dead_code)]
+fn engine_worker_command(program: &Path, memory_limit_bytes: Option<u64>) -> std::process::Command {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(bytes) = memory_limit_bytes.filter(|bytes| *bytes > 0) {
+            let limit_kib = (bytes / 1024).max(1).to_string();
+            let limit_bytes = bytes.to_string();
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(
+                    r#"limit_kib="$1"
+limit_bytes="$2"
+shift 2
+cg="/sys/fs/cgroup/mayhem-engine-$$"
+if [ -f /sys/fs/cgroup/cgroup.controllers ] && mkdir "$cg" 2>/dev/null; then
+  if echo "$limit_bytes" > "$cg/memory.max" 2>/dev/null; then
+    export MAYHEM_ENGINE_MEMORY_LIMIT_MODE=linux-cgroup-v2
+    "$@" &
+    child=$!
+    if echo "$child" > "$cg/cgroup.procs" 2>/dev/null; then
+      cleanup() {
+        kill "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+        rmdir "$cg" 2>/dev/null || true
+      }
+      trap cleanup INT TERM HUP EXIT
+      wait "$child"
+      status=$?
+      trap - INT TERM HUP EXIT
+      rmdir "$cg" 2>/dev/null || true
+      exit "$status"
+    fi
+    kill "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    rmdir "$cg" 2>/dev/null || true
+    ulimit -v "$limit_kib" || exit 127
+    export MAYHEM_ENGINE_MEMORY_LIMIT_MODE=linux-rlimit-as
+    exec "$@"
+  else
+    rmdir "$cg" 2>/dev/null || true
+    ulimit -v "$limit_kib" || exit 127
+    export MAYHEM_ENGINE_MEMORY_LIMIT_MODE=linux-rlimit-as
+  fi
+else
+  ulimit -v "$limit_kib" || exit 127
+  export MAYHEM_ENGINE_MEMORY_LIMIT_MODE=linux-rlimit-as
+fi
+exec "$@""#,
+                )
+                .arg("mayhem-engine-containment")
+                .arg(limit_kib)
+                .arg(limit_bytes)
+                .arg(program)
+                .env("MAYHEM_ENGINE_MEMORY_LIMIT_BYTES", bytes.to_string());
+            return command;
+        }
+    }
+
+    let mut command = std::process::Command::new(program);
+    if let Some(bytes) = memory_limit_bytes.filter(|bytes| *bytes > 0) {
+        command.env("MAYHEM_ENGINE_MEMORY_LIMIT_BYTES", bytes.to_string());
+        #[cfg(target_os = "macos")]
+        command.env("MAYHEM_ENGINE_MEMORY_LIMIT_MODE", "macos-provider-watchdog");
+        #[cfg(target_os = "windows")]
+        command.env(
+            "MAYHEM_ENGINE_MEMORY_LIMIT_MODE",
+            "windows-job-object-managed-by-provider",
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        command.env("MAYHEM_ENGINE_MEMORY_LIMIT_MODE", "provider-watchdog");
+    }
+    command
 }
 
 pub fn tool_call_json_schema(tools: &[ToolSpec]) -> Result<Value> {
@@ -2722,9 +2803,9 @@ mod llama_cpp_backend {
 #[cfg(feature = "mlx")]
 mod mlx_backend {
     use super::{
-        validate_load_config, verify_artifact, ArtifactFormat, EngineBackend, EngineError,
-        FinishReason, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result,
-        TokenChunk, TokenSink, Tokenization, UsageCounters,
+        engine_worker_command, validate_load_config, verify_artifact, ArtifactFormat,
+        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -2733,7 +2814,7 @@ mod mlx_backend {
     use std::env;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
     const WORKER: &str = include_str!("mlx_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_MLX_PYTHON";
@@ -2743,6 +2824,7 @@ mod mlx_backend {
         worker: RefCell<Option<MlxWorker>>,
         loaded: Option<LoadedModelInfo>,
         next_id: Cell<u64>,
+        memory_limit_bytes: Cell<Option<u64>>,
     }
 
     impl MlxBackend {
@@ -2759,6 +2841,7 @@ mod mlx_backend {
                 worker: RefCell::new(None),
                 loaded: None,
                 next_id: Cell::new(1),
+                memory_limit_bytes: Cell::new(None),
             })
         }
 
@@ -2782,7 +2865,10 @@ mod mlx_backend {
             self.next_id.set(id.saturating_add(1));
             let mut worker = self.worker.borrow_mut();
             if worker.is_none() {
-                *worker = Some(MlxWorker::spawn(&self.python)?);
+                *worker = Some(MlxWorker::spawn(
+                    &self.python,
+                    self.memory_limit_bytes.get(),
+                )?);
             }
             let worker = worker
                 .as_mut()
@@ -2834,6 +2920,7 @@ mod mlx_backend {
                 )));
             }
             verify_artifact(&config.artifact)?;
+            self.memory_limit_bytes.set(config.memory_limit_bytes);
 
             let model_path = mlx_model_path(&config.artifact.path)?;
             let info: WorkerLoadInfo = self.call(
@@ -2852,6 +2939,14 @@ mod mlx_backend {
             };
             self.loaded = Some(loaded.clone());
             Ok(loaded)
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            self.worker
+                .borrow()
+                .as_ref()
+                .map(|worker| vec![worker.child.id()])
+                .unwrap_or_default()
         }
 
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
@@ -2907,21 +3002,21 @@ mod mlx_backend {
     }
 
     impl MlxWorker {
-        fn spawn(python: &Path) -> Result<Self> {
-            let mut child = Command::new(python)
+        fn spawn(python: &Path, memory_limit_bytes: Option<u64>) -> Result<Self> {
+            let mut command = engine_worker_command(python, memory_limit_bytes);
+            command
                 .arg("-u")
                 .arg("-c")
                 .arg(WORKER)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(|err| {
-                    EngineError::Mlx(format!(
-                        "spawning MLX Python worker with {} failed: {err}",
-                        python.display()
-                    ))
-                })?;
+                .stderr(Stdio::inherit());
+            let mut child = command.spawn().map_err(|err| {
+                EngineError::Mlx(format!(
+                    "spawning MLX Python worker with {} failed: {err}",
+                    python.display()
+                ))
+            })?;
             let stdin = child
                 .stdin
                 .take()
@@ -2986,9 +3081,10 @@ mod mlx_backend {
 #[cfg(feature = "vllm")]
 mod vllm_backend {
     use super::{
-        validate_load_config, verify_artifact, vllm_safetensors_payload_path, ArtifactFormat,
-        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
-        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        engine_worker_command, validate_load_config, verify_artifact,
+        vllm_safetensors_payload_path, ArtifactFormat, EngineBackend, EngineError, FinishReason,
+        GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk,
+        TokenSink, Tokenization, UsageCounters,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -2997,7 +3093,7 @@ mod vllm_backend {
     use std::env;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -3012,6 +3108,7 @@ mod vllm_backend {
         worker: RefCell<Option<VllmWorker>>,
         loaded: Option<LoadedModelInfo>,
         next_id: Cell<u64>,
+        memory_limit_bytes: Cell<Option<u64>>,
     }
 
     impl VllmBackend {
@@ -3028,6 +3125,7 @@ mod vllm_backend {
                 worker: RefCell::new(None),
                 loaded: None,
                 next_id: Cell::new(1),
+                memory_limit_bytes: Cell::new(None),
             })
         }
 
@@ -3051,7 +3149,10 @@ mod vllm_backend {
             self.next_id.set(id.saturating_add(1));
             let mut worker = self.worker.borrow_mut();
             if worker.is_none() {
-                *worker = Some(VllmWorker::spawn(&self.python)?);
+                *worker = Some(VllmWorker::spawn(
+                    &self.python,
+                    self.memory_limit_bytes.get(),
+                )?);
             }
             let worker = worker.as_mut().ok_or_else(|| {
                 EngineError::Vllm("failed to start vLLM backend worker".to_owned())
@@ -3103,6 +3204,7 @@ mod vllm_backend {
                 )));
             }
             verify_artifact(&config.artifact)?;
+            self.memory_limit_bytes.set(config.memory_limit_bytes);
 
             let model_path = vllm_model_path(&config.artifact.path)?;
             let info: WorkerLoadInfo =
@@ -3120,6 +3222,14 @@ mod vllm_backend {
             };
             self.loaded = Some(loaded.clone());
             Ok(loaded)
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            self.worker
+                .borrow()
+                .as_ref()
+                .map(|worker| vec![worker.child.id()])
+                .unwrap_or_default()
         }
 
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
@@ -3180,12 +3290,16 @@ mod vllm_backend {
     }
 
     impl VllmWorker {
-        fn spawn(python: &Path) -> Result<Self> {
-            Self::spawn_with_timeout(python, request_timeout())
+        fn spawn(python: &Path, memory_limit_bytes: Option<u64>) -> Result<Self> {
+            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes)
         }
 
-        fn spawn_with_timeout(python: &Path, request_timeout: Duration) -> Result<Self> {
-            let mut command = Command::new(python);
+        fn spawn_with_timeout(
+            python: &Path,
+            request_timeout: Duration,
+            memory_limit_bytes: Option<u64>,
+        ) -> Result<Self> {
+            let mut command = engine_worker_command(python, memory_limit_bytes);
             command
                 .arg("-u")
                 .arg("-c")
@@ -3379,7 +3493,7 @@ mod vllm_backend {
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
             let mut worker =
-                VllmWorker::spawn_with_timeout(&path, Duration::from_secs(1)).expect("spawn");
+                VllmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None).expect("spawn");
             worker
                 .send(1, "load", Value::Null)
                 .expect("send request to fake worker");
@@ -3413,9 +3527,9 @@ mod vllm_backend {
 #[cfg(feature = "trt-llm")]
 mod trt_llm_backend {
     use super::{
-        validate_load_config, verify_artifact, ArtifactFormat, EngineBackend, EngineError,
-        FinishReason, GenerateOutput, GenerateRequest, LoadConfig, LoadedModelInfo, Result,
-        TokenChunk, TokenSink, Tokenization, UsageCounters,
+        engine_worker_command, validate_load_config, verify_artifact, ArtifactFormat,
+        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
@@ -3424,7 +3538,7 @@ mod trt_llm_backend {
     use std::env;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -3439,6 +3553,7 @@ mod trt_llm_backend {
         worker: RefCell<Option<TrtLlmWorker>>,
         loaded: Option<LoadedModelInfo>,
         next_id: Cell<u64>,
+        memory_limit_bytes: Cell<Option<u64>>,
     }
 
     impl TrtLlmBackend {
@@ -3455,6 +3570,7 @@ mod trt_llm_backend {
                 worker: RefCell::new(None),
                 loaded: None,
                 next_id: Cell::new(1),
+                memory_limit_bytes: Cell::new(None),
             })
         }
 
@@ -3478,7 +3594,10 @@ mod trt_llm_backend {
             self.next_id.set(id.saturating_add(1));
             let mut worker = self.worker.borrow_mut();
             if worker.is_none() {
-                *worker = Some(TrtLlmWorker::spawn(&self.python)?);
+                *worker = Some(TrtLlmWorker::spawn(
+                    &self.python,
+                    self.memory_limit_bytes.get(),
+                )?);
             }
             let worker = worker.as_mut().ok_or_else(|| {
                 EngineError::TrtLlm("failed to start TensorRT-LLM backend worker".to_owned())
@@ -3541,6 +3660,7 @@ mod trt_llm_backend {
                 )));
             }
             verify_artifact(&config.artifact)?;
+            self.memory_limit_bytes.set(config.memory_limit_bytes);
 
             let model_path = trt_llm_model_path(&config.artifact.path)?;
             if config.trt_require_engine_dir {
@@ -3560,6 +3680,14 @@ mod trt_llm_backend {
             };
             self.loaded = Some(loaded.clone());
             Ok(loaded)
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            self.worker
+                .borrow()
+                .as_ref()
+                .map(|worker| vec![worker.child.id()])
+                .unwrap_or_default()
         }
 
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
@@ -3620,12 +3748,16 @@ mod trt_llm_backend {
     }
 
     impl TrtLlmWorker {
-        fn spawn(python: &Path) -> Result<Self> {
-            Self::spawn_with_timeout(python, request_timeout())
+        fn spawn(python: &Path, memory_limit_bytes: Option<u64>) -> Result<Self> {
+            Self::spawn_with_timeout(python, request_timeout(), memory_limit_bytes)
         }
 
-        fn spawn_with_timeout(python: &Path, request_timeout: Duration) -> Result<Self> {
-            let mut command = Command::new(python);
+        fn spawn_with_timeout(
+            python: &Path,
+            request_timeout: Duration,
+            memory_limit_bytes: Option<u64>,
+        ) -> Result<Self> {
+            let mut command = engine_worker_command(python, memory_limit_bytes);
             command
                 .arg("-u")
                 .arg("-c")
@@ -3852,8 +3984,8 @@ mod trt_llm_backend {
             perms.set_mode(0o700);
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
-            let mut worker =
-                TrtLlmWorker::spawn_with_timeout(&path, Duration::from_secs(1)).expect("spawn");
+            let mut worker = TrtLlmWorker::spawn_with_timeout(&path, Duration::from_secs(1), None)
+                .expect("spawn");
             worker
                 .send(1, "load", Value::Null)
                 .expect("send request to fake worker");

@@ -106,6 +106,8 @@ const F13_MEMORY_RESERVE_FLOOR_BYTES: u64 = GIB_BYTES;
 const F13_DISK_RESERVE_DEFAULT_BYTES: u64 = 10 * GIB_BYTES;
 const F13_DISK_RESERVE_FLOOR_BYTES: u64 = 2 * GIB_BYTES;
 const PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL: i32 = 2;
+const PROVIDER_ENGINE_WATCHDOG_SUSTAINED_SAMPLES: u32 = 3;
+const PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_SECONDS: u64 = 30;
 const F13_MEMORY_CLAIM_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
@@ -23781,6 +23783,74 @@ impl ProviderRuntimeFloorMonitor {
         );
         provider_runtime_floor_rejection_from_observations(&disk, memory)
     }
+
+    fn memory_check(&self) -> Option<ProviderRuntimeFloorRejection> {
+        provider_runtime_floor_rejection_from_observations(
+            &[],
+            provider_runtime_memory_observation(self.memory_reserve_bytes, &self.memory_pool),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderEngineRssObservation {
+    pids: Vec<u32>,
+    total_rss_bytes: Option<u64>,
+    limit_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderEngineWatchdogAction {
+    Healthy,
+    RefuseNew(ProviderRuntimeFloorRejection),
+    RestartNow(ProviderRuntimeFloorRejection),
+}
+
+#[derive(Clone, Debug)]
+struct ProviderEngineWatchdog {
+    limit_bytes: u64,
+    sustained_samples: u32,
+    cooldown_until: Option<Instant>,
+}
+
+impl ProviderEngineWatchdog {
+    fn new(selected: &ProviderCandidate) -> Self {
+        Self {
+            limit_bytes: selected.feasibility.memory_budget.budget_bytes,
+            sustained_samples: 0,
+            cooldown_until: None,
+        }
+    }
+
+    fn check(
+        &mut self,
+        memory_floor: Option<ProviderRuntimeFloorRejection>,
+        rss: ProviderEngineRssObservation,
+        active_sessions: usize,
+        now: Instant,
+    ) -> ProviderEngineWatchdogAction {
+        let Some(reject) = provider_engine_watchdog_rejection(memory_floor, &rss) else {
+            self.sustained_samples = 0;
+            return ProviderEngineWatchdogAction::Healthy;
+        };
+        self.sustained_samples = self.sustained_samples.saturating_add(1);
+        if self.sustained_samples < PROVIDER_ENGINE_WATCHDOG_SUSTAINED_SAMPLES {
+            return ProviderEngineWatchdogAction::RefuseNew(reject);
+        }
+        if active_sessions > 0 {
+            return ProviderEngineWatchdogAction::RefuseNew(reject);
+        }
+        if self.cooldown_until.is_some_and(|until| now < until) {
+            return ProviderEngineWatchdogAction::RefuseNew(reject);
+        }
+        self.cooldown_until =
+            Some(now + Duration::from_secs(PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_SECONDS));
+        ProviderEngineWatchdogAction::RestartNow(reject)
+    }
+
+    fn reset_after_restart(&mut self) {
+        self.sustained_samples = 0;
+    }
 }
 
 fn provider_runtime_memory_observation(
@@ -23904,6 +23974,117 @@ fn provider_runtime_floor_rejection_from_observations(
         }),
         _ => None,
     }
+}
+
+fn provider_engine_watchdog_rejection(
+    memory_floor: Option<ProviderRuntimeFloorRejection>,
+    rss: &ProviderEngineRssObservation,
+) -> Option<ProviderRuntimeFloorRejection> {
+    if let Some(memory_floor) = memory_floor {
+        return Some(ProviderRuntimeFloorRejection {
+            code: memory_floor.code,
+            reason: format!(
+                "{}; provider engine watchdog will keep refusing new sessions and reload the engine after active sessions drain",
+                memory_floor.reason
+            ),
+        });
+    }
+    let Some(total_rss_bytes) = rss.total_rss_bytes else {
+        return None;
+    };
+    if rss.limit_bytes > 0 && total_rss_bytes > rss.limit_bytes {
+        return Some(ProviderRuntimeFloorRejection {
+            code: "CAPACITY",
+            reason: format!(
+                "provider engine watchdog is active: engine/process RSS {} across pid(s) {} exceeds budget {}; refusing new sessions and reloading the engine after active sessions drain",
+                human_bytes(total_rss_bytes),
+                rss.pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                human_bytes(rss.limit_bytes)
+            ),
+        });
+    }
+    None
+}
+
+fn provider_engine_rss_observation(
+    responder: &dyn ProviderSessionResponder,
+    limit_bytes: u64,
+) -> ProviderEngineRssObservation {
+    let mut pids = responder.process_ids();
+    pids.push(std::process::id());
+    pids.sort_unstable();
+    pids.dedup();
+    let mut total = 0_u64;
+    let mut observed_any = false;
+    for pid in &pids {
+        if let Some(rss) = provider_process_rss_bytes(*pid) {
+            observed_any = true;
+            total = total.saturating_add(rss);
+        }
+    }
+    ProviderEngineRssObservation {
+        pids,
+        total_rss_bytes: observed_any.then_some(total),
+        limit_bytes,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn provider_process_rss_bytes(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return kib.checked_mul(1024);
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn provider_process_rss_bytes(pid: u32) -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let kib = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(target_os = "windows")]
+fn provider_process_rss_bytes(pid: u32) -> Option<u64> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Process -Id {pid}).WorkingSet64"),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn provider_process_rss_bytes(_pid: u32) -> Option<u64> {
+    None
 }
 
 fn provider_session_usage_units(usage: &ReceiptUsage) -> u64 {
@@ -24094,6 +24275,9 @@ trait ProviderSessionResponder {
     fn supports_live_text_streaming(&self) -> bool {
         false
     }
+    fn process_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
     fn respond(
         &mut self,
         terms: &ProviderSessionTerms,
@@ -24125,6 +24309,24 @@ impl ProviderSessionResponder for DeterministicProviderSessionResponder {
     }
 }
 
+struct UnavailableProviderSessionResponder {
+    reason: String,
+}
+
+impl ProviderSessionResponder for UnavailableProviderSessionResponder {
+    fn mode(&self) -> &'static str {
+        "provider-engine-unavailable"
+    }
+
+    fn respond(
+        &mut self,
+        _terms: &ProviderSessionTerms,
+        _body: &Value,
+    ) -> Result<ProviderSessionOutput> {
+        bail!("{}", self.reason)
+    }
+}
+
 struct EngineProviderSessionResponder {
     backend: Box<dyn EngineBackend>,
 }
@@ -24136,6 +24338,10 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 
     fn supports_live_text_streaming(&self) -> bool {
         true
+    }
+
+    fn process_ids(&self) -> Vec<u32> {
+        self.backend.process_ids()
     }
 
     fn respond(
@@ -29705,6 +29911,7 @@ async fn serve_provider_sessions(
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
     let heartbeat_load = ProviderHeartbeatLoad::default();
     let runtime_floor_monitor = ProviderRuntimeFloorMonitor::new(ctx.args, ctx.home, ctx.selected)?;
+    let mut engine_watchdog = ProviderEngineWatchdog::new(ctx.selected);
     let heartbeat_task = heartbeat_enabled.then(|| {
         tokio::spawn(run_provider_session_heartbeats(
             ProviderSessionHeartbeatTask {
@@ -29731,6 +29938,7 @@ async fn serve_provider_sessions(
     let mut protection = ProviderProtectionState::new(protection_config);
     let mut draining = false;
     let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
+    let mut engine_watchdog_reject: Option<ProviderRuntimeFloorRejection> = None;
     let drain_paths = provider_drain_flag_paths(
         ctx.home,
         &ctx.wallet.public_key,
@@ -29764,8 +29972,72 @@ async fn serve_provider_sessions(
                 }
                 runtime_floor_reject = next_runtime_floor_reject;
             }
+            let watchdog_action = if draining {
+                ProviderEngineWatchdogAction::Healthy
+            } else {
+                let rss =
+                    provider_engine_rss_observation(responder.as_ref(), engine_watchdog.limit_bytes);
+                engine_watchdog.check(
+                    runtime_floor_monitor.memory_check(),
+                    rss,
+                    sessions.len(),
+                    Instant::now(),
+                )
+            };
+            match watchdog_action {
+                ProviderEngineWatchdogAction::Healthy => {
+                    if engine_watchdog_reject.take().is_some() {
+                        provider_session_debug(
+                            "engine watchdog pressure cleared; accepting new sessions again when other floors allow",
+                        );
+                    }
+                }
+                ProviderEngineWatchdogAction::RefuseNew(reject) => {
+                    if engine_watchdog_reject.as_ref() != Some(&reject) {
+                        provider_session_debug(format!(
+                            "engine watchdog active; refusing new sessions with {}: {}",
+                            reject.code, reject.reason
+                        ));
+                    }
+                    engine_watchdog_reject = Some(reject);
+                }
+                ProviderEngineWatchdogAction::RestartNow(reject) => {
+                    provider_session_debug(format!(
+                        "engine watchdog restarting session engine after sustained pressure: {}",
+                        reject.reason
+                    ));
+                    heartbeat_load.set_accepting_new(false);
+                    let restart_reason = reject.reason.clone();
+                    engine_watchdog_reject = Some(reject);
+                    let old_responder = std::mem::replace(
+                        &mut responder,
+                        Box::new(UnavailableProviderSessionResponder {
+                            reason: restart_reason,
+                        }),
+                    );
+                    drop(old_responder);
+                    match provider_session_responder(&ctx) {
+                        Ok(next_responder) => {
+                            responder = next_responder;
+                            engine_watchdog.reset_after_restart();
+                            engine_watchdog_reject = None;
+                            provider_log(
+                                ctx.args,
+                                "Provider engine watchdog reloaded the local engine after sustained memory pressure.",
+                            );
+                        }
+                        Err(err) => {
+                            provider_session_debug(format!(
+                                "engine watchdog reload failed; continuing to refuse new sessions: {err:#}"
+                            ));
+                        }
+                    }
+                }
+            }
             if !draining {
-                heartbeat_load.set_accepting_new(runtime_floor_reject.is_none());
+                heartbeat_load.set_accepting_new(
+                    runtime_floor_reject.is_none() && engine_watchdog_reject.is_none(),
+                );
             }
             if !draining {
                 match provider_drain_requested(&drain_paths) {
@@ -29834,7 +30106,9 @@ async fn serve_provider_sessions(
                         &terms,
                         &runtime,
                         responder.as_mut(),
-                        runtime_floor_reject.clone(),
+                        runtime_floor_reject
+                            .clone()
+                            .or_else(|| engine_watchdog_reject.clone()),
                         event,
                     )
                     .await?;
@@ -31742,6 +32016,8 @@ fn provider_engine_load_config(
     config.artifact = artifact;
     config.ctx_size = ctx_size.max(1);
     config.gpu_layers = selected.verdict.n_layers_gpu;
+    config.memory_limit_bytes = (selected.feasibility.memory_budget.budget_bytes > 0)
+        .then_some(selected.feasibility.memory_budget.budget_bytes);
     if let Some(mmproj_path) = artifact_paths.sidecars.get("mmproj") {
         let sidecar = selected
             .artifact
@@ -40083,6 +40359,10 @@ mod tests {
         assert_eq!(config.artifact.format, mayhem_engine::ArtifactFormat::Gguf);
         assert_eq!(config.ctx_size, 8192);
         assert_eq!(config.gpu_layers, Some(0));
+        assert_eq!(
+            config.memory_limit_bytes,
+            Some(selected.feasibility.memory_budget.budget_bytes)
+        );
     }
 
     #[test]
@@ -41026,6 +41306,83 @@ mod tests {
         .expect("macOS pressure floor must reject");
         assert_eq!(mac_reject.code, "CAPACITY");
         assert!(mac_reject.reason.contains("memory-pressure floor"));
+    }
+
+    #[test]
+    fn provider_engine_watchdog_rejects_rss_over_budget() {
+        let reject = provider_engine_watchdog_rejection(
+            None,
+            &ProviderEngineRssObservation {
+                pids: vec![11, 22],
+                total_rss_bytes: Some(9 * GIB_BYTES),
+                limit_bytes: 8 * GIB_BYTES,
+            },
+        )
+        .expect("rss above budget must reject");
+
+        assert_eq!(reject.code, "CAPACITY");
+        assert!(reject.reason.contains("engine watchdog is active"));
+        assert!(reject.reason.contains("11,22"));
+
+        assert!(provider_engine_watchdog_rejection(
+            None,
+            &ProviderEngineRssObservation {
+                pids: vec![11],
+                total_rss_bytes: Some(7 * GIB_BYTES),
+                limit_bytes: 8 * GIB_BYTES,
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn provider_engine_watchdog_restarts_only_after_sustained_pressure_and_drain() {
+        let mut watchdog = ProviderEngineWatchdog {
+            limit_bytes: 8 * GIB_BYTES,
+            sustained_samples: 0,
+            cooldown_until: None,
+        };
+        let rss = ProviderEngineRssObservation {
+            pids: vec![std::process::id()],
+            total_rss_bytes: Some(9 * GIB_BYTES),
+            limit_bytes: 8 * GIB_BYTES,
+        };
+        let now = Instant::now();
+
+        assert!(matches!(
+            watchdog.check(None, rss.clone(), 1, now),
+            ProviderEngineWatchdogAction::RefuseNew(_)
+        ));
+        assert!(matches!(
+            watchdog.check(None, rss.clone(), 1, now + Duration::from_secs(1)),
+            ProviderEngineWatchdogAction::RefuseNew(_)
+        ));
+        assert!(matches!(
+            watchdog.check(None, rss.clone(), 1, now + Duration::from_secs(2)),
+            ProviderEngineWatchdogAction::RefuseNew(_)
+        ));
+        assert!(matches!(
+            watchdog.check(None, rss.clone(), 0, now + Duration::from_secs(3)),
+            ProviderEngineWatchdogAction::RestartNow(_)
+        ));
+        assert!(matches!(
+            watchdog.check(None, rss, 0, now + Duration::from_secs(4)),
+            ProviderEngineWatchdogAction::RefuseNew(_)
+        ));
+        watchdog.reset_after_restart();
+        assert!(matches!(
+            watchdog.check(
+                None,
+                ProviderEngineRssObservation {
+                    pids: vec![std::process::id()],
+                    total_rss_bytes: Some(GIB_BYTES),
+                    limit_bytes: 8 * GIB_BYTES,
+                },
+                0,
+                now + Duration::from_secs(5),
+            ),
+            ProviderEngineWatchdogAction::Healthy
+        ));
     }
 
     #[test]
