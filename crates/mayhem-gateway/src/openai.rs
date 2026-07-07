@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
-    fmt,
+    fmt, fs,
     future::Future,
     io,
     net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -90,7 +91,7 @@ const DASHBOARD_CSS: &str = r#"
 *{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px;text-decoration:none}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
 "#;
 const DASHBOARD_USER_CSS: &str = r#"
-.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted)}.segment.active{border-color:var(--accent-primary);color:var(--accent-primary)}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
+.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted)}.segment.active{border-color:var(--accent-primary);color:var(--accent-primary)}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
 "#;
 
 #[derive(Clone, Debug)]
@@ -107,6 +108,7 @@ pub struct GatewayState {
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
     provider_earnings: Arc<Vec<Value>>,
+    provider_load_progress_dir: Arc<Option<PathBuf>>,
     provider_table: Arc<Mutex<ProviderTable>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
@@ -1006,6 +1008,7 @@ impl GatewayState {
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
             provider_earnings: Arc::new(Vec::new()),
+            provider_load_progress_dir: Arc::new(None),
             provider_table: Arc::new(Mutex::new(provider_table)),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1067,6 +1070,11 @@ impl GatewayState {
 
     pub fn with_provider_earnings(mut self, earnings: Vec<Value>) -> Self {
         self.provider_earnings = Arc::new(earnings);
+        self
+    }
+
+    pub fn with_provider_load_progress_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.provider_load_progress_dir = Arc::new(Some(dir.into()));
         self
     }
 
@@ -1700,7 +1708,15 @@ fn dashboard_provider_html(
     let provider_query = provider_filter
         .map(|provider| format!("?provider={}", html_escape(provider)))
         .unwrap_or_default();
-    let enclave_rows = dashboard_provider_enclave_rows(&candidates, &latest_receipts);
+    let load_progress = dashboard_provider_load_progress(state);
+    let loading_rows =
+        dashboard_provider_loading_row_count(&candidates, &load_progress, provider_filter);
+    let enclave_rows = dashboard_provider_enclave_rows(
+        &candidates,
+        &latest_receipts,
+        &load_progress,
+        provider_filter,
+    );
     let live_session_rows =
         dashboard_provider_live_session_rows(&latest_receipts, &candidates, &provider_scope);
     let earnings_body =
@@ -1730,16 +1746,24 @@ fn dashboard_provider_html(
                 .map(|epoch| format!("epoch {epoch}"))
                 .unwrap_or_else(|| "epoch not loaded".to_owned()),
             hardware_status_class = if candidates.is_empty() {
-                "status-dot muted"
+                if loading_rows > 0 {
+                    "status-dot"
+                } else {
+                    "status-dot muted"
+                }
             } else {
                 "status-dot"
             },
             hardware_status = if candidates.is_empty() {
-                "No route"
+                if loading_rows > 0 {
+                    "Loading"
+                } else {
+                    "No route"
+                }
             } else {
                 "Healthy"
             },
-            candidate_count = candidates.len(),
+            candidate_count = candidates.len() + loading_rows,
             receipt_count = latest_receipts
                 .iter()
                 .filter(|receipt| dashboard_provider_in_scope(
@@ -1760,6 +1784,32 @@ struct DashboardProviderCandidate {
     backend: String,
     att_tier: u8,
     kyb: Option<ProviderKybInfo>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct DashboardProviderLoadProgress {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model_id: String,
+    #[serde(default)]
+    enclave_id: String,
+    #[serde(default)]
+    artifact: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    position: Option<u64>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    percent: Option<u64>,
+    #[serde(default)]
+    updated_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1792,6 +1842,44 @@ fn dashboard_provider_candidates(
                 att_tier: candidate.att_tier,
                 kyb: candidate.kyb.clone(),
             });
+        }
+    }
+    out
+}
+
+fn dashboard_provider_load_progress(
+    state: &GatewayState,
+) -> BTreeMap<(String, String), DashboardProviderLoadProgress> {
+    let mut out = BTreeMap::new();
+    let Some(dir) = state.provider_load_progress_dir.as_ref().as_ref() else {
+        return out;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(progress) = serde_json::from_str::<DashboardProviderLoadProgress>(&raw) else {
+            continue;
+        };
+        if progress.provider.is_empty() || progress.enclave_id.is_empty() {
+            continue;
+        }
+        let key = (progress.provider.clone(), progress.enclave_id.clone());
+        let replace = out
+            .get(&key)
+            .map(|existing: &DashboardProviderLoadProgress| {
+                existing.updated_at_ms <= progress.updated_at_ms
+            })
+            .unwrap_or(true);
+        if replace {
+            out.insert(key, progress);
         }
     }
     out
@@ -1944,15 +2032,15 @@ fn dashboard_provider_reputation_bps(
 fn dashboard_provider_enclave_rows(
     candidates: &[DashboardProviderCandidate],
     receipts: &[StoredReceipt],
+    load_progress: &BTreeMap<(String, String), DashboardProviderLoadProgress>,
+    provider_filter: Option<&str>,
 ) -> String {
-    if candidates.is_empty() {
-        return r#"<tr><td colspan="5"><span class="privacy-note">No provider routes loaded</span></td></tr>"#
-            .to_owned();
-    }
-    candidates
+    let mut seen = BTreeSet::new();
+    let mut rows = candidates
         .iter()
         .take(10)
         .map(|candidate| {
+            seen.insert((candidate.provider.clone(), candidate.enclave_id.clone()));
             let active = receipts
                 .iter()
                 .filter(|receipt| {
@@ -1973,8 +2061,12 @@ fn dashboard_provider_enclave_rows(
                     )
                 })
                 .unwrap_or_default();
+            let status = dashboard_provider_enclave_status(load_progress.get(&(
+                candidate.provider.clone(),
+                candidate.enclave_id.clone(),
+            )));
             format!(
-                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td class="mono">{}</td><td class="mono">T{}{}</td><td><div class="mini-bar"><span style="--w:{}%"></span></div><span class="privacy-note">{}%</span></td><td><span class="status-dot">Serving</span></td></tr>"#,
+                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td class="mono">{}</td><td class="mono">T{}{}</td><td><div class="mini-bar"><span style="--w:{}%"></span></div><span class="privacy-note">{}%</span></td><td>{}</td></tr>"#,
                 html_escape(short_text(&candidate.model_id, 30).as_ref()),
                 html_escape(short_text(&candidate.enclave_id, 22).as_ref()),
                 html_escape(&candidate.backend),
@@ -1982,9 +2074,120 @@ fn dashboard_provider_enclave_rows(
                 kyb,
                 saturation,
                 saturation,
+                status,
             )
         })
-        .collect::<String>()
+        .collect::<String>();
+    let remaining = 10_usize.saturating_sub(seen.len());
+    for ((_, _), progress) in load_progress
+        .iter()
+        .filter(|((provider, enclave_id), _)| {
+            provider_filter.map_or(true, |filter| filter == provider)
+                && !seen.contains(&(provider.clone(), enclave_id.clone()))
+        })
+        .take(remaining)
+    {
+        rows.push_str(&dashboard_provider_progress_only_row(progress));
+    }
+    if rows.is_empty() {
+        return r#"<tr><td colspan="5"><span class="privacy-note">No provider routes loaded</span></td></tr>"#
+            .to_owned();
+    }
+    rows
+}
+
+fn dashboard_provider_loading_row_count(
+    candidates: &[DashboardProviderCandidate],
+    load_progress: &BTreeMap<(String, String), DashboardProviderLoadProgress>,
+    provider_filter: Option<&str>,
+) -> usize {
+    let seen = candidates
+        .iter()
+        .map(|candidate| (candidate.provider.clone(), candidate.enclave_id.clone()))
+        .collect::<BTreeSet<_>>();
+    load_progress
+        .iter()
+        .filter(|((provider, enclave_id), _)| {
+            provider_filter.map_or(true, |filter| filter == provider)
+                && !seen.contains(&(provider.clone(), enclave_id.clone()))
+        })
+        .count()
+}
+
+fn dashboard_provider_progress_only_row(progress: &DashboardProviderLoadProgress) -> String {
+    let model = if progress.model_id.trim().is_empty() {
+        "local provider load"
+    } else {
+        progress.model_id.trim()
+    };
+    let backend = if progress.artifact.trim().is_empty() {
+        "loading"
+    } else {
+        progress.artifact.trim()
+    };
+    format!(
+        r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td class="mono">{}</td><td class="mono">pending</td><td><div class="mini-bar"><span style="--w:0%"></span></div><span class="privacy-note">0%</span></td><td>{}</td></tr>"#,
+        html_escape(short_text(model, 30).as_ref()),
+        html_escape(short_text(&progress.enclave_id, 22).as_ref()),
+        html_escape(backend),
+        dashboard_provider_enclave_status(Some(progress)),
+    )
+}
+
+fn dashboard_provider_enclave_status(progress: Option<&DashboardProviderLoadProgress>) -> String {
+    let Some(progress) = progress else {
+        return r#"<span class="status-dot">Serving</span>"#.to_owned();
+    };
+    let phase = progress.phase.trim();
+    let status = progress.status.trim();
+    if status == "complete" && (phase == "serving" || phase == "joined") {
+        let label = if phase == "joined" {
+            "Joined"
+        } else {
+            "Serving"
+        };
+        return format!(r#"<span class="status-dot">{label}</span>"#);
+    }
+    if status == "error" {
+        let detail = non_empty_load_label(progress);
+        return format!(
+            r#"<div class="load-cell"><span class="status-dot muted">Load failed</span><span class="privacy-note">{}</span></div>"#,
+            html_escape(&detail),
+        );
+    }
+    let percent = progress
+        .percent
+        .or_else(|| dashboard_provider_progress_percent(progress.position, progress.total))
+        .unwrap_or(0)
+        .min(100);
+    let phase_label = if phase.is_empty() { "load" } else { phase };
+    let headline = if status == "complete" {
+        "Ready"
+    } else {
+        "Loading"
+    };
+    format!(
+        r#"<div class="load-cell"><span class="status-dot">{headline}</span><div class="mini-bar"><span style="--w:{percent}%"></span></div><span class="privacy-note">{} {}%</span></div>"#,
+        html_escape(phase_label),
+        percent,
+    )
+}
+
+fn dashboard_provider_progress_percent(position: Option<u64>, total: Option<u64>) -> Option<u64> {
+    match (position, total) {
+        (Some(position), Some(total)) if total > 0 => {
+            Some(((u128::from(position) * 100) / u128::from(total)).min(100) as u64)
+        }
+        _ => None,
+    }
+}
+
+fn non_empty_load_label(progress: &DashboardProviderLoadProgress) -> String {
+    if progress.phase.trim().is_empty() {
+        progress.label.clone()
+    } else {
+        progress.phase.clone()
+    }
 }
 
 fn dashboard_provider_live_session_rows(

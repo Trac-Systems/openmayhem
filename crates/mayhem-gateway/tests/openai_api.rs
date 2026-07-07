@@ -29,6 +29,7 @@ use mayhem_proto::{
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -2770,6 +2771,113 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert!(body.contains("mayhem earnings --provider"));
     assert!(body.contains("mayhem withdraw --claim-proof"));
     assert!(!body.contains("ledger earnings not loaded"));
+    assert_no_external_urls(&body);
+}
+
+#[tokio::test]
+async fn provider_dashboard_renders_local_load_progress() {
+    let provider = "66".repeat(32);
+    let model = routed_test_model_with_providers(std::slice::from_ref(&provider));
+    let enclave_id = model.mayhem.route_candidates[0].enclave_id.clone();
+    let progress_dir = tempfile::tempdir().expect("progress tempdir");
+    fs::write(
+        progress_dir.path().join("provider-progress.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "provider": provider,
+            "model_id": "mayhem/routed-test",
+            "enclave_id": enclave_id,
+            "artifact": "gguf-q4_k_m",
+            "label": "gguf-q4_k_m cached artifact",
+            "phase": "verify",
+            "status": "running",
+            "position": 42_u64,
+            "total": 100_u64,
+            "percent": 42_u64,
+            "updated_at_ms": 1_782_950_400_000_u64
+        }))
+        .expect("progress json"),
+    )
+    .expect("write progress");
+    let state = GatewayState::from_models(vec![model])
+        .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let query = dashboard_path
+        .strip_prefix("/mayhem/dashboard?")
+        .expect("dashboard token query");
+    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let app = openai_router(state);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &provider_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("provider dashboard html");
+    assert!(body.contains("Loading"));
+    assert!(body.contains("verify 42%"));
+    assert!(body.contains("style=\"--w:42%\""));
+    assert_no_external_urls(&body);
+}
+
+#[tokio::test]
+async fn provider_dashboard_renders_progress_before_route_exists() {
+    let provider = "77".repeat(32);
+    let enclave_id = "88".repeat(32);
+    let progress_dir = tempfile::tempdir().expect("progress tempdir");
+    fs::write(
+        progress_dir.path().join("provider-progress.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "provider": provider,
+            "model_id": "mayhem/loading-test",
+            "enclave_id": enclave_id,
+            "artifact": "gguf-q4_k_m",
+            "label": "gguf-q4_k_m artifact",
+            "phase": "download",
+            "status": "running",
+            "position": 7_u64,
+            "total": 10_u64,
+            "percent": 70_u64,
+            "updated_at_ms": 1_782_950_400_000_u64
+        }))
+        .expect("progress json"),
+    )
+    .expect("write progress");
+    let state = GatewayState::from_models(Vec::new())
+        .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let query = dashboard_path
+        .strip_prefix("/mayhem/dashboard?")
+        .expect("dashboard token query");
+    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let app = openai_router(state);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &provider_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("provider dashboard html");
+    assert!(body.contains("mayhem/loading-test"));
+    assert!(body.contains("pending"));
+    assert!(body.contains("download 70%"));
+    assert!(body.contains("Loading"));
+    assert!(!body.contains("No provider routes loaded"));
     assert_no_external_urls(&body);
 }
 

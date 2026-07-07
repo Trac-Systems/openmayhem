@@ -75,28 +75,27 @@ Install Mayhem from a checkout:
 ./install.sh --from-source
 ```
 
-Set up a user wallet and local config:
+Start Mayhem:
 
 ```bash
-mayhem setup --role user
+mayhem up --yes
 ```
 
-Start the local gateway. Keep this terminal open:
+`mayhem up` repairs first-run config, creates a wallet if needed, starts the Pear/Intercom peer through the bundled runtime, starts the local bridge and OpenAI-compatible gateway, health-checks everything, and prints copy/paste URLs. It never needs a browser; if a later flow offers a browser redirect, the URL is printed first.
 
 ```bash
-mayhem use \
-  --sc-bridge-url "$MAYHEM_SC_BRIDGE_URL" \
-  --sc-bridge-token "$MAYHEM_SC_BRIDGE_TOKEN"
+curl http://127.0.0.1:11435/v1/models
 ```
 
 What this does:
 
 | Command | Purpose |
 |---------|---------|
-| `mayhem use` | Reads canonical contract state, verifies admin-created model routes, starts the local OpenAI-compatible endpoint, and prints copy/paste dashboard URLs. |
-| `--sc-bridge-url` / `--sc-bridge-token` | Let the gateway open direct provider sessions over Intercom. |
+| `mayhem up --yes` | Starts the whole local user stack from one terminal and prints the OpenAI base URL plus dashboard URL. |
+| `curl http://127.0.0.1:11435/v1/models` | Confirms the local OpenAI-compatible endpoint is answering. |
+| `mayhem down` | Stops the supervised peer, bridge, gateway, and provider worker. |
 
-In a second terminal, list usable models:
+List usable models:
 
 ```bash
 mayhem models --gateway
@@ -124,51 +123,68 @@ mayhem models --gateway --require-kyb
 
 `--min-att-tier 3` asks for prompt-private routing. `--require-kyb` asks for Tier 4 identity; it does not make prompts private. You can also send routing preferences through OpenAI-compatible request headers, for example `X-Mayhem-Min-Att-Tier: 3`, `X-Mayhem-Hedge: 1`, or failover thresholds such as `X-Mayhem-Min-Tok-S`.
 
+Stop Mayhem:
+
+```bash
+mayhem down
+```
+
 ## Provider Walkthrough
 
-Install Mayhem and set up a provider wallet:
+Install Mayhem and start the provider stack:
 
 ```bash
 ./install.sh --from-source
-mayhem setup --role provider
+mayhem up --provider --yes
 ```
 
-List canonical models and provider-eligible routes:
+`mayhem up --provider` starts the same local user stack and also supervises provider serving for the first feasible admin-created enclave. Providers do not create models, prices, or canonical rooms; they only opt into admin-created capacity.
+
+Use the printed provider dashboard URL to watch enclave download, verify, seal, load, and serving progress.
+
+List canonical models and provider state:
 
 ```bash
-mayhem models
 mayhem provider list
-```
-
-Join an admin-created enclave and room:
-
-```bash
-mayhem provider start --enclave <admin-enclave-id> --rooms auto --serve-sessions
+mayhem provider health
 ```
 
 What this does:
 
 | Command | Purpose |
 |---------|---------|
-| `mayhem models` | Reads the ledger `catalog/current` anchor, fetches signed admin catalog JSON, verifies it, and lists approved catalog content without requiring a repo update. |
-| `provider start` | Creates provider opt-in evidence for an existing admin enclave/room and starts serving direct sessions. |
-| `--rooms auto` | Selects matching admin-created canonical rooms. Provider-created Intercom rooms are not canonical ledger rooms. |
+| `mayhem up --provider --yes` | Starts the peer, bridge, gateway, and provider worker in one supervised local stack. |
+| `mayhem provider list` | Shows this wallet's canonical admin-created enclave and room joins. |
+| `mayhem provider health` | Checks ledger serving state, local heartbeats, and gateway route visibility. |
 
-Inspect provider state:
+Inspect earnings and reputation:
 
 ```bash
-mayhem provider health
 mayhem earnings
 mayhem reputation
 ```
 
-Opt out:
+Stop the provider stack:
 
 ```bash
-mayhem provider stop
+mayhem down
 ```
 
 Providers are paid from settlement evidence on the rail they accepted for the served session.
+
+## Advanced / Manual Provider Start
+
+The main path is `mayhem up --provider`. For debugging a provider worker without the supervisor, use the manual command after a local peer and bridge are already running:
+
+```bash
+mayhem provider start --enclave <admin-enclave-id> --rooms auto --serve-sessions
+```
+
+| Command | Purpose |
+|---------|---------|
+| `mayhem models` | Reads the ledger `catalog/current` anchor, fetches signed admin catalog JSON, verifies it, and lists approved catalog content without requiring a repo update. |
+| `provider start` | Creates provider opt-in evidence for an existing admin enclave/room and starts serving direct sessions. |
+| `--rooms auto` | Selects matching admin-created canonical rooms. Provider-created Intercom rooms are not canonical ledger rooms. |
 
 ## Catalog And Enclaves
 
@@ -225,7 +241,7 @@ Providers choose which admin-supported rails they accept; they do not set prices
 
 ## Dashboards
 
-`mayhem use` serves loopback-only local dashboards:
+`mayhem up` serves loopback-only local dashboards:
 
 | Dashboard | Path | Shows |
 |-----------|------|-------|
@@ -270,6 +286,6 @@ cargo build --workspace
 MAYHEM_RUN_INTERCOM_TESTS=1 cargo test -p mayhem-bridge --test sc_bridge -- --nocapture
 ```
 
-Standalone `mayhem-gateway` is a raw development smoke binary and must be started with `--dev-embedded-catalog`. Production/user flows should use `mayhem use`.
+Standalone `mayhem-gateway` is a raw development smoke binary and must be started with `--dev-embedded-catalog`. Production/user/provider flows should use `mayhem up` and `mayhem down`.
 
 Operator, provider, and user docs live in `docs/operator-runbook.md`, `docs/provider-guide.md`, and `docs/user-guide.md`. The iteration plans and trackers in `docs/` record the implementation history.

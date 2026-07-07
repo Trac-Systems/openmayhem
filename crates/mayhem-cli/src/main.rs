@@ -3688,6 +3688,9 @@ struct ProviderStartArgs {
     /// Development-only: load a local catalog fixture without verifying its detached signature.
     #[arg(long, hide = true)]
     dev_skip_catalog_verify: bool,
+
+    #[arg(skip)]
+    load_progress: Option<ProviderLoadProgressContext>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -14157,6 +14160,7 @@ async fn up(args: UpArgs) -> Result<()> {
     .await?;
     let dashboard_url =
         read_up_logged_dashboard_url(&plan.home).unwrap_or_else(|| plan.dashboard_url.clone());
+    let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
 
     let report = json!({
         "ok": true,
@@ -14179,6 +14183,7 @@ async fn up(args: UpArgs) -> Result<()> {
             "url": plan.gateway_url,
             "openai_base_url": plan.openai_base_url,
             "dashboard_url": dashboard_url.clone(),
+            "provider_dashboard_url": provider_dashboard_url.clone(),
             "models": models,
         },
         "provider": plan.provider,
@@ -14193,6 +14198,7 @@ async fn up(args: UpArgs) -> Result<()> {
         "copy_paste": {
             "openai_base_url": plan.openai_base_url,
             "dashboard_url": dashboard_url.clone(),
+            "provider_dashboard_url": provider_dashboard_url.clone(),
             "status": format!("mayhem status --home {}", shell_single_quote(&plan.home.display().to_string())),
         },
     });
@@ -14203,6 +14209,9 @@ async fn up(args: UpArgs) -> Result<()> {
         println!("Mayhem is up.");
         println!("Copy/paste OpenAI base URL: {}", plan.openai_base_url);
         println!("Copy/paste dashboard URL: {dashboard_url}");
+        if plan.provider {
+            println!("Copy/paste provider dashboard URL: {provider_dashboard_url}");
+        }
         println!(
             "Copy/paste status command: mayhem status --home {}",
             plan.home.display()
@@ -14717,6 +14726,10 @@ fn read_up_logged_dashboard_url(home: &Path) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     })
+}
+
+fn provider_dashboard_url_from_user(user_dashboard_url: &str) -> String {
+    user_dashboard_url.replacen("/mayhem/dashboard", "/mayhem/dashboard/provider", 1)
 }
 
 fn mayhemd_launcher_command(mayhemd_path: &Path) -> Result<std::process::Command> {
@@ -15390,8 +15403,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     };
     let state = state.with_receipt_checkpoint_every(receipt_checkpoint_every.clone());
     let state = apply_gateway_canary_policy_args(state, &args)?;
-    let state = state.with_receipt_rail(args.rail.as_str());
+    let state = state
+        .with_receipt_rail(args.rail.as_str())
+        .with_provider_load_progress_dir(home.join("provider-load-progress"));
     let dashboard_url = state.dashboard_url(&gateway_url);
+    let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
     let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
     let report = json!({
         "ok": true,
@@ -15400,6 +15416,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "gateway_url": gateway_url,
         "openai_base_url": openai_base_url,
         "dashboard_url": dashboard_url,
+        "provider_dashboard_url": provider_dashboard_url,
         "dashboard_session_expires_in_seconds": dashboard_session_expires_in_seconds,
         "source": source,
         "backend": backend,
@@ -15429,6 +15446,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         println!("Rail: {}", args.rail.as_str());
         println!("Copy/paste OpenAI base URL: {openai_base_url}");
         println!("Copy/paste dashboard URL: {dashboard_url}");
+        println!("Copy/paste provider dashboard URL: {provider_dashboard_url}");
         println!("Dashboard session expires in: {dashboard_session_expires_in_seconds}s");
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
@@ -21366,6 +21384,12 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             selected.enclave.model_id
         );
     }
+    args.load_progress = Some(ProviderLoadProgressContext::new(
+        &home,
+        &wallet.public_key,
+        &selected,
+    ));
+    write_provider_load_progress_stage(&args, "selected admin enclave", "select", "complete", 100);
 
     provider_log(
         &args,
@@ -21383,6 +21407,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let artifact_paths = download_provider_artifact(&args, &downloads_dir, &selected).await?;
 
     provider_log(&args, "Verifying and sealing the enclave artifact");
+    write_provider_load_progress_stage(&args, "seal enclave artifact", "seal", "running", 0);
     let sealed_store = home
         .join("enclaves")
         .join(safe_path_component(&selected.enclave.model_id))
@@ -21419,8 +21444,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             ),
         );
     }
+    write_provider_load_progress_stage(&args, "seal enclave artifact", "seal", "complete", 100);
 
     provider_log(&args, "Preparing Tier-1 attestation");
+    write_provider_load_progress_stage(&args, "prepare attestation", "attest", "running", 0);
     let runtime_context = RuntimeKeyContext {
         provider_id: wallet.public_key.clone(),
         enclave_id: selected.enclave.enclave_id.clone(),
@@ -21487,6 +21514,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             attestation.report.enclave_id
         );
     }
+    write_provider_load_progress_stage(&args, "prepare attestation", "attest", "complete", 100);
 
     let session_responder = if args.serve_sessions {
         Some(provider_session_responder(&ProviderSessionContext {
@@ -21506,6 +21534,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     };
 
     provider_log(&args, "Submitting provider opt-in feature records");
+    write_provider_load_progress_stage(&args, "join canonical rooms", "register", "running", 0);
     let provider_feature =
         ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, args.sim).await?;
     let serve_feature = ensure_joined_enclave(
@@ -21527,6 +21556,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         args.sim,
     )
     .await?;
+    write_provider_load_progress_stage(&args, "join canonical rooms", "register", "complete", 100);
 
     let heartbeats = if args.no_heartbeat {
         Vec::new()
@@ -21555,6 +21585,23 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &selected.enclave.enclave_id,
         &heartbeats,
     )?;
+    if args.serve_sessions {
+        write_provider_load_progress_stage(
+            &args,
+            "provider session server",
+            "serving",
+            "complete",
+            100,
+        );
+    } else {
+        write_provider_load_progress_stage(
+            &args,
+            "joined canonical rooms",
+            "joined",
+            "complete",
+            100,
+        );
+    }
     let sealed_store_boot = json!({
         "checked": false,
         "mode": "sealed-manifest",
@@ -22957,8 +23004,11 @@ fn provider_progress_enabled(args: &ProviderStartArgs) -> bool {
 struct ProviderProgressBars {
     enabled: bool,
     label: String,
+    load_progress: Option<ProviderLoadProgressContext>,
     phase: Option<ProgressPhase>,
     bar: Option<ProgressBar>,
+    last_position: u64,
+    last_total: Option<u64>,
 }
 
 impl ProviderProgressBars {
@@ -22966,22 +23016,40 @@ impl ProviderProgressBars {
         Self {
             enabled: provider_progress_enabled(args),
             label: label.into(),
+            load_progress: args.load_progress.clone(),
             phase: None,
             bar: None,
+            last_position: 0,
+            last_total: None,
         }
     }
 
     fn update(&mut self, event: ProgressEvent) {
-        if !self.enabled {
-            return;
-        }
         if self.phase != Some(event.phase) {
             self.finish_current();
             self.phase = Some(event.phase);
-            self.bar = Some(provider_progress_bar(
+            if self.enabled {
+                self.bar = Some(provider_progress_bar(
+                    event.total,
+                    format!("{} {}", self.label, progress_phase_label(event.phase)),
+                ));
+            }
+        }
+        let phase_label = progress_phase_label(event.phase);
+        if let Some(load_progress) = &self.load_progress {
+            let _ = write_provider_load_progress(
+                load_progress,
+                &self.label,
+                phase_label,
+                "running",
+                Some(event.position),
                 event.total,
-                format!("{} {}", self.label, progress_phase_label(event.phase)),
-            ));
+            );
+        }
+        self.last_position = event.position;
+        self.last_total = event.total;
+        if !self.enabled {
+            return;
         }
         if let Some(bar) = &self.bar {
             if let Some(total) = event.total {
@@ -22992,6 +23060,18 @@ impl ProviderProgressBars {
     }
 
     fn finish_current(&mut self) {
+        if let Some(phase) = self.phase.take() {
+            if let Some(load_progress) = &self.load_progress {
+                let _ = write_provider_load_progress(
+                    load_progress,
+                    &self.label,
+                    progress_phase_label(phase),
+                    "complete",
+                    Some(self.last_position),
+                    self.last_total,
+                );
+            }
+        }
         if let Some(bar) = self.bar.take() {
             bar.finish_and_clear();
         }
@@ -23056,8 +23136,17 @@ fn with_provider_progress_spinner<T, F>(
 where
     F: FnOnce() -> Result<T>,
 {
-    let bar = provider_progress_spinner(args, message);
+    let message = message.into();
+    write_provider_load_progress_stage(args, &message, "load", "running", 0);
+    let bar = provider_progress_spinner(args, message.clone());
     let result = run();
+    write_provider_load_progress_stage(
+        args,
+        &message,
+        "load",
+        if result.is_ok() { "complete" } else { "error" },
+        if result.is_ok() { 100 } else { 0 },
+    );
     if let Some(bar) = bar {
         if result.is_ok() {
             bar.finish_and_clear();
@@ -23066,6 +23155,107 @@ where
         }
     }
     result
+}
+
+#[derive(Clone, Debug)]
+struct ProviderLoadProgressContext {
+    dir: PathBuf,
+    provider: String,
+    model_id: String,
+    enclave_id: String,
+    artifact: String,
+}
+
+#[derive(Serialize)]
+struct ProviderLoadProgressReport<'a> {
+    schema: u32,
+    provider: &'a str,
+    model_id: &'a str,
+    enclave_id: &'a str,
+    artifact: &'a str,
+    label: &'a str,
+    phase: &'a str,
+    status: &'a str,
+    position: Option<u64>,
+    total: Option<u64>,
+    percent: Option<u64>,
+    updated_at_ms: u64,
+}
+
+impl ProviderLoadProgressContext {
+    fn new(home: &Path, provider: &str, selected: &ProviderCandidate) -> Self {
+        Self {
+            dir: home.join("provider-load-progress"),
+            provider: provider.to_owned(),
+            model_id: selected.enclave.model_id.clone(),
+            enclave_id: selected.enclave.enclave_id.clone(),
+            artifact: selected.artifact_name.clone(),
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join(format!(
+            "{}-{}.json",
+            safe_path_component(&self.provider),
+            safe_path_component(&self.enclave_id)
+        ))
+    }
+}
+
+fn write_provider_load_progress_stage(
+    args: &ProviderStartArgs,
+    label: &str,
+    phase: &str,
+    status: &str,
+    percent: u64,
+) {
+    if let Some(load_progress) = &args.load_progress {
+        let percent = percent.min(100);
+        let _ = write_provider_load_progress(
+            load_progress,
+            label,
+            phase,
+            status,
+            Some(percent),
+            Some(100),
+        );
+    }
+}
+
+fn write_provider_load_progress(
+    ctx: &ProviderLoadProgressContext,
+    label: &str,
+    phase: &str,
+    status: &str,
+    position: Option<u64>,
+    total: Option<u64>,
+) -> Result<()> {
+    let percent = provider_load_progress_percent(position, total);
+    let updated_at_ms = unix_epoch_millis().unwrap_or(0);
+    let report = ProviderLoadProgressReport {
+        schema: 1,
+        provider: &ctx.provider,
+        model_id: &ctx.model_id,
+        enclave_id: &ctx.enclave_id,
+        artifact: &ctx.artifact,
+        label,
+        phase,
+        status,
+        position,
+        total,
+        percent,
+        updated_at_ms,
+    };
+    write_json_file(&ctx.path(), &report)
+}
+
+fn provider_load_progress_percent(position: Option<u64>, total: Option<u64>) -> Option<u64> {
+    match (position, total) {
+        (Some(position), Some(total)) if total > 0 => {
+            Some(((u128::from(position) * 100) / u128::from(total)).min(100) as u64)
+        }
+        _ => None,
+    }
 }
 
 fn validate_provider_start_security_mode(
@@ -38129,6 +38319,40 @@ mod tests {
     }
 
     #[test]
+    fn provider_load_progress_writes_dashboard_json() {
+        let dir = env::temp_dir().join(format!(
+            "mayhem-provider-progress-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        let ctx = ProviderLoadProgressContext {
+            dir: dir.clone(),
+            provider: "aa".repeat(32),
+            model_id: "mayhem/test-model".to_owned(),
+            enclave_id: "bb".repeat(32),
+            artifact: "gguf-q4_k_m".to_owned(),
+        };
+        write_provider_load_progress(
+            &ctx,
+            "gguf-q4_k_m artifact",
+            "download",
+            "running",
+            Some(5),
+            Some(10),
+        )
+        .expect("write progress");
+        let value = read_json_file(&ctx.path()).expect("read progress");
+        assert_eq!(value["provider"], "aa".repeat(32));
+        assert_eq!(value["model_id"], "mayhem/test-model");
+        assert_eq!(value["enclave_id"], "bb".repeat(32));
+        assert_eq!(value["artifact"], "gguf-q4_k_m");
+        assert_eq!(value["phase"], "download");
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["percent"], 50);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn opencode_merge_preserves_existing_config_and_adds_mayhem_provider() {
         let path = env::temp_dir().join(format!(
             "mayhem-opencode-merge-{}-{}.json",
@@ -38338,6 +38562,7 @@ mod tests {
             dev_session_shim: false,
             print_json: true,
             dev_skip_catalog_verify: true,
+            load_progress: None,
         }
     }
 
