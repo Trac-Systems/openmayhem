@@ -5025,6 +5025,7 @@ struct CatalogListModel {
     canary_verification_method: String,
     canary_verification_tolerance_bps: Option<u32>,
     artifacts: Vec<CatalogListArtifact>,
+    local_runs: Vec<CatalogListLocalRun>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5070,6 +5071,61 @@ struct CatalogListArtifact {
     source_sha256: Option<String>,
     canary_fingerprint: Option<String>,
     notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListLocalRun {
+    enclave_id: String,
+    artifact: String,
+    engine: String,
+    quant: String,
+    att_tier: u8,
+    marker: String,
+    status: String,
+    label: String,
+    reason: String,
+    requested_ctx: u64,
+    served_ctx: u64,
+    catalog_ctx_max: u64,
+    estimated_tok_s: Option<f64>,
+    estimated_tok_s_source: String,
+    n_layers_gpu: Option<u32>,
+    memory: CatalogListLocalRunMemory,
+    download: CatalogListDownloadEstimate,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogListLocalRunMemory {
+    required_bytes: u64,
+    required_human: String,
+    weights_bytes: u64,
+    weights_human: String,
+    kv_bytes: u64,
+    kv_human: String,
+    overhead_bytes: u64,
+    overhead_human: String,
+    budget_bytes: u64,
+    budget_human: String,
+    reserve_bytes: u64,
+    reserve_human: String,
+    claimed_bytes: u64,
+    claimed_human: String,
+    pool: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogListDownloadEstimate {
+    bytes: u64,
+    human: String,
+    eta: String,
+    eta_source: String,
+}
+
+#[derive(Clone, Copy)]
+struct CatalogListLocalRunContext<'a> {
+    contract: &'a ContractCatalog,
+    hardware: &'a HardwareReport,
+    home: &'a Path,
 }
 
 #[derive(Debug, Serialize)]
@@ -5139,6 +5195,7 @@ fn catalog_list(args: CatalogListArgs) -> Result<()> {
         verification.key_id,
         args.tier,
         None,
+        None,
     );
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -5156,12 +5213,14 @@ fn catalog_list_report(
     key_id: String,
     tier: CatalogListTier,
     hardware: Option<&HardwareReport>,
+    local_run: Option<CatalogListLocalRunContext<'_>>,
 ) -> CatalogListReport {
+    let local_run = local_run.as_ref();
     let models = catalog_doc
         .models
         .iter()
         .filter(|model| catalog_list_tier_matches(model.tier.as_str(), tier))
-        .map(|model| catalog_list_model(model, hardware))
+        .map(|model| catalog_list_model(model, hardware, local_run))
         .collect::<Vec<_>>();
     let artifact_count = models.iter().map(|model| model.artifacts.len()).sum();
     CatalogListReport {
@@ -5207,6 +5266,7 @@ fn catalog_list_hardware(hardware: &HardwareReport) -> CatalogListHardware {
 fn catalog_list_model(
     model: &catalog::CatalogModel,
     hardware: Option<&HardwareReport>,
+    local_run: Option<&CatalogListLocalRunContext<'_>>,
 ) -> CatalogListModel {
     let artifacts = model
         .artifacts
@@ -5268,6 +5328,287 @@ fn catalog_list_model(
         canary_verification_method: model.canary.verification_method.clone(),
         canary_verification_tolerance_bps: model.canary.verification_tolerance_bps,
         artifacts,
+        local_runs: local_run
+            .map(|context| catalog_model_local_runs(model, context))
+            .unwrap_or_default(),
+    }
+}
+
+fn catalog_model_local_runs(
+    model: &catalog::CatalogModel,
+    context: &CatalogListLocalRunContext<'_>,
+) -> Vec<CatalogListLocalRun> {
+    let mut enclaves = context
+        .contract
+        .enclaves
+        .iter()
+        .filter(|enclave| {
+            enclave.model_id == model.model_id
+                && enclave.status == "active"
+                && admin_role_marker_ok(enclave.created_by_role.as_deref())
+        })
+        .collect::<Vec<_>>();
+    enclaves.sort_by(|a, b| a.enclave_id.cmp(&b.enclave_id));
+
+    let args = provider_start_args_for_local_run_display(context.home);
+    let at = unix_epoch_seconds().unwrap_or(0);
+    enclaves
+        .into_iter()
+        .filter_map(|enclave| {
+            let (artifact_name, artifact) = model.artifacts.iter().find(|(_, artifact)| {
+                artifact.engine == enclave.backend
+                    && ledger_enclave_matches_catalog_artifact(enclave, artifact)
+            })?;
+            Some(catalog_enclave_local_run(
+                model,
+                enclave,
+                artifact_name,
+                artifact,
+                context,
+                &args,
+                at,
+            ))
+        })
+        .collect()
+}
+
+fn catalog_enclave_local_run(
+    model: &catalog::CatalogModel,
+    enclave: &LedgerEnclave,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    context: &CatalogListLocalRunContext<'_>,
+    args: &ProviderStartArgs,
+    at: u64,
+) -> CatalogListLocalRun {
+    let download = catalog_download_estimate(artifact);
+    let Some(verdict) = context
+        .hardware
+        .backend_verdicts
+        .iter()
+        .find(|verdict| verdict.backend == enclave.backend)
+    else {
+        return catalog_local_run_cannot_run(
+            enclave,
+            artifact_name,
+            artifact,
+            download,
+            "cannot_run",
+            format!(
+                "backend {} is not reported by hwprobe on this host",
+                enclave.backend
+            ),
+        );
+    };
+
+    let compatibility =
+        artifact_hardware_compatibility_base(model, artifact_name, artifact, context.hardware);
+    if !compatibility.compatible {
+        let status = if compatibility.reason.contains("needs at least") {
+            "too_big"
+        } else {
+            "cannot_run"
+        };
+        return catalog_local_run_cannot_run(
+            enclave,
+            artifact_name,
+            artifact,
+            download,
+            status,
+            compatibility.reason,
+        );
+    }
+
+    match provider_context_feasibility(
+        enclave,
+        model,
+        artifact,
+        verdict,
+        context.hardware,
+        args,
+        &context.contract.ctx_bracket_schedule,
+        at,
+    ) {
+        Ok(feasibility) => {
+            let reduced =
+                feasibility.fallback_applied || verdict.status != VerdictStatus::FullOffload;
+            let (marker, status, label) = if reduced {
+                ("◐", "runs_reduced", "runs reduced")
+            } else {
+                ("✓", "runs", "runs")
+            };
+            let mut details = Vec::new();
+            details.push(format!(
+                "ctx {} of requested/default {}",
+                feasibility.served_ctx, feasibility.requested_ctx
+            ));
+            details.push(format!(
+                "needs {} against {} budget",
+                human_bytes(feasibility.estimated_required_bytes),
+                human_bytes(feasibility.memory_budget.budget_bytes)
+            ));
+            if let Some(layers) = verdict.n_layers_gpu {
+                details.push(format!("{layers} GPU layer(s) estimated"));
+            }
+            if let Some(message) = feasibility.message.as_deref() {
+                details.push(message.to_owned());
+            }
+            CatalogListLocalRun {
+                enclave_id: enclave.enclave_id.clone(),
+                artifact: artifact_name.to_owned(),
+                engine: enclave.backend.clone(),
+                quant: normalize_ledger_quant(&enclave.quant),
+                att_tier: enclave.att_tier,
+                marker: marker.to_owned(),
+                status: status.to_owned(),
+                label: label.to_owned(),
+                reason: details.join("; "),
+                requested_ctx: feasibility.requested_ctx,
+                served_ctx: feasibility.served_ctx,
+                catalog_ctx_max: feasibility.catalog_ctx_max,
+                estimated_tok_s: verdict.est_tok_s,
+                estimated_tok_s_source: "hwprobe estimate until measured by live heartbeat/canary"
+                    .to_owned(),
+                n_layers_gpu: verdict.n_layers_gpu,
+                memory: catalog_local_run_memory(&feasibility),
+                download,
+            }
+        }
+        Err(err) => {
+            let reason = format!("{err:#}");
+            let status = if reason.contains("cannot fit") || reason.contains("exceeds usable") {
+                "too_big"
+            } else {
+                "cannot_run"
+            };
+            catalog_local_run_cannot_run(enclave, artifact_name, artifact, download, status, reason)
+        }
+    }
+}
+
+fn catalog_local_run_cannot_run(
+    enclave: &LedgerEnclave,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    download: CatalogListDownloadEstimate,
+    status: &str,
+    reason: String,
+) -> CatalogListLocalRun {
+    CatalogListLocalRun {
+        enclave_id: enclave.enclave_id.clone(),
+        artifact: artifact_name.to_owned(),
+        engine: enclave.backend.clone(),
+        quant: normalize_ledger_quant(&enclave.quant),
+        att_tier: enclave.att_tier,
+        marker: "✗".to_owned(),
+        status: status.to_owned(),
+        label: if status == "too_big" {
+            "too big".to_owned()
+        } else {
+            "cannot run".to_owned()
+        },
+        reason,
+        requested_ctx: 0,
+        served_ctx: 0,
+        catalog_ctx_max: 0,
+        estimated_tok_s: None,
+        estimated_tok_s_source: "not estimated because the local load gate failed".to_owned(),
+        n_layers_gpu: None,
+        memory: CatalogListLocalRunMemory {
+            required_bytes: artifact.weights_bytes,
+            required_human: human_bytes(artifact.weights_bytes),
+            weights_bytes: artifact.weights_bytes,
+            weights_human: human_bytes(artifact.weights_bytes),
+            kv_bytes: 0,
+            kv_human: human_bytes(0),
+            overhead_bytes: 0,
+            overhead_human: human_bytes(0),
+            budget_bytes: 0,
+            budget_human: human_bytes(0),
+            reserve_bytes: 0,
+            reserve_human: human_bytes(0),
+            claimed_bytes: 0,
+            claimed_human: human_bytes(0),
+            pool: "unavailable".to_owned(),
+        },
+        download,
+    }
+}
+
+fn catalog_local_run_memory(feasibility: &ProviderCtxFeasibility) -> CatalogListLocalRunMemory {
+    CatalogListLocalRunMemory {
+        required_bytes: feasibility.estimated_required_bytes,
+        required_human: human_bytes(feasibility.estimated_required_bytes),
+        weights_bytes: feasibility.estimated_weights_bytes,
+        weights_human: human_bytes(feasibility.estimated_weights_bytes),
+        kv_bytes: feasibility.estimated_kv_bytes,
+        kv_human: human_bytes(feasibility.estimated_kv_bytes),
+        overhead_bytes: feasibility.estimated_overhead_bytes,
+        overhead_human: human_bytes(feasibility.estimated_overhead_bytes),
+        budget_bytes: feasibility.memory_budget.budget_bytes,
+        budget_human: human_bytes(feasibility.memory_budget.budget_bytes),
+        reserve_bytes: feasibility.memory_budget.reserve_bytes,
+        reserve_human: human_bytes(feasibility.memory_budget.reserve_bytes),
+        claimed_bytes: feasibility.memory_budget.claimed_bytes,
+        claimed_human: human_bytes(feasibility.memory_budget.claimed_bytes),
+        pool: feasibility.memory_budget.pool.clone(),
+    }
+}
+
+fn catalog_download_estimate(artifact: &catalog::CatalogArtifact) -> CatalogListDownloadEstimate {
+    let sidecar_bytes = artifact.sidecars.values().fold(0_u64, |total, sidecar| {
+        total.saturating_add(sidecar.weights_bytes)
+    });
+    let bytes = artifact.weights_bytes.saturating_add(sidecar_bytes);
+    CatalogListDownloadEstimate {
+        bytes,
+        human: human_bytes(bytes),
+        eta: "measured after the first download chunk".to_owned(),
+        eta_source: "provider download progress refines ETA from observed link speed; no pre-download fake precision".to_owned(),
+    }
+}
+
+fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
+    ProviderStartArgs {
+        home: Some(home.to_path_buf()),
+        enclave: None,
+        rooms: "auto".to_owned(),
+        rpc_url: None,
+        session_rpc_url: None,
+        sc_bridge_url: None,
+        sc_bridge_token: None,
+        wallet_password: None,
+        catalog_path: None,
+        signature_path: None,
+        keys_dir: None,
+        canaries_dir: None,
+        artifact: None,
+        downloads_dir: None,
+        hf_token_file: None,
+        engine_backend: "auto".to_owned(),
+        fixture: None,
+        disk_path: None,
+        skip_disk_bench: true,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        enclave_binary: None,
+        sim: false,
+        no_heartbeat: true,
+        heartbeat_count: 1,
+        min_ask_mu: 0,
+        ctx: None,
+        memory_reserve: None,
+        disk_reserve: None,
+        max_sessions: None,
+        accept_rate_per_minute: 0,
+        serve_budget_mu: 0,
+        serve_budget_units: 0,
+        serve_budget_period_seconds: 86_400,
+        serve_sessions: false,
+        serve_sessions_seconds: 0,
+        dev_session_shim: false,
+        print_json: true,
+        dev_skip_catalog_verify: true,
+        load_progress: None,
     }
 }
 
@@ -5670,6 +6011,35 @@ fn print_catalog_list_report(report: &CatalogListReport) {
                 "    source: {}@{} {}",
                 artifact.source_repo, artifact.source_revision, artifact.source_path
             );
+        }
+        for local_run in &model.local_runs {
+            let tok_s = local_run
+                .estimated_tok_s
+                .map(|value| format!("{value:.1} tok/s est"))
+                .unwrap_or_else(|| "tok/s n/a".to_owned());
+            let layers = local_run
+                .n_layers_gpu
+                .map(|layers| format!(" layers={layers}"))
+                .unwrap_or_default();
+            println!(
+                "    {} {}: enclave={} artifact={} backend={} quant={} T{} ctx={}/{} {}{} mem={} budget={} download={} eta={}",
+                local_run.marker,
+                local_run.label,
+                short_hash(&local_run.enclave_id),
+                local_run.artifact,
+                local_run.engine,
+                local_run.quant,
+                local_run.att_tier,
+                local_run.served_ctx,
+                local_run.requested_ctx,
+                tok_s,
+                layers,
+                local_run.memory.required_human,
+                local_run.memory.budget_human,
+                local_run.download.human,
+                local_run.download.eta
+            );
+            println!("      {}", local_run.reason);
         }
     }
 }
@@ -16945,6 +17315,7 @@ async fn models(args: ModelsArgs) -> Result<()> {
         let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
         let rpc = PeerRpcClient::new(&rpc_url)?;
         let release = read_catalog_release_anchor(&rpc).await?;
+        let contract = read_contract_catalog(&rpc).await?;
         let files = fetch_catalog_release_files(&client, &home, &release).await?;
         let catalog_doc = catalog::load_document(&files.catalog_path)?;
         let hardware = probe(ProbeOptions {
@@ -16961,6 +17332,11 @@ async fn models(args: ModelsArgs) -> Result<()> {
             release.key_id.clone(),
             CatalogListTier::Launch,
             Some(&hardware),
+            Some(CatalogListLocalRunContext {
+                contract: &contract,
+                hardware: &hardware,
+                home: &home,
+            }),
         );
 
         if args.json {
@@ -37637,6 +38013,7 @@ mod tests {
             "test-key".to_owned(),
             CatalogListTier::Launch,
             Some(&hardware),
+            None,
         );
 
         let gguf = report.models[0]
@@ -37658,6 +38035,57 @@ mod tests {
             .reason
             .contains("MLX requires Apple Silicon"));
         assert!(report.local_hardware.is_some());
+    }
+
+    #[test]
+    fn catalog_list_report_adds_local_run_badge_from_provider_feasibility() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].caps.ctx_max = 131_072;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({ "tools": true, "json": true, "ctx": 131_072 });
+        let mut hardware = test_hardware(FixtureProfile::CpuOnly);
+        hardware.memory.total_bytes = 4 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(3 * GIB_BYTES);
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-local-run-badge-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let report = catalog_list_report(
+            &catalog,
+            PathBuf::from("catalog/models.json"),
+            PathBuf::from("catalog/signatures/models.json.sig"),
+            "cc".repeat(32),
+            "test-key".to_owned(),
+            CatalogListTier::Launch,
+            Some(&hardware),
+            Some(CatalogListLocalRunContext {
+                contract: &contract,
+                hardware: &hardware,
+                home: &home,
+            }),
+        );
+
+        let runs = &report.models[0].local_runs;
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.marker, "◐");
+        assert_eq!(run.status, "runs_reduced");
+        assert_eq!(run.artifact, "gguf-q4_k_m");
+        assert_eq!(run.engine, "llama.cpp");
+        assert!(run.served_ctx < run.requested_ctx);
+        assert!(run.reason.contains("Context auto-fallback"));
+        assert!(run.memory.required_bytes > 0);
+        assert!(run.memory.budget_bytes > 0);
+        assert_eq!(run.download.bytes, 42);
+        assert!(run.download.eta.contains("first download chunk"));
+        assert_eq!(
+            run.estimated_tok_s_source,
+            "hwprobe estimate until measured by live heartbeat/canary"
+        );
     }
 
     #[test]
@@ -41801,6 +42229,7 @@ mod tests {
             "cc".repeat(32),
             "test-key".to_owned(),
             CatalogListTier::Launch,
+            None,
             None,
         );
 
