@@ -12,10 +12,11 @@ use mayhem_gateway::openai::{
     GatewayAudioSpeechResult, GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult,
     GatewayCanaryModelConfig, GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry,
     GatewayEmbeddingFuture, GatewayEmbeddingResult, GatewayImageGenerationFuture,
-    GatewayImageGenerationResult, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
-    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
-    GatewayState, ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps,
-    PriceRefMu, ProviderSignedReceipt, ShapeAdapterInfo, ToolCallOutput, Usage,
+    GatewayImageGenerationResult, GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate,
+    GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
+    GatewaySessionResult, GatewayState, ImageGenerationOutput, ImageGenerationRequest,
+    MayhemModelInfo, ModelCaps, PriceRefMu, ProviderSignedReceipt, ShapeAdapterInfo,
+    ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, priced_usage_mu, text_generation_rate_map, token_fingerprint,
@@ -2685,6 +2686,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         reputation_bps: 10_000,
         probation: None,
         caps: serde_json::json!({}),
+        local_run: None,
     }
 }
 
@@ -3361,6 +3363,19 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
         "json": true,
         "ctx": 16384
     });
+    model.mayhem.route_candidates[0].local_run = Some(GatewayLocalRunBadge {
+        marker: "◐".to_owned(),
+        status: "runs_reduced".to_owned(),
+        label: "runs reduced".to_owned(),
+        reason: "ctx auto-fallback matched provider load gate".to_owned(),
+        requested_ctx: 65_536,
+        served_ctx: 16_384,
+        estimated_tok_s: Some("42.5".to_owned()),
+        memory_required_human: "914.00 MiB".to_owned(),
+        memory_budget_human: "1.00 GiB".to_owned(),
+        download_human: "2.52 GiB".to_owned(),
+        eta: "measured after the first download chunk".to_owned(),
+    });
     model.mayhem.route_candidates[1].accepted_rails = vec!["tnk".to_owned()];
     model.mayhem.route_candidates[1].att_tier = 2;
     model.mayhem.route_candidates[1].reputation_bps = 8_750;
@@ -3420,6 +3435,11 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     assert!(body.contains("sat 42%"));
     assert!(body.contains("slots 2/4"));
     assert!(body.contains("76.5 tok/s"));
+    assert!(body.contains("local ◐ runs reduced"));
+    assert!(body.contains("ctx 16384/65536"));
+    assert!(body.contains("42.5 tok/s est"));
+    assert!(body.contains("download 2.52 GiB"));
+    assert!(body.contains("ETA measured after the first download chunk"));
     assert!(body.contains("T2"));
     assert!(body.contains("rep 87.50%"));
     assert!(body.contains("price = f(seed v1, U 87.50%, demand 2500000mu, 5 sessions, supply 2)"));

@@ -45,11 +45,11 @@ use mayhem_gateway::{
     fold_reputation, heartbeat_signing_payload, normalize_rate_map,
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
-        validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy, GatewayModel,
-        GatewayRouteCandidate, GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord,
-        GatewayTokenStore, MayhemModelInfo, ModelCaps, PriceRefMu, ProviderKybInfo,
-        ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS,
-        MAX_ROUTE_MAX_WAIT_MS,
+        validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
+        GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate, GatewayState,
+        GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, MayhemModelInfo,
+        ModelCaps, PriceRefMu, ProviderKybInfo, ScBridgeGatewaySessionBackend,
+        ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_mu, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu,
     ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry, ReputationEvent,
@@ -5609,6 +5609,54 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         print_json: true,
         dev_skip_catalog_verify: true,
         load_progress: None,
+    }
+}
+
+fn annotate_gateway_models_with_local_runs(
+    mut models: Vec<GatewayModel>,
+    contract: &ContractCatalog,
+    catalog_doc: &catalog::CatalogDocument,
+    hardware: &HardwareReport,
+    home: &Path,
+) -> Vec<GatewayModel> {
+    let context = CatalogListLocalRunContext {
+        contract,
+        hardware,
+        home,
+    };
+    let mut by_enclave = BTreeMap::<String, GatewayLocalRunBadge>::new();
+    for model in &catalog_doc.models {
+        for local_run in catalog_model_local_runs(model, &context) {
+            by_enclave.insert(
+                local_run.enclave_id.clone(),
+                gateway_local_run_badge(local_run),
+            );
+        }
+    }
+    for model in &mut models {
+        for candidate in &mut model.mayhem.route_candidates {
+            candidate.local_run = by_enclave.get(&candidate.enclave_id).cloned();
+        }
+    }
+    models
+}
+
+fn gateway_local_run_badge(local_run: CatalogListLocalRun) -> GatewayLocalRunBadge {
+    GatewayLocalRunBadge {
+        marker: local_run.marker,
+        status: local_run.status,
+        label: local_run.label,
+        reason: local_run.reason,
+        requested_ctx: local_run.requested_ctx,
+        served_ctx: local_run.served_ctx,
+        estimated_tok_s: local_run
+            .estimated_tok_s
+            .filter(|value| value.is_finite())
+            .map(|value| format!("{value:.1}")),
+        memory_required_human: local_run.memory.required_human,
+        memory_budget_human: local_run.memory.budget_human,
+        download_human: local_run.download.human,
+        eta: local_run.download.eta,
     }
 }
 
@@ -17003,6 +17051,19 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             let models = gateway_models_from_contract(&contract)?;
             let (models, blocked_version_gates) =
                 filter_gateway_models_by_app_version(models, &catalog_doc)?;
+            let hardware = probe(ProbeOptions {
+                disk_path: home.clone(),
+                run_disk_bench: false,
+                disk_bench_mib: 1,
+                fixture: None,
+            });
+            let models = annotate_gateway_models_with_local_runs(
+                models,
+                &contract,
+                &catalog_doc,
+                &hardware,
+                &home,
+            );
             let model_count = models.len();
             let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
                 .await?
@@ -27152,6 +27213,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                         .unwrap_or(10_000),
                     probation: reputation.and_then(|record| record.probation.clone()),
                     caps: enclave.caps.clone(),
+                    local_run: None,
                 },
             );
         let tier = format!("T{effective_att_tier}");
@@ -38086,6 +38148,38 @@ mod tests {
             run.estimated_tok_s_source,
             "hwprobe estimate until measured by live heartbeat/canary"
         );
+    }
+
+    #[test]
+    fn gateway_models_carry_local_run_badges_only_in_local_snapshot() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 131_072;
+        let contract = test_contract(&root);
+        let mut hardware = test_hardware(FixtureProfile::CpuOnly);
+        hardware.memory.total_bytes = 4 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(3 * GIB_BYTES);
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-gateway-local-run-badge-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert!(models[0].mayhem.route_candidates[0].local_run.is_none());
+        let models =
+            annotate_gateway_models_with_local_runs(models, &contract, &catalog, &hardware, &home);
+        let badge = models[0].mayhem.route_candidates[0]
+            .local_run
+            .as_ref()
+            .expect("local gateway snapshot carries run badge");
+
+        assert_eq!(badge.marker, "◐");
+        assert_eq!(badge.status, "runs_reduced");
+        assert!(badge.served_ctx < badge.requested_ctx);
+        assert_eq!(badge.download_human, "42B");
+        assert!(badge.eta.contains("first download chunk"));
+        assert!(badge.memory_required_human.ends_with("B"));
     }
 
     #[test]

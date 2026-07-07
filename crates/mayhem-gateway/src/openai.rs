@@ -253,6 +253,24 @@ pub struct GatewayRouteCandidate {
     pub probation: Option<ProviderProbation>,
     #[serde(default)]
     pub caps: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_run: Option<GatewayLocalRunBadge>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GatewayLocalRunBadge {
+    pub marker: String,
+    pub status: String,
+    pub label: String,
+    pub reason: String,
+    pub requested_ctx: u64,
+    pub served_ctx: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tok_s: Option<String>,
+    pub memory_required_human: String,
+    pub memory_budget_human: String,
+    pub download_human: String,
+    pub eta: String,
 }
 
 fn default_reputation_bps() -> u32 {
@@ -2907,9 +2925,34 @@ fn dashboard_route_status(
     } else {
         r#"<span class="status-dot muted">Joined</span>"#
     };
+    let local_run = dashboard_local_run_status(candidate.local_run.as_ref());
     format!(
-        "{label}<span class=\"privacy-note\">{}</span>",
+        "{label}<span class=\"privacy-note\">{}</span>{local_run}",
         html_escape(&details.join(", "))
+    )
+}
+
+fn dashboard_local_run_status(local_run: Option<&GatewayLocalRunBadge>) -> String {
+    let Some(local_run) = local_run else {
+        return String::new();
+    };
+    let tok_s = local_run
+        .estimated_tok_s
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" · {value} tok/s est"))
+        .unwrap_or_default();
+    format!(
+        r#"<span class="privacy-note">local {} {} · ctx {}/{}{} · mem {}/{} · download {} · ETA {}</span>"#,
+        html_escape(&local_run.marker),
+        html_escape(&local_run.label),
+        local_run.served_ctx,
+        local_run.requested_ctx,
+        html_escape(&tok_s),
+        html_escape(&local_run.memory_required_human),
+        html_escape(&local_run.memory_budget_human),
+        html_escape(&local_run.download_human),
+        html_escape(&local_run.eta),
     )
 }
 
@@ -16729,6 +16772,7 @@ mod tests {
             reputation_bps: 10_000,
             probation: None,
             caps: json!({}),
+            local_run: None,
         }
     }
 
