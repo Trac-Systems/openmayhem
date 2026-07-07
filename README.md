@@ -147,6 +147,15 @@ mayhem models --gateway --quant int4
 
 `--min-att-tier 3` asks for prompt-private routing. `--require-kyb` asks for Tier 4 identity; it does not make prompts private. `--quant` filters live admin enclave routes by their pinned artifact bucket; it is not a separate price key. You can also send routing preferences through OpenAI-compatible request headers, for example `X-Mayhem-Min-Att-Tier: 3`, `X-Mayhem-Quant: int4`, `X-Mayhem-Hedge: 1`, or failover thresholds such as `X-Mayhem-Min-Tok-S`.
 
+Inspect the live market price and set a local user ceiling:
+
+```bash
+mayhem price show <model-id> --tier 1
+mayhem config max-price 250000
+```
+
+`mayhem config max-price` is a persistent default for the local gateway. Per-request clients can override it with `X-Mayhem-Max-Price-Mu`.
+
 Stop Mayhem:
 
 ```bash
@@ -180,6 +189,10 @@ What this does:
 | `mayhem up --provider --yes` | Starts the peer, bridge, gateway, and provider worker in one supervised local stack. |
 | `mayhem provider list` | Shows this wallet's canonical admin-created enclave and room joins. |
 | `mayhem provider health` | Checks ledger serving state, local heartbeats, and gateway route visibility. |
+| `mayhem provider min-ask set <enclave-or-model:T1> <mu>` | Sets this provider's local floor for an admin-created market. |
+| `mayhem provider limits set --max-concurrent <n> --accept-rate <n/min> --budget <mu|tokens>/<epoch|day>` | Sets local self-protection limits. |
+| `mayhem provider drain` | Stops accepting new sessions while finishing in-flight sessions. |
+| `mayhem provider earnings` | Shows this provider's earnings, holdback, and claimable balances. |
 
 Inspect earnings and reputation:
 
@@ -194,7 +207,7 @@ Stop the provider stack:
 mayhem down
 ```
 
-Providers are paid from settlement evidence on the rail they accepted for the served session.
+Providers are paid from settlement evidence on the rail they accepted for the served session. Provider min-ask, limits, and drain are local opt-in controls; they do not create canonical models, rooms, or prices.
 
 ## Advanced / Manual Provider Start
 
@@ -253,7 +266,7 @@ The contract and gateway settle usage through the generic metered map instead of
 
 ## Payments And Receipts
 
-All prices are denominated in `mu_usd`, integer micro-USD. The canonical ledger rails are exactly `fiat`, `tap`, and `tnk`; each rail has separate user balances, provider earnings, and operator-fee buckets. Money never crosses rails during settlement.
+All prices are denominated in `mu_usd`, integer micro-USD. The canonical ledger rails are exactly `fiat`, `tap`, and `tnk`; each rail has separate user balances, provider earnings, and operator-fee buckets. Money never crosses rails during settlement. `mayhem price show <model-id>` prints the live route-level market price and its published derivation when available.
 
 | Rail | Use |
 |------|-----|

@@ -21,6 +21,8 @@ const configStructSections = new Map([
   ['ConfigIdentity', 'identity'],
   ['ConfigNetwork', 'network'],
   ['ConfigProvider', 'provider'],
+  ['ConfigProviderLimits', 'provider.limits'],
+  ['ConfigUser', 'user'],
   ['ConfigRole', 'role'],
   ['SupervisorConfig', 'supervisor'],
   ['ChildConfig', 'supervisor.children[]'],
@@ -168,7 +170,7 @@ function extractConfigKeys(files) {
     const text = fs.readFileSync(path.join(repoRoot, file), 'utf8');
     for (const ref of lineRefs(file, text)) {
       for (const regex of [
-        /toml_(?:get_path|set_string|non_empty_string)\([^,]+,\s*"([^"]+)"/g,
+        /toml_(?:get_path|set_string|set_u64|remove_path|non_empty_string)\([^,]+,\s*"([^"]+)"/g,
         /toml_get_path\([^,]+,\s*"([^"]+)"/g,
         /validate_hex32_config\("([^"]+)"/g,
       ]) {

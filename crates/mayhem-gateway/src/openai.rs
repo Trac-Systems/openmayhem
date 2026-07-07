@@ -116,6 +116,7 @@ pub struct GatewayState {
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
     failover_policy: GatewayFailoverPolicyConfig,
+    default_max_price_mu: Option<u64>,
     dev_session_shim: bool,
 }
 
@@ -1037,6 +1038,7 @@ impl GatewayState {
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
             failover_policy: GatewayFailoverPolicyConfig::default(),
+            default_max_price_mu: None,
             dev_session_shim: false,
         }
     }
@@ -1116,6 +1118,22 @@ impl GatewayState {
     pub fn with_failover_policy(mut self, policy: GatewayFailoverPolicyConfig) -> Self {
         self.failover_policy = policy.sanitized();
         self
+    }
+
+    pub fn with_default_max_price_mu(mut self, max_price_mu: Option<u64>) -> Self {
+        self.default_max_price_mu = max_price_mu.filter(|value| *value > 0);
+        self
+    }
+
+    fn request_options_from_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<GatewayRequestOptions, ApiError> {
+        let mut options = GatewayRequestOptions::from_headers(headers)?;
+        if options.max_price_mu.is_none() {
+            options.max_price_mu = self.default_max_price_mu;
+        }
+        Ok(options)
     }
 
     pub fn dashboard_url(&self, gateway_root: &str) -> String {
@@ -1321,7 +1339,7 @@ async fn create_chat_completion(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
-    let options = match GatewayRequestOptions::from_headers(&headers) {
+    let options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
@@ -1350,7 +1368,7 @@ async fn create_embedding(
     headers: HeaderMap,
     Json(request): Json<EmbeddingRequest>,
 ) -> Response {
-    let options = match GatewayRequestOptions::from_headers(&headers) {
+    let options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
@@ -1365,7 +1383,7 @@ async fn create_image_generation(
     headers: HeaderMap,
     Json(request): Json<ImageGenerationRequest>,
 ) -> Response {
-    let options = match GatewayRequestOptions::from_headers(&headers) {
+    let options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
@@ -1380,7 +1398,7 @@ async fn create_audio_speech(
     headers: HeaderMap,
     Json(request): Json<AudioSpeechRequest>,
 ) -> Response {
-    let options = match GatewayRequestOptions::from_headers(&headers) {
+    let options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
@@ -1395,7 +1413,7 @@ async fn create_audio_transcription(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    let options = match GatewayRequestOptions::from_headers(&headers) {
+    let options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
@@ -13574,6 +13592,24 @@ mod tests {
         headers.insert("x-mayhem-quant", HeaderValue::from_static("potato"));
         let err = GatewayRequestOptions::from_headers(&headers).expect_err("bad quant rejects");
         assert_eq!(err.param, Some("X-Mayhem-Quant"));
+    }
+
+    #[test]
+    fn gateway_default_max_price_applies_when_header_is_absent() {
+        let state =
+            GatewayState::from_models(vec![test_model()]).with_default_max_price_mu(Some(777));
+        let headers = HeaderMap::new();
+        let options = state
+            .request_options_from_headers(&headers)
+            .expect("empty headers parse");
+        assert_eq!(options.max_price_mu, Some(777));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
+        let options = state
+            .request_options_from_headers(&headers)
+            .expect("headers parse");
+        assert_eq!(options.max_price_mu, Some(1_234));
     }
 
     #[test]

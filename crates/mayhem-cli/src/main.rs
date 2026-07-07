@@ -162,6 +162,11 @@ enum Commands {
     Use(UseArgs),
     /// List models from the ledger-anchored admin catalog release.
     Models(ModelsArgs),
+    /// Inspect live marketplace prices and derivation evidence.
+    Price {
+        #[command(subcommand)]
+        command: PriceCommands,
+    },
     /// Buy Mayhem credits through fiat/crypto rails.
     Pay {
         #[command(subcommand)]
@@ -227,6 +232,20 @@ enum ProviderCommands {
         #[command(subcommand)]
         command: ProviderRailsCommands,
     },
+    /// Inspect or set this provider's local min-ask per admin-created market.
+    MinAsk {
+        #[command(subcommand)]
+        command: ProviderMinAskCommands,
+    },
+    /// Inspect or set this provider's local self-protection limits.
+    Limits {
+        #[command(subcommand)]
+        command: ProviderLimitsCommands,
+    },
+    /// Gracefully stop accepting new sessions while finishing in-flight ones.
+    Drain(ProviderDrainArgs),
+    /// Show this provider's earnings, holdback, reputation, and claimable balances.
+    Earnings(ProviderEarningsArgs),
     /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
     Start(Box<ProviderStartArgs>),
     /// Register if needed, then join an existing admin-created enclave and canonical rooms.
@@ -259,6 +278,22 @@ enum ProviderRailsCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum ProviderMinAskCommands {
+    /// Read the configured local min-ask floor.
+    Get(ProviderMinAskGetArgs),
+    /// Set the configured local min-ask floor.
+    Set(ProviderMinAskSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderLimitsCommands {
+    /// Read configured local protection limits.
+    Get(ProviderLimitsGetArgs),
+    /// Set configured local protection limits.
+    Set(ProviderLimitsSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum FraudProofCommands {
     /// Submit an over-credit fraud proof against an epoch commit.
     Submit(FraudProofSubmitArgs),
@@ -272,6 +307,8 @@ enum ConfigCommands {
     Get(ConfigGetArgs),
     /// Persist one config key.
     Set(ConfigSetArgs),
+    /// Inspect or set the persistent user max-price ceiling.
+    MaxPrice(ConfigMaxPriceArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -294,6 +331,16 @@ enum AdminCommands {
     CloseRoom(AdminCloseRoomArgs),
     /// Set a forward-facing admin price schedule for an enclave.
     SetPrice(AdminSetPriceArgs),
+    /// Marketplace price seed helpers.
+    Price {
+        #[command(subcommand)]
+        command: AdminPriceCommands,
+    },
+    /// Marketplace fee helpers.
+    Fee {
+        #[command(subcommand)]
+        command: AdminFeeCommands,
+    },
     /// Set an admin-approved provider payout target.
     SetProviderPayout(AdminSetProviderPayoutArgs),
     /// Verify a provider business identity for Tier 4 accountability.
@@ -326,6 +373,24 @@ enum AdminCommands {
     EpochCommit(AdminEpochCommitArgs),
     /// Apply admin-verified epoch debits/earnings and ev/* roots.
     EpochApply(AdminEpochApplyArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminPriceCommands {
+    /// Seed the admin-owned initial market price P0 for an enclave.
+    Seed(AdminPriceSeedArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminFeeCommands {
+    /// Set the operator fee in basis points.
+    Set(AdminFeeSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PriceCommands {
+    /// Show the current live market price for a model/enclave.
+    Show(PriceShowArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -711,6 +776,24 @@ struct ConfigSetArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ConfigMaxPriceArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Persistent default max-bid in integer micro-USD. Omit to inspect.
+    mu: Option<u64>,
+
+    /// Remove the persistent max-price ceiling.
+    #[arg(long)]
+    clear: bool,
+
+    /// Print a machine-readable config report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct ResetArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -897,6 +980,10 @@ struct UseArgs {
     #[arg(long)]
     min_tok_s: Option<f64>,
 
+    /// Gateway-default user max-bid ceiling in µUSD. Overrides config for this gateway process.
+    #[arg(long)]
+    max_price_mu: Option<u64>,
+
     /// Provider receipt checkpoint window in output tokens. Bounds unpaid streamed output.
     #[arg(long)]
     receipt_checkpoint_tokens: Option<u64>,
@@ -1009,6 +1096,32 @@ struct ModelsArgs {
     require_kyb: bool,
 
     /// Print a machine-readable model list.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PriceShowArgs {
+    /// Model id or concrete enclave id to inspect.
+    model: String,
+
+    /// Gateway base URL. Defaults to config.toml, MAYHEM_GATEWAY_URL, or local gateway.
+    #[arg(long)]
+    gateway_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Restrict to a live attestation tier.
+    #[arg(long)]
+    tier: Option<u8>,
+
+    /// HTTP timeout in seconds.
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+
+    /// Print a machine-readable price report.
     #[arg(long)]
     json: bool,
 }
@@ -2896,6 +3009,47 @@ struct AdminSetPriceArgs {
 }
 
 #[derive(Debug, Parser)]
+struct AdminPriceSeedArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Admin-created enclave id to seed.
+    enclave_id: String,
+
+    /// Seed P0 in integer micro-USD per 1K input and output tokens.
+    p0_mu: u64,
+
+    /// Fixed per-request price in integer micro-USD.
+    #[arg(long, default_value_t = 0)]
+    per_req_mu: u64,
+
+    /// Minimum session price in integer micro-USD.
+    #[arg(long, default_value_t = 0)]
+    min_session_mu: u64,
+
+    /// Contract timestamp/slot at which the seed becomes active. Defaults to now.
+    #[arg(long)]
+    effective_at: Option<u64>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminFeeSetArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Operator fee in basis points; must be between 0 and 5000.
+    bps: u64,
+
+    /// Contract timestamp/slot when the change is submitted. Defaults to now.
+    #[arg(long)]
+    submitted_at: Option<u64>,
+
+    /// Contract timestamp/slot when the change becomes active. Defaults to submitted_at + 86400.
+    #[arg(long)]
+    effective_at: Option<u64>,
+}
+
+#[derive(Debug, Parser)]
 struct AdminSetProviderPayoutArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -3528,6 +3682,125 @@ struct ProviderRailsSetArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderMinAskGetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Market target: default, enclave id, model id, or model:T<tier>.
+    target: Option<String>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderMinAskSetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Market target: default, enclave id, model id, or model:T<tier>.
+    target: String,
+
+    /// Local provider floor in integer micro-USD. 0 accepts the admin market price.
+    mu: u64,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderLimitsGetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderLimitsSetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Local hard cap for concurrently accepted direct sessions.
+    #[arg(long)]
+    max_concurrent: Option<u32>,
+
+    /// Local maximum accepted session opens per rolling minute, e.g. 12 or 12/min. 0 means unlimited.
+    #[arg(long)]
+    accept_rate: Option<String>,
+
+    /// Exposure cap such as 2500000mu/day, 500000tokens/day, or 2500000mu/epoch.
+    #[arg(long)]
+    budget: Option<String>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderDrainArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted provider keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Restrict drain to one served enclave id. Omit to drain all local provider markets.
+    #[arg(long)]
+    enclave: Option<String>,
+
+    /// Clear the local drain flag so a restarted provider can accept sessions again.
+    #[arg(long)]
+    clear: bool,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderEarningsArgs {
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Provider public key to inspect. Defaults to the local provider wallet public key.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Intercom peer store name under <home>/stores when config.toml has no identity store.
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+
+    /// Password for the encrypted provider keypair.json. Empty by default.
+    #[arg(long)]
+    wallet_password: Option<String>,
+
+    /// Print machine-readable earnings.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderJoinArgs {
     #[command(flatten)]
     tx: ProviderTxArgs,
@@ -3883,6 +4156,7 @@ struct MayhemConfig {
     identity: Option<ConfigIdentity>,
     network: Option<ConfigNetwork>,
     provider: Option<ConfigProvider>,
+    user: Option<ConfigUser>,
     role: Option<ConfigRole>,
 }
 
@@ -3905,6 +4179,22 @@ struct ConfigNetwork {
 #[derive(Debug, Deserialize)]
 struct ConfigProvider {
     engine_backend: Option<String>,
+    min_ask: Option<BTreeMap<String, u64>>,
+    limits: Option<ConfigProviderLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigProviderLimits {
+    max_sessions: Option<u32>,
+    accept_rate_per_minute: Option<u32>,
+    serve_budget_mu: Option<u64>,
+    serve_budget_units: Option<u64>,
+    serve_budget_period_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigUser {
+    max_price_mu: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3946,6 +4236,9 @@ async fn main() -> Result<()> {
         Commands::Up(args) => up(args).await,
         Commands::Use(args) => use_gateway(args).await,
         Commands::Models(args) => models(args).await,
+        Commands::Price { command } => match command {
+            PriceCommands::Show(args) => price_show(args).await,
+        },
         Commands::Pay { command } => match command {
             PayCommands::Tnk(args) => pay_tnk(args).await,
             PayCommands::Stripe(args) => pay(PayRail::Stripe, args).await,
@@ -3960,6 +4253,7 @@ async fn main() -> Result<()> {
         Commands::Config { command } => match command {
             ConfigCommands::Get(args) => config_get(args),
             ConfigCommands::Set(args) => config_set(args),
+            ConfigCommands::MaxPrice(args) => config_max_price(args),
         },
         Commands::Down(args) => down(args).await,
         Commands::Reset(args) => reset(args, "reset").await,
@@ -3991,6 +4285,16 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
             ProviderRailsCommands::Get(args) => provider_rails_get(args).await,
             ProviderRailsCommands::Set(args) => provider_rails_set(args).await,
         },
+        ProviderCommands::MinAsk { command } => match command {
+            ProviderMinAskCommands::Get(args) => provider_min_ask_get(args),
+            ProviderMinAskCommands::Set(args) => provider_min_ask_set(args),
+        },
+        ProviderCommands::Limits { command } => match command {
+            ProviderLimitsCommands::Get(args) => provider_limits_get(args),
+            ProviderLimitsCommands::Set(args) => provider_limits_set(args),
+        },
+        ProviderCommands::Drain(args) => provider_drain(args).await,
+        ProviderCommands::Earnings(args) => provider_earnings(args).await,
         ProviderCommands::Start(args) => provider_start(*args).await,
         ProviderCommands::Join(args) => provider_join(args).await,
         ProviderCommands::Leave(args) => provider_leave(args).await,
@@ -11086,6 +11390,12 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::OpenRoom(args) => &args.tx,
         AdminCommands::CloseRoom(args) => &args.tx,
         AdminCommands::SetPrice(args) => &args.tx,
+        AdminCommands::Price { command } => match command {
+            AdminPriceCommands::Seed(args) => &args.tx,
+        },
+        AdminCommands::Fee { command } => match command {
+            AdminFeeCommands::Set(args) => &args.tx,
+        },
         AdminCommands::SetProviderPayout(args) => &args.tx,
         AdminCommands::SetProviderKyb(args) => &args.tx,
         AdminCommands::RevokeProviderKyb(args) => &args.tx,
@@ -11132,6 +11442,12 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             }),
         )),
         AdminCommands::SetPrice(args) => Ok(("setPrice", admin_set_price_payload(args)?)),
+        AdminCommands::Price { command } => match command {
+            AdminPriceCommands::Seed(args) => Ok(("setPrice", admin_price_seed_payload(args)?)),
+        },
+        AdminCommands::Fee { command } => match command {
+            AdminFeeCommands::Set(args) => Ok(("setParams", admin_fee_set_payload(args)?)),
+        },
         AdminCommands::SetProviderPayout(args) => Ok((
             "setProviderPayout",
             admin_set_provider_payout_payload(args)?,
@@ -11662,6 +11978,36 @@ fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Result<Value> {
         "per_req_mu": args.per_req_mu,
         "min_session_mu": args.min_session_mu,
         "effective_at": args.effective_at,
+    }))
+}
+
+fn admin_price_seed_payload(args: &AdminPriceSeedArgs) -> Result<Value> {
+    let effective_at = args.effective_at.unwrap_or(unix_epoch_seconds()?);
+    Ok(json!({
+        "op": "set_price",
+        "enclave_id": &args.enclave_id,
+        "rate_map": text_generation_rate_map(args.p0_mu, args.p0_mu),
+        "per_req_mu": args.per_req_mu,
+        "min_session_mu": args.min_session_mu,
+        "effective_at": effective_at,
+    }))
+}
+
+fn admin_fee_set_payload(args: &AdminFeeSetArgs) -> Result<Value> {
+    if args.bps > 5_000 {
+        bail!("admin fee bps must be between 0 and 5000");
+    }
+    let submitted_at = args.submitted_at.unwrap_or(unix_epoch_seconds()?);
+    let effective_at = args
+        .effective_at
+        .unwrap_or_else(|| submitted_at.saturating_add(86_400));
+    Ok(json!({
+        "op": "set_params",
+        "submitted_at": submitted_at,
+        "effective_at": effective_at,
+        "values": {
+            "fee_bps": args.bps,
+        },
     }))
 }
 
@@ -15401,6 +15747,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             .receipt_checkpoint_ms
             .unwrap_or(DEFAULT_RECEIPT_CHECKPOINT_MS),
     };
+    if args.max_price_mu == Some(0) {
+        bail!("--max-price-mu must be greater than zero");
+    }
+    let default_max_price_mu = args.max_price_mu.or_else(|| {
+        config
+            .as_ref()
+            .and_then(|config| config.user.as_ref())
+            .and_then(|user| user.max_price_mu)
+    });
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
@@ -15655,6 +16010,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let state = state.with_receipt_checkpoint_every(receipt_checkpoint_every.clone());
     let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state
+        .with_default_max_price_mu(default_max_price_mu)
         .with_receipt_rail(args.rail.as_str())
         .with_provider_load_progress_dir(home.join("provider-load-progress"));
     let dashboard_url = state.dashboard_url(&gateway_url);
@@ -15681,6 +16037,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             "tokens": receipt_checkpoint_every.tokens,
             "ms": receipt_checkpoint_every.ms,
         },
+        "default_max_price_mu": default_max_price_mu,
         "models": model_count,
         "version_gates": &blocked_version_gates,
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
@@ -15725,6 +16082,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                     public_key,
                     args.rail.as_str()
                 );
+            }
+            if let Some(mu) = default_max_price_mu {
+                println!("Default max-price ceiling: {mu} mu_usd.");
             }
             if args.apple_app_attest_jwks_file.is_some() {
                 println!("Tier 2 Apple App Attest verification: trusted JWKS loaded.");
@@ -16411,7 +16771,19 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
     let path = config_path_for_home(&home);
     let key = canonical_config_key(&args.key)?;
     let mut config = read_config_toml_value(&path)?;
-    toml_set_string(&mut config, key, args.value.clone())?;
+    if key == "user.max_price_mu" {
+        let value = args
+            .value
+            .trim()
+            .parse::<u64>()
+            .context("user.max_price_mu must be an integer mu_usd value")?;
+        if value == 0 {
+            bail!("user.max_price_mu must be greater than zero; use `mayhem config max-price --clear` to remove it");
+        }
+        toml_set_u64(&mut config, key, value)?;
+    } else {
+        toml_set_string(&mut config, key, args.value.clone())?;
+    }
     write_config_toml_value(&path, &config)?;
     let report = json!({
         "ok": true,
@@ -16429,6 +16801,56 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
             "Set {} = {} in {}",
             report["key"].as_str().unwrap_or(""),
             report["value"].as_str().unwrap_or(""),
+            report["path"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn config_max_price(args: ConfigMaxPriceArgs) -> Result<()> {
+    if args.clear && args.mu.is_some() {
+        bail!("pass either a max-price value or --clear, not both");
+    }
+    if args.mu == Some(0) {
+        bail!("max-price must be greater than 0; use --clear to remove the ceiling");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let mut config = read_config_toml_value(&path)?;
+    let changed = args.clear || args.mu.is_some();
+    if args.clear {
+        toml_remove_path(&mut config, "user.max_price_mu")?;
+    } else if let Some(mu) = args.mu {
+        toml_set_u64(&mut config, "user.max_price_mu", mu)?;
+    }
+    if changed {
+        write_config_toml_value(&path, &config)?;
+    }
+    let value = toml_get_path(&config, "user.max_price_mu")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u64::try_from(value).ok());
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "path": path,
+        "max_price_mu": value,
+        "cleared": args.clear,
+        "changed": changed,
+        "config": serde_json::to_value(&config)?,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if let Some(mu) = value {
+        println!(
+            "User max-price default: {mu} mu_usd in {}",
+            report["path"].as_str().unwrap_or("")
+        );
+        println!("Per-request override header: X-Mayhem-Max-Price-Mu");
+    } else {
+        println!(
+            "User max-price default: off in {}",
             report["path"].as_str().unwrap_or("")
         );
     }
@@ -16721,6 +17143,39 @@ async fn mayhem_test(args: TestArgs) -> Result<()> {
         print_test_report(&report);
     }
 
+    Ok(())
+}
+
+async fn price_show(args: PriceShowArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    if let Some(tier) = args.tier {
+        if !(1..=4).contains(&tier) {
+            bail!("--tier must be between 1 and 4");
+        }
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let gateway_root = resolve_cli_gateway_url(config.as_ref(), args.gateway_url.as_deref());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(args.timeout_seconds))
+        .build()?;
+    let models = fetch_gateway_models(&client, &gateway_root).await?;
+    let markets = price_show_markets_from_gateway_models(&models, &args.model, args.tier)?;
+    let report = json!({
+        "ok": true,
+        "gateway_url": gateway_root,
+        "target": args.model,
+        "tier": args.tier,
+        "markets": markets,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_price_show_report(&report)?;
+    }
     Ok(())
 }
 
@@ -17655,6 +18110,94 @@ fn gateway_model_summaries(models: &[Value]) -> Result<Vec<ModelSummary>> {
     models.iter().map(gateway_model_summary).collect()
 }
 
+fn price_show_markets_from_gateway_models(
+    models: &[Value],
+    target: &str,
+    tier: Option<u8>,
+) -> Result<Vec<Value>> {
+    let target = target.trim();
+    if target.is_empty() {
+        bail!("price show target must not be empty");
+    }
+    let mut markets = BTreeMap::new();
+    for model in models {
+        let model_id = model.get("id").and_then(Value::as_str).unwrap_or("");
+        let mayhem = model.get("mayhem").unwrap_or(&Value::Null);
+        for route in mayhem
+            .get("route_candidates")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let enclave_id = route
+                .get("enclave_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let route_tier = route.get("att_tier").and_then(Value::as_u64).unwrap_or(1) as u8;
+            if tier.is_some_and(|wanted| wanted != route_tier) {
+                continue;
+            }
+            if target != model_id && target != enclave_id {
+                continue;
+            }
+            let price = route
+                .get("price_ref_mu")
+                .or_else(|| mayhem.get("price_ref_mu"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if price.is_null() {
+                continue;
+            }
+            let key = if enclave_id.is_empty() {
+                format!("{model_id}:T{route_tier}")
+            } else {
+                enclave_id.to_owned()
+            };
+            markets.entry(key).or_insert_with(|| {
+                json!({
+                    "model": model_id,
+                    "enclave_id": enclave_id,
+                    "room_id": route.get("room_id").cloned().unwrap_or(Value::Null),
+                    "provider": route.get("provider").cloned().unwrap_or(Value::Null),
+                    "att_tier": route_tier,
+                    "quant": route
+                        .get("quant")
+                        .and_then(Value::as_str)
+                        .unwrap_or(DEFAULT_QUANT_BUCKET),
+                    "price_ref_mu": price,
+                })
+            });
+        }
+        if mayhem
+            .get("route_candidates")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+            && target == model_id
+            && tier.is_none()
+        {
+            let price = mayhem.get("price_ref_mu").cloned().unwrap_or(Value::Null);
+            if !price.is_null() {
+                markets.entry(model_id.to_owned()).or_insert_with(|| {
+                    json!({
+                        "model": model_id,
+                        "enclave_id": Value::Null,
+                        "room_id": Value::Null,
+                        "provider": Value::Null,
+                        "att_tier": Value::Null,
+                        "quant": DEFAULT_QUANT_BUCKET,
+                        "price_ref_mu": price,
+                    })
+                });
+            }
+        }
+    }
+    let markets = markets.into_values().collect::<Vec<_>>();
+    if markets.is_empty() {
+        bail!("no live price market found for {target}; run `mayhem models --gateway` to list available models")
+    }
+    Ok(markets)
+}
+
 fn filter_model_summaries_by_min_att_tier(
     summaries: Vec<ModelSummary>,
     min_att_tier: Option<u8>,
@@ -18499,6 +19042,94 @@ fn print_models_report(report: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_price_show_report(report: &Value) -> Result<()> {
+    println!("Gateway: {}", report["gateway_url"].as_str().unwrap_or(""));
+    if let Some(tier) = report["tier"].as_u64() {
+        println!("Filter: T{tier}");
+    }
+    for market in report["markets"]
+        .as_array()
+        .context("price report missing markets[]")?
+    {
+        let price = market.get("price_ref_mu").unwrap_or(&Value::Null);
+        let rate_map = gateway_price_rate_map(price);
+        println!(
+            "{}  {}  T{}  quant={}  ver={}",
+            market["model"].as_str().unwrap_or(""),
+            market["enclave_id"].as_str().unwrap_or("model-level"),
+            market["att_tier"].as_u64().unwrap_or(0),
+            market["quant"].as_str().unwrap_or(DEFAULT_QUANT_BUCKET),
+            price.get("ver").and_then(Value::as_u64).unwrap_or(0)
+        );
+        println!("  price: {}", format_rate_map(&rate_map));
+        println!(
+            "  per_req_mu={} min_session_mu={} denom={}",
+            price.get("per_req_mu").and_then(Value::as_u64).unwrap_or(0),
+            price
+                .get("min_session_mu")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            price
+                .get("denom")
+                .and_then(Value::as_str)
+                .unwrap_or("mu_usd")
+        );
+        match price.get("derivation").filter(|value| !value.is_null()) {
+            Some(derivation) => {
+                println!("  derivation: {}", serde_json::to_string(derivation)?);
+            }
+            None => {
+                println!("  derivation: not published yet; cold-start seed price is active");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_provider_limits_report(report: &Value) {
+    let limits = &report["limits"];
+    println!(
+        "Provider limits config: {}",
+        report["path"].as_str().unwrap_or("")
+    );
+    println!(
+        "max_concurrent: {}",
+        limits
+            .get("max_sessions")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "hwprobe default".to_owned())
+    );
+    println!(
+        "accept_rate: {}/min",
+        limits
+            .get("accept_rate_per_minute")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "budget_mu: {}",
+        limits
+            .get("serve_budget_mu")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "budget_tokens: {}",
+        limits
+            .get("serve_budget_units")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    );
+    println!(
+        "budget_period_seconds: {}",
+        limits
+            .get("serve_budget_period_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(86_400)
+    );
 }
 
 fn attestation_summary_for_model(model: &Value) -> String {
@@ -21717,6 +22348,7 @@ struct ProviderSessionHeartbeatTask {
 
 struct ProviderSessionContext<'a> {
     args: &'a ProviderStartArgs,
+    home: &'a Path,
     keypair_path: &'a Path,
     password: &'a str,
     wallet: &'a WalletInfo,
@@ -21932,6 +22564,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
     let selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
     let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
+    apply_provider_config_defaults(&mut args, config.as_ref(), &selected);
     let protection_config = ProviderProtectionConfig::from_provider_args(&args, &selected)?;
     if rooms.is_empty() {
         bail!(
@@ -22074,6 +22707,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let session_responder = if args.serve_sessions {
         Some(provider_session_responder(&ProviderSessionContext {
             args: &args,
+            home: &home,
             keypair_path: &keypair_path,
             password: &password,
             wallet: &wallet,
@@ -22248,6 +22882,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         serve_provider_sessions(
             ProviderSessionContext {
                 args: &args,
+                home: &home,
                 keypair_path: &keypair_path,
                 password: &password,
                 wallet: &wallet,
@@ -22473,6 +23108,485 @@ async fn provider_rails_set(args: ProviderRailsSetArgs) -> Result<()> {
     }
 
     print_provider_rails_report(&report, args.tx.json)
+}
+
+fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let config = read_config_toml_value(&path)?;
+    let table = provider_min_ask_table(&config);
+    let target = args
+        .target
+        .as_deref()
+        .map(normalize_provider_market_target)
+        .transpose()?;
+    let value = target
+        .as_ref()
+        .and_then(|target| table.get(target).copied());
+    let report = json!({
+        "ok": true,
+        "action": "provider.min_ask.get",
+        "home": home,
+        "path": path,
+        "target": target,
+        "min_ask_mu": value,
+        "markets": table,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if let Some(target) = report["target"].as_str() {
+        match report["min_ask_mu"].as_u64() {
+            Some(mu) => println!("{target}: {mu} mu_usd"),
+            None => println!("{target}: not set"),
+        }
+    } else {
+        println!(
+            "Provider min-ask config: {}",
+            report["path"].as_str().unwrap_or("")
+        );
+        if table.is_empty() {
+            println!("(empty; providers accept the admin market price)");
+        } else {
+            for (target, mu) in table {
+                println!("{target}: {mu} mu_usd");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn provider_min_ask_set(args: ProviderMinAskSetArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let target = normalize_provider_market_target(&args.target)?;
+    let mut config = read_config_toml_value(&path)?;
+    let table = ensure_toml_table_path(&mut config, &["provider", "min_ask"])?;
+    table.insert(
+        target.clone(),
+        toml::Value::Integer(i64::try_from(args.mu).context("min-ask mu exceeds i64")?),
+    );
+    write_config_toml_value(&path, &config)?;
+    let report = json!({
+        "ok": true,
+        "action": "provider.min_ask.set",
+        "home": home,
+        "path": path,
+        "target": target,
+        "min_ask_mu": args.mu,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Set provider min-ask {} = {} mu_usd in {}",
+            report["target"].as_str().unwrap_or(""),
+            report["min_ask_mu"].as_u64().unwrap_or(0),
+            report["path"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn provider_limits_get(args: ProviderLimitsGetArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let config = read_config_toml_value(&path)?;
+    let limits = provider_limits_value(&config);
+    let report = json!({
+        "ok": true,
+        "action": "provider.limits.get",
+        "home": home,
+        "path": path,
+        "limits": limits,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_provider_limits_report(&report);
+    }
+    Ok(())
+}
+
+fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
+    if args.max_concurrent.is_none() && args.accept_rate.is_none() && args.budget.is_none() {
+        bail!("set at least one of --max-concurrent, --accept-rate, or --budget");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let mut config = read_config_toml_value(&path)?;
+    if let Some(max_concurrent) = args.max_concurrent {
+        if max_concurrent == 0 {
+            bail!("--max-concurrent must be greater than zero");
+        }
+        toml_set_u64(
+            &mut config,
+            "provider.limits.max_sessions",
+            u64::from(max_concurrent),
+        )?;
+    }
+    if let Some(accept_rate) = args.accept_rate.as_deref() {
+        toml_set_u64(
+            &mut config,
+            "provider.limits.accept_rate_per_minute",
+            u64::from(parse_provider_accept_rate(accept_rate)?),
+        )?;
+    }
+    if let Some(budget) = args.budget.as_deref() {
+        let parsed = parse_provider_budget(budget)?;
+        match parsed.kind {
+            ProviderBudgetKind::Mu => {
+                toml_set_u64(
+                    &mut config,
+                    "provider.limits.serve_budget_mu",
+                    parsed.amount,
+                )?;
+                toml_set_u64(&mut config, "provider.limits.serve_budget_units", 0)?;
+            }
+            ProviderBudgetKind::Tokens => {
+                toml_set_u64(
+                    &mut config,
+                    "provider.limits.serve_budget_units",
+                    parsed.amount,
+                )?;
+                toml_set_u64(&mut config, "provider.limits.serve_budget_mu", 0)?;
+            }
+        }
+        toml_set_u64(
+            &mut config,
+            "provider.limits.serve_budget_period_seconds",
+            parsed.period_seconds,
+        )?;
+    }
+    write_config_toml_value(&path, &config)?;
+    let report = json!({
+        "ok": true,
+        "action": "provider.limits.set",
+        "home": home,
+        "path": path,
+        "limits": provider_limits_value(&config),
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_provider_limits_report(&report);
+    }
+    Ok(())
+}
+
+async fn provider_drain(args: ProviderDrainArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let wallet = resolve_cli_wallet(
+        &home,
+        config.as_ref(),
+        &args.peer_store_name,
+        args.wallet_password.as_deref().unwrap_or(""),
+    )
+    .await
+    .context("resolving provider wallet")?;
+    let path = provider_drain_flag_path(&home, &wallet.public_key, args.enclave.as_deref());
+    let changed = if args.clear {
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            true
+        } else {
+            false
+        }
+    } else {
+        write_json_file(
+            &path,
+            &json!({
+                "active": true,
+                "provider": wallet.public_key,
+                "enclave_id": args.enclave,
+                "created_at": unix_epoch_seconds()?,
+            }),
+        )?;
+        true
+    };
+    let report = json!({
+        "ok": true,
+        "action": if args.clear { "provider.drain.clear" } else { "provider.drain" },
+        "home": home,
+        "provider": wallet.public_key,
+        "enclave_id": args.enclave,
+        "path": path,
+        "changed": changed,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if args.clear {
+        println!(
+            "Provider drain cleared: {}",
+            report["path"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "Provider drain requested: {}",
+            report["path"].as_str().unwrap_or("")
+        );
+        println!(
+            "Running provider processes will stop accepting new sessions after the next poll."
+        );
+    }
+    Ok(())
+}
+
+async fn provider_earnings(args: ProviderEarningsArgs) -> Result<()> {
+    let provider = if let Some(provider) = args.provider {
+        Some(provider)
+    } else {
+        let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        let config = read_mayhem_config(&home)?;
+        let wallet = resolve_cli_wallet(
+            &home,
+            config.as_ref(),
+            &args.peer_store_name,
+            args.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await
+        .context("resolving provider wallet")?;
+        Some(wallet.public_key)
+    };
+    earnings(EarningsArgs {
+        rpc_url: args.rpc_url,
+        home: args.home,
+        provider,
+        json: args.json,
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProviderBudgetKind {
+    Mu,
+    Tokens,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ParsedProviderBudget {
+    amount: u64,
+    kind: ProviderBudgetKind,
+    period_seconds: u64,
+}
+
+fn normalize_provider_market_target(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("market target must not be empty");
+    }
+    if value.eq_ignore_ascii_case("default") {
+        return Ok("default".to_owned());
+    }
+    if is_hex_len(value, 32) {
+        return Ok(value.to_ascii_lowercase());
+    }
+    if let Some((model, tier)) = value.rsplit_once(':') {
+        let model = model.trim();
+        let tier = tier
+            .trim()
+            .strip_prefix('T')
+            .or_else(|| tier.trim().strip_prefix('t'))
+            .unwrap_or_else(|| tier.trim());
+        if model.is_empty() {
+            bail!("market target model must not be empty");
+        }
+        let tier = tier
+            .parse::<u8>()
+            .with_context(|| format!("market target tier must be T1..T4, got {tier:?}"))?;
+        if !(1..=4).contains(&tier) {
+            bail!("market target tier must be between T1 and T4");
+        }
+        return Ok(format!("{model}:T{tier}"));
+    }
+    Ok(value.to_owned())
+}
+
+fn provider_market_config_keys(selected: &ProviderCandidate) -> Vec<String> {
+    vec![
+        selected.enclave.enclave_id.to_ascii_lowercase(),
+        format!(
+            "{}:T{}",
+            selected.enclave.model_id, selected.enclave.att_tier
+        ),
+        selected.enclave.model_id.clone(),
+        "default".to_owned(),
+    ]
+}
+
+fn provider_config_min_ask(
+    config: Option<&MayhemConfig>,
+    selected: &ProviderCandidate,
+) -> Option<u64> {
+    let min_ask = config
+        .and_then(|config| config.provider.as_ref())
+        .and_then(|provider| provider.min_ask.as_ref())?;
+    provider_market_config_keys(selected)
+        .into_iter()
+        .find_map(|key| min_ask.get(&key).copied())
+}
+
+fn apply_provider_config_defaults(
+    args: &mut ProviderStartArgs,
+    config: Option<&MayhemConfig>,
+    selected: &ProviderCandidate,
+) {
+    if args.min_ask_mu == 0 {
+        if let Some(min_ask_mu) = provider_config_min_ask(config, selected) {
+            args.min_ask_mu = min_ask_mu;
+        }
+    }
+    let Some(limits) = config
+        .and_then(|config| config.provider.as_ref())
+        .and_then(|provider| provider.limits.as_ref())
+    else {
+        return;
+    };
+    if args.max_sessions.is_none() {
+        args.max_sessions = limits.max_sessions;
+    }
+    if args.accept_rate_per_minute == 0 {
+        if let Some(value) = limits.accept_rate_per_minute {
+            args.accept_rate_per_minute = value;
+        }
+    }
+    if args.serve_budget_mu == 0 {
+        if let Some(value) = limits.serve_budget_mu {
+            args.serve_budget_mu = value;
+        }
+    }
+    if args.serve_budget_units == 0 {
+        if let Some(value) = limits.serve_budget_units {
+            args.serve_budget_units = value;
+        }
+    }
+    if args.serve_budget_period_seconds == 86_400 {
+        if let Some(value) = limits.serve_budget_period_seconds {
+            args.serve_budget_period_seconds = value;
+        }
+    }
+}
+
+fn provider_min_ask_table(config: &toml::Value) -> BTreeMap<String, u64> {
+    toml_get_path(config, "provider.min_ask")
+        .and_then(toml::Value::as_table)
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_integer()
+                        .and_then(|value| u64::try_from(value).ok())
+                        .map(|value| (key.clone(), value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn provider_limits_value(config: &toml::Value) -> Value {
+    let limits = toml_get_path(config, "provider.limits").and_then(toml::Value::as_table);
+    let get_u64 = |key: &str| {
+        limits
+            .and_then(|limits| limits.get(key))
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| u64::try_from(value).ok())
+    };
+    json!({
+        "max_sessions": get_u64("max_sessions"),
+        "accept_rate_per_minute": get_u64("accept_rate_per_minute").unwrap_or(0),
+        "serve_budget_mu": get_u64("serve_budget_mu").unwrap_or(0),
+        "serve_budget_units": get_u64("serve_budget_units").unwrap_or(0),
+        "serve_budget_period_seconds": get_u64("serve_budget_period_seconds").unwrap_or(86_400),
+    })
+}
+
+fn parse_provider_accept_rate(value: &str) -> Result<u32> {
+    let trimmed = value.trim();
+    let number = trimmed.strip_suffix("/min").unwrap_or(trimmed).trim();
+    let parsed = number
+        .parse::<u32>()
+        .with_context(|| format!("--accept-rate must be N or N/min, got {value:?}"))?;
+    Ok(parsed)
+}
+
+fn parse_provider_budget(value: &str) -> Result<ParsedProviderBudget> {
+    let (amount_kind, period) = value.trim().split_once('/').with_context(|| {
+        format!("--budget must look like 2500000mu/day or 500000tokens/epoch, got {value:?}")
+    })?;
+    let period_seconds = match period.trim().to_ascii_lowercase().as_str() {
+        "day" | "daily" => 86_400,
+        "epoch" => DEFAULT_EPOCH_LENGTH_MILLIS / 1000,
+        other => other
+            .strip_suffix('s')
+            .unwrap_or(other)
+            .parse::<u64>()
+            .with_context(|| {
+                format!("budget period must be day, epoch, or seconds, got {period:?}")
+            })?,
+    };
+    if period_seconds == 0 {
+        bail!("budget period must be greater than zero");
+    }
+    let lower = amount_kind.trim().to_ascii_lowercase();
+    let (digits, kind) = if let Some(digits) = lower.strip_suffix("tokens") {
+        (digits, ProviderBudgetKind::Tokens)
+    } else if let Some(digits) = lower.strip_suffix("token") {
+        (digits, ProviderBudgetKind::Tokens)
+    } else if let Some(digits) = lower.strip_suffix("mu") {
+        (digits, ProviderBudgetKind::Mu)
+    } else if let Some(digits) = lower.strip_suffix("musd") {
+        (digits, ProviderBudgetKind::Mu)
+    } else {
+        bail!("budget amount must end in mu or tokens");
+    };
+    let amount = digits
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("budget amount must be an integer, got {amount_kind:?}"))?;
+    Ok(ParsedProviderBudget {
+        amount,
+        kind,
+        period_seconds,
+    })
+}
+
+fn provider_control_dir(home: &Path, provider: &str) -> PathBuf {
+    home.join("provider-control")
+        .join(safe_path_component(provider))
+}
+
+fn provider_drain_flag_path(home: &Path, provider: &str, enclave: Option<&str>) -> PathBuf {
+    provider_control_dir(home, provider).join(format!(
+        "{}.drain.json",
+        safe_path_component(enclave.unwrap_or("all"))
+    ))
+}
+
+fn provider_drain_flag_paths(home: &Path, provider: &str, enclave: &str) -> Vec<PathBuf> {
+    vec![
+        provider_drain_flag_path(home, provider, Some(enclave)),
+        provider_drain_flag_path(home, provider, None),
+    ]
+}
+
+fn provider_drain_requested(paths: &[PathBuf]) -> Result<Option<PathBuf>> {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let value = read_json_file(path)?;
+        if value.get("active").and_then(Value::as_bool).unwrap_or(true) {
+            return Ok(Some(path.clone()));
+        }
+    }
+    Ok(None)
 }
 
 struct ProviderTxContext {
@@ -26134,6 +27248,11 @@ async fn serve_provider_sessions(
     let mut pending_payloads = HashMap::new();
     let mut protection = ProviderProtectionState::new(protection_config);
     let mut draining = false;
+    let drain_paths = provider_drain_flag_paths(
+        ctx.home,
+        &ctx.wallet.public_key,
+        &ctx.selected.enclave.enclave_id,
+    );
     let serve_result: Result<()> = async {
         loop {
             expire_provider_pending_sessions(
@@ -26144,6 +27263,25 @@ async fn serve_provider_sessions(
                 &heartbeat_load,
             )
             .await;
+            if !draining {
+                match provider_drain_requested(&drain_paths) {
+                    Ok(Some(path)) => {
+                        provider_session_debug(format!(
+                            "local drain flag {} observed; refusing new sessions",
+                            path.display()
+                        ));
+                        heartbeat_load.set_accepting_new(false);
+                        draining = true;
+                        if sessions.is_empty() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => provider_session_debug(format!(
+                        "reading local drain flag failed: {err:#}"
+                    )),
+                }
+            }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 if !draining {
                     provider_session_debug(
@@ -30283,9 +31421,12 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "keypair_path" | "identity.keypair_path" => Ok("identity.keypair_path"),
         "store_name" | "identity.store_name" => Ok("identity.store_name"),
         "engine_backend" | "provider.engine_backend" => Ok("provider.engine_backend"),
+        "max_price" | "max_price_mu" | "user.max_price" | "user.max_price_mu" => {
+            Ok("user.max_price_mu")
+        }
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, user.max_price_mu, and role.mode"),
     }
 }
 
@@ -30316,6 +31457,59 @@ fn toml_set_string(value: &mut toml::Value, key: &str, new_value: String) -> Res
     }
     table.insert((*last).to_owned(), toml::Value::String(new_value));
     Ok(())
+}
+
+fn toml_set_u64(value: &mut toml::Value, key: &str, new_value: u64) -> Result<()> {
+    let segments = key.split('.').collect::<Vec<_>>();
+    let Some((last, parents)) = segments.split_last() else {
+        bail!("config key must not be empty");
+    };
+    let table = ensure_toml_table_path(value, parents)?;
+    table.insert(
+        (*last).to_owned(),
+        toml::Value::Integer(i64::try_from(new_value).context("config integer exceeds i64")?),
+    );
+    Ok(())
+}
+
+fn toml_remove_path(value: &mut toml::Value, key: &str) -> Result<()> {
+    let segments = key.split('.').collect::<Vec<_>>();
+    let Some((last, parents)) = segments.split_last() else {
+        bail!("config key must not be empty");
+    };
+    let mut table = value
+        .as_table_mut()
+        .context("config root must contain a TOML table")?;
+    for segment in parents {
+        let Some(next) = table.get_mut(*segment) else {
+            return Ok(());
+        };
+        if !next.is_table() {
+            return Ok(());
+        }
+        table = next.as_table_mut().expect("checked table");
+    }
+    table.remove(*last);
+    Ok(())
+}
+
+fn ensure_toml_table_path<'a>(
+    value: &'a mut toml::Value,
+    segments: &[&str],
+) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    let mut table = value
+        .as_table_mut()
+        .context("config root must contain a TOML table")?;
+    for segment in segments {
+        let entry = table
+            .entry((*segment).to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if !entry.is_table() {
+            bail!("{segment} exists in config.toml but is not a table");
+        }
+        table = entry.as_table_mut().expect("checked table");
+    }
+    Ok(table)
 }
 
 fn remove_local_state_path(path: &Path) -> Result<bool> {
@@ -31457,6 +32651,180 @@ mod tests {
         fs::remove_dir_all(&home).unwrap();
     }
 
+    #[test]
+    fn config_max_price_and_generic_alias_persist_numeric_toml() {
+        let home = test_temp_dir("mayhem-config-max-price");
+        config_max_price(ConfigMaxPriceArgs {
+            home: Some(home.clone()),
+            mu: Some(12_345),
+            clear: false,
+            json: true,
+        })
+        .unwrap();
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        assert_eq!(
+            toml_get_path(&config, "user.max_price_mu").and_then(toml::Value::as_integer),
+            Some(12_345)
+        );
+        let typed = read_mayhem_config(&home).unwrap().unwrap();
+        assert_eq!(typed.user.and_then(|user| user.max_price_mu), Some(12_345));
+
+        config_set(ConfigSetArgs {
+            home: Some(home.clone()),
+            key: "max-price".to_owned(),
+            value: "54321".to_owned(),
+            json: true,
+        })
+        .unwrap();
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        assert_eq!(
+            toml_get_path(&config, "user.max_price_mu").and_then(toml::Value::as_integer),
+            Some(54_321)
+        );
+
+        config_max_price(ConfigMaxPriceArgs {
+            home: Some(home.clone()),
+            mu: None,
+            clear: true,
+            json: true,
+        })
+        .unwrap();
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        assert!(toml_get_path(&config, "user.max_price_mu").is_none());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn provider_market_config_helpers_parse_and_apply_defaults() {
+        assert_eq!(
+            normalize_provider_market_target("test/model:3").unwrap(),
+            "test/model:T3"
+        );
+        assert_eq!(
+            normalize_provider_market_target(&"AA".repeat(16)).unwrap(),
+            "aa".repeat(16)
+        );
+        assert!(normalize_provider_market_target("test/model:T9").is_err());
+        assert_eq!(parse_provider_accept_rate("12/min").unwrap(), 12);
+        assert_eq!(
+            parse_provider_budget("2500mu/day").unwrap(),
+            ParsedProviderBudget {
+                amount: 2500,
+                kind: ProviderBudgetKind::Mu,
+                period_seconds: 86_400,
+            }
+        );
+        assert_eq!(
+            parse_provider_budget("42tokens/epoch")
+                .unwrap()
+                .period_seconds,
+            DEFAULT_EPOCH_LENGTH_MILLIS / 1000
+        );
+
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "gguf-q4_k_m".to_owned(),
+            artifact: catalog.models[0].artifacts["gguf-q4_k_m"].clone(),
+            verdict: BackendVerdict {
+                backend: "llama.cpp".to_owned(),
+                status: VerdictStatus::CpuOnly,
+                reason: None,
+                est_tok_s: Some(12.0),
+                n_layers_gpu: Some(0),
+                max_sessions: 3,
+                kv_cache_bytes_budget: 0,
+            },
+            price: contract.prices.first().cloned(),
+        };
+        let config: MayhemConfig = toml::from_str(
+            r#"
+            [provider.min_ask]
+            "test/model@4bit:T1" = 700
+
+            [provider.limits]
+            max_sessions = 2
+            accept_rate_per_minute = 9
+            serve_budget_mu = 1000
+            serve_budget_period_seconds = 3600
+            "#,
+        )
+        .unwrap();
+        let mut args = test_provider_start_args();
+        apply_provider_config_defaults(&mut args, Some(&config), &selected);
+        assert_eq!(args.min_ask_mu, 700);
+        assert_eq!(args.max_sessions, Some(2));
+        assert_eq!(args.accept_rate_per_minute, 9);
+        assert_eq!(args.serve_budget_mu, 1000);
+        assert_eq!(args.serve_budget_period_seconds, 3600);
+    }
+
+    #[test]
+    fn price_show_extracts_route_level_tier_markets() {
+        let markets = price_show_markets_from_gateway_models(
+            &[json!({
+                "id": "test/model",
+                "mayhem": {
+                    "price_ref_mu": {
+                        "denom": "mu_usd",
+                        "ver": 1,
+                        "rate_map": [
+                            { "unit": "input_token", "per_unit_mu": 1, "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_mu": 2, "granularity": 1000 }
+                        ],
+                        "per_req_mu": 0,
+                        "min_session_mu": 0
+                    },
+                    "route_candidates": [{
+                        "provider": "55".repeat(32),
+                        "enclave_id": "11".repeat(32),
+                        "room_id": "aa".repeat(16),
+                        "att_tier": 1,
+                        "quant": "int4",
+                        "price_ref_mu": {
+                            "denom": "mu_usd",
+                            "ver": 1,
+                            "rate_map": [
+                                { "unit": "input_token", "per_unit_mu": 1, "granularity": 1000 },
+                                { "unit": "output_token", "per_unit_mu": 2, "granularity": 1000 }
+                            ],
+                            "per_req_mu": 0,
+                            "min_session_mu": 0
+                        }
+                    }, {
+                        "provider": "66".repeat(32),
+                        "enclave_id": "22".repeat(32),
+                        "room_id": "bb".repeat(16),
+                        "att_tier": 3,
+                        "quant": "fp16",
+                        "price_ref_mu": {
+                            "denom": "mu_usd",
+                            "ver": 2,
+                            "rate_map": [
+                                { "unit": "input_token", "per_unit_mu": 90, "granularity": 1000 },
+                                { "unit": "output_token", "per_unit_mu": 180, "granularity": 1000 }
+                            ],
+                            "per_req_mu": 0,
+                            "min_session_mu": 0,
+                            "derivation": { "epoch": 7, "source": "market" }
+                        }
+                    }]
+                }
+            })],
+            "test/model",
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(markets.len(), 1);
+        assert_eq!(markets[0]["enclave_id"], "22".repeat(32));
+        assert_eq!(markets[0]["att_tier"], 3);
+        assert_eq!(markets[0]["price_ref_mu"]["ver"], 2);
+        assert_eq!(markets[0]["price_ref_mu"]["derivation"]["epoch"], 7);
+    }
+
     #[tokio::test]
     async fn reset_requires_confirmation_and_removes_home() {
         let home = test_temp_dir("mayhem-reset");
@@ -32028,6 +33396,100 @@ mod tests {
                 "effective_at": 21_600,
             })
         );
+    }
+
+    #[test]
+    fn admin_price_seed_and_fee_shortcuts_build_existing_contract_payloads() {
+        let seed = AdminPriceSeedArgs {
+            tx: test_admin_tx_args(),
+            enclave_id: "enclave-a".to_owned(),
+            p0_mu: 42,
+            per_req_mu: 3,
+            min_session_mu: 100,
+            effective_at: Some(10),
+        };
+        assert_eq!(
+            admin_price_seed_payload(&seed).unwrap(),
+            json!({
+                "op": "set_price",
+                "enclave_id": "enclave-a",
+                "rate_map": [
+                    { "unit": "input_token", "per_unit_mu": 42, "granularity": 1000 },
+                    { "unit": "output_token", "per_unit_mu": 42, "granularity": 1000 },
+                ],
+                "per_req_mu": 3,
+                "min_session_mu": 100,
+                "effective_at": 10,
+            })
+        );
+
+        let fee = AdminFeeSetArgs {
+            tx: test_admin_tx_args(),
+            bps: 1_500,
+            submitted_at: Some(1),
+            effective_at: Some(86_401),
+        };
+        assert_eq!(
+            admin_fee_set_payload(&fee).unwrap(),
+            json!({
+                "op": "set_params",
+                "submitted_at": 1,
+                "effective_at": 86401,
+                "values": { "fee_bps": 1500 },
+            })
+        );
+
+        let bad = AdminFeeSetArgs { bps: 5_001, ..fee };
+        assert!(admin_fee_set_payload(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("between 0 and 5000"));
+    }
+
+    #[test]
+    fn marketplace_cli_parses_short_operator_commands() {
+        let min_ask = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "min-ask",
+            "set",
+            "test/model:T3",
+            "900",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = min_ask.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::MinAsk { command } = *command else {
+            panic!("expected min-ask command");
+        };
+        let ProviderMinAskCommands::Set(args) = command else {
+            panic!("expected min-ask set");
+        };
+        assert_eq!(args.target, "test/model:T3");
+        assert_eq!(args.mu, 900);
+        assert!(args.json);
+
+        let price = Cli::try_parse_from([
+            "mayhem",
+            "price",
+            "show",
+            "test/model",
+            "--tier",
+            "3",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Price { command } = price.command else {
+            panic!("expected price command");
+        };
+        let args = match command {
+            PriceCommands::Show(args) => args,
+        };
+        assert_eq!(args.model, "test/model");
+        assert_eq!(args.tier, Some(3));
+        assert!(args.json);
     }
 
     #[test]
@@ -37279,6 +38741,7 @@ mod tests {
                 tnk_treasury_address: Some("testtrac1treasury".to_owned()),
             }),
             provider: None,
+            user: None,
             role: None,
         };
 
@@ -37449,6 +38912,7 @@ mod tests {
                 tnk_treasury_address: None,
             }),
             provider: None,
+            user: None,
             role: None,
         };
 
