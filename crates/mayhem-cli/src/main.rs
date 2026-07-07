@@ -3372,6 +3372,14 @@ struct AdminEpochApplyArgs {
     #[arg(long, value_name = "PATH")]
     earnings_file: Option<PathBuf>,
 
+    /// JSON array of {enclave_id,demand_mu,session_count} market usage.
+    #[arg(long)]
+    market_usage_json: Option<String>,
+
+    /// Path to a JSON array of {enclave_id,demand_mu,session_count} market usage.
+    #[arg(long, value_name = "PATH")]
+    market_usage_file: Option<PathBuf>,
+
     /// JSON object containing dep/use/earn/fee roots.
     #[arg(long)]
     roots_json: Option<String>,
@@ -12088,6 +12096,15 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
         recomputed_field(recomputed.as_ref(), "earnings").or_else(|| Some(json!([]))),
         "epoch earnings",
     )?;
+    let market_usage = optional_json_arg_or_file(
+        args.market_usage_json.as_deref(),
+        args.market_usage_file.as_ref(),
+        "epoch market usage",
+    )?
+    .or_else(|| recomputed_field(recomputed.as_ref(), "market_usage"));
+    if let Some(value) = market_usage.as_ref() {
+        ensure_json_array(value, "epoch market usage")?;
+    }
     let roots = json_arg_or_file_object(
         args.roots_json.as_deref(),
         args.roots_file.as_ref(),
@@ -12101,7 +12118,7 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
         "epoch totals",
     )?;
 
-    Ok(json!({
+    let mut payload = json!({
         "op": "epoch_apply",
         "epoch": epoch,
         "at": args.at,
@@ -12109,7 +12126,11 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
         "earnings": earnings,
         "roots": roots,
         "totals": totals,
-    }))
+    });
+    if let Some(market_usage) = market_usage {
+        payload["market_usage"] = market_usage;
+    }
+    Ok(payload)
 }
 
 fn epoch_apply_feature_key(value: &Value) -> Result<String> {
@@ -12236,6 +12257,13 @@ fn optional_json_arg_or_file(
 
 fn recomputed_field(recomputed: Option<&Value>, field: &str) -> Option<Value> {
     recomputed.and_then(|value| value.get(field).cloned())
+}
+
+fn ensure_json_array(value: &Value, label: &str) -> Result<()> {
+    if !value.is_array() {
+        bail!("{label} JSON must be an array");
+    }
+    Ok(())
 }
 
 fn epoch_arg_or_recomputed(epoch: Option<u64>, recomputed: Option<&Value>) -> Result<u64> {
@@ -32090,6 +32118,10 @@ mod tests {
             debits_file: None,
             earnings_json: Some(r#"[{"provider":"provider-a","gross_mu":2000}]"#.to_owned()),
             earnings_file: None,
+            market_usage_json: Some(
+                r#"[{"enclave_id":"enclave-a","demand_mu":2000,"session_count":1}]"#.to_owned(),
+            ),
+            market_usage_file: None,
             roots_json: Some(commit["roots"].to_string()),
             roots_file: None,
             totals_json: Some(commit["totals"].to_string()),
@@ -32104,6 +32136,7 @@ mod tests {
                 "at": 25_200,
                 "debits": [{"user": "user-a", "mu": 2000}],
                 "earnings": [{"provider": "provider-a", "gross_mu": 2000}],
+                "market_usage": [{"enclave_id": "enclave-a", "demand_mu": 2000, "session_count": 1}],
                 "roots": commit["roots"],
                 "totals": commit["totals"],
             })
@@ -32118,6 +32151,7 @@ mod tests {
                 "roots": commit["roots"],
                 "earnings": [{"gross_mu": 2000, "provider": "provider-a"}],
                 "debits": [{"mu": 2000, "user": "user-a"}],
+                "market_usage": [{"demand_mu": 2000, "enclave_id": "enclave-a", "session_count": 1}],
                 "at": 25_200,
                 "epoch": 7,
                 "op": "epoch_apply",
@@ -32160,6 +32194,8 @@ mod tests {
             debits_file: None,
             earnings_json: Some("[]".to_owned()),
             earnings_file: None,
+            market_usage_json: None,
+            market_usage_file: None,
             roots_json: Some(roots.to_string()),
             roots_file: None,
             totals_json: Some(totals.to_string()),

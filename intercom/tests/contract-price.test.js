@@ -4,6 +4,7 @@ import MayhemContract from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
+  executeEpochApplyFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
@@ -19,6 +20,17 @@ const DAY_SECONDS = 24 * 60 * 60;
 const providerRegistration = {
   op: 'register_provider',
 };
+
+const seededBalance = (user, mu, rail = 'fiat') => ({
+  user,
+  rail,
+  denom: 'mu_usd',
+  mu,
+  updated_epoch: 0,
+  updated_at: null,
+});
+
+const rateFor = (rateMap, unit) => rateMap.find((entry) => entry.unit === unit)?.per_unit_mu;
 
 const enclaveRegistration = {
   op: 'register_enclave',
@@ -101,6 +113,41 @@ async function setupRegisteredEnclave() {
   }
 
   return { contract, storage, provider, admin };
+}
+
+async function registerAndJoinExtraProvider(contract, storage, admin, provider, txStart) {
+  const consent = await execute(
+    contract,
+    storage,
+    'consent',
+    {
+      op: 'consent',
+      ver: 1,
+      hash: rulesHash,
+      sig: signConsent(provider.wallet, 1, rulesHash),
+    },
+    provider.publicKey,
+    txStart
+  );
+  assert.equal(consent.ok, true, consent.message);
+  const registered = await execute(
+    contract,
+    storage,
+    'registerProvider',
+    providerRegistration,
+    provider.publicKey,
+    txStart + 1
+  );
+  assert.equal(registered.ok, true, registered.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    txStart + 2
+  );
+  assert.equal(joined.ok, true, joined.message);
 }
 
 test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit', async () => {
@@ -230,6 +277,153 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     12
   );
   assert.equal(afterSecond.price.ver, 2);
+});
+
+test('MayhemContract epochApply keeps cold-start markets pinned to the admin seed', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    6
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 20_000_000));
+
+  const applied = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 43_201,
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 10_000_000 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 10_000_000 }],
+      market_usage: [{ enclave_id: enclaveId, demand_mu: 10_000_000, session_count: 4 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(applied.market_prices, undefined);
+
+  const schedule = await storage.get(`price/${enclaveId}`);
+  assert.equal(schedule.value.current.ver, 1);
+  assert.deepEqual(schedule.value.current.rate_map, textRateMap(18, 55));
+});
+
+test('MayhemContract epochApply floats market price from settled usage with clamp and damping', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+  const providerTwo = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    6
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 7);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
+
+  const highDemand = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 43_201,
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
+      market_usage: [{ enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 4 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(highDemand.ok, true, highDemand.message);
+  assert.deepEqual(highDemand.market_prices, [
+    {
+      enclave_id: enclaveId,
+      ver: 2,
+      utilization_bps: 10_000,
+      ema_utilization_bps: 8_875,
+      active_supply: 2,
+      active_demand_mu: 2_000_000,
+      frozen: false,
+    },
+  ]);
+  let schedule = await storage.get(`price/${enclaveId}`);
+  const raised = schedule.value.current;
+  assert.equal(raised.ver, 2);
+  assert.equal(raised.price_source, 'market_float');
+  assert.equal(raised.seed.ver, 1);
+  assert.equal(rateFor(raised.rate_map, 'input_token'), 19);
+  assert.equal(rateFor(raised.rate_map, 'output_token'), 60);
+  assert.ok(rateFor(raised.rate_map, 'input_token') <= Math.floor(18 * 1.1));
+  assert.ok(rateFor(raised.rate_map, 'output_token') <= Math.floor(55 * 1.1));
+
+  const lowDemand = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 2,
+      at: 46_801,
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 10_000 }],
+      earnings: [{ rail: 'fiat', provider: providerTwo.publicKey, gross_mu: 10_000 }],
+      market_usage: [{ enclave_id: enclaveId, demand_mu: 10_000, session_count: 1 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(lowDemand.ok, true, lowDemand.message);
+  schedule = await storage.get(`price/${enclaveId}`);
+  const lowered = schedule.value.current;
+  assert.equal(lowered.ver, 3);
+  assert.equal(rateFor(lowered.rate_map, 'input_token'), 18);
+  assert.ok(rateFor(lowered.rate_map, 'output_token') < rateFor(raised.rate_map, 'output_token'));
+
+  const reseed = await execute(
+    contract,
+    storage,
+    'setPrice',
+    makePrice({ rate_map: textRateMap(19, 56), effective_at: 43_202 }),
+    admin.publicKey,
+    10
+  );
+  assert.equal(reseed.ok, true, reseed.message);
+  assert.equal(reseed.ver, 4);
+});
+
+test('MayhemContract epochApply rejects market usage that does not reconcile to settled gross', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));
+  const mismatch = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 43_201,
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000 }],
+      market_usage: [{ enclave_id: enclaveId, demand_mu: 1_999, session_count: 1 }],
+    },
+    admin.publicKey
+  );
+  assert.match(mismatch.message, /market usage demand must equal/i);
 });
 
 test('MayhemContract setModelRef is admin-only and forward-facing', async () => {

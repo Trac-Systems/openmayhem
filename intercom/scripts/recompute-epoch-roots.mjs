@@ -65,12 +65,41 @@ function addRailAmount(map, rail, id, amount, label) {
   map.set(key, { ...current, mu: next });
 }
 
+function addMarketUsage(map, enclaveId, sessionId, amount) {
+  if (typeof enclaveId !== 'string' || enclaveId.length === 0) {
+    throw new Error('receipt enclave_id is required');
+  }
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw new Error('receipt session_id is required');
+  }
+  const current = map.get(enclaveId) ?? {
+    enclave_id: enclaveId,
+    demand_mu: 0,
+    sessions: new Set(),
+  };
+  const next = current.demand_mu + amount;
+  safeAmount(next, 'market demand_mu', { allowZero: true });
+  current.demand_mu = next;
+  current.sessions.add(sessionId);
+  map.set(enclaveId, current);
+}
+
 function sortedRailEntries(map) {
   return Array.from(map.values()).sort((a, b) => {
     const railOrder = LEDGER_RAIL_ORDER.indexOf(a.rail) - LEDGER_RAIL_ORDER.indexOf(b.rail);
     if (railOrder !== 0) return railOrder;
     return a.id.localeCompare(b.id);
   });
+}
+
+function sortedMarketUsageEntries(map) {
+  return Array.from(map.values())
+    .sort((a, b) => a.enclave_id.localeCompare(b.enclave_id))
+    .map((entry) => ({
+      enclave_id: entry.enclave_id,
+      demand_mu: entry.demand_mu,
+      session_count: entry.sessions.size,
+    }));
 }
 
 function canonicalUsageUnit(unit) {
@@ -242,6 +271,7 @@ export async function recomputeEpoch(bundle) {
   const usageLeaves = [];
   const debitMap = new Map();
   const grossEarningMap = new Map();
+  const marketUsageMap = new Map();
   const previousBySession = new Map();
   const sessions = new Set();
 
@@ -266,6 +296,7 @@ export async function recomputeEpoch(bundle) {
     sessions.add(body.session_id);
     addRailAmount(debitMap, rail, body.user, settleMu, 'debit');
     addRailAmount(grossEarningMap, rail, body.provider, settleMu, 'earning');
+    addMarketUsage(marketUsageMap, body.enclave_id, body.session_id, settleMu);
     usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', receiptLeafEnvelope(envelope)));
   }
 
@@ -306,6 +337,7 @@ export async function recomputeEpoch(bundle) {
     .map(({ rail, id: user, mu }) => ({ rail, user, mu }));
   const earnings = sortedRailEntries(grossEarningMap)
     .map(({ rail, id: provider, mu: gross_mu }) => ({ rail, provider, gross_mu }));
+  const market_usage = sortedMarketUsageEntries(marketUsageMap);
   const useMu = debits.reduce((sum, entry) => sum + entry.mu, 0);
   const totals = {
     dep_count: dep.count,
@@ -318,7 +350,7 @@ export async function recomputeEpoch(bundle) {
     fee_cum_mu: feeCumMu,
   };
 
-  return { epoch, params: { fee_bps: feeBps }, roots, totals, debits, earnings };
+  return { epoch, params: { fee_bps: feeBps }, roots, totals, debits, earnings, market_usage };
 }
 
 function adminFeeBps(bundle) {

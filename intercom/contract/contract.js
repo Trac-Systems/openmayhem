@@ -24,6 +24,15 @@ const PROVIDER_LIFECYCLE_OPS = new Set([
   'leave_room',
 ]);
 const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
+const MARKET_PRICE_TARGET_UTILIZATION_BPS = 8_500;
+const MARKET_PRICE_EMA_ALPHA_BPS = 2_500;
+const MARKET_PRICE_GAIN_BPS = 5_000;
+const MARKET_PRICE_MAX_STEP_BPS = 1_000;
+const MARKET_PRICE_COLD_START_MIN_PROVIDERS = 2;
+const MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU = 1_000_000;
+const MARKET_PRICE_MAX_UTILIZATION_BPS = 50_000;
+const MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS = 2_500;
+const MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS = 15_000;
 const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
 const DAY_SECONDS = 24 * 60 * 60;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
@@ -2165,9 +2174,10 @@ class MayhemContract extends Contract {
     const key = `price/${this.value.enclave_id}`;
     const schedule = await this.priceSchedule(key, enclave);
     const latest = this.priceLatestEntry(schedule);
+    const latestSeed = this.priceLatestSeedEntry(schedule);
     if (
-      latest &&
-      this.value.effective_at - latest.effective_at < PRICE_RATE_LIMIT_SECONDS
+      latestSeed &&
+      this.value.effective_at - latestSeed.effective_at < PRICE_RATE_LIMIT_SECONDS
     ) {
       return new Error('Price changes are limited to once per 6h.');
     }
@@ -2566,6 +2576,16 @@ class MayhemContract extends Contract {
     if (grossRailTotals instanceof Error) return grossRailTotals;
     const railTotalError = this.assertMatchingRailTotals(debitRailTotals, grossRailTotals);
     if (railTotalError) return railTotalError;
+    const marketUsageProvided = hasOwn(this.value, 'market_usage');
+    const marketUsageMap = marketUsageProvided
+      ? this.aggregateMarketUsageEntries(this.value.market_usage)
+      : new Map();
+    if (marketUsageMap instanceof Error) return marketUsageMap;
+    const marketUsageTotal = this.sumMarketDemandMu(marketUsageMap);
+    if (marketUsageTotal instanceof Error) return marketUsageTotal;
+    if (marketUsageProvided && marketUsageTotal !== grossTotal) {
+      return new Error('Epoch market usage demand must equal gross provider earnings.');
+    }
 
     const applyState = await this.epochApplyStateRecord();
     const normalized = {
@@ -2577,6 +2597,9 @@ class MayhemContract extends Contract {
       roots,
       totals,
     };
+    if (marketUsageProvided) {
+      normalized.market_usage = this.mapMarketUsageEntriesForHash(marketUsageMap);
+    }
     const applyHash = await this.epochApplyHash(normalized);
     if (applyState.updated_epoch === this.value.epoch && applyState.last_apply_hash === applyHash) {
       return {
@@ -2741,6 +2764,11 @@ class MayhemContract extends Contract {
       });
       if (totalsError) return totalsError;
     }
+    let marketPriceUpdates = [];
+    if (marketUsageProvided) {
+      marketPriceUpdates = await this.computeMarketPriceUpdates(marketUsageMap);
+      if (marketPriceUpdates instanceof Error) return marketPriceUpdates;
+    }
 
     for (const balance of this.sortedRailRecords(balances, 'user')) {
       await this.put(this.balanceKey(balance.user, balance.rail), balance);
@@ -2771,6 +2799,10 @@ class MayhemContract extends Contract {
         feeCumMu: nextFeeCumTotal,
       });
     }
+    for (const update of marketPriceUpdates) {
+      await this.put(update.schedule_key, update.schedule);
+      await this.put(update.record_key, update.record);
+    }
 
     const result = {
       ok: true,
@@ -2784,6 +2816,17 @@ class MayhemContract extends Contract {
         (left, right) => PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
       ),
     };
+    if (marketPriceUpdates.length > 0) {
+      result.market_prices = marketPriceUpdates.map((update) => ({
+        enclave_id: update.enclave_id,
+        ver: update.ver,
+        utilization_bps: update.utilization_bps,
+        ema_utilization_bps: update.ema_utilization_bps,
+        active_supply: update.active_supply,
+        active_demand_mu: update.active_demand_mu,
+        frozen: update.frozen,
+      }));
+    }
     console.log('mayhem epochApply', result);
     return result;
   }
@@ -4669,6 +4712,15 @@ class MayhemContract extends Contract {
     };
   }
 
+  priceScheduleAt(schedule, at) {
+    const updated = cloneValue(schedule);
+    if (updated.pending && updated.pending.effective_at <= at) {
+      updated.current = updated.pending;
+      updated.pending = null;
+    }
+    return updated;
+  }
+
   priceActiveEntry(schedule, at) {
     if (schedule.pending && schedule.pending.effective_at <= at) return cloneValue(schedule.pending);
     return schedule.current ? cloneValue(schedule.current) : null;
@@ -4676,6 +4728,261 @@ class MayhemContract extends Contract {
 
   priceLatestEntry(schedule) {
     return schedule.pending ?? schedule.current;
+  }
+
+  priceSeedSnapshot(record) {
+    if (!record) return null;
+    return {
+      enclave_id: record.enclave_id,
+      model_id: record.model_id,
+      denom: record.denom,
+      ver: record.seed_ver ?? record.ver,
+      rate_map: cloneValue(record.seed_rate_map ?? record.rate_map),
+      per_req_mu: record.seed_per_req_mu ?? record.per_req_mu,
+      min_session_mu: record.seed_min_session_mu ?? record.min_session_mu,
+      effective_at: record.seed_effective_at ?? record.effective_at,
+      effective_from: record.seed_effective_from ?? record.effective_from,
+      updated_at: record.seed_updated_at ?? record.updated_at,
+      set_by: record.seed_by ?? record.set_by,
+      set_by_role: record.seed_by_role ?? record.set_by_role,
+    };
+  }
+
+  priceSeedEntry(record) {
+    return record?.seed ? cloneValue(record.seed) : this.priceSeedSnapshot(record);
+  }
+
+  priceLatestSeedEntry(schedule) {
+    if (schedule.pending) return this.priceSeedEntry(schedule.pending);
+    if (schedule.current) return this.priceSeedEntry(schedule.current);
+    return null;
+  }
+
+  marketPriceConstants() {
+    return {
+      target_utilization_bps: MARKET_PRICE_TARGET_UTILIZATION_BPS,
+      ema_alpha_bps: MARKET_PRICE_EMA_ALPHA_BPS,
+      gain_bps: MARKET_PRICE_GAIN_BPS,
+      max_step_bps: MARKET_PRICE_MAX_STEP_BPS,
+      cold_start_min_providers: MARKET_PRICE_COLD_START_MIN_PROVIDERS,
+      provider_epoch_target_mu: MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU,
+      max_utilization_bps: MARKET_PRICE_MAX_UTILIZATION_BPS,
+      below_target_discount_bps: MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS,
+      above_target_slope_bps: MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS,
+    };
+  }
+
+  marketUtilizationBps(demandMu, activeSupply) {
+    if (!Number.isSafeInteger(demandMu) || demandMu < 0) {
+      return new Error('Invalid market demand.');
+    }
+    if (!Number.isSafeInteger(activeSupply) || activeSupply < 0) {
+      return new Error('Invalid market active supply.');
+    }
+    if (activeSupply === 0) return 0;
+    const capacityMu = activeSupply * MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU;
+    if (!Number.isSafeInteger(capacityMu) || capacityMu <= 0) {
+      return new Error('Invalid market supply capacity.');
+    }
+    const util = Math.floor((demandMu * 10_000) / capacityMu);
+    return Math.min(util, MARKET_PRICE_MAX_UTILIZATION_BPS);
+  }
+
+  marketEmaUtilizationBps(previousEmaBps, utilizationBps) {
+    const previous = Number.isSafeInteger(previousEmaBps)
+      ? previousEmaBps
+      : MARKET_PRICE_TARGET_UTILIZATION_BPS;
+    return Math.floor(
+      (
+        previous * (10_000 - MARKET_PRICE_EMA_ALPHA_BPS) +
+        utilizationBps * MARKET_PRICE_EMA_ALPHA_BPS
+      ) / 10_000
+    );
+  }
+
+  marketCurveMultiplierBps(utilizationBps) {
+    if (utilizationBps <= MARKET_PRICE_TARGET_UTILIZATION_BPS) {
+      const shortfall = MARKET_PRICE_TARGET_UTILIZATION_BPS - utilizationBps;
+      return 10_000 - Math.floor(
+        (shortfall * MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS) /
+        MARKET_PRICE_TARGET_UTILIZATION_BPS
+      );
+    }
+    const excess = utilizationBps - MARKET_PRICE_TARGET_UTILIZATION_BPS;
+    const denominator = 10_000 - MARKET_PRICE_TARGET_UTILIZATION_BPS;
+    return 10_000 + Math.floor((excess * MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS) / denominator);
+  }
+
+  scalePriceTerm(term, multiplierBps) {
+    if (!Number.isSafeInteger(term) || term < 0 || !Number.isSafeInteger(multiplierBps) || multiplierBps < 0) {
+      return new Error('Invalid price term.');
+    }
+    if (term === 0) return 0;
+    const scaled = this.safeNarrowMu(
+      (BigInt(term) * BigInt(multiplierBps) + 5_000n) / 10_000n
+    );
+    if (scaled instanceof Error) return scaled;
+    return Math.max(1, scaled);
+  }
+
+  stepPriceTerm(current, desired) {
+    if (
+      !Number.isSafeInteger(current) ||
+      !Number.isSafeInteger(desired) ||
+      current < 0 ||
+      desired < 0
+    ) {
+      return new Error('Invalid price term.');
+    }
+    if (current === desired) return current;
+    if (current === 0) return desired;
+    const delta = Math.abs(desired - current);
+    const gained = Math.max(1, Math.floor((delta * MARKET_PRICE_GAIN_BPS) / 10_000));
+    const maxStep = Math.max(1, Math.floor((current * MARKET_PRICE_MAX_STEP_BPS) / 10_000));
+    const step = Math.min(gained, maxStep);
+    return desired > current ? current + step : Math.max(0, current - step);
+  }
+
+  scaleRateMap(rateMap, multiplierBps) {
+    const scaled = [];
+    for (const entry of rateMap) {
+      const perUnitMu = this.scalePriceTerm(entry.per_unit_mu, multiplierBps);
+      if (perUnitMu instanceof Error) return perUnitMu;
+      scaled.push({ ...entry, per_unit_mu: perUnitMu });
+    }
+    return this.normalizeRateMap(scaled);
+  }
+
+  stepRateMap(currentRateMap, desiredRateMap) {
+    const desiredByUnit = this.rateMapByUnit(desiredRateMap);
+    const stepped = [];
+    for (const entry of currentRateMap) {
+      const desired = desiredByUnit.get(entry.unit);
+      if (!desired || desired.granularity !== entry.granularity) {
+        return new Error('Market price rate_map shape changed.');
+      }
+      const perUnitMu = this.stepPriceTerm(entry.per_unit_mu, desired.per_unit_mu);
+      if (perUnitMu instanceof Error) return perUnitMu;
+      stepped.push({ ...entry, per_unit_mu: perUnitMu });
+    }
+    return this.normalizeRateMap(stepped);
+  }
+
+  priceTermsEqual(left, right) {
+    return (
+      stableJson(left.rate_map) === stableJson(right.rate_map) &&
+      left.per_req_mu === right.per_req_mu &&
+      left.min_session_mu === right.min_session_mu
+    );
+  }
+
+  async computeMarketPriceUpdates(marketUsageMap) {
+    const updates = [];
+    for (const usage of this.mapMarketUsageEntriesForHash(marketUsageMap)) {
+      const enclave = await this.get(`enclave/${usage.enclave_id}`);
+      if (!enclave || enclave.status !== 'active') return new Error('Market usage enclave is not active.');
+      const scheduleKey = `price/${usage.enclave_id}`;
+      const storedSchedule = await this.priceSchedule(scheduleKey, enclave);
+      const schedule = this.priceScheduleAt(storedSchedule, this.value.at);
+      const current = this.priceActiveEntry(schedule, this.value.at);
+      if (!current) return new Error('Market usage enclave has no admin price seed.');
+      const seed = this.priceSeedEntry(current);
+      if (!seed || seed.set_by_role !== 'admin') {
+        return new Error('Market price requires an admin seed.');
+      }
+
+      const activeSupply = this.enclaveActiveProviders(enclave).length;
+      const previousMarket = current.market && typeof current.market === 'object'
+        ? current.market
+        : {};
+      const utilizationBps = this.marketUtilizationBps(usage.demand_mu, activeSupply);
+      if (utilizationBps instanceof Error) return utilizationBps;
+      const frozen = activeSupply < MARKET_PRICE_COLD_START_MIN_PROVIDERS;
+      const emaUtilizationBps = frozen
+        ? MARKET_PRICE_TARGET_UTILIZATION_BPS
+        : this.marketEmaUtilizationBps(previousMarket.ema_utilization_bps, utilizationBps);
+      const multiplierBps = frozen
+        ? 10_000
+        : this.marketCurveMultiplierBps(emaUtilizationBps);
+      const desiredRateMap = this.scaleRateMap(seed.rate_map, multiplierBps);
+      if (desiredRateMap instanceof Error) return desiredRateMap;
+      const desiredPerReqMu = this.scalePriceTerm(seed.per_req_mu, multiplierBps);
+      if (desiredPerReqMu instanceof Error) return desiredPerReqMu;
+      const desiredMinSessionMu = this.scalePriceTerm(seed.min_session_mu, multiplierBps);
+      if (desiredMinSessionMu instanceof Error) return desiredMinSessionMu;
+
+      const nextTerms = frozen
+        ? {
+            rate_map: cloneValue(seed.rate_map),
+            per_req_mu: seed.per_req_mu,
+            min_session_mu: seed.min_session_mu,
+          }
+        : {
+            rate_map: this.stepRateMap(current.rate_map, desiredRateMap),
+            per_req_mu: this.stepPriceTerm(current.per_req_mu, desiredPerReqMu),
+            min_session_mu: this.stepPriceTerm(current.min_session_mu, desiredMinSessionMu),
+          };
+      if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
+      if (nextTerms.per_req_mu instanceof Error) return nextTerms.per_req_mu;
+      if (nextTerms.min_session_mu instanceof Error) return nextTerms.min_session_mu;
+      if (frozen && this.priceTermsEqual(current, nextTerms)) continue;
+
+      const latest = this.priceLatestEntry(schedule);
+      const record = {
+        enclave_id: current.enclave_id,
+        model_id: current.model_id,
+        denom: PRICE_DENOMINATION,
+        ver: latest ? latest.ver + 1 : 1,
+        rate_map: nextTerms.rate_map,
+        per_req_mu: nextTerms.per_req_mu,
+        min_session_mu: nextTerms.min_session_mu,
+        effective_at: this.value.at,
+        effective_from: this.tx,
+        updated_at: this.tx,
+        set_by: seed.set_by,
+        set_by_role: 'admin',
+        price_source: frozen ? 'admin_seed_cold_start' : 'market_float',
+        seed,
+        market: {
+          schema_version: 1,
+          source: 'settled_epoch_usage',
+          epoch: this.value.epoch,
+          active_supply: activeSupply,
+          active_demand_mu: usage.demand_mu,
+          session_count: usage.session_count,
+          utilization_bps: utilizationBps,
+          ema_utilization_bps: emaUtilizationBps,
+          multiplier_bps: multiplierBps,
+          desired_rate_map: desiredRateMap,
+          desired_per_req_mu: desiredPerReqMu,
+          desired_min_session_mu: desiredMinSessionMu,
+          frozen,
+          frozen_reason: frozen ? 'cold_start_min_providers' : null,
+          constants: this.marketPriceConstants(),
+          previous_price_ver: current.ver,
+          seed_price_ver: seed.ver,
+        },
+      };
+      const updatedSchedule = {
+        ...schedule,
+        current: record,
+      };
+      updates.push({
+        enclave_id: usage.enclave_id,
+        ver: record.ver,
+        rate_map: record.rate_map,
+        utilization_bps: utilizationBps,
+        ema_utilization_bps: emaUtilizationBps,
+        active_supply: activeSupply,
+        active_demand_mu: usage.demand_mu,
+        frozen,
+        schedule_key: scheduleKey,
+        schedule: updatedSchedule,
+        record_key: `price/${usage.enclave_id}/v/${record.ver}`,
+        record,
+      });
+    }
+    return updates;
   }
 
   modelClassFor(value) {
@@ -5091,6 +5398,7 @@ class MayhemContract extends Contract {
       ['debits', value.debits],
       ['earnings', value.earnings],
     ];
+    if (value.market_usage !== undefined) arrays.push(['market_usage', value.market_usage]);
     for (const [name, entries] of arrays) {
       if (!Array.isArray(entries)) return new Error(`Epoch apply ${name} must be an array.`);
       if (entries.length > LEDGER_BATCH_SCHEMA_MAX) {
@@ -5105,7 +5413,7 @@ class MayhemContract extends Contract {
       return new Error('epochApply feature value must be an object.');
     }
     const required = ['op', 'epoch', 'at', 'debits', 'earnings'];
-    const allowed = new Set([...required, 'roots', 'totals']);
+    const allowed = new Set([...required, 'market_usage', 'roots', 'totals']);
     const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
     if (unknown.length > 0) {
       return new Error(`epochApply feature does not accept fields: ${unknown.join(', ')}.`);
@@ -6362,6 +6670,44 @@ class MayhemContract extends Contract {
     return out;
   }
 
+  aggregateMarketUsageEntries(entries) {
+    const out = new Map();
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return new Error('Invalid market usage entry.');
+      }
+      const shapeError = this.validateExactObjectKeys(
+        entry,
+        ['enclave_id', 'demand_mu', 'session_count'],
+        'market usage entry'
+      );
+      if (shapeError) return shapeError;
+      const enclaveId = entry.enclave_id;
+      if (!this.isSafeKeyPart(enclaveId)) return new Error('Invalid market usage enclave_id.');
+      if (!Number.isSafeInteger(entry.demand_mu) || entry.demand_mu <= 0) {
+        return new Error('Invalid market usage demand.');
+      }
+      if (!Number.isSafeInteger(entry.session_count) || entry.session_count <= 0) {
+        return new Error('Invalid market usage session_count.');
+      }
+      const current = out.get(enclaveId) ?? {
+        enclave_id: enclaveId,
+        demand_mu: 0,
+        session_count: 0,
+      };
+      const demandMu = this.safeAddMu(current.demand_mu, entry.demand_mu);
+      if (demandMu instanceof Error) return demandMu;
+      const sessionCount = this.safeAddMu(current.session_count, entry.session_count);
+      if (sessionCount instanceof Error) return sessionCount;
+      out.set(enclaveId, {
+        enclave_id: enclaveId,
+        demand_mu: demandMu,
+        session_count: sessionCount,
+      });
+    }
+    return out;
+  }
+
   sumMu(entries) {
     let sum = 0;
     for (const [, mu] of entries) {
@@ -6376,6 +6722,16 @@ class MayhemContract extends Contract {
     let sum = 0;
     for (const entry of entries.values()) {
       const next = this.safeAddMu(sum, entry[amountKey]);
+      if (next instanceof Error) return next;
+      sum = next;
+    }
+    return sum;
+  }
+
+  sumMarketDemandMu(entries) {
+    let sum = 0;
+    for (const entry of entries.values()) {
+      const next = this.safeAddMu(sum, entry.demand_mu);
       if (next instanceof Error) return next;
       sum = next;
     }
@@ -6465,6 +6821,16 @@ class MayhemContract extends Contract {
       [idKey]: entry[idKey],
       [amountKey]: entry[amountKey],
     }));
+  }
+
+  mapMarketUsageEntriesForHash(map) {
+    return Array.from(map.values())
+      .sort((left, right) => compareCodepoint(left.enclave_id, right.enclave_id))
+      .map((entry) => ({
+        enclave_id: entry.enclave_id,
+        demand_mu: entry.demand_mu,
+        session_count: entry.session_count,
+      }));
   }
 
   async balanceRecord(user, rail) {
