@@ -29,7 +29,7 @@ use crate::{
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
-    ProviderHeartbeat, ProviderKey, ReputationEventKind,
+    ProviderHeartbeat, ProviderKey, ProviderProbation, ReputationEventKind,
 };
 use axum::{
     body::Body,
@@ -76,6 +76,7 @@ const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
 const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
 const X_MAYHEM_STALL_TIMEOUT_MS_HEADER: &str = "x-mayhem-stall-timeout-ms";
 const X_MAYHEM_MIN_TOK_S_HEADER: &str = "x-mayhem-min-tok-s";
+const ROUTE_REPUTATION_PRIORITY_BPS_DELTA: u32 = 500;
 const DEFAULT_CANARY_SEED: i64 = 7;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
@@ -210,8 +211,16 @@ pub struct GatewayRouteCandidate {
     pub binary_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kyb: Option<ProviderKybInfo>,
+    #[serde(default = "default_reputation_bps")]
+    pub reputation_bps: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probation: Option<ProviderProbation>,
     #[serde(default)]
     pub caps: Value,
+}
+
+fn default_reputation_bps() -> u32 {
+    10_000
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2721,11 +2730,11 @@ fn contract_snapshot_for_route(
         model_id: model.id.clone(),
         room_id: candidate.room_id.clone(),
         consent_ver: rules_ver,
-        reputation: 1.0,
+        reputation: f64::from(candidate.reputation_bps.min(10_000)) / 10_000.0,
         price_ver: candidate.price_ver,
         rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
         ref_rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
-        probation: None,
+        probation: candidate.probation.clone(),
         caps: heartbeat_caps_for_route(model, candidate),
         attestation_head: Some(candidate.binary_hash.clone()),
     }
@@ -8126,7 +8135,7 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
             ordered.push(candidate);
         }
     }
-    state.apply_chat_affinity(model, request, ordered)
+    prioritize_material_reputation_gap(state.apply_chat_affinity(model, request, ordered))
 }
 
 fn ordered_route_candidates_for_embedding_with_seed<'a>(
@@ -8213,7 +8222,7 @@ fn ordered_route_candidates_for_embedding_with_seed<'a>(
             ordered.push(candidate);
         }
     }
-    ordered
+    prioritize_material_reputation_gap(ordered)
 }
 
 fn ordered_route_candidates_for_image_generation_with_seed<'a>(
@@ -8300,7 +8309,7 @@ fn ordered_route_candidates_for_image_generation_with_seed<'a>(
             ordered.push(candidate);
         }
     }
-    ordered
+    prioritize_material_reputation_gap(ordered)
 }
 
 fn ordered_route_candidates_for_requirements_with_seed<'a>(
@@ -8384,7 +8393,7 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
             ordered.push(candidate);
         }
     }
-    ordered
+    prioritize_material_reputation_gap(ordered)
 }
 
 impl GatewayState {
@@ -8463,6 +8472,30 @@ impl GatewayState {
             .expect("chat affinity map poisoned")
             .insert(key, route_key(route));
     }
+}
+
+fn prioritize_material_reputation_gap<'a>(
+    mut ordered: Vec<&'a GatewayRouteCandidate>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    if ordered.len() < 2 {
+        return ordered;
+    }
+    let Some((best_index, best_reputation)) = ordered
+        .iter()
+        .enumerate()
+        .map(|(idx, candidate)| (idx, candidate.reputation_bps.min(10_000)))
+        .max_by_key(|(_, reputation_bps)| *reputation_bps)
+    else {
+        return ordered;
+    };
+    let first_reputation = ordered[0].reputation_bps.min(10_000);
+    if best_index > 0
+        && best_reputation.saturating_sub(first_reputation) >= ROUTE_REPUTATION_PRIORITY_BPS_DELTA
+    {
+        let best = ordered.remove(best_index);
+        ordered.insert(0, best);
+    }
+    ordered
 }
 
 fn route_key(candidate: &GatewayRouteCandidate) -> ProviderKey {
@@ -12922,6 +12955,8 @@ mod tests {
             manifest_hash: format!("{:02x}", idx.wrapping_add(190)).repeat(32),
             binary_hash: format!("{:02x}", idx.wrapping_add(200)).repeat(32),
             kyb: None,
+            reputation_bps: 10_000,
+            probation: None,
             caps: json!({}),
         }
     }
@@ -13145,6 +13180,64 @@ mod tests {
             counts[&model.mayhem.route_candidates[0].provider] < 256,
             "catalog array first provider must not win every live selection"
         );
+    }
+
+    #[test]
+    fn route_selection_uses_anchored_reputation_weight() {
+        let neutral_model = test_routed_model(2);
+        let neutral_state = GatewayState::from_models(vec![neutral_model.clone()]);
+        let request = test_chat_request(&neutral_model.id);
+        let penalized_provider = neutral_model.mayhem.route_candidates[0].provider.clone();
+        let neutral_wins = (0..512)
+            .filter(|seed| {
+                ordered_route_candidates_for_request_with_seed(
+                    &neutral_state,
+                    &neutral_model,
+                    &request,
+                    None,
+                    *seed,
+                )
+                .into_iter()
+                .next()
+                .map(|candidate| candidate.provider == penalized_provider)
+                .unwrap_or(false)
+            })
+            .count();
+
+        let mut anchored_model = neutral_model.clone();
+        anchored_model.mayhem.route_candidates[0].reputation_bps = 3_100;
+        let anchored_state = GatewayState::from_models(vec![anchored_model.clone()]);
+        let anchored_wins = (0..512)
+            .filter(|seed| {
+                ordered_route_candidates_for_request_with_seed(
+                    &anchored_state,
+                    &anchored_model,
+                    &request,
+                    None,
+                    *seed,
+                )
+                .into_iter()
+                .next()
+                .map(|candidate| candidate.provider == penalized_provider)
+                .unwrap_or(false)
+            })
+            .count();
+
+        assert!(
+            neutral_wins > 150,
+            "neutral reputation should select the provider at a visible baseline"
+        );
+        assert_eq!(
+            anchored_wins, 0,
+            "anchored low reputation should not outrank a materially healthier route"
+        );
+
+        let snapshot = contract_snapshot_for_route(
+            &anchored_model,
+            &anchored_model.mayhem.route_candidates[0],
+            3,
+        );
+        assert!((snapshot.reputation - 0.31).abs() < f64::EPSILON);
     }
 
     #[test]

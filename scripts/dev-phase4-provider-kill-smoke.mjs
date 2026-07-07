@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -73,6 +73,9 @@ Environment:
   MAYHEM_P43_MODEL           Catalog model id (default: ${DEFAULT_MODEL})
   MAYHEM_P43_PROVIDER_MODE   real or shim (default: real)
   MAYHEM_P43_AGENT_LOOP      Run E13 multi-model/stickiness smoke instead of provider-kill smoke (default: 0)
+  MAYHEM_P43_REPUTATION_D3   Run D3 anchored-reputation routing distribution smoke (default: 0)
+  MAYHEM_P43_REPUTATION_REQUESTS Number of D3 routing requests (default: 100)
+  MAYHEM_P43_REPUTATION_REQUEST_DELAY_MS Delay between successful D3 requests (default: 0)
   MAYHEM_P43_SECONDARY_MODEL Secondary smoke-only model id for E13 (default: <model>-e13-helper)
   MAYHEM_P43_ARTIFACT        Real provider artifact path (default: ${DEFAULT_ARTIFACT})
   MAYHEM_P43_DELTA_DELAY_MS  Delay after early content deltas (default: 2500)
@@ -125,6 +128,16 @@ function envPositiveInt(name, fallback) {
   const value = Number.parseInt(raw, 10);
   if (!Number.isSafeInteger(value) || value <= 0) {
     fail(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function envNonNegativeInt(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    fail(`${name} must be a non-negative integer`);
   }
   return value;
 }
@@ -245,6 +258,61 @@ async function run(command, args, options = {}) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+let walletModules = null;
+
+async function loadWalletModules() {
+  if (walletModules) return walletModules;
+  const walletModule = await import(pathToFileURL(path.join(ROOT, 'intercom/node_modules/trac-wallet/index.js')).href);
+  const b4aModule = await import(pathToFileURL(path.join(ROOT, 'intercom/node_modules/b4a/index.js')).href);
+  walletModules = {
+    Wallet: walletModule.default,
+    b4a: b4aModule.default,
+  };
+  return walletModules;
+}
+
+async function submitContractTx({ rpcUrl, keypairPath, type, value }) {
+  const { Wallet, b4a } = await loadWalletModules();
+  const wallet = new Wallet();
+  await wallet.initKeyPair(keypairPath);
+  const address = b4a.toString(wallet.publicKey, 'hex');
+  const preparedCommand = { type, value };
+  const nonceResponse = await fetch(`${rpcUrl}/contract/nonce`).then((response) => response.json());
+  const nonce = nonceResponse.nonce;
+  const prepared = await fetch(`${rpcUrl}/contract/tx/prepare`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prepared_command: preparedCommand, address, nonce }),
+  }).then((response) => response.json());
+  if (!prepared?.tx) {
+    fail(`contract tx prepare failed: ${JSON.stringify(prepared)}`);
+  }
+  const signature = b4a.toString(wallet.sign(b4a.from(prepared.tx, 'hex')), 'hex');
+  const submitted = await fetch(`${rpcUrl}/contract/tx`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      tx: prepared.tx,
+      prepared_command: preparedCommand,
+      address,
+      signature,
+      nonce,
+      sim: false,
+    }),
+  }).then((response) => response.json());
+  const result = submitted.result || submitted;
+  const accepted = result?.ok === true || (result?.local === true && result?.txo);
+  if (!accepted) {
+    fail(`contract tx rejected: ${JSON.stringify(submitted)}`);
+  }
+  return {
+    tx: prepared.tx,
+    command_hash: prepared.command_hash || null,
+    address,
+    result,
+  };
 }
 
 function spawnLogged(command, args, logFile, options = {}) {
@@ -1386,9 +1454,13 @@ async function main() {
   const mayhemEnclaveBin = path.join(ROOT, 'target/debug/mayhem-enclave');
   const modelId = process.env.MAYHEM_P43_MODEL || DEFAULT_MODEL;
   const agentLoopMode = envFlag('MAYHEM_P43_AGENT_LOOP');
+  const reputationD3Mode = envFlag('MAYHEM_P43_REPUTATION_D3');
   const secondaryModelId = process.env.MAYHEM_P43_SECONDARY_MODEL || `${modelId}-e13-helper`;
   if (agentLoopMode && secondaryModelId === modelId) {
     fail('MAYHEM_P43_SECONDARY_MODEL must differ from MAYHEM_P43_MODEL');
+  }
+  if (agentLoopMode && reputationD3Mode) {
+    fail('MAYHEM_P43_AGENT_LOOP and MAYHEM_P43_REPUTATION_D3 are separate smoke modes');
   }
   const providerMode = (process.env.MAYHEM_P43_PROVIDER_MODE || 'real').trim();
   if (!['real', 'shim'].includes(providerMode)) fail('MAYHEM_P43_PROVIDER_MODE must be real or shim');
@@ -1870,6 +1942,53 @@ async function main() {
   const allProviders = secondaryProvider ? [...providers, secondaryProvider] : providers;
   const providerPubkeys = allProviders.map((provider) => provider.pubkey);
   const primaryProviderPubkeys = providers.map((provider) => provider.pubkey);
+  let reputationD3 = null;
+  if (reputationD3Mode) {
+    const penalized = providers[0];
+    log(`anchoring low reputation for provider ${penalized.label} before gateway start`);
+    const evidenceHash = (await b3(Buffer.from(`d3-dispute-lost:${tag}:${penalized.pubkey}`, 'utf8'))).toString('hex');
+    const event = await submitContractTx({
+      rpcUrl: adminRpcUrl,
+      keypairPath: path.join(adminHome, 'stores/admin/db/keypair.json'),
+      type: 'recordReputationEvent',
+      value: {
+        op: 'record_rep_event',
+        provider: penalized.pubkey,
+        event_id: `d3-dispute-lost-${tag}`,
+        kind: 'dispute_lost',
+        epoch: 1,
+        at: 3600,
+        evidence_hash: evidenceHash,
+      },
+    });
+    adminReports['admin-record-reputation-event'] = {
+      submitted: true,
+      tx_type: 'recordReputationEvent',
+      command: {
+        op: 'record_rep_event',
+        provider: penalized.pubkey,
+        event_id: `d3-dispute-lost-${tag}`,
+        kind: 'dispute_lost',
+        epoch: 1,
+        at: 3600,
+        evidence_hash: evidenceHash,
+      },
+      tx: event,
+    };
+    adminRun('admin-reputation-anchor', [
+      'reputation-anchor',
+      '--provider', penalized.pubkey,
+      '--epoch', '1',
+      '--at', '3600',
+    ]);
+    reputationD3 = {
+      penalized_provider: penalized.pubkey,
+      healthy_provider: providers[1].pubkey,
+      evidence_hash: evidenceHash,
+      event_tx: event.tx,
+      anchor: adminReports['admin-reputation-anchor'],
+    };
+  }
 
   const remoteClientBridge = await startRemoteClientBridge({
     label: 'client',
@@ -1952,7 +2071,210 @@ async function main() {
     ? await waitForGatewayRoutes(gatewayUrl, secondaryModelId, [secondaryProvider.pubkey], 120_000)
     : null;
 
-  const chatMaxTokens = envPositiveInt('MAYHEM_P43_CHAT_MAX_TOKENS', agentLoopMode ? 32 : 128);
+  const chatMaxTokens = envPositiveInt(
+    'MAYHEM_P43_CHAT_MAX_TOKENS',
+    reputationD3Mode ? 4 : (agentLoopMode ? 32 : 128)
+  );
+  if (reputationD3Mode) {
+    log('running D3 anchored-reputation routing distribution smoke');
+    const requestCount = envPositiveInt('MAYHEM_P43_REPUTATION_REQUESTS', 100);
+    const maxAttempts = envPositiveInt('MAYHEM_P43_REPUTATION_ATTEMPTS', 3);
+    const cooloffRetryMs = envPositiveInt('MAYHEM_P43_REPUTATION_COOLOFF_RETRY_MS', 31_000);
+    const requestDelayMs = envNonNegativeInt('MAYHEM_P43_REPUTATION_REQUEST_DELAY_MS', 0);
+    const penalizedRoute = routeInfo.routes.find((route) => route.provider === reputationD3.penalized_provider);
+    const healthyRoute = routeInfo.routes.find((route) => route.provider === reputationD3.healthy_provider);
+    if (!penalizedRoute || !healthyRoute) {
+      fail(`D3 routes missing anchored providers: ${JSON.stringify(routeInfo.routes)}`);
+    }
+    if (Number(penalizedRoute.reputation_bps) !== 3100) {
+      fail(`D3 penalized route did not expose reputation_bps=3100: ${JSON.stringify(penalizedRoute)}`);
+    }
+    if (Number(healthyRoute.reputation_bps) !== 10000) {
+      fail(`D3 healthy route did not expose neutral reputation_bps=10000: ${JSON.stringify(healthyRoute)}`);
+    }
+    writeJson(path.join(runDir, 'd3-route-info.json'), {
+      penalized_provider: reputationD3.penalized_provider,
+      healthy_provider: reputationD3.healthy_provider,
+      routes: routeInfo.routes,
+    });
+
+    const turns = [];
+    const transientFailures = [];
+    const providerCounts = Object.fromEntries(primaryProviderPubkeys.map((provider) => [provider, 0]));
+    for (let i = 0; i < requestCount; i += 1) {
+      let completed = false;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const before = await fetchStoredReceipts(gatewayUrl);
+        let stream = null;
+        try {
+          const stemBase = `d3-route-${String(i + 1).padStart(3, '0')}`;
+          stream = await runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
+            timeoutMs: providerMode === 'real' ? 240_000 : 90_000,
+            maxTokens: chatMaxTokens,
+            prompt: `D3 routing probe ${i + 1}. Answer with one concise sentence using the word mayhem.`,
+            fileStem: attempt === 1 ? stemBase : `${stemBase}-try-${attempt}`,
+          });
+        } catch (err) {
+          const afterFailure = await fetchStoredReceipts(gatewayUrl).catch(() => []);
+          const newReceipts = afterFailure.length > before.length
+            ? afterFailure.slice(before.length).map((receipt) => receipt?.body?.session_id || null)
+            : [];
+          transientFailures.push({
+            idx: i + 1,
+            attempt,
+            error: err?.message || String(err),
+            new_receipts: newReceipts,
+          });
+          if (newReceipts.length > 0) {
+            fail(`D3 attempt ${i + 1}/${attempt} failed after receipt creation: ${err?.message || err}`);
+          }
+          if (attempt >= maxAttempts) {
+            fail(`D3 request ${i + 1} failed after ${maxAttempts} attempt(s): ${err?.message || err}`);
+          }
+          const message = err?.message || String(err);
+          await sleep(message.includes('cooling off') ? cooloffRetryMs : 1_000 * attempt);
+          continue;
+        }
+
+        const after = await fetchStoredReceipts(gatewayUrl);
+        const { body } = newFinalReceiptForModel(before.length, after, modelId);
+        if (!primaryProviderPubkeys.includes(body.provider)) {
+          fail(`D3 response provider ${body.provider} is not one of the primary providers`);
+        }
+        providerCounts[body.provider] = (providerCounts[body.provider] || 0) + 1;
+        turns.push({
+          idx: i + 1,
+          attempt,
+          provider: body.provider,
+          session_id: body.session_id,
+          mu_owed_cum: body.mu_owed_cum,
+          usage: body.usage,
+          first_content_ms: stream.timing_ms.first_content,
+          total_ms: stream.timing_ms.total,
+        });
+        completed = true;
+        break;
+      }
+      if (!completed) fail(`D3 request ${i + 1} did not complete`);
+      if (requestDelayMs > 0 && i + 1 < requestCount) {
+        await sleep(requestDelayMs);
+      }
+    }
+
+    const penalizedCount = providerCounts[reputationD3.penalized_provider] || 0;
+    const healthyCount = providerCounts[reputationD3.healthy_provider] || 0;
+    const assertions = {
+      route_exposes_penalized_reputation: Number(penalizedRoute.reputation_bps) === 3100,
+      route_exposes_healthy_reputation: Number(healthyRoute.reputation_bps || 10000) === 10000,
+      request_count_met: turns.length >= requestCount,
+      healthy_provider_dominates:
+        healthyCount >= Math.ceil(requestCount * 0.7) && healthyCount > penalizedCount * 2,
+      gateway_process_stayed_running: gateway.exitCode === null,
+    };
+    const assertionsPassed = Object.values(assertions).every(Boolean);
+
+    const finalReceipts = await fetchStoredReceipts(gatewayUrl);
+    const report = {
+      ok: true,
+      mode: 'd3-reputation-routing',
+      tag,
+      run_dir: path.relative(ROOT, runDir),
+      local: {
+        gateway_url: gatewayUrl,
+        admin_rpc_url: adminRpcUrl,
+        user_sc_bridge_label: userScBridge.label,
+        user_sc_bridge_url: userScBridge.url,
+        user_sc_bridge_remote_url: userScBridge.remote?.scBridgeUrl || null,
+        user_sc_bridge_tunnel_log: userScBridge.tunnel_log || null,
+        subnet_channel: subnetChannel,
+        peer_dht_bootstrap: peerDhtBootstrap,
+      },
+      remote: {
+        host: remote.host,
+        root: remoteRoot,
+        run_dir: remoteRun,
+        client_bridge: userScBridge.remote ? {
+          label: userScBridge.remote.label,
+          pubkey: userScBridge.remote.pubkey,
+          peer_pid: userScBridge.remote.peerPid,
+          peer_log: userScBridge.remote.peerLog,
+        } : null,
+      },
+      admin: {
+        pubkey: adminPubkey[1],
+        rules_hash: rulesHash,
+        room_nonce: roomNonce,
+        room_id: roomId,
+        reports: Object.fromEntries(Object.entries(adminReports).map(([key, value]) => [key, {
+          submitted: value.submitted,
+          tx_type: value.tx_type,
+          command: value.command,
+        }])),
+      },
+      enclave: {
+        enclave_id: enclaveId,
+        model_id: modelId,
+        backend: 'llama.cpp',
+        artifact_name: artifactName,
+        artifact_root: artifactMerkle.root,
+        artifact_chunks: artifactMerkle.chunks,
+        artifact_bytes: artifactMerkle.total_bytes,
+        artifact_sha256: artifactSha256,
+        manifest_hash: manifestHash,
+        binary_hash: binaryHash,
+        binary_sha256: binarySha256,
+      },
+      providers: providers.map((provider) => ({
+        label: provider.label,
+        pubkey: provider.pubkey,
+        peer_pid: provider.peerPid,
+        provider_pid: provider.providerPid,
+        provider_log: provider.providerLog,
+        self_test: provider.startup.self_test,
+        rooms: provider.startup.rooms,
+        features: provider.startup.features,
+      })),
+      reputation: {
+        ...reputationD3,
+        route_candidates: {
+          penalized: penalizedRoute,
+          healthy: healthyRoute,
+        },
+      },
+      distribution: {
+        request_count: requestCount,
+        max_attempts: maxAttempts,
+        cooloff_retry_ms: cooloffRetryMs,
+        request_delay_ms: requestDelayMs,
+        transient_failures: transientFailures,
+        provider_counts: providerCounts,
+        penalized_count: penalizedCount,
+        healthy_count: healthyCount,
+        turns,
+      },
+      receipts: {
+        stored_count: finalReceipts.length,
+        final_count: finalReceipts.filter(receiptIsFinal).length,
+      },
+      assertions_passed: assertionsPassed,
+      assertions,
+    };
+    const reportPath = path.join(runDir, 'report.json');
+    writeJson(reportPath, report);
+    for (const [name, ok] of Object.entries(assertions)) {
+      if (!ok) fail(`D3 assertion failed: ${name}; report=${path.relative(ROOT, reportPath)}`);
+    }
+    console.log(JSON.stringify(report, null, 2));
+    await cleanup({
+      remote,
+      passFile,
+      remotePids: cleanupState.remotePids,
+      localChildren: cleanupState.localChildren,
+      devnetLog,
+      remoteRun,
+    });
+    return;
+  }
   if (agentLoopMode) {
     log('running E13 multi-model conversation affinity smoke');
     const conversationId = process.env.MAYHEM_P43_CONVERSATION_ID || `e13-agent-loop-${tag}`;

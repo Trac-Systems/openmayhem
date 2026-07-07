@@ -45,8 +45,9 @@ use mayhem_gateway::{
         ProviderKybInfo, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
     },
     rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
-    ProbationCaps, ProbationPolicy, RateMapEntry, ReputationEvent, ReputationEventKind,
-    DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
+    ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry, ReputationEvent,
+    ReputationEventKind, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT,
+    OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, GpuInfo, GpuVendor, HardwareReport,
@@ -19119,6 +19120,15 @@ struct LedgerProvider {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerReputationRecord {
+    provider: String,
+    #[serde(default)]
+    r_bps: u32,
+    #[serde(default)]
+    probation: Option<ProviderProbation>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LedgerProviderKyb {
     provider: String,
     status: String,
@@ -19201,6 +19211,7 @@ struct ContractCatalog {
     roomserve: Vec<LedgerRoomServe>,
     serves: Vec<LedgerServe>,
     providers: Vec<LedgerProvider>,
+    reputations: Vec<LedgerReputationRecord>,
     kyb: Vec<LedgerProviderKyb>,
     prices: Vec<LedgerPriceSchedule>,
     rules: Option<RulesRef>,
@@ -21459,6 +21470,7 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         roomserve: read_prefix_values(rpc, "roomserve/").await?,
         serves: read_prefix_values(rpc, "serve/").await?,
         providers: read_prefix_values_filtered(rpc, "prov/", |tail| !tail.contains('/')).await?,
+        reputations: read_prefix_values_filtered(rpc, "rep/", |tail| !tail.contains('/')).await?,
         kyb: read_prefix_values_filtered(rpc, "kyb/", |tail| !tail.contains('/')).await?,
         prices,
         rules: read_state_value(rpc, "rules/current")
@@ -21540,6 +21552,11 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         .iter()
         .filter(|provider| provider.status == "active")
         .map(|provider| (provider.provider.as_str(), provider))
+        .collect::<BTreeMap<_, _>>();
+    let reputation_by_provider = contract
+        .reputations
+        .iter()
+        .map(|record| (record.provider.as_str(), record))
         .collect::<BTreeMap<_, _>>();
     let active_kyb_by_provider = contract
         .kyb
@@ -21661,6 +21678,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 .insert(serving.provider.clone(), kyb.clone());
         }
         let effective_att_tier = kyb.as_ref().map(|_| 4).unwrap_or(enclave.att_tier);
+        let reputation = reputation_by_provider.get(serving.provider.as_str());
         route_candidates_by_model
             .entry(enclave.model_id.clone())
             .or_default()
@@ -21685,6 +21703,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     manifest_hash: enclave.manifest_hash.clone(),
                     binary_hash: enclave.binary_hash.clone(),
                     kyb,
+                    reputation_bps: reputation
+                        .map(|record| record.r_bps.min(10_000))
+                        .unwrap_or(10_000),
+                    probation: reputation.and_then(|record| record.probation.clone()),
                     caps: enclave.caps.clone(),
                 },
             );
@@ -30514,6 +30536,8 @@ mod tests {
         assert_eq!(models[0].mayhem.route_candidates.len(), 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
         assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
+        assert_eq!(models[0].mayhem.route_candidates[0].reputation_bps, 10_000);
+        assert_eq!(models[0].mayhem.route_candidates[0].probation, None);
         assert_eq!(
             models[0].mayhem.route_candidates[0].provider,
             "55".repeat(32)
@@ -30808,6 +30832,34 @@ mod tests {
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
         assert!(models[0].mayhem.kyb_identities.is_empty());
         assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
+    }
+
+    #[test]
+    fn gateway_models_carry_anchored_provider_reputation() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        contract.reputations.push(LedgerReputationRecord {
+            provider: "55".repeat(32),
+            r_bps: 3_100,
+            probation: Some(ProviderProbation {
+                active: true,
+                since_seconds: 0,
+                successful_sessions: 0,
+                required_successful_sessions: 50,
+                required_seconds: 7 * 24 * 60 * 60,
+                caps: ProbationCaps {
+                    max_concurrent_sessions_per_user: 2,
+                    price_max_bps: 10_000,
+                    weight_bps: 5_000,
+                },
+            }),
+        });
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+        let route = &models[0].mayhem.route_candidates[0];
+        assert_eq!(route.reputation_bps, 3_100);
+        assert_eq!(route.probation.as_ref().unwrap().successful_sessions, 0);
+        assert!(route.probation.as_ref().unwrap().active);
     }
 
     #[test]
@@ -36119,6 +36171,7 @@ mod tests {
                 status: "active".to_owned(),
                 accepted_rails: vec!["fiat".to_owned()],
             }],
+            reputations: Vec::new(),
             kyb: Vec::new(),
             prices: vec![LedgerPriceSchedule {
                 enclave_id: "11".repeat(32),

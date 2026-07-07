@@ -2313,6 +2313,8 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         manifest_hash: identity.manifest_hash,
         binary_hash: identity.binary_hash,
         kyb: None,
+        reputation_bps: 10_000,
+        probation: None,
         caps: serde_json::json!({}),
     }
 }

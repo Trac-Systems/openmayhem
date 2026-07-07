@@ -12,6 +12,7 @@ pub const DEFAULT_SATURATION_CUTOFF: f64 = 0.85;
 pub const DEFAULT_REPUTATION_ALPHA: f64 = 1.5;
 pub const DEFAULT_SATURATION_BETA: f64 = 1.0;
 pub const DEFAULT_PRICE_GAMMA: f64 = 0.7;
+const P2C_REPUTATION_DECISION_DELTA: f64 = 0.05;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_MIN_SAMPLES: u64 = 3;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_EWMA_THRESHOLD: f64 = 0.8;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES: u32 = 3;
@@ -707,6 +708,16 @@ fn weighted_sample_index(
 }
 
 fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize) -> usize {
+    let left_reputation = candidates[left].entry.contract.reputation.clamp(0.0, 1.0)
+        * probation_weight_multiplier(&candidates[left].entry);
+    let right_reputation = candidates[right].entry.contract.reputation.clamp(0.0, 1.0)
+        * probation_weight_multiplier(&candidates[right].entry);
+    if (left_reputation - right_reputation).abs() >= P2C_REPUTATION_DECISION_DELTA {
+        if left_reputation > right_reputation {
+            return left;
+        }
+        return right;
+    }
     let left_sat = candidates[left]
         .entry
         .heartbeat
@@ -1240,6 +1251,26 @@ mod tests {
         let mut rng = ScriptedRng::new([0.0, 0.0]);
         let selected =
             select_weighted_p2c(&entries, &request, &weights, &mut rng).expect("provider selected");
+        assert_eq!(selected.selected.entry.key, entries[1].key);
+    }
+
+    #[test]
+    fn weighted_p2c_prefers_material_anchored_reputation_gap() {
+        let now = 1_000_000;
+        let mut request = eligible_request(now + 1);
+        request.min_reputation = 0.0;
+        let weights = SelectionWeights::default();
+        let mut low_reputation_fast = entry_for(1, now, 0.2, 50);
+        low_reputation_fast.contract.reputation = 0.31;
+        let mut healthy_slow = entry_for(2, now, 0.7, 500);
+        healthy_slow.contract.reputation = 1.0;
+        let entries = vec![low_reputation_fast, healthy_slow];
+        let mut rng = ScriptedRng::new([0.0, 0.0]);
+
+        let selected =
+            select_weighted_p2c(&entries, &request, &weights, &mut rng).expect("provider selected");
+
+        assert_eq!(selected.sampled.len(), 2);
         assert_eq!(selected.selected.entry.key, entries[1].key);
     }
 
