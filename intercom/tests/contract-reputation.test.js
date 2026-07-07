@@ -4,6 +4,7 @@ import MayhemContract from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
+  executeReputationAnchorFeature,
   makeIdentity,
   makeTxKey,
   makeVerifier,
@@ -248,6 +249,59 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerEntry.value.probation.successful_sessions, 50);
   assert.equal(providerEntry.value.probation.since_seconds, 0);
+});
+
+test('MayhemContract applies reputation anchors through free admin feature records', async () => {
+  const { admin, provider, outsider, storage, contract } = await setupReputationContract();
+  const event = await recordEvent(
+    contract,
+    storage,
+    admin,
+    provider,
+    {
+      op: 'record_rep_event',
+      event_id: 'dispute-lost-1',
+      kind: 'dispute_lost',
+    },
+    5
+  );
+  assert.equal(event.ok, true, event.message);
+
+  const anchor = {
+    op: 'anchor_reputation',
+    provider: provider.publicKey,
+    epoch: 1,
+    folded_at: DAY_SECONDS,
+    events_head: event.head,
+    r_bps: 3_100,
+    raw_milli: -20_000,
+    successful_sessions: 0,
+  };
+
+  const nonAdmin = await executeReputationAnchorFeature(contract, storage, anchor, outsider.publicKey);
+  assert.match(nonAdmin.message, /admin required/i);
+  assert.equal(await storage.get(`rep/${provider.publicKey}`), null);
+
+  const anchored = await executeReputationAnchorFeature(contract, storage, anchor, admin.publicKey);
+  assert.deepEqual(anchored, {
+    ok: true,
+    op: 'anchorReputation',
+    provider: provider.publicKey,
+    epoch: 1,
+    events_head: event.head,
+  });
+
+  const rep = await storage.get(`rep/${provider.publicKey}`);
+  assert.equal(rep.value.r_bps, 3_100);
+  assert.equal(rep.value.raw_milli, -20_000);
+  assert.match(rep.value.updated_at, /^rep\//);
+
+  const invalidKey = await contract.reputationAnchorFeatureKey({
+    ...anchor,
+    r_bps: 10_001,
+  });
+  assert(invalidKey instanceof Error);
+  assert.match(invalidKey.message, /r_bps/i);
 });
 
 test('MayhemContract reputation event log replays deterministically', async () => {

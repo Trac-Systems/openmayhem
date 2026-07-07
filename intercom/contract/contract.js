@@ -873,6 +873,11 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'anchor_reputation') {
+      const result = await this.applyReputationAnchorFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
   }
 
   async applyConsentFeature(key, value) {
@@ -1148,6 +1153,23 @@ class MayhemContract extends Contract {
       return await this.tnkSettlement();
     } finally {
       this.tx = previousTx;
+    }
+  }
+
+  async applyReputationAnchorFeature(key, value) {
+    const expectedKey = await this.reputationAnchorFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    const previousValue = this.value;
+    this.tx = key;
+    this.value = value;
+    try {
+      return await this.anchorReputation();
+    } finally {
+      this.tx = previousTx;
+      this.value = previousValue;
     }
   }
 
@@ -2235,6 +2257,9 @@ class MayhemContract extends Contract {
   async anchorReputation() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
+
+    const validationError = this.validateReputationAnchor(this.value);
+    if (validationError) return validationError;
 
     const providerKey = `prov/${this.value.provider}`;
     const provider = await this.get(providerKey);
@@ -4738,6 +4763,35 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  validateReputationAnchor(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Invalid reputation anchor payload.');
+    }
+    if (value.op !== 'anchor_reputation') return new Error('Invalid reputation anchor op.');
+    if (!this.isSafeKeyPart(value.provider)) return new Error('Invalid reputation provider.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 0) {
+      return new Error('Invalid reputation anchor epoch.');
+    }
+    if (!Number.isSafeInteger(value.folded_at) || value.folded_at < 0) {
+      return new Error('Invalid reputation anchor folded_at.');
+    }
+    if (!this.isHexBytes(value.events_head, 32)) return new Error('Invalid reputation events head.');
+    if (!Number.isSafeInteger(value.r_bps) || value.r_bps < 0 || value.r_bps > 10_000) {
+      return new Error('Invalid reputation r_bps.');
+    }
+    if (!Number.isSafeInteger(value.raw_milli)) return new Error('Invalid reputation raw_milli.');
+    if (!Number.isSafeInteger(value.successful_sessions) || value.successful_sessions < 0) {
+      return new Error('Invalid reputation successful_sessions.');
+    }
+    if (
+      value.provenance_violation !== undefined &&
+      typeof value.provenance_violation !== 'boolean'
+    ) {
+      return new Error('Invalid reputation provenance_violation.');
+    }
+    return null;
+  }
+
   validateProbeResult(value) {
     if (!this.isSafeKeyPart(value.probe_id)) return new Error('Invalid probe id.');
     if (!PROBE_KINDS.has(value.probe_kind)) return new Error('Unsupported probe kind.');
@@ -6671,6 +6725,19 @@ class MayhemContract extends Contract {
       'hex'
     );
     return `settle/tnk/${value.epoch}/${digest}`;
+  }
+
+  async reputationAnchorFeatureKey(value) {
+    const validationError = this.validateReputationAnchor(value);
+    if (validationError) return validationError;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-reputation-anchor-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    return `rep/${value.provider}/${value.epoch}/${digest}`;
   }
 
   async epochCommitHash(value) {

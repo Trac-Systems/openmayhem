@@ -23,6 +23,43 @@ export const UNIV2_POOL_ABI = [
 let cache = null;
 let inFlight = null;
 
+function splitRpcUrls(value) {
+  if (value === undefined || value === null || value === '') return [];
+  if (Array.isArray(value)) return value.flatMap(splitRpcUrls);
+  return String(value)
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+export function rpcUrlCandidates({ rpcUrl, rpcUrls, fallbackRpcUrls } = {}) {
+  const out = [];
+  const seen = new Set();
+  for (const url of [
+    ...splitRpcUrls(rpcUrls),
+    ...splitRpcUrls(rpcUrl),
+    ...splitRpcUrls(fallbackRpcUrls),
+  ]) {
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+function rpcFailureLabel(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname;
+  } catch (_error) {
+    return 'configured-rpc';
+  }
+}
+
+function rpcErrorMessage(error) {
+  return String(error?.message || error || 'unknown error').replace(/https?:\/\/[^\s"'<>]+/g, 'https://<redacted>');
+}
+
 function shellQuote(value) {
   const raw = String(value ?? '');
   if (raw.length === 0) return "''";
@@ -250,6 +287,8 @@ function cacheRate(rate, nowMs) {
 
 export async function resolveTapUsdRate({
   rpcUrl,
+  rpcUrls,
+  fallbackRpcUrls,
   chainId,
   poolAddress = DEFAULT_TAP_USDT_POOL,
   tapAddress,
@@ -277,8 +316,9 @@ export async function resolveTapUsdRate({
       ? 0
       : parseNonNegativeInt(chainId, '--chain-id');
     const failures = [];
+    const candidates = rpcUrlCandidates({ rpcUrl, rpcUrls, fallbackRpcUrls });
 
-    if (!rpcUrl || normalizedChainId !== DEFAULT_MAINNET_CHAIN_ID) {
+    if (candidates.length === 0 || normalizedChainId !== DEFAULT_MAINNET_CHAIN_ID) {
       if (fallback === null) throw new Error('Missing pinned TAP_USD fallback for non-mainnet or RPC-less price resolution');
       return cacheRate({
         source: 'config',
@@ -288,46 +328,54 @@ export async function resolveTapUsdRate({
       }, now);
     }
 
-    try {
-      const provider = providerFactory(rpcUrl);
-      const dex = await readTapUsdE6FromDex({
-        provider,
-        poolAddress,
-        tapAddress,
-        usdtAddress,
-        timeoutMs,
-        poolFactory,
-      });
+    for (const candidate of candidates) {
+      try {
+        const provider = providerFactory(candidate);
+        const dex = await readTapUsdE6FromDex({
+          provider,
+          poolAddress,
+          tapAddress,
+          usdtAddress,
+          timeoutMs,
+          poolFactory,
+        });
+        return cacheRate({
+          source: 'uniswap-v2',
+          tap_usd_e6: dex.tap_usd_e6,
+          ts: nowSeconds(),
+          pool_address: dex.pool_address,
+          tap_reserve: dex.tap_reserve,
+          usdt_reserve: dex.usdt_reserve,
+          rpc_source: rpcFailureLabel(candidate),
+          failures,
+        }, now);
+      } catch (error) {
+        failures.push({
+          source: 'uniswap-v2',
+          rpc_source: rpcFailureLabel(candidate),
+          error: rpcErrorMessage(error),
+        });
+      }
+    }
+
+    if (fallback !== null) {
       return cacheRate({
-        source: 'uniswap-v2',
-        tap_usd_e6: dex.tap_usd_e6,
+        source: 'config',
+        tap_usd_e6: fallback,
         ts: nowSeconds(),
-        pool_address: dex.pool_address,
-        tap_reserve: dex.tap_reserve,
-        usdt_reserve: dex.usdt_reserve,
         failures,
       }, now);
-    } catch (error) {
-      failures.push({ source: 'uniswap-v2', error: error?.message || String(error) });
-      if (fallback !== null) {
-        return cacheRate({
-          source: 'config',
-          tap_usd_e6: fallback,
-          ts: nowSeconds(),
-          failures,
-        }, now);
-      }
-      if (cache) {
-        return cacheRate({
-          source: 'stale',
-          tap_usd_e6: cache.tap_usd_e6,
-          ts: nowSeconds(),
-          stale_from_ts: cache.ts,
-          failures,
-        }, now);
-      }
-      throw new Error(`No TAP/USD source returned a usable price: ${JSON.stringify(failures)}`);
     }
+    if (cache) {
+      return cacheRate({
+        source: 'stale',
+        tap_usd_e6: cache.tap_usd_e6,
+        ts: nowSeconds(),
+        stale_from_ts: cache.ts,
+        failures,
+      }, now);
+    }
+    throw new Error(`No TAP/USD source returned a usable price: ${JSON.stringify(failures)}`);
   })().finally(() => {
     inFlight = null;
   });
@@ -424,10 +472,22 @@ export function buildAdminCommand(rate, options = {}) {
 }
 
 export async function runOnce(options = {}) {
+  const chainId = options.chainId === undefined || options.chainId === null || options.chainId === ''
+    ? 0
+    : parseNonNegativeInt(options.chainId, '--chain-id');
   const rate = await resolveTapUsdRate({
     ...options,
     rpcUrl: options.priceRpcUrl ?? options.ethRpcUrl ?? options.rpcUrl,
+    fallbackRpcUrls: options.fallbackPriceRpcUrls ?? options.ethRpcFallbacks,
+    chainId,
   });
+  if (
+    options.requireLiveMainnetPrice
+    && chainId === DEFAULT_MAINNET_CHAIN_ID
+    && rate.source !== 'uniswap-v2'
+  ) {
+    throw new Error(`Refusing to post non-mainnet-live TAP price on chain-id 1 (source=${rate.source}). Configure MAYHEM_TAP_ETH_RPC plus QuickNode fallback, or pass --allow-price-fallback only for local/emergency dry runs.`);
+  }
   const adminOptions = {
     submit: true,
     sim: options.sim,
@@ -448,6 +508,7 @@ export async function runOnce(options = {}) {
     pool_address: rate.pool_address ?? null,
     tap_reserve: rate.tap_reserve ?? null,
     usdt_reserve: rate.usdt_reserve ?? null,
+    rpc_source: rate.rpc_source ?? null,
     stale_from_ts: rate.stale_from_ts ?? null,
     cache_hit: Boolean(rate.cache_hit),
     failures: rate.failures ?? [],
@@ -496,7 +557,18 @@ export function resetTapPriceCacheForTest() {
 
 async function main() {
   const args = parseArgs();
-  const ethRpc = args['eth-rpc'] || args.rpc || process.env.MAYHEM_TAP_ETH_RPC || process.env.ETH_RPC;
+  const ethRpc = args['eth-rpc']
+    || args.rpc
+    || process.env.MAYHEM_TAP_ETH_RPC
+    || process.env.TK_ETH_RPC
+    || process.env.ETH_RPC;
+  const ethRpcFallbacks = args['eth-rpc-fallbacks']
+    || args['eth-rpc-fallback']
+    || process.env.MAYHEM_TAP_ETH_RPC_FALLBACKS
+    || process.env.MAYHEM_TAP_ETH_RPC_FALLBACK
+    || process.env.TK_ETH_RPC_FALLBACKS
+    || process.env.TK_ETH_RPC_FALLBACK
+    || process.env.ETH_RPC_FALLBACKS;
   const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
   const chainId = args['chain-id'] ?? process.env.MAYHEM_TAP_ETH_CHAIN_ID ?? (ethRpc ? DEFAULT_MAINNET_CHAIN_ID : 0);
   const intervalMs = parsePositiveInt(args['interval-ms'] ?? DEFAULT_INTERVAL_MS, '--interval-ms', DEFAULT_INTERVAL_MS);
@@ -505,6 +577,7 @@ async function main() {
   const submit = boolArg(args.submit, false);
   const options = {
     priceRpcUrl: ethRpc,
+    fallbackPriceRpcUrls: ethRpcFallbacks,
     adminRpcUrl,
     chainId,
     poolAddress: args.pool || process.env.MAYHEM_TAP_USDT_POOL || DEFAULT_TAP_USDT_POOL,
@@ -526,6 +599,7 @@ async function main() {
     verify: !boolArg(args['no-verify'], false),
     verifyTimeoutMs: parsePositiveInt(args['verify-timeout-ms'] ?? 30_000, '--verify-timeout-ms', 30_000),
     verifyPollMs: parsePositiveInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500),
+    requireLiveMainnetPrice: !boolArg(args['allow-price-fallback'], false),
   };
 
   do {
@@ -535,6 +609,7 @@ async function main() {
     } else {
       console.log('[tap:rate] TAP/USD oracle tick complete');
       console.log('[tap:rate] source:', report.source);
+      if (report.rpc_source) console.log('[tap:rate] rpc_source:', report.rpc_source);
       console.log('[tap:rate] tap_usd_e6:', report.tap_usd_e6);
       console.log('[tap:rate] submitted:', report.submitted);
       console.log('Copy/paste admin TAP rate oracle submit command:');

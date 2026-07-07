@@ -150,6 +150,25 @@ export async function executeTnkSettlementFeature(contract, storage, value, send
   return result ?? contract._mayhemLastFeatureResult;
 }
 
+export async function reputationAnchorFeatureKey(contract, value) {
+  const key = await contract.reputationAnchorFeatureKey(value);
+  if (key instanceof Error) throw key;
+  return key;
+}
+
+export async function executeReputationAnchorFeature(contract, storage, value, sender) {
+  contract._mayhemLastFeatureResult = undefined;
+  const result = await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await reputationAnchorFeatureKey(contract, value),
+    value,
+    sender
+  );
+  return result ?? contract._mayhemLastFeatureResult;
+}
+
 export async function spendReservationFeatureKey(contract, value) {
   const key = await contract.spendReservationFeatureKey(value);
   if (key instanceof Error) throw key;

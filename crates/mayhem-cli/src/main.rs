@@ -38,14 +38,15 @@ use mayhem_engine::{
     ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
-    heartbeat_signing_payload, normalize_rate_map,
+    fold_reputation, heartbeat_signing_payload, normalize_rate_map,
     openai::{
         serve as serve_gateway, validate_loopback_dashboard_bind, GatewayCanaryProbePolicy,
         GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
         ProviderKybInfo, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
     },
     rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
-    RateMapEntry, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
+    ProbationCaps, ProbationPolicy, RateMapEntry, ReputationEvent, ReputationEventKind,
+    DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, GpuInfo, GpuVendor, HardwareReport,
@@ -286,6 +287,8 @@ enum AdminCommands {
     BanProvider(AdminBanProviderArgs),
     /// Accredit an auditor key for probe submission.
     AuditorRegister(AdminAuditorRegisterArgs),
+    /// Fold real reputation events and anchor rep/<provider> snapshots.
+    ReputationAnchor(AdminReputationAnchorArgs),
     /// Post a fresh TNK/USD oracle rate for payment and payout conversions.
     RateOracle(AdminRateOracleArgs),
     /// Post a fresh TAP/USD policy rate for TAP deposit conversion.
@@ -2867,6 +2870,36 @@ struct AdminAuditorRegisterArgs {
     /// Registration age timestamp used by the contract.
     #[arg(long, default_value_t = 0)]
     registered_at_seconds: u64,
+}
+
+#[derive(Debug, Parser)]
+struct AdminReputationAnchorArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Provider public key to fold and anchor.
+    #[arg(long, conflicts_with = "all")]
+    provider: Option<String>,
+
+    /// Fold every provider with an ev/rep/head entry.
+    #[arg(long)]
+    all: bool,
+
+    /// Epoch label for the reputation snapshot. Defaults to active billing epoch.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    /// Fold timestamp in Unix seconds. Defaults to now for each scan.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// Keep scanning on an interval; requires --submit.
+    #[arg(long)]
+    watch: bool,
+
+    /// Seconds between reputation oracle scans in --watch mode.
+    #[arg(long, default_value_t = 60)]
+    interval_seconds: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -10170,6 +10203,9 @@ async fn admin(command: AdminCommands) -> Result<()> {
         AdminCommands::TnkSettlement(args) => {
             return run_admin_tnk_settlement_feature(args).await;
         }
+        AdminCommands::ReputationAnchor(args) => {
+            return run_admin_reputation_anchor(args).await;
+        }
         AdminCommands::PayoutConfirm(_) => {
             bail!(
                 "payout-confirm is retired; use TNK tnk-settlement batch evidence, TAP claim-proof tools, or fiat paygate settlement"
@@ -10216,6 +10252,403 @@ async fn run_admin_tnk_settlement_feature(args: &AdminTnkSettlementArgs) -> Resu
     run_admin_tnk_settlement_runner(args).await
 }
 
+async fn run_admin_reputation_anchor(args: &AdminReputationAnchorArgs) -> Result<()> {
+    if args.interval_seconds == 0 {
+        bail!("--interval-seconds must be positive");
+    }
+    if !args.all && args.provider.is_none() {
+        bail!("pass --provider <pubkey> or --all");
+    }
+    if args.watch && (!args.tx.submit || args.tx.sim) {
+        bail!("--watch requires --submit without --sim so the oracle can actually anchor");
+    }
+
+    let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let mut scans = Vec::new();
+
+    loop {
+        let at = args.at.unwrap_or(unix_epoch_seconds()?);
+        let epoch = match args.epoch {
+            Some(epoch) => epoch,
+            None => active_billing_epoch(&rpc).await?,
+        };
+        let providers = reputation_anchor_target_providers(&rpc, args).await?;
+        let mut anchors = Vec::new();
+        let mut skipped = Vec::new();
+        for provider in providers {
+            match build_reputation_anchor_feature(&rpc, &rpc_url, &provider, epoch, at).await {
+                Ok(anchor) => anchors.push(anchor),
+                Err(err) if args.all => skipped.push(json!({
+                    "provider": provider,
+                    "reason": err.to_string(),
+                })),
+                Err(err) => return Err(err),
+            }
+        }
+
+        let mut submitted = Vec::new();
+        if args.tx.submit && !args.tx.sim {
+            for anchor in &anchors {
+                let response = rpc.submit_feature(&anchor.feature).await.with_context(|| {
+                    format!("submitting reputation anchor for {}", anchor.provider)
+                })?;
+                if response.get("ok").and_then(Value::as_bool) != Some(true) {
+                    bail!(
+                        "reputation anchor for {} was not accepted: {}",
+                        anchor.provider,
+                        response
+                    );
+                }
+                submitted.push(json!({
+                    "provider": anchor.provider,
+                    "result": response,
+                }));
+            }
+        }
+
+        let scan = json!({
+            "at": at,
+            "epoch": epoch,
+            "providers_scanned": anchors.len() + skipped.len(),
+            "anchors": anchors,
+            "skipped": skipped,
+            "submitted": submitted,
+        });
+
+        if args.watch && !args.tx.json {
+            print_reputation_anchor_scan_report(&scan)?;
+        }
+        scans.push(scan);
+
+        if !args.watch {
+            break;
+        }
+        sleep(Duration::from_secs(args.interval_seconds)).await;
+    }
+
+    let report = json!({
+        "ok": true,
+        "rpc_url": rpc_url,
+        "watch": args.watch,
+        "sim": args.tx.sim,
+        "submitted": args.tx.submit && !args.tx.sim,
+        "scan_count": scans.len(),
+        "scans": scans,
+    });
+    if args.tx.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_reputation_anchor_report(&report)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReputationAnchorReport {
+    provider: String,
+    event_count: usize,
+    events_head: String,
+    previous: Option<Value>,
+    snapshot: Value,
+    feature: Value,
+    copy_paste: Value,
+}
+
+async fn reputation_anchor_target_providers(
+    rpc: &PeerRpcClient,
+    args: &AdminReputationAnchorArgs,
+) -> Result<Vec<String>> {
+    if let Some(provider) = args.provider.as_deref() {
+        return Ok(vec![provider.to_owned()]);
+    }
+    let mut providers = read_prefix_entries(rpc, "ev/rep/head/")
+        .await?
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .key
+                .strip_prefix("ev/rep/head/")
+                .filter(|tail| !tail.contains('/'))
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    Ok(providers)
+}
+
+async fn build_reputation_anchor_feature(
+    rpc: &PeerRpcClient,
+    rpc_url: &str,
+    provider: &str,
+    epoch: u64,
+    at: u64,
+) -> Result<ReputationAnchorReport> {
+    let provider_record = read_state_value(rpc, &format!("prov/{provider}"))
+        .await?
+        .with_context(|| format!("provider {provider} is not registered"))?;
+    let head_record = read_state_value(rpc, &format!("ev/rep/head/{provider}"))
+        .await?
+        .with_context(|| format!("provider {provider} has no reputation event head"))?;
+    let events_head = head_record
+        .get("head")
+        .and_then(Value::as_str)
+        .filter(|head| is_hex_len(head, 64))
+        .with_context(|| format!("provider {provider} reputation head is invalid"))?
+        .to_owned();
+    let mut event_entries = read_prefix_entries(rpc, &format!("ev/rep/{provider}/"))
+        .await?
+        .into_iter()
+        .filter(|entry| entry.key != format!("ev/rep/head/{provider}"))
+        .collect::<Vec<_>>();
+    event_entries.sort_by(|left, right| {
+        reputation_event_sort_key(left)
+            .cmp(&reputation_event_sort_key(right))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let events = event_entries
+        .iter()
+        .map(contract_reputation_event_to_fold_event)
+        .collect::<Result<Vec<_>>>()?;
+    if events.is_empty() {
+        bail!("provider {provider} has no reputation events to fold");
+    }
+
+    let policy = read_reputation_probation_policy(rpc, at).await?;
+    let probation_since = provider_record
+        .get("probation")
+        .and_then(|probation| probation.get("since_seconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let folded = fold_reputation(provider, &events, at, epoch, probation_since, 0, &policy)
+        .context("folding reputation events")?;
+    let value = reputation_anchor_payload(
+        provider,
+        epoch,
+        at,
+        &events_head,
+        folded.r_bps,
+        folded.raw_milli,
+        folded.probation.successful_sessions,
+        folded.provenance_violation,
+    );
+    let key = reputation_anchor_feature_key(&value)?;
+    let feature = json!({
+        "feature": "mayhem",
+        "key": key,
+        "value": value,
+    });
+    let feature_json = serde_json::to_string(&feature)?;
+    let previous = read_state_value(rpc, &format!("rep/{provider}")).await?;
+    Ok(ReputationAnchorReport {
+        provider: provider.to_owned(),
+        event_count: events.len(),
+        events_head,
+        previous,
+        snapshot: json!({
+            "r_bps": folded.r_bps,
+            "raw_milli": folded.raw_milli,
+            "successful_sessions": folded.probation.successful_sessions,
+            "provenance_violation": folded.provenance_violation,
+            "folded_at": at,
+            "epoch": epoch,
+        }),
+        feature,
+        copy_paste: json!({
+            "peer_rpc": format!(
+                "curl -sS -X POST {}/contract/feature -H 'content-type: application/json' --data {}",
+                shell_single_quote(rpc_url.trim_end_matches('/')),
+                shell_single_quote(&feature_json)
+            ),
+        }),
+    })
+}
+
+fn reputation_anchor_payload(
+    provider: &str,
+    epoch: u64,
+    folded_at: u64,
+    events_head: &str,
+    r_bps: u32,
+    raw_milli: i64,
+    successful_sessions: u64,
+    provenance_violation: bool,
+) -> Value {
+    let mut value = json!({
+        "op": "anchor_reputation",
+        "provider": provider,
+        "epoch": epoch,
+        "folded_at": folded_at,
+        "events_head": events_head,
+        "r_bps": r_bps,
+        "raw_milli": raw_milli,
+        "successful_sessions": successful_sessions,
+    });
+    if provenance_violation {
+        value["provenance_violation"] = json!(true);
+    }
+    value
+}
+
+fn reputation_anchor_feature_key(value: &Value) -> Result<String> {
+    if value.get("op").and_then(Value::as_str) != Some("anchor_reputation") {
+        bail!("reputation anchor payload must have op=anchor_reputation");
+    }
+    let provider = value
+        .get("provider")
+        .and_then(Value::as_str)
+        .context("reputation anchor payload missing provider")?;
+    if !is_safe_key_part(provider) {
+        bail!("reputation anchor provider is not contract-safe");
+    }
+    let epoch = value
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .context("reputation anchor payload missing epoch")?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-reputation-anchor-feature-v1",
+        "value": value,
+    }));
+    Ok(format!("rep/{provider}/{epoch}/{digest}"))
+}
+
+fn contract_reputation_event_to_fold_event(entry: &PrefixStateEntry) -> Result<ReputationEvent> {
+    let value = &entry.value;
+    let provider = value
+        .get("provider")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{} missing provider", entry.key))?
+        .to_owned();
+    let event_id = value
+        .get("event_id")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{} missing event_id", entry.key))?
+        .to_owned();
+    let epoch = value
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .with_context(|| format!("{} missing epoch", entry.key))?;
+    let at_seconds = value
+        .get("at")
+        .and_then(Value::as_u64)
+        .with_context(|| format!("{} missing at", entry.key))?;
+    let evidence_hash = value
+        .get("evidence_hash")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let kind = match value
+        .get("kind")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{} missing kind", entry.key))?
+    {
+        "session_ok" => ReputationEventKind::SessionOk {
+            paid_mu: value
+                .get("paid_mu")
+                .and_then(Value::as_u64)
+                .with_context(|| format!("{} session_ok missing paid_mu", entry.key))?,
+        },
+        "session_partial" => ReputationEventKind::SessionPartial {
+            paid_mu: value
+                .get("paid_mu")
+                .and_then(Value::as_u64)
+                .with_context(|| format!("{} session_partial missing paid_mu", entry.key))?,
+        },
+        "session_fail" => ReputationEventKind::SessionFail {
+            max_spend_mu: value
+                .get("max_spend_mu")
+                .and_then(Value::as_u64)
+                .with_context(|| format!("{} session_fail missing max_spend_mu", entry.key))?,
+        },
+        "probe_ok" => ReputationEventKind::ProbeOk,
+        "probe_fail" => ReputationEventKind::ProbeFail,
+        "uptime_tick" => ReputationEventKind::UptimeTick,
+        "dispute_lost" => ReputationEventKind::DisputeLost,
+        "provenance_violation" => ReputationEventKind::ProvenanceViolation,
+        other => bail!(
+            "{} has unsupported reputation event kind {other}",
+            entry.key
+        ),
+    };
+    Ok(ReputationEvent {
+        provider,
+        event_id,
+        epoch,
+        at_seconds,
+        evidence_hash,
+        kind,
+    })
+}
+
+fn reputation_event_sort_key(entry: &PrefixStateEntry) -> (u64, u64, String) {
+    (
+        entry
+            .value
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+        entry
+            .value
+            .get("at")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+        entry
+            .value
+            .get("event_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+    )
+}
+
+async fn read_reputation_probation_policy(rpc: &PeerRpcClient, at: u64) -> Result<ProbationPolicy> {
+    let default = ProbationPolicy::default();
+    let default_caps = ProbationCaps::default();
+    Ok(ProbationPolicy {
+        required_successful_sessions: read_param_u64_at(
+            rpc,
+            "probation_successful_sessions",
+            default.required_successful_sessions,
+            at,
+        )
+        .await?,
+        required_seconds: read_param_u64_at(rpc, "probation_seconds", default.required_seconds, at)
+            .await?,
+        caps: ProbationCaps {
+            max_concurrent_sessions_per_user: read_param_u64_at(
+                rpc,
+                "probation_max_concurrent_sessions_per_user",
+                u64::from(default_caps.max_concurrent_sessions_per_user),
+                at,
+            )
+            .await?
+            .try_into()
+            .context("probation_max_concurrent_sessions_per_user exceeds u32")?,
+            price_max_bps: read_param_u64_at(
+                rpc,
+                "probation_price_max_bps",
+                u64::from(default_caps.price_max_bps),
+                at,
+            )
+            .await?
+            .try_into()
+            .context("probation_price_max_bps exceeds u32")?,
+            weight_bps: read_param_u64_at(
+                rpc,
+                "probation_weight_bps",
+                u64::from(default_caps.weight_bps),
+                at,
+            )
+            .await?
+            .try_into()
+            .context("probation_weight_bps exceeds u32")?,
+        },
+    })
+}
+
 fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
     match command {
         AdminCommands::SetRules(args) => &args.tx,
@@ -10232,6 +10665,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::RevokeProviderKyb(args) => &args.tx,
         AdminCommands::BanProvider(args) => &args.tx,
         AdminCommands::AuditorRegister(args) => &args.tx,
+        AdminCommands::ReputationAnchor(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
         AdminCommands::TapRateOracle(args) => &args.tx,
         AdminCommands::TnkSettlement(args) => &args.tx,
@@ -10286,6 +10720,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::BanProvider(args) => Ok(("banProvider", admin_ban_provider_payload(args)?)),
         AdminCommands::AuditorRegister(args) => {
             Ok(("auditorRegister", admin_auditor_register_payload(args)))
+        }
+        AdminCommands::ReputationAnchor(_) => {
+            bail!("reputation anchors are free features, not paid admin txs")
         }
         AdminCommands::RateOracle(_) | AdminCommands::TapRateOracle(_) => {
             bail!("rate oracle updates are free features, not paid admin txs")
@@ -11662,6 +12099,56 @@ fn print_admin_feature_report(report: &Value) -> Result<()> {
         println!("Submitted: false (--sim dry-run for free feature)");
     } else {
         println!("Submitted: false (pass --submit to append through peer RPC)");
+    }
+    Ok(())
+}
+
+fn print_reputation_anchor_report(report: &Value) -> Result<()> {
+    println!("Reputation oracle report.");
+    println!("RPC: {}", report["rpc_url"].as_str().unwrap_or(""));
+    println!(
+        "Submitted: {}",
+        report["submitted"].as_bool().unwrap_or(false)
+    );
+    if let Some(scans) = report["scans"].as_array() {
+        for scan in scans {
+            print_reputation_anchor_scan_report(scan)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_reputation_anchor_scan_report(scan: &Value) -> Result<()> {
+    println!(
+        "Scan epoch={} at={} providers={}",
+        scan["epoch"].as_u64().unwrap_or(0),
+        scan["at"].as_u64().unwrap_or(0),
+        scan["providers_scanned"].as_u64().unwrap_or(0)
+    );
+    for anchor in scan["anchors"].as_array().into_iter().flatten() {
+        println!(
+            "  provider={} events={} r_bps={} raw_milli={} head={}",
+            anchor["provider"].as_str().unwrap_or(""),
+            anchor["event_count"].as_u64().unwrap_or(0),
+            anchor["snapshot"]["r_bps"].as_u64().unwrap_or(0),
+            anchor["snapshot"]["raw_milli"].as_i64().unwrap_or(0),
+            anchor["events_head"].as_str().unwrap_or("")
+        );
+        println!(
+            "    key={}",
+            anchor["feature"]["key"].as_str().unwrap_or("")
+        );
+        println!(
+            "    copy/paste={}",
+            anchor["copy_paste"]["peer_rpc"].as_str().unwrap_or("")
+        );
+    }
+    for skipped in scan["skipped"].as_array().into_iter().flatten() {
+        println!(
+            "  skipped provider={} reason={}",
+            skipped["provider"].as_str().unwrap_or(""),
+            skipped["reason"].as_str().unwrap_or("")
+        );
     }
     Ok(())
 }
@@ -34754,6 +35241,18 @@ mod tests {
         let b = json!({ "a": { "c": 3, "d": 4 }, "b": 2 });
 
         assert_eq!(stable_value_hash(&a), stable_value_hash(&b));
+    }
+
+    #[test]
+    fn reputation_anchor_feature_key_rejects_unsafe_provider() {
+        let value = json!({
+            "op": "anchor_reputation",
+            "provider": "../bad",
+            "epoch": 1,
+        });
+
+        let err = reputation_anchor_feature_key(&value).unwrap_err();
+        assert!(err.to_string().contains("contract-safe"));
     }
 
     #[test]

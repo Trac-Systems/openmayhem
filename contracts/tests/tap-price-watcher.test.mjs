@@ -10,6 +10,8 @@ import {
   readTapUsdE6FromDex,
   resetTapPriceCacheForTest,
   resolveTapUsdRate,
+  rpcUrlCandidates,
+  runOnce,
   tapRateStateMatches,
   tapUsdE6FromReserves,
 } from '../scripts/tap-price-watcher.mjs';
@@ -160,6 +162,54 @@ test('TAP rate resolver caches DEX reads and falls back safely', async () => {
   assert.equal(noRpc.tap_usd_e6, 55_000);
 });
 
+test('TAP rate resolver tries mainnet RPC fallbacks before stale/config', async () => {
+  resetTapPriceCacheForTest();
+  assert.deepEqual(rpcUrlCandidates({
+    rpcUrl: 'https://mainnet.infura.io/v3/a',
+    fallbackRpcUrls: 'https://example.quiknode.pro/b, https://mainnet.infura.io/v3/a',
+  }), [
+    'https://mainnet.infura.io/v3/a',
+    'https://example.quiknode.pro/b',
+  ]);
+
+  const used = [];
+  const rate = await resolveTapUsdRate({
+    rpcUrl: 'https://mainnet.infura.io/v3/primary-placeholder',
+    fallbackRpcUrls: 'https://example.quiknode.pro/fallback-secret',
+    chainId: 1,
+    tapAddress: TAP,
+    providerFactory: (url) => {
+      used.push(url);
+      return { url };
+    },
+    poolFactory: (_address, _abi, provider) => {
+      if (provider.url.includes('infura')) {
+        return {
+          token0: async () => { throw new Error(`down ${provider.url}`); },
+          token1: async () => DEFAULT_USDT_ADDRESS,
+          getReserves: async () => [U18(1), U6(1), 0],
+        };
+      }
+      return fakePool();
+    },
+    nowMs: () => 7_000,
+    nowSeconds: () => 70,
+    ttlMs: 1_000,
+  });
+
+  assert.deepEqual(used, [
+    'https://mainnet.infura.io/v3/primary-placeholder',
+    'https://example.quiknode.pro/fallback-secret',
+  ]);
+  assert.equal(rate.source, 'uniswap-v2');
+  assert.equal(rate.rpc_source, 'example.quiknode.pro');
+  assert.equal(rate.tap_usd_e6, 2_500_000);
+  assert.equal(rate.failures.length, 1);
+  assert.equal(rate.failures[0].rpc_source, 'mainnet.infura.io');
+  assert.doesNotMatch(rate.failures[0].error, /primary-placeholder/);
+  assert.match(rate.failures[0].error, /https:\/\/<redacted>/);
+});
+
 test('TAP rate watcher builds redacted admin commands and verifies state shape', () => {
   const rate = { source: 'config', tap_usd_e6: 50_000, ts: 3_600 };
   const args = buildAdminCommandArgs(rate, {
@@ -193,4 +243,31 @@ test('TAP rate watcher builds redacted admin commands and verifies state shape',
     ts: 3_600,
     posted_by_role: 'admin',
   }), false);
+});
+
+test('TAP rate watcher refuses non-live mainnet fallback unless explicitly allowed', async () => {
+  resetTapPriceCacheForTest();
+  await assert.rejects(
+    runOnce({
+      chainId: 1,
+      fallbackUsd: '0.05',
+      requireLiveMainnetPrice: true,
+      submit: false,
+      nowMs: () => 10_000,
+      nowSeconds: () => 100,
+    }),
+    /Refusing to post non-mainnet-live TAP price/
+  );
+
+  resetTapPriceCacheForTest();
+  const allowed = await runOnce({
+    chainId: 1,
+    fallbackUsd: '0.05',
+    requireLiveMainnetPrice: false,
+    submit: false,
+    nowMs: () => 11_000,
+    nowSeconds: () => 110,
+  });
+  assert.equal(allowed.source, 'config');
+  assert.equal(allowed.tap_usd_e6, 50_000);
 });
