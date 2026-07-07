@@ -52,12 +52,14 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{stream, Stream};
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    default_model_class, migrate_receipt_body, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
-    AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
-    SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP,
+    chunk_json_payload, default_model_class, migrate_receipt_body, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    supported_receipt_signing_bytes, AttestationReport, CheckpointPolicy, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3373,17 +3375,15 @@ impl ScBridgeGatewaySessionBackend {
         .chars()
         .take(32)
         .collect::<String>();
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.req",
-                    "rid": request_id,
-                    "body": direct_session_request_body(request),
-                }),
-            )
-            .await?;
+        let request_body = direct_session_request_body(request);
+        send_direct_session_request_frames(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            &request_id,
+            &request_body,
+        )
+        .await?;
 
         let collected = match collect_direct_session_output(
             &mut bridge,
@@ -3599,17 +3599,15 @@ impl ScBridgeGatewaySessionBackend {
         .chars()
         .take(32)
         .collect::<String>();
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.req",
-                    "rid": request_id,
-                    "body": direct_session_embedding_request_body(request),
-                }),
-            )
-            .await?;
+        let request_body = direct_session_embedding_request_body(request);
+        send_direct_session_request_frames(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            &request_id,
+            &request_body,
+        )
+        .await?;
 
         let collected = collect_direct_session_embedding_output(
             &mut bridge,
@@ -3782,17 +3780,14 @@ impl ScBridgeGatewaySessionBackend {
         .chars()
         .take(32)
         .collect::<String>();
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.req",
-                    "rid": request_id,
-                    "body": request_body,
-                }),
-            )
-            .await?;
+        send_direct_session_request_frames(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            &request_id,
+            &request_body,
+        )
+        .await?;
 
         let collected = collect_direct_session_image_generation_output(
             &mut bridge,
@@ -3955,17 +3950,14 @@ impl ScBridgeGatewaySessionBackend {
 
         let request_body = direct_session_audio_speech_request_body(request);
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.req",
-                    "rid": request_id,
-                    "body": request_body,
-                }),
-            )
-            .await?;
+        send_direct_session_request_frames(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            &request_id,
+            &request_body,
+        )
+        .await?;
 
         let collected = collect_direct_session_audio_speech_output(
             &mut bridge,
@@ -4128,17 +4120,14 @@ impl ScBridgeGatewaySessionBackend {
 
         let request_body = direct_session_audio_transcription_request_body(request);
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
-        bridge
-            .session_send(
-                provider,
-                &invocation.session_id,
-                json!({
-                    "t": "s.req",
-                    "rid": request_id,
-                    "body": request_body,
-                }),
-            )
-            .await?;
+        send_direct_session_request_frames(
+            &mut bridge,
+            provider,
+            &invocation.session_id,
+            &request_id,
+            &request_body,
+        )
+        .await?;
 
         let collected = collect_direct_session_audio_transcription_output(
             &mut bridge,
@@ -4507,6 +4496,92 @@ fn request_id_for_body(session_id: &str, body: &Value) -> String {
         .chars()
         .take(32)
         .collect()
+}
+
+async fn send_direct_session_request_frames(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    session_id: &str,
+    request_id: &str,
+    body: &Value,
+) -> Result<(), GatewaySessionError> {
+    let max_frame_bytes = direct_session_max_frame_bytes();
+    for frame in direct_session_request_frames(request_id, body, max_frame_bytes)? {
+        bridge
+            .session_send(provider, session_id, frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending s.req for session {session_id} to provider {provider} failed: {err}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn direct_session_request_frames(
+    request_id: &str,
+    body: &Value,
+    max_frame_bytes: usize,
+) -> Result<Vec<Value>, GatewaySessionError> {
+    let direct = json!({
+        "t": "s.req",
+        "rid": request_id,
+        "body": body,
+    });
+    if session_frame_json_len(&direct)? <= max_frame_bytes {
+        return Ok(vec![direct]);
+    }
+
+    let chunk_size = direct_session_payload_chunk_bytes(max_frame_bytes);
+    let (manifest, chunks) = chunk_json_payload(body, chunk_size)
+        .map_err(|err| GatewaySessionError::new(format!("chunking s.req payload failed: {err}")))?;
+    let payload_id = manifest.blake3.clone();
+    let mut frames = Vec::with_capacity(chunks.len().saturating_add(1));
+    for chunk in chunks {
+        frames.push(json!({
+            "t": "s.req_chunk",
+            "v": 1,
+            "rid": request_id,
+            "payload_id": payload_id,
+            "chunk": chunk,
+        }));
+    }
+    frames.push(json!({
+        "t": "s.req",
+        "rid": request_id,
+        "body_ref": manifest,
+    }));
+
+    for frame in &frames {
+        let len = session_frame_json_len(frame)?;
+        if len > max_frame_bytes {
+            return Err(GatewaySessionError::new(format!(
+                "chunked s.req frame {} bytes exceeds session max {max_frame_bytes} bytes",
+                len
+            )));
+        }
+    }
+    Ok(frames)
+}
+
+fn direct_session_max_frame_bytes() -> usize {
+    std::env::var("MAYHEM_SESSION_MAX_FRAME_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 8 * 1024)
+        .unwrap_or(DEFAULT_SESSION_MAX_FRAME_BYTES)
+}
+
+fn direct_session_payload_chunk_bytes(max_frame_bytes: usize) -> usize {
+    let safe_raw = max_frame_bytes.saturating_sub(4096) / 3;
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES.min(safe_raw.max(1024))
+}
+
+fn session_frame_json_len(frame: &Value) -> Result<usize, GatewaySessionError> {
+    serde_json::to_vec(frame)
+        .map(|bytes| bytes.len())
+        .map_err(|err| GatewaySessionError::new(format!("serializing session frame failed: {err}")))
 }
 
 fn set_optional_json(body: &mut Value, key: &str, value: Option<Value>) {
@@ -7029,17 +7104,15 @@ async fn open_live_direct_chat_session(
     .chars()
     .take(32)
     .collect::<String>();
-    bridge
-        .session_send(
-            provider,
-            &invocation.session_id,
-            json!({
-                "t": "s.req",
-                "rid": request_id,
-                "body": direct_session_request_body(request),
-            }),
-        )
-        .await?;
+    let request_body = direct_session_request_body(request);
+    send_direct_session_request_frames(
+        &mut bridge,
+        provider,
+        &invocation.session_id,
+        &request_id,
+        &request_body,
+    )
+    .await?;
     Ok((
         bridge,
         provider.to_owned(),
@@ -12273,7 +12346,8 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use mayhem_proto::{
-        attestation_signing_bytes, receipt_signing_bytes_for_version, AttestationSigner,
+        attestation_signing_bytes, reassemble_json_payload, receipt_signing_bytes_for_version,
+        AttestationSigner, PayloadChunk, PayloadChunkManifest,
     };
 
     #[test]
@@ -13865,6 +13939,34 @@ mod tests {
 
         assert_eq!(body["user"], json!("terminal-user-1"));
         assert_eq!(body["metadata"]["conversation_id"], json!("agent-loop-1"));
+    }
+
+    #[test]
+    fn direct_session_request_frames_chunk_large_body_under_transport_limit() {
+        let mut request = test_chat_request("mayhem/chat");
+        request.messages[0].content = json!("hello ".repeat(20_000));
+        let body = direct_session_request_body(&request);
+        let max_frame_bytes = 12 * 1024;
+
+        let frames = direct_session_request_frames("rid-large", &body, max_frame_bytes).unwrap();
+
+        assert!(frames.len() > 2);
+        assert!(frames.iter().all(|frame| {
+            session_frame_json_len(frame).expect("frame serializes") <= max_frame_bytes
+        }));
+        assert!(frames[..frames.len() - 1]
+            .iter()
+            .all(|frame| frame.get("t").and_then(Value::as_str) == Some("s.req_chunk")));
+        let final_frame = frames.last().expect("final frame");
+        assert_eq!(final_frame.get("t").and_then(Value::as_str), Some("s.req"));
+        let manifest: PayloadChunkManifest =
+            serde_json::from_value(final_frame["body_ref"].clone()).unwrap();
+        let chunks = frames[..frames.len() - 1]
+            .iter()
+            .map(|frame| serde_json::from_value::<PayloadChunk>(frame["chunk"].clone()).unwrap())
+            .collect::<Vec<_>>();
+        let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
+        assert_eq!(restored, body);
     }
 
     fn test_chat_output() -> ChatOutput {

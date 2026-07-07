@@ -54,12 +54,12 @@ use mayhem_hwprobe::{
     ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
-    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
-    AttestationRuntimeConfig, CatalogEnclaveIdentity, CheckpointPolicy, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_STEP,
+    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
+    AttestationRuntimeConfig, CatalogEnclaveIdentity, CheckpointPolicy, PayloadChunk,
+    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -19769,6 +19769,11 @@ struct ActiveProviderSession {
     checkpoint_every: CheckpointPolicy,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PendingProviderPayload {
+    chunks: Vec<PayloadChunk>,
+}
+
 #[derive(Clone, Debug)]
 struct ProviderSessionTerms {
     contract_version: u32,
@@ -23646,12 +23651,14 @@ async fn serve_provider_sessions(
         .then(|| Instant::now() + Duration::from_secs(ctx.args.serve_sessions_seconds));
     let mut sessions = HashMap::new();
     let mut pending_requests = HashMap::new();
+    let mut pending_payloads = HashMap::new();
     let serve_result: Result<()> = async {
         loop {
             expire_provider_pending_sessions(
                 &mut bridge,
                 &mut sessions,
                 &mut pending_requests,
+                &mut pending_payloads,
                 &heartbeat_load,
             )
             .await;
@@ -23683,6 +23690,7 @@ async fn serve_provider_sessions(
                         &mut bridge,
                         &mut sessions,
                         &mut pending_requests,
+                        &mut pending_payloads,
                         &heartbeat_load,
                         &terms,
                         &runtime,
@@ -23696,6 +23704,7 @@ async fn serve_provider_sessions(
                         &mut bridge,
                         &mut sessions,
                         &mut pending_requests,
+                        &mut pending_payloads,
                         &heartbeat_load,
                     )
                     .await;
@@ -23707,6 +23716,7 @@ async fn serve_provider_sessions(
                     let dropped = clear_provider_sessions_after_bridge_drop(
                         &mut sessions,
                         &mut pending_requests,
+                        &mut pending_payloads,
                         &heartbeat_load,
                     );
                     provider_session_debug(format!(
@@ -23802,11 +23812,13 @@ async fn reconnect_provider_session_bridge(
 fn clear_provider_sessions_after_bridge_drop(
     sessions: &mut HashMap<String, ActiveProviderSession>,
     pending_requests: &mut HashMap<String, Instant>,
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
 ) -> usize {
     let dropped = sessions.len();
     sessions.clear();
     pending_requests.clear();
+    pending_payloads.clear();
     heartbeat_load.set_active_sessions(0);
     dropped
 }
@@ -23815,6 +23827,7 @@ async fn expire_provider_pending_sessions(
     bridge: &mut ScBridgeClient,
     sessions: &mut HashMap<String, ActiveProviderSession>,
     pending_requests: &mut HashMap<String, Instant>,
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
 ) {
     let expired = provider_session_expired_pending_ids(pending_requests, Instant::now());
@@ -23823,6 +23836,7 @@ async fn expire_provider_pending_sessions(
     }
     for session_id in expired {
         pending_requests.remove(&session_id);
+        remove_provider_session_pending_payloads(pending_payloads, &session_id);
         let Some(active) = sessions.remove(&session_id) else {
             continue;
         };
@@ -23859,6 +23873,81 @@ fn provider_session_expired_pending_ids(
     expired
 }
 
+fn provider_session_payload_key(session_id: &str, request_id: &str, payload_id: &str) -> String {
+    format!("{session_id}:{request_id}:{payload_id}")
+}
+
+fn provider_session_request_id(frame: &Value) -> String {
+    frame
+        .get("rid")
+        .and_then(Value::as_str)
+        .filter(|rid| !rid.is_empty())
+        .unwrap_or("missing-rid")
+        .to_owned()
+}
+
+fn remove_provider_session_pending_payloads(
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
+    session_id: &str,
+) {
+    let prefix = format!("{session_id}:");
+    pending_payloads.retain(|key, _| !key.starts_with(&prefix));
+}
+
+fn provider_session_collect_request_chunk(
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
+    session_id: &str,
+    frame: &Value,
+) -> Result<()> {
+    let request_id = provider_session_request_id(frame);
+    let payload_id = frame
+        .get("payload_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("s.req_chunk missing payload_id")?;
+    let chunk: PayloadChunk = serde_json::from_value(
+        frame
+            .get("chunk")
+            .cloned()
+            .context("s.req_chunk missing chunk")?,
+    )
+    .context("decoding s.req_chunk chunk")?;
+    pending_payloads
+        .entry(provider_session_payload_key(
+            session_id,
+            &request_id,
+            payload_id,
+        ))
+        .or_default()
+        .chunks
+        .push(chunk);
+    Ok(())
+}
+
+fn provider_session_request_body_from_frame(
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
+    session_id: &str,
+    frame: &Value,
+) -> Result<Value> {
+    if let Some(body) = frame.get("body") {
+        return Ok(body.clone());
+    }
+    let manifest: PayloadChunkManifest = serde_json::from_value(
+        frame
+            .get("body_ref")
+            .cloned()
+            .context("s.req missing body or body_ref")?,
+    )
+    .context("decoding s.req body_ref manifest")?;
+    let request_id = provider_session_request_id(frame);
+    let key = provider_session_payload_key(session_id, &request_id, &manifest.blake3);
+    let pending = pending_payloads
+        .remove(&key)
+        .with_context(|| format!("s.req body_ref {} has no received chunks", manifest.blake3))?;
+    reassemble_json_payload(&manifest, &pending.chunks)
+        .map_err(|err| anyhow::anyhow!("reassembling s.req body_ref failed: {err}"))
+}
+
 fn provider_session_request_timeout() -> Duration {
     Duration::from_millis(
         std::env::var("MAYHEM_PROVIDER_SESSION_REQUEST_TIMEOUT_MS")
@@ -23874,6 +23963,7 @@ async fn handle_provider_session_frame(
     bridge: &mut ScBridgeClient,
     sessions: &mut HashMap<String, ActiveProviderSession>,
     pending_requests: &mut HashMap<String, Instant>,
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
@@ -24029,6 +24119,45 @@ async fn handle_provider_session_frame(
                 }
             }
         }
+        Some("s.req_chunk") => {
+            provider_session_debug(format!("handling s.req_chunk for session {session_id}"));
+            if !sessions.contains_key(&session_id) {
+                provider_session_debug(format!(
+                    "closing unknown session {session_id} after s.req_chunk from {remote}"
+                ));
+                send_provider_session_close(bridge, &remote, &session_id, "err:unknown_session")
+                    .await?;
+                return Ok(());
+            }
+            if let Err(err) =
+                provider_session_collect_request_chunk(pending_payloads, &session_id, &frame)
+            {
+                let request_id = provider_session_request_id(&frame);
+                provider_session_debug(format!(
+                    "request chunk failed for session {session_id}: {err:#}"
+                ));
+                send_provider_session_error(
+                    bridge,
+                    &remote,
+                    &session_id,
+                    &request_id,
+                    "request_chunk_failed",
+                    &err.to_string(),
+                )
+                .await?;
+                send_provider_session_close(
+                    bridge,
+                    &remote,
+                    &session_id,
+                    "err:request_chunk_failed",
+                )
+                .await?;
+                sessions.remove(&session_id);
+                pending_requests.remove(&session_id);
+                remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                heartbeat_load.set_active_sessions(sessions.len());
+            }
+        }
         Some("s.req") => {
             provider_session_debug(format!("handling s.req for session {session_id}"));
             pending_requests.remove(&session_id);
@@ -24045,7 +24174,39 @@ async fn handle_provider_session_frame(
                 .and_then(Value::as_str)
                 .filter(|rid| !rid.is_empty())
                 .unwrap_or("missing-rid");
-            let body = frame.get("body").cloned().unwrap_or(Value::Null);
+            let body = match provider_session_request_body_from_frame(
+                pending_payloads,
+                &session_id,
+                &frame,
+            ) {
+                Ok(body) => body,
+                Err(err) => {
+                    provider_session_debug(format!(
+                        "request reassembly failed for session {session_id}: {err:#}"
+                    ));
+                    send_provider_session_error(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        request_id,
+                        "request_reassembly_failed",
+                        &err.to_string(),
+                    )
+                    .await?;
+                    send_provider_session_close(
+                        bridge,
+                        &active.remote,
+                        &active.session_id,
+                        "err:request_reassembly_failed",
+                    )
+                    .await?;
+                    sessions.remove(&session_id);
+                    pending_requests.remove(&session_id);
+                    remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                    heartbeat_load.set_active_sessions(sessions.len());
+                    return Ok(());
+                }
+            };
             provider_session_debug(format!(
                 "building response for session {session_id} request {request_id}"
             ));
@@ -24098,6 +24259,7 @@ async fn handle_provider_session_frame(
                             .await?;
                             sessions.remove(&session_id);
                             pending_requests.remove(&session_id);
+                            remove_provider_session_pending_payloads(pending_payloads, &session_id);
                             heartbeat_load.set_active_sessions(sessions.len());
                             return Ok(());
                         }
@@ -24127,6 +24289,7 @@ async fn handle_provider_session_frame(
                     .await?;
                     sessions.remove(&session_id);
                     pending_requests.remove(&session_id);
+                    remove_provider_session_pending_payloads(pending_payloads, &session_id);
                     heartbeat_load.set_active_sessions(sessions.len());
                     return Ok(());
                 }
@@ -24172,6 +24335,7 @@ async fn handle_provider_session_frame(
                     .ok();
                     sessions.remove(&session_id);
                     pending_requests.remove(&session_id);
+                    remove_provider_session_pending_payloads(pending_payloads, &session_id);
                     heartbeat_load.set_active_sessions(sessions.len());
                     return Ok(());
                 }
@@ -24200,6 +24364,7 @@ async fn handle_provider_session_frame(
                 .await?;
                 sessions.remove(&session_id);
                 pending_requests.remove(&session_id);
+                remove_provider_session_pending_payloads(pending_payloads, &session_id);
                 heartbeat_load.set_active_sessions(sessions.len());
                 return Ok(());
             }
@@ -24209,11 +24374,13 @@ async fn handle_provider_session_frame(
             send_provider_session_close(bridge, &active.remote, &active.session_id, "done").await?;
             sessions.remove(&session_id);
             pending_requests.remove(&session_id);
+            remove_provider_session_pending_payloads(pending_payloads, &session_id);
             heartbeat_load.set_active_sessions(sessions.len());
         }
         Some("s.close") => {
             sessions.remove(&session_id);
             pending_requests.remove(&session_id);
+            remove_provider_session_pending_payloads(pending_payloads, &session_id);
             heartbeat_load.set_active_sessions(sessions.len());
         }
         _ => {}
@@ -24419,31 +24586,31 @@ async fn send_provider_session_output(
         .as_ref()
         .map(|state| state.last_checkpoint_tokens)
         .unwrap_or(0);
+    let mut token_ids_sent_in_deltas = live_stream_state.is_some();
     if output.tool.is_none() && live_stream_state.is_none() {
         let mut delivered_content = String::new();
-        for part in provider_stream_parts(&output.content) {
+        let parts = provider_stream_parts(&output.content);
+        for (part_index, part) in parts.iter().enumerate() {
             provider_session_debug(format!(
                 "sending content s.delta #{index} for session {} request {request_id}",
                 active.session_id
             ));
+            let token_ids_delta =
+                provider_token_ids_delta_for_part(&output.token_ids, part_index, parts.len());
+            if !token_ids_delta.is_empty() {
+                token_ids_sent_in_deltas = true;
+            }
             bridge
                 .session_send(
                     &active.remote,
                     &active.session_id,
-                    json!({
-                        "t": "s.delta",
-                        "rid": request_id,
-                        "i": index,
-                        "d": part,
-                        "tool": null,
-                        "fin": null,
-                    }),
+                    provider_session_content_delta_frame(request_id, index, part, token_ids_delta),
                 )
                 .await
                 .context("sending content s.delta")?;
             maybe_provider_session_delta_delay(&active.session_id, request_id, index).await;
             index = index.saturating_add(1);
-            delivered_content.push_str(&part);
+            delivered_content.push_str(part);
             let delivered_tokens = rough_text_tokens(&delivered_content);
             if provider_session_checkpoint_due(
                 delivered_tokens,
@@ -24514,7 +24681,7 @@ async fn send_provider_session_output(
                 "embeddings": output.embeddings.as_ref(),
                 "fin": output.finish_reason,
                 "usage": output.usage,
-                "token_ids": &output.token_ids,
+                "token_ids": (!token_ids_sent_in_deltas).then_some(&output.token_ids),
                 "artifacts": provider_session_artifact_summaries(&output.artifacts),
             }),
         )
@@ -24566,6 +24733,36 @@ fn provider_session_checkpoint_due(
     delivered_tokens > 0
         && delivered_tokens < total_completion_tokens
         && delivered_tokens.saturating_sub(last_checkpoint_tokens) >= checkpoint_tokens
+}
+
+fn provider_session_content_delta_frame(
+    request_id: &str,
+    index: u64,
+    part: &str,
+    token_ids_delta: &[i32],
+) -> Value {
+    json!({
+        "t": "s.delta",
+        "rid": request_id,
+        "i": index,
+        "d": part,
+        "token_ids_delta": token_ids_delta,
+        "tool": null,
+        "fin": null,
+    })
+}
+
+fn provider_token_ids_delta_for_part<'a>(
+    token_ids: &'a [i32],
+    part_index: usize,
+    part_count: usize,
+) -> &'a [i32] {
+    if token_ids.is_empty() || part_count == 0 {
+        return &[];
+    }
+    let start = part_index.saturating_mul(token_ids.len()) / part_count;
+    let end = part_index.saturating_add(1).saturating_mul(token_ids.len()) / part_count;
+    &token_ids[start.min(token_ids.len())..end.min(token_ids.len())]
 }
 
 async fn send_provider_session_receipt_frame(
@@ -32871,6 +33068,7 @@ mod tests {
     fn provider_bridge_drop_clears_active_session_slots_without_exiting() {
         let mut sessions = HashMap::new();
         let mut pending_requests = HashMap::new();
+        let mut pending_payloads = HashMap::new();
         for id in ["s1", "s2"] {
             sessions.insert(
                 id.to_owned(),
@@ -32884,16 +33082,126 @@ mod tests {
             );
             pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
         }
+        pending_payloads.insert(
+            provider_session_payload_key("s1", "r1", &"bb".repeat(32)),
+            PendingProviderPayload::default(),
+        );
         let load = ProviderHeartbeatLoad::default();
         load.set_active_sessions(sessions.len());
 
-        let dropped =
-            clear_provider_sessions_after_bridge_drop(&mut sessions, &mut pending_requests, &load);
+        let dropped = clear_provider_sessions_after_bridge_drop(
+            &mut sessions,
+            &mut pending_requests,
+            &mut pending_payloads,
+            &load,
+        );
 
         assert_eq!(dropped, 2);
         assert!(sessions.is_empty());
         assert!(pending_requests.is_empty());
+        assert!(pending_payloads.is_empty());
         assert_eq!(load.snapshot().active_slots, 0);
+    }
+
+    #[test]
+    fn provider_session_reassembles_chunked_request_body() {
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "be precise" },
+                { "role": "user", "content": "x".repeat(4097) }
+            ],
+            "stream": true,
+        });
+        let (manifest, chunks) = mayhem_proto::chunk_json_payload(&body, 512).unwrap();
+        let session_id = "sess-chunk";
+        let request_id = "req-chunk";
+        let mut pending_payloads = HashMap::new();
+        for chunk in chunks {
+            provider_session_collect_request_chunk(
+                &mut pending_payloads,
+                session_id,
+                &json!({
+                    "t": "s.req_chunk",
+                    "rid": request_id,
+                    "payload_id": manifest.blake3,
+                    "chunk": chunk,
+                }),
+            )
+            .unwrap();
+        }
+
+        let restored = provider_session_request_body_from_frame(
+            &mut pending_payloads,
+            session_id,
+            &json!({
+                "t": "s.req",
+                "rid": request_id,
+                "body_ref": manifest,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(restored, body);
+        assert!(pending_payloads.is_empty());
+    }
+
+    #[test]
+    fn provider_session_rejects_corrupt_chunked_request_body() {
+        let body = json!({ "messages": [{ "role": "user", "content": "hello" }], "stream": true });
+        let (manifest, mut chunks) = mayhem_proto::chunk_json_payload(&body, 8).unwrap();
+        chunks[0].data = "00".repeat(8);
+        let session_id = "sess-corrupt";
+        let request_id = "req-corrupt";
+        let mut pending_payloads = HashMap::new();
+        for chunk in chunks {
+            provider_session_collect_request_chunk(
+                &mut pending_payloads,
+                session_id,
+                &json!({
+                    "t": "s.req_chunk",
+                    "rid": request_id,
+                    "payload_id": manifest.blake3,
+                    "chunk": chunk,
+                }),
+            )
+            .unwrap();
+        }
+
+        let err = provider_session_request_body_from_frame(
+            &mut pending_payloads,
+            session_id,
+            &json!({
+                "t": "s.req",
+                "rid": request_id,
+                "body_ref": manifest,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("reassembling s.req body_ref failed"));
+    }
+
+    #[test]
+    fn provider_session_content_deltas_distribute_token_ids_incrementally() {
+        let parts = provider_stream_parts("one two three four five");
+        let token_ids = vec![10, 11, 12, 13, 14, 15, 16];
+        let mut observed = Vec::new();
+
+        for (index, part) in parts.iter().enumerate() {
+            let delta = provider_token_ids_delta_for_part(&token_ids, index, parts.len());
+            let frame = provider_session_content_delta_frame("rid", index as u64, part, delta);
+            observed.extend(
+                frame["token_ids_delta"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_i64().unwrap() as i32),
+            );
+        }
+
+        assert_eq!(observed, token_ids);
     }
 
     #[test]

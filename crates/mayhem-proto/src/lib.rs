@@ -21,6 +21,10 @@ pub const USAGE_IMAGE: &str = "image";
 pub const USAGE_STEP: &str = "step";
 pub const USAGE_INPUT_CHARACTER: &str = "input_character";
 pub const USAGE_AUDIO_SECOND: &str = "audio_second";
+pub const DEFAULT_SESSION_MAX_FRAME_BYTES: usize = 256 * 1024;
+pub const DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES: usize = 16 * 1024;
+pub const SESSION_PAYLOAD_CHUNK_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_PAYLOAD_CHUNK_ENCODING: &str = "hex";
 pub const TIER1_SOFTWARE_ATTESTATION_TIER: u8 = 1;
 pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
 pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
@@ -575,6 +579,445 @@ pub fn session_frame_head(frame: &serde_json::Value) -> Result<String, serde_jso
     )
 }
 
+pub fn stable_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&stable_json_value(value))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PayloadChunkManifest {
+    #[serde(rename = "v")]
+    pub schema_version: u32,
+    pub encoding: String,
+    pub total_len: u64,
+    pub chunk_size: u64,
+    pub chunk_count: u64,
+    pub blake3: String,
+    pub chunks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PayloadChunk {
+    pub i: u64,
+    pub offset: u64,
+    pub len: u64,
+    pub blake3: String,
+    pub encoding: String,
+    pub data: String,
+    #[serde(rename = "final")]
+    pub final_chunk: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PayloadChunkError {
+    EmptyChunkSize,
+    UnsupportedSchemaVersion(u32),
+    UnsupportedEncoding(String),
+    LengthOverflow,
+    InvalidDigest(String),
+    InvalidHex(String),
+    MissingChunk {
+        index: u64,
+    },
+    DuplicateChunk {
+        index: u64,
+    },
+    ReorderedChunk {
+        expected: u64,
+        got: u64,
+    },
+    ChunkHashMismatch {
+        index: u64,
+        expected: String,
+        got: String,
+    },
+    RootHashMismatch {
+        expected: String,
+        got: String,
+    },
+    OffsetMismatch {
+        index: u64,
+        expected: u64,
+        got: u64,
+    },
+    LenMismatch {
+        index: u64,
+        expected: u64,
+        got: u64,
+    },
+    FinalFlagMismatch {
+        index: u64,
+    },
+    TotalLenMismatch {
+        expected: u64,
+        got: u64,
+    },
+    ChunkCountMismatch {
+        expected: u64,
+        got: u64,
+    },
+    Json(String),
+}
+
+impl fmt::Display for PayloadChunkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyChunkSize => write!(f, "payload chunk size must be greater than zero"),
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(f, "unsupported payload chunk schema version {version}")
+            }
+            Self::UnsupportedEncoding(encoding) => {
+                write!(f, "unsupported payload chunk encoding {encoding}")
+            }
+            Self::LengthOverflow => write!(f, "payload length overflowed target integer"),
+            Self::InvalidDigest(label) => write!(f, "{label} must be a 32-byte hex digest"),
+            Self::InvalidHex(label) => write!(f, "{label} is not valid hex"),
+            Self::MissingChunk { index } => write!(f, "payload chunk {index} is missing"),
+            Self::DuplicateChunk { index } => write!(f, "payload chunk {index} is duplicated"),
+            Self::ReorderedChunk { expected, got } => {
+                write!(
+                    f,
+                    "payload chunks are reordered: expected {expected}, got {got}"
+                )
+            }
+            Self::ChunkHashMismatch {
+                index,
+                expected,
+                got,
+            } => write!(
+                f,
+                "payload chunk {index} blake3 mismatch: expected {expected}, got {got}"
+            ),
+            Self::RootHashMismatch { expected, got } => {
+                write!(f, "payload blake3 mismatch: expected {expected}, got {got}")
+            }
+            Self::OffsetMismatch {
+                index,
+                expected,
+                got,
+            } => write!(
+                f,
+                "payload chunk {index} offset mismatch: expected {expected}, got {got}"
+            ),
+            Self::LenMismatch {
+                index,
+                expected,
+                got,
+            } => write!(
+                f,
+                "payload chunk {index} length mismatch: expected {expected}, got {got}"
+            ),
+            Self::FinalFlagMismatch { index } => {
+                write!(f, "payload chunk {index} final flag mismatch")
+            }
+            Self::TotalLenMismatch { expected, got } => {
+                write!(
+                    f,
+                    "payload total length mismatch: expected {expected}, got {got}"
+                )
+            }
+            Self::ChunkCountMismatch { expected, got } => {
+                write!(
+                    f,
+                    "payload chunk count mismatch: expected {expected}, got {got}"
+                )
+            }
+            Self::Json(message) => write!(f, "payload JSON error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for PayloadChunkError {}
+
+pub fn chunk_json_payload(
+    value: &serde_json::Value,
+    chunk_size: usize,
+) -> Result<(PayloadChunkManifest, Vec<PayloadChunk>), PayloadChunkError> {
+    let bytes = stable_json_bytes(value).map_err(|err| PayloadChunkError::Json(err.to_string()))?;
+    chunk_payload_bytes(&bytes, chunk_size)
+}
+
+pub fn reassemble_json_payload(
+    manifest: &PayloadChunkManifest,
+    chunks: &[PayloadChunk],
+) -> Result<serde_json::Value, PayloadChunkError> {
+    let bytes = reassemble_payload_chunks(manifest, chunks)?;
+    serde_json::from_slice(&bytes).map_err(|err| PayloadChunkError::Json(err.to_string()))
+}
+
+pub fn chunk_payload_bytes(
+    bytes: &[u8],
+    chunk_size: usize,
+) -> Result<(PayloadChunkManifest, Vec<PayloadChunk>), PayloadChunkError> {
+    if chunk_size == 0 {
+        return Err(PayloadChunkError::EmptyChunkSize);
+    }
+    let total_len = u64::try_from(bytes.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+    let chunk_size_u64 =
+        u64::try_from(chunk_size).map_err(|_| PayloadChunkError::LengthOverflow)?;
+    let root = blake3_hex(bytes);
+    let mut chunks = Vec::new();
+    if bytes.is_empty() {
+        return Ok((
+            PayloadChunkManifest {
+                schema_version: SESSION_PAYLOAD_CHUNK_SCHEMA_VERSION,
+                encoding: SESSION_PAYLOAD_CHUNK_ENCODING.to_owned(),
+                total_len,
+                chunk_size: chunk_size_u64,
+                chunk_count: 0,
+                blake3: root,
+                chunks: Vec::new(),
+            },
+            chunks,
+        ));
+    }
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let index_u64 = u64::try_from(index).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        let offset = index
+            .checked_mul(chunk_size)
+            .ok_or(PayloadChunkError::LengthOverflow)?;
+        let offset_u64 = u64::try_from(offset).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        let len_u64 = u64::try_from(chunk.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        let hash = blake3_hex(chunk);
+        chunks.push(PayloadChunk {
+            i: index_u64,
+            offset: offset_u64,
+            len: len_u64,
+            blake3: hash,
+            encoding: SESSION_PAYLOAD_CHUNK_ENCODING.to_owned(),
+            data: hex_encode(chunk),
+            final_chunk: false,
+        });
+    }
+    if let Some(last) = chunks.last_mut() {
+        last.final_chunk = true;
+    }
+    let manifest = PayloadChunkManifest {
+        schema_version: SESSION_PAYLOAD_CHUNK_SCHEMA_VERSION,
+        encoding: SESSION_PAYLOAD_CHUNK_ENCODING.to_owned(),
+        total_len,
+        chunk_size: chunk_size_u64,
+        chunk_count: u64::try_from(chunks.len()).map_err(|_| PayloadChunkError::LengthOverflow)?,
+        blake3: root,
+        chunks: chunks.iter().map(|chunk| chunk.blake3.clone()).collect(),
+    };
+    Ok((manifest, chunks))
+}
+
+pub fn reassemble_payload_chunks(
+    manifest: &PayloadChunkManifest,
+    chunks: &[PayloadChunk],
+) -> Result<Vec<u8>, PayloadChunkError> {
+    validate_payload_manifest(manifest)?;
+    let got_count = u64::try_from(chunks.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+    if got_count != manifest.chunk_count {
+        return Err(PayloadChunkError::ChunkCountMismatch {
+            expected: manifest.chunk_count,
+            got: got_count,
+        });
+    }
+    if manifest.chunk_count == 0 {
+        if manifest.total_len != 0 {
+            return Err(PayloadChunkError::TotalLenMismatch {
+                expected: manifest.total_len,
+                got: 0,
+            });
+        }
+        let actual = blake3_hex(&[]);
+        if actual != manifest.blake3 {
+            return Err(PayloadChunkError::RootHashMismatch {
+                expected: manifest.blake3.clone(),
+                got: actual,
+            });
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut seen = vec![false; chunks.len()];
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(manifest.total_len).map_err(|_| PayloadChunkError::LengthOverflow)?,
+    );
+    for (expected_index, chunk) in chunks.iter().enumerate() {
+        let expected_index_u64 =
+            u64::try_from(expected_index).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        validate_payload_chunk(chunk)?;
+        if chunk.i != expected_index_u64 {
+            return Err(PayloadChunkError::ReorderedChunk {
+                expected: expected_index_u64,
+                got: chunk.i,
+            });
+        }
+        let seen_index = usize::try_from(chunk.i).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if seen_index >= seen.len() {
+            return Err(PayloadChunkError::MissingChunk { index: chunk.i });
+        }
+        if seen[seen_index] {
+            return Err(PayloadChunkError::DuplicateChunk { index: chunk.i });
+        }
+        seen[seen_index] = true;
+        let expected_hash =
+            manifest
+                .chunks
+                .get(expected_index)
+                .ok_or(PayloadChunkError::MissingChunk {
+                    index: expected_index_u64,
+                })?;
+        if &chunk.blake3 != expected_hash {
+            return Err(PayloadChunkError::ChunkHashMismatch {
+                index: chunk.i,
+                expected: expected_hash.clone(),
+                got: chunk.blake3.clone(),
+            });
+        }
+        let expected_offset =
+            u64::try_from(bytes.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if chunk.offset != expected_offset {
+            return Err(PayloadChunkError::OffsetMismatch {
+                index: chunk.i,
+                expected: expected_offset,
+                got: chunk.offset,
+            });
+        }
+        let decoded = hex_decode(&chunk.data, "payload chunk data")?;
+        let decoded_len =
+            u64::try_from(decoded.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+        if decoded_len != chunk.len {
+            return Err(PayloadChunkError::LenMismatch {
+                index: chunk.i,
+                expected: chunk.len,
+                got: decoded_len,
+            });
+        }
+        let actual_hash = blake3_hex(&decoded);
+        if actual_hash != chunk.blake3 {
+            return Err(PayloadChunkError::ChunkHashMismatch {
+                index: chunk.i,
+                expected: chunk.blake3.clone(),
+                got: actual_hash,
+            });
+        }
+        let should_be_final = expected_index + 1 == chunks.len();
+        if chunk.final_chunk != should_be_final {
+            return Err(PayloadChunkError::FinalFlagMismatch { index: chunk.i });
+        }
+        bytes.extend_from_slice(&decoded);
+    }
+    if let Some((index, _)) = seen.iter().enumerate().find(|(_, seen)| !**seen) {
+        return Err(PayloadChunkError::MissingChunk {
+            index: u64::try_from(index).map_err(|_| PayloadChunkError::LengthOverflow)?,
+        });
+    }
+    let got_len = u64::try_from(bytes.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+    if got_len != manifest.total_len {
+        return Err(PayloadChunkError::TotalLenMismatch {
+            expected: manifest.total_len,
+            got: got_len,
+        });
+    }
+    let actual_root = blake3_hex(&bytes);
+    if actual_root != manifest.blake3 {
+        return Err(PayloadChunkError::RootHashMismatch {
+            expected: manifest.blake3.clone(),
+            got: actual_root,
+        });
+    }
+    Ok(bytes)
+}
+
+fn validate_payload_manifest(manifest: &PayloadChunkManifest) -> Result<(), PayloadChunkError> {
+    if manifest.schema_version != SESSION_PAYLOAD_CHUNK_SCHEMA_VERSION {
+        return Err(PayloadChunkError::UnsupportedSchemaVersion(
+            manifest.schema_version,
+        ));
+    }
+    if manifest.encoding != SESSION_PAYLOAD_CHUNK_ENCODING {
+        return Err(PayloadChunkError::UnsupportedEncoding(
+            manifest.encoding.clone(),
+        ));
+    }
+    if manifest.chunk_size == 0 && manifest.chunk_count > 0 {
+        return Err(PayloadChunkError::EmptyChunkSize);
+    }
+    if !is_hex_len(&manifest.blake3, 64) {
+        return Err(PayloadChunkError::InvalidDigest(
+            "payload blake3".to_owned(),
+        ));
+    }
+    let declared_count =
+        u64::try_from(manifest.chunks.len()).map_err(|_| PayloadChunkError::LengthOverflow)?;
+    if declared_count != manifest.chunk_count {
+        return Err(PayloadChunkError::ChunkCountMismatch {
+            expected: manifest.chunk_count,
+            got: declared_count,
+        });
+    }
+    for (index, hash) in manifest.chunks.iter().enumerate() {
+        if !is_hex_len(hash, 64) {
+            return Err(PayloadChunkError::InvalidDigest(format!(
+                "payload chunk {index} blake3"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_payload_chunk(chunk: &PayloadChunk) -> Result<(), PayloadChunkError> {
+    if chunk.encoding != SESSION_PAYLOAD_CHUNK_ENCODING {
+        return Err(PayloadChunkError::UnsupportedEncoding(
+            chunk.encoding.clone(),
+        ));
+    }
+    if !is_hex_len(&chunk.blake3, 64) {
+        return Err(PayloadChunkError::InvalidDigest(format!(
+            "payload chunk {} blake3",
+            chunk.i
+        )));
+    }
+    Ok(())
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(value: &str, label: &str) -> Result<Vec<u8>, PayloadChunkError> {
+    if value.len() % 2 != 0 {
+        return Err(PayloadChunkError::InvalidHex(label.to_owned()));
+    }
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for index in (0..bytes.len()).step_by(2) {
+        let high = hex_nibble(bytes[index])
+            .ok_or_else(|| PayloadChunkError::InvalidHex(label.to_owned()))?;
+        let low = hex_nibble(bytes[index + 1])
+            .ok_or_else(|| PayloadChunkError::InvalidHex(label.to_owned()))?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn stable_json_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => {
@@ -899,5 +1342,52 @@ mod tests {
             session_frame_head(&changed).unwrap(),
             session_frame_head(&reordered).unwrap()
         );
+    }
+
+    #[test]
+    fn payload_chunks_roundtrip_stable_json() {
+        let value = json!({
+            "z": "tail",
+            "a": ["hello", "world", { "nested": true }],
+            "long": "x".repeat(DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES + 17),
+        });
+        let (manifest, chunks) = chunk_json_payload(&value, 1024).unwrap();
+        assert!(chunks.len() > 1);
+        assert_eq!(manifest.chunk_count, chunks.len() as u64);
+        let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
+        assert_eq!(restored, stable_json_value(&value));
+    }
+
+    #[test]
+    fn payload_chunks_reject_missing_duplicate_reordered_and_corrupt_chunks() {
+        let bytes = b"chunk me into enough pieces to test the guard rails";
+        let (manifest, chunks) = chunk_payload_bytes(bytes, 8).unwrap();
+
+        let missing = &chunks[..chunks.len() - 1];
+        assert!(matches!(
+            reassemble_payload_chunks(&manifest, missing).unwrap_err(),
+            PayloadChunkError::ChunkCountMismatch { .. }
+        ));
+
+        let mut duplicate = chunks.clone();
+        duplicate[1] = duplicate[0].clone();
+        assert!(matches!(
+            reassemble_payload_chunks(&manifest, &duplicate).unwrap_err(),
+            PayloadChunkError::ReorderedChunk { .. } | PayloadChunkError::DuplicateChunk { .. }
+        ));
+
+        let mut reordered = chunks.clone();
+        reordered.swap(0, 1);
+        assert!(matches!(
+            reassemble_payload_chunks(&manifest, &reordered).unwrap_err(),
+            PayloadChunkError::ReorderedChunk { .. }
+        ));
+
+        let mut corrupt = chunks.clone();
+        corrupt[0].data = "00".repeat(8);
+        assert!(matches!(
+            reassemble_payload_chunks(&manifest, &corrupt).unwrap_err(),
+            PayloadChunkError::ChunkHashMismatch { .. }
+        ));
     }
 }
