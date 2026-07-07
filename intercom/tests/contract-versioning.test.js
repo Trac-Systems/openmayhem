@@ -183,7 +183,7 @@ test('receipt schema migration normalizes legacy usage maps', async () => {
     user_sig: b4a.toString(user.wallet.sign(message), 'hex'),
   };
 
-  const migrated = contract.normalizeReceiptEnvelope(envelope, {
+  const migrated = await contract.normalizeReceiptEnvelope(envelope, {
     targetSchemaVersion: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
   });
   assert.equal(migrated instanceof Error, false, migrated.message);
@@ -192,7 +192,7 @@ test('receipt schema migration normalizes legacy usage maps', async () => {
   assert.deepEqual(migrated.signed_body, body);
   assert.equal(contract.verifyReceiptEnvelope(migrated), true);
 
-  const unsupported = contract.normalizeReceiptEnvelope(
+  const unsupported = await contract.normalizeReceiptEnvelope(
     { ...envelope, body: { ...body, schema_version: 99 } },
     { targetSchemaVersion: NEXT_SESSION_RECEIPT_SCHEMA_VERSION }
   );

@@ -54,7 +54,6 @@ const CTX_BRACKETS = Object.freeze([
   { id: 'le256k', max_ctx: 262_144 },
   { id: 'gt256k', max_ctx: null },
 ]);
-const CTX_BRACKET_IDS = new Set(CTX_BRACKETS.map((entry) => entry.id));
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
@@ -374,9 +373,9 @@ export const contractCtxBracketTable = () => ({
   brackets: cloneValue(CTX_BRACKETS),
 });
 
-const ctxBracketForTokens = (tokens) => {
+const ctxBracketForTokens = (tokens, table = CTX_BRACKETS) => {
   if (!Number.isSafeInteger(tokens) || tokens < 0) return null;
-  const bracket = CTX_BRACKETS.find((entry) => entry.max_ctx === null || tokens <= entry.max_ctx);
+  const bracket = table.find((entry) => entry.max_ctx === null || tokens <= entry.max_ctx);
   return bracket?.id ?? null;
 };
 
@@ -447,6 +446,27 @@ class MayhemContract extends Contract {
           items: { type: 'string', min: 1, max: 64 },
           optional: true,
         },
+      },
+    });
+
+    this.addSchema('setCtxBrackets', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        submitted_at: { type: 'number', integer: true, min: 0 },
+        effective_at: { type: 'number', integer: true, min: 0 },
+        brackets: { type: 'array', min: 1, max: 32, items: { type: 'any' } },
+      },
+    });
+
+    this.addSchema('readCtxBrackets', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        at: { type: 'number', integer: true, min: 0, optional: true },
+        ver: { type: 'number', integer: true, min: 1, optional: true },
       },
     });
 
@@ -1006,7 +1026,7 @@ class MayhemContract extends Contract {
   }
 
   async applySpendReserveFeature(key, value) {
-    const normalized = this.normalizeSpendReserveValue(value);
+    const normalized = await this.normalizeSpendReserveValue(value);
     if (normalized instanceof Error) return normalized;
     normalized.voucher_hash = await this.opaqueHash('mayhem-spend-voucher-record-v1', normalized.voucher_body);
     const expectedKey = await this.spendReservationFeatureKey(normalized);
@@ -1067,7 +1087,7 @@ class MayhemContract extends Contract {
     if (balanceError) return balanceError;
 
     const holdKey = this.spendHoldKey(normalized.user, normalized.rail, normalized.epoch);
-    const hold = this.normalizeSpendHoldRecord(
+    const hold = await this.normalizeSpendHoldRecord(
       (await this.get(holdKey)) ?? null,
       normalized.user,
       normalized.rail,
@@ -1369,6 +1389,67 @@ class MayhemContract extends Contract {
     const params = await this.activeParamsAt(this.value.at, keys);
     console.log('mayhem readParams', { at: this.value.at, params });
     return { ok: true, op: 'readParams', at: this.value.at, params };
+  }
+
+  async setCtxBrackets() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const governanceParams = await this.activeParamsAt(this.value.submitted_at, [
+      'param_activation_delay_seconds',
+    ]);
+    if (
+      this.value.effective_at - this.value.submitted_at <
+      governanceParams.param_activation_delay_seconds
+    ) {
+      return new Error('Context bracket changes require at least the active param_activation_delay_seconds.');
+    }
+
+    const brackets = this.normalizeCtxBracketTable(this.value.brackets);
+    if (brackets instanceof Error) return brackets;
+
+    const schedule = await this.ctxBracketSchedule();
+    if (schedule.pending && schedule.pending.effective_at > this.value.submitted_at) {
+      return new Error('Pending context bracket table already scheduled.');
+    }
+    const latest = this.ctxBracketLatestEntry(schedule);
+    const record = {
+      ver: latest.ver + 1,
+      brackets,
+      submitted_at: this.value.submitted_at,
+      effective_at: this.value.effective_at,
+      effective_from: this.tx,
+      updated_at: this.tx,
+      set_by: this.address,
+      set_by_role: 'admin',
+    };
+    const updated = {
+      current: schedule.current,
+      pending: schedule.pending,
+    };
+    if (updated.pending && updated.pending.effective_at <= this.value.effective_at) {
+      updated.current = updated.pending;
+      updated.pending = null;
+    }
+    if (updated.pending) return new Error('Pending context bracket table already scheduled.');
+    updated.pending = record;
+
+    await this.put('ctx_brackets', updated);
+    await this.put(`ctx_brackets/v/${record.ver}`, record);
+    console.log('mayhem setCtxBrackets', record);
+    return { ok: true, op: 'setCtxBrackets', ver: record.ver, effective_at: record.effective_at };
+  }
+
+  async readCtxBrackets() {
+    if (hasOwn(this.value, 'ver') && hasOwn(this.value, 'at')) {
+      return new Error('Read context brackets by either ver or at, not both.');
+    }
+    const table = hasOwn(this.value, 'ver')
+      ? await this.ctxBracketTableByVersion(this.value.ver)
+      : await this.ctxBracketTableAt(this.value.at ?? 0);
+    if (table instanceof Error) return table;
+    console.log('mayhem readCtxBrackets', table);
+    return { ok: true, op: 'readCtxBrackets', table };
   }
 
   async consent() {
@@ -3053,7 +3134,7 @@ class MayhemContract extends Contract {
       if (!hasOwn(this.value, 'claimed_mu_owed_cum')) {
         return new Error('Over-credit fraud proof requires claimed_mu_owed_cum.');
       }
-      const receipt = this.normalizeReceiptEnvelope(this.value.receipt);
+      const receipt = await this.normalizeReceiptEnvelope(this.value.receipt);
       if (receipt instanceof Error) return receipt;
       if (!this.verifyReceiptEnvelope(receipt)) {
         return new Error('Invalid receipt signature.');
@@ -4488,6 +4569,100 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  normalizeCtxBracketTable(brackets) {
+    if (!Array.isArray(brackets) || brackets.length === 0 || brackets.length > 32) {
+      return new Error('Context bracket table must be a non-empty array.');
+    }
+    const ids = new Set();
+    let previousMax = 0;
+    const normalized = [];
+    for (let idx = 0; idx < brackets.length; idx += 1) {
+      const entry = brackets[idx];
+      const shapeError = this.validateExactObjectKeys(entry, ['id', 'max_ctx'], 'context bracket');
+      if (shapeError) return shapeError;
+      if (!this.isSafeKeyPart(entry.id)) return new Error('Invalid context bracket id.');
+      if (ids.has(entry.id)) return new Error('Duplicate context bracket id.');
+      ids.add(entry.id);
+
+      const isLast = idx === brackets.length - 1;
+      if (isLast) {
+        if (entry.max_ctx !== null) return new Error('Last context bracket max_ctx must be null.');
+        normalized.push({ id: entry.id, max_ctx: null });
+        continue;
+      }
+      if (!Number.isSafeInteger(entry.max_ctx) || entry.max_ctx <= previousMax) {
+        return new Error('Context bracket max_ctx values must increase.');
+      }
+      previousMax = entry.max_ctx;
+      normalized.push({ id: entry.id, max_ctx: entry.max_ctx });
+    }
+    return normalized;
+  }
+
+  defaultCtxBracketTableRecord() {
+    return {
+      ver: CTX_BRACKET_TABLE_VERSION,
+      brackets: cloneValue(CTX_BRACKETS),
+      submitted_at: 0,
+      effective_at: 0,
+      effective_from: null,
+      updated_at: null,
+      set_by: null,
+      set_by_role: 'genesis',
+    };
+  }
+
+  async ctxBracketSchedule() {
+    if (!this.storage) return { current: this.defaultCtxBracketTableRecord(), pending: null };
+    const stored = await this.get('ctx_brackets');
+    const fallback = this.defaultCtxBracketTableRecord();
+    if (!stored) return { current: fallback, pending: null };
+    return {
+      current: stored.current ?? fallback,
+      pending: stored.pending ?? null,
+    };
+  }
+
+  ctxBracketLatestEntry(schedule) {
+    if (schedule.pending && schedule.pending.ver > schedule.current.ver) return schedule.pending;
+    return schedule.current;
+  }
+
+  ctxBracketActiveEntry(schedule, at) {
+    if (schedule.pending && schedule.pending.effective_at <= at) return schedule.pending;
+    return schedule.current;
+  }
+
+  async ctxBracketTableAt(at) {
+    if (!Number.isSafeInteger(at) || at < 0) return new Error('Invalid context bracket timestamp.');
+    return cloneValue(this.ctxBracketActiveEntry(await this.ctxBracketSchedule(), at));
+  }
+
+  async ctxBracketTableByVersion(ver) {
+    if (!Number.isSafeInteger(ver) || ver < 1) return new Error('Invalid context bracket table version.');
+    if (ver === CTX_BRACKET_TABLE_VERSION) return this.defaultCtxBracketTableRecord();
+    const record = await this.get(`ctx_brackets/v/${ver}`);
+    if (!record) return new Error('Unknown context bracket table version.');
+    return cloneValue(record);
+  }
+
+  validateCtxBracketEvidence(tokens, bracket, tableVer, table, label) {
+    if (typeof bracket !== 'string') return new Error(`Invalid ${label} context bracket.`);
+    if (!Number.isSafeInteger(tableVer) || tableVer < 1) {
+      return new Error(`Invalid ${label} context bracket table version.`);
+    }
+    if (!table || table.ver !== tableVer) {
+      return new Error(`${label} context bracket table version mismatch.`);
+    }
+    if (!Array.isArray(table.brackets) || !table.brackets.some((entry) => entry.id === bracket)) {
+      return new Error(`Invalid ${label} context bracket.`);
+    }
+    if (ctxBracketForTokens(tokens, table.brackets) !== bracket) {
+      return new Error(`${label} context bracket does not match served context.`);
+    }
+    return null;
+  }
+
   validateProviderLifecycleIntent(intent) {
     if (!PROVIDER_LIFECYCLE_OPS.has(intent.op)) return new Error('Unsupported provider lifecycle op.');
     const allowed = intent.op === 'register_provider'
@@ -4523,7 +4698,7 @@ class MayhemContract extends Contract {
   }
 
   async spendReservationFeatureKey(value) {
-    const normalized = value.voucher_body ? value : this.normalizeSpendReserveValue(value);
+    const normalized = value.voucher_body ? value : await this.normalizeSpendReserveValue(value);
     if (normalized instanceof Error) return normalized;
     const digest = b4a.toString(
       await blake3(b4a.from(stableJson({
@@ -5439,7 +5614,7 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  normalizeSpendVoucherForReserve(voucher) {
+  async normalizeSpendVoucherForReserve(voucher) {
     const shapeError = this.validateExactObjectKeys(
       voucher,
       [
@@ -5484,15 +5659,16 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(voucher.served_ctx) || voucher.served_ctx < 0) {
       return new Error('Invalid spend voucher served context.');
     }
-    if (typeof voucher.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(voucher.ctx_bracket)) {
-      return new Error('Invalid spend voucher context bracket.');
-    }
-    if (voucher.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
-      return new Error('Unsupported spend voucher context bracket table version.');
-    }
-    if (ctxBracketForTokens(voucher.served_ctx) !== voucher.ctx_bracket) {
-      return new Error('Spend voucher context bracket does not match served context.');
-    }
+    const table = await this.ctxBracketTableByVersion(voucher.ctx_bracket_table_ver);
+    if (table instanceof Error) return table;
+    const ctxError = this.validateCtxBracketEvidence(
+      voucher.served_ctx,
+      voucher.ctx_bracket,
+      voucher.ctx_bracket_table_ver,
+      table,
+      'spend voucher'
+    );
+    if (ctxError) return ctxError;
     if (!Number.isSafeInteger(voucher.max_spend_mu) || voucher.max_spend_mu < 1) {
       return new Error('Invalid spend voucher max spend.');
     }
@@ -5527,7 +5703,7 @@ class MayhemContract extends Contract {
     };
   }
 
-  normalizeSpendReserveValue(value) {
+  async normalizeSpendReserveValue(value) {
     const shapeError = this.validateExactObjectKeys(
       value,
       [
@@ -5571,22 +5747,26 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.served_ctx) || value.served_ctx < 0) {
       return new Error('Invalid spend reservation served context.');
     }
-    if (typeof value.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(value.ctx_bracket)) {
-      return new Error('Invalid spend reservation context bracket.');
+    const activeTable = await this.ctxBracketTableAt(value.at);
+    if (activeTable instanceof Error) return activeTable;
+    if (value.ctx_bracket_table_ver !== activeTable.ver) {
+      return new Error('Spend reservation context bracket table is not active.');
     }
-    if (value.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
-      return new Error('Unsupported spend reservation context bracket table version.');
-    }
-    if (ctxBracketForTokens(value.served_ctx) !== value.ctx_bracket) {
-      return new Error('Spend reservation context bracket does not match served context.');
-    }
+    const ctxError = this.validateCtxBracketEvidence(
+      value.served_ctx,
+      value.ctx_bracket,
+      value.ctx_bracket_table_ver,
+      activeTable,
+      'spend reservation'
+    );
+    if (ctxError) return ctxError;
     if (!Number.isSafeInteger(value.max_spend_mu) || value.max_spend_mu < 1) {
       return new Error('Invalid spend reservation max spend.');
     }
     if (!this.isHexBytes(value.provider_sig, 64)) {
       return new Error('Invalid spend reservation provider signature.');
     }
-    const voucher = this.normalizeSpendVoucherForReserve(value.voucher);
+    const voucher = await this.normalizeSpendVoucherForReserve(value.voucher);
     if (voucher instanceof Error) return voucher;
     if (voucher.session_id !== value.session_id.toLowerCase()) {
       return new Error('Spend reservation voucher session mismatch.');
@@ -5649,7 +5829,7 @@ class MayhemContract extends Contract {
     };
   }
 
-  normalizeSpendHoldRecord(record, user, rail, epoch) {
+  async normalizeSpendHoldRecord(record, user, rail, epoch) {
     if (!record) {
       return {
         user,
@@ -5700,15 +5880,16 @@ class MayhemContract extends Contract {
       if (!Number.isSafeInteger(session.served_ctx) || session.served_ctx < 0) {
         return new Error('Invalid spend hold served context.');
       }
-      if (typeof session.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(session.ctx_bracket)) {
-        return new Error('Invalid spend hold context bracket.');
-      }
-      if (session.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
-        return new Error('Unsupported spend hold context bracket table version.');
-      }
-      if (ctxBracketForTokens(session.served_ctx) !== session.ctx_bracket) {
-        return new Error('Spend hold context bracket does not match served context.');
-      }
+      const table = await this.ctxBracketTableByVersion(session.ctx_bracket_table_ver);
+      if (table instanceof Error) return table;
+      const ctxError = this.validateCtxBracketEvidence(
+        session.served_ctx,
+        session.ctx_bracket,
+        session.ctx_bracket_table_ver,
+        table,
+        'spend hold'
+      );
+      if (ctxError) return ctxError;
       if (!Number.isSafeInteger(session.max_spend_mu) || session.max_spend_mu < 1) {
         return new Error('Invalid spend hold max spend.');
       }
@@ -6788,7 +6969,7 @@ class MayhemContract extends Contract {
     return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => compareCodepoint(left, right)));
   }
 
-  normalizeReceiptEnvelope(value, options = {}) {
+  async normalizeReceiptEnvelope(value, options = {}) {
     const targetSchemaVersion = options.targetSchemaVersion ?? SESSION_RECEIPT_SCHEMA_VERSION;
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Fraud proof receipt must be an object.');
@@ -6833,7 +7014,7 @@ class MayhemContract extends Contract {
     const migratedBody = this.migrateReceiptBody(body, targetSchemaVersion);
     if (migratedBody instanceof Error) return migratedBody;
 
-    const bodyError = this.validateReceiptBody(migratedBody, targetSchemaVersion);
+    const bodyError = await this.validateReceiptBody(migratedBody, targetSchemaVersion);
     if (bodyError) return bodyError;
 
     const envelope = {
@@ -6898,7 +7079,7 @@ class MayhemContract extends Contract {
     return migrated;
   }
 
-  validateReceiptBody(body, expectedSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
+  async validateReceiptBody(body, expectedSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
     if (body.schema_version !== expectedSchemaVersion) {
       return new Error('Unsupported receipt schema version.');
     }
@@ -6931,15 +7112,16 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(body.served_ctx) || body.served_ctx < 0) {
       return new Error('Invalid receipt served context.');
     }
-    if (typeof body.ctx_bracket !== 'string' || !CTX_BRACKET_IDS.has(body.ctx_bracket)) {
-      return new Error('Invalid receipt context bracket.');
-    }
-    if (body.ctx_bracket_table_ver !== CTX_BRACKET_TABLE_VERSION) {
-      return new Error('Unsupported receipt context bracket table version.');
-    }
-    if (ctxBracketForTokens(body.served_ctx) !== body.ctx_bracket) {
-      return new Error('Receipt context bracket does not match served context.');
-    }
+    const table = await this.ctxBracketTableByVersion(body.ctx_bracket_table_ver);
+    if (table instanceof Error) return table;
+    const ctxError = this.validateCtxBracketEvidence(
+      body.served_ctx,
+      body.ctx_bracket,
+      body.ctx_bracket_table_ver,
+      table,
+      'receipt'
+    );
+    if (ctxError) return ctxError;
     if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
       return new Error('Invalid receipt rules version.');
     }

@@ -16,6 +16,7 @@ import {
   signConsent,
   signSpendReservation,
   signSpendVoucher,
+  spendReservationFeatureKey,
 } from './helpers/contract.js';
 
 const rulesHash = '7'.repeat(64);
@@ -184,6 +185,7 @@ function signedSpendReservation(
     servedCtx = 8192,
     ctxBracket = ctxBracketForTokens(servedCtx),
     ctxBracketTableVer = CTX_BRACKET_TABLE_VERSION,
+    at = epoch * 3_600,
   } = {}
 ) {
   const voucherBody = {
@@ -205,7 +207,7 @@ function signedSpendReservation(
     contract_version: CONTRACT_VERSION,
     session_id: sessionId,
     epoch,
-    at: epoch * 3_600,
+    at,
     rail: 'fiat',
     user: ctx.user.publicKey,
     provider: provider.publicKey,
@@ -466,7 +468,7 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
     sessionId: 'a1'.repeat(32),
     maxSpendMu: 700_000,
   });
-  const firstKey = await ctx.contract.spendReservationFeatureKey(first);
+  const firstKey = await spendReservationFeatureKey(ctx.contract, first, ctx.storage);
   const firstResult = await executeSpendReservationFeature(
     ctx.contract,
     ctx.storage,
@@ -621,6 +623,78 @@ test('MayhemContract spend reservation moves to next epoch after epochApply', as
   );
   assert.equal(nextResult.ok, true, nextResult.message);
   assert.equal(nextResult.available_mu, 0);
+});
+
+test('MayhemContract context bracket tables are admin scheduled and pinned by version', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
+
+  const update = {
+    op: 'set_ctx_brackets',
+    submitted_at: 0,
+    effective_at: 86_400,
+    brackets: [
+      { id: 'le16k', max_ctx: 16_384 },
+      { id: 'le64k', max_ctx: 65_536 },
+      { id: 'gt64k', max_ctx: null },
+    ],
+  };
+  const nonAdmin = await execute(ctx.contract, ctx.storage, 'setCtxBrackets', update, ctx.provider.publicKey, 20);
+  assert.match(nonAdmin.message, /Admin required/);
+
+  const scheduled = await execute(ctx.contract, ctx.storage, 'setCtxBrackets', update, ctx.admin.publicKey, 21);
+  assert.equal(scheduled.ok, true, scheduled.message);
+  assert.equal(scheduled.ver, 2);
+
+  const before = await execute(
+    ctx.contract,
+    ctx.storage,
+    'readCtxBrackets',
+    { op: 'read_ctx_brackets', at: 86_399 },
+    ctx.user.publicKey,
+    22
+  );
+  assert.equal(before.table.ver, 1);
+  assert.equal(before.table.brackets[0].id, 'le8k');
+
+  const after = await execute(
+    ctx.contract,
+    ctx.storage,
+    'readCtxBrackets',
+    { op: 'read_ctx_brackets', at: 86_400 },
+    ctx.user.publicKey,
+    23
+  );
+  assert.equal(after.table.ver, 2);
+  assert.equal(after.table.brackets[0].id, 'le16k');
+
+  const oldTableAfterActivation = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'c1'.repeat(32),
+    servedCtx: 12_000,
+    ctxBracket: 'le32k',
+    ctxBracketTableVer: 1,
+    maxSpendMu: 100_000,
+    at: 86_400,
+  });
+  await assert.rejects(
+    spendReservationFeatureKey(ctx.contract, oldTableAfterActivation, ctx.storage),
+    /not active/
+  );
+
+  const currentTableAfterActivation = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'c2'.repeat(32),
+    servedCtx: 12_000,
+    ctxBracket: 'le16k',
+    ctxBracketTableVer: 2,
+    maxSpendMu: 100_000,
+    at: 86_400,
+  });
+  const key = await spendReservationFeatureKey(ctx.contract, currentTableAfterActivation, ctx.storage);
+  assert.match(key, /^hold\/reserve\/fiat\//);
 });
 
 test('MayhemContract epochApply mutates credit, earning, and fee state in place', async () => {

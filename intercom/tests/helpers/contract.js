@@ -169,10 +169,16 @@ export async function executeReputationAnchorFeature(contract, storage, value, s
   return result ?? contract._mayhemLastFeatureResult;
 }
 
-export async function spendReservationFeatureKey(contract, value) {
-  const key = await contract.spendReservationFeatureKey(value);
-  if (key instanceof Error) throw key;
-  return key;
+export async function spendReservationFeatureKey(contract, value, storage = null) {
+  const previousStorage = contract.storage;
+  if (storage) contract.storage = storage;
+  try {
+    const key = await contract.spendReservationFeatureKey(value);
+    if (key instanceof Error) throw key;
+    return key;
+  } finally {
+    if (storage) contract.storage = previousStorage;
+  }
 }
 
 export async function executeSpendReservationFeature(contract, storage, value, sender) {
@@ -181,7 +187,7 @@ export async function executeSpendReservationFeature(contract, storage, value, s
     contract,
     storage,
     'mayhem_feature',
-    await spendReservationFeatureKey(contract, value),
+    await spendReservationFeatureKey(contract, value, storage),
     value,
     sender
   );
