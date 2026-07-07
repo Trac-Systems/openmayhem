@@ -28155,13 +28155,19 @@ fn download_provider_primary_artifact(
             selected.artifact.source.kind
         );
     };
+    provider_download_disk_preflight(
+        args,
+        &destination,
+        selected.artifact.weights_bytes,
+        &format!("{} artifact", selected.artifact_name),
+    )?;
 
     let mut request = DownloadRequest::new(source, destination.clone());
     request.chunk_size = args.chunk_size;
     request.expected_merkle_root = Some(selected.enclave.artifact_root.clone());
     let mut progress =
         ProviderProgressBars::new(args, format!("{} artifact", selected.artifact_name));
-    download_resumable_with_progress(&request, |event| {
+    if let Err(err) = download_resumable_with_progress(&request, |event| {
         progress.update(event);
     })
     .with_context(|| {
@@ -28169,7 +28175,11 @@ fn download_provider_primary_artifact(
             "downloading and verifying artifact root {}",
             selected.enclave.artifact_root
         )
-    })?;
+    }) {
+        cleanup_provider_partial_download(&destination);
+        progress.finish();
+        return Err(err);
+    }
     progress.finish();
     verify_artifact_sha256(&destination, &selected.artifact)?;
     Ok(destination)
@@ -28231,13 +28241,19 @@ fn download_provider_sidecar_artifact(
             sidecar.source.kind
         );
     };
+    provider_download_disk_preflight(
+        args,
+        &destination,
+        ledger_sidecar.weights_bytes,
+        &format!("{}/{} sidecar", selected.artifact_name, name),
+    )?;
 
     let mut request = DownloadRequest::new(source, destination.clone());
     request.chunk_size = args.chunk_size;
     request.expected_merkle_root = Some(ledger_sidecar.artifact_root.clone());
     let mut progress =
         ProviderProgressBars::new(args, format!("{}/{} sidecar", selected.artifact_name, name));
-    download_resumable_with_progress(&request, |event| {
+    if let Err(err) = download_resumable_with_progress(&request, |event| {
         progress.update(event);
     })
     .with_context(|| {
@@ -28245,7 +28261,11 @@ fn download_provider_sidecar_artifact(
             "downloading and verifying sidecar {name} root {}",
             ledger_sidecar.artifact_root
         )
-    })?;
+    }) {
+        cleanup_provider_partial_download(&destination);
+        progress.finish();
+        return Err(err);
+    }
     progress.finish();
     let actual = file_sha256_hex(&destination)?;
     if !actual.eq_ignore_ascii_case(&sidecar.source_sha256) {
@@ -28257,6 +28277,64 @@ fn download_provider_sidecar_artifact(
         );
     }
     Ok(destination)
+}
+
+fn provider_download_partial_path(destination: &Path) -> PathBuf {
+    let mut path = destination.to_path_buf();
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    path.set_file_name(format!("{file_name}.part"));
+    path
+}
+
+fn cleanup_provider_partial_download(destination: &Path) {
+    let part = provider_download_partial_path(destination);
+    let _ = fs::remove_file(part);
+}
+
+fn provider_download_disk_preflight(
+    args: &ProviderStartArgs,
+    destination: &Path,
+    expected_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    if expected_bytes == 0 {
+        bail!(
+            "admin catalog is missing weights_bytes for {label}; cannot safely pre-check disk space before download"
+        );
+    }
+    let part = provider_download_partial_path(destination);
+    let mut partial_bytes = fs::metadata(&part)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if partial_bytes > expected_bytes {
+        let _ = fs::remove_file(&part);
+        partial_bytes = 0;
+    }
+    let remaining_bytes = expected_bytes.saturating_sub(partial_bytes);
+    let (reserve_bytes, reserve_source) =
+        provider_disk_reserve_bytes(args.disk_reserve.as_deref())?;
+    let available_bytes = available_bytes_for_path(destination)?.with_context(|| {
+        format!(
+            "checking available disk space for {}",
+            destination.display()
+        )
+    })?;
+    let required_bytes = remaining_bytes.saturating_add(reserve_bytes);
+    if available_bytes < required_bytes {
+        bail!(
+            "Not enough disk space to download {label}: need {} remaining download bytes plus {} reserve ({reserve_source}), but only {} is free at {}. Free space, choose a different --downloads-dir, or adjust --disk-reserve.",
+            human_bytes(remaining_bytes),
+            human_bytes(reserve_bytes),
+            human_bytes(available_bytes),
+            destination.display()
+        );
+    }
+    Ok(())
 }
 
 fn provider_primary_cache_file(selected: &ProviderCandidate) -> String {
@@ -40357,6 +40435,40 @@ mod tests {
         assert!(
             format!("{err:#}").contains("requires admin artifact_root_kind blake3_merkle_v1"),
             "{err:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn provider_download_preflights_disk_reserve_before_network_fetch() {
+        let temp = env::temp_dir().join(format!(
+            "mayhem-cli-download-disk-preflight-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let contract = test_contract(&root);
+        let mut args = test_provider_start_args();
+        args.disk_reserve = Some("1000000000GB".to_owned());
+        let selected =
+            build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap()[0].clone();
+        let downloads = temp.join("downloads");
+        let destination = downloads.join(provider_primary_cache_file(&selected));
+
+        let err = download_provider_artifact(&args, &downloads, &selected)
+            .await
+            .expect_err("impossible disk reserve must reject before download");
+        assert!(
+            format!("{err:#}").contains("Not enough disk space to download"),
+            "{err:#}"
+        );
+        assert!(
+            !provider_download_partial_path(&destination).exists(),
+            "disk preflight must fail before creating a partial download"
         );
 
         let _ = fs::remove_dir_all(temp);
