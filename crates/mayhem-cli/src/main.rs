@@ -16110,6 +16110,20 @@ fn start_mayhemd_for_up(plan: &UpPlan) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn windows_detached_command(program: impl AsRef<OsStr>) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new(program);
+    command.creation_flags(
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW,
+    );
+    command
+}
+
 fn read_up_logged_dashboard_url(home: &Path) -> Option<String> {
     let log = fs::read_to_string(home.join("mayhemd-up.log")).ok()?;
     log.lines().rev().find_map(|line| {
@@ -16137,18 +16151,14 @@ fn mayhemd_launcher_command(mayhemd_path: &Path) -> Result<std::process::Command
     }
     #[cfg(not(unix))]
     {
-        let mut command = std::process::Command::new(mayhemd_path);
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-            command.creation_flags(
-                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
-            );
+            return Ok(windows_detached_command(mayhemd_path));
         }
-        Ok(command)
+        #[cfg(not(windows))]
+        {
+            Ok(std::process::Command::new(mayhemd_path))
+        }
     }
 }
 
