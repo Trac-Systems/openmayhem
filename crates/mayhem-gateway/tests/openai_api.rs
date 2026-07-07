@@ -2334,6 +2334,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         enclave_id: catalog_enclave_id(&identity),
         room_id,
         price_ver: 7,
+        min_ask_mu: 0,
         att_tier: 1,
         admin_pubkey: identity.admin_pubkey,
         artifact_root: identity.artifact_root,
@@ -2375,6 +2376,7 @@ fn test_provider_heartbeat(
         },
         perf: HeartbeatPerf { tok_s, ttft_ms },
         price_ver: candidate.price_ver,
+        min_ask_mu: 0,
         caps: HeartbeatCaps {
             tools: candidate
                 .caps

@@ -175,6 +175,8 @@ pub struct ProviderHeartbeat {
     pub q: HeartbeatQueue,
     pub perf: HeartbeatPerf,
     pub price_ver: u64,
+    #[serde(default)]
+    pub min_ask_mu: u64,
     pub caps: HeartbeatCaps,
     pub att: HeartbeatAttestation,
     pub ts: u64,
@@ -1736,6 +1738,7 @@ mod tests {
             "q": { "depth": 0, "est_wait_ms": 0 },
             "perf": { "tok_s": 42.0, "ttft_ms": 120 },
             "price_ver": 3,
+            "min_ask_mu": 0,
             "caps": { "tools": true, "json": true, "ctx": 8192, "vision": false },
             "att": { "epoch": 81, "head": "44".repeat(32) },
             "ts": now_millis,

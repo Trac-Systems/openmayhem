@@ -75,6 +75,7 @@ const EMBEDDED_CANARY_LAUNCH_V1: &str =
 const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
+const X_MAYHEM_MAX_PRICE_MU_HEADER: &str = "x-mayhem-max-price-mu";
 const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
 const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
 const X_MAYHEM_STALL_TIMEOUT_MS_HEADER: &str = "x-mayhem-stall-timeout-ms";
@@ -206,6 +207,8 @@ pub struct GatewayRouteCandidate {
     pub enclave_id: String,
     pub room_id: String,
     pub price_ver: u64,
+    #[serde(default)]
+    pub min_ask_mu: u64,
     pub att_tier: u8,
     pub admin_pubkey: String,
     pub artifact_root: String,
@@ -2990,6 +2993,7 @@ struct ResponseMayhemMeta<'a> {
 struct GatewayRequestOptions {
     hedge_requested: bool,
     min_att_tier: Option<u8>,
+    max_price_mu: Option<u64>,
     failover_overrides: GatewayFailoverPolicyConfig,
 }
 
@@ -3312,7 +3316,7 @@ fn provider_table_from_models(models: &[GatewayModel], rules_ver: u64) -> Provid
     for model in models {
         for candidate in &model.mayhem.route_candidates {
             table.upsert_contract(contract_snapshot_for_route(model, candidate, rules_ver));
-            table.upsert_heartbeat(heartbeat_for_route(model, candidate, now), now);
+            table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
         }
     }
     table
@@ -3333,6 +3337,8 @@ fn contract_snapshot_for_route(
         reputation: f64::from(candidate.reputation_bps.min(10_000)) / 10_000.0,
         price_ver: candidate.price_ver,
         rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
+        per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
+        min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
         ref_rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
         probation: candidate.probation.clone(),
         caps: heartbeat_caps_for_route(model, candidate),
@@ -3364,6 +3370,7 @@ fn heartbeat_for_route(
             ttft_ms: 150,
         },
         price_ver: candidate.price_ver,
+        min_ask_mu: candidate.min_ask_mu,
         caps: heartbeat_caps_for_route(model, candidate),
         att: HeartbeatAttestation {
             epoch: 0,
@@ -3503,9 +3510,35 @@ impl GatewayRequestOptions {
         Ok(Self {
             hedge_requested: parse_x_mayhem_hedge(headers)?,
             min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
+            max_price_mu: parse_x_mayhem_max_price_mu(headers)?,
             failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
         })
     }
+}
+
+fn parse_x_mayhem_max_price_mu(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
+    let Some(value) = headers.get(X_MAYHEM_MAX_PRICE_MU_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Max-Price-Mu must be an ASCII positive integer µUSD value",
+            Some("X-Mayhem-Max-Price-Mu"),
+        )
+    })?;
+    let parsed = value.trim().parse::<u64>().map_err(|_| {
+        ApiError::bad_request(
+            "X-Mayhem-Max-Price-Mu must be a positive integer µUSD value",
+            Some("X-Mayhem-Max-Price-Mu"),
+        )
+    })?;
+    if parsed == 0 {
+        return Err(ApiError::bad_request(
+            "X-Mayhem-Max-Price-Mu must be greater than 0",
+            Some("X-Mayhem-Max-Price-Mu"),
+        ));
+    }
+    Ok(Some(parsed))
 }
 
 fn parse_x_mayhem_failover_overrides(
@@ -7023,56 +7056,9 @@ async fn run_embedding_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayEmbeddingRun, ApiError> {
     let eligible_routes =
-        ordered_route_candidates_for_embedding(state, model, inputs, options.min_att_tier);
+        ordered_route_candidates_for_embedding_with_options(state, model, inputs, options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        let rail = state.receipt_config.rail.clone();
-        let rail_candidates = model
-            .mayhem
-            .route_candidates
-            .iter()
-            .filter(|candidate| {
-                candidate
-                    .accepted_rails
-                    .iter()
-                    .any(|candidate_rail| candidate_rail == &rail)
-            })
-            .collect::<Vec<_>>();
-        if rail_candidates.is_empty() {
-            return Err(ApiError::payment_required(
-                format!("no provider accepts the {rail} payment rail"),
-                Some("model"),
-            ));
-        }
-        let att_candidates = rail_candidates
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                options
-                    .min_att_tier
-                    .map(|min_tier| candidate.att_tier >= min_tier)
-                    .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
-        if att_candidates.is_empty() {
-            return Err(ApiError::bad_request(
-                "no provider route satisfies X-Mayhem-Min-Att-Tier",
-                Some("X-Mayhem-Min-Att-Tier"),
-            ));
-        }
-        let now_millis = now_millis_u64();
-        if att_candidates
-            .iter()
-            .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
-        {
-            return Err(ApiError::service_unavailable(
-                "all otherwise eligible provider routes are cooling off after a retryable failure",
-                Some("model"),
-            ));
-        }
-        return Err(ApiError::bad_request(
-            "no provider route is currently eligible",
-            Some("model"),
-        ));
+        return Err(no_eligible_route_error(state, model, options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7155,56 +7141,9 @@ async fn run_image_generation_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayImageGenerationRun, ApiError> {
     let eligible_routes =
-        ordered_route_candidates_for_image_generation(state, model, request, options.min_att_tier);
+        ordered_route_candidates_for_image_generation_with_options(state, model, request, options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        let rail = state.receipt_config.rail.clone();
-        let rail_candidates = model
-            .mayhem
-            .route_candidates
-            .iter()
-            .filter(|candidate| {
-                candidate
-                    .accepted_rails
-                    .iter()
-                    .any(|candidate_rail| candidate_rail == &rail)
-            })
-            .collect::<Vec<_>>();
-        if rail_candidates.is_empty() {
-            return Err(ApiError::payment_required(
-                format!("no provider accepts the {rail} payment rail"),
-                Some("model"),
-            ));
-        }
-        let att_candidates = rail_candidates
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                options
-                    .min_att_tier
-                    .map(|min_tier| candidate.att_tier >= min_tier)
-                    .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
-        if att_candidates.is_empty() {
-            return Err(ApiError::bad_request(
-                "no provider route satisfies X-Mayhem-Min-Att-Tier",
-                Some("X-Mayhem-Min-Att-Tier"),
-            ));
-        }
-        let now_millis = now_millis_u64();
-        if att_candidates
-            .iter()
-            .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
-        {
-            return Err(ApiError::service_unavailable(
-                "all otherwise eligible provider routes are cooling off after a retryable failure",
-                Some("model"),
-            ));
-        }
-        return Err(ApiError::bad_request(
-            "no provider route is currently eligible",
-            Some("model"),
-        ));
+        return Err(no_eligible_route_error(state, model, options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7291,9 +7230,9 @@ async fn run_audio_speech_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioSpeechRun, ApiError> {
     let eligible_routes =
-        ordered_route_candidates_for_audio_speech(state, model, request, options.min_att_tier);
+        ordered_route_candidates_for_audio_speech_with_options(state, model, request, options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        return Err(no_eligible_route_error(state, model, options.min_att_tier));
+        return Err(no_eligible_route_error(state, model, options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7377,14 +7316,11 @@ async fn run_audio_transcription_with_route_retry(
     request: &AudioTranscriptionRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioTranscriptionRun, ApiError> {
-    let eligible_routes = ordered_route_candidates_for_audio_transcription(
-        state,
-        model,
-        request,
-        options.min_att_tier,
+    let eligible_routes = ordered_route_candidates_for_audio_transcription_with_options(
+        state, model, request, options,
     );
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        return Err(no_eligible_route_error(state, model, options.min_att_tier));
+        return Err(no_eligible_route_error(state, model, options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -7465,7 +7401,7 @@ async fn run_audio_transcription_with_route_retry(
 fn no_eligible_route_error(
     state: &GatewayState,
     model: &GatewayModel,
-    min_att_tier: Option<u8>,
+    options: GatewayRequestOptions,
 ) -> ApiError {
     let rail = state.receipt_config.rail.clone();
     let rail_candidates = model
@@ -7489,7 +7425,8 @@ fn no_eligible_route_error(
         .iter()
         .copied()
         .filter(|candidate| {
-            min_att_tier
+            options
+                .min_att_tier
                 .map(|min_tier| candidate.att_tier >= min_tier)
                 .unwrap_or(true)
         })
@@ -7510,7 +7447,24 @@ fn no_eligible_route_error(
             Some("model"),
         );
     }
+    if options.max_price_mu.is_some() {
+        return no_price_band_route_error();
+    }
     ApiError::bad_request("no provider route is currently eligible", Some("model"))
+}
+
+fn no_price_band_route_error() -> ApiError {
+    ApiError::bad_request(
+        "no provider route is at or below X-Mayhem-Max-Price-Mu",
+        Some("X-Mayhem-Max-Price-Mu"),
+    )
+}
+
+fn ensure_max_price_allows(quote_mu: u64, max_price_mu: Option<u64>) -> Result<(), ApiError> {
+    if max_price_mu.is_some_and(|max_price_mu| quote_mu > max_price_mu) {
+        return Err(no_price_band_route_error());
+    }
+    Ok(())
 }
 
 async fn build_chat_completion(
@@ -7666,13 +7620,9 @@ async fn prepare_live_direct_chat_session(
     config: ScBridgeGatewaySessionConfig,
 ) -> Result<LiveDirectChatSession, ApiError> {
     let mut eligible_route_refs =
-        ordered_route_candidates_for_request(&state, &model, &request, options.min_att_tier);
+        ordered_route_candidates_for_request_with_options(&state, &model, &request, options);
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
-        return Err(no_eligible_route_error(
-            &state,
-            &model,
-            options.min_att_tier,
-        ));
+        return Err(no_eligible_route_error(&state, &model, options));
     }
     if eligible_route_refs.is_empty() {
         return Err(ApiError::service_unavailable(
@@ -8764,56 +8714,9 @@ async fn run_chat_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewaySessionRun, ApiError> {
     let mut eligible_routes =
-        ordered_route_candidates_for_request(state, model, request, options.min_att_tier);
+        ordered_route_candidates_for_request_with_options(state, model, request, options);
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
-        let rail = state.receipt_config.rail.clone();
-        let rail_candidates = model
-            .mayhem
-            .route_candidates
-            .iter()
-            .filter(|candidate| {
-                candidate
-                    .accepted_rails
-                    .iter()
-                    .any(|candidate_rail| candidate_rail == &rail)
-            })
-            .collect::<Vec<_>>();
-        if rail_candidates.is_empty() {
-            return Err(ApiError::payment_required(
-                format!("no provider accepts the {rail} payment rail"),
-                Some("model"),
-            ));
-        }
-        let att_candidates = rail_candidates
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                options
-                    .min_att_tier
-                    .map(|min_tier| candidate.att_tier >= min_tier)
-                    .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
-        if att_candidates.is_empty() {
-            return Err(ApiError::bad_request(
-                "no provider route satisfies X-Mayhem-Min-Att-Tier",
-                Some("X-Mayhem-Min-Att-Tier"),
-            ));
-        }
-        let now_millis = now_millis_u64();
-        if att_candidates
-            .iter()
-            .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
-        {
-            return Err(ApiError::service_unavailable(
-                "all otherwise eligible provider routes are cooling off after a retryable failure",
-                Some("model"),
-            ));
-        }
-        return Err(ApiError::bad_request(
-            "no provider route is currently eligible",
-            Some("model"),
-        ));
+        return Err(no_eligible_route_error(state, model, options));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
@@ -8940,74 +8843,101 @@ async fn run_chat_with_route_retry(
     ))
 }
 
-fn ordered_route_candidates_for_request<'a>(
+fn ordered_route_candidates_for_request_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &ChatCompletionRequest,
-    min_att_tier: Option<u8>,
+    options: GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = route_selection_seed(model, request, now_millis_u64());
-    ordered_route_candidates_for_request_with_seed(state, model, request, min_att_tier, seed)
-}
-
-fn ordered_route_candidates_for_embedding<'a>(
-    state: &GatewayState,
-    model: &'a GatewayModel,
-    inputs: &[String],
-    min_att_tier: Option<u8>,
-) -> Vec<&'a GatewayRouteCandidate> {
-    let seed = embedding_route_selection_seed(model, inputs, now_millis_u64());
-    ordered_route_candidates_for_embedding_with_seed(state, model, inputs, min_att_tier, seed)
-}
-
-fn ordered_route_candidates_for_image_generation<'a>(
-    state: &GatewayState,
-    model: &'a GatewayModel,
-    request: &ImageGenerationRequest,
-    min_att_tier: Option<u8>,
-) -> Vec<&'a GatewayRouteCandidate> {
-    let seed = image_generation_route_selection_seed(model, request, now_millis_u64());
-    ordered_route_candidates_for_image_generation_with_seed(
+    ordered_route_candidates_for_request_with_max_price_seed(
         state,
         model,
         request,
-        min_att_tier,
+        options.min_att_tier,
+        options.max_price_mu,
         seed,
     )
 }
 
-fn ordered_route_candidates_for_audio_speech<'a>(
+fn ordered_route_candidates_for_embedding_with_options<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    inputs: &[String],
+    options: GatewayRequestOptions,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = embedding_route_selection_seed(model, inputs, now_millis_u64());
+    ordered_route_candidates_for_embedding_with_max_price_seed(
+        state,
+        model,
+        inputs,
+        options.min_att_tier,
+        options.max_price_mu,
+        seed,
+    )
+}
+
+fn ordered_route_candidates_for_image_generation_with_options<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &ImageGenerationRequest,
+    options: GatewayRequestOptions,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let seed = image_generation_route_selection_seed(model, request, now_millis_u64());
+    ordered_route_candidates_for_image_generation_with_max_price_seed(
+        state,
+        model,
+        request,
+        options.min_att_tier,
+        options.max_price_mu,
+        seed,
+    )
+}
+
+fn ordered_route_candidates_for_audio_speech_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &AudioSpeechRequest,
-    min_att_tier: Option<u8>,
+    options: GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = audio_speech_route_selection_seed(model, request, now_millis_u64());
     let now_millis = now_millis_u64();
     ordered_route_candidates_for_requirements_with_seed(
         state,
         model,
-        min_att_tier,
+        options.min_att_tier,
         seed,
-        request_requirements_for_audio_speech(state, model, request, now_millis),
+        request_requirements_for_audio_speech(
+            state,
+            model,
+            request,
+            now_millis,
+            options.max_price_mu,
+        ),
         now_millis,
     )
 }
 
-fn ordered_route_candidates_for_audio_transcription<'a>(
+fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &AudioTranscriptionRequest,
-    min_att_tier: Option<u8>,
+    options: GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = audio_transcription_route_selection_seed(model, request, now_millis_u64());
     let now_millis = now_millis_u64();
     ordered_route_candidates_for_requirements_with_seed(
         state,
         model,
-        min_att_tier,
+        options.min_att_tier,
         seed,
-        request_requirements_for_audio_transcription(state, model, request, now_millis),
+        request_requirements_for_audio_transcription(
+            state,
+            model,
+            request,
+            now_millis,
+            options.max_price_mu,
+        ),
         now_millis,
     )
 }
@@ -9045,11 +8975,30 @@ async fn run_hedge_probes_if_requested(
     })
 }
 
+#[cfg(test)]
 fn ordered_route_candidates_for_request_with_seed<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &ChatCompletionRequest,
     min_att_tier: Option<u8>,
+    seed: u64,
+) -> Vec<&'a GatewayRouteCandidate> {
+    ordered_route_candidates_for_request_with_max_price_seed(
+        state,
+        model,
+        request,
+        min_att_tier,
+        None,
+        seed,
+    )
+}
+
+fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
+    state: &GatewayState,
+    model: &'a GatewayModel,
+    request: &ChatCompletionRequest,
+    min_att_tier: Option<u8>,
+    max_price_mu: Option<u64>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -9063,7 +9012,8 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
     }
 
     state.refresh_provider_table_routes(model);
-    let requirements = request_requirements_for_chat(state, model, request, now_millis);
+    let requirements =
+        request_requirements_for_chat(state, model, request, now_millis, max_price_mu);
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
@@ -9132,11 +9082,12 @@ fn ordered_route_candidates_for_request_with_seed<'a>(
     prioritize_material_reputation_gap(state.apply_chat_affinity(model, request, ordered))
 }
 
-fn ordered_route_candidates_for_embedding_with_seed<'a>(
+fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     inputs: &[String],
     min_att_tier: Option<u8>,
+    max_price_mu: Option<u64>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -9150,7 +9101,8 @@ fn ordered_route_candidates_for_embedding_with_seed<'a>(
     }
 
     state.refresh_provider_table_routes(model);
-    let requirements = request_requirements_for_embedding(state, model, inputs, now_millis);
+    let requirements =
+        request_requirements_for_embedding(state, model, inputs, now_millis, max_price_mu);
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
@@ -9219,11 +9171,12 @@ fn ordered_route_candidates_for_embedding_with_seed<'a>(
     prioritize_material_reputation_gap(ordered)
 }
 
-fn ordered_route_candidates_for_image_generation_with_seed<'a>(
+fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
     request: &ImageGenerationRequest,
     min_att_tier: Option<u8>,
+    max_price_mu: Option<u64>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -9237,7 +9190,8 @@ fn ordered_route_candidates_for_image_generation_with_seed<'a>(
     }
 
     state.refresh_provider_table_routes(model);
-    let requirements = request_requirements_for_image_generation(state, model, request, now_millis);
+    let requirements =
+        request_requirements_for_image_generation(state, model, request, now_millis, max_price_mu);
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
@@ -9400,7 +9354,7 @@ impl GatewayState {
                 candidate,
                 self.receipt_config.rules_ver,
             ));
-            table.upsert_heartbeat(heartbeat_for_route(model, candidate, now), now);
+            table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
         }
     }
 
@@ -9538,9 +9492,10 @@ fn chat_affinity_key(
 
 fn request_requirements_for_chat(
     state: &GatewayState,
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &ChatCompletionRequest,
     now_millis: u64,
+    max_price_mu: Option<u64>,
 ) -> RequestRequirements {
     let prompt_text = chat_prompt_text(request);
     let input_tokens = rough_tokens(&prompt_text);
@@ -9559,16 +9514,17 @@ fn request_requirements_for_chat(
         input_tokens,
         output_tokens,
         now_millis,
-        max_price_mu: Some(estimate_max_spend_mu(model, request, &prompt_text)),
+        max_price_mu,
         ..RequestRequirements::default()
     }
 }
 
 fn request_requirements_for_embedding(
     state: &GatewayState,
-    model: &GatewayModel,
+    _model: &GatewayModel,
     inputs: &[String],
     now_millis: u64,
+    max_price_mu: Option<u64>,
 ) -> RequestRequirements {
     let input_tokens = embedding_input_token_count(inputs);
     RequestRequirements {
@@ -9580,16 +9536,17 @@ fn request_requirements_for_embedding(
         input_tokens,
         output_tokens: 0,
         now_millis,
-        max_price_mu: Some(estimate_embedding_max_spend_mu(model, inputs)),
+        max_price_mu,
         ..RequestRequirements::default()
     }
 }
 
 fn request_requirements_for_image_generation(
     state: &GatewayState,
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &ImageGenerationRequest,
     now_millis: u64,
+    max_price_mu: Option<u64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
     RequestRequirements {
@@ -9601,16 +9558,17 @@ fn request_requirements_for_image_generation(
         input_tokens,
         output_tokens: 0,
         now_millis,
-        max_price_mu: Some(estimate_image_generation_max_spend_mu(model, request)),
+        max_price_mu,
         ..RequestRequirements::default()
     }
 }
 
 fn request_requirements_for_audio_speech(
     state: &GatewayState,
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &AudioSpeechRequest,
     now_millis: u64,
+    max_price_mu: Option<u64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.input);
     RequestRequirements {
@@ -9622,16 +9580,17 @@ fn request_requirements_for_audio_speech(
         input_tokens,
         output_tokens: 0,
         now_millis,
-        max_price_mu: Some(estimate_audio_speech_max_spend_mu(model, request)),
+        max_price_mu,
         ..RequestRequirements::default()
     }
 }
 
 fn request_requirements_for_audio_transcription(
     state: &GatewayState,
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &AudioTranscriptionRequest,
     now_millis: u64,
+    max_price_mu: Option<u64>,
 ) -> RequestRequirements {
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
@@ -9642,7 +9601,7 @@ fn request_requirements_for_audio_transcription(
         input_tokens: audio_transcription_seconds(request),
         output_tokens: 0,
         now_millis,
-        max_price_mu: Some(estimate_audio_transcription_max_spend_mu(model, request)),
+        max_price_mu,
         ..RequestRequirements::default()
     }
 }
@@ -10774,6 +10733,7 @@ impl GatewayState {
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
         let max_spend_mu = estimate_max_spend_mu(model, request, &prompt_text);
+        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -10854,6 +10814,7 @@ impl GatewayState {
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
         let max_spend_mu = estimate_embedding_max_spend_mu(model, inputs);
+        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -10934,6 +10895,7 @@ impl GatewayState {
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
         let max_spend_mu = estimate_image_generation_max_spend_mu(model, request);
+        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -11014,6 +10976,7 @@ impl GatewayState {
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
         let max_spend_mu = estimate_audio_speech_max_spend_mu(model, request);
+        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -11094,6 +11057,7 @@ impl GatewayState {
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
         let max_spend_mu = estimate_audio_transcription_max_spend_mu(model, request);
+        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
         if max_spend_mu > self.receipt_config.balance_mu {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
@@ -13380,6 +13344,15 @@ mod tests {
             )
             .expect_err("gateway rejects spend vouchers above the startup balance snapshot");
         assert!(err.message.contains("insufficient local balance"));
+
+        let max_bid = GatewayRequestOptions {
+            max_price_mu: Some(999),
+            ..GatewayRequestOptions::default()
+        };
+        let err = state
+            .prepare_chat_invocation_for_route(&model, &request, None, max_bid)
+            .expect_err("gateway rejects quotes above the user max-bid");
+        assert_eq!(err.param, Some("X-Mayhem-Max-Price-Mu"));
     }
 
     #[test]
@@ -13414,11 +13387,19 @@ mod tests {
             HeaderValue::from_static("9000"),
         );
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
+        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("headers parse");
         assert_eq!(options.failover_overrides.open_timeout_ms, Some(2_500));
         assert_eq!(options.failover_overrides.ttft_timeout_ms, Some(4_000));
         assert_eq!(options.failover_overrides.stall_timeout_ms, Some(9_000));
         assert_eq!(options.failover_overrides.min_tok_s, Some(17.5));
+        assert_eq!(options.max_price_mu, Some(1_234));
+
+        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("0"));
+        let err =
+            GatewayRequestOptions::from_headers(&headers).expect_err("zero max price rejects");
+        assert_eq!(err.param, Some("X-Mayhem-Max-Price-Mu"));
+        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
 
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("0"));
         let err = GatewayRequestOptions::from_headers(&headers).expect_err("zero floor rejects");
@@ -14043,6 +14024,7 @@ mod tests {
             enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
             room_id: format!("{:02x}", idx.wrapping_add(160)).repeat(16),
             price_ver: 7,
+            min_ask_mu: 0,
             att_tier: 1,
             admin_pubkey: "33".repeat(32),
             artifact_root: format!("{:02x}", idx.wrapping_add(180)).repeat(32),
@@ -14552,6 +14534,40 @@ mod tests {
             ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
         assert_eq!(selected.len(), 1);
         assert_ne!(selected[0].provider, dropped_provider);
+    }
+
+    #[test]
+    fn route_selection_honors_user_max_bid_and_provider_min_ask() {
+        let mut model = test_routed_model(2);
+        let request = test_chat_request(&model.id);
+        let high_ask_provider = model.mayhem.route_candidates[0].provider.clone();
+        model.mayhem.route_candidates[0].min_ask_mu = u64::MAX;
+        let state = GatewayState::from_models(vec![model.clone()]);
+
+        let selected =
+            ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, 0xfeed);
+        assert_eq!(selected.len(), 1);
+        assert_ne!(selected[0].provider, high_ask_provider);
+
+        let priced_out = ordered_route_candidates_for_request_with_max_price_seed(
+            &state,
+            &model,
+            &request,
+            None,
+            Some(1),
+            0xfeed,
+        );
+        assert!(priced_out.is_empty());
+
+        let clearing = ordered_route_candidates_for_request_with_max_price_seed(
+            &state,
+            &model,
+            &request,
+            None,
+            Some(u64::MAX),
+            0xfeed,
+        );
+        assert_eq!(clearing.len(), 1);
     }
 
     #[test]

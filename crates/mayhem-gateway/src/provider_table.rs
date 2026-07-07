@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use mayhem_proto::ReceiptUsage;
 use serde::{Deserialize, Serialize};
 
-use crate::{text_usage_mu, HeartbeatCaps, ProviderHeartbeat, ProviderProbation, RateMapEntry};
+use crate::{
+    priced_usage_mu, text_usage_mu, HeartbeatCaps, ProviderHeartbeat, ProviderProbation,
+    RateMapEntry,
+};
 
 pub const DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS: u64 = 10_000;
 pub const DEFAULT_OBSERVATION_EWMA_ALPHA: f64 = 0.2;
@@ -37,6 +40,10 @@ pub struct ContractProviderSnapshot {
     pub reputation: f64,
     pub price_ver: u64,
     pub rate_map: Vec<RateMapEntry>,
+    #[serde(default)]
+    pub per_req_mu: u64,
+    #[serde(default)]
+    pub min_session_mu: u64,
     pub ref_rate_map: Vec<RateMapEntry>,
     pub probation: Option<ProviderProbation>,
     pub caps: HeartbeatCaps,
@@ -108,6 +115,7 @@ pub enum IneligibilityReason {
     Saturated,
     Capabilities,
     Price,
+    ProviderMinAsk,
     ProbationConcurrentLimit,
     ProbationPriceCap,
     AttestationMissing,
@@ -308,6 +316,22 @@ impl ProviderTable {
         );
     }
 
+    pub fn upsert_fallback_heartbeat(
+        &mut self,
+        heartbeat: ProviderHeartbeat,
+        received_at_millis: u64,
+    ) {
+        let key = ProviderKey::from_heartbeat(&heartbeat);
+        if self.heartbeats.get(&key).is_some_and(|live| {
+            !live.heartbeat.sig.is_empty()
+                && received_at_millis.saturating_sub(live.received_at_millis)
+                    <= self.heartbeat_ttl_millis
+        }) {
+            return;
+        }
+        self.upsert_heartbeat(heartbeat, received_at_millis);
+    }
+
     pub fn record_observation(&mut self, key: &ProviderKey, sample: ProviderObservationSample) {
         self.record_observation_at(key, sample, 0);
     }
@@ -472,6 +496,9 @@ pub fn evaluate_eligibility(
     {
         return Err(IneligibilityReason::Price);
     }
+    if heartbeat.min_ask_mu > estimated_price_mu {
+        return Err(IneligibilityReason::ProviderMinAsk);
+    }
     if let Some(probation) = entry
         .contract
         .probation
@@ -599,7 +626,12 @@ pub fn estimate_request_price_mu(
     request: &RequestRequirements,
 ) -> u64 {
     let usage = ReceiptUsage::text(request.input_tokens, request.output_tokens);
-    text_usage_mu(&contract.rate_map, &usage)
+    priced_usage_mu(
+        &contract.rate_map,
+        contract.per_req_mu,
+        contract.min_session_mu,
+        &usage,
+    )
 }
 
 pub fn estimate_reference_request_price_mu(
@@ -784,6 +816,8 @@ mod tests {
             reputation: 0.8,
             price_ver: 5,
             rate_map: text_generation_rate_map(20, 60),
+            per_req_mu: 0,
+            min_session_mu: 0,
             ref_rate_map: text_generation_rate_map(20, 60),
             probation: None,
             caps: caps(),
@@ -803,6 +837,8 @@ mod tests {
             reputation: 0.72,
             price_ver: 5,
             rate_map: text_generation_rate_map(20, 60),
+            per_req_mu: 0,
+            min_session_mu: 0,
             ref_rate_map: text_generation_rate_map(20, 60),
             probation: None,
             caps: caps(),
@@ -838,6 +874,7 @@ mod tests {
                 ttft_ms,
             },
             price_ver: 5,
+            min_ask_mu: 0,
             caps: caps(),
             att: HeartbeatAttestation {
                 epoch,
@@ -870,6 +907,7 @@ mod tests {
                 ttft_ms: 140,
             },
             price_ver: 5,
+            min_ask_mu: 0,
             caps: caps(),
             att: HeartbeatAttestation {
                 epoch,
@@ -1213,6 +1251,23 @@ mod tests {
             evaluate_eligibility(&good, &price_limited),
             Err(IneligibilityReason::Price)
         );
+
+        let mut ask_limited = good.clone();
+        ask_limited
+            .heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .min_ask_mu = 81;
+        assert_eq!(
+            evaluate_eligibility(&ask_limited, &request),
+            Err(IneligibilityReason::ProviderMinAsk)
+        );
+        ask_limited
+            .heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .min_ask_mu = 80;
+        assert_eq!(evaluate_eligibility(&ask_limited, &request), Ok(80));
 
         let mut bad = good.clone();
         bad.attestation_head = None;

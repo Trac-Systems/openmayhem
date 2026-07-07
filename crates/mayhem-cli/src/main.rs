@@ -3680,6 +3680,10 @@ struct ProviderStartArgs {
     #[arg(long, default_value_t = 1)]
     heartbeat_count: u32,
 
+    /// Provider floor for accepted sessions in µUSD. 0 accepts the current market price.
+    #[arg(long, default_value_t = 0)]
+    min_ask_mu: u64,
+
     /// Keep running and answer direct mx/s/<session_id> requests over SC-Bridge.
     #[arg(long)]
     serve_sessions: bool,
@@ -21310,6 +21314,7 @@ struct ProviderSessionHeartbeatTask {
     rooms: Vec<LedgerRoom>,
     attestation: Tier1AttestationReport,
     attestation_head: String,
+    min_ask_mu: u64,
     load: ProviderHeartbeatLoad,
 }
 
@@ -21369,6 +21374,7 @@ struct ProviderSessionTerms {
     rate_map: Vec<RateMapEntry>,
     per_req_mu: u64,
     min_session_mu: u64,
+    min_ask_mu: u64,
     rules_ver: u64,
     ctx: u64,
 }
@@ -21797,6 +21803,9 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "runtime_config": attestation.report.runtime_config,
         },
         "rules": &rules,
+        "market": {
+            "min_ask_mu": args.min_ask_mu,
+        },
         "rooms": rooms.clone(),
         "local_heartbeat_cache": heartbeat_cache,
         "features": {
@@ -23790,6 +23799,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
+                    min_ask_mu: 0,
                     att_tier: effective_att_tier,
                     admin_pubkey: enclave.created_by.clone(),
                     artifact_root: enclave.artifact_root.clone(),
@@ -25424,6 +25434,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.rooms,
                 ctx.attestation,
                 ctx.attestation_head,
+                ctx.args.min_ask_mu,
                 seq,
                 seq == 0,
                 ProviderLoadSnapshot::default(),
@@ -25443,6 +25454,7 @@ async fn send_provider_heartbeat_round(
     rooms: &[LedgerRoom],
     attestation: &Tier1AttestationReport,
     attestation_head: &str,
+    min_ask_mu: u64,
     seq: u64,
     join_rooms: bool,
     load: ProviderLoadSnapshot,
@@ -25487,6 +25499,7 @@ async fn send_provider_heartbeat_round(
                 .and_then(|price| price.current.as_ref())
                 .map(|price| price.ver)
                 .unwrap_or(0),
+            "min_ask_mu": min_ask_mu,
             "caps": {
                 "tools": caps.tools,
                 "json": caps.json,
@@ -25512,6 +25525,7 @@ async fn send_provider_heartbeat_round(
             "room_id": room.room_id,
             "sidechannel": room.sidechannel,
             "seq": seq,
+            "min_ask_mu": min_ask_mu,
         }));
     }
     Ok(sent)
@@ -25546,6 +25560,7 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
             &ctx.rooms,
             &ctx.attestation,
             &ctx.attestation_head,
+            ctx.min_ask_mu,
             seq,
             join_rooms,
             ctx.load.snapshot(),
@@ -25593,13 +25608,14 @@ async fn serve_provider_sessions(
     provider_log(
         ctx.args,
         &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {}",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} and min_ask_mu {}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
             responder.mode(),
             terms.price_ver,
-            format_rate_map(&terms.rate_map)
+            format_rate_map(&terms.rate_map),
+            terms.min_ask_mu
         ),
     );
 
@@ -25617,6 +25633,7 @@ async fn serve_provider_sessions(
                 rooms: ctx.rooms.to_vec(),
                 attestation: ctx.attestation.clone(),
                 attestation_head: ctx.attestation_head.to_owned(),
+                min_ask_mu: ctx.args.min_ask_mu,
                 load: heartbeat_load.clone(),
             },
         ))
@@ -27925,6 +27942,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         rate_map: price.rate_map.clone(),
         per_req_mu: price.per_req_mu,
         min_session_mu: price.min_session_mu,
+        min_ask_mu: ctx.args.min_ask_mu,
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.model.caps.ctx_max,
     })
@@ -28346,6 +28364,15 @@ fn provider_session_open_decision(
         return reject(
             "BALANCE",
             "voucher max_spend_mu must be positive".to_owned(),
+        );
+    }
+    if voucher.body.max_spend_mu < terms.min_ask_mu {
+        return reject(
+            "PRICE_FLOOR",
+            format!(
+                "session quote {}µUSD is below provider min_ask_mu {}µUSD",
+                voucher.body.max_spend_mu, terms.min_ask_mu
+            ),
         );
     }
     if frame.get("sig").and_then(Value::as_str) != Some(voucher.user_sig.as_str()) {
@@ -33657,6 +33684,15 @@ mod tests {
             provider_session_open_decision(&frame, &terms),
             ProviderSessionDecision::Accept
         );
+        let mut priced_out_terms = terms.clone();
+        priced_out_terms.min_ask_mu = 1001;
+        assert!(matches!(
+            provider_session_open_decision(&frame, &priced_out_terms),
+            ProviderSessionDecision::Reject {
+                code: "PRICE_FLOOR",
+                ..
+            }
+        ));
         let mut legacy_voucher = frame.clone();
         let user_key = SigningKey::from_bytes(&[6_u8; 32]);
         let voucher_body: mayhem_proto::SpendVoucherBody =
@@ -33718,7 +33754,7 @@ mod tests {
         assert!(matches!(
             provider_session_open_decision(&wrong_price, &terms),
             ProviderSessionDecision::Reject {
-                code: "VOUCHER",
+                code: "PRICE_VER",
                 ..
             }
         ));
@@ -38873,6 +38909,7 @@ mod tests {
             sim: false,
             no_heartbeat: true,
             heartbeat_count: 1,
+            min_ask_mu: 0,
             serve_sessions: false,
             serve_sessions_seconds: 0,
             dev_session_shim: false,
@@ -38944,6 +38981,7 @@ mod tests {
             rate_map: text_generation_rate_map(1, 2),
             per_req_mu: 0,
             min_session_mu: 0,
+            min_ask_mu: 0,
             rules_ver: 3,
             ctx: 8192,
         }
@@ -38988,6 +39026,8 @@ mod tests {
                 "enclave_id": voucher_body.enclave_id,
                 "price_ver": voucher_body.price_ver,
                 "locked_rate_map": voucher_body.locked_rate_map,
+                "locked_per_req_mu": voucher_body.locked_per_req_mu,
+                "locked_min_session_mu": voucher_body.locked_min_session_mu,
                 "max_spend_mu": voucher_body.max_spend_mu,
                 "checkpoint_every": {
                     "tokens": voucher_body.checkpoint_every.tokens,
