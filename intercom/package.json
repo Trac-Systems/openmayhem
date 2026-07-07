@@ -10,8 +10,11 @@
     "msb:balance": "node scripts/msb-balance-probe.mjs",
     "tnk:watch-rate": "node scripts/tnk-rate-watcher.mjs",
     "tnk:watch-deposits": "node scripts/tnk-deposit-watcher.mjs",
+    "market:sim": "node scripts/market-sim.mjs",
+    "market:sim:report": "node scripts/market-sim.mjs --write-report",
     "test:tnk-rate": "node --test tests/tnk-rate-watcher.test.js",
     "test:tnk-watcher": "node --test tests/tnk-deposit-watcher.test.js",
+    "test:market-sim": "node --test tests/market-sim.test.js",
     "test:contract": "node --test tests/contract-consent.test.js tests/contract-registry.test.js tests/contract-room.test.js tests/contract-price.test.js tests/contract-params.test.js tests/contract-reputation.test.js tests/contract-auditor.test.js tests/contract-ledger.test.js tests/contract-rate.test.js tests/contract-deposit.test.js tests/contract-epoch.test.js tests/contract-guardian.test.js tests/contract-payout.test.js tests/contract-slash.test.js tests/contract-dispute.test.js tests/contract-security-surface.test.js",
     "test:features": "node --test tests/direct-session.test.js"
   },
