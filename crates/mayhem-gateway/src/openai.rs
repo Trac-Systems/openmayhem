@@ -24,7 +24,10 @@ use crate::{
         DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
         DEFAULT_STALL_TIMEOUT_MILLIS, DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
     },
-    pricing::{normalize_rate_map, priced_usage_mu, text_generation_rate_map, RateMapEntry},
+    pricing::{
+        normalize_rate_map, priced_usage_mu, rate_map_cost_basis_per_1k, text_generation_rate_map,
+        RateMapEntry,
+    },
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ProviderCapacityMismatchEvent,
         ProviderObservationSample, ProviderTable, ProviderTableEntry, ProviderUnderdeliveryEvent,
@@ -101,6 +104,10 @@ const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
 const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
+const DASHBOARD_USER_PINS_COOKIE_NAME: &str = "mayhem_dashboard_user_pins";
+const DASHBOARD_PROVIDER_PINS_COOKIE_NAME: &str = "mayhem_dashboard_provider_pins";
+const DASHBOARD_NETWORK_PINS_COOKIE_NAME: &str = "mayhem_dashboard_network_pins";
+const DASHBOARD_PIN_COOKIE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
 const DASHBOARD_CSS: &str = r#"
 @font-face{font-family:Exo;src:url('/mayhem/dashboard/assets/exo-latin.woff2') format('woff2');font-style:normal;font-weight:400 700;font-display:swap}
@@ -109,6 +116,9 @@ const DASHBOARD_CSS: &str = r#"
 "#;
 const DASHBOARD_USER_CSS: &str = r#"
 .overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider,.wide-grid.network{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.wide-grid.network .card{overflow:hidden}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment,.badge{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted);white-space:nowrap}.segment.active,.badge.good{border-color:var(--accent-primary);color:var(--accent-primary)}.badge.live{border-color:var(--accent-secondary);color:var(--accent-secondary)}.badge-row{display:flex;gap:8px;flex-wrap:wrap}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider,.wide-grid.network{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
+"#;
+const DASHBOARD_CHART_CSS: &str = r#"
+.price-chart-grid{display:grid;grid-template-columns:1fr;gap:24px;margin:0 0 24px}.price-chart-card .card-header{align-items:flex-start}.price-chart-title{min-width:0}.price-chart-title h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.price-chart-toolbar{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin:0 0 14px}.price-chart-control{display:grid;gap:6px}.price-chart-control .segmented{gap:6px}.price-chart-control .segment{text-decoration:none}.price-chart-shell{border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.3),rgba(16,16,19,.42));overflow:hidden}.price-chart-svg{display:block;width:100%;height:auto}.price-grid-line{stroke:rgba(136,138,140,.16);stroke-width:1}.price-axis{fill:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}.price-step{fill:none;stroke:var(--accent-primary);stroke-width:2.4;stroke-linejoin:round;stroke-linecap:round}.price-overlay{fill:none;stroke:var(--accent-secondary);stroke-width:1.4;stroke-linejoin:round;stroke-linecap:round;opacity:.65}.price-volume{fill:rgba(136,138,140,.36)}.price-candle .wick{stroke:var(--text-primary);stroke-width:1.4}.price-candle .body{stroke:transparent}.price-candle.up .body{fill:rgba(66,187,147,.76)}.price-candle.down .body{fill:rgba(197,68,89,.76)}.price-marker{fill:var(--surface-card);stroke:var(--accent-primary-light);stroke-width:1.4}.price-marker.pinned{stroke:var(--accent-secondary)}.price-chart-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.price-chart-empty{min-height:300px}.price-chart-footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px;color:var(--text-muted);font-size:13px}@media(max-width:640px){.price-chart-toolbar{gap:10px}.price-chart-title h2{white-space:normal}.price-chart-footer{display:grid}.price-axis{font-size:10px}}
 "#;
 
 #[derive(Clone, Debug)]
@@ -290,6 +300,8 @@ pub struct PriceRefMu {
     pub min_session_mu: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derivation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1441,6 +1453,7 @@ impl GatewayState {
                     per_req_mu: 0,
                     min_session_mu: 0,
                     derivation: None,
+                    history: Vec::new(),
                 },
                 attestation_tiers: tiers,
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
@@ -2074,6 +2087,99 @@ async fn create_audio_transcription(
 struct DashboardQuery {
     token: Option<String>,
     provider: Option<String>,
+    tier: Option<String>,
+    tf: Option<String>,
+    bucket: Option<String>,
+    quant: Option<String>,
+    pin: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardChartSurface {
+    User,
+    Provider,
+    Network,
+}
+
+impl DashboardChartSurface {
+    fn base_path(self) -> &'static str {
+        match self {
+            Self::User => "/mayhem/dashboard",
+            Self::Provider => "/mayhem/dashboard/provider",
+            Self::Network => "/mayhem/dashboard/network",
+        }
+    }
+
+    fn pin_cookie_name(self) -> &'static str {
+        match self {
+            Self::User => DASHBOARD_USER_PINS_COOKIE_NAME,
+            Self::Provider => DASHBOARD_PROVIDER_PINS_COOKIE_NAME,
+            Self::Network => DASHBOARD_NETWORK_PINS_COOKIE_NAME,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardPriceTimeframe {
+    H1,
+    H4,
+    D1,
+    W1,
+}
+
+impl DashboardPriceTimeframe {
+    fn from_query(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("4h") => Self::H4,
+            Some("1d") | Some("d1") | Some("day") => Self::D1,
+            Some("1w") | Some("w1") | Some("week") => Self::W1,
+            _ => Self::H1,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::H1 => "1h",
+            Self::H4 => "4h",
+            Self::D1 => "1d",
+            Self::W1 => "1w",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::H1 => "1h",
+            Self::H4 => "4h",
+            Self::D1 => "1D",
+            Self::W1 => "1W",
+        }
+    }
+
+    fn window_epochs(self) -> u64 {
+        match self {
+            Self::H1 => 1,
+            Self::H4 => 4,
+            Self::D1 => 24,
+            Self::W1 => 168,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DashboardChartOptions {
+    surface: DashboardChartSurface,
+    selected_tier: Option<String>,
+    selected_timeframe: DashboardPriceTimeframe,
+    selected_bucket: Option<String>,
+    selected_quant: Option<String>,
+    pinned_models: Vec<String>,
+    provider_filter: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DashboardPinState {
+    models: Vec<String>,
+    set_cookie: Option<String>,
 }
 
 async fn mayhem_dashboard(
@@ -2088,15 +2194,19 @@ async fn mayhem_dashboard(
             None,
         );
     }
+    let (chart_options, pin_cookie) =
+        dashboard_chart_options(DashboardChartSurface::User, &query, &headers);
     let origin = dashboard_origin_from_headers(&headers);
-    dashboard_html_response(
+    dashboard_html_response_with_extra_cookie(
         StatusCode::OK,
         dashboard_user_html(
             &state,
             state.dashboard_session.expires_in().as_secs(),
             &origin,
+            &chart_options,
         ),
         Some(&state.dashboard_session.token),
+        pin_cookie.as_deref(),
     )
 }
 
@@ -2112,16 +2222,20 @@ async fn mayhem_dashboard_provider(
             None,
         );
     }
+    let (chart_options, pin_cookie) =
+        dashboard_chart_options(DashboardChartSurface::Provider, &query, &headers);
     let origin = dashboard_origin_from_headers(&headers);
-    dashboard_html_response(
+    dashboard_html_response_with_extra_cookie(
         StatusCode::OK,
         dashboard_provider_html(
             &state,
             state.dashboard_session.expires_in().as_secs(),
             &origin,
             query.provider.as_deref(),
+            &chart_options,
         ),
         Some(&state.dashboard_session.token),
+        pin_cookie.as_deref(),
     )
 }
 
@@ -2137,15 +2251,19 @@ async fn mayhem_dashboard_network(
             None,
         );
     }
+    let (chart_options, pin_cookie) =
+        dashboard_chart_options(DashboardChartSurface::Network, &query, &headers);
     let origin = dashboard_origin_from_headers(&headers);
-    dashboard_html_response(
+    dashboard_html_response_with_extra_cookie(
         StatusCode::OK,
         dashboard_network_html(
             &state,
             state.dashboard_session.expires_in().as_secs(),
             &origin,
+            &chart_options,
         ),
         Some(&state.dashboard_session.token),
+        pin_cookie.as_deref(),
     )
 }
 
@@ -2283,6 +2401,94 @@ fn dashboard_request_authorized(
         .any(|token| state.dashboard_session.is_valid(token))
 }
 
+fn dashboard_chart_options(
+    surface: DashboardChartSurface,
+    query: &DashboardQuery,
+    headers: &HeaderMap,
+) -> (DashboardChartOptions, Option<String>) {
+    let pins = dashboard_pin_state_from_request(headers, surface, query.pin.as_deref());
+    (
+        DashboardChartOptions {
+            surface,
+            selected_tier: dashboard_normalize_tier(query.tier.as_deref()),
+            selected_timeframe: DashboardPriceTimeframe::from_query(query.tf.as_deref()),
+            selected_bucket: query
+                .bucket
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            selected_quant: query
+                .quant
+                .as_deref()
+                .map(normalize_quant_bucket)
+                .and_then(Result::ok),
+            pinned_models: pins.models,
+            provider_filter: query
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        },
+        pins.set_cookie,
+    )
+}
+
+fn dashboard_pin_state_from_request(
+    headers: &HeaderMap,
+    surface: DashboardChartSurface,
+    query_pin: Option<&str>,
+) -> DashboardPinState {
+    if let Some(query_pin) = query_pin {
+        let models = dashboard_parse_pin_list(query_pin);
+        return DashboardPinState {
+            set_cookie: Some(dashboard_pin_cookie_value(surface, &models)),
+            models,
+        };
+    }
+    let models = dashboard_cookie_named(headers, surface.pin_cookie_name())
+        .map(dashboard_parse_pin_list)
+        .unwrap_or_default();
+    DashboardPinState {
+        models,
+        set_cookie: None,
+    }
+}
+
+fn dashboard_parse_pin_list(value: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    value
+        .split(',')
+        .filter_map(|entry| {
+            let decoded = dashboard_url_decode(entry);
+            let trimmed = decoded.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("clear") {
+                return None;
+            }
+            let model = trimmed.chars().take(160).collect::<String>();
+            if seen.insert(model.clone()) {
+                Some(model)
+            } else {
+                None
+            }
+        })
+        .take(12)
+        .collect()
+}
+
+fn dashboard_pin_cookie_value(surface: DashboardChartSurface, models: &[String]) -> String {
+    let value = models
+        .iter()
+        .map(|model| dashboard_url_encode(model))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{}={value}; Path=/mayhem/dashboard; Max-Age={DASHBOARD_PIN_COOKIE_MAX_AGE_SECONDS}; SameSite=Strict",
+        surface.pin_cookie_name()
+    )
+}
+
 fn dashboard_header_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("x-mayhem-dashboard-token")
@@ -2301,19 +2507,32 @@ fn dashboard_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn dashboard_cookie_token(headers: &HeaderMap) -> Option<&str> {
+    dashboard_cookie_named(headers, DASHBOARD_COOKIE_NAME)
+}
+
+fn dashboard_cookie_named<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookie| {
             cookie.split(';').find_map(|part| {
                 let (name, value) = part.trim().split_once('=')?;
-                (name == DASHBOARD_COOKIE_NAME).then_some(value.trim())
+                (name == cookie_name).then_some(value.trim())
             })
         })
         .filter(|value| !value.is_empty())
 }
 
 fn dashboard_html_response(status: StatusCode, body: String, token: Option<&str>) -> Response {
+    dashboard_html_response_with_extra_cookie(status, body, token, None)
+}
+
+fn dashboard_html_response_with_extra_cookie(
+    status: StatusCode,
+    body: String,
+    token: Option<&str>,
+    extra_cookie: Option<&str>,
+) -> Response {
     let mut response = (status, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -2321,7 +2540,12 @@ fn dashboard_html_response(status: StatusCode, body: String, token: Option<&str>
     );
     if let Some(token) = token {
         if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(token)) {
-            response.headers_mut().insert(header::SET_COOKIE, value);
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    if let Some(cookie) = extra_cookie {
+        if let Ok(value) = HeaderValue::from_str(cookie) {
+            response.headers_mut().append(header::SET_COOKIE, value);
         }
     }
     with_dashboard_security_headers(response)
@@ -2378,7 +2602,12 @@ fn dashboard_tier_tooltip() -> &'static str {
     "Tier 1: runs Mayhem software; trust is economic. Tier 2: proven Apple or NVIDIA hardware running the real app. Tier 3: Only Tier 3 keeps prompts private from the provider's own machine. Tier 4: admin-verified business identity, not prompt privacy; Tier 4 can still read prompts. Higher numbers are not a privacy ladder."
 }
 
-fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &str) -> String {
+fn dashboard_user_html(
+    state: &GatewayState,
+    expires_in_seconds: u64,
+    origin: &str,
+    chart_options: &DashboardChartOptions,
+) -> String {
     let receipts = state.receipts();
     let latest_receipts = dashboard_latest_receipts(&receipts);
     let active_sessions = latest_receipts
@@ -2395,6 +2624,7 @@ fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &s
     let session_rows = dashboard_session_rows(&latest_receipts);
     let model_rows = dashboard_model_rows(&state.models);
     let spend_body = dashboard_spend_body(&latest_receipts);
+    let price_charts = dashboard_price_chart_cards(&state.models, chart_options, None);
     let access_summary = state.access_summary();
     let token_rows = dashboard_access_token_rows(&access_summary);
     let token_count = access_summary
@@ -2417,7 +2647,7 @@ fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &s
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
 OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
@@ -2477,6 +2707,7 @@ fn dashboard_provider_html(
     expires_in_seconds: u64,
     origin: &str,
     provider_filter: Option<&str>,
+    chart_options: &DashboardChartOptions,
 ) -> String {
     let receipts = state.receipts();
     let latest_receipts = dashboard_latest_receipts(&receipts);
@@ -2535,10 +2766,12 @@ fn dashboard_provider_html(
     let hardware_body = dashboard_provider_hwprobe_body(&candidates, &probes, &provider_scope);
     let claim_body =
         dashboard_provider_claim_body(provider_filter, &provider_scope, &earning_totals);
+    let price_charts =
+        dashboard_price_chart_cards(&state.models, chart_options, Some(&provider_scope));
     dashboard_html_document(
         "Provider Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section><p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section><section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section><p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             earned = format_mu_usd(earned_mu),
             earned_source = if earning_totals.loaded {
                 "ledger earn/* rows"
@@ -2585,7 +2818,12 @@ fn dashboard_provider_html(
     )
 }
 
-fn dashboard_network_html(state: &GatewayState, expires_in_seconds: u64, origin: &str) -> String {
+fn dashboard_network_html(
+    state: &GatewayState,
+    expires_in_seconds: u64,
+    origin: &str,
+    chart_options: &DashboardChartOptions,
+) -> String {
     let entries = {
         let table = state
             .provider_table
@@ -2617,10 +2855,11 @@ fn dashboard_network_html(state: &GatewayState, expires_in_seconds: u64, origin:
     let gateway_root = origin.trim_end_matches('/');
     let model_rows = dashboard_network_model_rows(&state.models, &entries);
     let provider_rows = dashboard_network_provider_rows(&state.models, &entries);
+    let price_charts = dashboard_price_chart_cards(&state.models, chart_options, None);
     dashboard_html_document(
         "Network Explorer",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/network</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Network explorer</p></section><section class="overview-grid provider"><article class="card metric-card"><span class="label">Catalog models</span><p class="value mono">{model_count}</p><p class="privacy-note">from gateway catalog state</p></article><article class="card metric-card"><span class="label">Canonical providers</span><p class="value mono">{provider_count}</p><p class="privacy-note">from route candidates</p></article><article class="card metric-card"><span class="label">Live heartbeats</span><p class="value mono">{live_count}</p><p class="privacy-note">signed provider reports</p></article><article class="card metric-card"><span class="label">Unavailable models</span><p class="value mono">{unavailable_models}</p><p class="privacy-note">no live provider heartbeat</p></article></section><section class="wide-grid network"><article class="card"><div class="card-header"><h2>Models</h2><span class="count-chip">{model_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Availability</th><th>Abilities</th><th>Terms</th><th>Constraints</th></tr></thead><tbody>{model_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Providers</h2><span class="count-chip">{route_count}</span></div><table class="table"><thead><tr><th>Provider</th><th>Route</th><th>Backend</th><th>Rails / price</th><th>Status</th></tr></thead><tbody>{provider_rows}</tbody></table></article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Explorer data is local gateway state from catalog, contract route candidates, and provider heartbeats.</span><span class="mono">127.0.0.1</span></footer>"#,
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/network</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Network explorer</p></section><section class="overview-grid provider"><article class="card metric-card"><span class="label">Catalog models</span><p class="value mono">{model_count}</p><p class="privacy-note">from gateway catalog state</p></article><article class="card metric-card"><span class="label">Canonical providers</span><p class="value mono">{provider_count}</p><p class="privacy-note">from route candidates</p></article><article class="card metric-card"><span class="label">Live heartbeats</span><p class="value mono">{live_count}</p><p class="privacy-note">signed provider reports</p></article><article class="card metric-card"><span class="label">Unavailable models</span><p class="value mono">{unavailable_models}</p><p class="privacy-note">no live provider heartbeat</p></article></section>{price_charts}<section class="wide-grid network"><article class="card"><div class="card-header"><h2>Models</h2><span class="count-chip">{model_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Availability</th><th>Abilities</th><th>Terms</th><th>Constraints</th></tr></thead><tbody>{model_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Providers</h2><span class="count-chip">{route_count}</span></div><table class="table"><thead><tr><th>Provider</th><th>Route</th><th>Backend</th><th>Rails / price</th><th>Status</th></tr></thead><tbody>{provider_rows}</tbody></table></article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Explorer data is local gateway state from catalog, contract route candidates, and provider heartbeats.</span><span class="mono">127.0.0.1</span></footer>"#,
             model_count = state.models.len(),
         ),
     )
@@ -3676,6 +3915,1029 @@ fn dashboard_model_price(model: &GatewayModel) -> String {
     dashboard_price(&model.mayhem.price_ref_mu)
 }
 
+#[derive(Clone, Debug)]
+struct DashboardPricePoint {
+    epoch: u64,
+    price_mu: u64,
+    volume_mu: u64,
+    pinned: bool,
+    ctx_bracket: String,
+    title: String,
+}
+
+#[derive(Clone, Debug)]
+struct DashboardPriceSeries {
+    tier: String,
+    quant: String,
+    ctx_bracket: String,
+    price_ver: u64,
+    points: Vec<DashboardPricePoint>,
+}
+
+#[derive(Clone, Debug)]
+struct DashboardPriceCandle {
+    start_epoch: u64,
+    end_epoch: u64,
+    open_mu: u64,
+    high_mu: u64,
+    low_mu: u64,
+    close_mu: u64,
+    volume_mu: u64,
+    pinned: bool,
+    title: String,
+}
+
+fn dashboard_price_chart_cards(
+    models: &[GatewayModel],
+    options: &DashboardChartOptions,
+    provider_scope: Option<&BTreeSet<String>>,
+) -> String {
+    let mut ordered = models
+        .iter()
+        .filter(|model| match provider_scope {
+            Some(scope) => model
+                .mayhem
+                .route_candidates
+                .iter()
+                .any(|candidate| dashboard_provider_in_scope(scope, &candidate.provider)),
+            None => true,
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        let left_pin = dashboard_pin_rank(options, &left.id);
+        let right_pin = dashboard_pin_rank(options, &right.id);
+        left_pin
+            .cmp(&right_pin)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if ordered.is_empty() {
+        return r#"<section class="price-chart-grid"><article class="card price-chart-card price-chart-empty"><div class="empty-state"><div><div class="empty-icon"></div><p>No price markets loaded</p></div></div></article></section>"#
+            .to_owned();
+    }
+    let cards = ordered
+        .into_iter()
+        .map(|model| dashboard_price_chart_card(model, options, provider_scope))
+        .collect::<String>();
+    format!(r#"<section class="price-chart-grid">{cards}</section>"#)
+}
+
+fn dashboard_pin_rank(options: &DashboardChartOptions, model_id: &str) -> (bool, usize) {
+    options
+        .pinned_models
+        .iter()
+        .position(|model| model == model_id)
+        .map(|index| (false, index))
+        .unwrap_or((true, usize::MAX))
+}
+
+fn dashboard_price_chart_card(
+    model: &GatewayModel,
+    options: &DashboardChartOptions,
+    provider_scope: Option<&BTreeSet<String>>,
+) -> String {
+    let series = dashboard_model_price_series(model, provider_scope);
+    let pinned = options.pinned_models.iter().any(|id| id == &model.id);
+    let mut next_pins = options.pinned_models.clone();
+    next_pins.retain(|id| id != &model.id);
+    let pin_label = if pinned {
+        "Following"
+    } else {
+        next_pins.insert(0, model.id.clone());
+        "Follow"
+    };
+    let fallback_tier = options.selected_tier.as_deref().unwrap_or("T1");
+    let fallback_quant = options
+        .selected_quant
+        .as_deref()
+        .unwrap_or(DEFAULT_QUANT_BUCKET);
+    let fallback_bucket = options.selected_bucket.as_deref().unwrap_or("base");
+    let empty_pin_href = dashboard_chart_href(
+        options,
+        Some(fallback_tier),
+        options.selected_timeframe,
+        Some(fallback_bucket),
+        Some(fallback_quant),
+        Some(&next_pins),
+    );
+    if series.is_empty() {
+        return format!(
+            r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2></div><a class="copy-chip" href="{}">{pin_label}</a></div><div class="empty-state price-chart-empty"><div><div class="empty-icon"></div><p>Price history pending</p></div></div></article>"#,
+            html_escape(&model.id),
+            html_escape(&empty_pin_href),
+        );
+    }
+
+    let tiers = dashboard_unique_series_values(series.iter().map(|entry| entry.tier.as_str()));
+    let selected_tier = options
+        .selected_tier
+        .as_ref()
+        .filter(|tier| tiers.iter().any(|entry| entry == *tier))
+        .cloned()
+        .unwrap_or_else(|| tiers.first().cloned().unwrap_or_else(|| "T1".to_owned()));
+    let tier_series = series
+        .iter()
+        .filter(|entry| entry.tier == selected_tier)
+        .collect::<Vec<_>>();
+    let quants =
+        dashboard_unique_series_values(tier_series.iter().map(|entry| entry.quant.as_str()));
+    let selected_quant = options
+        .selected_quant
+        .as_ref()
+        .filter(|quant| quants.iter().any(|entry| entry == *quant))
+        .cloned()
+        .unwrap_or_else(|| {
+            quants
+                .first()
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_QUANT_BUCKET.to_owned())
+        });
+    let quant_series = tier_series
+        .into_iter()
+        .filter(|entry| entry.quant == selected_quant)
+        .collect::<Vec<_>>();
+    let buckets =
+        dashboard_unique_series_values(quant_series.iter().map(|entry| entry.ctx_bracket.as_str()));
+    let selected_bucket = options
+        .selected_bucket
+        .as_ref()
+        .filter(|bucket| buckets.iter().any(|entry| entry == *bucket))
+        .cloned()
+        .unwrap_or_else(|| {
+            buckets
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "base".to_owned())
+        });
+    let selected = quant_series
+        .iter()
+        .find(|entry| entry.ctx_bracket == selected_bucket)
+        .copied()
+        .unwrap_or(quant_series[0]);
+    let overlays = quant_series
+        .iter()
+        .filter(|entry| entry.ctx_bracket != selected.ctx_bracket)
+        .copied()
+        .collect::<Vec<_>>();
+    let pin_href = dashboard_chart_href(
+        options,
+        Some(&selected_tier),
+        options.selected_timeframe,
+        Some(&selected_bucket),
+        Some(&selected_quant),
+        Some(&next_pins),
+    );
+    let controls = dashboard_price_chart_controls(
+        options,
+        &tiers,
+        &selected_tier,
+        &quants,
+        &selected_quant,
+        &buckets,
+        &selected_bucket,
+    );
+    let chart = dashboard_price_chart_svg(selected, &overlays, options.selected_timeframe);
+    let latest = selected.points.last();
+    let latest_epoch = latest
+        .map(|point| point.epoch.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let latest_price = latest
+        .map(|point| format!("{}mu/1k", point.price_mu))
+        .unwrap_or_else(|| "pending".to_owned());
+    let volume = latest
+        .map(|point| format!("{}mu volume", point.volume_mu))
+        .unwrap_or_else(|| "0mu volume".to_owned());
+    format!(
+        r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2><p class="privacy-note">{} · {} · {}</p></div><a class="copy-chip" href="{}">{pin_label}</a></div>{controls}<div class="price-chart-shell">{chart}</div><div class="price-chart-legend"><span class="badge good">{}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge live">{}</span></div><div class="price-chart-footer"><span class="mono">epoch {latest_epoch}</span><span class="mono">{latest_price}</span><span class="mono">{volume}</span></div></article>"#,
+        html_escape(&model.id),
+        html_escape(&selected_tier),
+        html_escape(&selected_quant),
+        html_escape(&selected.ctx_bracket),
+        html_escape(&pin_href),
+        html_escape(options.selected_timeframe.label()),
+        html_escape(&selected.ctx_bracket),
+        html_escape(&format!("price v{}", selected.price_ver)),
+        if latest.is_some_and(|point| point.pinned) {
+            "pinned/no-volume"
+        } else {
+            "settled"
+        },
+    )
+}
+
+fn dashboard_unique_series_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn dashboard_price_chart_controls(
+    options: &DashboardChartOptions,
+    tiers: &[String],
+    selected_tier: &str,
+    quants: &[String],
+    selected_quant: &str,
+    buckets: &[String],
+    selected_bucket: &str,
+) -> String {
+    let tier_links = tiers
+        .iter()
+        .map(|tier| {
+            let href = dashboard_chart_href(
+                options,
+                Some(tier),
+                options.selected_timeframe,
+                Some(selected_bucket),
+                Some(selected_quant),
+                None,
+            );
+            dashboard_segment_link(tier, &href, tier == selected_tier)
+        })
+        .collect::<String>();
+    let time_links = [
+        DashboardPriceTimeframe::H1,
+        DashboardPriceTimeframe::H4,
+        DashboardPriceTimeframe::D1,
+        DashboardPriceTimeframe::W1,
+    ]
+    .into_iter()
+    .map(|timeframe| {
+        let href = dashboard_chart_href(
+            options,
+            Some(selected_tier),
+            timeframe,
+            Some(selected_bucket),
+            Some(selected_quant),
+            None,
+        );
+        dashboard_segment_link(
+            timeframe.label(),
+            &href,
+            timeframe == options.selected_timeframe,
+        )
+    })
+    .collect::<String>();
+    let quant_links = quants
+        .iter()
+        .map(|quant| {
+            let href = dashboard_chart_href(
+                options,
+                Some(selected_tier),
+                options.selected_timeframe,
+                Some(selected_bucket),
+                Some(quant),
+                None,
+            );
+            dashboard_segment_link(quant, &href, quant == selected_quant)
+        })
+        .collect::<String>();
+    let bucket_links = buckets
+        .iter()
+        .map(|bucket| {
+            let href = dashboard_chart_href(
+                options,
+                Some(selected_tier),
+                options.selected_timeframe,
+                Some(bucket),
+                Some(selected_quant),
+                None,
+            );
+            dashboard_segment_link(bucket, &href, bucket == selected_bucket)
+        })
+        .collect::<String>();
+    format!(
+        r#"<div class="price-chart-toolbar"><div class="price-chart-control"><span class="label">Tier</span><div class="segmented">{tier_links}</div></div><div class="price-chart-control"><span class="label">Timeframe</span><div class="segmented">{time_links}</div></div><div class="price-chart-control"><span class="label">Quant</span><div class="segmented">{quant_links}</div></div><div class="price-chart-control"><span class="label">Ctx bucket</span><div class="segmented">{bucket_links}</div></div></div>"#
+    )
+}
+
+fn dashboard_segment_link(label: &str, href: &str, active: bool) -> String {
+    let class = if active { "segment active" } else { "segment" };
+    format!(
+        r#"<a class="{class}" href="{}">{}</a>"#,
+        html_escape(href),
+        html_escape(label),
+    )
+}
+
+fn dashboard_chart_href(
+    options: &DashboardChartOptions,
+    tier: Option<&str>,
+    timeframe: DashboardPriceTimeframe,
+    bucket: Option<&str>,
+    quant: Option<&str>,
+    pin_override: Option<&[String]>,
+) -> String {
+    let mut query = Vec::new();
+    if let Some(provider) = options.provider_filter.as_deref() {
+        query.push(format!("provider={}", dashboard_url_encode(provider)));
+    }
+    if let Some(tier) = tier {
+        query.push(format!("tier={}", dashboard_url_encode(tier)));
+    }
+    query.push(format!("tf={}", timeframe.code()));
+    if let Some(bucket) = bucket.filter(|value| !value.is_empty()) {
+        query.push(format!("bucket={}", dashboard_url_encode(bucket)));
+    }
+    if let Some(quant) = quant.filter(|value| !value.is_empty()) {
+        query.push(format!("quant={}", dashboard_url_encode(quant)));
+    }
+    let pins = pin_override.unwrap_or(&options.pinned_models);
+    if pin_override.is_some() {
+        if pins.is_empty() {
+            query.push("pin=clear".to_owned());
+        } else {
+            query.push(format!(
+                "pin={}",
+                pins.iter()
+                    .map(|pin| dashboard_url_encode(pin))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    } else if !pins.is_empty() {
+        query.push(format!(
+            "pin={}",
+            pins.iter()
+                .map(|pin| dashboard_url_encode(pin))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    format!("{}?{}", options.surface.base_path(), query.join("&"))
+}
+
+fn dashboard_model_price_series(
+    model: &GatewayModel,
+    provider_scope: Option<&BTreeSet<String>>,
+) -> Vec<DashboardPriceSeries> {
+    let mut by_key: BTreeMap<(String, String, String), DashboardPriceSeries> = BTreeMap::new();
+    for candidate in &model.mayhem.route_candidates {
+        if let Some(scope) = provider_scope {
+            if !dashboard_provider_in_scope(scope, &candidate.provider) {
+                continue;
+            }
+        }
+        let price = route_price_ref_mu(model, Some(candidate));
+        let tier = format!("T{}", candidate.att_tier.max(1));
+        let quant = normalize_quant_bucket(&candidate.quant)
+            .unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned());
+        let series = dashboard_price_series_from_price(price, &tier, &quant);
+        let key = (
+            series.tier.clone(),
+            series.quant.clone(),
+            series.ctx_bracket.clone(),
+        );
+        by_key
+            .entry(key)
+            .and_modify(|existing| {
+                if series.points.len() > existing.points.len() {
+                    *existing = series.clone();
+                }
+            })
+            .or_insert(series);
+    }
+    if by_key.is_empty() && provider_scope.is_none() {
+        let tier = model
+            .mayhem
+            .attestation_tiers
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "T1".to_owned());
+        let quant = model
+            .mayhem
+            .quant_buckets
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_QUANT_BUCKET.to_owned());
+        let series = dashboard_price_series_from_price(&model.mayhem.price_ref_mu, &tier, &quant);
+        by_key.insert(
+            (
+                series.tier.clone(),
+                series.quant.clone(),
+                series.ctx_bracket.clone(),
+            ),
+            series,
+        );
+    }
+    by_key.into_values().collect()
+}
+
+fn dashboard_price_series_from_price(
+    price: &PriceRefMu,
+    tier: &str,
+    quant: &str,
+) -> DashboardPriceSeries {
+    let mut points = dashboard_price_points_from_price(price);
+    points.sort_by_key(|point| point.epoch);
+    let ctx_bracket = points
+        .last()
+        .map(|point| point.ctx_bracket.clone())
+        .or_else(|| {
+            price
+                .derivation
+                .as_ref()
+                .and_then(dashboard_ctx_bracket_from_derivation)
+        })
+        .unwrap_or_else(|| "base".to_owned());
+    DashboardPriceSeries {
+        tier: tier.to_owned(),
+        quant: quant.to_owned(),
+        ctx_bracket,
+        price_ver: price.ver,
+        points,
+    }
+}
+
+fn dashboard_price_points_from_price(price: &PriceRefMu) -> Vec<DashboardPricePoint> {
+    let fallback_price = dashboard_price_basis_mu(price);
+    let history = if price.history.is_empty() {
+        price.derivation.iter().collect::<Vec<_>>()
+    } else {
+        price.history.iter().collect::<Vec<_>>()
+    };
+    let mut points = history
+        .into_iter()
+        .enumerate()
+        .map(|(index, derivation)| {
+            let volume_mu = dashboard_derivation_volume_mu(derivation);
+            let pinned = dashboard_derivation_pinned(derivation, volume_mu);
+            DashboardPricePoint {
+                epoch: derivation_u64(derivation, &["epoch"]).unwrap_or(index as u64),
+                price_mu: dashboard_derivation_price_basis_mu(derivation).unwrap_or(fallback_price),
+                volume_mu,
+                pinned,
+                ctx_bracket: dashboard_ctx_bracket_from_derivation(derivation)
+                    .unwrap_or_else(|| "base".to_owned()),
+                title: dashboard_price_derivation_summary(derivation),
+            }
+        })
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        points.push(DashboardPricePoint {
+            epoch: price.ver,
+            price_mu: fallback_price,
+            volume_mu: 0,
+            pinned: true,
+            ctx_bracket: "base".to_owned(),
+            title: format!("price v{} · derivation pending", price.ver),
+        });
+    }
+    points
+}
+
+fn dashboard_price_basis_mu(price: &PriceRefMu) -> u64 {
+    rate_map_cost_basis_per_1k(&price.rate_map)
+        .max(price.per_req_mu)
+        .max(price.min_session_mu)
+        .max(1)
+}
+
+fn dashboard_derivation_price_basis_mu(derivation: &Value) -> Option<u64> {
+    for path in [
+        &["result_price", "rate_map"][..],
+        &["rate_map"][..],
+        &["seed_price", "rate_map"][..],
+    ] {
+        if let Some(rate_map) =
+            derivation_value(derivation, path).and_then(dashboard_rate_map_from_value)
+        {
+            let basis = rate_map_cost_basis_per_1k(&rate_map);
+            if basis > 0 {
+                return Some(basis);
+            }
+        }
+    }
+    if let Some(input) = derivation_u64(derivation, &["result_price", "in_per_1k"]) {
+        let output = derivation_u64(derivation, &["result_price", "out_per_1k"]).unwrap_or(0);
+        return Some(rate_map_cost_basis_per_1k(&text_generation_rate_map(input, output)).max(1));
+    }
+    for path in [
+        &["result_price", "price_basis_mu"][..],
+        &["price_basis_mu"][..],
+        &["result_price", "per_req_mu"][..],
+        &["result_price", "min_session_mu"][..],
+        &["price_mu"][..],
+    ] {
+        if let Some(value) = derivation_u64(derivation, path).filter(|value| *value > 0) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn dashboard_rate_map_from_value(value: &Value) -> Option<Vec<RateMapEntry>> {
+    let rate_map = value
+        .as_array()?
+        .iter()
+        .filter_map(|entry| {
+            Some(RateMapEntry {
+                unit: entry.get("unit")?.as_str()?.to_owned(),
+                per_unit_mu: entry.get("per_unit_mu")?.as_u64()?,
+                granularity: entry.get("granularity")?.as_u64()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!rate_map.is_empty()).then(|| normalize_rate_map(rate_map))
+}
+
+fn dashboard_derivation_volume_mu(derivation: &Value) -> u64 {
+    [
+        &["usage", "settled_mu"][..],
+        &["usage", "settled_work_mu"][..],
+        &["usage", "active_demand_mu"][..],
+        &["settled_mu"][..],
+        &["volume_mu"][..],
+        &["active_demand_mu"][..],
+        &["demand_mu"][..],
+    ]
+    .into_iter()
+    .find_map(|path| derivation_u64(derivation, path))
+    .unwrap_or(0)
+}
+
+fn dashboard_derivation_pinned(derivation: &Value, volume_mu: u64) -> bool {
+    if derivation_bool(derivation, &["controller", "frozen"]).unwrap_or(false) || volume_mu == 0 {
+        return true;
+    }
+    let source = derivation_str(derivation, &["controller", "source"])
+        .or_else(|| derivation_str(derivation, &["price_source"]))
+        .unwrap_or("");
+    source.contains("cold_start") || source.contains("pinned") || source.contains("seed")
+}
+
+fn dashboard_ctx_bracket_from_derivation(derivation: &Value) -> Option<String> {
+    derivation_str(derivation, &["ctx_bracket"])
+        .or_else(|| derivation_str(derivation, &["result_price", "ctx_bracket"]))
+        .or_else(|| derivation_str(derivation, &["seed_price", "ctx_bracket"]))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn dashboard_price_chart_svg(
+    selected: &DashboardPriceSeries,
+    overlays: &[&DashboardPriceSeries],
+    timeframe: DashboardPriceTimeframe,
+) -> String {
+    if selected.points.is_empty() {
+        return r#"<div class="empty-state price-chart-empty"><div><div class="empty-icon"></div><p>Price history pending</p></div></div>"#
+            .to_owned();
+    }
+    let width = 760.0;
+    let left = 54.0;
+    let right = 18.0;
+    let plot_top = 20.0;
+    let plot_bottom = 214.0;
+    let volume_top = 234.0;
+    let volume_bottom = 292.0;
+    let inner_right = width - right;
+    let window_epochs = timeframe.window_epochs();
+    let selected_candles = (timeframe != DashboardPriceTimeframe::H1)
+        .then(|| dashboard_price_candles(&selected.points, window_epochs))
+        .unwrap_or_default();
+    let overlay_candles = overlays
+        .iter()
+        .map(|series| dashboard_price_candles(&series.points, window_epochs))
+        .collect::<Vec<_>>();
+    let (min_epoch, max_epoch) = dashboard_chart_epoch_bounds(
+        selected,
+        overlays,
+        &selected_candles,
+        &overlay_candles,
+        timeframe,
+    );
+    let (min_price, max_price) = dashboard_chart_price_bounds(
+        selected,
+        overlays,
+        &selected_candles,
+        &overlay_candles,
+        timeframe,
+    );
+    let max_volume = if timeframe == DashboardPriceTimeframe::H1 {
+        selected
+            .points
+            .iter()
+            .map(|point| point.volume_mu)
+            .max()
+            .unwrap_or(0)
+    } else {
+        selected_candles
+            .iter()
+            .map(|candle| candle.volume_mu)
+            .max()
+            .unwrap_or(0)
+    };
+    let x_for_epoch =
+        |epoch: u64| dashboard_chart_x(epoch, min_epoch, max_epoch, left, inner_right);
+    let y_for_price =
+        |price: u64| dashboard_chart_y(price, min_price, max_price, plot_top, plot_bottom);
+    let mut body = String::new();
+    for i in 0..=4 {
+        let y = plot_top + (plot_bottom - plot_top) * f64::from(i) / 4.0;
+        body.push_str(&format!(
+            r#"<line class="price-grid-line" x1="{left}" y1="{}" x2="{inner_right}" y2="{}"/>"#,
+            svg_num(y),
+            svg_num(y),
+        ));
+    }
+    for i in 0..=4 {
+        let x = left + (inner_right - left) * f64::from(i) / 4.0;
+        body.push_str(&format!(
+            r#"<line class="price-grid-line" x1="{}" y1="{plot_top}" x2="{}" y2="{volume_bottom}"/>"#,
+            svg_num(x),
+            svg_num(x),
+        ));
+    }
+    let mid_price = min_price.saturating_add(max_price.saturating_sub(min_price) / 2);
+    for (label, y) in [
+        (max_price, y_for_price(max_price)),
+        (mid_price, y_for_price(mid_price)),
+        (min_price, y_for_price(min_price)),
+    ] {
+        body.push_str(&format!(
+            r#"<text class="price-axis" x="8" y="{}">{}mu</text>"#,
+            svg_num(y + 4.0),
+            label,
+        ));
+    }
+    body.push_str(&format!(
+        r#"<text class="price-axis" x="{left}" y="304">epoch {min_epoch}</text><text class="price-axis" x="{}" y="304" text-anchor="end">epoch {max_epoch}</text>"#,
+        inner_right,
+    ));
+
+    if timeframe == DashboardPriceTimeframe::H1 {
+        for overlay in overlays {
+            let path = dashboard_price_line_path(
+                overlay
+                    .points
+                    .iter()
+                    .map(|point| (point.epoch, point.price_mu)),
+                &x_for_epoch,
+                &y_for_price,
+            );
+            if !path.is_empty() {
+                body.push_str(&format!(
+                    r#"<path class="price-overlay" d="{}"><title>{}</title></path>"#,
+                    html_escape(&path),
+                    html_escape(&format!("{} {}", overlay.ctx_bracket, overlay.quant)),
+                ));
+            }
+        }
+        let path = dashboard_price_step_path(&selected.points, &x_for_epoch, &y_for_price);
+        if !path.is_empty() {
+            body.push_str(&format!(
+                r#"<path class="price-step" d="{}"/>"#,
+                html_escape(&path)
+            ));
+        }
+        for point in &selected.points {
+            body.push_str(&dashboard_volume_bar(
+                x_for_epoch(point.epoch),
+                9.0,
+                point.volume_mu,
+                max_volume,
+                volume_top,
+                volume_bottom,
+                &point.title,
+            ));
+            if point.pinned {
+                body.push_str(&dashboard_price_marker(
+                    x_for_epoch(point.epoch),
+                    y_for_price(point.price_mu),
+                    "pinned",
+                    &point.title,
+                ));
+            }
+        }
+    } else {
+        for (overlay, candles) in overlays.iter().zip(overlay_candles.iter()) {
+            let path = dashboard_price_line_path(
+                candles
+                    .iter()
+                    .map(|candle| (candle.end_epoch, candle.close_mu)),
+                &x_for_epoch,
+                &y_for_price,
+            );
+            if !path.is_empty() {
+                body.push_str(&format!(
+                    r#"<path class="price-overlay" d="{}"><title>{}</title></path>"#,
+                    html_escape(&path),
+                    html_escape(&format!("{} {}", overlay.ctx_bracket, overlay.quant)),
+                ));
+            }
+        }
+        let candle_width =
+            ((inner_right - left) / (selected_candles.len().max(1) as f64) * 0.5).clamp(5.0, 16.0);
+        for candle in &selected_candles {
+            let x = x_for_epoch(candle.end_epoch);
+            body.push_str(&dashboard_volume_bar(
+                x,
+                candle_width,
+                candle.volume_mu,
+                max_volume,
+                volume_top,
+                volume_bottom,
+                &candle.title,
+            ));
+            body.push_str(&dashboard_price_candle_svg(
+                candle,
+                x,
+                candle_width,
+                &y_for_price,
+            ));
+            if candle.pinned {
+                body.push_str(&dashboard_price_marker(
+                    x,
+                    y_for_price(candle.close_mu),
+                    "pinned",
+                    &candle.title,
+                ));
+            }
+        }
+    }
+
+    format!(
+        r#"<svg class="price-chart-svg" viewBox="0 0 760 310" role="img" aria-label="{} {} price chart">{body}</svg>"#,
+        html_escape(&selected.tier),
+        html_escape(&selected.ctx_bracket),
+    )
+}
+
+fn dashboard_price_candles(
+    points: &[DashboardPricePoint],
+    window_epochs: u64,
+) -> Vec<DashboardPriceCandle> {
+    let mut buckets: BTreeMap<u64, Vec<&DashboardPricePoint>> = BTreeMap::new();
+    for point in points {
+        let start = (point.epoch / window_epochs.max(1)) * window_epochs.max(1);
+        buckets.entry(start).or_default().push(point);
+    }
+    buckets
+        .into_iter()
+        .map(|(start_epoch, mut points)| {
+            points.sort_by_key(|point| point.epoch);
+            let first = points[0];
+            let last = points[points.len() - 1];
+            let high_mu = points
+                .iter()
+                .map(|point| point.price_mu)
+                .max()
+                .unwrap_or(first.price_mu);
+            let low_mu = points
+                .iter()
+                .map(|point| point.price_mu)
+                .min()
+                .unwrap_or(first.price_mu);
+            let volume_mu = points
+                .iter()
+                .map(|point| point.volume_mu)
+                .fold(0_u64, u64::saturating_add);
+            let pinned = volume_mu == 0 || points.iter().all(|point| point.pinned);
+            let end_epoch = start_epoch
+                .saturating_add(window_epochs.max(1))
+                .saturating_sub(1);
+            DashboardPriceCandle {
+                start_epoch,
+                end_epoch,
+                open_mu: first.price_mu,
+                high_mu,
+                low_mu,
+                close_mu: last.price_mu,
+                volume_mu,
+                pinned,
+                title: format!(
+                    "epoch {}-{} OHLC {}/{}/{}/{}mu volume {}mu | {}",
+                    start_epoch,
+                    end_epoch,
+                    first.price_mu,
+                    high_mu,
+                    low_mu,
+                    last.price_mu,
+                    volume_mu,
+                    last.title
+                ),
+            }
+        })
+        .collect()
+}
+
+fn dashboard_chart_epoch_bounds(
+    selected: &DashboardPriceSeries,
+    overlays: &[&DashboardPriceSeries],
+    selected_candles: &[DashboardPriceCandle],
+    overlay_candles: &[Vec<DashboardPriceCandle>],
+    timeframe: DashboardPriceTimeframe,
+) -> (u64, u64) {
+    let mut epochs = Vec::new();
+    if timeframe == DashboardPriceTimeframe::H1 {
+        epochs.extend(selected.points.iter().map(|point| point.epoch));
+        for overlay in overlays {
+            epochs.extend(overlay.points.iter().map(|point| point.epoch));
+        }
+    } else {
+        epochs.extend(
+            selected_candles
+                .iter()
+                .flat_map(|candle| [candle.start_epoch, candle.end_epoch]),
+        );
+        for candles in overlay_candles {
+            epochs.extend(
+                candles
+                    .iter()
+                    .flat_map(|candle| [candle.start_epoch, candle.end_epoch]),
+            );
+        }
+    }
+    let min = epochs.iter().copied().min().unwrap_or(0);
+    let max = epochs
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(min.saturating_add(1));
+    if min == max {
+        (min, min.saturating_add(1))
+    } else {
+        (min, max)
+    }
+}
+
+fn dashboard_chart_price_bounds(
+    selected: &DashboardPriceSeries,
+    overlays: &[&DashboardPriceSeries],
+    selected_candles: &[DashboardPriceCandle],
+    overlay_candles: &[Vec<DashboardPriceCandle>],
+    timeframe: DashboardPriceTimeframe,
+) -> (u64, u64) {
+    let mut prices = Vec::new();
+    if timeframe == DashboardPriceTimeframe::H1 {
+        prices.extend(selected.points.iter().map(|point| point.price_mu));
+        for overlay in overlays {
+            prices.extend(overlay.points.iter().map(|point| point.price_mu));
+        }
+    } else {
+        for candle in selected_candles {
+            prices.push(candle.open_mu);
+            prices.push(candle.high_mu);
+            prices.push(candle.low_mu);
+            prices.push(candle.close_mu);
+        }
+        for candles in overlay_candles {
+            prices.extend(candles.iter().map(|candle| candle.close_mu));
+        }
+    }
+    let min = prices.iter().copied().min().unwrap_or(1);
+    let max = prices
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(min.saturating_add(1));
+    if min == max {
+        let pad = min.max(10) / 10;
+        (
+            min.saturating_sub(pad.max(1)),
+            max.saturating_add(pad.max(1)),
+        )
+    } else {
+        let pad = max.saturating_sub(min).max(10) / 10;
+        (min.saturating_sub(pad), max.saturating_add(pad))
+    }
+}
+
+fn dashboard_chart_x(epoch: u64, min_epoch: u64, max_epoch: u64, left: f64, right: f64) -> f64 {
+    let span = max_epoch.saturating_sub(min_epoch).max(1) as f64;
+    left + (epoch.saturating_sub(min_epoch) as f64 / span) * (right - left)
+}
+
+fn dashboard_chart_y(price: u64, min_price: u64, max_price: u64, top: f64, bottom: f64) -> f64 {
+    let span = max_price.saturating_sub(min_price).max(1) as f64;
+    bottom - (price.saturating_sub(min_price) as f64 / span) * (bottom - top)
+}
+
+fn dashboard_price_line_path<'a>(
+    pairs: impl Iterator<Item = (u64, u64)> + 'a,
+    x_for_epoch: &impl Fn(u64) -> f64,
+    y_for_price: &impl Fn(u64) -> f64,
+) -> String {
+    let mut path = String::new();
+    for (index, (epoch, price)) in pairs.enumerate() {
+        let x = svg_num(x_for_epoch(epoch));
+        let y = svg_num(y_for_price(price));
+        if index == 0 {
+            path.push_str(&format!("M{x} {y}"));
+        } else {
+            path.push_str(&format!(" L{x} {y}"));
+        }
+    }
+    path
+}
+
+fn dashboard_price_step_path(
+    points: &[DashboardPricePoint],
+    x_for_epoch: &impl Fn(u64) -> f64,
+    y_for_price: &impl Fn(u64) -> f64,
+) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+    if points.len() == 1 {
+        let y = svg_num(y_for_price(points[0].price_mu));
+        return format!("M54 {y} H742");
+    }
+    let mut path = String::new();
+    for (index, point) in points.iter().enumerate() {
+        let x = svg_num(x_for_epoch(point.epoch));
+        let y = svg_num(y_for_price(point.price_mu));
+        if index == 0 {
+            path.push_str(&format!("M{x} {y}"));
+        } else {
+            path.push_str(&format!(" H{x} V{y}"));
+        }
+    }
+    path
+}
+
+fn dashboard_volume_bar(
+    x: f64,
+    width: f64,
+    volume_mu: u64,
+    max_volume: u64,
+    top: f64,
+    bottom: f64,
+    title: &str,
+) -> String {
+    let height = if max_volume == 0 {
+        0.0
+    } else {
+        (volume_mu as f64 / max_volume as f64) * (bottom - top)
+    };
+    let y = bottom - height;
+    format!(
+        r#"<rect class="price-volume" x="{}" y="{}" width="{}" height="{}"><title>{}</title></rect>"#,
+        svg_num(x - width / 2.0),
+        svg_num(y),
+        svg_num(width.max(2.0)),
+        svg_num(height.max(1.0)),
+        html_escape(title),
+    )
+}
+
+fn dashboard_price_candle_svg(
+    candle: &DashboardPriceCandle,
+    x: f64,
+    width: f64,
+    y_for_price: &impl Fn(u64) -> f64,
+) -> String {
+    let open_y = y_for_price(candle.open_mu);
+    let close_y = y_for_price(candle.close_mu);
+    let high_y = y_for_price(candle.high_mu);
+    let low_y = y_for_price(candle.low_mu);
+    let top = open_y.min(close_y);
+    let height = (open_y - close_y).abs().max(2.0);
+    let class = if candle.close_mu >= candle.open_mu {
+        "price-candle up"
+    } else {
+        "price-candle down"
+    };
+    format!(
+        r#"<g class="{class}"><title>{}</title><line class="wick" x1="{}" y1="{}" x2="{}" y2="{}"/><rect class="body" x="{}" y="{}" width="{}" height="{}" rx="2"/></g>"#,
+        html_escape(&candle.title),
+        svg_num(x),
+        svg_num(high_y),
+        svg_num(x),
+        svg_num(low_y),
+        svg_num(x - width / 2.0),
+        svg_num(top),
+        svg_num(width.max(3.0)),
+        svg_num(height),
+    )
+}
+
+fn dashboard_price_marker(x: f64, y: f64, class_suffix: &str, title: &str) -> String {
+    format!(
+        r#"<path class="price-marker {class_suffix}" d="M{} {} L{} {} L{} {} L{} {} Z"><title>{}</title></path>"#,
+        svg_num(x),
+        svg_num(y - 5.0),
+        svg_num(x + 5.0),
+        svg_num(y),
+        svg_num(x),
+        svg_num(y + 5.0),
+        svg_num(x - 5.0),
+        svg_num(y),
+        html_escape(title),
+    )
+}
+
+fn svg_num(value: f64) -> String {
+    let mut text = format!("{value:.1}");
+    if text.ends_with(".0") {
+        text.truncate(text.len() - 2);
+    }
+    text
+}
+
 fn dashboard_price(price: &PriceRefMu) -> String {
     let entries = price
         .rate_map
@@ -3699,6 +4961,10 @@ fn dashboard_model_price_derivation(model: &GatewayModel) -> String {
     let Some(derivation) = model.mayhem.price_ref_mu.derivation.as_ref() else {
         return "derivation pending".to_owned();
     };
+    dashboard_price_derivation_summary(derivation)
+}
+
+fn dashboard_price_derivation_summary(derivation: &Value) -> String {
     let epoch = derivation_u64(derivation, &["epoch"])
         .map(|value| value.to_string())
         .unwrap_or_else(|| "?".to_owned());
@@ -3799,6 +5065,67 @@ fn short_text(value: &str, max: usize) -> String {
     format!("{}...", value.chars().take(keep).collect::<String>())
 }
 
+fn dashboard_normalize_tier(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let tier = value.trim_start_matches(['T', 't']);
+    let tier = tier.parse::<u8>().ok()?.clamp(1, 9);
+    Some(format!("T{tier}"))
+}
+
+fn dashboard_url_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn dashboard_url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hi = hex_nibble(bytes[index + 1]);
+                let lo = hex_nibble(bytes[index + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi << 4) | lo);
+                    index += 3;
+                } else {
+                    out.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn html_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -3816,7 +5143,7 @@ fn html_escape(value: &str) -> String {
 
 fn dashboard_html_document(title: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>{DASHBOARD_CSS}{DASHBOARD_USER_CSS}</style></head><body>{body}</body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="{DASHBOARD_CSP}"><title>Mayhem {title}</title><style>{DASHBOARD_CSS}{DASHBOARD_USER_CSS}{DASHBOARD_CHART_CSS}</style></head><body>{body}</body></html>"#
     )
 }
 
@@ -14267,6 +15594,7 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 derivation: price_derivation_from_catalog_value(price),
+                history: price_history_from_catalog_value(price),
             },
             attestation_tier_labels: attestation_tier_labels_from_catalog_value(model)
                 .unwrap_or_else(|| attestation_tier_labels_for_counts(&tiers)),
@@ -14376,6 +15704,19 @@ fn price_derivation_from_catalog_value(price: &Value) -> Option<Value> {
         .or_else(|| price.get("market"))
         .filter(|value| value.is_object())
         .cloned()
+}
+
+fn price_history_from_catalog_value(price: &Value) -> Vec<Value> {
+    price
+        .get("history")
+        .or_else(|| price.get("price_history"))
+        .or_else(|| price.get("market_history"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|value| value.is_object())
+        .cloned()
+        .collect()
 }
 
 fn caps_output_modalities(caps: &Value) -> Vec<String> {
@@ -16601,6 +17942,7 @@ mod tests {
                     per_req_mu: 0,
                     min_session_mu: 0,
                     derivation: None,
+                    history: Vec::new(),
                 },
                 attestation_tiers: BTreeMap::from([("T1".to_owned(), 1)]),
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
@@ -17599,6 +18941,7 @@ mod tests {
             per_req_mu: 0,
             min_session_mu: 0,
             derivation: None,
+            history: Vec::new(),
         };
         model.mayhem.route_candidates[0].att_tier = 1;
         model.mayhem.route_candidates[0].quant = "int4".to_owned();
@@ -17609,6 +18952,7 @@ mod tests {
             per_req_mu: 0,
             min_session_mu: 0,
             derivation: None,
+            history: Vec::new(),
         });
         model.mayhem.route_candidates[1].att_tier = 3;
         model.mayhem.route_candidates[1].quant = "fp16".to_owned();
@@ -17619,6 +18963,7 @@ mod tests {
             per_req_mu: 123,
             min_session_mu: 456,
             derivation: None,
+            history: Vec::new(),
         });
         let state = GatewayState::from_models(vec![model.clone()]).with_receipt_balance_mu(10_000);
 

@@ -27190,6 +27190,12 @@ async fn read_prefix_entries(rpc: &PeerRpcClient, prefix: &str) -> Result<Vec<Pr
         .collect())
 }
 
+#[derive(Debug, Clone)]
+struct GatewayServedPrice {
+    price: LedgerPriceRecord,
+    market_key: String,
+}
+
 fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<GatewayModel>> {
     let now = unix_epoch_seconds()?;
     let active_enclaves = contract
@@ -27241,22 +27247,37 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         *count = count.saturating_add(1);
     }
 
-    let mut price_derivation_by_market: BTreeMap<String, Value> = BTreeMap::new();
+    let mut price_history_by_market: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for derivation in &contract.price_derivations {
         let Some(enclave_id) = derivation.get("enclave_id").and_then(Value::as_str) else {
             continue;
         };
         let ctx_bracket = derivation.get("ctx_bracket").and_then(Value::as_str);
         let market_key = ledger_price_market_key(enclave_id, ctx_bracket);
-        let candidate_key = price_derivation_sort_key(derivation);
-        let should_replace = price_derivation_by_market
-            .get(market_key.as_str())
-            .map(|existing| candidate_key > price_derivation_sort_key(existing))
-            .unwrap_or(true);
-        if should_replace {
-            price_derivation_by_market.insert(market_key, derivation.clone());
+        price_history_by_market
+            .entry(market_key)
+            .or_default()
+            .push(derivation.clone());
+    }
+    for history in price_history_by_market.values_mut() {
+        history.sort_by_key(price_derivation_sort_key);
+        history.dedup_by(|left, right| {
+            price_derivation_sort_key(left) == price_derivation_sort_key(right)
+        });
+        if history.len() > 720 {
+            let drop_count = history.len() - 720;
+            history.drain(..drop_count);
         }
     }
+    let price_derivation_by_market = price_history_by_market
+        .iter()
+        .filter_map(|(market_key, history)| {
+            history
+                .last()
+                .cloned()
+                .map(|derivation| (market_key.clone(), derivation))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let mut prices_by_market = BTreeMap::new();
     for schedule in &contract.prices {
@@ -27295,7 +27316,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .or_insert_with(|| gateway_caps_from_contract(&enclave.caps));
     }
 
-    let mut served_price_by_model: BTreeMap<String, LedgerPriceRecord> = BTreeMap::new();
+    let mut served_price_by_model: BTreeMap<String, GatewayServedPrice> = BTreeMap::new();
     for serving in contract
         .roomserve
         .iter()
@@ -27330,11 +27351,17 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         served_price_by_model
             .entry(enclave.model_id.clone())
             .and_modify(|existing| {
-                if price_sort_key(serving_price) < price_sort_key(existing) {
-                    *existing = serving_price.clone();
+                if price_sort_key(serving_price) < price_sort_key(&existing.price) {
+                    *existing = GatewayServedPrice {
+                        price: serving_price.clone(),
+                        market_key: market_key.clone(),
+                    };
                 }
             })
-            .or_insert_with(|| serving_price.clone());
+            .or_insert_with(|| GatewayServedPrice {
+                price: serving_price.clone(),
+                market_key: market_key.clone(),
+            });
     }
 
     let mut providers_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -27404,7 +27431,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
-                    price_ref_mu: Some(gateway_price_ref_from_ledger(serving_price)),
+                    price_ref_mu: Some(gateway_price_ref_from_ledger_with_history(
+                        serving_price,
+                        price_history_by_market
+                            .get(market_key.as_str())
+                            .map(Vec::as_slice),
+                    )),
                     min_ask_mu: 0,
                     att_tier: effective_att_tier,
                     quant: normalize_ledger_quant(&enclave.quant),
@@ -27480,7 +27512,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .unwrap_or_else(|| DEFAULT_MODEL_CLASS.to_owned()),
                 providers_online,
                 rooms,
-                price_ref_mu: gateway_price_ref_from_ledger(&price),
+                price_ref_mu: gateway_price_ref_from_ledger_with_history(
+                    &price.price,
+                    price_history_by_market
+                        .get(price.market_key.as_str())
+                        .map(Vec::as_slice),
+                ),
                 attestation_tier_labels: gateway_attestation_tier_labels_for_counts(
                     &attestation_tiers,
                 ),
@@ -27628,14 +27665,21 @@ fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64, u64, u64) {
     )
 }
 
-fn gateway_price_ref_from_ledger(price: &LedgerPriceRecord) -> PriceRefMu {
+fn gateway_price_ref_from_ledger_with_history(
+    price: &LedgerPriceRecord,
+    history: Option<&[Value]>,
+) -> PriceRefMu {
+    let history = history
+        .map(|entries| entries.iter().take(720).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     PriceRefMu {
         denom: "mu_usd".to_owned(),
         ver: price.ver,
         rate_map: normalize_rate_map(price.rate_map.clone()),
         per_req_mu: price.per_req_mu,
         min_session_mu: price.min_session_mu,
-        derivation: price.derivation.clone(),
+        derivation: price.derivation.clone().or_else(|| history.last().cloned()),
+        history,
     }
 }
 
@@ -38545,6 +38589,11 @@ mod tests {
             "derivation_hash": "77".repeat(32),
             "price_root": "88".repeat(32)
         }));
+        let mut prior_derivation = contract.price_derivations[0].clone();
+        prior_derivation["epoch"] = json!(5u64);
+        prior_derivation["usage"]["active_demand_mu"] = json!(8_765u64);
+        prior_derivation["derivation_hash"] = json!("76".repeat(32));
+        contract.price_derivations.push(prior_derivation);
         let models = gateway_models_from_contract(&contract).unwrap();
 
         assert_eq!(models.len(), 1);
@@ -38557,7 +38606,7 @@ mod tests {
         assert_eq!(models[0].mayhem.price_ref_mu.ver, 1);
         assert_eq!(
             models[0].mayhem.price_ref_mu.rate_map,
-            text_generation_rate_map(1, 2)
+            normalize_rate_map(text_generation_rate_map(1, 2))
         );
         let derivation = models[0]
             .mayhem
@@ -38575,6 +38624,14 @@ mod tests {
             derivation["price_root"].as_str(),
             Some(expected_price_root.as_str())
         );
+        let history_epochs = models[0]
+            .mayhem
+            .price_ref_mu
+            .history
+            .iter()
+            .map(|entry| entry["epoch"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(history_epochs, vec![5, 7]);
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
         assert_eq!(models[0].mayhem.quant_buckets["int4"], 1);
         assert!(models[0].mayhem.kyb_identities.is_empty());
@@ -38605,11 +38662,20 @@ mod tests {
             .expect("route carries its own enclave market price");
         assert_eq!(route_price.denom, "mu_usd");
         assert_eq!(route_price.ver, 1);
-        assert_eq!(route_price.rate_map, text_generation_rate_map(1, 2));
+        assert_eq!(
+            route_price.rate_map,
+            normalize_rate_map(text_generation_rate_map(1, 2))
+        );
         assert_eq!(
             route_price.derivation.as_ref().unwrap()["epoch"].as_u64(),
             Some(7)
         );
+        let route_history_epochs = route_price
+            .history
+            .iter()
+            .map(|entry| entry["epoch"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(route_history_epochs, vec![5, 7]);
         assert_eq!(
             models[0].mayhem.route_candidates[0].admin_pubkey,
             "44".repeat(32)
@@ -38848,7 +38914,7 @@ mod tests {
         assert_eq!(helper.mayhem.price_ref_mu.ver, 2);
         assert_eq!(
             helper.mayhem.price_ref_mu.rate_map,
-            text_generation_rate_map(3, 5)
+            normalize_rate_map(text_generation_rate_map(3, 5))
         );
         assert_eq!(
             helper.mayhem.route_candidates[0].accepted_rails,
@@ -38957,7 +39023,10 @@ mod tests {
         assert_eq!(tier1.quant, "int4");
         assert_eq!(tier1.price_ver, 1);
         assert_eq!(tier1_price.ver, 1);
-        assert_eq!(tier1_price.rate_map, text_generation_rate_map(1, 2));
+        assert_eq!(
+            tier1_price.rate_map,
+            normalize_rate_map(text_generation_rate_map(1, 2))
+        );
 
         let tier3 = by_tier[&3];
         let tier3_price = tier3
@@ -38969,7 +39038,10 @@ mod tests {
         assert_eq!(tier3.quant, "fp16");
         assert_eq!(tier3.price_ver, 9);
         assert_eq!(tier3_price.ver, 9);
-        assert_eq!(tier3_price.rate_map, text_generation_rate_map(90, 180));
+        assert_eq!(
+            tier3_price.rate_map,
+            normalize_rate_map(text_generation_rate_map(90, 180))
+        );
         assert_eq!(tier3_price.per_req_mu, 123);
         assert_eq!(tier3_price.min_session_mu, 456);
         assert_eq!(

@@ -2103,6 +2103,7 @@ fn routed_embedding_test_model() -> GatewayModel {
         per_req_mu: 0,
         min_session_mu: 0,
         derivation: None,
+        history: Vec::new(),
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -2152,6 +2153,7 @@ fn routed_image_generation_test_model() -> GatewayModel {
         per_req_mu: 0,
         min_session_mu: 0,
         derivation: None,
+        history: Vec::new(),
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -2207,6 +2209,7 @@ fn routed_audio_speech_test_model() -> GatewayModel {
         per_req_mu: 0,
         min_session_mu: 0,
         derivation: None,
+        history: Vec::new(),
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -2252,6 +2255,7 @@ fn routed_audio_transcription_test_model() -> GatewayModel {
         per_req_mu: 0,
         min_session_mu: 0,
         derivation: None,
+        history: Vec::new(),
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -2629,6 +2633,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 per_req_mu: 0,
                 min_session_mu: 0,
                 derivation: None,
+                history: Vec::new(),
             },
             attestation_tiers: tiers,
             attestation_tier_labels: BTreeMap::from([(
@@ -3103,6 +3108,52 @@ async fn dashboard_uses_local_design_system_and_font_asset() {
 }
 
 #[tokio::test]
+async fn dashboard_price_chart_follow_list_persists_in_cookie() {
+    let state = GatewayState::from_models(vec![routed_test_model()]);
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let pinned_path = format!("{dashboard_path}&pin=mayhem%2Frouted-test");
+    let app = openai_router(state);
+
+    let (status, headers, bytes) = raw_request(app.clone(), Method::GET, &pinned_path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("dashboard html");
+    assert!(body.contains("price-chart-svg"));
+    assert!(body.contains("Following"));
+    let cookies = headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    assert!(
+        cookies
+            .iter()
+            .any(|cookie| cookie.contains("mayhem_dashboard_user_pins=mayhem%2Frouted-test")),
+        "pin cookie missing from {cookies:?}"
+    );
+    let cookie_header = cookies
+        .iter()
+        .filter_map(|cookie| cookie.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        dashboard_path,
+        None,
+        &[("cookie", &cookie_header)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("dashboard html");
+    assert!(body.contains("Following"));
+    assert_no_external_urls(&body);
+}
+
+#[tokio::test]
 async fn user_dashboard_renders_live_gateway_data() {
     let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
@@ -3137,6 +3188,9 @@ async fn user_dashboard_renders_live_gateway_data() {
     assert!(body.contains("Sessions"));
     assert!(body.contains("Models"));
     assert!(body.contains("Spend"));
+    assert!(body.contains("price-chart-svg"));
+    assert!(body.contains("Ctx bucket"));
+    assert!(body.contains("Timeframe"));
     assert!(body.contains("Only Tier 3 keeps prompts private"));
     assert!(body.contains("Tier 4 can still read prompts"));
     assert!(body.contains("not a privacy ladder"));
@@ -3204,6 +3258,8 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert!(body.contains("Earnings"));
     assert!(body.contains("Reputation / Holdback"));
     assert!(body.contains("Hardware / Health"));
+    assert!(body.contains("price-chart-svg"));
+    assert!(body.contains("Ctx bucket"));
     assert!(body.contains("mayhem earnings --provider"));
     assert!(body.contains("mayhem withdraw --claim-proof"));
     assert!(!body.contains("ledger earnings not loaded"));
@@ -3425,6 +3481,8 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     assert!(body.contains("Network explorer"));
     assert!(body.contains("mayhem/routed-test"));
     assert!(body.contains("mayhem/unavailable-test"));
+    assert!(body.contains("price-chart-svg"));
+    assert!(body.contains("Timeframe"));
     assert!(body.contains("vllm"));
     assert!(body.contains("llama.cpp"));
     assert!(body.contains("fiat, tap"));
