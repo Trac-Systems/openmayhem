@@ -153,7 +153,7 @@ function normalizeReceiptUsage(usageSource) {
   return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
 }
 
-function migrateReceiptBody(body, targetSchemaVersion = 3) {
+function migrateReceiptBody(body, targetSchemaVersion = 4) {
   if (!Number.isSafeInteger(body.schema_version) || body.schema_version < 1) {
     throw new Error('receipt schema_version is unsupported');
   }
@@ -169,6 +169,10 @@ function migrateReceiptBody(body, targetSchemaVersion = 3) {
       migrated.schema_version = 2;
     } else if (migrated.schema_version === 2) {
       migrated.schema_version = 3;
+    } else if (migrated.schema_version === 3) {
+      migrated.locked_per_req_mu ??= 0;
+      migrated.locked_min_session_mu ??= 0;
+      migrated.schema_version = 4;
     } else {
       throw new Error(`unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}`);
     }

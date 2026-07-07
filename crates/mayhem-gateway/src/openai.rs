@@ -23,7 +23,7 @@ use crate::{
         SessionFailoverState, SessionPriceMu, DEFAULT_MAX_OPEN_ATTEMPTS,
         DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
     },
-    pricing::{normalize_rate_map, text_generation_rate_map, text_usage_mu, RateMapEntry},
+    pricing::{normalize_rate_map, priced_usage_mu, text_generation_rate_map, RateMapEntry},
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ProviderObservationSample, ProviderTable,
         ProviderTableEntry, RequestRequirements, SelectionWeights,
@@ -232,6 +232,8 @@ pub struct PriceRefMu {
     pub denom: String,
     pub ver: u64,
     pub rate_map: Vec<RateMapEntry>,
+    pub per_req_mu: u64,
+    pub min_session_mu: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -953,6 +955,8 @@ impl GatewayState {
                     denom: "mu_usd".to_owned(),
                     ver: 1,
                     rate_map: text_generation_rate_map(20, 60),
+                    per_req_mu: 0,
+                    min_session_mu: 0,
                 },
                 attestation_tiers: tiers,
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
@@ -6901,6 +6905,14 @@ fn validate_provider_receipt(
             "provider receipt locked_rate_map mismatch",
         ),
         (
+            body.locked_per_req_mu == invocation.spend_voucher.body.locked_per_req_mu,
+            "provider receipt locked_per_req_mu mismatch",
+        ),
+        (
+            body.locked_min_session_mu == invocation.spend_voucher.body.locked_min_session_mu,
+            "provider receipt locked_min_session_mu mismatch",
+        ),
+        (
             body.rules_ver == invocation.rules_ver,
             "provider receipt rules_ver mismatch",
         ),
@@ -10774,6 +10786,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
+            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
+            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10852,6 +10866,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
+            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
+            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10930,6 +10946,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
+            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
+            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11008,6 +11026,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
+            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
+            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11086,6 +11106,8 @@ impl GatewayState {
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
+            locked_per_req_mu: model.mayhem.price_ref_mu.per_req_mu,
+            locked_min_session_mu: model.mayhem.price_ref_mu.min_session_mu,
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11185,6 +11207,8 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11274,6 +11298,8 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11363,6 +11389,8 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11513,6 +11541,8 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11602,6 +11632,8 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -12237,6 +12269,11 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .and_then(Value::as_u64)
                     .unwrap_or(1),
                 rate_map,
+                per_req_mu: price.get("per_req_mu").and_then(Value::as_u64).unwrap_or(0),
+                min_session_mu: price
+                    .get("min_session_mu")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             },
             attestation_tier_labels: attestation_tier_labels_from_catalog_value(model)
                 .unwrap_or_else(|| attestation_tier_labels_for_counts(&tiers)),
@@ -12464,11 +12501,21 @@ fn session_locked_rate_map(model: &GatewayModel) -> Vec<RateMapEntry> {
 }
 
 fn calculate_locked_mu_owed(invocation: &GatewaySessionInvocation, usage: &ReceiptUsage) -> u64 {
-    text_usage_mu(&invocation.spend_voucher.body.locked_rate_map, usage)
+    priced_usage_mu(
+        &invocation.spend_voucher.body.locked_rate_map,
+        invocation.spend_voucher.body.locked_per_req_mu,
+        invocation.spend_voucher.body.locked_min_session_mu,
+        usage,
+    )
 }
 
 fn calculate_mu_owed(price: &PriceRefMu, usage: &ReceiptUsage) -> u64 {
-    text_usage_mu(&price.rate_map, usage)
+    priced_usage_mu(
+        &price.rate_map,
+        price.per_req_mu,
+        price.min_session_mu,
+        usage,
+    )
 }
 
 fn session_id_for(model_id: &str, prompt_text: &str) -> String {
@@ -13791,6 +13838,8 @@ mod tests {
             enclave_id: enclave_id.clone(),
             price_ver: 7,
             locked_rate_map: text_generation_rate_map(20, 60),
+            locked_per_req_mu: 0,
+            locked_min_session_mu: 0,
             max_spend_mu: 1000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 128,
@@ -13838,6 +13887,8 @@ mod tests {
                     denom: "mu_usd".to_owned(),
                     ver: 7,
                     rate_map: text_generation_rate_map(20, 60),
+                    per_req_mu: 0,
+                    min_session_mu: 0,
                 },
                 attestation_tiers: BTreeMap::from([("T1".to_owned(), 1)]),
                 attestation_tier_labels: attestation_tier_labels_for_counts(&BTreeMap::from([(
@@ -14950,6 +15001,8 @@ mod tests {
             model_id: model.id.clone(),
             price_ver: invocation.price_ver,
             locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+            locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+            locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
             mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
@@ -14984,6 +15037,8 @@ mod tests {
             model_id: model.id.clone(),
             price_ver: invocation.price_ver,
             locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+            locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+            locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
             mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),

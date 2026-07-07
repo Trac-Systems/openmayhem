@@ -8,8 +8,8 @@ pub const CRATE_NAME: &str = "mayhem-proto";
 pub const CONTRACT_VERSION: u32 = 2;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 3;
-pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 4;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 4;
+pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 5;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
@@ -172,6 +172,8 @@ pub struct SpendVoucherBody {
     pub enclave_id: String,
     pub price_ver: u64,
     pub locked_rate_map: Vec<RateMapEntry>,
+    pub locked_per_req_mu: u64,
+    pub locked_min_session_mu: u64,
     pub max_spend_mu: u64,
     pub checkpoint_every: CheckpointPolicy,
 }
@@ -312,6 +314,8 @@ pub struct ReceiptBody {
     pub model_id: String,
     pub price_ver: u64,
     pub locked_rate_map: Vec<RateMapEntry>,
+    pub locked_per_req_mu: u64,
+    pub locked_min_session_mu: u64,
     pub rules_ver: u64,
     pub usage: ReceiptUsage,
     pub mu_owed_cum: u64,
@@ -1139,6 +1143,8 @@ mod tests {
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
+            locked_per_req_mu: 7,
+            locked_min_session_mu: 11,
             max_spend_mu: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
@@ -1164,6 +1170,8 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
+            locked_per_req_mu: 7,
+            locked_min_session_mu: 11,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
@@ -1208,6 +1216,8 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
+            locked_per_req_mu: 0,
+            locked_min_session_mu: 0,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
@@ -1251,6 +1261,8 @@ mod tests {
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
+            locked_per_req_mu: 7,
+            locked_min_session_mu: 11,
             max_spend_mu: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
@@ -1283,6 +1295,8 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
+            locked_per_req_mu: 7,
+            locked_min_session_mu: 11,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,

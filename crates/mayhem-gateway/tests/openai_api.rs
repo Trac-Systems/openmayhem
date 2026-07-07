@@ -18,7 +18,7 @@ use mayhem_gateway::openai::{
     PriceRefMu, ProviderSignedReceipt, ShapeAdapterInfo, ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
-    aggregate_canary_fingerprints, text_generation_rate_map, text_usage_mu, token_fingerprint,
+    aggregate_canary_fingerprints, priced_usage_mu, text_generation_rate_map, token_fingerprint,
     HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
     ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
@@ -1810,6 +1810,8 @@ fn routed_embedding_test_model() -> GatewayModel {
             per_unit_mu: 10,
             granularity: 1_000,
         }],
+        per_req_mu: 0,
+        min_session_mu: 0,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -1853,6 +1855,8 @@ fn routed_image_generation_test_model() -> GatewayModel {
                 granularity: 1,
             },
         ],
+        per_req_mu: 0,
+        min_session_mu: 0,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -1899,6 +1903,8 @@ fn routed_audio_speech_test_model() -> GatewayModel {
                 granularity: 1,
             },
         ],
+        per_req_mu: 0,
+        min_session_mu: 0,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -1938,6 +1944,8 @@ fn routed_audio_transcription_test_model() -> GatewayModel {
             per_unit_mu: 250,
             granularity: 1,
         }],
+        per_req_mu: 0,
+        min_session_mu: 0,
     };
     model.mayhem.caps = ModelCaps {
         tools: false,
@@ -1989,9 +1997,16 @@ fn signed_image_provider_receipt(
         model_id: model.id.clone(),
         price_ver: invocation.price_ver,
         locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+        locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+        locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: text_usage_mu(&invocation.spend_voucher.body.locked_rate_map, usage),
+        mu_owed_cum: priced_usage_mu(
+            &invocation.spend_voucher.body.locked_rate_map,
+            invocation.spend_voucher.body.locked_per_req_mu,
+            invocation.spend_voucher.body.locked_min_session_mu,
+            usage,
+        ),
         prompt_hash: image_prompt_hash_for_test(request),
         ts: 1_782_950_400_000,
     };
@@ -2056,9 +2071,16 @@ fn signed_provider_receipt_for_test(
         model_id: model.id.clone(),
         price_ver: invocation.price_ver,
         locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+        locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
+        locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: text_usage_mu(&invocation.spend_voucher.body.locked_rate_map, usage),
+        mu_owed_cum: priced_usage_mu(
+            &invocation.spend_voucher.body.locked_rate_map,
+            invocation.spend_voucher.body.locked_per_req_mu,
+            invocation.spend_voucher.body.locked_min_session_mu,
+            usage,
+        ),
         prompt_hash,
         ts: 1_782_950_400_000,
     };
@@ -2270,6 +2292,8 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 denom: "mu_usd".to_owned(),
                 ver: 7,
                 rate_map: text_generation_rate_map(20, 60),
+                per_req_mu: 0,
+                min_session_mu: 0,
             },
             attestation_tiers: tiers,
             attestation_tier_labels: BTreeMap::from([(

@@ -44,8 +44,8 @@ const DISPUTE_DEPOSIT_MU = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 3;
-export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 4;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 4;
+export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 5;
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
@@ -998,6 +998,12 @@ class MayhemContract extends Contract {
     if (stableJson(normalized.locked_rate_map) !== stableJson(lockedPrice.rate_map)) {
       return new Error('Spend reservation locked rate_map does not match price version.');
     }
+    if (normalized.locked_per_req_mu !== (lockedPrice.per_req_mu ?? 0)) {
+      return new Error('Spend reservation locked per_req_mu does not match price version.');
+    }
+    if (normalized.locked_min_session_mu !== (lockedPrice.min_session_mu ?? 0)) {
+      return new Error('Spend reservation locked min_session_mu does not match price version.');
+    }
     const rules = await this.currentRules();
     if (!rules || rules.ver !== normalized.rules_ver) {
       return new Error('Spend reservation rules version is not current.');
@@ -1023,6 +1029,8 @@ class MayhemContract extends Contract {
         existing.enclave_id !== normalized.enclave_id ||
         existing.price_ver !== normalized.price_ver ||
         stableJson(existing.locked_rate_map) !== stableJson(normalized.locked_rate_map) ||
+        existing.locked_per_req_mu !== normalized.locked_per_req_mu ||
+        existing.locked_min_session_mu !== normalized.locked_min_session_mu ||
         existing.max_spend_mu !== normalized.max_spend_mu ||
         existing.voucher_hash !== normalized.voucher_hash
       ) {
@@ -1057,6 +1065,8 @@ class MayhemContract extends Contract {
       enclave_id: normalized.enclave_id,
       price_ver: normalized.price_ver,
       locked_rate_map: normalized.locked_rate_map,
+      locked_per_req_mu: normalized.locked_per_req_mu,
+      locked_min_session_mu: normalized.locked_min_session_mu,
       rules_ver: normalized.rules_ver,
       max_spend_mu: normalized.max_spend_mu,
       voucher_hash: normalized.voucher_hash,
@@ -5204,6 +5214,8 @@ class MayhemContract extends Contract {
         'enclave_id',
         'price_ver',
         'locked_rate_map',
+        'locked_per_req_mu',
+        'locked_min_session_mu',
         'max_spend_mu',
         'checkpoint_every',
         'user_sig',
@@ -5226,6 +5238,12 @@ class MayhemContract extends Contract {
     }
     const lockedRateMap = this.normalizeLockedRateMap(voucher.locked_rate_map, 'spend voucher locked_rate_map');
     if (lockedRateMap instanceof Error) return lockedRateMap;
+    if (!Number.isSafeInteger(voucher.locked_per_req_mu) || voucher.locked_per_req_mu < 0) {
+      return new Error('Invalid spend voucher locked per-request price.');
+    }
+    if (!Number.isSafeInteger(voucher.locked_min_session_mu) || voucher.locked_min_session_mu < 0) {
+      return new Error('Invalid spend voucher locked minimum session price.');
+    }
     if (!Number.isSafeInteger(voucher.max_spend_mu) || voucher.max_spend_mu < 1) {
       return new Error('Invalid spend voucher max spend.');
     }
@@ -5242,6 +5260,8 @@ class MayhemContract extends Contract {
       enclave_id: voucher.enclave_id.toLowerCase(),
       price_ver: voucher.price_ver,
       locked_rate_map: lockedRateMap,
+      locked_per_req_mu: voucher.locked_per_req_mu,
+      locked_min_session_mu: voucher.locked_min_session_mu,
       max_spend_mu: voucher.max_spend_mu,
       checkpoint_every: {
         tokens: voucher.checkpoint_every.tokens,
@@ -5326,6 +5346,8 @@ class MayhemContract extends Contract {
       enclave_id: value.enclave_id.toLowerCase(),
       price_ver: value.price_ver,
       locked_rate_map: voucher.body.locked_rate_map,
+      locked_per_req_mu: voucher.body.locked_per_req_mu,
+      locked_min_session_mu: voucher.body.locked_min_session_mu,
       rules_ver: value.rules_ver,
       max_spend_mu: value.max_spend_mu,
       voucher: {
@@ -5334,6 +5356,8 @@ class MayhemContract extends Contract {
         enclave_id: voucher.body.enclave_id,
         price_ver: voucher.body.price_ver,
         locked_rate_map: voucher.body.locked_rate_map,
+        locked_per_req_mu: voucher.body.locked_per_req_mu,
+        locked_min_session_mu: voucher.body.locked_min_session_mu,
         max_spend_mu: voucher.body.max_spend_mu,
         checkpoint_every: voucher.body.checkpoint_every,
         user_sig: voucher.user_sig,
@@ -5384,6 +5408,12 @@ class MayhemContract extends Contract {
       if (lockedRateMap instanceof Error) return lockedRateMap;
       if (stableJson(lockedRateMap) !== stableJson(session.locked_rate_map)) {
         return new Error('Spend hold locked_rate_map must be canonical.');
+      }
+      if (!Number.isSafeInteger(session.locked_per_req_mu) || session.locked_per_req_mu < 0) {
+        return new Error('Invalid spend hold locked per-request price.');
+      }
+      if (!Number.isSafeInteger(session.locked_min_session_mu) || session.locked_min_session_mu < 0) {
+        return new Error('Invalid spend hold locked minimum session price.');
       }
       if (!Number.isSafeInteger(session.max_spend_mu) || session.max_spend_mu < 1) {
         return new Error('Invalid spend hold max spend.');
@@ -6417,6 +6447,8 @@ class MayhemContract extends Contract {
       prompt_hash: bodySource.prompt_hash,
       ts: bodySource.ts,
     };
+    if (hasOwn(bodySource, 'locked_per_req_mu')) body.locked_per_req_mu = bodySource.locked_per_req_mu;
+    if (hasOwn(bodySource, 'locked_min_session_mu')) body.locked_min_session_mu = bodySource.locked_min_session_mu;
 
     const migratedBody = this.migrateReceiptBody(body, targetSchemaVersion);
     if (migratedBody instanceof Error) return migratedBody;
@@ -6465,7 +6497,11 @@ class MayhemContract extends Contract {
       } else if (migrated.schema_version === 2) {
         migrated.schema_version = 3;
       } else if (migrated.schema_version === 3) {
+        migrated.locked_per_req_mu ??= 0;
+        migrated.locked_min_session_mu ??= 0;
         migrated.schema_version = 4;
+      } else if (migrated.schema_version === 4) {
+        migrated.schema_version = 5;
       } else {
         return new Error(
           `Unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}.`
@@ -6499,6 +6535,12 @@ class MayhemContract extends Contract {
     if (stableJson(lockedRateMap) !== stableJson(body.locked_rate_map)) {
       return new Error('Receipt locked_rate_map must be canonical.');
     }
+    if (!Number.isSafeInteger(body.locked_per_req_mu) || body.locked_per_req_mu < 0) {
+      return new Error('Invalid receipt locked per-request price.');
+    }
+    if (!Number.isSafeInteger(body.locked_min_session_mu) || body.locked_min_session_mu < 0) {
+      return new Error('Invalid receipt locked minimum session price.');
+    }
     if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
       return new Error('Invalid receipt rules version.');
     }
@@ -6510,10 +6552,15 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(body.mu_owed_cum) || body.mu_owed_cum < 0) {
       return new Error('Invalid receipt cumulative amount.');
     }
-    const lockedMu = this.usageMuForRateMap(body.locked_rate_map, body.usage);
+    const lockedMu = this.usageMuForLockedTerms(
+      body.locked_rate_map,
+      body.locked_per_req_mu,
+      body.locked_min_session_mu,
+      body.usage
+    );
     if (lockedMu instanceof Error) return lockedMu;
     if (body.mu_owed_cum !== lockedMu) {
-      return new Error('Receipt cumulative amount does not match locked rate_map.');
+      return new Error('Receipt cumulative amount does not match locked price terms.');
     }
     if (!Number.isSafeInteger(body.ts) || body.ts < 0) return new Error('Invalid receipt timestamp.');
     return null;
@@ -6831,6 +6878,20 @@ class MayhemContract extends Contract {
       total += this.ceilDivBigInt(entry.count * entry.perUnitMu, entry.granularity);
     }
     return this.safeNarrowMu(total);
+  }
+
+  usageMuForLockedTerms(rateMap, perReqMu, minSessionMu, usage) {
+    if (!Number.isSafeInteger(perReqMu) || perReqMu < 0) {
+      return new Error('Invalid locked per-request price.');
+    }
+    if (!Number.isSafeInteger(minSessionMu) || minSessionMu < 0) {
+      return new Error('Invalid locked minimum session price.');
+    }
+    const usageMu = this.usageMuForRateMap(rateMap, usage);
+    if (usageMu instanceof Error) return usageMu;
+    const subtotal = this.safeAddMu(usageMu, perReqMu);
+    if (subtotal instanceof Error) return subtotal;
+    return Math.max(subtotal, minSessionMu);
   }
 
   ceilDivBigInt(value, divisor) {

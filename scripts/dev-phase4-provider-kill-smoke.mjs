@@ -39,6 +39,9 @@ const SSH_OPTS = [
   '-o', 'PasswordAuthentication=yes',
   '-o', 'KbdInteractiveAuthentication=yes',
   '-o', 'NumberOfPasswordPrompts=1',
+  '-o', 'ConnectTimeout=20',
+  '-o', 'ServerAliveInterval=5',
+  '-o', 'ServerAliveCountMax=2',
   '-o', 'StrictHostKeyChecking=no',
   '-o', `UserKnownHostsFile=${path.join(ROOT, '.mayhem-local/macmini-known-hosts')}`,
 ];
@@ -74,14 +77,19 @@ Environment:
   MAYHEM_P43_PROVIDER_MODE   real or shim (default: real)
   MAYHEM_P43_AGENT_LOOP      Run E13 multi-model/stickiness smoke instead of provider-kill smoke (default: 0)
   MAYHEM_P43_REPUTATION_D3   Run D3 anchored-reputation routing distribution smoke (default: 0)
+  MAYHEM_P43_MARKET_F1       Run F1 two-provider market-price float smoke (default: 0)
+  MAYHEM_P43_MARKET_REQUESTS High-demand requests for F1 market smoke (default: 5)
   MAYHEM_P43_REPUTATION_REQUESTS Number of D3 routing requests (default: 100)
   MAYHEM_P43_REPUTATION_REQUEST_DELAY_MS Delay between successful D3 requests (default: 0)
   MAYHEM_P43_SECONDARY_MODEL Secondary smoke-only model id for E13 (default: <model>-e13-helper)
   MAYHEM_P43_ARTIFACT        Real provider artifact path (default: ${DEFAULT_ARTIFACT})
+  MAYHEM_P43_PRICE_IN_PER_1K_MU Override admin P0 input-token rate for the smoke
+  MAYHEM_P43_PRICE_OUT_PER_1K_MU Override admin P0 output-token rate for the smoke
+  MAYHEM_P43_PRICE_MIN_SESSION_MU Override admin P0 min-session rate (F1 default: 500000)
   MAYHEM_P43_DELTA_DELAY_MS  Delay after early content deltas (default: 2500)
   MAYHEM_P43_DELTA_DELAY_COUNT Number of early content deltas to delay (default: 12 real, 1 shim)
   MAYHEM_P43_CHAT_MAX_TOKENS Streaming failover max_tokens (default: 128)
-  MAYHEM_P43_SESSION_OPEN_TIMEOUT_SECONDS Direct-session open timeout (default: 60 real E13, 30 shim E13, 3 provider-kill)
+  MAYHEM_P43_SESSION_OPEN_TIMEOUT_SECONDS Direct-session open timeout (default: 60 real E13, 30 shim E13, 15 F1, 3 provider-kill)
   MAYHEM_P43_RECEIPT_CHECKPOINT_TOKENS Receipt checkpoint token window (default: 32)
   MAYHEM_P43_RECEIPT_CHECKPOINT_MS Receipt checkpoint wall-clock window (default: 30000)
   MAYHEM_P43_LOCAL_DHT_HOST  Local LAN IP advertised to the Mac mini DHT peer
@@ -906,8 +914,17 @@ async function remoteSha256(remote, passFile, remotePath) {
 }
 
 async function remotePidAlive(remote, passFile, pid) {
-  const result = await ssh(remote, passFile, `kill -0 ${Number(pid)} >/dev/null 2>&1 && echo alive || true`);
-  return result.stdout.trim() === 'alive';
+  try {
+    const result = await ssh(
+      remote,
+      passFile,
+      `kill -0 ${Number(pid)} >/dev/null 2>&1 && echo alive || true`,
+      { timeoutMs: 10_000 }
+    );
+    return result.stdout.trim() === 'alive';
+  } catch {
+    return true;
+  }
 }
 
 async function waitRemoteLogPattern(remote, passFile, file, pattern, timeoutMs, label, pid = null) {
@@ -981,7 +998,7 @@ async function remoteFreePort(remote, passFile) {
     's.close()',
   ].join('\n');
   try {
-    const result = await ssh(remote, passFile, `/usr/bin/python3 -c ${sh(script)}`, { timeoutMs: 10_000 });
+    const result = await ssh(remote, passFile, `/usr/bin/python3 -c ${sh(script)}`, { timeoutMs: 30_000 });
     const port = Number.parseInt(result.stdout.trim(), 10);
     if (!Number.isSafeInteger(port) || port <= 0) {
       throw new Error(`remote did not return a free port: ${result.stdout}`);
@@ -1154,6 +1171,220 @@ function newFinalReceiptForModel(beforeCount, receipts, modelId) {
   return { entry: finals[0], body: storedReceiptBody(finals[0]) };
 }
 
+async function readStateValue(rpcUrl, key) {
+  const response = await fetch(`${rpcUrl.replace(/\/$/, '')}/state?key=${encodeURI(key)}`);
+  if (!response.ok) {
+    const text = await response.text();
+    fail(`state read ${key} returned HTTP ${response.status}: ${text}`);
+  }
+  const body = await response.json();
+  if (Object.prototype.hasOwnProperty.call(body, 'value')) return body.value;
+  if (body.result && Object.prototype.hasOwnProperty.call(body.result, 'value')) return body.result.value;
+  return body.result ?? body;
+}
+
+function safeMu(value, label) {
+  const number = Number(value ?? 0);
+  if (!Number.isSafeInteger(number) || number < 0) fail(`${label} is not a non-negative safe integer: ${value}`);
+  return number;
+}
+
+async function readDepositRootSnapshot(rpcUrl, epoch) {
+  const value = await readStateValue(rpcUrl, `ev/dep/${epoch}`);
+  if (!value) return null;
+  if (value.type !== 'deposit_root') fail(`ev/dep/${epoch} is not a deposit root`);
+  return {
+    merkle_root: value.merkle_root,
+    count: safeMu(value.count, `ev/dep/${epoch} count`),
+    mu_total: safeMu(value.mu_total, `ev/dep/${epoch} mu_total`),
+    source: `ev/dep/${epoch}`,
+  };
+}
+
+async function readLedgerSnapshot(rpcUrl, user, provider) {
+  const [balance, earning, fee] = await Promise.all([
+    readStateValue(rpcUrl, `bal/${user}/fiat`),
+    readStateValue(rpcUrl, `earn/fiat/${provider}`),
+    readStateValue(rpcUrl, 'fee/fiat/cum'),
+  ]);
+  return {
+    user,
+    provider,
+    rail: 'fiat',
+    balance,
+    earning,
+    fee,
+    balance_mu: safeMu(balance?.mu, 'fiat balance mu'),
+    provider_total_mu: safeMu(earning?.total_mu, 'fiat provider total_mu'),
+    fee_cum_mu: safeMu(fee?.cum_mu, 'fiat fee cum_mu'),
+  };
+}
+
+async function waitForLedgerMovement(rpcUrl, user, provider, before, expected, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = null;
+  while (Date.now() < deadline) {
+    latest = await readLedgerSnapshot(rpcUrl, user, provider);
+    const actual = {
+      debit_mu: before.balance_mu - latest.balance_mu,
+      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
+      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+    };
+    if (
+      actual.debit_mu === expected.debit_mu &&
+      actual.provider_net_mu === expected.provider_net_mu &&
+      actual.fee_mu === expected.fee_mu
+    ) {
+      return { after: latest, actual };
+    }
+    await sleep(500);
+  }
+  latest = latest || await readLedgerSnapshot(rpcUrl, user, provider);
+  return {
+    after: latest,
+    actual: {
+      debit_mu: before.balance_mu - latest.balance_mu,
+      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
+      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+    },
+  };
+}
+
+function runJsonCommandToFile(command, args, outPath, options = {}) {
+  const stdout = runSync(command, args, options);
+  fs.writeFileSync(outPath, stdout);
+  return readJson(outPath);
+}
+
+async function priorEarningsFile({ rpcUrl, providers, runDir, epoch }) {
+  const prior = {};
+  for (const provider of providers) {
+    const earning = await readStateValue(rpcUrl, `earn/fiat/${provider}`);
+    const total = safeMu(earning?.total_mu, `prior fiat earning for ${provider}`);
+    if (total > 0) prior[`fiat/${provider}`] = total;
+  }
+  if (Object.keys(prior).length === 0) return { path: null, values: prior };
+  const priorPath = path.join(runDir, `epoch-${epoch}-prior-earnings.json`);
+  writeJson(priorPath, prior);
+  return { path: priorPath, values: prior };
+}
+
+async function settleGatewayReceiptEpoch({
+  mayhemBin,
+  adminHome,
+  adminRpcUrl,
+  receiptsPath,
+  runDir,
+  user,
+  provider,
+  providers = [provider],
+  epoch = 1,
+  feeBps = 1500,
+}) {
+  const before = await readLedgerSnapshot(adminRpcUrl, user, provider);
+  const bundlePath = path.join(runDir, `epoch-${epoch}-bundle.json`);
+  const exportPath = path.join(runDir, `epoch-${epoch}-export.json`);
+  const recomputedPath = path.join(runDir, `epoch-${epoch}-recomputed.json`);
+  const commitSimPath = path.join(runDir, `epoch-${epoch}-commit-sim.json`);
+  const commitPath = path.join(runDir, `epoch-${epoch}-commit.json`);
+  const applySimPath = path.join(runDir, `epoch-${epoch}-apply-sim.json`);
+  const applyPath = path.join(runDir, `epoch-${epoch}-apply.json`);
+  const prior = await priorEarningsFile({ rpcUrl: adminRpcUrl, providers, runDir, epoch });
+
+  const exportArgs = [
+    'receipts', 'export',
+    '--epoch', String(epoch),
+    '--fee-bps', String(feeBps),
+    '--prior-fee-cum-mu', String(before.fee_cum_mu),
+    '--receipts-file', receiptsPath,
+    '--output', bundlePath,
+    '--no-verify',
+    '--json',
+  ];
+  if (prior.path) exportArgs.push('--prior-earnings-file', prior.path);
+  const exportReport = runJsonCommandToFile(mayhemBin, exportArgs, exportPath);
+  const bundle = readJson(bundlePath);
+  const depositRoot = await readDepositRootSnapshot(adminRpcUrl, epoch);
+  if (depositRoot) {
+    bundle.deposit_root = depositRoot;
+    fs.writeFileSync(bundlePath, `${JSON.stringify(bundle, null, 2)}\n`);
+  }
+
+  const recomputedStdout = runSync('node', [path.join(ROOT, 'intercom/scripts/recompute-epoch-roots.mjs'), bundlePath]);
+  fs.writeFileSync(recomputedPath, recomputedStdout);
+  const recomputed = readJson(recomputedPath);
+  if (safeMu(recomputed?.totals?.use_mu, 'recomputed use_mu') <= 0) {
+    fail('epoch recompute produced zero usage; refusing to mark billing moved');
+  }
+  const providerEarning = (recomputed.earnings || []).find(
+    (entry) => entry.rail === 'fiat' && entry.provider === provider
+  );
+  if (!providerEarning) fail(`epoch recompute did not include fiat earnings for provider ${provider}`);
+  const expectedDebitMu = safeMu(recomputed.totals.use_mu, 'expected debit mu');
+  const providerGrossMu = safeMu(providerEarning.gross_mu, 'provider gross_mu');
+  const expectedProviderNetMu = providerGrossMu - Math.floor((providerGrossMu * feeBps) / 10_000);
+  const expectedFeeMu = safeMu(recomputed.totals.fee_mu, 'expected fee_mu');
+
+  const adminEpochCommon = [
+    '--home', adminHome,
+    '--peer-store-name', 'admin',
+    '--rpc-url', adminRpcUrl,
+    '--recomputed-file', recomputedPath,
+    '--at', String(epoch),
+    '--submit',
+    '--json',
+  ];
+  const commitSim = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-commit', ...adminEpochCommon, '--sim'], commitSimPath);
+  const commit = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-commit', ...adminEpochCommon], commitPath);
+  const applySim = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-apply', ...adminEpochCommon, '--sim'], applySimPath);
+  const apply = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-apply', ...adminEpochCommon], applyPath);
+
+  const expected = { debit_mu: expectedDebitMu, provider_net_mu: expectedProviderNetMu, fee_mu: expectedFeeMu };
+  const { after, actual } = await waitForLedgerMovement(adminRpcUrl, user, provider, before, expected);
+  if (actual.debit_mu !== expected.debit_mu) fail(`fiat balance debit mismatch; expected ${expected.debit_mu}, got ${actual.debit_mu}`);
+  if (actual.provider_net_mu !== expected.provider_net_mu) {
+    fail(`fiat provider earning mismatch; expected ${expected.provider_net_mu}, got ${actual.provider_net_mu}`);
+  }
+  if (actual.fee_mu !== expected.fee_mu) fail(`fiat fee movement mismatch; expected ${expected.fee_mu}, got ${actual.fee_mu}`);
+
+  return {
+    ok: true,
+    epoch,
+    fee_bps: feeBps,
+    before,
+    after,
+    expected,
+    actual,
+    recomputed,
+    prior_earnings: prior.values,
+    files: {
+      bundle: path.relative(ROOT, bundlePath),
+      export_report: path.relative(ROOT, exportPath),
+      recomputed: path.relative(ROOT, recomputedPath),
+      commit_sim: path.relative(ROOT, commitSimPath),
+      commit: path.relative(ROOT, commitPath),
+      apply_sim: path.relative(ROOT, applySimPath),
+      apply: path.relative(ROOT, applyPath),
+      prior_earnings: prior.path ? path.relative(ROOT, prior.path) : null,
+    },
+    reports: { export: exportReport, commit_sim: commitSim, commit, apply_sim: applySim, apply },
+  };
+}
+
+function rateForUnit(price, unit) {
+  const entry = (price?.rate_map || []).find((item) => item.unit === unit);
+  if (!entry) fail(`price rate_map missing ${unit}`);
+  return safeMu(entry.per_unit_mu, `${unit} per_unit_mu`);
+}
+
+function writeReceiptSubset(file, entries) {
+  writeJson(file, { data: entries });
+}
+
+function finalReceiptsForModel(entries, modelId) {
+  return entries.filter((entry) => receiptIsFinal(entry) && storedReceiptBody(entry).model_id === modelId);
+}
+
 function providerLogOutputTailProof(text, checkpointedOutputTokens) {
   let maxBufferedTokenIndex = -1;
   const tokenPattern = /live buffering token #(\d+)/g;
@@ -1324,7 +1555,7 @@ async function startRemoteProvider({
   cleanupState.remotePids.push(providerPid);
   const providerWaitCmd = `for i in $(seq 1 1200); do grep -q '"self_test"' ${sh(providerLog)} && exit 0; kill -0 ${providerPid} >/dev/null 2>&1 || exit 2; sleep 0.5; done; exit 1`;
   await ssh(remote, passFile, providerWaitCmd, { timeoutMs: 610_000 });
-  const startupText = (await ssh(remote, passFile, `cat ${sh(providerLog)}`)).stdout;
+  const startupText = (await ssh(remote, passFile, `cat ${sh(providerLog)}`, { timeoutMs: 20_000 })).stdout;
   const startupReport = parseFirstJsonObject(startupText);
   if (!startupReport?.provider) fail(`provider ${label} startup report missing provider pubkey; see ${providerLog}`);
   return {
@@ -1398,7 +1629,7 @@ async function startRemoteClientBridge({
     `remote client bridge ${label}`,
     remotePeerPid
   );
-  const startupText = (await ssh(remote, passFile, `cat ${sh(remotePeerLog)}`)).stdout;
+  const startupText = (await ssh(remote, passFile, `cat ${sh(remotePeerLog)}`, { timeoutMs: 20_000 })).stdout;
   const pubkey = startupText.match(/Peer pubkey \(hex\):\s+([0-9a-f]{64})/);
   if (!pubkey) fail(`remote client bridge ${label} missing peer pubkey; see ${remotePeerLog}`);
   return {
@@ -1455,12 +1686,13 @@ async function main() {
   const modelId = process.env.MAYHEM_P43_MODEL || DEFAULT_MODEL;
   const agentLoopMode = envFlag('MAYHEM_P43_AGENT_LOOP');
   const reputationD3Mode = envFlag('MAYHEM_P43_REPUTATION_D3');
+  const marketF1Mode = envFlag('MAYHEM_P43_MARKET_F1');
   const secondaryModelId = process.env.MAYHEM_P43_SECONDARY_MODEL || `${modelId}-e13-helper`;
   if (agentLoopMode && secondaryModelId === modelId) {
     fail('MAYHEM_P43_SECONDARY_MODEL must differ from MAYHEM_P43_MODEL');
   }
-  if (agentLoopMode && reputationD3Mode) {
-    fail('MAYHEM_P43_AGENT_LOOP and MAYHEM_P43_REPUTATION_D3 are separate smoke modes');
+  if ([agentLoopMode, reputationD3Mode, marketF1Mode].filter(Boolean).length > 1) {
+    fail('MAYHEM_P43_AGENT_LOOP, MAYHEM_P43_REPUTATION_D3, and MAYHEM_P43_MARKET_F1 are separate smoke modes');
   }
   const providerMode = (process.env.MAYHEM_P43_PROVIDER_MODE || 'real').trim();
   if (!['real', 'shim'].includes(providerMode)) fail('MAYHEM_P43_PROVIDER_MODE must be real or shim');
@@ -1506,8 +1738,12 @@ async function main() {
   const catalog = readJson(path.join(ROOT, 'catalog/models.json'));
   const model = catalog.models.find((entry) => entry.model_id === modelId);
   if (!model) fail(`catalog model not found: ${modelId}`);
-  const inPer1kMu = model.price_ref_mu?.in_per_1k || 18;
-  const outPer1kMu = model.price_ref_mu?.out_per_1k || 55;
+  const inPer1kMu = envNonNegativeInt('MAYHEM_P43_PRICE_IN_PER_1K_MU', model.price_ref_mu?.in_per_1k || 18);
+  const outPer1kMu = envNonNegativeInt('MAYHEM_P43_PRICE_OUT_PER_1K_MU', model.price_ref_mu?.out_per_1k || 55);
+  const minSessionMu = envNonNegativeInt(
+    'MAYHEM_P43_PRICE_MIN_SESSION_MU',
+    marketF1Mode ? 500_000 : 0
+  );
   const rateMapJson = textRateMapJson(inPer1kMu, outPer1kMu);
   const artifactEntry = Object.entries(model.artifacts).find(([, artifact]) => artifact.engine === 'llama.cpp');
   if (!artifactEntry) fail(`model ${modelId} has no llama.cpp artifact`);
@@ -1825,6 +2061,7 @@ async function main() {
       'set-price',
       '--enclave-id', enclaveId,
       '--rate-map-json', rateMapJson,
+      '--min-session-mu', String(minSessionMu),
       '--effective-at', '0',
     ]);
   adminRun('admin-open-room', [
@@ -1861,6 +2098,7 @@ async function main() {
       'set-price',
       '--enclave-id', secondaryEnclaveId,
       '--rate-map-json', rateMapJson,
+      '--min-session-mu', String(minSessionMu),
       '--effective-at', '0',
     ]);
     adminRun('admin-open-room-secondary', [
@@ -1871,7 +2109,9 @@ async function main() {
       '--label', 'phase4-e13-agent-loop-helper',
     ]);
   }
-  const gatewayCreditMu = 10_000_000;
+  const gatewayCreditMu = marketF1Mode
+    ? envPositiveInt('MAYHEM_P43_MARKET_CREDIT_MU', 50_000_000)
+    : 10_000_000;
   const fiatDepositRef = (await b3(Buffer.from(`phase4-fiat-credit:${tag}:${userPubkey[1]}`, 'utf8'))).toString('hex');
   adminRun('admin-fiat-deposit', [
     'fiat-deposit',
@@ -2037,7 +2277,7 @@ async function main() {
   const receiptCheckpointMs = envPositiveInt('MAYHEM_P43_RECEIPT_CHECKPOINT_MS', 30000);
   const sessionOpenTimeoutSeconds = envPositiveInt(
     'MAYHEM_P43_SESSION_OPEN_TIMEOUT_SECONDS',
-    agentLoopMode ? (providerMode === 'real' ? 60 : 30) : 3
+    agentLoopMode ? (providerMode === 'real' ? 60 : 30) : (marketF1Mode ? 15 : 3)
   );
   await fsp.mkdir(path.join(gatewayHome, 'stores'), { recursive: true });
   const gatewayStore = path.join(ROOT, 'intercom/stores/mayhem-devnet-joiner-a');
@@ -2073,8 +2313,218 @@ async function main() {
 
   const chatMaxTokens = envPositiveInt(
     'MAYHEM_P43_CHAT_MAX_TOKENS',
-    reputationD3Mode ? 4 : (agentLoopMode ? 32 : 128)
+    (reputationD3Mode || marketF1Mode) ? 4 : (agentLoopMode ? 32 : 128)
   );
+  if (marketF1Mode) {
+    log('running F1 market price float smoke with real two-provider receipts');
+    const requestCount = envPositiveInt('MAYHEM_P43_MARKET_REQUESTS', 5);
+    const initialPrice = await readStateValue(adminRpcUrl, `price/${enclaveId}`);
+    const initialOutputMu = rateForUnit(initialPrice?.current, 'output_token');
+    const highBefore = await fetchStoredReceipts(gatewayUrl);
+    const highTurns = [];
+    for (let i = 0; i < requestCount; i += 1) {
+      const before = await fetchStoredReceipts(gatewayUrl);
+      const stream = await runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
+        timeoutMs: providerMode === 'real' ? 240_000 : 90_000,
+        maxTokens: chatMaxTokens,
+        prompt: `F1 high-demand market probe ${i + 1}. Answer with one concise sentence using the word mayhem.`,
+        fileStem: `f1-high-${String(i + 1).padStart(2, '0')}`,
+      });
+      const after = await fetchStoredReceipts(gatewayUrl);
+      const { body } = newFinalReceiptForModel(before.length, after, modelId);
+      highTurns.push({
+        idx: i + 1,
+        provider: body.provider,
+        session_id: body.session_id,
+        rail: body.rail,
+        price_ver: body.price_ver,
+        usage: body.usage,
+        mu_owed_cum: body.mu_owed_cum,
+        first_content_ms: stream.timing_ms.first_content,
+        total_ms: stream.timing_ms.total,
+      });
+    }
+    const highAfter = await fetchStoredReceipts(gatewayUrl);
+    const highReceipts = highAfter.slice(highBefore.length);
+    const highFinals = finalReceiptsForModel(highReceipts, modelId);
+    if (highFinals.length < requestCount) {
+      fail(`F1 high-demand phase expected ${requestCount} final receipts, got ${highFinals.length}`);
+    }
+    const highReceiptsPath = path.join(runDir, 'f1-high-receipts.json');
+    writeReceiptSubset(highReceiptsPath, highReceipts);
+    const highProvider = storedReceiptBody(highFinals[0]).provider;
+    const highSettlement = await settleGatewayReceiptEpoch({
+      mayhemBin,
+      adminHome,
+      adminRpcUrl,
+      receiptsPath: highReceiptsPath,
+      runDir,
+      user: userPubkey[1],
+      provider: highProvider,
+      providers: primaryProviderPubkeys,
+      epoch: 1,
+      feeBps: 1500,
+    });
+    const highPrice = await readStateValue(adminRpcUrl, `price/${enclaveId}`);
+    const highRecord = highPrice?.current;
+    const highOutputMu = rateForUnit(highRecord, 'output_token');
+    const highMarket = highRecord?.market || {};
+
+    const lowBefore = await fetchStoredReceipts(gatewayUrl);
+    const lowStream = await runStreamingChatSmoke(gatewayUrl, modelId, runDir, {
+      timeoutMs: providerMode === 'real' ? 240_000 : 90_000,
+      maxTokens: 1,
+      prompt: 'F1 low-demand drain probe. Answer with one word.',
+      fileStem: 'f1-low-01',
+    });
+    const lowAfter = await fetchStoredReceipts(gatewayUrl);
+    const lowReceipts = lowAfter.slice(lowBefore.length);
+    const lowFinals = finalReceiptsForModel(lowReceipts, modelId);
+    if (lowFinals.length !== 1) fail(`F1 low-demand phase expected one final receipt, got ${lowFinals.length}`);
+    const lowReceiptsPath = path.join(runDir, 'f1-low-receipts.json');
+    writeReceiptSubset(lowReceiptsPath, lowReceipts);
+    const lowBody = storedReceiptBody(lowFinals[0]);
+    const lowSettlement = await settleGatewayReceiptEpoch({
+      mayhemBin,
+      adminHome,
+      adminRpcUrl,
+      receiptsPath: lowReceiptsPath,
+      runDir,
+      user: userPubkey[1],
+      provider: lowBody.provider,
+      providers: primaryProviderPubkeys,
+      epoch: 2,
+      feeBps: 1500,
+    });
+    const lowPrice = await readStateValue(adminRpcUrl, `price/${enclaveId}`);
+    const lowRecord = lowPrice?.current;
+    const lowOutputMu = rateForUnit(lowRecord, 'output_token');
+    const lowMarket = lowRecord?.market || {};
+
+    const maxStepBps = safeMu(highMarket?.constants?.max_step_bps, 'market max_step_bps');
+    const maxUp = initialOutputMu + Math.max(1, Math.floor((initialOutputMu * maxStepBps) / 10_000));
+    const maxDownStep = Math.max(1, Math.floor((highOutputMu * maxStepBps) / 10_000));
+    const assertions = {
+      high_used_two_active_providers: highMarket.active_supply === 2,
+      high_not_cold_start: highMarket.frozen === false,
+      high_price_source_market_float: highRecord?.price_source === 'market_float',
+      high_price_version_advanced: Number(highRecord?.ver || 0) > Number(initialPrice?.current?.ver || 0),
+      high_price_moved_up: highOutputMu > initialOutputMu,
+      high_move_within_clamp: highOutputMu <= maxUp,
+      high_usage_from_settled_receipts:
+        highSettlement.recomputed.market_usage?.[0]?.demand_mu === highMarket.active_demand_mu,
+      low_used_two_active_providers: lowMarket.active_supply === 2,
+      low_not_cold_start: lowMarket.frozen === false,
+      low_price_source_market_float: lowRecord?.price_source === 'market_float',
+      low_price_version_advanced: Number(lowRecord?.ver || 0) > Number(highRecord?.ver || 0),
+      low_price_moved_down: lowOutputMu < highOutputMu,
+      low_move_within_clamp: highOutputMu - lowOutputMu <= maxDownStep,
+      low_usage_from_settled_receipts:
+        lowSettlement.recomputed.market_usage?.[0]?.demand_mu === lowMarket.active_demand_mu,
+      gateway_process_stayed_running: gateway.exitCode === null,
+    };
+    for (const [name, ok] of Object.entries(assertions)) {
+      if (!ok) fail(`F1 market assertion failed: ${name}`);
+    }
+
+    const finalReceipts = await fetchStoredReceipts(gatewayUrl);
+    const report = {
+      ok: true,
+      mode: 'f1-market-price-float',
+      tag,
+      run_dir: path.relative(ROOT, runDir),
+      local: {
+        gateway_url: gatewayUrl,
+        admin_rpc_url: adminRpcUrl,
+        user_sc_bridge_label: userScBridge.label,
+        user_sc_bridge_url: userScBridge.url,
+        user_sc_bridge_remote_url: userScBridge.remote?.scBridgeUrl || null,
+        user_sc_bridge_tunnel_log: userScBridge.tunnel_log || null,
+        subnet_channel: subnetChannel,
+        peer_dht_bootstrap: peerDhtBootstrap,
+      },
+      admin: {
+        pubkey: adminPubkey[1],
+        room_nonce: roomNonce,
+        room_id: roomId,
+        rules_hash: rulesHash,
+        reports: Object.fromEntries(Object.entries(adminReports).map(([key, value]) => [key, {
+          submitted: value.submitted,
+          tx_type: value.tx_type,
+          command: value.command,
+        }])),
+      },
+      enclave: {
+        enclave_id: enclaveId,
+        model_id: modelId,
+        backend: 'llama.cpp',
+        artifact_name: artifactName,
+        artifact_root: artifactMerkle.root,
+        artifact_chunks: artifactMerkle.chunks,
+        artifact_bytes: artifactMerkle.total_bytes,
+        artifact_sha256: artifactSha256,
+        manifest_hash: manifestHash,
+        binary_hash: binaryHash,
+        binary_sha256: binarySha256,
+      },
+      providers: providers.map((provider) => ({
+        label: provider.label,
+        pubkey: provider.pubkey,
+        peer_pid: provider.peerPid,
+        provider_pid: provider.providerPid,
+        provider_log: provider.providerLog,
+        self_test: provider.startup.self_test,
+        rooms: provider.startup.rooms,
+        features: provider.startup.features,
+      })),
+      route_candidates: routeInfo.routes,
+      price: {
+        seed: initialPrice?.current,
+        high: highRecord,
+        low: lowRecord,
+        initial_output_mu: initialOutputMu,
+        high_output_mu: highOutputMu,
+        low_output_mu: lowOutputMu,
+      },
+      high_demand: {
+        request_count: requestCount,
+        turns: highTurns,
+        receipts_path: path.relative(ROOT, highReceiptsPath),
+        settlement: highSettlement,
+      },
+      low_demand: {
+        turn: {
+          provider: lowBody.provider,
+          session_id: lowBody.session_id,
+          rail: lowBody.rail,
+          price_ver: lowBody.price_ver,
+          usage: lowBody.usage,
+          mu_owed_cum: lowBody.mu_owed_cum,
+          first_content_ms: lowStream.timing_ms.first_content,
+          total_ms: lowStream.timing_ms.total,
+        },
+        receipts_path: path.relative(ROOT, lowReceiptsPath),
+        settlement: lowSettlement,
+      },
+      receipts: {
+        stored_count: finalReceipts.length,
+        final_count: finalReceipts.filter(receiptIsFinal).length,
+      },
+      assertions,
+    };
+    const reportPath = path.join(runDir, 'report.json');
+    writeJson(reportPath, report);
+    console.log(JSON.stringify(report, null, 2));
+    await cleanup({
+      remote,
+      passFile,
+      remotePids: cleanupState.remotePids,
+      localChildren: cleanupState.localChildren,
+      devnetLog,
+      remoteRun,
+    });
+    return;
+  }
   if (reputationD3Mode) {
     log('running D3 anchored-reputation routing distribution smoke');
     const requestCount = envPositiveInt('MAYHEM_P43_REPUTATION_REQUESTS', 100);

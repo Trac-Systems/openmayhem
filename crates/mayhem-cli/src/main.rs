@@ -48,7 +48,7 @@ use mayhem_gateway::{
         GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
         ProviderKybInfo, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
     },
-    rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu, text_usage_mu,
+    priced_usage_mu, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu,
     ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry, ReputationEvent,
     ReputationEventKind, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT,
     OUTPUT_TOKEN_UNIT,
@@ -21347,6 +21347,8 @@ struct ActiveProviderSession {
     rail: String,
     price_ver: u64,
     locked_rate_map: Vec<RateMapEntry>,
+    locked_per_req_mu: u64,
+    locked_min_session_mu: u64,
     checkpoint_every: CheckpointPolicy,
 }
 
@@ -21365,6 +21367,8 @@ struct ProviderSessionTerms {
     room_ids: Vec<String>,
     price_ver: u64,
     rate_map: Vec<RateMapEntry>,
+    per_req_mu: u64,
+    min_session_mu: u64,
     rules_ver: u64,
     ctx: u64,
 }
@@ -23849,6 +23853,8 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     denom: "mu_usd".to_owned(),
                     ver: price.ver,
                     rate_map: normalize_rate_map(price.rate_map.clone()),
+                    per_req_mu: price.per_req_mu,
+                    min_session_mu: price.min_session_mu,
                 },
                 attestation_tier_labels: gateway_attestation_tier_labels_for_counts(
                     &attestation_tiers,
@@ -23985,8 +23991,10 @@ fn filter_gateway_models_by_app_version(
     Ok((allowed, blocked))
 }
 
-fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64) {
+fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64, u64, u64) {
     (
+        price.min_session_mu,
+        price.per_req_mu,
         rate_map_cost_basis_per_1k(&price.rate_map),
         text_rate_per_1k_mu(&price.rate_map, INPUT_TOKEN_UNIT),
         text_rate_per_1k_mu(&price.rate_map, OUTPUT_TOKEN_UNIT),
@@ -23997,6 +24005,8 @@ fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64) {
 fn same_gateway_price_terms(left: &LedgerPriceRecord, right: &LedgerPriceRecord) -> bool {
     left.ver == right.ver
         && left.denom == right.denom
+        && left.per_req_mu == right.per_req_mu
+        && left.min_session_mu == right.min_session_mu
         && normalize_rate_map(left.rate_map.clone()) == normalize_rate_map(right.rate_map.clone())
 }
 
@@ -26014,6 +26024,8 @@ async fn handle_provider_session_frame(
                             locked_rate_map: normalize_rate_map(
                                 spend_voucher.body.locked_rate_map.clone(),
                             ),
+                            locked_per_req_mu: spend_voucher.body.locked_per_req_mu,
+                            locked_min_session_mu: spend_voucher.body.locked_min_session_mu,
                             checkpoint_every,
                         },
                     );
@@ -27205,6 +27217,8 @@ fn provider_session_receipt_for_usage(
         model_id: terms.model_id.clone(),
         price_ver: active.price_ver,
         locked_rate_map: active.locked_rate_map.clone(),
+        locked_per_req_mu: active.locked_per_req_mu,
+        locked_min_session_mu: active.locked_min_session_mu,
         rules_ver: terms.rules_ver,
         usage: usage.clone(),
         mu_owed_cum: provider_session_mu_owed(active, &usage),
@@ -27219,7 +27233,12 @@ fn provider_session_receipt_for_usage(
 }
 
 fn provider_session_mu_owed(active: &ActiveProviderSession, usage: &ReceiptUsage) -> u64 {
-    text_usage_mu(&active.locked_rate_map, usage)
+    priced_usage_mu(
+        &active.locked_rate_map,
+        active.locked_per_req_mu,
+        active.locked_min_session_mu,
+        usage,
+    )
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
@@ -27904,6 +27923,8 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
         rate_map: price.rate_map.clone(),
+        per_req_mu: price.per_req_mu,
+        min_session_mu: price.min_session_mu,
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.model.caps.ctx_max,
     })
@@ -28253,6 +28274,12 @@ fn provider_session_open_decision(
     let Some(frame_price_ver) = frame.get("price_ver").and_then(Value::as_u64) else {
         return reject("PRICE_VER", "session price_ver is missing".to_owned());
     };
+    if frame_price_ver != terms.price_ver {
+        return reject(
+            "PRICE_VER",
+            "session price_ver does not match this admin-created enclave".to_owned(),
+        );
+    }
     if frame.get("rules_ver").and_then(Value::as_u64) != Some(terms.rules_ver) {
         return reject(
             "CONSENT",
@@ -28295,6 +28322,24 @@ fn provider_session_open_decision(
         return reject(
             "VOUCHER",
             "voucher locked_rate_map must be canonical".to_owned(),
+        );
+    }
+    if voucher.body.locked_rate_map != normalize_rate_map(terms.rate_map.clone()) {
+        return reject(
+            "VOUCHER",
+            "voucher locked_rate_map does not match admin price".to_owned(),
+        );
+    }
+    if voucher.body.locked_per_req_mu != terms.per_req_mu {
+        return reject(
+            "VOUCHER",
+            "voucher locked_per_req_mu does not match admin price".to_owned(),
+        );
+    }
+    if voucher.body.locked_min_session_mu != terms.min_session_mu {
+        return reject(
+            "VOUCHER",
+            "voucher locked_min_session_mu does not match admin price".to_owned(),
         );
     }
     if voucher.body.max_spend_mu == 0 {
@@ -34057,6 +34102,8 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
+            locked_per_req_mu: terms.per_req_mu,
+            locked_min_session_mu: terms.min_session_mu,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
@@ -34089,6 +34136,11 @@ mod tests {
         assert_eq!(receipt.body.model_id, terms.model_id);
         assert_eq!(receipt.body.price_ver, active.price_ver);
         assert_eq!(receipt.body.locked_rate_map, active.locked_rate_map);
+        assert_eq!(receipt.body.locked_per_req_mu, active.locked_per_req_mu);
+        assert_eq!(
+            receipt.body.locked_min_session_mu,
+            active.locked_min_session_mu
+        );
         assert_eq!(receipt.body.rules_ver, terms.rules_ver);
         assert_eq!(receipt.body.usage.input_tokens(), 3);
         assert_eq!(receipt.body.usage.output_tokens(), 4);
@@ -34119,6 +34171,8 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
+            locked_per_req_mu: terms.per_req_mu,
+            locked_min_session_mu: terms.min_session_mu,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
         };
         let body = json!({
@@ -34172,6 +34226,8 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: 1,
             locked_rate_map: text_generation_rate_map(1, 2),
+            locked_per_req_mu: 0,
+            locked_min_session_mu: 0,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
         };
         assert_eq!(
@@ -34202,6 +34258,8 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
+            locked_per_req_mu: terms.per_req_mu,
+            locked_min_session_mu: terms.min_session_mu,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
@@ -35341,6 +35399,8 @@ mod tests {
                     session_id: id.to_owned(),
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
+                    locked_per_req_mu: 0,
+                    locked_min_session_mu: 0,
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -35370,6 +35430,8 @@ mod tests {
                     session_id: id.to_owned(),
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
+                    locked_per_req_mu: 0,
+                    locked_min_session_mu: 0,
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -38880,6 +38942,8 @@ mod tests {
             room_ids: vec!["aa".repeat(16)],
             price_ver: 1,
             rate_map: text_generation_rate_map(1, 2),
+            per_req_mu: 0,
+            min_session_mu: 0,
             rules_ver: 3,
             ctx: 8192,
         }
@@ -38895,6 +38959,8 @@ mod tests {
             enclave_id: terms.enclave_id.clone(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
+            locked_per_req_mu: terms.per_req_mu,
+            locked_min_session_mu: terms.min_session_mu,
             max_spend_mu: 1000,
             checkpoint_every: mayhem_proto::CheckpointPolicy {
                 tokens: 8192,

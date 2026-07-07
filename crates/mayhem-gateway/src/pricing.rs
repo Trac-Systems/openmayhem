@@ -49,6 +49,17 @@ pub fn text_usage_mu(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> u64 {
     usage_map_mu(rate_map, usage)
 }
 
+pub fn priced_usage_mu(
+    rate_map: &[RateMapEntry],
+    per_req_mu: u64,
+    min_session_mu: u64,
+    usage: &ReceiptUsage,
+) -> u64 {
+    usage_map_mu(rate_map, usage)
+        .saturating_add(per_req_mu)
+        .max(min_session_mu)
+}
+
 pub fn usage_map_mu(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> u64 {
     let counts = usage
         .units()

@@ -171,6 +171,8 @@ function signedSpendReservation(
     epoch = 1,
     priceVer = 1,
     lockedRateMap = TEXT_LOCKED_RATE_MAP,
+    lockedPerReqMu = 0,
+    lockedMinSessionMu = 100,
   } = {}
 ) {
   const voucherBody = {
@@ -179,6 +181,8 @@ function signedSpendReservation(
     enclave_id: enclaveId,
     price_ver: priceVer,
     locked_rate_map: lockedRateMap,
+    locked_per_req_mu: lockedPerReqMu,
+    locked_min_session_mu: lockedMinSessionMu,
     max_spend_mu: maxSpendMu,
     checkpoint_every: { tokens: 8192, ms: 30_000 },
   };
@@ -536,6 +540,8 @@ test('MayhemContract spend reservation keeps the locked quote after market price
   assert.equal(hold.sessions.length, 1);
   assert.equal(hold.sessions[0].price_ver, 1);
   assert.deepEqual(hold.sessions[0].locked_rate_map, TEXT_LOCKED_RATE_MAP);
+  assert.equal(hold.sessions[0].locked_per_req_mu, 0);
+  assert.equal(hold.sessions[0].locked_min_session_mu, 100);
 
   const forgedV1Quote = signedSpendReservation(ctx, {
     provider: ctx.provider,
