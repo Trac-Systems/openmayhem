@@ -77,7 +77,7 @@ const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
-const DEFAULT_HOLDBACK_EPOCHS: u64 = 168;
+const DEFAULT_HOLDBACK_EPOCHS: u64 = 24;
 const DEFAULT_CHALLENGE_EPOCHS: u64 = 6;
 const DEFAULT_CANARY_PROBE_HOLDBACK_BPS: u64 = 0;
 const DEFAULT_CANARY_PROBE_RELEASE_MIN_PASSES: u64 = 1;
@@ -965,15 +965,15 @@ struct UseArgs {
     rail: GatewayLedgerRail,
 
     /// Seconds to wait for provider s.accept/s.reject after opening a direct session.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     session_open_timeout_seconds: Option<u64>,
 
     /// Seconds to wait between provider session frames after s.accept.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     session_frame_timeout_seconds: Option<u64>,
 
     /// Seconds to wait for the first provider token after s.accept.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     session_ttft_timeout_seconds: Option<u64>,
 
     /// Minimum sustained provider throughput before the gateway reroutes.
@@ -3514,6 +3514,14 @@ struct AdminEpochApplyArgs {
 
     #[arg(long)]
     at: u64,
+
+    /// Zero-based page number for paged epoch apply. Omit for the normal single-page apply.
+    #[arg(long)]
+    page: Option<u64>,
+
+    /// Marks a paged epoch apply page as the final page for that epoch.
+    #[arg(long)]
+    last_page: bool,
 
     /// Output from intercom/scripts/recompute-epoch-roots.mjs.
     #[arg(long, value_name = "PATH")]
@@ -12536,6 +12544,7 @@ fn admin_epoch_commit_payload(args: &AdminEpochCommitArgs) -> Result<Value> {
 fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
     let recomputed = read_optional_json_file(args.recomputed_file.as_ref(), "recomputed epoch")?;
     let epoch = epoch_arg_or_recomputed(args.epoch, recomputed.as_ref())?;
+    let paged = args.page.is_some() || args.last_page;
     let debits = json_arg_or_file_array(
         args.debits_json.as_deref(),
         args.debits_file.as_ref(),
@@ -12557,28 +12566,39 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
     if let Some(value) = market_usage.as_ref() {
         ensure_json_array(value, "epoch market usage")?;
     }
-    let roots = json_arg_or_file_object(
-        args.roots_json.as_deref(),
-        args.roots_file.as_ref(),
-        recomputed_field(recomputed.as_ref(), "roots"),
-        "epoch roots",
-    )?;
-    let totals = json_arg_or_file_object(
-        args.totals_json.as_deref(),
-        args.totals_file.as_ref(),
-        recomputed_field(recomputed.as_ref(), "totals"),
-        "epoch totals",
-    )?;
-
     let mut payload = json!({
         "op": "epoch_apply",
         "epoch": epoch,
         "at": args.at,
         "debits": debits,
         "earnings": earnings,
-        "roots": roots,
-        "totals": totals,
     });
+    if paged {
+        if args.roots_json.is_some()
+            || args.roots_file.is_some()
+            || args.totals_json.is_some()
+            || args.totals_file.is_some()
+        {
+            bail!("paged epoch apply pages must omit aggregate roots and totals");
+        }
+        payload["page"] = json!(args.page.unwrap_or(0));
+        payload["last_page"] = json!(args.last_page);
+    } else {
+        let roots = json_arg_or_file_object(
+            args.roots_json.as_deref(),
+            args.roots_file.as_ref(),
+            recomputed_field(recomputed.as_ref(), "roots"),
+            "epoch roots",
+        )?;
+        let totals = json_arg_or_file_object(
+            args.totals_json.as_deref(),
+            args.totals_file.as_ref(),
+            recomputed_field(recomputed.as_ref(), "totals"),
+            "epoch totals",
+        )?;
+        payload["roots"] = roots;
+        payload["totals"] = totals;
+    }
     if let Some(market_usage) = market_usage {
         payload["market_usage"] = market_usage;
     }
@@ -12894,7 +12914,13 @@ async fn run_admin_feature_command(
                 .get("epoch")
                 .and_then(Value::as_u64)
                 .context("epochApply feature value missing epoch")?;
-            report["apply_state"] = wait_for_epoch_apply_state(&rpc, epoch).await?;
+            let page = value.get("page").and_then(Value::as_u64);
+            let last_page = value
+                .get("last_page")
+                .and_then(Value::as_bool)
+                .unwrap_or(page.is_none());
+            report["apply_state"] =
+                wait_for_epoch_apply_state(&rpc, epoch, page, last_page).await?;
         }
     } else if args.submit && args.sim {
         report["sim"] = json!(true);
@@ -12908,13 +12934,30 @@ async fn run_admin_feature_command(
     Ok(())
 }
 
-async fn wait_for_epoch_apply_state(rpc: &PeerRpcClient, epoch: u64) -> Result<Value> {
+async fn wait_for_epoch_apply_state(
+    rpc: &PeerRpcClient,
+    epoch: u64,
+    page: Option<u64>,
+    last_page: bool,
+) -> Result<Value> {
     let mut last = Value::Null;
     for _ in 0..120 {
         last = read_state_value(rpc, "epoch/apply/state")
             .await?
             .unwrap_or(Value::Null);
-        if last
+        if page.is_some() && !last_page {
+            if last
+                .get("pending_epoch")
+                .and_then(Value::as_u64)
+                .is_some_and(|pending| pending == epoch)
+                && last
+                    .get("pending_next_page")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|next| next == page.unwrap_or(0).saturating_add(1))
+            {
+                return Ok(last);
+            }
+        } else if last
             .get("updated_epoch")
             .and_then(Value::as_u64)
             .is_some_and(|updated| updated >= epoch)
@@ -27589,7 +27632,7 @@ fn provider_session_request_timeout() -> Duration {
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|millis| *millis > 0)
-            .unwrap_or(15_000)
+            .unwrap_or(30_000)
             .min(300_000),
     )
 }
@@ -33571,7 +33614,7 @@ mod tests {
             tx: test_admin_tx_args(),
             submitted_at: 0,
             effective_at: 86_400,
-            values_json: Some(r#"{ "fee_bps": 1500, "holdback_epochs": 168 }"#.to_owned()),
+            values_json: Some(r#"{ "fee_bps": 1500, "holdback_epochs": 24 }"#.to_owned()),
             values_file: None,
         };
         assert_eq!(
@@ -33582,7 +33625,7 @@ mod tests {
                 "effective_at": 86_400,
                 "values": {
                     "fee_bps": 1500,
-                    "holdback_epochs": 168,
+                    "holdback_epochs": 24,
                 },
             })
         );
@@ -34195,6 +34238,8 @@ mod tests {
             tx: test_admin_tx_args(),
             epoch: Some(7),
             at: 25_200,
+            page: None,
+            last_page: false,
             recomputed_file: None,
             debits_json: Some(r#"[{"user":"user-a","mu":2000}]"#.to_owned()),
             debits_file: None,
@@ -34240,6 +34285,38 @@ mod tests {
             }))
             .unwrap()
         );
+
+        let paged_apply = admin_epoch_apply_payload(&AdminEpochApplyArgs {
+            tx: test_admin_tx_args(),
+            epoch: Some(8),
+            at: 28_800,
+            page: Some(0),
+            last_page: false,
+            recomputed_file: None,
+            debits_json: Some(r#"[{"user":"user-a","mu":2000}]"#.to_owned()),
+            debits_file: None,
+            earnings_json: Some(r#"[{"provider":"provider-a","gross_mu":2000}]"#.to_owned()),
+            earnings_file: None,
+            market_usage_json: None,
+            market_usage_file: None,
+            roots_json: None,
+            roots_file: None,
+            totals_json: None,
+            totals_file: None,
+        })
+        .unwrap();
+        assert_eq!(
+            paged_apply,
+            json!({
+                "op": "epoch_apply",
+                "epoch": 8,
+                "at": 28_800,
+                "debits": [{"user": "user-a", "mu": 2000}],
+                "earnings": [{"provider": "provider-a", "gross_mu": 2000}],
+                "page": 0,
+                "last_page": false,
+            })
+        );
     }
 
     #[test]
@@ -34271,6 +34348,8 @@ mod tests {
             tx: test_admin_tx_args(),
             epoch: Some(1),
             at: 1,
+            page: None,
+            last_page: false,
             recomputed_file: None,
             debits_json: Some("{}".to_owned()),
             debits_file: None,

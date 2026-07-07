@@ -62,13 +62,23 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     admin.publicKey,
     3
   );
-  assert.match(tooSoon.message, /24h activation delay/i);
+  assert.match(tooSoon.message, /param_activation_delay_seconds/i);
 
   const defaults = await execute(
     contract,
     storage,
     'readParams',
-    readParams(0),
+    readParams(0, [
+      'fee_bps',
+      'price_max_bps',
+      'holdback_epochs',
+      'max_apply_batch',
+      'dispute_deposit_mu',
+      'price_rate_limit_seconds',
+      'param_activation_delay_seconds',
+      'market_target_utilization_bps',
+      'market_provider_epoch_target_mu',
+    ]),
     outsider.publicKey,
     4
   );
@@ -79,6 +89,13 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     params: {
       fee_bps: 1_500,
       price_max_bps: 40_000,
+      holdback_epochs: 24,
+      max_apply_batch: 2_000,
+      dispute_deposit_mu: 1_000_000,
+      price_rate_limit_seconds: 21_600,
+      param_activation_delay_seconds: 86_400,
+      market_target_utilization_bps: 8_500,
+      market_provider_epoch_target_mu: 1_000_000,
     },
   });
 
@@ -185,4 +202,52 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     8
   );
   assert.match(aboveFeeCap.message, /fee_bps.*out of range/i);
+
+  const tuneEpochAndMarket = await execute(
+    contract,
+    storage,
+    'setParams',
+    makeSetParams({
+      submitted_at: DAY_SECONDS,
+      effective_at: 2 * DAY_SECONDS,
+      values: {
+        holdback_epochs: 12,
+        max_apply_batch: 2_500,
+        dispute_deposit_mu: 2_000_000,
+        price_rate_limit_seconds: 900,
+        market_target_utilization_bps: 7_500,
+        market_provider_epoch_target_mu: 2_000_000,
+        param_activation_delay_seconds: 3_600,
+      },
+    }),
+    admin.publicKey,
+    9
+  );
+  assert.equal(tuneEpochAndMarket.ok, true, tuneEpochAndMarket.message);
+
+  const tuned = await execute(
+    contract,
+    storage,
+    'readParams',
+    readParams(2 * DAY_SECONDS, [
+      'holdback_epochs',
+      'max_apply_batch',
+      'dispute_deposit_mu',
+      'price_rate_limit_seconds',
+      'market_target_utilization_bps',
+      'market_provider_epoch_target_mu',
+      'param_activation_delay_seconds',
+    ]),
+    outsider.publicKey,
+    10
+  );
+  assert.deepEqual(tuned.params, {
+    holdback_epochs: 12,
+    max_apply_batch: 2_500,
+    dispute_deposit_mu: 2_000_000,
+    price_rate_limit_seconds: 900,
+    market_target_utilization_bps: 7_500,
+    market_provider_epoch_target_mu: 2_000_000,
+    param_activation_delay_seconds: 3_600,
+  });
 });

@@ -764,13 +764,16 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   const right = await setupLedgerContract(identities);
   let expectedDebited = 0;
   let expectedFee = 0;
+  const netEarningsByEpoch = [];
 
   let totalKeysAfterFirst = null;
   let paymentKeysAfterFirst = null;
   for (let epoch = 1; epoch <= 100; epoch++) {
     const grossMu = 1_000 + (epoch % 7);
+    const feeMu = Math.floor((grossMu * 1_500) / 10_000);
     expectedDebited += grossMu;
-    expectedFee += Math.floor((grossMu * 1_500) / 10_000);
+    expectedFee += feeMu;
+    netEarningsByEpoch.push(grossMu - feeMu);
     for (const ctx of [left, right]) {
       const result = await executeEpochApplyFeature(
         ctx.contract,
@@ -800,9 +803,10 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   const balance = (await left.storage.get(`bal/${identities.user.publicKey}/fiat`)).value;
   const earning = (await left.storage.get(`earn/fiat/${identities.provider.publicKey}`)).value;
   const fee = (await left.storage.get('fee/fiat/cum')).value;
+  const expectedHeld = netEarningsByEpoch.slice(-24).reduce((sum, mu) => sum + mu, 0);
   assert.equal(balance.mu, 1_000_000 - expectedDebited);
   assert.equal(earning.total_mu, expectedDebited - expectedFee);
-  assert.equal(earning.held_mu, expectedDebited - expectedFee);
+  assert.equal(earning.held_mu, expectedHeld);
   assert.equal(earning.paid_cum_mu, 0);
   assert.equal(fee.cum_mu, expectedFee);
   assert.equal(fee.updated_epoch, 100);
@@ -910,7 +914,7 @@ test('MayhemContract guarded mu helpers reject over-safe-integer results', async
 test('MayhemContract epochApply enforces max_apply_batch before writing', async () => {
   const { admin, provider, storage, contract } = await setupLedgerContract();
   const before = storage.snapshotBytes();
-  const tooManyDebits = Array.from({ length: 501 }, (_, i) => ({
+  const tooManyDebits = Array.from({ length: 2_001 }, (_, i) => ({
     rail: 'fiat',
     user: `user-${i}`,
     mu: 1,
@@ -923,10 +927,75 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
       epoch: 1,
       at: 3600,
       debits: tooManyDebits,
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 501 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_001 }],
     },
     admin.publicKey
   );
   assert.match(tooLarge.message, /max_apply_batch/i);
   assert.equal(storage.snapshotBytes(), before);
+});
+
+test('MayhemContract epochApply paginates settlement entries across free pages', async () => {
+  const { admin, provider, user, storage, contract } = await setupLedgerContract();
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));
+  const firstDebits = Array.from({ length: 1_999 }, () => ({
+    rail: 'fiat',
+    user: user.publicKey,
+    mu: 1,
+  }));
+  const secondDebits = Array.from({ length: 501 }, () => ({
+    rail: 'fiat',
+    user: user.publicKey,
+    mu: 1,
+  }));
+
+  const firstPage = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      page: 0,
+      last_page: false,
+      at: 3600,
+      debits: firstDebits,
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 1_999 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(firstPage.ok, true, firstPage.message);
+  assert.equal(firstPage.page, 0);
+  assert.equal(firstPage.last_page, false);
+  assert.equal(firstPage.debited_mu, 1_999);
+  let applyState = (await storage.get('epoch/apply/state')).value;
+  assert.equal(applyState.updated_epoch, 0);
+  assert.equal(applyState.pending_epoch, 1);
+  assert.equal(applyState.pending_next_page, 1);
+
+  const secondPage = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      page: 1,
+      last_page: true,
+      at: 3600,
+      debits: secondDebits,
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 501 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(secondPage.ok, true, secondPage.message);
+  assert.equal(secondPage.page, 1);
+  assert.equal(secondPage.last_page, true);
+  assert.equal(secondPage.debited_mu, 501);
+  applyState = (await storage.get('epoch/apply/state')).value;
+  assert.equal(applyState.updated_epoch, 1);
+  assert.equal(applyState.pending_epoch, null);
+  assert.equal(applyState.pending_next_page, 0);
+
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 7_500);
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_mu, 2_126);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 374);
 });

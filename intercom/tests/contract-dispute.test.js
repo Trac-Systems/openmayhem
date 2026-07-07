@@ -65,7 +65,7 @@ async function setupDisputeContract() {
     user: user.publicKey,
     rail: 'fiat',
     denom: 'mu_usd',
-    mu: 10_000,
+    mu: 2_000_000,
     updated_epoch: 0,
     updated_at: null,
   });
@@ -111,6 +111,29 @@ function seedProviderHoldback(storage, provider, overrides = {}) {
   });
 }
 
+test('MayhemContract dispute default bond blocks half-cent spam-scale opens', async () => {
+  const { user, provider, storage, contract } = await setupDisputeContract();
+  await storage.put(`bal/${user.publicKey}/fiat`, {
+    user: user.publicKey,
+    rail: 'fiat',
+    denom: 'mu_usd',
+    mu: 10_000,
+    updated_epoch: 0,
+    updated_at: null,
+  });
+  const before = storage.snapshotBytes();
+  const opened = await execute(
+    contract,
+    storage,
+    'dispute',
+    openDispute(user, provider),
+    user.publicKey,
+    5
+  );
+  assert.match(opened.message, /insufficient balance for dispute deposit/i);
+  assert.equal(storage.snapshotBytes(), before);
+});
+
 test('MayhemContract dispute lifecycle refunds deposit and applies provider_fault slash', async () => {
   const { admin, user, provider, outsider, storage, contract } = await setupDisputeContract();
   await seedProviderHoldback(storage, provider);
@@ -125,8 +148,8 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
   );
   assert.equal(opened.ok, true, opened.message);
   assert.equal(opened.dispute_id, 1);
-  assert.equal(opened.deposit_mu, 5_000);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
+  assert.equal(opened.deposit_mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
 
   const nonAdmin = await execute(
     contract,
@@ -163,13 +186,13 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
     7
   );
   assert.equal(resolved.ok, true, resolved.message);
-  assert.equal(resolved.deposit_refunded_mu, 5_000);
+  assert.equal(resolved.deposit_refunded_mu, 1_000_000);
   assert.equal(resolved.deposit_forfeited_mu, 0);
   assert.equal(resolved.slash.forfeited_mu, 2_000);
   assert.equal(resolved.slash.beneficiary_mu, 1_000);
   assert.equal(resolved.slash.treasury_mu, 1_000);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 11_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 2_001_000);
   assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     rail: 'fiat',
@@ -191,7 +214,7 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
   const dispute = (await storage.get('disp/1')).value;
   assert.equal(dispute.status, 'resolved');
   assert.equal(dispute.deposit_action, 'refund');
-  assert.equal(dispute.deposit_refunded_mu, 5_000);
+  assert.equal(dispute.deposit_refunded_mu, 1_000_000);
   assert.equal(dispute.reputation_event.kind, 'dispute_lost');
   assert.equal(dispute.slash.reason, 'dispute_lost');
   assert.equal(dispute.resolution_hash.length, 64);
@@ -236,7 +259,7 @@ test('MayhemContract dispute resolution validates slash target before mutating f
     5
   );
   assert.equal(opened.ok, true, opened.message);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
 
   const invalid = await execute(
     contract,
@@ -257,7 +280,7 @@ test('MayhemContract dispute resolution validates slash target before mutating f
   );
   assert.match(invalid.message, /invalid slash beneficiary/i);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
   assert.equal((await storage.get('disp/1')).value.status, 'open');
   assert.equal(await storage.get(`ev/rep/${provider.publicKey}/dispute-1-lost`), null);
   assert.equal(await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(6)}`), null);
@@ -299,11 +322,11 @@ test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', asy
   );
   assert.equal(resolved.ok, true, resolved.message);
   assert.equal(resolved.deposit_refunded_mu, 0);
-  assert.equal(resolved.deposit_forfeited_mu, 5_000);
+  assert.equal(resolved.deposit_forfeited_mu, 1_000_000);
   assert.equal(resolved.slash, null);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 5_000);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 5_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 1_000_000);
   const dispute = (await storage.get('disp/1')).value;
   assert.equal(dispute.status, 'resolved');
   assert.equal(dispute.outcome, 'opener_fault');

@@ -23,24 +23,24 @@ const PROVIDER_LIFECYCLE_OPS = new Set([
   'join_room',
   'leave_room',
 ]);
-const PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
-const MARKET_PRICE_TARGET_UTILIZATION_BPS = 8_500;
-const MARKET_PRICE_EMA_ALPHA_BPS = 2_500;
-const MARKET_PRICE_GAIN_BPS = 5_000;
-const MARKET_PRICE_MAX_STEP_BPS = 1_000;
-const MARKET_PRICE_COLD_START_MIN_PROVIDERS = 2;
-const MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU = 1_000_000;
-const MARKET_PRICE_MAX_UTILIZATION_BPS = 50_000;
-const MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS = 2_500;
-const MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS = 15_000;
-const PARAM_ACTIVATION_DELAY_SECONDS = 24 * 60 * 60;
 const DAY_SECONDS = 24 * 60 * 60;
+const DEFAULT_PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
+const DEFAULT_MARKET_PRICE_TARGET_UTILIZATION_BPS = 8_500;
+const DEFAULT_MARKET_PRICE_EMA_ALPHA_BPS = 2_500;
+const DEFAULT_MARKET_PRICE_GAIN_BPS = 5_000;
+const DEFAULT_MARKET_PRICE_MAX_STEP_BPS = 1_000;
+const DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS = 2;
+const DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU = 1_000_000;
+const DEFAULT_MARKET_PRICE_MAX_UTILIZATION_BPS = 50_000;
+const DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS = 2_500;
+const DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS = 15_000;
+const DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS = DAY_SECONDS;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const FULL_SLASH_BPS = 10_000;
 const DISPUTE_LOST_SLASH_BPS = 2_000;
 const MAX_OPERATOR_FEE_BPS = 5_000;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 1;
-const DISPUTE_DEPOSIT_MU = 5_000;
+const DEFAULT_DISPUTE_DEPOSIT_MU = 1_000_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
@@ -63,16 +63,28 @@ const PARAM_DEFINITIONS = Object.freeze({
   canary_probe_release_min_passes: { default: 1, min: 0, max: 1_000_000 },
   probe_reward_mu: { default: 5_000, min: 0, max: Number.MAX_SAFE_INTEGER },
   uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
-  holdback_epochs: { default: 168, min: 0, max: 1_000_000 },
+  holdback_epochs: { default: 24, min: 0, max: 1_000_000 },
   fee_bps: { default: 1_500, min: 0, max: MAX_OPERATOR_FEE_BPS },
+  dispute_deposit_mu: { default: DEFAULT_DISPUTE_DEPOSIT_MU, min: 1, max: Number.MAX_SAFE_INTEGER },
   payout_min_mu: { default: 1_000_000, min: 0, max: Number.MAX_SAFE_INTEGER },
   price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
   price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },
+  price_rate_limit_seconds: { default: DEFAULT_PRICE_RATE_LIMIT_SECONDS, min: 0, max: 365 * DAY_SECONDS },
+  market_target_utilization_bps: { default: DEFAULT_MARKET_PRICE_TARGET_UTILIZATION_BPS, min: 1, max: 9_999 },
+  market_ema_alpha_bps: { default: DEFAULT_MARKET_PRICE_EMA_ALPHA_BPS, min: 1, max: 10_000 },
+  market_gain_bps: { default: DEFAULT_MARKET_PRICE_GAIN_BPS, min: 1, max: 10_000 },
+  market_max_step_bps: { default: DEFAULT_MARKET_PRICE_MAX_STEP_BPS, min: 1, max: 10_000 },
+  market_cold_start_min_providers: { default: DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS, min: 0, max: 1_000_000 },
+  market_provider_epoch_target_mu: { default: DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU, min: 1, max: Number.MAX_SAFE_INTEGER },
+  market_max_utilization_bps: { default: DEFAULT_MARKET_PRICE_MAX_UTILIZATION_BPS, min: 1, max: 1_000_000 },
+  market_below_target_discount_bps: { default: DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS, min: 0, max: 10_000 },
+  market_above_target_slope_bps: { default: DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS, min: 0, max: 1_000_000 },
   epoch_seconds: { default: 3_600, min: 60, max: 86_400 },
   rate_staleness_seconds: { default: 45 * 60, min: 60, max: 86_400 },
   rules_grace_seconds: { default: 14 * 24 * 60 * 60, min: 0, max: 365 * 24 * 60 * 60 },
   challenge_epochs: { default: 6, min: 0, max: 1_000_000 },
-  max_apply_batch: { default: 500, min: 1, max: 5_000 },
+  max_apply_batch: { default: 2_000, min: 1, max: 5_000 },
+  param_activation_delay_seconds: { default: DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS, min: 0, max: 30 * DAY_SECONDS },
 });
 const REPUTATION_EVENT_KINDS = new Set([
   'session_ok',
@@ -1251,8 +1263,14 @@ class MayhemContract extends Contract {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
 
-    if (this.value.effective_at - this.value.submitted_at < PARAM_ACTIVATION_DELAY_SECONDS) {
-      return new Error('Parameter changes require at least 24h activation delay.');
+    const governanceParams = await this.activeParamsAt(this.value.submitted_at, [
+      'param_activation_delay_seconds',
+    ]);
+    if (
+      this.value.effective_at - this.value.submitted_at <
+      governanceParams.param_activation_delay_seconds
+    ) {
+      return new Error('Parameter changes require at least the active param_activation_delay_seconds.');
     }
 
     const valuesError = this.validateParamValues(this.value.values);
@@ -2206,7 +2224,11 @@ class MayhemContract extends Contract {
     });
     if (rateError) return rateError;
     const priceRateMap = this.normalizeRateMap(this.value.rate_map);
-    const params = await this.activeParamsAt(this.value.effective_at, ['price_min_bps', 'price_max_bps']);
+    const params = await this.activeParamsAt(this.value.effective_at, [
+      'price_min_bps',
+      'price_max_bps',
+      'price_rate_limit_seconds',
+    ]);
     const boundsError = this.validateRateMapBounds(priceRateMap, modelRef.rate_map, params);
     if (boundsError) return boundsError;
 
@@ -2216,9 +2238,9 @@ class MayhemContract extends Contract {
     const latestSeed = this.priceLatestSeedEntry(schedule);
     if (
       latestSeed &&
-      this.value.effective_at - latestSeed.effective_at < PRICE_RATE_LIMIT_SECONDS
+      this.value.effective_at - latestSeed.effective_at < params.price_rate_limit_seconds
     ) {
-      return new Error('Price changes are limited to once per 6h.');
+      return new Error('Price seed changes are limited by price_rate_limit_seconds.');
     }
 
     const record = {
@@ -2582,6 +2604,14 @@ class MayhemContract extends Contract {
     if ((roots && !totals) || (!roots && totals)) {
       return new Error('Epoch apply roots and totals must be provided together.');
     }
+    const page = this.epochApplyPage(this.value);
+    if (page instanceof Error) return page;
+    const lastPage = this.epochApplyLastPage(this.value);
+    if (lastPage instanceof Error) return lastPage;
+    const pagedApply = hasOwn(this.value, 'page');
+    if (pagedApply && (roots || totals)) {
+      return new Error('Paged epochApply pages must omit aggregate roots and totals.');
+    }
 
     const params = await this.activeParamsAt(this.value.at, [
       'fee_bps',
@@ -2627,8 +2657,11 @@ class MayhemContract extends Contract {
     }
 
     const applyState = await this.epochApplyStateRecord();
+    const previousApplyHash = page === 0 ? null : applyState.last_apply_hash;
     const normalized = {
       epoch: this.value.epoch,
+      page,
+      last_page: lastPage,
       at: this.value.at,
       fee_bps: params.fee_bps,
       debits: this.mapRailEntriesForHash(debitMap, 'user', 'mu'),
@@ -2636,12 +2669,15 @@ class MayhemContract extends Contract {
       roots,
       totals,
     };
+    if (previousApplyHash !== null) {
+      normalized.previous_apply_hash = previousApplyHash;
+    }
     if (marketUsageProvided) {
       normalized.market_usage = this.mapMarketUsageEntriesForHash(marketUsageMap);
     }
     const applyHash = await this.epochApplyHash(normalized);
-    if (applyState.updated_epoch === this.value.epoch && applyState.last_apply_hash === applyHash) {
-      return {
+    if (this.isIdempotentEpochApplyPage(applyState, this.value.epoch, page, lastPage, applyHash)) {
+      const result = {
         ok: true,
         op: 'epochApply',
         epoch: this.value.epoch,
@@ -2650,13 +2686,14 @@ class MayhemContract extends Contract {
         earned_mu: 0,
         fee_mu: 0,
       };
+      if (pagedApply) {
+        result.page = page;
+        result.last_page = lastPage;
+      }
+      return result;
     }
-    if (this.value.epoch <= applyState.updated_epoch) {
-      return new Error('Guardian monotonic epoch invariant failed.');
-    }
-    if (this.value.epoch !== applyState.updated_epoch + 1) {
-      return new Error('Guardian monotonic epoch invariant failed: epoch apply must be contiguous.');
-    }
+    const pageOrderError = this.validateEpochApplyPageOrder(applyState, this.value.epoch, page);
+    if (pageOrderError) return pageOrderError;
 
     const balances = new Map();
     for (const debit of debitMap.values()) {
@@ -2778,6 +2815,7 @@ class MayhemContract extends Contract {
     if (providerDeltaTotal instanceof Error) return providerDeltaTotal;
     const guardian = this.guardianCheckEpochApply({
       epoch: this.value.epoch,
+      page,
       applyState,
       feeRecords,
       debitTotal,
@@ -2830,12 +2868,13 @@ class MayhemContract extends Contract {
       };
       await this.put(this.feeCumKey(rail), feeRecord);
     }
-    await this.put('epoch/apply/state', {
-      ...applyState,
-      updated_epoch: this.value.epoch,
-      updated_at: this.tx,
-      last_apply_hash: applyHash,
-    });
+    await this.put('epoch/apply/state', this.nextEpochApplyState({
+      applyState,
+      epoch: this.value.epoch,
+      page,
+      lastPage,
+      applyHash,
+    }));
     if (totals) {
       await this.writeEpochEvidenceRoots({
         epoch: this.value.epoch,
@@ -2872,6 +2911,10 @@ class MayhemContract extends Contract {
         (left, right) => PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
       ),
     };
+    if (pagedApply) {
+      result.page = page;
+      result.last_page = lastPage;
+    }
     if (marketPriceUpdates.length > 0) {
       result.market_prices = marketPriceUpdates.map((update) => ({
         enclave_id: update.enclave_id,
@@ -3127,9 +3170,11 @@ class MayhemContract extends Contract {
     if (balance instanceof Error) return balance;
     const balanceError = this.guardianValidateBalanceRecord(balance, this.address, rail);
     if (balanceError) return balanceError;
-    if (balance.mu < DISPUTE_DEPOSIT_MU) return new Error('Insufficient balance for dispute deposit.');
+    const params = await this.activeParamsAt(this.value.at, ['dispute_deposit_mu']);
+    const depositMu = params.dispute_deposit_mu;
+    if (balance.mu < depositMu) return new Error('Insufficient balance for dispute deposit.');
 
-    const nextBalanceMu = this.safeSubMu(balance.mu, DISPUTE_DEPOSIT_MU);
+    const nextBalanceMu = this.safeSubMu(balance.mu, depositMu);
     if (nextBalanceMu instanceof Error) return nextBalanceMu;
     const nextBalance = {
       ...balance,
@@ -3158,7 +3203,7 @@ class MayhemContract extends Contract {
       at: this.value.at,
       evidence_hash: this.value.evidence_hash ?? null,
       evidence: cloneValue(this.value.evidence ?? null),
-      deposit_mu: DISPUTE_DEPOSIT_MU,
+      deposit_mu: depositMu,
       deposit_holder: this.address,
       opened_at: this.tx,
       updated_at: this.tx,
@@ -3173,7 +3218,7 @@ class MayhemContract extends Contract {
       ok: true,
       op: 'dispute',
       dispute_id: disputeId,
-      deposit_mu: DISPUTE_DEPOSIT_MU,
+      deposit_mu: depositMu,
       dispute_hash: record.dispute_hash,
     };
   }
@@ -4507,6 +4552,9 @@ class MayhemContract extends Contract {
     if (params.price_min_bps > params.price_max_bps) {
       return new Error('price_min_bps must not exceed price_max_bps.');
     }
+    if (params.market_max_utilization_bps < params.market_target_utilization_bps) {
+      return new Error('market_max_utilization_bps must be >= market_target_utilization_bps.');
+    }
     return null;
   }
 
@@ -4892,21 +4940,35 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  marketPriceConstants() {
+  marketPriceParamKeys() {
+    return [
+      'market_target_utilization_bps',
+      'market_ema_alpha_bps',
+      'market_gain_bps',
+      'market_max_step_bps',
+      'market_cold_start_min_providers',
+      'market_provider_epoch_target_mu',
+      'market_max_utilization_bps',
+      'market_below_target_discount_bps',
+      'market_above_target_slope_bps',
+    ];
+  }
+
+  marketPriceConstants(params) {
     return {
-      target_utilization_bps: MARKET_PRICE_TARGET_UTILIZATION_BPS,
-      ema_alpha_bps: MARKET_PRICE_EMA_ALPHA_BPS,
-      gain_bps: MARKET_PRICE_GAIN_BPS,
-      max_step_bps: MARKET_PRICE_MAX_STEP_BPS,
-      cold_start_min_providers: MARKET_PRICE_COLD_START_MIN_PROVIDERS,
-      provider_epoch_target_mu: MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU,
-      max_utilization_bps: MARKET_PRICE_MAX_UTILIZATION_BPS,
-      below_target_discount_bps: MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS,
-      above_target_slope_bps: MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS,
+      target_utilization_bps: params.market_target_utilization_bps,
+      ema_alpha_bps: params.market_ema_alpha_bps,
+      gain_bps: params.market_gain_bps,
+      max_step_bps: params.market_max_step_bps,
+      cold_start_min_providers: params.market_cold_start_min_providers,
+      provider_epoch_target_mu: params.market_provider_epoch_target_mu,
+      max_utilization_bps: params.market_max_utilization_bps,
+      below_target_discount_bps: params.market_below_target_discount_bps,
+      above_target_slope_bps: params.market_above_target_slope_bps,
     };
   }
 
-  marketUtilizationBps(demandMu, activeSupply) {
+  marketUtilizationBps(demandMu, activeSupply, constants) {
     if (!Number.isSafeInteger(demandMu) || demandMu < 0) {
       return new Error('Invalid market demand.');
     }
@@ -4914,37 +4976,37 @@ class MayhemContract extends Contract {
       return new Error('Invalid market active supply.');
     }
     if (activeSupply === 0) return 0;
-    const capacityMu = activeSupply * MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU;
+    const capacityMu = activeSupply * constants.provider_epoch_target_mu;
     if (!Number.isSafeInteger(capacityMu) || capacityMu <= 0) {
       return new Error('Invalid market supply capacity.');
     }
     const util = Math.floor((demandMu * 10_000) / capacityMu);
-    return Math.min(util, MARKET_PRICE_MAX_UTILIZATION_BPS);
+    return Math.min(util, constants.max_utilization_bps);
   }
 
-  marketEmaUtilizationBps(previousEmaBps, utilizationBps) {
+  marketEmaUtilizationBps(previousEmaBps, utilizationBps, constants) {
     const previous = Number.isSafeInteger(previousEmaBps)
       ? previousEmaBps
-      : MARKET_PRICE_TARGET_UTILIZATION_BPS;
+      : constants.target_utilization_bps;
     return Math.floor(
       (
-        previous * (10_000 - MARKET_PRICE_EMA_ALPHA_BPS) +
-        utilizationBps * MARKET_PRICE_EMA_ALPHA_BPS
+        previous * (10_000 - constants.ema_alpha_bps) +
+        utilizationBps * constants.ema_alpha_bps
       ) / 10_000
     );
   }
 
-  marketCurveMultiplierBps(utilizationBps) {
-    if (utilizationBps <= MARKET_PRICE_TARGET_UTILIZATION_BPS) {
-      const shortfall = MARKET_PRICE_TARGET_UTILIZATION_BPS - utilizationBps;
+  marketCurveMultiplierBps(utilizationBps, constants) {
+    if (utilizationBps <= constants.target_utilization_bps) {
+      const shortfall = constants.target_utilization_bps - utilizationBps;
       return 10_000 - Math.floor(
-        (shortfall * MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS) /
-        MARKET_PRICE_TARGET_UTILIZATION_BPS
+        (shortfall * constants.below_target_discount_bps) /
+        constants.target_utilization_bps
       );
     }
-    const excess = utilizationBps - MARKET_PRICE_TARGET_UTILIZATION_BPS;
-    const denominator = 10_000 - MARKET_PRICE_TARGET_UTILIZATION_BPS;
-    return 10_000 + Math.floor((excess * MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS) / denominator);
+    const excess = utilizationBps - constants.target_utilization_bps;
+    const denominator = 10_000 - constants.target_utilization_bps;
+    return 10_000 + Math.floor((excess * constants.above_target_slope_bps) / denominator);
   }
 
   scalePriceTerm(term, multiplierBps) {
@@ -4959,7 +5021,7 @@ class MayhemContract extends Contract {
     return Math.max(1, scaled);
   }
 
-  stepPriceTerm(current, desired) {
+  stepPriceTerm(current, desired, constants) {
     if (
       !Number.isSafeInteger(current) ||
       !Number.isSafeInteger(desired) ||
@@ -4971,8 +5033,8 @@ class MayhemContract extends Contract {
     if (current === desired) return current;
     if (current === 0) return desired;
     const delta = Math.abs(desired - current);
-    const gained = Math.max(1, Math.floor((delta * MARKET_PRICE_GAIN_BPS) / 10_000));
-    const maxStep = Math.max(1, Math.floor((current * MARKET_PRICE_MAX_STEP_BPS) / 10_000));
+    const gained = Math.max(1, Math.floor((delta * constants.gain_bps) / 10_000));
+    const maxStep = Math.max(1, Math.floor((current * constants.max_step_bps) / 10_000));
     const step = Math.min(gained, maxStep);
     return desired > current ? current + step : Math.max(0, current - step);
   }
@@ -4987,7 +5049,7 @@ class MayhemContract extends Contract {
     return this.normalizeRateMap(scaled);
   }
 
-  stepRateMap(currentRateMap, desiredRateMap) {
+  stepRateMap(currentRateMap, desiredRateMap, constants) {
     const desiredByUnit = this.rateMapByUnit(desiredRateMap);
     const stepped = [];
     for (const entry of currentRateMap) {
@@ -4995,7 +5057,7 @@ class MayhemContract extends Contract {
       if (!desired || desired.granularity !== entry.granularity) {
         return new Error('Market price rate_map shape changed.');
       }
-      const perUnitMu = this.stepPriceTerm(entry.per_unit_mu, desired.per_unit_mu);
+      const perUnitMu = this.stepPriceTerm(entry.per_unit_mu, desired.per_unit_mu, constants);
       if (perUnitMu instanceof Error) return perUnitMu;
       stepped.push({ ...entry, per_unit_mu: perUnitMu });
     }
@@ -5014,6 +5076,8 @@ class MayhemContract extends Contract {
     const at = context.at ?? this.value.at;
     const epoch = context.epoch ?? this.value.epoch;
     const tx = context.tx ?? this.tx;
+    const marketParams = await this.activeParamsAt(at, this.marketPriceParamKeys());
+    const constants = this.marketPriceConstants(marketParams);
     const updates = [];
     for (const usage of this.mapMarketUsageEntriesForHash(marketUsageMap)) {
       const enclave = await this.get(`enclave/${usage.enclave_id}`);
@@ -5032,15 +5096,15 @@ class MayhemContract extends Contract {
       const previousMarket = current.market && typeof current.market === 'object'
         ? current.market
         : {};
-      const utilizationBps = this.marketUtilizationBps(usage.demand_mu, activeSupply);
+      const utilizationBps = this.marketUtilizationBps(usage.demand_mu, activeSupply, constants);
       if (utilizationBps instanceof Error) return utilizationBps;
-      const frozen = activeSupply < MARKET_PRICE_COLD_START_MIN_PROVIDERS;
+      const frozen = activeSupply < constants.cold_start_min_providers;
       const emaUtilizationBps = frozen
-        ? MARKET_PRICE_TARGET_UTILIZATION_BPS
-        : this.marketEmaUtilizationBps(previousMarket.ema_utilization_bps, utilizationBps);
+        ? constants.target_utilization_bps
+        : this.marketEmaUtilizationBps(previousMarket.ema_utilization_bps, utilizationBps, constants);
       const multiplierBps = frozen
         ? 10_000
-        : this.marketCurveMultiplierBps(emaUtilizationBps);
+        : this.marketCurveMultiplierBps(emaUtilizationBps, constants);
       const desiredRateMap = this.scaleRateMap(seed.rate_map, multiplierBps);
       if (desiredRateMap instanceof Error) return desiredRateMap;
       const desiredPerReqMu = this.scalePriceTerm(seed.per_req_mu, multiplierBps);
@@ -5055,9 +5119,9 @@ class MayhemContract extends Contract {
             min_session_mu: seed.min_session_mu,
           }
         : {
-            rate_map: this.stepRateMap(current.rate_map, desiredRateMap),
-            per_req_mu: this.stepPriceTerm(current.per_req_mu, desiredPerReqMu),
-            min_session_mu: this.stepPriceTerm(current.min_session_mu, desiredMinSessionMu),
+            rate_map: this.stepRateMap(current.rate_map, desiredRateMap, constants),
+            per_req_mu: this.stepPriceTerm(current.per_req_mu, desiredPerReqMu, constants),
+            min_session_mu: this.stepPriceTerm(current.min_session_mu, desiredMinSessionMu, constants),
           };
       if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
       if (nextTerms.per_req_mu instanceof Error) return nextTerms.per_req_mu;
@@ -5093,7 +5157,7 @@ class MayhemContract extends Contract {
           desired_min_session_mu: desiredMinSessionMu,
           frozen,
           frozen_reason: frozen ? 'cold_start_min_providers' : null,
-          constants: this.marketPriceConstants(),
+          constants,
           previous_price_ver: current.ver,
           previous_rate_map: cloneValue(current.rate_map),
           previous_per_req_mu: current.per_req_mu,
@@ -5611,12 +5675,88 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  epochApplyPage(value) {
+    if (!hasOwn(value, 'page')) return 0;
+    if (!Number.isSafeInteger(value.page) || value.page < 0) {
+      return new Error('Invalid epochApply page.');
+    }
+    return value.page;
+  }
+
+  epochApplyLastPage(value) {
+    if (!hasOwn(value, 'last_page')) return !hasOwn(value, 'page');
+    if (typeof value.last_page !== 'boolean') {
+      return new Error('Invalid epochApply last_page.');
+    }
+    return value.last_page;
+  }
+
+  isIdempotentEpochApplyPage(applyState, epoch, page, lastPage, applyHash) {
+    if (applyState.last_apply_hash !== applyHash) return false;
+    if (lastPage) {
+      return applyState.updated_epoch === epoch && (applyState.pending_epoch ?? null) === null;
+    }
+    return (
+      applyState.pending_epoch === epoch &&
+      applyState.pending_next_page === page + 1
+    );
+  }
+
+  validateEpochApplyPageOrder(applyState, epoch, page) {
+    const pendingEpoch = applyState.pending_epoch ?? null;
+    if (page === 0) {
+      if (pendingEpoch !== null) return new Error('Guardian monotonic epoch invariant failed: pending epoch apply page exists.');
+      if (epoch <= applyState.updated_epoch) return new Error('Guardian monotonic epoch invariant failed.');
+      if (epoch !== applyState.updated_epoch + 1) {
+        return new Error('Guardian monotonic epoch invariant failed: epoch apply must be contiguous.');
+      }
+      return null;
+    }
+    if (pendingEpoch !== epoch) {
+      return new Error('Guardian monotonic epoch invariant failed: epoch apply page has no pending predecessor.');
+    }
+    if (epoch !== applyState.updated_epoch + 1) {
+      return new Error('Guardian monotonic epoch invariant failed: epoch apply must be contiguous.');
+    }
+    if (applyState.pending_next_page !== page) {
+      return new Error('Guardian monotonic epoch invariant failed: epoch apply page is not contiguous.');
+    }
+    if (!this.isHexBytes(applyState.last_apply_hash, 32)) {
+      return new Error('Guardian monotonic epoch invariant failed: pending epoch apply hash missing.');
+    }
+    return null;
+  }
+
+  nextEpochApplyState({ applyState, epoch, page, lastPage, applyHash }) {
+    const base = {
+      ...applyState,
+      updated_at: this.tx,
+      last_apply_hash: applyHash,
+    };
+    if (lastPage) {
+      return {
+        ...base,
+        updated_epoch: epoch,
+        pending_epoch: null,
+        pending_next_page: 0,
+        last_page: page,
+      };
+    }
+    return {
+      ...base,
+      pending_epoch: epoch,
+      pending_next_page: page + 1,
+      updated_epoch: applyState.updated_epoch,
+      last_page: page,
+    };
+  }
+
   validateEpochApplyFeatureValue(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('epochApply feature value must be an object.');
     }
     const required = ['op', 'epoch', 'at', 'debits', 'earnings'];
-    const allowed = new Set([...required, 'market_usage', 'roots', 'totals']);
+    const allowed = new Set([...required, 'market_usage', 'roots', 'totals', 'page', 'last_page']);
     const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
     if (unknown.length > 0) {
       return new Error(`epochApply feature does not accept fields: ${unknown.join(', ')}.`);
@@ -5631,6 +5771,10 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.at) || value.at < 0) {
       return new Error('Invalid epochApply feature timestamp.');
     }
+    const page = this.epochApplyPage(value);
+    if (page instanceof Error) return page;
+    const lastPage = this.epochApplyLastPage(value);
+    if (lastPage instanceof Error) return lastPage;
     return this.validateEpochApplyShape(value);
   }
 

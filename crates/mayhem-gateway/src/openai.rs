@@ -19,9 +19,10 @@ use crate::{
         DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
-        midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy, RedispatchMode,
-        SessionFailoverState, SessionPriceMu, DEFAULT_MAX_OPEN_ATTEMPTS,
-        DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS, DEFAULT_STALL_TIMEOUT_MILLIS,
+        default_ttft_timeout_millis, midstream_stalled_after, x_mayhem_hedge_requested,
+        FailoverPolicy, RedispatchMode, SessionFailoverState, SessionPriceMu,
+        DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
+        DEFAULT_STALL_TIMEOUT_MILLIS, DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
     },
     pricing::{normalize_rate_map, priced_usage_mu, text_generation_rate_map, RateMapEntry},
     provider_table::{
@@ -350,7 +351,7 @@ impl Default for GatewayFailoverInvocation {
     fn default() -> Self {
         Self {
             open_timeout_ms: DEFAULT_OPEN_TIMEOUT_MILLIS,
-            ttft_timeout_ms: DEFAULT_STALL_TIMEOUT_MILLIS,
+            ttft_timeout_ms: DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
             stall_timeout_ms: DEFAULT_STALL_TIMEOUT_MILLIS,
             min_tok_s: None,
         }
@@ -358,7 +359,7 @@ impl Default for GatewayFailoverInvocation {
 }
 
 impl GatewayFailoverInvocation {
-    fn from_config(config: GatewayFailoverPolicyConfig) -> Self {
+    fn from_config_for_prompt(config: GatewayFailoverPolicyConfig, prompt_tokens: u64) -> Self {
         let config = config.sanitized();
         Self {
             open_timeout_ms: config
@@ -366,7 +367,7 @@ impl GatewayFailoverInvocation {
                 .unwrap_or(DEFAULT_OPEN_TIMEOUT_MILLIS),
             ttft_timeout_ms: config
                 .ttft_timeout_ms
-                .unwrap_or(DEFAULT_STALL_TIMEOUT_MILLIS),
+                .unwrap_or_else(|| default_ttft_timeout_millis(prompt_tokens)),
             stall_timeout_ms: config
                 .stall_timeout_ms
                 .unwrap_or(DEFAULT_STALL_TIMEOUT_MILLIS),
@@ -3675,22 +3676,25 @@ fn parse_x_mayhem_max_price_mu(headers: &HeaderMap) -> Result<Option<u64>, ApiEr
 fn parse_x_mayhem_failover_overrides(
     headers: &HeaderMap,
 ) -> Result<GatewayFailoverPolicyConfig, ApiError> {
+    reject_admin_controlled_timeout_header(
+        headers,
+        X_MAYHEM_OPEN_TIMEOUT_MS_HEADER,
+        "X-Mayhem-Open-Timeout-Ms",
+    )?;
+    reject_admin_controlled_timeout_header(
+        headers,
+        X_MAYHEM_TTFT_TIMEOUT_MS_HEADER,
+        "X-Mayhem-TTFT-Timeout-Ms",
+    )?;
+    reject_admin_controlled_timeout_header(
+        headers,
+        X_MAYHEM_STALL_TIMEOUT_MS_HEADER,
+        "X-Mayhem-Stall-Timeout-Ms",
+    )?;
     Ok(GatewayFailoverPolicyConfig {
-        open_timeout_ms: parse_positive_millis_header(
-            headers,
-            X_MAYHEM_OPEN_TIMEOUT_MS_HEADER,
-            "X-Mayhem-Open-Timeout-Ms",
-        )?,
-        ttft_timeout_ms: parse_positive_millis_header(
-            headers,
-            X_MAYHEM_TTFT_TIMEOUT_MS_HEADER,
-            "X-Mayhem-TTFT-Timeout-Ms",
-        )?,
-        stall_timeout_ms: parse_positive_millis_header(
-            headers,
-            X_MAYHEM_STALL_TIMEOUT_MS_HEADER,
-            "X-Mayhem-Stall-Timeout-Ms",
-        )?,
+        open_timeout_ms: None,
+        ttft_timeout_ms: None,
+        stall_timeout_ms: None,
         min_tok_s: parse_positive_float_header(
             headers,
             X_MAYHEM_MIN_TOK_S_HEADER,
@@ -3699,33 +3703,18 @@ fn parse_x_mayhem_failover_overrides(
     })
 }
 
-fn parse_positive_millis_header(
+fn reject_admin_controlled_timeout_header(
     headers: &HeaderMap,
     key: &'static str,
     display: &'static str,
-) -> Result<Option<u64>, ApiError> {
-    let Some(value) = headers.get(key) else {
-        return Ok(None);
-    };
-    let value = value.to_str().map_err(|_| {
-        ApiError::bad_request(
-            format!("{display} must be an ASCII positive integer number of milliseconds"),
-            Some(display),
-        )
-    })?;
-    let parsed = value.trim().parse::<u64>().map_err(|_| {
-        ApiError::bad_request(
-            format!("{display} must be a positive integer number of milliseconds"),
-            Some(display),
-        )
-    })?;
-    if parsed == 0 {
+) -> Result<(), ApiError> {
+    if headers.contains_key(key) {
         return Err(ApiError::bad_request(
-            format!("{display} must be greater than 0"),
+            format!("{display} is admin catalog controlled; set model failover policy instead"),
             Some(display),
         ));
     }
-    Ok(Some(parsed))
+    Ok(())
 }
 
 fn parse_positive_float_header(
@@ -3906,7 +3895,7 @@ impl ScBridgeGatewaySessionConfig {
             url: url.into(),
             token: token.into(),
             open_timeout: Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS),
-            ttft_timeout: Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS),
+            ttft_timeout: Duration::from_millis(DEFAULT_TTFT_BASE_TIMEOUT_MILLIS),
             frame_timeout: Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS),
             min_tok_s: None,
         }
@@ -10813,7 +10802,8 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
-        let failover = self.failover_thresholds_for_model(model, options);
+        let input_tokens = rough_tokens(&prompt_text);
+        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -10893,7 +10883,8 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = embedding_prompt_text(inputs);
-        let failover = self.failover_thresholds_for_model(model, options);
+        let input_tokens = embedding_input_token_count(inputs);
+        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -10973,7 +10964,8 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = image_generation_prompt_text(request);
-        let failover = self.failover_thresholds_for_model(model, options);
+        let input_tokens = rough_tokens(&prompt_text);
+        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -11053,7 +11045,8 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = audio_speech_prompt_hash(request);
-        let failover = self.failover_thresholds_for_model(model, options);
+        let input_tokens = rough_tokens(&request.input);
+        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -11133,7 +11126,7 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = audio_transcription_prompt_hash(request);
-        let failover = self.failover_thresholds_for_model(model, options);
+        let failover = self.failover_thresholds_for_model(model, options, 0);
         let session_id = session_id_for(&model.id, &prompt_text);
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
@@ -11209,12 +11202,16 @@ impl GatewayState {
         &self,
         model: &GatewayModel,
         options: &GatewayRequestOptions,
+        prompt_tokens: u64,
     ) -> GatewayFailoverInvocation {
         let config = self
             .failover_policy
             .merged_with(model.mayhem.failover)
-            .merged_with(options.failover_overrides);
-        GatewayFailoverInvocation::from_config(config)
+            .merged_with(GatewayFailoverPolicyConfig {
+                min_tok_s: options.failover_overrides.min_tok_s,
+                ..GatewayFailoverPolicyConfig::default()
+            });
+        GatewayFailoverInvocation::from_config_for_prompt(config, prompt_tokens)
     }
 
     fn meter_chat_session(
@@ -13339,7 +13336,7 @@ mod tests {
     };
 
     #[test]
-    fn sc_bridge_direct_session_defaults_match_p4_3_failover_timeouts() {
+    fn sc_bridge_direct_session_defaults_match_f11_failover_timeouts() {
         let config = ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:49222", "token");
         assert_eq!(
             config.open_timeout,
@@ -13347,15 +13344,16 @@ mod tests {
         );
         assert_eq!(
             config.ttft_timeout,
-            Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS)
+            Duration::from_millis(DEFAULT_TTFT_BASE_TIMEOUT_MILLIS)
         );
         assert_eq!(
             config.frame_timeout,
             Duration::from_millis(DEFAULT_STALL_TIMEOUT_MILLIS)
         );
         assert_eq!(config.min_tok_s, None);
-        assert!(config.open_timeout <= Duration::from_secs(3));
-        assert!(config.frame_timeout < Duration::from_secs(20));
+        assert_eq!(config.open_timeout, Duration::from_secs(10));
+        assert_eq!(config.ttft_timeout, Duration::from_secs(30));
+        assert_eq!(config.frame_timeout, Duration::from_secs(30));
     }
 
     #[test]
@@ -13440,7 +13438,7 @@ mod tests {
     }
 
     #[test]
-    fn failover_thresholds_merge_gateway_model_and_request_overrides() {
+    fn failover_thresholds_merge_admin_model_and_user_owned_throughput_overrides() {
         let mut model = test_model();
         model.mayhem.failover = GatewayFailoverPolicyConfig {
             ttft_timeout_ms: Some(7_000),
@@ -13470,8 +13468,32 @@ mod tests {
 
         assert_eq!(invocation.failover.open_timeout_ms, 4_000);
         assert_eq!(invocation.failover.ttft_timeout_ms, 7_000);
-        assert_eq!(invocation.failover.stall_timeout_ms, 9_000);
+        assert_eq!(invocation.failover.stall_timeout_ms, 6_000);
         assert_eq!(invocation.failover.min_tok_s, Some(30.0));
+    }
+
+    #[test]
+    fn failover_thresholds_scale_default_ttft_with_prompt_tokens() {
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let mut request = test_chat_request(&model.id);
+        request.messages = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: json!("x ".repeat(100_000)),
+            name: None,
+            extra: BTreeMap::new(),
+        }];
+        let invocation = state
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("invocation");
+        assert_eq!(invocation.failover.open_timeout_ms, 10_000);
+        assert_eq!(invocation.failover.stall_timeout_ms, 30_000);
+        assert_eq!(invocation.failover.ttft_timeout_ms, 130_000);
     }
 
     #[test]
@@ -13561,22 +13583,23 @@ mod tests {
     #[test]
     fn request_failover_headers_parse_and_reject_invalid_values() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-mayhem-open-timeout-ms", HeaderValue::from_static("2500"));
-        headers.insert("x-mayhem-ttft-timeout-ms", HeaderValue::from_static("4000"));
-        headers.insert(
-            "x-mayhem-stall-timeout-ms",
-            HeaderValue::from_static("9000"),
-        );
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
         headers.insert("x-mayhem-quant", HeaderValue::from_static("Q4_K_M"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("headers parse");
-        assert_eq!(options.failover_overrides.open_timeout_ms, Some(2_500));
-        assert_eq!(options.failover_overrides.ttft_timeout_ms, Some(4_000));
-        assert_eq!(options.failover_overrides.stall_timeout_ms, Some(9_000));
+        assert_eq!(options.failover_overrides.open_timeout_ms, None);
+        assert_eq!(options.failover_overrides.ttft_timeout_ms, None);
+        assert_eq!(options.failover_overrides.stall_timeout_ms, None);
         assert_eq!(options.failover_overrides.min_tok_s, Some(17.5));
         assert_eq!(options.max_price_mu, Some(1_234));
         assert_eq!(options.quant.as_deref(), Some("int4"));
+
+        headers.insert("x-mayhem-open-timeout-ms", HeaderValue::from_static("2500"));
+        let err =
+            GatewayRequestOptions::from_headers(&headers).expect_err("timeout header rejects");
+        assert_eq!(err.param, Some("X-Mayhem-Open-Timeout-Ms"));
+        assert!(err.message.contains("admin catalog controlled"));
+        headers.remove("x-mayhem-open-timeout-ms");
 
         headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("0"));
         let err =

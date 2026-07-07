@@ -6,10 +6,20 @@ use thiserror::Error;
 
 use crate::{text_generation_rate_map, usage_map_mu, ProviderKey, RateMapEntry};
 
-pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = 3_000;
+pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = 10_000;
 pub const DEFAULT_MAX_OPEN_ATTEMPTS: u8 = 4;
 pub const DEFAULT_PROVIDER_COOLOFF_MILLIS: u64 = 30_000;
-pub const DEFAULT_STALL_TIMEOUT_MILLIS: u64 = 15_000;
+pub const DEFAULT_STALL_TIMEOUT_MILLIS: u64 = 30_000;
+pub const DEFAULT_TTFT_BASE_TIMEOUT_MILLIS: u64 = 30_000;
+pub const DEFAULT_TTFT_PROMPT_TOKEN_STEP: u64 = 1_000;
+pub const DEFAULT_TTFT_PROMPT_TOKEN_STEP_MILLIS: u64 = 1_000;
+
+pub fn default_ttft_timeout_millis(prompt_tokens: u64) -> u64 {
+    let prompt_steps = prompt_tokens.saturating_add(DEFAULT_TTFT_PROMPT_TOKEN_STEP - 1)
+        / DEFAULT_TTFT_PROMPT_TOKEN_STEP;
+    DEFAULT_TTFT_BASE_TIMEOUT_MILLIS
+        .saturating_add(prompt_steps.saturating_mul(DEFAULT_TTFT_PROMPT_TOKEN_STEP_MILLIS))
+}
 
 pub fn midstream_stalled_after(
     last_delta_at_millis: Option<u64>,
@@ -512,21 +522,21 @@ mod tests {
             .start_open_attempt(providers[0].clone(), 1_000)
             .expect("first attempt");
         assert_eq!(first.attempt, 1);
-        assert_eq!(first.deadline_at_millis, 4_000);
-        assert!(!state.open_attempt_timed_out(&first, 3_999));
-        assert!(state.open_attempt_timed_out(&first, 4_000));
+        assert_eq!(first.deadline_at_millis, 11_000);
+        assert!(!state.open_attempt_timed_out(&first, 10_999));
+        assert!(state.open_attempt_timed_out(&first, 11_000));
 
         assert_eq!(
-            state.record_open_timeout(&providers[0], 4_000),
+            state.record_open_timeout(&providers[0], 11_000),
             OpenRetryDecision::Retry {
                 next_attempt: 2,
-                cooled_until_millis: 34_000,
+                cooled_until_millis: 41_000,
             }
         );
-        assert!(state.provider_in_cooloff(&providers[0], 33_999));
-        assert!(!state.provider_in_cooloff(&providers[0], 34_000));
+        assert!(state.provider_in_cooloff(&providers[0], 40_999));
+        assert!(!state.provider_in_cooloff(&providers[0], 41_000));
         assert_eq!(
-            state.available_candidates(&providers, 33_999),
+            state.available_candidates(&providers, 40_999),
             providers[1..].to_vec()
         );
 
@@ -579,11 +589,11 @@ mod tests {
             .record_delta(&first, 2, 200)
             .expect("delta accepted")
             .is_none());
-        assert!(!state.midstream_stalled(15_200));
-        assert!(state.midstream_stalled(15_201));
+        assert!(!state.midstream_stalled(30_200));
+        assert!(state.midstream_stalled(30_201));
 
         let redispatch = state
-            .record_midstream_stall(15_201)
+            .record_midstream_stall(30_201)
             .expect("redispatch planned");
         assert_eq!(redispatch.stalled_provider, first);
         assert_eq!(

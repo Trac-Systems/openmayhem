@@ -236,6 +236,75 @@ function extractDefaults(files) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+const contractParamDescriptions = new Map([
+  ['epoch_seconds', 'Settlement epoch length used by rollup/watchers.'],
+  ['fee_bps', 'Operator fee charged during epoch apply.'],
+  ['challenge_epochs', 'Epoch commit/fraud-proof challenge window.'],
+  ['holdback_epochs', 'Provider earnings holdback before payout maturity.'],
+  ['payout_min_mu', 'Minimum payout/settlement threshold.'],
+  ['probation_successful_sessions', 'Successful sessions required before probation can clear.'],
+  ['probation_seconds', 'Time window before probation can clear.'],
+  ['probation_max_concurrent_sessions_per_user', 'Probation concurrent-session cap per user.'],
+  ['probation_price_max_bps', 'Probation price cap relative to reference.'],
+  ['probation_weight_bps', 'Routing weight while a provider is on probation.'],
+  ['auditor_min_reputation_bps', 'Minimum auditor reputation.'],
+  ['auditor_min_age_seconds', 'Minimum auditor account age.'],
+  ['canary_match_min_bps', 'Canary probe match threshold.'],
+  ['canary_probe_holdback_bps', 'Extra probe-gated provider holdback share.'],
+  ['canary_probe_release_min_passes', 'Probe passes needed for gated holdback release.'],
+  ['probe_reward_mu', 'Auditor probe reward.'],
+  ['uptime_tick_seconds', 'Uptime probe cadence.'],
+  ['rate_staleness_seconds', 'Maximum accepted TNK/TAP oracle price age.'],
+  ['price_min_bps', 'Admin seed price lower bound versus model reference.'],
+  ['price_max_bps', 'Admin seed price upper bound versus model reference.'],
+  ['rules_grace_seconds', 'Rules/app compatibility grace window.'],
+  ['max_apply_batch', 'Maximum epochApply debits plus earnings per page.'],
+  ['dispute_deposit_mu', 'Dispute bond amount.'],
+  ['price_rate_limit_seconds', 'Admin seed price change throttle.'],
+  ['market_target_utilization_bps', 'Target utilization for the market price curve.'],
+  ['market_ema_alpha_bps', 'Utilization EMA weight per epoch.'],
+  ['market_gain_bps', 'Dampening gain toward the desired market price.'],
+  ['market_max_step_bps', 'Per-epoch market price movement clamp.'],
+  ['market_cold_start_min_providers', 'Minimum active supply before floating away from the admin seed.'],
+  ['market_provider_epoch_target_mu', 'Per-provider epoch capacity unit for utilization.'],
+  ['market_max_utilization_bps', 'Utilization cap used by the controller.'],
+  ['market_below_target_discount_bps', 'Below-target discount slope cap.'],
+  ['market_above_target_slope_bps', 'Above-target premium slope.'],
+  ['param_activation_delay_seconds', 'Governance delay for future set_params changes.'],
+]);
+
+function extractContractAdminParams() {
+  const file = 'intercom/contract/contract.js';
+  const full = path.join(repoRoot, file);
+  if (!fs.existsSync(full)) return [];
+  const text = fs.readFileSync(full, 'utf8');
+  const constants = new Map();
+  for (const match of text.matchAll(/const\s+([A-Z0-9_]+)\s*=\s*([^;]+);/g)) {
+    constants.set(match[1], match[2].trim());
+  }
+  const block = text.match(/const PARAM_DEFINITIONS = Object\.freeze\(\{\n([\s\S]*?)\n\}\);/);
+  if (!block) return [];
+  const blockStartLine = text.slice(0, block.index).split('\n').length;
+  return block[1]
+    .split('\n')
+    .map((line, idx) => {
+      const match = line.match(/^\s{2}([a-z0-9_]+):\s*\{\s*default:\s*([^,]+),\s*min:\s*([^,]+),\s*max:\s*([^}]+)\s*\},?/);
+      if (!match) return null;
+      const defaultExpression = match[2].trim();
+      const resolvedDefault = constants.get(defaultExpression) ?? null;
+      return {
+        name: match[1],
+        default_expression: defaultExpression,
+        resolved_default: resolvedDefault,
+        min: match[3].trim(),
+        max: match[4].trim(),
+        description: contractParamDescriptions.get(match[1]) || 'Admin-governed intercom contract parameter.',
+        source: `${file}:${blockStartLine + idx + 1}`,
+      };
+    })
+    .filter(Boolean);
+}
+
 function parseHelp(help) {
   const lines = help.replace(/\r/g, '').split('\n');
   const commands = [];
@@ -368,6 +437,7 @@ function renderMarkdown(inventory) {
     ['Environment variables', inventory.environment.length],
     ['TOML config keys', inventory.config.length],
     ['Mayhem HTTP headers', inventory.headers.length],
+    ['Intercom contract admin params', inventory.contract_admin_params.length],
     ['Operational defaults', inventory.defaults.length],
   ]));
   out.push('');
@@ -436,6 +506,18 @@ function renderMarkdown(inventory) {
     header.sources.slice(0, 5).join(', '),
   ])));
   out.push('');
+  out.push('## Intercom Contract Admin Params');
+  out.push('');
+  out.push('These `PARAM_DEFINITIONS` values are governed by admin `set_params`; providers and users cannot set them.');
+  out.push('');
+  out.push(markdownTable(['Parameter', 'Default expression', 'Bounds', 'What it controls', 'Source'], inventory.contract_admin_params.map((param) => [
+    `\`${param.name}\``,
+    param.resolved_default ? `\`${param.default_expression}\` (= \`${param.resolved_default}\`)` : `\`${param.default_expression}\``,
+    `\`${param.min}\` .. \`${param.max}\``,
+    param.description,
+    param.source,
+  ])));
+  out.push('');
   out.push('## Operational Defaults');
   out.push('');
   out.push(markdownTable(['Constant', 'Default expression', 'What it controls', 'When to change it', 'Source'], inventory.defaults.map((entry) => [
@@ -460,6 +542,7 @@ function buildInventory() {
     environment: extractEnvironment(files),
     config: extractConfigKeys(files),
     headers: extractHeaders(files),
+    contract_admin_params: extractContractAdminParams(),
     defaults: extractDefaults(files),
   };
 }

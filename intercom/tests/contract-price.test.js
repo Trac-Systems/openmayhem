@@ -207,7 +207,7 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     admin.publicKey,
     9
   );
-  assert.match(tooSoon.message, /once per 6h/i);
+  assert.match(tooSoon.message, /price_rate_limit_seconds/i);
 
   const second = await execute(
     contract,
@@ -427,6 +427,74 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   );
   assert.equal(reseed.ok, true, reseed.message);
   assert.equal(reseed.ver, 4);
+});
+
+test('MayhemContract market price derivation uses active admin-tuned epoch params', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+  const providerTwo = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  const tuned = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: DAY_SECONDS,
+      values: {
+        market_target_utilization_bps: 7_500,
+        market_provider_epoch_target_mu: 2_000_000,
+        market_cold_start_min_providers: 1,
+        market_gain_bps: 10_000,
+        market_max_step_bps: 10_000,
+      },
+    },
+    admin.publicKey,
+    6
+  );
+  assert.equal(tuned.ok, true, tuned.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    7
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 8);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
+
+  const applied = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: DAY_SECONDS + 1,
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
+      market_usage: [{ enclave_id: enclaveId, demand_mu: 2_000_000, session_count: 4 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(applied.ok, true, applied.message);
+  const derivation = (await storage.get(`ev/price/1/${enclaveId}`)).value;
+  assert.deepEqual(derivation.controller.constants, {
+    target_utilization_bps: 7_500,
+    ema_alpha_bps: 2_500,
+    gain_bps: 10_000,
+    max_step_bps: 10_000,
+    cold_start_min_providers: 1,
+    provider_epoch_target_mu: 2_000_000,
+    max_utilization_bps: 50_000,
+    below_target_discount_bps: 2_500,
+    above_target_slope_bps: 15_000,
+  });
+  assert.equal(derivation.controller.utilization_bps, 5_000);
 });
 
 test('MayhemContract anchors committed price derivations with epoch evidence roots', async () => {
