@@ -44,10 +44,12 @@ use mayhem_engine::{
 use mayhem_gateway::{
     fold_reputation, heartbeat_signing_payload, normalize_rate_map,
     openai::{
-        serve as serve_gateway, validate_loopback_dashboard_bind, GatewayCanaryProbePolicy,
-        GatewayModel, GatewayRouteCandidate, GatewayState, MayhemModelInfo, ModelCaps, PriceRefMu,
-        ProviderKybInfo, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
-        DEFAULT_ROUTE_MAX_WAIT_MS, MAX_ROUTE_MAX_WAIT_MS,
+        gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
+        validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy, GatewayModel,
+        GatewayRouteCandidate, GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord,
+        GatewayTokenStore, MayhemModelInfo, ModelCaps, PriceRefMu, ProviderKybInfo,
+        ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS,
+        MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_mu, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu,
     ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry, ReputationEvent,
@@ -173,6 +175,11 @@ enum Commands {
     Down(DownArgs),
     /// Start the local OpenAI-compatible user gateway.
     Use(UseArgs),
+    /// Manage hashed bearer tokens for shared gateway access.
+    Tokens {
+        #[command(subcommand)]
+        command: TokenCommands,
+    },
     /// List models from the ledger-anchored admin catalog release.
     Models(ModelsArgs),
     /// Inspect live marketplace prices and derivation evidence.
@@ -656,6 +663,10 @@ struct StatusArgs {
     #[arg(long)]
     gateway_url: Option<String>,
 
+    /// Bearer token for checking a shared or --require-auth gateway.
+    #[arg(long, value_name = "TOKEN")]
+    gateway_token: Option<String>,
+
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
@@ -1049,6 +1060,10 @@ struct UseArgs {
     #[arg(long)]
     bind: Option<String>,
 
+    /// Require bearer tokens even on loopback.
+    #[arg(long)]
+    require_auth: bool,
+
     /// Loopback port for the gateway when --bind is not provided.
     #[arg(long, default_value_t = 11_435)]
     port: u16,
@@ -1080,6 +1095,72 @@ struct UseArgs {
     /// Development smoke only: trust --dev-catalog-path without detached signature verification.
     #[arg(long, hide = true)]
     dev_skip_catalog_verify: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenCommands {
+    /// Create a shared-gateway bearer token and print it exactly once.
+    Create(TokenCreateArgs),
+    /// List shared-gateway token metadata and usage.
+    List(TokenListArgs),
+    /// Revoke a shared-gateway token by name.
+    Revoke(TokenRevokeArgs),
+}
+
+#[derive(Debug, Parser)]
+struct TokenCreateArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Human label used for list/revoke and spend attribution.
+    #[arg(long)]
+    name: String,
+
+    /// Expiry duration such as 12h, 7d, 30d, or none. Defaults to none.
+    #[arg(long)]
+    expires: Option<String>,
+
+    /// Budget as USD/day, USD/month, or USD/total, for example 10/day.
+    #[arg(long)]
+    budget: Option<String>,
+
+    /// Maximum accepted requests per minute for this token.
+    #[arg(long)]
+    max_rate: Option<u32>,
+
+    /// Comma-separated model allowlist. Omit for all models.
+    #[arg(long)]
+    models: Option<String>,
+
+    /// Print machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct TokenListArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Print machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct TokenRevokeArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Token name to revoke.
+    name: String,
+
+    /// Print machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -4228,6 +4309,7 @@ struct ConfigNetwork {
     rpc_url: Option<String>,
     sc_bridge_url: Option<String>,
     sc_bridge_token: Option<String>,
+    gateway_bind: Option<String>,
     gateway_url: Option<String>,
     paygate_url: Option<String>,
     tnk_treasury_address: Option<String>,
@@ -4296,6 +4378,7 @@ async fn main() -> Result<()> {
         Commands::Admin { command } => admin(*command).await,
         Commands::Up(args) => up(args).await,
         Commands::Use(args) => use_gateway(args).await,
+        Commands::Tokens { command } => tokens_command(command),
         Commands::Models(args) => models(args).await,
         Commands::Price { command } => match command {
             PriceCommands::Show(args) => price_show(args).await,
@@ -15910,6 +15993,310 @@ fn sc_bridge_port_from_url(url: &str) -> Result<u16> {
         .context("SC-Bridge URL must include an explicit loopback port")
 }
 
+fn tokens_command(command: TokenCommands) -> Result<()> {
+    match command {
+        TokenCommands::Create(args) => tokens_create(args),
+        TokenCommands::List(args) => tokens_list(args),
+        TokenCommands::Revoke(args) => tokens_revoke(args),
+    }
+}
+
+fn tokens_create(args: TokenCreateArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let store_path = gateway_token_store_path(&home);
+    let mut store = read_gateway_token_store(&store_path)?;
+    let name = parse_token_name(&args.name)?;
+    if store.tokens.iter().any(|token| token.name == name) {
+        bail!("gateway token name {name:?} already exists; revoke or choose a different name");
+    }
+    if args.max_rate == Some(0) {
+        bail!("--max-rate must be greater than zero");
+    }
+    let (budget_mu, budget_period) = parse_token_budget(args.budget.as_deref())?;
+    let expires_at = parse_token_expires(args.expires.as_deref())?;
+    let models = parse_token_models(args.models.as_deref())?;
+    let token = new_gateway_token()?;
+    let token_hash = gateway_token_hash(&token);
+    let token_id = gateway_token_id(&token_hash);
+    let created_at = unix_epoch_seconds()?;
+    store.tokens.push(GatewayTokenRecord {
+        name: name.clone(),
+        token_hash,
+        token_id: token_id.clone(),
+        created_at,
+        expires_at,
+        budget_mu,
+        budget_period,
+        spent_total_mu: 0,
+        spent_period_mu: 0,
+        period_started_at: Some(created_at),
+        max_rate_per_minute: args.max_rate,
+        models,
+        last_used_at: None,
+        revoked_at: None,
+    });
+    write_gateway_token_store(&store_path, &store)?;
+    let output = json!({
+        "ok": true,
+        "store": store_path.display().to_string(),
+        "name": name,
+        "token_id": token_id,
+        "token": token.clone(),
+        "expires_at": expires_at,
+        "budget_mu": budget_mu,
+        "budget_period": budget_period,
+        "max_rate_per_minute": args.max_rate,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Gateway token created.");
+        println!("Name: {}", output["name"].as_str().unwrap_or(""));
+        println!("Token ID: {}", output["token_id"].as_str().unwrap_or(""));
+        println!("Token: {token}");
+        println!("Store: {}", store_path.display());
+        println!("The token is shown once; the store contains only its hash.");
+    }
+    Ok(())
+}
+
+fn tokens_list(args: TokenListArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let store_path = gateway_token_store_path(&home);
+    let store = read_gateway_token_store(&store_path)?;
+    let tokens = store
+        .tokens
+        .iter()
+        .map(gateway_token_public_value)
+        .collect::<Vec<_>>();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "store": store_path,
+                "tokens": tokens,
+            }))?
+        );
+    } else {
+        println!("Gateway tokens: {}", store_path.display());
+        if store.tokens.is_empty() {
+            println!("No tokens.");
+        } else {
+            for token in &store.tokens {
+                let active = if token.is_active(unix_epoch_seconds()?) {
+                    "active"
+                } else {
+                    "inactive"
+                };
+                let budget = token_budget_label(token);
+                let last_used = token
+                    .last_used_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "never".to_owned());
+                println!(
+                    "{}  {}  {}  spent=${}  last={}  {}",
+                    token.name,
+                    token.token_id,
+                    active,
+                    mu_to_usd_amount(token.spent_total_mu),
+                    last_used,
+                    budget,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tokens_revoke(args: TokenRevokeArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let store_path = gateway_token_store_path(&home);
+    let mut store = read_gateway_token_store(&store_path)?;
+    let now = unix_epoch_seconds()?;
+    let token = store
+        .tokens
+        .iter_mut()
+        .find(|token| token.name == args.name)
+        .with_context(|| format!("gateway token {:?} was not found", args.name))?;
+    token.revoked_at = Some(now);
+    write_gateway_token_store(&store_path, &store)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "store": store_path,
+                "name": args.name,
+                "revoked_at": now,
+            }))?
+        );
+    } else {
+        println!("Gateway token revoked: {}", args.name);
+    }
+    Ok(())
+}
+
+fn gateway_token_store_path(home: &Path) -> PathBuf {
+    home.join("gateway-tokens.json")
+}
+
+fn read_gateway_token_store(path: &Path) -> Result<GatewayTokenStore> {
+    if !path.exists() {
+        return Ok(GatewayTokenStore::empty());
+    }
+    serde_json::from_value(read_json_file(path)?)
+        .map(GatewayTokenStore::normalized)
+        .with_context(|| format!("parsing gateway token store {}", path.display()))
+}
+
+fn write_gateway_token_store(path: &Path, store: &GatewayTokenStore) -> Result<()> {
+    write_json_file(path, store)
+}
+
+fn parse_token_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty() {
+        bail!("--name must not be empty");
+    }
+    if name.contains('/') || name.contains('\\') {
+        bail!("--name must not contain path separators");
+    }
+    Ok(name.to_owned())
+}
+
+fn parse_token_budget(
+    value: Option<&str>,
+) -> Result<(Option<u64>, Option<GatewayTokenBudgetPeriod>)> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok((None, None));
+    };
+    let Some((amount, period)) = value.split_once('/') else {
+        bail!("--budget must be formatted as USD/day, USD/month, or USD/total");
+    };
+    let amount_mu = parse_usd_amount_to_mu(amount)
+        .with_context(|| format!("parsing --budget amount {amount:?}"))?;
+    let period = match period.trim().to_ascii_lowercase().as_str() {
+        "day" => GatewayTokenBudgetPeriod::Day,
+        "month" => GatewayTokenBudgetPeriod::Month,
+        "total" => GatewayTokenBudgetPeriod::Total,
+        _ => bail!("--budget period must be day, month, or total"),
+    };
+    Ok((Some(amount_mu), Some(period)))
+}
+
+fn parse_token_expires(value: Option<&str>) -> Result<Option<u64>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let seconds = parse_duration_seconds(value, "--expires")?;
+    unix_epoch_seconds()?
+        .checked_add(seconds)
+        .context("--expires overflowed")
+        .map(Some)
+}
+
+fn parse_duration_seconds(value: &str, flag: &str) -> Result<u64> {
+    let value = value.trim();
+    let digit_count = value
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_count == 0 {
+        bail!("{flag} must be a positive duration such as 12h, 7d, or none");
+    }
+    let (amount, unit) = value.split_at(digit_count);
+    let amount = amount.parse::<u64>()?;
+    if amount == 0 {
+        bail!("{flag} must be positive");
+    }
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        "d" | "day" | "days" => 24 * 60 * 60,
+        "w" | "week" | "weeks" => 7 * 24 * 60 * 60,
+        _ => bail!("{flag} unit must be s, m, h, d, w, or none"),
+    };
+    amount
+        .checked_mul(multiplier)
+        .context("duration overflowed")
+}
+
+fn parse_token_models(value: Option<&str>) -> Result<Vec<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let models = value
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        bail!("--models must contain at least one model id when provided");
+    }
+    Ok(models)
+}
+
+fn new_gateway_token() -> Result<String> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).context("generating gateway token entropy")?;
+    Ok(format!("sk-mayhem-{}", hex_lower(&random)))
+}
+
+fn gateway_token_id(token_hash: &str) -> String {
+    format!("tok_{}", token_hash.chars().take(16).collect::<String>())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn gateway_token_public_value(token: &GatewayTokenRecord) -> Value {
+    json!({
+        "name": token.name,
+        "token_id": token.token_id,
+        "active": token.is_active(unix_epoch_seconds().unwrap_or(0)),
+        "created_at": token.created_at,
+        "expires_at": token.expires_at,
+        "budget_mu": token.budget_mu,
+        "budget_period": token.budget_period,
+        "spent_total_mu": token.spent_total_mu,
+        "spent_total_usd": mu_to_usd_amount(token.spent_total_mu),
+        "spent_period_mu": token.spent_period_mu,
+        "last_used_at": token.last_used_at,
+        "revoked_at": token.revoked_at,
+        "max_rate_per_minute": token.max_rate_per_minute,
+        "models": token.models,
+    })
+}
+
+fn token_budget_label(token: &GatewayTokenRecord) -> String {
+    match (token.budget_mu, token.budget_period) {
+        (Some(mu), Some(period)) => {
+            let period = match period {
+                GatewayTokenBudgetPeriod::Total => "total",
+                GatewayTokenBudgetPeriod::Day => "day",
+                GatewayTokenBudgetPeriod::Month => "month",
+            };
+            format!("budget=${}/{period}", mu_to_usd_amount(mu))
+        }
+        _ => "budget=unlimited".to_owned(),
+    }
+}
+
 async fn use_gateway(args: UseArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
@@ -15990,7 +16377,26 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             u32::try_from(value).context("user.min_ctx exceeds supported token count")
         })
         .transpose()?;
+    let token_store_path = gateway_token_store_path(&home);
+    let token_store = read_gateway_token_store(&token_store_path)?;
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
+    let shared_network_bind = !gateway_bind_is_loopback(bind);
+    let require_gateway_auth = args.require_auth || shared_network_bind;
+    let active_token_count = token_store.active_token_count(unix_epoch_seconds()?);
+    if let Err(err) =
+        validate_gateway_bind_access(bind, require_gateway_auth, active_token_count > 0)
+    {
+        bail!("{err}");
+    }
+    let token_count = token_store.tokens.len();
+    let shared_gateway_notice = shared_network_bind.then_some(
+        "Shared gateway notice: serving unencrypted HTTP on this network bind; use a TLS reverse proxy or Tailscale/VPN for WAN exposure.",
+    );
+    let access_control = GatewayAccessControl::new(
+        require_gateway_auth,
+        token_store,
+        Some(token_store_path.clone()),
+    );
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
     let apple_app_attest_jwks = match &args.apple_app_attest_jwks_file {
@@ -16258,7 +16664,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         .with_default_max_wait_ms(default_max_wait_ms)
         .with_default_min_ctx(default_min_ctx)
         .with_receipt_rail(args.rail.as_str())
-        .with_provider_load_progress_dir(home.join("provider-load-progress"));
+        .with_provider_load_progress_dir(home.join("provider-load-progress"))
+        .with_access_control(access_control);
     let dashboard_url = state.dashboard_url(&gateway_url);
     let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
     let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
@@ -16287,6 +16694,13 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "default_max_price_mu": default_max_price_mu,
         "default_max_wait_ms": default_max_wait_ms.unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS),
         "default_min_ctx": default_min_ctx,
+        "access": {
+            "require_auth": require_gateway_auth,
+            "token_store": token_store_path,
+            "token_count": token_count,
+            "active_token_count": active_token_count,
+        },
+        "shared_gateway_notice": shared_gateway_notice,
         "models": model_count,
         "version_gates": &blocked_version_gates,
         "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
@@ -16304,6 +16718,17 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         println!("Copy/paste OpenAI base URL: {openai_base_url}");
         println!("Copy/paste dashboard URL: {dashboard_url}");
         println!("Copy/paste provider dashboard URL: {provider_dashboard_url}");
+        println!(
+            "Gateway access: {}.",
+            if require_gateway_auth {
+                "bearer token required"
+            } else {
+                "loopback token optional"
+            }
+        );
+        if let Some(notice) = shared_gateway_notice {
+            println!("{notice}");
+        }
         println!("Dashboard session expires in: {dashboard_session_expires_in_seconds}s");
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
@@ -16610,10 +17035,18 @@ async fn status(args: StatusArgs) -> Result<()> {
         Err(err) => component_error(err),
     };
 
-    let gateway_status =
-        fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/status")).await;
-    let gateway_receipts =
-        fetch_gateway_json(&client, &format!("{gateway_root}/mayhem/receipts")).await;
+    let gateway_status = fetch_gateway_json_with_token(
+        &client,
+        &format!("{gateway_root}/mayhem/status"),
+        args.gateway_token.as_deref(),
+    )
+    .await;
+    let gateway_receipts = fetch_gateway_json_with_token(
+        &client,
+        &format!("{gateway_root}/mayhem/receipts"),
+        args.gateway_token.as_deref(),
+    )
+    .await;
     let gateway = json!({
         "ok": gateway_status.is_ok() && gateway_receipts.is_ok(),
         "url": gateway_root,
@@ -16927,6 +17360,50 @@ fn print_status_report(report: &Value) {
             status["sessions_paused"].as_u64().unwrap_or(0),
             status["receipts"].as_u64().unwrap_or(0)
         );
+        if let Some(access) = status.get("access") {
+            let require_auth = access
+                .get("require_auth")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let token_count = access
+                .get("token_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let active_token_count = access
+                .get("active_token_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            println!(
+                "Gateway access: {} tokens={}/{}",
+                if require_auth { "required" } else { "optional" },
+                active_token_count,
+                token_count
+            );
+            for token in access
+                .get("tokens")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(8)
+            {
+                let name = token.get("name").and_then(Value::as_str).unwrap_or("token");
+                let token_id = token
+                    .get("token_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tok_unknown");
+                let spent = token
+                    .get("spent_total_mu")
+                    .and_then(Value::as_u64)
+                    .map(mu_to_usd_amount)
+                    .unwrap_or_else(|| "0.00".to_owned());
+                let last_used = token
+                    .get("last_used_at")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "never".to_owned());
+                println!("  {name} ({token_id}) spent=${spent} last={last_used}");
+            }
+        }
     }
 }
 
@@ -18120,8 +18597,19 @@ fn stable_json_value(value: &Value) -> Value {
 }
 
 async fn fetch_gateway_json(client: &reqwest::Client, url: &str) -> Result<Value> {
-    let response = client
-        .get(url)
+    fetch_gateway_json_with_token(client, url, None).await
+}
+
+async fn fetch_gateway_json_with_token(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<Value> {
+    let mut request = client.get(url);
+    if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("requesting {url}"))?;
@@ -19150,21 +19638,27 @@ fn gateway_bind_addr(
     if let Some(bind) = bind {
         let bind = bind.trim();
         if !bind.is_empty() {
-            let bind = bind
+            return bind
                 .parse()
-                .with_context(|| format!("parsing gateway bind address {bind}"))?;
-            validate_loopback_dashboard_bind(bind)?;
-            return Ok(bind);
+                .with_context(|| format!("parsing gateway bind address {bind}"));
         }
+    }
+    if let Some(bind) = config
+        .and_then(|config| config.network.as_ref())
+        .and_then(|network| network.gateway_bind.as_deref())
+        .map(str::trim)
+        .filter(|bind| !bind.is_empty())
+    {
+        return bind
+            .parse()
+            .with_context(|| format!("parsing network.gateway_bind address {bind}"));
     }
     let port = config
         .and_then(|config| config.network.as_ref())
         .and_then(|network| network.gateway_url.as_deref())
         .and_then(gateway_port_from_url)
         .unwrap_or(port);
-    let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    validate_loopback_dashboard_bind(bind)?;
-    Ok(bind)
+    Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 }
 
 fn gateway_port_from_url(value: &str) -> Option<u16> {
@@ -40370,6 +40864,7 @@ mod tests {
                 rpc_url: None,
                 sc_bridge_url: None,
                 sc_bridge_token: None,
+                gateway_bind: None,
                 gateway_url: None,
                 paygate_url: None,
                 tnk_treasury_address: Some("testtrac1treasury".to_owned()),
@@ -40534,13 +41029,14 @@ mod tests {
     }
 
     #[test]
-    fn use_gateway_bind_addr_honors_config_port_and_rejects_non_loopback_bind() {
+    fn use_gateway_bind_addr_honors_config_port_and_defers_non_loopback_auth_check() {
         let config = MayhemConfig {
             identity: None,
             network: Some(ConfigNetwork {
                 rpc_url: None,
                 sc_bridge_url: None,
                 sc_bridge_token: None,
+                gateway_bind: None,
                 gateway_url: Some("http://127.0.0.1:4242/v1".to_owned()),
                 paygate_url: None,
                 tnk_treasury_address: None,
@@ -40557,8 +41053,48 @@ mod tests {
         assert_eq!(explicit.to_string(), "127.0.0.1:5252");
         assert_eq!(gateway_public_url(explicit), "http://127.0.0.1:5252");
 
-        assert!(gateway_bind_addr(Some(&config), Some("0.0.0.0:5252"), 11_435).is_err());
-        assert!(gateway_bind_addr(Some(&config), Some("192.168.1.5:5252"), 11_435).is_err());
+        let shared = gateway_bind_addr(Some(&config), Some("0.0.0.0:5252"), 11_435).unwrap();
+        assert_eq!(shared.to_string(), "0.0.0.0:5252");
+        assert!(validate_gateway_bind_access(shared, true, false).is_err());
+        assert!(validate_gateway_bind_access(shared, true, true).is_ok());
+
+        let lan = gateway_bind_addr(Some(&config), Some("192.168.1.5:5252"), 11_435).unwrap();
+        assert_eq!(lan.to_string(), "192.168.1.5:5252");
+    }
+
+    #[test]
+    fn gateway_tokens_create_persists_only_hash_metadata() {
+        let home = temp_work_dir("mayhem-token-create").unwrap();
+        tokens_create(TokenCreateArgs {
+            home: Some(home.clone()),
+            name: "agent-loop".to_owned(),
+            expires: Some("none".to_owned()),
+            budget: Some("10/day".to_owned()),
+            max_rate: Some(60),
+            models: Some("mayhem/dev-chat-tools,mayhem/dev-embed".to_owned()),
+            json: true,
+        })
+        .unwrap();
+
+        let store_path = gateway_token_store_path(&home);
+        let raw = fs::read_to_string(&store_path).unwrap();
+        assert!(!raw.contains("sk-mayhem-"));
+        let store = read_gateway_token_store(&store_path).unwrap();
+        assert_eq!(store.tokens.len(), 1);
+        let token = &store.tokens[0];
+        assert_eq!(token.name, "agent-loop");
+        assert_eq!(token.budget_mu, Some(10_000_000));
+        assert_eq!(token.budget_period, Some(GatewayTokenBudgetPeriod::Day));
+        assert_eq!(token.max_rate_per_minute, Some(60));
+        assert_eq!(
+            token.models,
+            vec![
+                "mayhem/dev-chat-tools".to_owned(),
+                "mayhem/dev-embed".to_owned()
+            ]
+        );
+        assert_eq!(token.token_hash.len(), 64);
+        assert!(token.token_id.starts_with("tok_"));
     }
 
     #[test]

@@ -130,6 +130,7 @@ pub struct GatewayState {
     provider_table: Arc<Mutex<ProviderTable>>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
+    access_control: Arc<GatewayAccessControl>,
     epoch_seconds: u64,
     ctx_bracket_schedule: Arc<CtxBracketSchedule>,
     failover_policy: GatewayFailoverPolicyConfig,
@@ -418,6 +419,408 @@ pub struct StoredReceipt {
     pub voucher: SpendVoucher,
     pub receipt: SessionReceipt,
     pub receipt_ack: ReceiptAck,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<GatewayTokenAttribution>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTokenBudgetPeriod {
+    Total,
+    Day,
+    Month,
+}
+
+impl GatewayTokenBudgetPeriod {
+    fn window_seconds(self) -> Option<u64> {
+        match self {
+            Self::Total => None,
+            Self::Day => Some(24 * 60 * 60),
+            Self::Month => Some(30 * 24 * 60 * 60),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GatewayTokenRecord {
+    pub name: String,
+    pub token_hash: String,
+    pub token_id: String,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_mu: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_period: Option<GatewayTokenBudgetPeriod>,
+    #[serde(default)]
+    pub spent_total_mu: u64,
+    #[serde(default)]
+    pub spent_period_mu: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rate_per_minute: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
+}
+
+impl GatewayTokenRecord {
+    pub fn is_active(&self, now: u64) -> bool {
+        self.revoked_at.is_none()
+            && self
+                .expires_at
+                .map(|expires_at| expires_at > now)
+                .unwrap_or(true)
+    }
+
+    fn reset_budget_window_if_needed(&mut self, now: u64) {
+        let Some(period) = self.budget_period else {
+            return;
+        };
+        let Some(window_seconds) = period.window_seconds() else {
+            self.period_started_at.get_or_insert(self.created_at);
+            return;
+        };
+        let started_at = self.period_started_at.unwrap_or(self.created_at);
+        if now.saturating_sub(started_at) >= window_seconds {
+            self.spent_period_mu = 0;
+            self.period_started_at = Some(now);
+        } else {
+            self.period_started_at = Some(started_at);
+        }
+    }
+
+    fn effective_spent_mu(&self) -> u64 {
+        match self
+            .budget_period
+            .unwrap_or(GatewayTokenBudgetPeriod::Total)
+        {
+            GatewayTokenBudgetPeriod::Total => self.spent_total_mu,
+            GatewayTokenBudgetPeriod::Day | GatewayTokenBudgetPeriod::Month => self.spent_period_mu,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GatewayTokenStore {
+    #[serde(default = "default_gateway_token_store_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub tokens: Vec<GatewayTokenRecord>,
+}
+
+impl Default for GatewayTokenStore {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl GatewayTokenStore {
+    pub fn empty() -> Self {
+        Self {
+            version: default_gateway_token_store_version(),
+            tokens: Vec::new(),
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        if self.version == 0 {
+            self.version = default_gateway_token_store_version();
+        }
+        self
+    }
+
+    pub fn active_token_count(&self, now: u64) -> usize {
+        self.tokens
+            .iter()
+            .filter(|token| token.is_active(now))
+            .count()
+    }
+}
+
+fn default_gateway_token_store_version() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GatewayTokenAttribution {
+    pub name: String,
+    pub token_id: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GatewayTokenRateWindow {
+    started_at: u64,
+    count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayAccessControl {
+    require_auth: bool,
+    store_path: Option<PathBuf>,
+    store: Arc<Mutex<GatewayTokenStore>>,
+    rate_windows: Arc<Mutex<BTreeMap<String, GatewayTokenRateWindow>>>,
+}
+
+impl GatewayAccessControl {
+    pub fn disabled() -> Self {
+        Self::new(false, GatewayTokenStore::empty(), None)
+    }
+
+    pub fn new(require_auth: bool, store: GatewayTokenStore, store_path: Option<PathBuf>) -> Self {
+        Self {
+            require_auth,
+            store_path,
+            store: Arc::new(Mutex::new(store.normalized())),
+            rate_windows: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub fn requires_auth(&self) -> bool {
+        self.require_auth
+    }
+
+    pub fn has_active_tokens(&self, now: u64) -> bool {
+        self.store
+            .lock()
+            .expect("gateway token store poisoned")
+            .active_token_count(now)
+            > 0
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.store
+            .lock()
+            .expect("gateway token store poisoned")
+            .tokens
+            .len()
+    }
+
+    fn authorize(
+        &self,
+        headers: &HeaderMap,
+        model: Option<&str>,
+    ) -> Result<Option<GatewayTokenAttribution>, ApiError> {
+        let Some(raw_token) = gateway_bearer_token(headers)? else {
+            if self.require_auth {
+                return Err(ApiError::unauthorized(
+                    "missing bearer token",
+                    Some("Authorization"),
+                ));
+            }
+            return Ok(None);
+        };
+        let token_hash = gateway_token_hash(&raw_token);
+        let now = now_secs();
+        let mut store = self.store.lock().expect("gateway token store poisoned");
+        let token = store
+            .tokens
+            .iter_mut()
+            .find(|token| token.token_hash == token_hash)
+            .ok_or_else(|| ApiError::unauthorized("invalid bearer token", Some("Authorization")))?;
+        if token.revoked_at.is_some() {
+            return Err(ApiError::unauthorized(
+                "revoked bearer token",
+                Some("Authorization"),
+            ));
+        }
+        if token.expires_at.is_some_and(|expires_at| expires_at <= now) {
+            return Err(ApiError::unauthorized(
+                "expired bearer token",
+                Some("Authorization"),
+            ));
+        }
+        if let Some(model) = model {
+            if !token.models.is_empty() && !token.models.iter().any(|allowed| allowed == model) {
+                return Err(ApiError::forbidden(
+                    "bearer token is not allowed to use this model",
+                    Some("model"),
+                ));
+            }
+        }
+        token.reset_budget_window_if_needed(now);
+        if token
+            .budget_mu
+            .is_some_and(|budget_mu| token.effective_spent_mu() >= budget_mu)
+        {
+            return Err(ApiError::payment_required(
+                "bearer token budget cap reached",
+                Some("Authorization"),
+            ));
+        }
+        self.check_rate_limit(token, now)?;
+        token.last_used_at = Some(now);
+        let attribution = GatewayTokenAttribution {
+            name: token.name.clone(),
+            token_id: token.token_id.clone(),
+        };
+        self.persist_store(&store)?;
+        Ok(Some(attribution))
+    }
+
+    fn ensure_budget_allows(
+        &self,
+        attribution: &Option<GatewayTokenAttribution>,
+        max_spend_mu: u64,
+    ) -> Result<(), ApiError> {
+        let Some(attribution) = attribution else {
+            return Ok(());
+        };
+        let now = now_secs();
+        let mut store = self.store.lock().expect("gateway token store poisoned");
+        let token = store
+            .tokens
+            .iter_mut()
+            .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
+            .ok_or_else(|| ApiError::unauthorized("invalid bearer token", Some("Authorization")))?;
+        token.reset_budget_window_if_needed(now);
+        if token.budget_mu.is_some_and(|budget_mu| {
+            token.effective_spent_mu().saturating_add(max_spend_mu) > budget_mu
+        }) {
+            return Err(ApiError::payment_required(
+                "bearer token budget cap reached",
+                Some("Authorization"),
+            ));
+        }
+        self.persist_store(&store)
+    }
+
+    fn record_spend(
+        &self,
+        attribution: &GatewayTokenAttribution,
+        spend_mu_delta: u64,
+    ) -> Result<(), ApiError> {
+        if spend_mu_delta == 0 {
+            return Ok(());
+        }
+        let now = now_secs();
+        let mut store = self.store.lock().expect("gateway token store poisoned");
+        let Some(token) = store
+            .tokens
+            .iter_mut()
+            .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
+        else {
+            return Ok(());
+        };
+        token.reset_budget_window_if_needed(now);
+        token.spent_total_mu = token.spent_total_mu.saturating_add(spend_mu_delta);
+        token.spent_period_mu = token.spent_period_mu.saturating_add(spend_mu_delta);
+        self.persist_store(&store)
+    }
+
+    fn summary(&self) -> Value {
+        let now = now_secs();
+        let store = self.store.lock().expect("gateway token store poisoned");
+        let tokens = store
+            .tokens
+            .iter()
+            .map(|token| {
+                let active = token.is_active(now);
+                json!({
+                    "name": token.name,
+                    "token_id": token.token_id,
+                    "active": active,
+                    "expires_at": token.expires_at,
+                    "budget_mu": token.budget_mu,
+                    "budget_period": token.budget_period,
+                    "spent_total_mu": token.spent_total_mu,
+                    "spent_period_mu": token.spent_period_mu,
+                    "spent_total_usd": format_mu_usd(token.spent_total_mu),
+                    "last_used_at": token.last_used_at,
+                    "revoked_at": token.revoked_at,
+                    "max_rate_per_minute": token.max_rate_per_minute,
+                    "models": token.models,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "require_auth": self.require_auth,
+            "token_count": store.tokens.len(),
+            "active_token_count": store.active_token_count(now),
+            "tokens": tokens,
+        })
+    }
+
+    fn check_rate_limit(&self, token: &GatewayTokenRecord, now: u64) -> Result<(), ApiError> {
+        let Some(limit) = token.max_rate_per_minute else {
+            return Ok(());
+        };
+        let mut windows = self
+            .rate_windows
+            .lock()
+            .expect("gateway token rate windows poisoned");
+        let window =
+            windows
+                .entry(token.token_id.clone())
+                .or_insert_with(|| GatewayTokenRateWindow {
+                    started_at: now,
+                    count: 0,
+                });
+        if now.saturating_sub(window.started_at) >= 60 {
+            window.started_at = now;
+            window.count = 0;
+        }
+        if window.count >= limit {
+            return Err(ApiError::too_many_requests(
+                "bearer token rate limit reached",
+                Some("Authorization"),
+            ));
+        }
+        window.count = window.count.saturating_add(1);
+        Ok(())
+    }
+
+    fn persist_store(&self, store: &GatewayTokenStore) -> Result<(), ApiError> {
+        let Some(path) = self.store_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                ApiError::internal_message(format!(
+                    "creating gateway token store directory failed: {err}"
+                ))
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(store).map_err(ApiError::internal)?;
+        fs::write(path, bytes).map_err(|err| {
+            ApiError::internal_message(format!("writing gateway token store failed: {err}"))
+        })
+    }
+}
+
+pub fn gateway_token_hash(token: &str) -> String {
+    blake3_hex(format!("mayhem-gateway-token-v1\0{}", token.trim()).as_bytes())
+}
+
+fn gateway_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::unauthorized("invalid Authorization header", Some("Authorization"))
+    })?;
+    let mut parts = value.split_whitespace();
+    let Some(scheme) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(token) = parts.next() else {
+        return Err(ApiError::unauthorized(
+            "invalid Authorization header",
+            Some("Authorization"),
+        ));
+    };
+    if !scheme.eq_ignore_ascii_case("Bearer") || parts.next().is_some() {
+        return Err(ApiError::unauthorized(
+            "invalid Authorization header",
+            Some("Authorization"),
+        ));
+    }
+    Ok(Some(token.to_owned()))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -846,6 +1249,7 @@ pub struct GatewaySessionInvocation {
     pub attestation: Option<GatewaySessionAttestation>,
     pub hedge: GatewayHedgeInvocation,
     pub failover: GatewayFailoverInvocation,
+    pub access_token: Option<GatewayTokenAttribution>,
     receipt_cosign_enabled: bool,
     receipt_user_seed: [u8; 32],
 }
@@ -1083,6 +1487,7 @@ impl GatewayState {
             provider_table: Arc::new(Mutex::new(provider_table)),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
+            access_control: Arc::new(GatewayAccessControl::disabled()),
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
             ctx_bracket_schedule: Arc::new(default_ctx_bracket_schedule()),
             failover_policy: GatewayFailoverPolicyConfig::default(),
@@ -1165,6 +1570,11 @@ impl GatewayState {
         self
     }
 
+    pub fn with_access_control(mut self, access_control: GatewayAccessControl) -> Self {
+        self.access_control = Arc::new(access_control);
+        self
+    }
+
     pub fn with_failover_policy(mut self, policy: GatewayFailoverPolicyConfig) -> Self {
         self.failover_policy = policy.sanitized();
         self
@@ -1220,6 +1630,18 @@ impl GatewayState {
             options.min_ctx = self.default_min_ctx;
         }
         Ok(options)
+    }
+
+    fn authorize_gateway_request(
+        &self,
+        headers: &HeaderMap,
+        model: Option<&str>,
+    ) -> Result<Option<GatewayTokenAttribution>, ApiError> {
+        self.access_control.authorize(headers, model)
+    }
+
+    fn access_summary(&self) -> Value {
+        self.access_control.summary()
     }
 
     pub fn dashboard_url(&self, gateway_root: &str) -> String {
@@ -1298,11 +1720,33 @@ impl GatewayState {
             .len()
     }
 
-    fn record_receipt(&self, receipt: StoredReceipt) {
+    fn record_receipt(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
+        let spend_delta = receipt.access_token.as_ref().and_then(|access_token| {
+            let session_id = receipt.receipt.body.session_id.as_str();
+            let cumulative = receipt.receipt.body.mu_owed_cum;
+            let receipts = self.receipts.lock().expect("receipt store poisoned");
+            let previous = receipts
+                .iter()
+                .filter(|existing| {
+                    existing.access_token.as_ref() == Some(access_token)
+                        && existing.receipt.body.session_id == session_id
+                })
+                .map(|existing| existing.receipt.body.mu_owed_cum)
+                .max()
+                .unwrap_or(0);
+            cumulative
+                .checked_sub(previous)
+                .filter(|delta| *delta > 0)
+                .map(|delta| (access_token.clone(), delta))
+        });
         self.receipts
             .lock()
             .expect("receipt store poisoned")
             .push(receipt);
+        if let Some((access_token, delta)) = spend_delta {
+            self.access_control.record_spend(&access_token, delta)?;
+        }
+        Ok(())
     }
 
     fn record_probe(&self, probe: StoredProbeEvent) {
@@ -1409,9 +1853,46 @@ pub fn openai_router(state: GatewayState) -> Router {
 }
 
 pub async fn serve(bind: SocketAddr, state: GatewayState) -> std::io::Result<()> {
-    validate_loopback_dashboard_bind(bind)?;
+    validate_gateway_bind_access(
+        bind,
+        state.access_control.requires_auth(),
+        state.access_control.has_active_tokens(now_secs()),
+    )?;
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, openai_router(state)).await
+}
+
+pub fn gateway_bind_is_loopback(bind: SocketAddr) -> bool {
+    bind.ip().is_loopback()
+}
+
+pub fn validate_gateway_bind_access(
+    bind: SocketAddr,
+    auth_required: bool,
+    has_active_tokens: bool,
+) -> std::io::Result<()> {
+    if auth_required && !has_active_tokens {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Refusing to open the gateway to the network without access tokens. Run `mayhem tokens create` first.",
+        ));
+    }
+    if gateway_bind_is_loopback(bind) {
+        return Ok(());
+    }
+    if !has_active_tokens {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Refusing to open the gateway to the network without access tokens. Run `mayhem tokens create` first.",
+        ));
+    }
+    if !auth_required {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Refusing to open the gateway to the network without enforced bearer-token auth.",
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_loopback_dashboard_bind(bind: SocketAddr) -> std::io::Result<()> {
@@ -1424,7 +1905,10 @@ pub fn validate_loopback_dashboard_bind(bind: SocketAddr) -> std::io::Result<()>
     }
 }
 
-async fn list_models(State(state): State<SharedState>) -> Response {
+async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(err) = state.authorize_gateway_request(&headers, None) {
+        return err.into_response();
+    }
     let data = state
         .models
         .iter()
@@ -1446,10 +1930,15 @@ async fn create_chat_completion(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
-    let options = match state.request_options_from_headers(&headers) {
+    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
+    options.access_token = access_token;
     match build_chat_completion(state.clone(), request, options).await {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
@@ -1460,8 +1949,12 @@ async fn create_chat_completion(
 
 async fn create_completion(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Response {
+    if let Err(err) = state.authorize_gateway_request(&headers, Some(&request.model)) {
+        return err.into_response();
+    }
     match build_completion(&state, request) {
         Ok(ChatResponse::Json(value)) => Json(value).into_response(),
         Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
@@ -1475,10 +1968,15 @@ async fn create_embedding(
     headers: HeaderMap,
     Json(request): Json<EmbeddingRequest>,
 ) -> Response {
-    let options = match state.request_options_from_headers(&headers) {
+    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
+    options.access_token = access_token;
     match build_embedding(&state, request, options).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => err.into_response(),
@@ -1490,10 +1988,15 @@ async fn create_image_generation(
     headers: HeaderMap,
     Json(request): Json<ImageGenerationRequest>,
 ) -> Response {
-    let options = match state.request_options_from_headers(&headers) {
+    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
+    options.access_token = access_token;
     match build_image_generation(&state, request, options).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => err.into_response(),
@@ -1505,10 +2008,15 @@ async fn create_audio_speech(
     headers: HeaderMap,
     Json(request): Json<AudioSpeechRequest>,
 ) -> Response {
-    let options = match state.request_options_from_headers(&headers) {
+    let access_token = match state.authorize_gateway_request(&headers, Some(&request.model)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
     };
+    options.access_token = access_token;
     match build_audio_speech(&state, request, options).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
@@ -1528,10 +2036,18 @@ async fn create_audio_transcription(
         .await
         .and_then(|request| Ok((request, options)))
     {
-        Ok((request, options)) => match build_audio_transcription(&state, request, options).await {
-            Ok(value) => Json(value).into_response(),
-            Err(err) => err.into_response(),
-        },
+        Ok((request, mut options)) => {
+            let access_token = match state.authorize_gateway_request(&headers, Some(&request.model))
+            {
+                Ok(access_token) => access_token,
+                Err(err) => return err.into_response(),
+            };
+            options.access_token = access_token;
+            match build_audio_transcription(&state, request, options).await {
+                Ok(value) => Json(value).into_response(),
+                Err(err) => err.into_response(),
+            }
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -1667,7 +2183,10 @@ async fn mayhem_dashboard_exo_font(
     with_dashboard_security_headers(response)
 }
 
-async fn mayhem_status(State(state): State<SharedState>) -> Response {
+async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(err) = state.authorize_gateway_request(&headers, None) {
+        return err.into_response();
+    }
     Json(json!({
         "ok": true,
         "version": 1,
@@ -1679,11 +2198,15 @@ async fn mayhem_status(State(state): State<SharedState>) -> Response {
         "sessions_paused": state.paused_session_count(),
         "receipts": state.receipt_count(),
         "probes": state.probes.lock().expect("probe store poisoned").len(),
+        "access": state.access_summary(),
     }))
     .into_response()
 }
 
-async fn mayhem_receipts(State(state): State<SharedState>) -> Response {
+async fn mayhem_receipts(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(err) = state.authorize_gateway_request(&headers, None) {
+        return err.into_response();
+    }
     Json(json!({
         "object": "list",
         "data": state.receipts(),
@@ -1692,7 +2215,10 @@ async fn mayhem_receipts(State(state): State<SharedState>) -> Response {
     .into_response()
 }
 
-async fn mayhem_probes(State(state): State<SharedState>) -> Response {
+async fn mayhem_probes(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(err) = state.authorize_gateway_request(&headers, None) {
+        return err.into_response();
+    }
     Json(json!({
         "object": "list",
         "data": state.probes(),
@@ -1700,7 +2226,13 @@ async fn mayhem_probes(State(state): State<SharedState>) -> Response {
     .into_response()
 }
 
-async fn mayhem_reputation_events(State(state): State<SharedState>) -> Response {
+async fn mayhem_reputation_events(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = state.authorize_gateway_request(&headers, None) {
+        return err.into_response();
+    }
     Json(json!({
         "object": "list",
         "data": state.reputation_events(),
@@ -1708,7 +2240,10 @@ async fn mayhem_reputation_events(State(state): State<SharedState>) -> Response 
     .into_response()
 }
 
-async fn mayhem_balance(State(state): State<SharedState>) -> Response {
+async fn mayhem_balance(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(err) = state.authorize_gateway_request(&headers, None) {
+        return err.into_response();
+    }
     Json(json!({
         "denom": "mu_usd",
         "balance_mu": state.receipt_config.balance_mu,
@@ -1842,6 +2377,21 @@ fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &s
     let session_rows = dashboard_session_rows(&latest_receipts);
     let model_rows = dashboard_model_rows(&state.models);
     let spend_body = dashboard_spend_body(&latest_receipts);
+    let access_summary = state.access_summary();
+    let token_rows = dashboard_access_token_rows(&access_summary);
+    let token_count = access_summary
+        .get("token_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let auth_mode = if access_summary
+        .get("require_auth")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "Required"
+    } else {
+        "Optional local"
+    };
     let balance_usd = format_mu_usd(state.receipt_config.balance_mu);
     let lifetime_spend = format_mu_usd(lifetime_spend_mu);
     let api_key_masked = "mayhem-local";
@@ -1849,11 +2399,59 @@ fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &s
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
 OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
     )
+}
+
+fn dashboard_access_token_rows(access_summary: &Value) -> String {
+    let Some(tokens) = access_summary.get("tokens").and_then(Value::as_array) else {
+        return r#"<tr><td colspan="4"><span class="privacy-note">No gateway access tokens</span></td></tr>"#
+            .to_owned();
+    };
+    if tokens.is_empty() {
+        return r#"<tr><td colspan="4"><span class="privacy-note">No gateway access tokens</span></td></tr>"#
+            .to_owned();
+    }
+    tokens
+        .iter()
+        .map(|token| {
+            let name = token.get("name").and_then(Value::as_str).unwrap_or("token");
+            let token_id = token
+                .get("token_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let spend = token
+                .get("spent_total_mu")
+                .and_then(Value::as_u64)
+                .map(format_mu_usd)
+                .unwrap_or_else(|| "$0.000000".to_owned());
+            let last_used = token
+                .get("last_used_at")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "never".to_owned());
+            let active = token
+                .get("active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let status = if active {
+                r#"<span class="status-dot">Active</span>"#
+            } else {
+                r#"<span class="status-dot muted">Inactive</span>"#
+            };
+            format!(
+                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span></td><td><span class="mono">{}</span></td><td>{}</td></tr>"#,
+                html_escape(short_text(name, 24).as_ref()),
+                html_escape(short_text(token_id, 18).as_ref()),
+                html_escape(&spend),
+                html_escape(&last_used),
+                status,
+            )
+        })
+        .collect::<String>()
 }
 
 fn dashboard_provider_html(
@@ -3227,6 +3825,7 @@ struct GatewayRequestOptions {
     min_ctx: Option<u32>,
     quant: Option<String>,
     failover_overrides: GatewayFailoverPolicyConfig,
+    access_token: Option<GatewayTokenAttribution>,
 }
 
 impl Default for GatewayRequestOptions {
@@ -3239,6 +3838,7 @@ impl Default for GatewayRequestOptions {
             min_ctx: None,
             quant: None,
             failover_overrides: GatewayFailoverPolicyConfig::default(),
+            access_token: None,
         }
     }
 }
@@ -3797,6 +4397,7 @@ impl GatewayRequestOptions {
             min_ctx: parse_x_mayhem_min_ctx(headers)?,
             quant: parse_x_mayhem_quant(headers)?,
             failover_overrides: parse_x_mayhem_failover_overrides(headers)?,
+            access_token: None,
         })
     }
 }
@@ -11786,6 +12387,8 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        self.access_control
+            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
@@ -11826,6 +12429,7 @@ impl GatewayState {
             attestation,
             hedge: hedge_invocation_for_model(model, options, failover),
             failover,
+            access_token: options.access_token.clone(),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -11881,6 +12485,8 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        self.access_control
+            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
@@ -11921,6 +12527,7 @@ impl GatewayState {
             attestation,
             hedge: GatewayHedgeInvocation::default(),
             failover,
+            access_token: options.access_token.clone(),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -11976,6 +12583,8 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        self.access_control
+            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
@@ -12016,6 +12625,7 @@ impl GatewayState {
             attestation,
             hedge: GatewayHedgeInvocation::default(),
             failover,
+            access_token: options.access_token.clone(),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -12071,6 +12681,8 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        self.access_control
+            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
@@ -12111,6 +12723,7 @@ impl GatewayState {
             attestation,
             hedge: GatewayHedgeInvocation::default(),
             failover,
+            access_token: options.access_token.clone(),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -12166,6 +12779,8 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        self.access_control
+            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
@@ -12206,6 +12821,7 @@ impl GatewayState {
             attestation,
             hedge: GatewayHedgeInvocation::default(),
             failover,
+            access_token: options.access_token.clone(),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -12358,8 +12974,9 @@ impl GatewayState {
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
+            access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone());
+        self.record_receipt(stored.clone())?;
         Ok(stored)
     }
 
@@ -12452,8 +13069,9 @@ impl GatewayState {
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
+            access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone());
+        self.record_receipt(stored.clone())?;
         Ok(stored)
     }
 
@@ -12546,8 +13164,9 @@ impl GatewayState {
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
+            access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone());
+        self.record_receipt(stored.clone())?;
         Ok(stored)
     }
 
@@ -12607,8 +13226,9 @@ impl GatewayState {
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
+            access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone());
+        self.record_receipt(stored.clone())?;
         Ok(stored)
     }
 
@@ -12701,8 +13321,9 @@ impl GatewayState {
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
+            access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone());
+        self.record_receipt(stored.clone())?;
         Ok(stored)
     }
 
@@ -12795,8 +13416,9 @@ impl GatewayState {
             voucher: invocation.spend_voucher.clone(),
             receipt,
             receipt_ack,
+            access_token: invocation.access_token.clone(),
         };
-        self.record_receipt(stored.clone());
+        self.record_receipt(stored.clone())?;
         Ok(stored)
     }
 
@@ -13534,6 +14156,7 @@ fn receipt_summary(receipt: &StoredReceipt) -> Value {
         "mu_owed_cum": receipt.receipt.body.mu_owed_cum,
         "prompt_hash": receipt.receipt.body.prompt_hash,
         "receipt_ack": receipt.receipt_ack,
+        "access_token": receipt.access_token,
     })
 }
 
@@ -14616,6 +15239,14 @@ fn now_millis_u64() -> u64 {
 }
 
 impl ApiError {
+    fn unauthorized(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            param,
+        }
+    }
+
     fn bad_request(message: impl Into<String>, param: Option<&'static str>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -14627,6 +15258,14 @@ impl ApiError {
     fn payment_required(message: impl Into<String>, param: Option<&'static str>) -> Self {
         Self {
             status: StatusCode::PAYMENT_REQUIRED,
+            message: message.into(),
+            param,
+        }
+    }
+
+    fn forbidden(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
             param,
         }
@@ -14656,10 +15295,26 @@ impl ApiError {
         }
     }
 
+    fn too_many_requests(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            param,
+        }
+    }
+
     fn internal(err: serde_json::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("receipt signing payload failed: {err}"),
+            param: None,
+        }
+    }
+
+    fn internal_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
             param: None,
         }
     }
@@ -15136,6 +15791,140 @@ mod tests {
             .expect("headers parse");
         assert_eq!(options.max_price_mu, Some(1_234));
         assert_eq!(options.max_wait_ms, 0);
+    }
+
+    #[test]
+    fn shared_gateway_bind_requires_active_tokens_and_enforced_auth() {
+        let loopback = "127.0.0.1:11435".parse().unwrap();
+        let shared = "0.0.0.0:11435".parse().unwrap();
+
+        assert!(validate_gateway_bind_access(loopback, false, false).is_ok());
+        assert!(validate_gateway_bind_access(loopback, true, false).is_err());
+        assert!(validate_gateway_bind_access(shared, true, false).is_err());
+        assert!(validate_gateway_bind_access(shared, false, true).is_err());
+        assert!(validate_gateway_bind_access(shared, true, true).is_ok());
+    }
+
+    #[test]
+    fn gateway_access_control_authorizes_hashes_and_rejects_bad_tokens() {
+        let raw_token = "sk-mayhem-test-token";
+        let store = GatewayTokenStore {
+            version: 1,
+            tokens: vec![GatewayTokenRecord {
+                name: "agent".to_owned(),
+                token_hash: gateway_token_hash(raw_token),
+                token_id: "tok_test".to_owned(),
+                created_at: 1,
+                expires_at: None,
+                budget_mu: None,
+                budget_period: None,
+                spent_total_mu: 0,
+                spent_period_mu: 0,
+                period_started_at: Some(1),
+                max_rate_per_minute: Some(1),
+                models: vec!["mayhem/dev-chat-tools".to_owned()],
+                last_used_at: None,
+                revoked_at: None,
+            }],
+        };
+        let access = GatewayAccessControl::new(true, store, None);
+        let missing = HeaderMap::new();
+        assert_eq!(
+            access
+                .authorize(&missing, Some("mayhem/dev-chat-tools"))
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {raw_token}")).unwrap(),
+        );
+        let attribution = access
+            .authorize(&headers, Some("mayhem/dev-chat-tools"))
+            .expect("valid token accepted")
+            .expect("token attribution");
+        assert_eq!(attribution.name, "agent");
+
+        assert_eq!(
+            access
+                .authorize(&headers, Some("mayhem/other-model"))
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            access
+                .authorize(&headers, Some("mayhem/dev-chat-tools"))
+                .unwrap_err()
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-mayhem-wrong"),
+        );
+        assert_eq!(
+            access
+                .authorize(&wrong, Some("mayhem/dev-chat-tools"))
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn gateway_receipt_attribution_records_token_spend_delta() {
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let access_token = GatewayTokenAttribution {
+            name: "agent".to_owned(),
+            token_id: "tok_delta".to_owned(),
+        };
+        let store = GatewayTokenStore {
+            version: 1,
+            tokens: vec![GatewayTokenRecord {
+                name: access_token.name.clone(),
+                token_hash: gateway_token_hash("sk-mayhem-delta"),
+                token_id: access_token.token_id.clone(),
+                created_at: 1,
+                expires_at: None,
+                budget_mu: Some(1_000_000),
+                budget_period: Some(GatewayTokenBudgetPeriod::Total),
+                spent_total_mu: 0,
+                spent_period_mu: 0,
+                period_started_at: Some(1),
+                max_rate_per_minute: None,
+                models: Vec::new(),
+                last_used_at: None,
+                revoked_at: None,
+            }],
+        };
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_access_control(GatewayAccessControl::new(false, store, None));
+        let mut invocation = test_invocation();
+        invocation.access_token = Some(access_token);
+
+        let stored = state
+            .meter_chat_session(&model, &request, &output, &invocation, None)
+            .expect("metering succeeds");
+        let access = state.access_summary();
+        let spent = access["tokens"][0]["spent_total_mu"].as_u64().unwrap();
+        assert_eq!(spent, stored.receipt.body.mu_owed_cum);
+
+        state
+            .record_receipt(stored.clone())
+            .expect("duplicate cumulative receipt is accepted");
+        let access = state.access_summary();
+        assert_eq!(
+            access["tokens"][0]["spent_total_mu"].as_u64().unwrap(),
+            spent
+        );
     }
 
     #[tokio::test]
@@ -15690,6 +16479,7 @@ mod tests {
             }),
             hedge: GatewayHedgeInvocation::default(),
             failover: GatewayFailoverInvocation::default(),
+            access_token: None,
             receipt_cosign_enabled: true,
             receipt_user_seed: test_user_seed(),
         }
