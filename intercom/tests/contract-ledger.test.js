@@ -726,6 +726,105 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   assert.equal(fee.updated_epoch, 100);
 });
 
+test('MayhemContract epochApply replays codepoint-sorted varied keys deterministically', async () => {
+  const identities = {
+    admin: await makeIdentity(),
+    provider: await makeIdentity(),
+    provider2: await makeIdentity(),
+    user: await makeIdentity(),
+    outsider: await makeIdentity(),
+  };
+  const left = await setupLedgerContract(identities);
+  const right = await setupLedgerContract(identities);
+  const providers = ['ProviderA', 'providera'];
+  const users = ['UserA', 'usera'];
+
+  for (const ctx of [left, right]) {
+    for (const provider of providers) {
+      await ctx.storage.put(`prov/${provider}`, {
+        provider,
+        status: 'active',
+        accepted_rails: ['fiat'],
+      });
+    }
+    await ctx.storage.put(`bal/${users[0]}/fiat`, seededBalance(users[0], 500));
+    await ctx.storage.put(`bal/${users[1]}/fiat`, seededBalance(users[1], 700));
+  }
+
+  const leftApply = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 3600,
+    debits: [
+      { rail: 'fiat', user: users[1], mu: 700 },
+      { rail: 'fiat', user: users[0], mu: 500 },
+    ],
+    earnings: [
+      { rail: 'fiat', provider: providers[1], gross_mu: 700 },
+      { rail: 'fiat', provider: providers[0], gross_mu: 500 },
+    ],
+  };
+  const rightApply = {
+    ...leftApply,
+    debits: [...leftApply.debits].reverse(),
+    earnings: [...leftApply.earnings].reverse(),
+  };
+
+  for (const [ctx, value] of [[left, leftApply], [right, rightApply]]) {
+    const result = await executeEpochApplyFeature(ctx.contract, ctx.storage, value, identities.admin.publicKey);
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.fee_mu, 180);
+    assert.equal(result.earned_mu, 1020);
+  }
+
+  const stripTxStamps = (record) => {
+    const value = { ...record };
+    delete value.updated_at;
+    return value;
+  };
+  assert.equal(
+    (await left.storage.get('epoch/apply/state')).value.last_apply_hash,
+    (await right.storage.get('epoch/apply/state')).value.last_apply_hash
+  );
+  for (const key of [
+    `bal/${users[0]}/fiat`,
+    `bal/${users[1]}/fiat`,
+    `earn/fiat/${providers[0]}`,
+    `earn/fiat/${providers[1]}`,
+    'fee/fiat/cum',
+  ]) {
+    assert.deepEqual(stripTxStamps((await left.storage.get(key)).value), stripTxStamps((await right.storage.get(key)).value));
+  }
+});
+
+test('MayhemContract epochApply computes large fee bps with exact BigInt math', async () => {
+  const { admin, provider, user, storage, contract } = await setupLedgerContract();
+  const grossMu = 2_000_000_000_001;
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, grossMu));
+
+  const result = await executeEpochApplyFeature(
+    contract,
+    storage,
+    makeEpochApply(1, user.publicKey, provider.publicKey, grossMu),
+    admin.publicKey
+  );
+  assert.equal(result.ok, true, result.message);
+
+  const expectedFee = Number((BigInt(grossMu) * 1_500n) / 10_000n);
+  const expectedProvider = grossMu - expectedFee;
+  assert.equal(result.fee_mu, expectedFee);
+  assert.equal(result.earned_mu, expectedProvider);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 0);
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_mu, expectedProvider);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, expectedFee);
+});
+
+test('MayhemContract guarded mu helpers reject over-safe-integer results', async () => {
+  const { contract } = await setupLedgerContract();
+  assert.match(contract.safeAddMu(Number.MAX_SAFE_INTEGER, 1).message, /overflow/i);
+  assert.match(contract.safeMulDivMu(Number.MAX_SAFE_INTEGER, 10_000, 1).message, /overflow/i);
+});
+
 test('MayhemContract epochApply enforces max_apply_batch before writing', async () => {
   const { admin, provider, storage, contract } = await setupLedgerContract();
   const before = storage.snapshotBytes();

@@ -302,6 +302,13 @@ export const deriveRoomId = async (modelId, creator, nonce) => {
 
 const cloneValue = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+const compareCodepoint = (left, right) => {
+  const a = String(left);
+  const b = String(right);
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+};
 const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
   if (value && typeof value === 'object') {
@@ -1009,6 +1016,10 @@ class MayhemContract extends Contract {
       ) {
         return new Error('Spend reservation session already exists with different terms.');
       }
+      const availableMu = hold.reserved_mu >= balance.mu
+        ? 0
+        : this.safeSubMu(balance.mu, hold.reserved_mu);
+      if (availableMu instanceof Error) return availableMu;
       return {
         ok: true,
         op: 'spendReserve',
@@ -1018,7 +1029,7 @@ class MayhemContract extends Contract {
         user: normalized.user,
         provider: normalized.provider,
         reserved_mu: hold.reserved_mu,
-        available_mu: Math.max(0, balance.mu - hold.reserved_mu),
+        available_mu: availableMu,
         idempotent: true,
       };
     }
@@ -1044,10 +1055,12 @@ class MayhemContract extends Contract {
       ...hold,
       balance_mu_at_last_reserve: balance.mu,
       reserved_mu: nextReservedMu,
-      sessions: [...hold.sessions, session].sort((a, b) => a.session_id.localeCompare(b.session_id)),
+      sessions: [...hold.sessions, session].sort((a, b) => compareCodepoint(a.session_id, b.session_id)),
       updated_at: this.tx,
     };
     await this.put(holdKey, nextHold);
+    const availableMu = this.safeSubMu(balance.mu, nextHold.reserved_mu);
+    if (availableMu instanceof Error) return availableMu;
     return {
       ok: true,
       op: 'spendReserve',
@@ -1057,7 +1070,7 @@ class MayhemContract extends Contract {
       user: normalized.user,
       provider: normalized.provider,
       reserved_mu: nextHold.reserved_mu,
-      available_mu: balance.mu - nextHold.reserved_mu,
+      available_mu: availableMu,
       idempotent: false,
     };
   }
@@ -2591,10 +2604,12 @@ class MayhemContract extends Contract {
       const balanceError = this.guardianValidateBalanceRecord(balance, user, rail);
       if (balanceError) return balanceError;
       if (balance.mu < debitMu) return new Error('Insufficient credit balance.');
+      const nextBalanceMu = this.safeSubMu(balance.mu, debitMu);
+      if (nextBalanceMu instanceof Error) return nextBalanceMu;
       balances.set(stableJson([rail, user]), {
         ...balance,
         rail,
-        mu: balance.mu - debitMu,
+        mu: nextBalanceMu,
         updated_epoch: this.value.epoch,
         updated_at: this.tx,
       });
@@ -2614,8 +2629,10 @@ class MayhemContract extends Contract {
         return new Error('Provider does not accept payment rail.');
       }
 
-      const feeMu = Math.floor((grossMu * params.fee_bps) / 10_000);
-      const providerMu = grossMu - feeMu;
+      const feeMu = this.safeMulDivMu(grossMu, params.fee_bps, 10_000);
+      if (feeMu instanceof Error) return feeMu;
+      const providerMu = this.safeSubMu(grossMu, feeMu);
+      if (providerMu instanceof Error) return providerMu;
       feeDeltaTotalMu = this.safeAddMu(feeDeltaTotalMu, feeMu);
       if (feeDeltaTotalMu instanceof Error) return feeDeltaTotalMu;
       const nextRailFee = this.safeAddMu(feeDeltaByRail.get(rail) ?? 0, feeMu);
@@ -2695,6 +2712,8 @@ class MayhemContract extends Contract {
       if (nextFeeCumTotal instanceof Error) return nextFeeCumTotal;
     }
 
+    const providerDeltaTotal = this.safeSubMu(grossTotal, feeDeltaTotalMu);
+    if (providerDeltaTotal instanceof Error) return providerDeltaTotal;
     const guardian = this.guardianCheckEpochApply({
       epoch: this.value.epoch,
       applyState,
@@ -2702,7 +2721,7 @@ class MayhemContract extends Contract {
       debitTotal,
       debitRailTotals,
       feeDeltaByRail,
-      providerDeltaTotal: grossTotal - feeDeltaTotalMu,
+      providerDeltaTotal,
       nextFeeRecords,
       balances,
       earnings,
@@ -2759,7 +2778,7 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       idempotent: false,
       debited_mu: debitTotal,
-      earned_mu: grossTotal - feeDeltaTotalMu,
+      earned_mu: providerDeltaTotal,
       fee_mu: feeDeltaTotalMu,
       rails: Array.from(touchedRails).sort(
         (left, right) => PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
@@ -2958,10 +2977,12 @@ class MayhemContract extends Contract {
     if (balanceError) return balanceError;
     if (balance.mu < DISPUTE_DEPOSIT_MU) return new Error('Insufficient balance for dispute deposit.');
 
+    const nextBalanceMu = this.safeSubMu(balance.mu, DISPUTE_DEPOSIT_MU);
+    if (nextBalanceMu instanceof Error) return nextBalanceMu;
     const nextBalance = {
       ...balance,
       rail,
-      mu: balance.mu - DISPUTE_DEPOSIT_MU,
+      mu: nextBalanceMu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch ?? 0),
       updated_at: this.tx,
     };
@@ -3523,7 +3544,7 @@ class MayhemContract extends Contract {
         return new Error('Invalid TNK settlement output role.');
       }
     }
-    providerOutputs.sort((left, right) => left.provider.localeCompare(right.provider));
+    providerOutputs.sort((left, right) => compareCodepoint(left.provider, right.provider));
     return [...providerOutputs, ...operatorOutputs];
   }
 
@@ -4003,7 +4024,8 @@ class MayhemContract extends Contract {
     const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who, ledgerRail);
     if (balanceError) return balanceError;
     const clawbackMu = Math.min(balance.mu, this.value.mu);
-    const networkAbsorbedMu = this.value.mu - clawbackMu;
+    const networkAbsorbedMu = this.safeSubMu(this.value.mu, clawbackMu);
+    if (networkAbsorbedMu instanceof Error) return networkAbsorbedMu;
     const nextMu = this.safeSubMu(balance.mu, clawbackMu);
     if (nextMu instanceof Error) return nextMu;
 
@@ -4711,7 +4733,7 @@ class MayhemContract extends Contract {
         per_unit_mu: entry.per_unit_mu,
         granularity: entry.granularity,
       }))
-      .sort((left, right) => left.unit.localeCompare(right.unit));
+      .sort((left, right) => compareCodepoint(left.unit, right.unit));
   }
 
   rateMapByUnit(rateMap) {
@@ -5174,7 +5196,9 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
       return new Error('Guardian earnings epoch invariant failed.');
     }
-    if (record.held_mu > record.total_mu || record.paid_cum_mu > record.total_mu - record.held_mu) {
+    const payableMu = this.safeSubMu(record.total_mu, record.held_mu);
+    if (payableMu instanceof Error) return payableMu;
+    if (record.held_mu > record.total_mu || record.paid_cum_mu > payableMu) {
       return new Error('Guardian earnings conservation invariant failed.');
     }
     if (record.holdbacks !== undefined) {
@@ -5246,11 +5270,15 @@ class MayhemContract extends Contract {
       const railFeeDelta = feeDeltaByRail.get(rail) ?? 0;
       feeDeltaMu = this.safeAddMu(feeDeltaMu, railFeeDelta);
       if (feeDeltaMu instanceof Error) return feeDeltaMu;
-      if (nextFee.cum_mu !== fee.cum_mu + railFeeDelta) {
+      const expectedFeeCumMu = this.safeAddMu(fee.cum_mu, railFeeDelta);
+      if (expectedFeeCumMu instanceof Error) return expectedFeeCumMu;
+      if (nextFee.cum_mu !== expectedFeeCumMu) {
         return new Error('Guardian fee conservation invariant failed.');
       }
     }
-    if (providerDeltaTotal + feeDeltaMu !== debitTotal) {
+    const grossDeltaTotal = this.safeAddMu(providerDeltaTotal, feeDeltaMu);
+    if (grossDeltaTotal instanceof Error) return grossDeltaTotal;
+    if (grossDeltaTotal !== debitTotal) {
       return new Error('Guardian conservation invariant failed.');
     }
 
@@ -5397,7 +5425,8 @@ class MayhemContract extends Contract {
         kept.push(bucket);
         continue;
       }
-      const gatedMu = Math.floor((bucket.mu * probeGate.holdback_bps) / 10_000);
+      const gatedMu = this.safeMulDivMu(bucket.mu, probeGate.holdback_bps, 10_000);
+      if (gatedMu instanceof Error) return gatedMu;
       if (gatedMu > 0) {
         kept.push({ epoch: bucket.epoch, mu: gatedMu, probe_gate: true });
       }
@@ -5448,7 +5477,7 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(slashBps) || slashBps < 0 || slashBps > 10_000) {
       return new Error('Invalid slash bps.');
     }
-    return Number((BigInt(heldMu) * BigInt(slashBps)) / 10_000n);
+    return this.safeMulDivMu(heldMu, slashBps, 10_000);
   }
 
   providerActiveEnclaves(provider) {
@@ -5493,7 +5522,7 @@ class MayhemContract extends Contract {
       });
     }
     return Array.from(entries.values()).sort((a, b) => (
-      a.provider.localeCompare(b.provider) || a.enclave_id.localeCompare(b.enclave_id)
+      compareCodepoint(a.provider, b.provider) || compareCodepoint(a.enclave_id, b.enclave_id)
     ));
   }
 
@@ -5503,7 +5532,7 @@ class MayhemContract extends Contract {
       entries.push({ provider: providerId, enclave_id: enclaveId });
     }
     return entries.sort((a, b) => (
-      a.provider.localeCompare(b.provider) || a.enclave_id.localeCompare(b.enclave_id)
+      compareCodepoint(a.provider, b.provider) || compareCodepoint(a.enclave_id, b.enclave_id)
     ));
   }
 
@@ -5710,12 +5739,16 @@ class MayhemContract extends Contract {
 
       const railForfeitedMu = this.slashAmount(earning.held_mu, slashBps);
       if (railForfeitedMu instanceof Error) return railForfeitedMu;
-      const railReporterMu = beneficiary === null ? 0 : Math.floor(railForfeitedMu / 2);
-      const railTreasuryMu = railForfeitedMu - railReporterMu;
+      const railReporterMu = beneficiary === null ? 0 : this.safeMulDivMu(railForfeitedMu, 1, 2);
+      if (railReporterMu instanceof Error) return railReporterMu;
+      const railTreasuryMu = this.safeSubMu(railForfeitedMu, railReporterMu);
+      if (railTreasuryMu instanceof Error) return railTreasuryMu;
       const remainingHoldbacks = this.slashHoldbackBuckets(holdbacks, railForfeitedMu);
       if (remainingHoldbacks instanceof Error) return remainingHoldbacks;
-      const railHeldAfterMu = earning.held_mu - railForfeitedMu;
-      const railTotalMu = earning.total_mu - railForfeitedMu;
+      const railHeldAfterMu = this.safeSubMu(earning.held_mu, railForfeitedMu);
+      if (railHeldAfterMu instanceof Error) return railHeldAfterMu;
+      const railTotalMu = this.safeSubMu(earning.total_mu, railForfeitedMu);
+      if (railTotalMu instanceof Error) return railTotalMu;
       const slashedCumMu = this.safeAddMu(earning.slashed_cum_mu ?? 0, railForfeitedMu);
       if (slashedCumMu instanceof Error) return slashedCumMu;
 
@@ -5990,7 +6023,7 @@ class MayhemContract extends Contract {
       if (next instanceof Error) return next;
       usage[unit] = next;
     }
-    return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
+    return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => compareCodepoint(left, right)));
   }
 
   normalizeReceiptEnvelope(value, options = {}) {
@@ -6166,8 +6199,10 @@ class MayhemContract extends Contract {
     if (previousMu > receipt.body.mu_owed_cum || previousMu > claimedCum) {
       return new Error('Previous receipt amount exceeds cumulative amount.');
     }
-    const actualMu = receipt.body.mu_owed_cum - previousMu;
-    const claimedMu = claimedCum - previousMu;
+    const actualMu = this.safeSubMu(receipt.body.mu_owed_cum, previousMu);
+    if (actualMu instanceof Error) return actualMu;
+    const claimedMu = this.safeSubMu(claimedCum, previousMu);
+    if (claimedMu instanceof Error) return claimedMu;
     if (claimedMu <= actualMu) return new Error('Receipt does not contradict committed usage.');
     if (commit.totals.use_mu !== claimedMu) {
       return new Error('Fraud proof claimed amount does not match committed usage total.');
@@ -6370,11 +6405,7 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b)) {
       return new Error('mu values must be safe integers.');
     }
-    const sum = a + b;
-    if (!Number.isSafeInteger(sum) || sum > Number.MAX_SAFE_INTEGER) {
-      return new Error('mu value overflow.');
-    }
-    return sum;
+    return this.safeNarrowMu(BigInt(a) + BigInt(b));
   }
 
   safeSubMu(a, b) {
@@ -6382,11 +6413,34 @@ class MayhemContract extends Contract {
       return new Error('mu values must be safe integers.');
     }
     if (b > a) return new Error('mu value underflow.');
-    return a - b;
+    return this.safeNarrowMu(BigInt(a) - BigInt(b));
+  }
+
+  safeMulDivMu(a, b, divisor) {
+    if (
+      !Number.isSafeInteger(a) ||
+      !Number.isSafeInteger(b) ||
+      !Number.isSafeInteger(divisor) ||
+      a < 0 ||
+      b < 0 ||
+      divisor <= 0
+    ) {
+      return new Error('mu values must be safe integers.');
+    }
+    return this.safeNarrowMu((BigInt(a) * BigInt(b)) / BigInt(divisor));
+  }
+
+  safeNarrowMu(value) {
+    if (typeof value !== 'bigint' || value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return new Error('mu value overflow.');
+    }
+    const narrowed = Number(value);
+    if (!Number.isSafeInteger(narrowed)) return new Error('mu value overflow.');
+    return narrowed;
   }
 
   sortedMapEntries(map) {
-    return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b));
+    return Array.from(map.entries()).sort(([a], [b]) => compareCodepoint(a, b));
   }
 
   sortedRailRecords(map, idKey) {
@@ -6394,7 +6448,7 @@ class MayhemContract extends Contract {
       const railOrder =
         PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(a.rail) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(b.rail);
       if (railOrder !== 0) return railOrder;
-      return a[idKey].localeCompare(b[idKey]);
+      return compareCodepoint(a[idKey], b[idKey]);
     });
   }
 
@@ -6512,8 +6566,7 @@ class MayhemContract extends Contract {
       return new Error('Invalid TNK/USD rate.');
     }
     const mu = (tnkE18 * BigInt(tnkUsdE6)) / TNK_E18;
-    if (mu > BigInt(Number.MAX_SAFE_INTEGER)) return new Error('mu value overflow.');
-    return Number(mu);
+    return this.safeNarrowMu(mu);
   }
 
   tapWeiToMu(tapWei, tapUsdE6) {
@@ -6521,8 +6574,7 @@ class MayhemContract extends Contract {
       return new Error('Invalid TAP/USD policy rate.');
     }
     const mu = (tapWei * BigInt(tapUsdE6)) / TAP_WEI;
-    if (mu > BigInt(Number.MAX_SAFE_INTEGER)) return new Error('mu value overflow.');
-    return Number(mu);
+    return this.safeNarrowMu(mu);
   }
 
   async requireFreshRate(at) {
@@ -6933,7 +6985,7 @@ class MayhemContract extends Contract {
   }
 
   async reputationEventHead(previousHead, event) {
-    const payload = JSON.stringify({
+    const payload = stableJson({
       domain: 'mayhem-reputation-event-v1',
       previous_head: previousHead,
       event,

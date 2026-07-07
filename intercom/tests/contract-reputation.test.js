@@ -401,3 +401,40 @@ test('MayhemContract reputation event log replays deterministically', async () =
 
   assert.equal(first.storage.snapshotBytes(), second.storage.snapshotBytes());
 });
+
+test('MayhemContract reputation event head is stable across object key order', async () => {
+  const { contract } = await setupReputationContract();
+  const first = {
+    op: 'record_rep_event',
+    provider: 'a'.repeat(64),
+    event_id: 'ordered-event',
+    kind: 'session_ok',
+    epoch: 1,
+    at: DAY_SECONDS,
+    evidence_hash: 'b'.repeat(64),
+    paid_mu: 100,
+    nested: {
+      zeta: 1,
+      alpha: 2,
+    },
+  };
+  const second = {
+    nested: {
+      alpha: 2,
+      zeta: 1,
+    },
+    paid_mu: 100,
+    evidence_hash: 'b'.repeat(64),
+    at: DAY_SECONDS,
+    epoch: 1,
+    kind: 'session_ok',
+    event_id: 'ordered-event',
+    provider: 'a'.repeat(64),
+    op: 'record_rep_event',
+  };
+
+  assert.equal(
+    await contract.reputationEventHead(null, first),
+    await contract.reputationEventHead(null, second)
+  );
+});

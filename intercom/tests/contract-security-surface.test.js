@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 import MayhemContract, { deriveRoomId } from '../contract/contract.js';
 import {
@@ -313,6 +314,15 @@ const buildAdminOnlyRateFeatureAttempts = () => [
     ts: 3_600,
   },
 ];
+
+test('MayhemContract replicated source avoids locale and env-dependent admission knobs', () => {
+  const contractSource = fs.readFileSync(new URL('../contract/contract.js', import.meta.url), 'utf8');
+  const protocolSource = fs.readFileSync(new URL('../contract/protocol.js', import.meta.url), 'utf8');
+
+  assert.doesNotMatch(contractSource, /localeCompare/);
+  assert.doesNotMatch(contractSource, /MAYHEM_TX_MAX_BYTES/);
+  assert.match(protocolSource, /MAYHEM_TX_MAX_BYTES/);
+});
 
 test('MayhemContract rejects admin ops before genesis admin is present', async () => {
   const outsider = await makeIdentity();
