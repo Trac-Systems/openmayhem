@@ -403,6 +403,98 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   assert.equal(reseed.ver, 4);
 });
 
+test('MayhemContract keeps one enclave price while conserving mixed rail settlement', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const fiatUser = await makeIdentity();
+  const tapUser = await makeIdentity();
+  const tapProvider = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  const fiatJoined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    6
+  );
+  assert.equal(fiatJoined.ok, true, fiatJoined.message);
+  await registerAndJoinExtraProvider(contract, storage, admin, tapProvider, 7);
+  const tapRails = await execute(
+    contract,
+    storage,
+    'setProviderRails',
+    { op: 'set_provider_rails', rails: ['tap'] },
+    tapProvider.publicKey,
+    10
+  );
+  assert.equal(tapRails.ok, true, tapRails.message);
+
+  await storage.put(`bal/${fiatUser.publicKey}/fiat`, seededBalance(fiatUser.publicKey, 2_000_000, 'fiat'));
+  await storage.put(`bal/${tapUser.publicKey}/tap`, seededBalance(tapUser.publicKey, 2_000_000, 'tap'));
+
+  const applied = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 43_201,
+      debits: [
+        { rail: 'fiat', user: fiatUser.publicKey, mu: 500_000 },
+        { rail: 'tap', user: tapUser.publicKey, mu: 500_000 },
+      ],
+      earnings: [
+        { rail: 'fiat', provider: provider.publicKey, gross_mu: 500_000 },
+        { rail: 'tap', provider: tapProvider.publicKey, gross_mu: 500_000 },
+      ],
+      market_usage: [{ enclave_id: enclaveId, demand_mu: 1_000_000, session_count: 2 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(applied.ok, true, applied.message);
+  assert.deepEqual(applied.rails, ['fiat', 'tap']);
+  assert.deepEqual(applied.market_prices, [
+    {
+      enclave_id: enclaveId,
+      ver: 2,
+      utilization_bps: 5_000,
+      ema_utilization_bps: 7_625,
+      active_supply: 2,
+      active_demand_mu: 1_000_000,
+      frozen: false,
+    },
+  ]);
+
+  const schedule = await storage.get(`price/${enclaveId}`);
+  assert.equal(schedule.value.current.ver, 2);
+  assert.equal(schedule.value.current.price_source, 'market_float');
+  assert.equal(await storage.get(`price/${enclaveId}/fiat`), null);
+  assert.equal(await storage.get(`price/${enclaveId}/tap`), null);
+  assert.equal((await storage.get(`bal/${fiatUser.publicKey}/fiat`)).value.mu, 1_500_000);
+  assert.equal((await storage.get(`bal/${tapUser.publicKey}/tap`)).value.mu, 1_500_000);
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_mu, 425_000);
+  assert.equal((await storage.get(`earn/tap/${tapProvider.publicKey}`)).value.total_mu, 425_000);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 75_000);
+  assert.equal((await storage.get('fee/tap/cum')).value.cum_mu, 75_000);
+
+  const crossRailMismatch = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 2,
+      at: 46_801,
+      debits: [{ rail: 'fiat', user: fiatUser.publicKey, mu: 100 }],
+      earnings: [{ rail: 'tap', provider: tapProvider.publicKey, gross_mu: 100 }],
+      market_usage: [{ enclave_id: enclaveId, demand_mu: 100, session_count: 1 }],
+    },
+    admin.publicKey
+  );
+  assert.match(crossRailMismatch.message, /per rail/i);
+});
+
 test('MayhemContract epochApply rejects market usage that does not reconcile to settled gross', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
   const user = await makeIdentity();
