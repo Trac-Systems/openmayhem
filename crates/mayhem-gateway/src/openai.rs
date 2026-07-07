@@ -6608,8 +6608,14 @@ fn direct_session_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected =
-        expected_provider_receipt(model, request, output, provider, provider_receipt.body.seq);
+    let expected = expected_provider_receipt(
+        model,
+        request,
+        output,
+        provider,
+        provider_receipt.body.seq,
+        invocation,
+    );
     if expected.mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
         return Err(GatewaySessionError::new(
             "provider receipt exceeds signed spend voucher",
@@ -6636,7 +6642,7 @@ fn direct_session_embedding_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected = expected_embedding_provider_receipt(model, inputs, output, provider);
+    let expected = expected_embedding_provider_receipt(model, inputs, output, provider, invocation);
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -6658,7 +6664,8 @@ fn direct_session_image_generation_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected = expected_image_generation_provider_receipt(model, request, output, provider);
+    let expected =
+        expected_image_generation_provider_receipt(model, request, output, provider, invocation);
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -6680,7 +6687,8 @@ fn direct_session_audio_speech_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected = expected_audio_speech_provider_receipt(model, request, output, provider);
+    let expected =
+        expected_audio_speech_provider_receipt(model, request, output, provider, invocation);
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -6702,7 +6710,8 @@ fn direct_session_audio_transcription_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected = expected_audio_transcription_provider_receipt(model, request, output, provider);
+    let expected =
+        expected_audio_transcription_provider_receipt(model, request, output, provider, invocation);
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -6728,7 +6737,7 @@ fn direct_session_partial_receipt_ack(
         partial.output.usage.prompt_tokens,
         partial.output.usage.completion_tokens,
     );
-    let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+    let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
     if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
         return Err(GatewaySessionError::new(
             "provider partial receipt exceeds signed spend voucher",
@@ -6755,86 +6764,91 @@ fn direct_session_partial_receipt_ack(
 }
 
 fn expected_embedding_provider_receipt<'a>(
-    model: &GatewayModel,
+    _model: &GatewayModel,
     inputs: &[String],
     output: &EmbeddingOutput,
     provider: &'a str,
+    invocation: &GatewaySessionInvocation,
 ) -> ExpectedProviderReceipt<'a> {
     let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
     ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
         prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
         usage,
     }
 }
 
 fn expected_image_generation_provider_receipt<'a>(
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &ImageGenerationRequest,
     output: &ImageGenerationOutput,
     provider: &'a str,
+    invocation: &GatewaySessionInvocation,
 ) -> ExpectedProviderReceipt<'a> {
     let usage = output.usage.clone();
     ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
         prompt_hash: image_generation_prompt_hash(request),
         usage,
     }
 }
 
 fn expected_audio_speech_provider_receipt<'a>(
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &AudioSpeechRequest,
     output: &AudioSpeechOutput,
     provider: &'a str,
+    invocation: &GatewaySessionInvocation,
 ) -> ExpectedProviderReceipt<'a> {
     let usage = output.usage.clone();
     ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
         prompt_hash: audio_speech_prompt_hash(request),
         usage,
     }
 }
 
 fn expected_audio_transcription_provider_receipt<'a>(
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &AudioTranscriptionRequest,
     output: &AudioTranscriptionOutput,
     provider: &'a str,
+    invocation: &GatewaySessionInvocation,
 ) -> ExpectedProviderReceipt<'a> {
     let usage = output.usage.clone();
     ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
         prompt_hash: audio_transcription_prompt_hash(request),
         usage,
     }
 }
 
 fn expected_provider_receipt<'a>(
-    model: &GatewayModel,
+    _model: &GatewayModel,
     request: &ChatCompletionRequest,
     output: &ChatOutput,
     provider: &'a str,
     seq: u64,
+    invocation: &GatewaySessionInvocation,
 ) -> ExpectedProviderReceipt<'a> {
     let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
     ExpectedProviderReceipt {
         provider,
         seq,
         final_receipt: true,
-        mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
         prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
         usage,
     }
@@ -6881,6 +6895,10 @@ fn validate_provider_receipt(
         (
             body.price_ver == invocation.price_ver,
             "provider receipt price_ver mismatch",
+        ),
+        (
+            body.locked_rate_map == invocation.spend_voucher.body.locked_rate_map,
+            "provider receipt locked_rate_map mismatch",
         ),
         (
             body.rules_ver == invocation.rules_ver,
@@ -10720,6 +10738,7 @@ impl GatewayState {
         let price_ver = route
             .map(|candidate| candidate.price_ver)
             .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let locked_rate_map = session_locked_rate_map(model);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10754,6 +10773,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
+            locked_rate_map: locked_rate_map.clone(),
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10796,6 +10816,7 @@ impl GatewayState {
         let price_ver = route
             .map(|candidate| candidate.price_ver)
             .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let locked_rate_map = session_locked_rate_map(model);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10830,6 +10851,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
+            locked_rate_map: locked_rate_map.clone(),
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10872,6 +10894,7 @@ impl GatewayState {
         let price_ver = route
             .map(|candidate| candidate.price_ver)
             .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let locked_rate_map = session_locked_rate_map(model);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10906,6 +10929,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
+            locked_rate_map: locked_rate_map.clone(),
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -10948,6 +10972,7 @@ impl GatewayState {
         let price_ver = route
             .map(|candidate| candidate.price_ver)
             .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let locked_rate_map = session_locked_rate_map(model);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -10982,6 +11007,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
+            locked_rate_map: locked_rate_map.clone(),
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11024,6 +11050,7 @@ impl GatewayState {
         let price_ver = route
             .map(|candidate| candidate.price_ver)
             .unwrap_or(model.mayhem.price_ref_mu.ver);
+        let locked_rate_map = session_locked_rate_map(model);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
             contract: EnclaveContractRecord {
                 enclave_id: candidate.enclave_id.clone(),
@@ -11058,6 +11085,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
+            locked_rate_map: locked_rate_map.clone(),
             max_spend_mu,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
@@ -11106,7 +11134,7 @@ impl GatewayState {
     ) -> Result<StoredReceipt, ApiError> {
         let prompt_text = chat_prompt_text(request);
         let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
-        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
         if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
@@ -11156,6 +11184,7 @@ impl GatewayState {
                 enclave_id: invocation.enclave_id.clone(),
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
+                locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11195,7 +11224,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
-        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
         if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
@@ -11244,6 +11273,7 @@ impl GatewayState {
                 enclave_id: invocation.enclave_id.clone(),
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
+                locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11283,7 +11313,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
-        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
         if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
@@ -11332,6 +11362,7 @@ impl GatewayState {
                 enclave_id: invocation.enclave_id.clone(),
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
+                locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11388,7 +11419,7 @@ impl GatewayState {
             partial.output.usage.prompt_tokens,
             partial.output.usage.completion_tokens,
         );
-        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
         if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
             return Err(ApiError::payment_required(
                 "provider partial receipt exceeds signed spend voucher",
@@ -11432,7 +11463,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
-        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
         if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
@@ -11481,6 +11512,7 @@ impl GatewayState {
                 enclave_id: invocation.enclave_id.clone(),
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
+                locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -11520,7 +11552,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
-        let mu_owed_cum = calculate_mu_owed(&model.mayhem.price_ref_mu, &usage);
+        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
         if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
@@ -11569,6 +11601,7 @@ impl GatewayState {
                 enclave_id: invocation.enclave_id.clone(),
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
+                locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
                 rules_ver: invocation.rules_ver,
                 usage,
                 mu_owed_cum,
@@ -12424,6 +12457,14 @@ fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiE
         message: format!("model '{model}' is not available"),
         param: Some("model"),
     })
+}
+
+fn session_locked_rate_map(model: &GatewayModel) -> Vec<RateMapEntry> {
+    normalize_rate_map(model.mayhem.price_ref_mu.rate_map.clone())
+}
+
+fn calculate_locked_mu_owed(invocation: &GatewaySessionInvocation, usage: &ReceiptUsage) -> u64 {
+    text_usage_mu(&invocation.spend_voucher.body.locked_rate_map, usage)
 }
 
 fn calculate_mu_owed(price: &PriceRefMu, usage: &ReceiptUsage) -> u64 {
@@ -13529,7 +13570,7 @@ mod tests {
             output.usage.completion_tokens.saturating_add(1),
         );
         wrong_usage.body.mu_owed_cum =
-            calculate_mu_owed(&model.mayhem.price_ref_mu, &wrong_usage.body.usage);
+            calculate_locked_mu_owed(&invocation, &wrong_usage.body.usage);
         wrong_usage.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&wrong_usage.body).unwrap(),
@@ -13588,10 +13629,8 @@ mod tests {
             output.usage.prompt_tokens,
             output.usage.completion_tokens.saturating_add(1),
         );
-        inflated.provider_receipt.body.mu_owed_cum = calculate_mu_owed(
-            &model.mayhem.price_ref_mu,
-            &inflated.provider_receipt.body.usage,
-        );
+        inflated.provider_receipt.body.mu_owed_cum =
+            calculate_locked_mu_owed(&invocation, &inflated.provider_receipt.body.usage);
         inflated.provider_receipt.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&inflated.provider_receipt.body).unwrap(),
@@ -13686,7 +13725,7 @@ mod tests {
         let mut inflated_usage = provider_receipt.clone();
         inflated_usage.body.usage = ReceiptUsage::text(9, 0);
         inflated_usage.body.mu_owed_cum =
-            calculate_mu_owed(&model.mayhem.price_ref_mu, &inflated_usage.body.usage);
+            calculate_locked_mu_owed(&invocation, &inflated_usage.body.usage);
         inflated_usage.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&inflated_usage.body).unwrap(),
@@ -13751,6 +13790,7 @@ mod tests {
             rail: "fiat".to_owned(),
             enclave_id: enclave_id.clone(),
             price_ver: 7,
+            locked_rate_map: text_generation_rate_map(20, 60),
             max_spend_mu: 1000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 128,
@@ -14909,9 +14949,10 @@ mod tests {
             enclave_id: invocation.enclave_id.clone(),
             model_id: model.id.clone(),
             price_ver: invocation.price_ver,
+            locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
-            mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+            mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
             prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
             ts: 123,
         };
@@ -14942,9 +14983,10 @@ mod tests {
             enclave_id: invocation.enclave_id.clone(),
             model_id: model.id.clone(),
             price_ver: invocation.price_ver,
+            locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
-            mu_owed_cum: calculate_mu_owed(&model.mayhem.price_ref_mu, &usage),
+            mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
             prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
             ts: 123,
         };

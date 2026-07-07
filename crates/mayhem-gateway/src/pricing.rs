@@ -1,15 +1,9 @@
 use mayhem_proto::{ReceiptUsage, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN};
-use serde::{Deserialize, Serialize};
+
+pub use mayhem_proto::RateMapEntry;
 
 pub const INPUT_TOKEN_UNIT: &str = USAGE_INPUT_TOKEN;
 pub const OUTPUT_TOKEN_UNIT: &str = USAGE_OUTPUT_TOKEN;
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct RateMapEntry {
-    pub unit: String,
-    pub per_unit_mu: u64,
-    pub granularity: u64,
-}
 
 pub fn text_generation_rate_map(in_per_1k_mu: u64, out_per_1k_mu: u64) -> Vec<RateMapEntry> {
     vec![

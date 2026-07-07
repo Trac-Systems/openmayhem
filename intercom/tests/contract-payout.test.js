@@ -17,6 +17,10 @@ const rulesHash = '9'.repeat(64);
 const enclaveId = '7'.repeat(64);
 const modelId = 'mayhem/payout-rollup-test@q4';
 const retiredPayoutMessage = /unknown contract operation type|function not registered/i;
+const payoutLockedRateMap = [
+  { unit: 'input_token', per_unit_mu: 2_000_000, granularity: 350 },
+  { unit: 'output_token', per_unit_mu: 2_000_000, granularity: 350 },
+];
 
 async function setupPayoutContract() {
   const admin = await makeIdentity();
@@ -105,6 +109,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       enclave_id: enclaveId,
       model_id: modelId,
       price_ver: 1,
+      locked_rate_map: payoutLockedRateMap,
       rules_ver: 1,
       usage: { in: 100, out: 250 },
       mu_owed_cum: 2_000_000,

@@ -21345,6 +21345,8 @@ struct ActiveProviderSession {
     user_pubkey: String,
     session_id: String,
     rail: String,
+    price_ver: u64,
+    locked_rate_map: Vec<RateMapEntry>,
     checkpoint_every: CheckpointPolicy,
 }
 
@@ -25581,11 +25583,13 @@ async fn serve_provider_sessions(
     provider_log(
         ctx.args,
         &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {}",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
-            responder.mode()
+            responder.mode(),
+            terms.price_ver,
+            format_rate_map(&terms.rate_map)
         ),
     );
 
@@ -25986,6 +25990,13 @@ async fn handle_provider_session_frame(
             match decision {
                 ProviderSessionDecision::Accept => {
                     provider_session_debug(format!("sending s.accept for session {session_id}"));
+                    let spend_voucher: SpendVoucher = serde_json::from_value(
+                        frame
+                            .get("voucher")
+                            .cloned()
+                            .context("accepted s.open missing spend voucher")?,
+                    )
+                    .context("accepted s.open invalid spend voucher")?;
                     let checkpoint_every = provider_session_frame_checkpoint_policy(&frame)
                         .context("accepted s.open missing checkpoint policy")?;
                     sessions.insert(
@@ -25999,6 +26010,10 @@ async fn handle_provider_session_frame(
                                 .unwrap_or_default()
                                 .to_owned(),
                             session_id: session_id.clone(),
+                            price_ver: spend_voucher.body.price_ver,
+                            locked_rate_map: normalize_rate_map(
+                                spend_voucher.body.locked_rate_map.clone(),
+                            ),
                             checkpoint_every,
                         },
                     );
@@ -27188,10 +27203,11 @@ fn provider_session_receipt_for_usage(
         provider: terms.provider.clone(),
         enclave_id: terms.enclave_id.clone(),
         model_id: terms.model_id.clone(),
-        price_ver: terms.price_ver,
+        price_ver: active.price_ver,
+        locked_rate_map: active.locked_rate_map.clone(),
         rules_ver: terms.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: provider_session_mu_owed(terms, &usage),
+        mu_owed_cum: provider_session_mu_owed(active, &usage),
         prompt_hash: provider_session_prompt_hash(body),
         ts: unix_epoch_millis()?,
     };
@@ -27202,8 +27218,8 @@ fn provider_session_receipt_for_usage(
     })
 }
 
-fn provider_session_mu_owed(terms: &ProviderSessionTerms, usage: &ReceiptUsage) -> u64 {
-    text_usage_mu(&terms.rate_map, usage)
+fn provider_session_mu_owed(active: &ActiveProviderSession, usage: &ReceiptUsage) -> u64 {
+    text_usage_mu(&active.locked_rate_map, usage)
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
@@ -27989,18 +28005,12 @@ fn provider_session_contract_decision(
             "admin price schedule is no longer present for this enclave".to_owned(),
         );
     };
-    let Some(current_price) = current_mu_usd_price(schedule) else {
+    if current_mu_usd_price(schedule).is_none() {
         return reject(
             "PRICE_VER",
             "admin price schedule is no longer current mu_usd".to_owned(),
         );
     };
-    if current_price.ver != terms.price_ver {
-        return reject(
-            "PRICE_VER",
-            "current admin price version changed after provider startup".to_owned(),
-        );
-    }
 
     let startup_room_ids = terms.room_ids.iter().collect::<BTreeSet<_>>();
     let startup_rooms_by_id = startup_rooms
@@ -28131,10 +28141,8 @@ fn provider_session_spend_reservation_value(
         .get("voucher")
         .cloned()
         .context("s.open missing spend voucher")?;
-    let max_spend_mu = voucher
-        .get("max_spend_mu")
-        .and_then(Value::as_u64)
-        .context("spend voucher missing max_spend_mu")?;
+    let spend_voucher: SpendVoucher =
+        serde_json::from_value(voucher.clone()).context("invalid spend voucher")?;
     Ok(json!({
         "op": "spend_reserve",
         "contract_version": CONTRACT_VERSION,
@@ -28145,9 +28153,9 @@ fn provider_session_spend_reservation_value(
         "user": user,
         "provider": terms.provider,
         "enclave_id": terms.enclave_id,
-        "price_ver": terms.price_ver,
+        "price_ver": spend_voucher.body.price_ver,
         "rules_ver": terms.rules_ver,
-        "max_spend_mu": max_spend_mu,
+        "max_spend_mu": spend_voucher.body.max_spend_mu,
         "voucher": voucher,
         "provider_sig": "",
     }))
@@ -28242,12 +28250,9 @@ fn provider_session_open_decision(
             "session enclave_id is not this admin-created enclave".to_owned(),
         );
     }
-    if frame.get("price_ver").and_then(Value::as_u64) != Some(terms.price_ver) {
-        return reject(
-            "PRICE_VER",
-            "session price_ver does not match the current admin price".to_owned(),
-        );
-    }
+    let Some(frame_price_ver) = frame.get("price_ver").and_then(Value::as_u64) else {
+        return reject("PRICE_VER", "session price_ver is missing".to_owned());
+    };
     if frame.get("rules_ver").and_then(Value::as_u64) != Some(terms.rules_ver) {
         return reject(
             "CONSENT",
@@ -28280,8 +28285,17 @@ fn provider_session_open_decision(
     if voucher.body.enclave_id.as_str() != terms.enclave_id.as_str() {
         return reject("VOUCHER", "voucher enclave_id mismatch".to_owned());
     }
-    if voucher.body.price_ver != terms.price_ver {
+    if voucher.body.price_ver != frame_price_ver {
         return reject("VOUCHER", "voucher price_ver mismatch".to_owned());
+    }
+    if voucher.body.locked_rate_map.is_empty() {
+        return reject("VOUCHER", "voucher locked_rate_map is empty".to_owned());
+    }
+    if normalize_rate_map(voucher.body.locked_rate_map.clone()) != voucher.body.locked_rate_map {
+        return reject(
+            "VOUCHER",
+            "voucher locked_rate_map must be canonical".to_owned(),
+        );
     }
     if voucher.body.max_spend_mu == 0 {
         return reject(
@@ -31176,6 +31190,10 @@ mod tests {
                     "enclave_id": "33".repeat(32),
                     "model_id": "mayhem/test",
                     "price_ver": 1,
+                    "locked_rate_map": [
+                        { "unit": "input_token", "per_unit_mu": 50, "granularity": 1 },
+                        { "unit": "output_token", "per_unit_mu": 50, "granularity": 1 }
+                    ],
                     "rules_ver": 1,
                     "usage": { "input_token": 1, "output_token": 1 },
                     "mu_owed_cum": 100,
@@ -31239,6 +31257,9 @@ mod tests {
                     "enclave_id": "33".repeat(32),
                     "model_id": "mayhem/test",
                     "price_ver": 1,
+                    "locked_rate_map": [
+                        { "unit": "input_token", "per_unit_mu": 100, "granularity": 1 }
+                    ],
                     "rules_ver": 1,
                     "usage": { "input_token": 1 },
                     "mu_owed_cum": 100,
@@ -33652,7 +33673,7 @@ mod tests {
         assert!(matches!(
             provider_session_open_decision(&wrong_price, &terms),
             ProviderSessionDecision::Reject {
-                code: "PRICE_VER",
+                code: "VOUCHER",
                 ..
             }
         ));
@@ -33859,13 +33880,10 @@ mod tests {
 
         let mut stale_price = contract.clone();
         stale_price.prices[0].current.as_mut().unwrap().ver = terms.price_ver + 1;
-        assert!(matches!(
+        assert_eq!(
             provider_session_contract_decision(&stale_price, &terms, &startup_rooms, "fiat"),
-            ProviderSessionDecision::Reject {
-                code: "PRICE_VER",
-                ..
-            }
-        ));
+            ProviderSessionDecision::Accept
+        );
 
         let mut provider_priced = contract.clone();
         provider_priced.prices[0]
@@ -34037,6 +34055,8 @@ mod tests {
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
             rail: "fiat".to_owned(),
+            price_ver: terms.price_ver,
+            locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
@@ -34067,7 +34087,8 @@ mod tests {
         assert_eq!(receipt.body.provider, terms.provider);
         assert_eq!(receipt.body.enclave_id, terms.enclave_id);
         assert_eq!(receipt.body.model_id, terms.model_id);
-        assert_eq!(receipt.body.price_ver, terms.price_ver);
+        assert_eq!(receipt.body.price_ver, active.price_ver);
+        assert_eq!(receipt.body.locked_rate_map, active.locked_rate_map);
         assert_eq!(receipt.body.rules_ver, terms.rules_ver);
         assert_eq!(receipt.body.usage.input_tokens(), 3);
         assert_eq!(receipt.body.usage.output_tokens(), 4);
@@ -34096,6 +34117,8 @@ mod tests {
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
             rail: "fiat".to_owned(),
+            price_ver: terms.price_ver,
+            locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
         };
         let body = json!({
@@ -34120,7 +34143,7 @@ mod tests {
         assert_eq!(receipt.body.usage, usage);
         assert_eq!(
             receipt.body.mu_owed_cum,
-            provider_session_mu_owed(&terms, &usage)
+            provider_session_mu_owed(&active, &usage)
         );
 
         let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
@@ -34147,6 +34170,8 @@ mod tests {
             user_pubkey: "66".repeat(32),
             session_id: "aa".repeat(32),
             rail: "fiat".to_owned(),
+            price_ver: 1,
+            locked_rate_map: text_generation_rate_map(1, 2),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
         };
         assert_eq!(
@@ -34175,6 +34200,8 @@ mod tests {
             user_pubkey: hex_encode(&user_key.verifying_key().to_bytes()),
             session_id: "aa".repeat(32),
             rail: "fiat".to_owned(),
+            price_ver: terms.price_ver,
+            locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
         };
         let body = json!({
@@ -35312,6 +35339,8 @@ mod tests {
                     rail: "fiat".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    price_ver: 1,
+                    locked_rate_map: text_generation_rate_map(1, 2),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -35339,6 +35368,8 @@ mod tests {
                     rail: "fiat".to_owned(),
                     user_pubkey: "aa".repeat(32),
                     session_id: id.to_owned(),
+                    price_ver: 1,
+                    locked_rate_map: text_generation_rate_map(1, 2),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -38863,6 +38894,7 @@ mod tests {
             rail: "fiat".to_owned(),
             enclave_id: terms.enclave_id.clone(),
             price_ver: terms.price_ver,
+            locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
             max_spend_mu: 1000,
             checkpoint_every: mayhem_proto::CheckpointPolicy {
                 tokens: 8192,
@@ -38889,6 +38921,7 @@ mod tests {
                 "rail": voucher_body.rail,
                 "enclave_id": voucher_body.enclave_id,
                 "price_ver": voucher_body.price_ver,
+                "locked_rate_map": voucher_body.locked_rate_map,
                 "max_spend_mu": voucher_body.max_spend_mu,
                 "checkpoint_every": {
                     "tokens": voucher_body.checkpoint_every.tokens,

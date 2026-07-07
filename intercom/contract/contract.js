@@ -44,8 +44,8 @@ const DISPUTE_DEPOSIT_MU = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 2;
-export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 3;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 3;
+export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 4;
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
@@ -988,13 +988,15 @@ class MayhemContract extends Contract {
     }
     const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id);
     if (priceError) return priceError;
-    const schedule = await this.get(`price/${normalized.enclave_id}`);
-    const price = this.priceActiveEntry(schedule, normalized.at);
-    if (!price || price.ver !== normalized.price_ver) {
-      return new Error('Spend reservation price version is not current.');
+    const lockedPrice = await this.get(`price/${normalized.enclave_id}/v/${normalized.price_ver}`);
+    if (!lockedPrice || lockedPrice.denom !== PRICE_DENOMINATION) {
+      return new Error('Spend reservation locked price version is not known.');
     }
-    if (price.set_by_role !== 'admin') {
-      return new Error('Spend reservation price is not admin-set.');
+    if (lockedPrice.set_by_role !== 'admin') {
+      return new Error('Spend reservation locked price is not admin-set.');
+    }
+    if (stableJson(normalized.locked_rate_map) !== stableJson(lockedPrice.rate_map)) {
+      return new Error('Spend reservation locked rate_map does not match price version.');
     }
     const rules = await this.currentRules();
     if (!rules || rules.ver !== normalized.rules_ver) {
@@ -1020,6 +1022,7 @@ class MayhemContract extends Contract {
         existing.provider !== normalized.provider ||
         existing.enclave_id !== normalized.enclave_id ||
         existing.price_ver !== normalized.price_ver ||
+        stableJson(existing.locked_rate_map) !== stableJson(normalized.locked_rate_map) ||
         existing.max_spend_mu !== normalized.max_spend_mu ||
         existing.voucher_hash !== normalized.voucher_hash
       ) {
@@ -1053,6 +1056,7 @@ class MayhemContract extends Contract {
       provider: normalized.provider,
       enclave_id: normalized.enclave_id,
       price_ver: normalized.price_ver,
+      locked_rate_map: normalized.locked_rate_map,
       rules_ver: normalized.rules_ver,
       max_spend_mu: normalized.max_spend_mu,
       voucher_hash: normalized.voucher_hash,
@@ -5043,6 +5047,37 @@ class MayhemContract extends Contract {
       .sort((left, right) => compareCodepoint(left.unit, right.unit));
   }
 
+  normalizeLockedRateMap(rateMap, label) {
+    if (!Array.isArray(rateMap) || rateMap.length === 0 || rateMap.length > RATE_MAP_MAX_ENTRIES) {
+      return new Error(`${label} must be a non-empty array with at most ${RATE_MAP_MAX_ENTRIES} entries.`);
+    }
+    const seen = new Set();
+    const normalized = [];
+    for (const entry of rateMap) {
+      const shapeError = this.validateExactObjectKeys(entry, ['unit', 'per_unit_mu', 'granularity'], `${label} entry`);
+      if (shapeError) return shapeError;
+      if (typeof entry.unit !== 'string' || entry.unit.length === 0 || entry.unit.length > 64) {
+        return new Error(`${label} unit must be a non-empty string.`);
+      }
+      const unit = this.canonicalUsageUnit(entry.unit);
+      if (!this.isSafeKeyPart(unit)) return new Error(`${label} unit is invalid.`);
+      if (seen.has(unit)) return new Error(`${label} has duplicate unit ${unit}.`);
+      seen.add(unit);
+      if (!Number.isSafeInteger(entry.per_unit_mu) || entry.per_unit_mu <= 0) {
+        return new Error(`${label} per_unit_mu must be a positive integer.`);
+      }
+      if (!Number.isSafeInteger(entry.granularity) || entry.granularity <= 0) {
+        return new Error(`${label} granularity must be a positive integer.`);
+      }
+      normalized.push({
+        unit,
+        per_unit_mu: entry.per_unit_mu,
+        granularity: entry.granularity,
+      });
+    }
+    return normalized.sort((left, right) => compareCodepoint(left.unit, right.unit));
+  }
+
   rateMapByUnit(rateMap) {
     const byUnit = new Map();
     for (const entry of rateMap ?? []) byUnit.set(entry.unit, entry);
@@ -5168,6 +5203,7 @@ class MayhemContract extends Contract {
         'rail',
         'enclave_id',
         'price_ver',
+        'locked_rate_map',
         'max_spend_mu',
         'checkpoint_every',
         'user_sig',
@@ -5188,6 +5224,8 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(voucher.price_ver) || voucher.price_ver < 1) {
       return new Error('Invalid spend voucher price version.');
     }
+    const lockedRateMap = this.normalizeLockedRateMap(voucher.locked_rate_map, 'spend voucher locked_rate_map');
+    if (lockedRateMap instanceof Error) return lockedRateMap;
     if (!Number.isSafeInteger(voucher.max_spend_mu) || voucher.max_spend_mu < 1) {
       return new Error('Invalid spend voucher max spend.');
     }
@@ -5203,6 +5241,7 @@ class MayhemContract extends Contract {
       rail,
       enclave_id: voucher.enclave_id.toLowerCase(),
       price_ver: voucher.price_ver,
+      locked_rate_map: lockedRateMap,
       max_spend_mu: voucher.max_spend_mu,
       checkpoint_every: {
         tokens: voucher.checkpoint_every.tokens,
@@ -5286,6 +5325,7 @@ class MayhemContract extends Contract {
       provider: value.provider.toLowerCase(),
       enclave_id: value.enclave_id.toLowerCase(),
       price_ver: value.price_ver,
+      locked_rate_map: voucher.body.locked_rate_map,
       rules_ver: value.rules_ver,
       max_spend_mu: value.max_spend_mu,
       voucher: {
@@ -5293,6 +5333,7 @@ class MayhemContract extends Contract {
         rail: voucher.body.rail,
         enclave_id: voucher.body.enclave_id,
         price_ver: voucher.body.price_ver,
+        locked_rate_map: voucher.body.locked_rate_map,
         max_spend_mu: voucher.body.max_spend_mu,
         checkpoint_every: voucher.body.checkpoint_every,
         user_sig: voucher.user_sig,
@@ -5335,6 +5376,14 @@ class MayhemContract extends Contract {
       if (!this.isHexBytes(session.enclave_id, 32)) return new Error('Invalid spend hold enclave.');
       if (!Number.isSafeInteger(session.price_ver) || session.price_ver < 1) {
         return new Error('Invalid spend hold price version.');
+      }
+      const lockedRateMap = this.normalizeLockedRateMap(
+        session.locked_rate_map,
+        'spend hold locked_rate_map'
+      );
+      if (lockedRateMap instanceof Error) return lockedRateMap;
+      if (stableJson(lockedRateMap) !== stableJson(session.locked_rate_map)) {
+        return new Error('Spend hold locked_rate_map must be canonical.');
       }
       if (!Number.isSafeInteger(session.max_spend_mu) || session.max_spend_mu < 1) {
         return new Error('Invalid spend hold max spend.');
@@ -6361,6 +6410,7 @@ class MayhemContract extends Contract {
       enclave_id: bodySource.enclave_id,
       model_id: bodySource.model_id,
       price_ver: bodySource.price_ver,
+      locked_rate_map: cloneValue(bodySource.locked_rate_map),
       rules_ver: bodySource.rules_ver,
       usage: cloneValue(bodySource.usage),
       mu_owed_cum: bodySource.mu_owed_cum,
@@ -6414,6 +6464,8 @@ class MayhemContract extends Contract {
         migrated.schema_version = 2;
       } else if (migrated.schema_version === 2) {
         migrated.schema_version = 3;
+      } else if (migrated.schema_version === 3) {
+        migrated.schema_version = 4;
       } else {
         return new Error(
           `Unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}.`
@@ -6442,6 +6494,11 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(body.price_ver) || body.price_ver < 1) {
       return new Error('Invalid receipt price version.');
     }
+    const lockedRateMap = this.normalizeLockedRateMap(body.locked_rate_map, 'receipt locked_rate_map');
+    if (lockedRateMap instanceof Error) return lockedRateMap;
+    if (stableJson(lockedRateMap) !== stableJson(body.locked_rate_map)) {
+      return new Error('Receipt locked_rate_map must be canonical.');
+    }
     if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
       return new Error('Invalid receipt rules version.');
     }
@@ -6452,6 +6509,11 @@ class MayhemContract extends Contract {
     }
     if (!Number.isSafeInteger(body.mu_owed_cum) || body.mu_owed_cum < 0) {
       return new Error('Invalid receipt cumulative amount.');
+    }
+    const lockedMu = this.usageMuForRateMap(body.locked_rate_map, body.usage);
+    if (lockedMu instanceof Error) return lockedMu;
+    if (body.mu_owed_cum !== lockedMu) {
+      return new Error('Receipt cumulative amount does not match locked rate_map.');
     }
     if (!Number.isSafeInteger(body.ts) || body.ts < 0) return new Error('Invalid receipt timestamp.');
     return null;
@@ -6736,6 +6798,44 @@ class MayhemContract extends Contract {
       sum = next;
     }
     return sum;
+  }
+
+  usageMuForRateMap(rateMap, usage) {
+    const rates = this.rateMapByUnit(rateMap);
+    const priced = [];
+    for (const [unit, count] of Object.entries(usage ?? {})) {
+      if (!Number.isSafeInteger(count) || count < 0) return new Error('Invalid receipt usage count.');
+      if (count === 0) continue;
+      const rate = rates.get(unit);
+      if (!rate) return new Error(`Receipt locked_rate_map missing usage unit ${unit}.`);
+      if (!Number.isSafeInteger(rate.per_unit_mu) || rate.per_unit_mu <= 0) {
+        return new Error('Invalid locked rate per_unit_mu.');
+      }
+      if (!Number.isSafeInteger(rate.granularity) || rate.granularity <= 0) {
+        return new Error('Invalid locked rate granularity.');
+      }
+      priced.push({
+        count: BigInt(count),
+        perUnitMu: BigInt(rate.per_unit_mu),
+        granularity: BigInt(rate.granularity),
+      });
+    }
+    if (priced.length === 0) return 0;
+    const sameGranularity = priced.every((entry) => entry.granularity === priced[0].granularity);
+    if (sameGranularity) {
+      const raw = priced.reduce((sum, entry) => sum + entry.count * entry.perUnitMu, 0n);
+      return this.safeNarrowMu(this.ceilDivBigInt(raw, priced[0].granularity));
+    }
+    let total = 0n;
+    for (const entry of priced) {
+      total += this.ceilDivBigInt(entry.count * entry.perUnitMu, entry.granularity);
+    }
+    return this.safeNarrowMu(total);
+  }
+
+  ceilDivBigInt(value, divisor) {
+    if (value <= 0n) return 0n;
+    return (value + divisor - 1n) / divisor;
   }
 
   railTotals(entries, amountKey) {

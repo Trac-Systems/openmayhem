@@ -22,6 +22,16 @@ import {
 const rulesHash = '6'.repeat(64);
 const enclaveId = 'e'.repeat(64);
 const modelId = 'meta/llama-3.1-8b-instruct@4bit';
+
+const textLockedRateMapFor = (mu) => [
+  { unit: 'input_token', per_unit_mu: mu, granularity: 350 },
+  { unit: 'output_token', per_unit_mu: mu, granularity: 350 },
+];
+
+const imageLockedRateMap = [
+  { unit: 'image', per_unit_mu: 500, granularity: 1 },
+  { unit: 'step', per_unit_mu: 2, granularity: 1 },
+];
 const scriptPath = fileURLToPath(new URL('../scripts/recompute-epoch-roots.mjs', import.meta.url));
 
 const seededBalance = (user, mu, rail = 'fiat') => ({
@@ -93,6 +103,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       enclave_id: enclaveId,
       model_id: modelId,
       price_ver: 1,
+      locked_rate_map: textLockedRateMapFor(2_000),
       rules_ver: 1,
       usage: { in: 100, out: 250 },
       mu_owed_cum: 2_000,
@@ -114,6 +125,7 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
       {
         ...legacyText.receipts[0],
         schema_version: 2,
+        locked_rate_map: textLockedRateMapFor(2_000),
         usage: { input_token: 100, output_token: 250 },
       },
     ],
@@ -127,6 +139,7 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
         ...legacyText.receipts[0],
         schema_version: 2,
         model_id: 'admin/image-small@fp16',
+        locked_rate_map: imageLockedRateMap,
         usage: { images: 2, steps: 60 },
         mu_owed_cum: 1_120,
       },
@@ -138,6 +151,7 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
         ...legacyText.receipts[0],
         schema_version: 2,
         model_id: 'admin/image-small@fp16',
+        locked_rate_map: imageLockedRateMap,
         usage: { image: 2, step: 60 },
         mu_owed_cum: 1_120,
       },
@@ -163,6 +177,7 @@ const signedReceipt = (user, provider, enclave, overrides = {}) => {
     enclave_id: enclaveId,
     model_id: modelId,
     price_ver: 1,
+    locked_rate_map: textLockedRateMapFor(1_000),
     rules_ver: 1,
     usage: { in: 100, out: 250 },
     mu_owed_cum: 1_000,

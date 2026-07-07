@@ -21,6 +21,10 @@ import {
 } from './helpers/contract.js';
 
 const rulesHash = '6'.repeat(64);
+const versioningLockedRateMap = [
+  { unit: 'input_token', per_unit_mu: 100, granularity: 30 },
+  { unit: 'output_token', per_unit_mu: 100, granularity: 30 },
+];
 
 test('contract reports the exported contract version', async () => {
   const user = await makeIdentity();
@@ -126,6 +130,7 @@ test('receipt verifier accepts v1 and v2 receipt signing payloads', async () => 
     enclave_id: 'enclave-versioning',
     model_id: 'model/versioning',
     price_ver: 1,
+    locked_rate_map: versioningLockedRateMap,
     rules_ver: 1,
     usage: { in: 10, out: 20 },
     mu_owed_cum: 100,
@@ -163,6 +168,7 @@ test('receipt schema migration normalizes legacy usage maps', async () => {
     enclave_id: 'enclave-schema-migration',
     model_id: 'model/schema-migration',
     price_ver: 1,
+    locked_rate_map: versioningLockedRateMap,
     rules_ver: 1,
     usage: { in: 10, out_tokens: 20 },
     mu_owed_cum: 100,

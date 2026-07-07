@@ -1988,9 +1988,10 @@ fn signed_image_provider_receipt(
         enclave_id: invocation.enclave_id.clone(),
         model_id: model.id.clone(),
         price_ver: invocation.price_ver,
+        locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: text_usage_mu(&model.mayhem.price_ref_mu.rate_map, usage),
+        mu_owed_cum: text_usage_mu(&invocation.spend_voucher.body.locked_rate_map, usage),
         prompt_hash: image_prompt_hash_for_test(request),
         ts: 1_782_950_400_000,
     };
@@ -2054,9 +2055,10 @@ fn signed_provider_receipt_for_test(
         enclave_id: invocation.enclave_id.clone(),
         model_id: model.id.clone(),
         price_ver: invocation.price_ver,
+        locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: text_usage_mu(&model.mayhem.price_ref_mu.rate_map, usage),
+        mu_owed_cum: text_usage_mu(&invocation.spend_voucher.body.locked_rate_map, usage),
         prompt_hash,
         ts: 1_782_950_400_000,
     };

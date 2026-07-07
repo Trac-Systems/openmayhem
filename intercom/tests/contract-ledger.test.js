@@ -19,6 +19,10 @@ import {
 } from './helpers/contract.js';
 
 const rulesHash = '7'.repeat(64);
+const TEXT_LOCKED_RATE_MAP = Object.freeze([
+  { unit: 'input_token', per_unit_mu: 20, granularity: 1_000 },
+  { unit: 'output_token', per_unit_mu: 60, granularity: 1_000 },
+]);
 
 const providerRegistration = {
   op: 'register_provider',
@@ -157,12 +161,24 @@ async function seedReservationServing(ctx, provider = ctx.provider) {
   return { enclaveId, modelId };
 }
 
-function signedSpendReservation(ctx, { provider = ctx.provider, enclaveId, sessionId, maxSpendMu, epoch = 1 } = {}) {
+function signedSpendReservation(
+  ctx,
+  {
+    provider = ctx.provider,
+    enclaveId,
+    sessionId,
+    maxSpendMu,
+    epoch = 1,
+    priceVer = 1,
+    lockedRateMap = TEXT_LOCKED_RATE_MAP,
+  } = {}
+) {
   const voucherBody = {
     session_id: sessionId,
     rail: 'fiat',
     enclave_id: enclaveId,
-    price_ver: 1,
+    price_ver: priceVer,
+    locked_rate_map: lockedRateMap,
     max_spend_mu: maxSpendMu,
     checkpoint_every: { tokens: 8192, ms: 30_000 },
   };
@@ -176,7 +192,7 @@ function signedSpendReservation(ctx, { provider = ctx.provider, enclaveId, sessi
     user: ctx.user.publicKey,
     provider: provider.publicKey,
     enclave_id: enclaveId,
-    price_ver: 1,
+    price_ver: priceVer,
     rules_ver: 1,
     max_spend_mu: maxSpendMu,
     voucher: {
@@ -476,6 +492,66 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
   );
   assert.match(secondResult.message, /Insufficient unreserved credit balance/);
   assert.equal((await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value.reserved_mu, 700_000);
+});
+
+test('MayhemContract spend reservation keeps the locked quote after market price advances', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId, modelId } = await seedReservationServing(ctx, ctx.provider);
+
+  const lockedAtV1 = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'f3'.repeat(32),
+    maxSpendMu: 100_000,
+    priceVer: 1,
+    lockedRateMap: TEXT_LOCKED_RATE_MAP,
+  });
+
+  const v2RateMap = [
+    { unit: 'input_token', per_unit_mu: 40, granularity: 1_000 },
+    { unit: 'output_token', per_unit_mu: 120, granularity: 1_000 },
+  ];
+  await seedCurrentAdminPrice(ctx.storage, {
+    enclaveId,
+    modelId,
+    admin: ctx.admin.publicKey,
+    txNo: 20,
+    ver: 2,
+    inPer1kMu: 40,
+    outPer1kMu: 120,
+    minSessionMu: 100,
+    effectiveAt: 3_600,
+  });
+  assert.equal((await ctx.storage.get(`price/${enclaveId}`)).value.current.ver, 2);
+
+  const result = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    lockedAtV1,
+    ctx.provider.publicKey
+  );
+  assert.equal(result.ok, true, result.message);
+
+  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
+  assert.equal(hold.sessions.length, 1);
+  assert.equal(hold.sessions[0].price_ver, 1);
+  assert.deepEqual(hold.sessions[0].locked_rate_map, TEXT_LOCKED_RATE_MAP);
+
+  const forgedV1Quote = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'f4'.repeat(32),
+    maxSpendMu: 100_000,
+    priceVer: 1,
+    lockedRateMap: v2RateMap,
+  });
+  const rejected = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    forgedV1Quote,
+    ctx.provider.publicKey
+  );
+  assert.match(rejected.message, /locked rate_map/i);
 });
 
 test('MayhemContract spend reservation moves to next epoch after epochApply', async () => {

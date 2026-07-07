@@ -8,8 +8,8 @@ pub const CRATE_NAME: &str = "mayhem-proto";
 pub const CONTRACT_VERSION: u32 = 2;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 2;
-pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 3;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 3;
+pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 4;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
@@ -158,12 +158,20 @@ pub struct CheckpointPolicy {
     pub ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct RateMapEntry {
+    pub unit: String,
+    pub per_unit_mu: u64,
+    pub granularity: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpendVoucherBody {
     pub session_id: String,
     pub rail: String,
     pub enclave_id: String,
     pub price_ver: u64,
+    pub locked_rate_map: Vec<RateMapEntry>,
     pub max_spend_mu: u64,
     pub checkpoint_every: CheckpointPolicy,
 }
@@ -303,6 +311,7 @@ pub struct ReceiptBody {
     pub enclave_id: String,
     pub model_id: String,
     pub price_ver: u64,
+    pub locked_rate_map: Vec<RateMapEntry>,
     pub rules_ver: u64,
     pub usage: ReceiptUsage,
     pub mu_owed_cum: u64,
@@ -360,6 +369,7 @@ pub fn migrate_receipt_body_to_schema(
                 migrated.schema_version = 2;
             }
             2 => migrated.schema_version = 3,
+            3 => migrated.schema_version = 4,
             from => {
                 return Err(ReceiptSchemaMigrationError::Unsupported {
                     from,
@@ -1041,6 +1051,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn locked_rate_map() -> Vec<RateMapEntry> {
+        vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_mu: 20,
+                granularity: 1_000,
+            },
+            RateMapEntry {
+                unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                per_unit_mu: 60,
+                granularity: 1_000,
+            },
+        ]
+    }
+
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-proto");
@@ -1113,6 +1138,7 @@ mod tests {
             rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
+            locked_rate_map: locked_rate_map(),
             max_spend_mu: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
@@ -1137,6 +1163,7 @@ mod tests {
             enclave_id: "enclave".to_owned(),
             model_id: "model".to_owned(),
             price_ver: 1,
+            locked_rate_map: locked_rate_map(),
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
@@ -1180,6 +1207,7 @@ mod tests {
             enclave_id: "enclave".to_owned(),
             model_id: "model".to_owned(),
             price_ver: 1,
+            locked_rate_map: locked_rate_map(),
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
@@ -1222,6 +1250,7 @@ mod tests {
             rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
+            locked_rate_map: locked_rate_map(),
             max_spend_mu: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
@@ -1253,6 +1282,7 @@ mod tests {
             enclave_id: "enclave".to_owned(),
             model_id: "model".to_owned(),
             price_ver: 1,
+            locked_rate_map: locked_rate_map(),
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
             mu_owed_cum: 1,
