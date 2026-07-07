@@ -26,7 +26,7 @@ use crate::{
     pricing::{normalize_rate_map, text_generation_rate_map, text_usage_mu, RateMapEntry},
     provider_table::{
         ContractProviderSnapshot, LcgBalancerRng, ProviderObservationSample, ProviderTable,
-        RequestRequirements, SelectionWeights,
+        ProviderTableEntry, RequestRequirements, SelectionWeights,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
     HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
@@ -91,7 +91,7 @@ const DASHBOARD_CSS: &str = r#"
 *{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px;text-decoration:none}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
 "#;
 const DASHBOARD_USER_CSS: &str = r#"
-.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted)}.segment.active{border-color:var(--accent-primary);color:var(--accent-primary)}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
+.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider,.wide-grid.network{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.wide-grid.network .card{overflow:hidden}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment,.badge{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted);white-space:nowrap}.segment.active,.badge.good{border-color:var(--accent-primary);color:var(--accent-primary)}.badge.live{border-color:var(--accent-secondary);color:var(--accent-secondary)}.badge-row{display:flex;gap:8px;flex-wrap:wrap}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider,.wide-grid.network{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
 "#;
 
 #[derive(Clone, Debug)]
@@ -1078,6 +1078,17 @@ impl GatewayState {
         self
     }
 
+    pub fn with_provider_heartbeats(self, heartbeats: Vec<ProviderHeartbeat>) -> Self {
+        let now = now_millis_u64();
+        {
+            let mut table = self.provider_table.lock().expect("provider table poisoned");
+            for heartbeat in heartbeats {
+                table.upsert_heartbeat(heartbeat, now);
+            }
+        }
+        self
+    }
+
     pub fn with_failover_policy(mut self, policy: GatewayFailoverPolicyConfig) -> Self {
         self.failover_policy = policy.sanitized();
         self
@@ -1238,6 +1249,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/probes", get(mayhem_probes))
         .route("/mayhem/balance", get(mayhem_balance))
         .route("/mayhem/dashboard", get(mayhem_dashboard))
+        .route("/mayhem/dashboard/network", get(mayhem_dashboard_network))
         .route("/mayhem/dashboard/provider", get(mayhem_dashboard_provider))
         .route("/mayhem/dashboard/session", get(mayhem_dashboard_session))
         .route(
@@ -1430,6 +1442,30 @@ async fn mayhem_dashboard_provider(
     )
 }
 
+async fn mayhem_dashboard_network(
+    State(state): State<SharedState>,
+    Query(query): Query<DashboardQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !dashboard_request_authorized(&state, &headers, query.token.as_deref()) {
+        return dashboard_html_response(
+            StatusCode::UNAUTHORIZED,
+            dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
+            None,
+        );
+    }
+    let origin = dashboard_origin_from_headers(&headers);
+    dashboard_html_response(
+        StatusCode::OK,
+        dashboard_network_html(
+            &state,
+            state.dashboard_session.expires_in().as_secs(),
+            &origin,
+        ),
+        Some(&state.dashboard_session.token),
+    )
+}
+
 async fn mayhem_dashboard_session(
     State(state): State<SharedState>,
     Query(query): Query<DashboardQuery>,
@@ -1452,6 +1488,7 @@ async fn mayhem_dashboard_session(
             "expires_in_seconds": state.dashboard_session.expires_in().as_secs(),
             "paths": {
                 "dashboard": "/mayhem/dashboard",
+                "network_dashboard": "/mayhem/dashboard/network",
                 "provider_dashboard": "/mayhem/dashboard/provider",
                 "status": "/mayhem/status",
                 "models": "/v1/models",
@@ -1655,7 +1692,7 @@ fn dashboard_user_html(state: &GatewayState, expires_in_seconds: u64, origin: &s
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section><section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">API key</span><div class="copy-row"><span class="mono">mayhem-...</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
 OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
@@ -1728,7 +1765,7 @@ fn dashboard_provider_html(
     dashboard_html_document(
         "Provider Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section><p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section><section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section><p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section><section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             earned = format_mu_usd(earned_mu),
             earned_source = if earning_totals.loaded {
                 "ledger earn/* rows"
@@ -1773,6 +1810,360 @@ fn dashboard_provider_html(
                 .count(),
         ),
     )
+}
+
+fn dashboard_network_html(state: &GatewayState, expires_in_seconds: u64, origin: &str) -> String {
+    let entries = {
+        let table = state
+            .provider_table
+            .lock()
+            .expect("provider table poisoned");
+        table.entries(now_millis_u64())
+    };
+    let provider_count = state
+        .models
+        .iter()
+        .flat_map(|model| model.mayhem.route_candidates.iter())
+        .map(|candidate| candidate.provider.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let route_count = state
+        .models
+        .iter()
+        .map(|model| model.mayhem.route_candidates.len())
+        .sum::<usize>();
+    let live_count = entries
+        .iter()
+        .filter(|entry| dashboard_entry_has_live_heartbeat(entry))
+        .count();
+    let unavailable_models = state
+        .models
+        .iter()
+        .filter(|model| !dashboard_model_has_live_provider(model, &entries))
+        .count();
+    let gateway_root = origin.trim_end_matches('/');
+    let model_rows = dashboard_network_model_rows(&state.models, &entries);
+    let provider_rows = dashboard_network_provider_rows(&state.models, &entries);
+    dashboard_html_document(
+        "Network Explorer",
+        &format!(
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/network</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Network explorer</p></section><section class="overview-grid provider"><article class="card metric-card"><span class="label">Catalog models</span><p class="value mono">{model_count}</p><p class="privacy-note">from gateway catalog state</p></article><article class="card metric-card"><span class="label">Canonical providers</span><p class="value mono">{provider_count}</p><p class="privacy-note">from route candidates</p></article><article class="card metric-card"><span class="label">Live heartbeats</span><p class="value mono">{live_count}</p><p class="privacy-note">signed provider reports</p></article><article class="card metric-card"><span class="label">Unavailable models</span><p class="value mono">{unavailable_models}</p><p class="privacy-note">no live provider heartbeat</p></article></section><section class="wide-grid network"><article class="card"><div class="card-header"><h2>Models</h2><span class="count-chip">{model_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Availability</th><th>Abilities</th><th>Terms</th><th>Constraints</th></tr></thead><tbody>{model_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Providers</h2><span class="count-chip">{route_count}</span></div><table class="table"><thead><tr><th>Provider</th><th>Route</th><th>Backend</th><th>Rails / price</th><th>Status</th></tr></thead><tbody>{provider_rows}</tbody></table></article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Explorer data is local gateway state from catalog, contract route candidates, and provider heartbeats.</span><span class="mono">127.0.0.1</span></footer>"#,
+            model_count = state.models.len(),
+        ),
+    )
+}
+
+fn dashboard_network_model_rows(models: &[GatewayModel], entries: &[ProviderTableEntry]) -> String {
+    if models.is_empty() {
+        return r#"<tr><td colspan="5"><span class="privacy-note">No catalog models loaded</span></td></tr>"#
+            .to_owned();
+    }
+    models
+        .iter()
+        .map(|model| {
+            let route_count = model.mayhem.route_candidates.len();
+            let room_count = model
+                .mayhem
+                .route_candidates
+                .iter()
+                .map(|candidate| candidate.room_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let live_count = model
+                .mayhem
+                .route_candidates
+                .iter()
+                .filter(|candidate| {
+                    dashboard_entry_for_route(entries, candidate)
+                        .is_some_and(dashboard_entry_has_live_heartbeat)
+                })
+                .count();
+            let availability = if live_count > 0 {
+                format!(r#"<span class="status-dot">Online</span><p class="privacy-note">{live_count}/{route_count} providers live</p>"#)
+            } else if route_count > 0 {
+                format!(r#"<span class="status-dot muted">Unavailable</span><p class="privacy-note">{route_count} joined; heartbeat pending</p>"#)
+            } else {
+                r#"<span class="status-dot muted">Unavailable</span><p class="privacy-note">no canonical provider route</p>"#
+                    .to_owned()
+            };
+            let constraints = dashboard_model_constraints(model, route_count, room_count);
+            format!(
+                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td>{availability}</td><td>{}</td><td><span class="mono">{}</span><p class="privacy-note">price v{}</p></td><td>{constraints}</td></tr>"#,
+                html_escape(short_text(&model.id, 34).as_ref()),
+                html_escape(&model.mayhem.source),
+                dashboard_badges(&dashboard_model_abilities(model), "badge"),
+                html_escape(&dashboard_model_price(model)),
+                model.mayhem.price_ref_mu.ver,
+            )
+        })
+        .collect::<String>()
+}
+
+fn dashboard_network_provider_rows(
+    models: &[GatewayModel],
+    entries: &[ProviderTableEntry],
+) -> String {
+    let mut rows = String::new();
+    for model in models {
+        for candidate in &model.mayhem.route_candidates {
+            let entry = dashboard_entry_for_route(entries, candidate);
+            let backend = dashboard_route_engine(model, candidate);
+            let rails = dashboard_route_rails(candidate);
+            let quality = dashboard_route_quality(entry);
+            let status = dashboard_route_status(model, candidate, entry);
+            rows.push_str(&format!(
+                r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">room {}</p></td><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">{} · price v{}</p></td><td>{}<p class="privacy-note">{}</p></td></tr>"#,
+                html_escape(short_text(&candidate.provider, 18).as_ref()),
+                html_escape(short_text(&candidate.enclave_id, 18).as_ref()),
+                html_escape(short_text(&model.id, 28).as_ref()),
+                html_escape(short_text(&candidate.room_id, 14).as_ref()),
+                html_escape(&backend),
+                dashboard_badges(&dashboard_route_abilities(model, candidate, entry), "badge"),
+                html_escape(&rails),
+                html_escape(&dashboard_model_price(model)),
+                candidate.price_ver,
+                status,
+                html_escape(&quality),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        r#"<tr><td colspan="5"><span class="privacy-note">No canonical provider routes loaded</span></td></tr>"#
+            .to_owned()
+    } else {
+        rows
+    }
+}
+
+fn dashboard_entry_for_route<'a>(
+    entries: &'a [ProviderTableEntry],
+    candidate: &GatewayRouteCandidate,
+) -> Option<&'a ProviderTableEntry> {
+    entries.iter().find(|entry| {
+        entry.key.provider == candidate.provider
+            && entry.key.enclave_id == candidate.enclave_id
+            && entry.key.room_id == candidate.room_id
+    })
+}
+
+fn dashboard_entry_has_live_heartbeat(entry: &ProviderTableEntry) -> bool {
+    entry
+        .heartbeat
+        .as_ref()
+        .is_some_and(|heartbeat| !heartbeat.sig.trim().is_empty())
+}
+
+fn dashboard_model_has_live_provider(model: &GatewayModel, entries: &[ProviderTableEntry]) -> bool {
+    model.mayhem.route_candidates.iter().any(|candidate| {
+        dashboard_entry_for_route(entries, candidate)
+            .is_some_and(dashboard_entry_has_live_heartbeat)
+    })
+}
+
+fn dashboard_model_abilities(model: &GatewayModel) -> Vec<String> {
+    let mut abilities = BTreeSet::new();
+    for modality in model
+        .mayhem
+        .caps
+        .output_modalities
+        .iter()
+        .chain(model.mayhem.caps.output_modality.iter())
+        .chain(model.mayhem.adapter.modality_set.iter())
+    {
+        if !modality.trim().is_empty() {
+            abilities.insert(modality.trim().to_owned());
+        }
+    }
+    if model.mayhem.model_class == DEFAULT_MODEL_CLASS {
+        abilities.insert("text".to_owned());
+    }
+    if model.mayhem.caps.tools {
+        abilities.insert("tools".to_owned());
+    }
+    if model.mayhem.caps.json {
+        abilities.insert("json".to_owned());
+    }
+    if model.mayhem.caps.vision {
+        abilities.insert("vision".to_owned());
+    }
+    if model.mayhem.caps.image {
+        abilities.insert("image".to_owned());
+    }
+    if model.mayhem.caps.video {
+        abilities.insert("video".to_owned());
+    }
+    if model.mayhem.caps.audio {
+        abilities.insert("audio".to_owned());
+    }
+    abilities.insert(format!("ctx {}", model.mayhem.caps.ctx));
+    abilities.into_iter().collect()
+}
+
+fn dashboard_route_abilities(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    entry: Option<&ProviderTableEntry>,
+) -> Vec<String> {
+    let caps = entry
+        .and_then(|entry| {
+            entry
+                .heartbeat
+                .as_ref()
+                .map(|heartbeat| heartbeat.caps.clone())
+        })
+        .unwrap_or_else(|| heartbeat_caps_for_route(model, candidate));
+    let mut abilities = BTreeSet::new();
+    if caps.tools {
+        abilities.insert("tools".to_owned());
+    }
+    if caps.json {
+        abilities.insert("json".to_owned());
+    }
+    if caps.vision {
+        abilities.insert("vision".to_owned());
+    }
+    abilities.insert(format!("ctx {}", caps.ctx));
+    abilities.into_iter().collect()
+}
+
+fn dashboard_model_constraints(
+    model: &GatewayModel,
+    route_count: usize,
+    room_count: usize,
+) -> String {
+    let mut constraints = Vec::new();
+    constraints.push(format!("{} routes", route_count));
+    constraints.push(format!("{} rooms", room_count));
+    constraints.push(dashboard_attestation_summary(model));
+    if !model.mayhem.kyb_identities.is_empty() {
+        constraints.push(format!("{} KYB", model.mayhem.kyb_identities.len()));
+    }
+    if let Some(min_app) = &model.mayhem.min_app_version {
+        constraints.push(format!("min app {min_app}"));
+    }
+    dashboard_badges(&constraints, "badge")
+}
+
+fn dashboard_attestation_summary(model: &GatewayModel) -> String {
+    let labels = model
+        .mayhem
+        .attestation_tier_labels
+        .iter()
+        .map(|(tier, label)| format!("{tier}:{label}"))
+        .collect::<Vec<_>>();
+    if !labels.is_empty() {
+        return labels.join(", ");
+    }
+    let tiers = model
+        .mayhem
+        .attestation_tiers
+        .iter()
+        .map(|(tier, count)| format!("{tier}:{count}"))
+        .collect::<Vec<_>>();
+    if tiers.is_empty() {
+        "T1".to_owned()
+    } else {
+        tiers.join(", ")
+    }
+}
+
+fn dashboard_route_engine(model: &GatewayModel, candidate: &GatewayRouteCandidate) -> String {
+    candidate
+        .caps
+        .get("engine")
+        .or_else(|| candidate.caps.get("backend"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(model.mayhem.adapter.request_shape_family.as_str())
+        .to_owned()
+}
+
+fn dashboard_route_rails(candidate: &GatewayRouteCandidate) -> String {
+    if candidate.accepted_rails.is_empty() {
+        "not advertised".to_owned()
+    } else {
+        candidate.accepted_rails.join(", ")
+    }
+}
+
+fn dashboard_route_quality(entry: Option<&ProviderTableEntry>) -> String {
+    let Some(entry) = entry else {
+        return "no provider-table entry".to_owned();
+    };
+    if !dashboard_entry_has_live_heartbeat(entry) {
+        return "live heartbeat pending".to_owned();
+    }
+    let Some(heartbeat) = entry.heartbeat.as_ref() else {
+        return "live heartbeat pending".to_owned();
+    };
+    let mut parts = vec![
+        format!("sat {:.0}%", heartbeat.sat.clamp(0.0, 1.0) * 100.0),
+        format!("slots {}/{}", heartbeat.slots.active, heartbeat.slots.max),
+        format!("ttft {}ms", heartbeat.perf.ttft_ms),
+    ];
+    if let Some(tok_s) = heartbeat.perf.tok_s.filter(|value| value.is_finite()) {
+        parts.push(format!("{tok_s:.1} tok/s"));
+    }
+    if let Some(age) = entry.heartbeat_age_millis {
+        parts.push(format!("age {}ms", age));
+    }
+    parts.join(", ")
+}
+
+fn dashboard_route_status(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    entry: Option<&ProviderTableEntry>,
+) -> String {
+    let mut details = vec![
+        format!("T{}", candidate.att_tier),
+        format!(
+            "rep {}",
+            format_bps_percent(candidate.reputation_bps.min(10_000))
+        ),
+    ];
+    if candidate.kyb.is_some() {
+        details.push("KYB".to_owned());
+    }
+    if candidate
+        .probation
+        .as_ref()
+        .is_some_and(|probation| probation.active)
+    {
+        details.push("probation".to_owned());
+    }
+    let att = entry
+        .and_then(|entry| entry.attestation_head.as_ref())
+        .map(|_| "attested")
+        .unwrap_or("attestation pending");
+    details.push(att.to_owned());
+    let label = if entry.is_some_and(dashboard_entry_has_live_heartbeat) {
+        r#"<span class="status-dot">Online</span>"#
+    } else if model.mayhem.route_candidates.is_empty() {
+        r#"<span class="status-dot muted">Unavailable</span>"#
+    } else {
+        r#"<span class="status-dot muted">Joined</span>"#
+    };
+    format!(
+        "{label}<span class=\"privacy-note\">{}</span>",
+        html_escape(&details.join(", "))
+    )
+}
+
+fn dashboard_badges(values: &[String], class_name: &str) -> String {
+    if values.is_empty() {
+        return r#"<span class="privacy-note">none advertised</span>"#.to_owned();
+    }
+    let badges = values
+        .iter()
+        .map(|value| {
+            format!(
+                r#"<span class="{class_name}">{}</span>"#,
+                html_escape(value)
+            )
+        })
+        .collect::<String>();
+    format!(r#"<div class="badge-row">{badges}</div>"#)
 }
 
 #[derive(Clone, Debug)]

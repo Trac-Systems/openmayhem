@@ -19,12 +19,13 @@ use mayhem_gateway::openai::{
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, text_generation_rate_map, text_usage_mu, token_fingerprint,
-    ReputationEventKind,
+    HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
+    ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
     catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde_json::{json, Value};
 use std::{
@@ -2320,6 +2321,68 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
     }
 }
 
+fn test_provider_heartbeat(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    sat: f64,
+    active_slots: u32,
+    max_slots: u32,
+    tok_s: Option<f64>,
+    ttft_ms: u64,
+) -> ProviderHeartbeat {
+    ProviderHeartbeat {
+        t: "hb".to_owned(),
+        v: HEARTBEAT_SCHEMA_VERSION,
+        contract_version: CONTRACT_VERSION,
+        provider: candidate.provider.clone(),
+        enclave_id: candidate.enclave_id.clone(),
+        model_id: model.id.clone(),
+        room_id: candidate.room_id.clone(),
+        sat,
+        slots: HeartbeatSlots {
+            active: active_slots,
+            max: max_slots,
+        },
+        q: HeartbeatQueue {
+            depth: 1,
+            est_wait_ms: 250,
+        },
+        perf: HeartbeatPerf { tok_s, ttft_ms },
+        price_ver: candidate.price_ver,
+        caps: HeartbeatCaps {
+            tools: candidate
+                .caps
+                .get("tools")
+                .and_then(Value::as_bool)
+                .unwrap_or(model.mayhem.caps.tools),
+            json: candidate
+                .caps
+                .get("json")
+                .and_then(Value::as_bool)
+                .unwrap_or(model.mayhem.caps.json),
+            ctx: candidate
+                .caps
+                .get("ctx")
+                .or_else(|| candidate.caps.get("ctx_max"))
+                .and_then(Value::as_u64)
+                .and_then(|ctx| u32::try_from(ctx).ok())
+                .unwrap_or(model.mayhem.caps.ctx),
+            vision: candidate
+                .caps
+                .get("vision")
+                .and_then(Value::as_bool)
+                .unwrap_or(model.mayhem.caps.vision),
+        },
+        att: HeartbeatAttestation {
+            epoch: 3,
+            head: candidate.binary_hash.clone(),
+        },
+        ts: 1_782_950_400,
+        nonce: format!("network-dashboard-test-{}", candidate.room_id),
+        sig: "11".repeat(64),
+    }
+}
+
 fn routed_test_identity() -> CatalogEnclaveIdentity {
     CatalogEnclaveIdentity {
         admin_pubkey: "44".repeat(32),
@@ -2878,6 +2941,91 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
     assert!(body.contains("download 70%"));
     assert!(body.contains("Loading"));
     assert!(!body.contains("No provider routes loaded"));
+    assert_no_external_urls(&body);
+}
+
+#[tokio::test]
+async fn network_dashboard_renders_live_catalog_and_provider_state() {
+    let provider_a = "88".repeat(32);
+    let provider_b = "99".repeat(32);
+    let mut model = routed_test_model_with_providers(&[provider_a.clone(), provider_b.clone()]);
+    model.mayhem.providers_online = 2;
+    model.mayhem.rooms = 2;
+    model.mayhem.route_candidates[0].accepted_rails = vec!["fiat".to_owned(), "tap".to_owned()];
+    model.mayhem.route_candidates[0].caps = json!({
+        "engine": "vllm",
+        "tools": true,
+        "json": true,
+        "ctx": 16384
+    });
+    model.mayhem.route_candidates[1].accepted_rails = vec!["tnk".to_owned()];
+    model.mayhem.route_candidates[1].att_tier = 2;
+    model.mayhem.route_candidates[1].reputation_bps = 8_750;
+    model.mayhem.route_candidates[1].caps = json!({
+        "engine": "llama.cpp",
+        "tools": false,
+        "json": true,
+        "ctx": 4096
+    });
+
+    let mut unavailable = model.clone();
+    unavailable.id = "mayhem/unavailable-test".to_owned();
+    unavailable.mayhem.source = "catalog".to_owned();
+    unavailable.mayhem.providers_online = 0;
+    unavailable.mayhem.rooms = 0;
+    unavailable.mayhem.route_candidates.clear();
+
+    let heartbeat = test_provider_heartbeat(
+        &model,
+        &model.mayhem.route_candidates[0],
+        0.42,
+        2,
+        4,
+        Some(76.5),
+        321,
+    );
+    let state = GatewayState::from_models(vec![model, unavailable])
+        .with_provider_heartbeats(vec![heartbeat]);
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let network_url = dashboard_url.replacen("/mayhem/dashboard?", "/mayhem/dashboard/network?", 1);
+    let network_path = network_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("network dashboard url is rooted at gateway")
+        .to_owned();
+    let app = openai_router(state);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &network_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("network dashboard html");
+    assert!(body.contains("Network explorer"));
+    assert!(body.contains("mayhem/routed-test"));
+    assert!(body.contains("mayhem/unavailable-test"));
+    assert!(body.contains("vllm"));
+    assert!(body.contains("llama.cpp"));
+    assert!(body.contains("fiat, tap"));
+    assert!(body.contains("tnk"));
+    assert!(body.contains("Online"));
+    assert!(body.contains("Joined"));
+    assert!(body.contains("Unavailable"));
+    assert!(body.contains("sat 42%"));
+    assert!(body.contains("slots 2/4"));
+    assert!(body.contains("76.5 tok/s"));
+    assert!(body.contains("T2"));
+    assert!(body.contains("rep 87.50%"));
+    assert!(body.contains("no canonical provider route"));
+    assert!(body.contains("ctx 16384"));
+    assert!(body.contains("ctx 4096"));
+    assert!(!body.contains(">vision<"));
+    assert!(!body.contains("1,240"));
+    assert!(!body.contains("42 tok/s"));
+    assert!(!body.contains("mx/s/session"));
     assert_no_external_urls(&body);
 }
 
