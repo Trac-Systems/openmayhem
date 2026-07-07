@@ -41,8 +41,10 @@ const DEFAULT_DISPUTE_LOST_SLASH_BPS = 2_000;
 const MAX_OPERATOR_FEE_BPS = 5_000;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 1;
 const DEFAULT_DISPUTE_DEPOSIT_MU = 1_000_000;
+const DEFAULT_MAX_APPLY_BATCH = 2_000;
+const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
+const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
-const LEDGER_BATCH_SCHEMA_MAX = 5_000;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
 export const SESSION_RECEIPT_SCHEMA_VERSION = 6;
 export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 7;
@@ -93,8 +95,9 @@ const PARAM_DEFINITIONS = Object.freeze({
   rate_staleness_seconds: { default: 45 * 60, min: 60, max: 86_400 },
   rules_grace_seconds: { default: 14 * 24 * 60 * 60, min: 0, max: 365 * 24 * 60 * 60 },
   challenge_epochs: { default: 6, min: 0, max: 1_000_000 },
-  max_apply_batch: { default: 2_000, min: 1, max: 5_000 },
-  max_tnk_settlement_outputs: { default: LEDGER_BATCH_SCHEMA_MAX, min: 1, max: LEDGER_BATCH_SCHEMA_MAX },
+  max_apply_batch: { default: DEFAULT_MAX_APPLY_BATCH, min: 1, max: Number.MAX_SAFE_INTEGER },
+  max_market_usage_entries: { default: DEFAULT_MAX_MARKET_USAGE_ENTRIES, min: 0, max: Number.MAX_SAFE_INTEGER },
+  max_tnk_settlement_outputs: { default: DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS, min: 1, max: Number.MAX_SAFE_INTEGER },
   param_activation_delay_seconds: { default: DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS, min: 0, max: 30 * DAY_SECONDS },
 });
 const REPUTATION_EVENT_KINDS = new Set([
@@ -177,7 +180,7 @@ const MODEL_CLASSES = new Set([
 ]);
 const RATE_MAP_MAX_ENTRIES = 16;
 const MODEL_CLASS_RATE_UNITS = Object.freeze({
-  [DEFAULT_MODEL_CLASS]: new Set(['input_token', 'output_token']),
+  [DEFAULT_MODEL_CLASS]: new Set(['input_token', 'cached_input_token', 'output_token']),
   embedding: new Set(['input_token', 'embedding']),
   'image-generation': new Set(['image', 'step']),
   'video-generation': new Set(['video_second', 'frame']),
@@ -2787,6 +2790,7 @@ class MayhemContract extends Contract {
       'epoch_seconds',
       'fee_bps',
       'max_apply_batch',
+      'max_market_usage_entries',
       'holdback_epochs',
       'challenge_epochs',
       'canary_probe_holdback_bps',
@@ -2794,6 +2798,9 @@ class MayhemContract extends Contract {
     ]);
     if (this.value.debits.length + this.value.earnings.length > params.max_apply_batch) {
       return new Error('Epoch apply batch exceeds max_apply_batch.');
+    }
+    if ((this.value.market_usage?.length ?? 0) > params.max_market_usage_entries) {
+      return new Error('Epoch market usage batch exceeds max_market_usage_entries.');
     }
 
     const debitMap = this.aggregateRailLedgerEntries(this.value.debits, 'user', 'mu', 'debit');
@@ -3886,9 +3893,6 @@ class MayhemContract extends Contract {
     if (tnkE18 instanceof Error) return tnkE18;
     if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
       return new Error('TNK settlement outputs are required.');
-    }
-    if (value.outputs.length > LEDGER_BATCH_SCHEMA_MAX) {
-      return new Error('TNK settlement output batch exceeds limit.');
     }
     return null;
   }
@@ -6112,9 +6116,6 @@ class MayhemContract extends Contract {
     if (value.market_usage !== undefined) arrays.push(['market_usage', value.market_usage]);
     for (const [name, entries] of arrays) {
       if (!Array.isArray(entries)) return new Error(`Epoch apply ${name} must be an array.`);
-      if (entries.length > LEDGER_BATCH_SCHEMA_MAX) {
-        return new Error(`Epoch apply ${name} batch is too large.`);
-      }
     }
     return null;
   }
@@ -7086,6 +7087,13 @@ class MayhemContract extends Contract {
       case 'prompt_tokens':
       case 'input_token':
         return 'input_token';
+      case 'cached_input':
+      case 'cached_inputs':
+      case 'cached_input_tokens':
+      case 'cached_prompt_tokens':
+      case 'cached_tokens':
+      case 'cached_input_token':
+        return 'cached_input_token';
       case 'out':
       case 'out_tokens':
       case 'output':

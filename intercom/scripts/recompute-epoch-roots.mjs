@@ -151,6 +151,13 @@ function canonicalUsageUnit(unit) {
     case 'prompt_tokens':
     case 'input_token':
       return 'input_token';
+    case 'cached_input':
+    case 'cached_inputs':
+    case 'cached_input_tokens':
+    case 'cached_prompt_tokens':
+    case 'cached_tokens':
+    case 'cached_input_token':
+      return 'cached_input_token';
     case 'out':
     case 'out_tokens':
     case 'output':

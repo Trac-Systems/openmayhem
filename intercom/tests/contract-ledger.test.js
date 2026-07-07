@@ -1070,6 +1070,82 @@ test('MayhemContract epochApply uses the active admin max_apply_batch param', as
   assert.equal(storage.snapshotBytes(), before);
 });
 
+test('MayhemContract epochApply accepts admin-raised max_apply_batch above default schema size', async () => {
+  const { admin, provider, user, storage, contract } = await setupLedgerContract();
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));
+  const raised = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: 86_400,
+      values: { max_apply_batch: 5_501 },
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(raised.ok, true, raised.message);
+
+  const manyDebits = Array.from({ length: 5_500 }, () => ({
+    rail: 'fiat',
+    user: user.publicKey,
+    mu: 1,
+  }));
+  const applied = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 86_400,
+      debits: manyDebits,
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 5_500 }],
+    },
+    admin.publicKey
+  );
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(applied.debited_mu, 5_500);
+  assert.equal(applied.earned_mu, 4_675);
+  assert.equal(applied.fee_mu, 825);
+});
+
+test('MayhemContract epochApply uses the active admin max_market_usage_entries param', async () => {
+  const { admin, provider, user, storage, contract } = await setupLedgerContract();
+  const tuned = await execute(
+    contract,
+    storage,
+    'setParams',
+    {
+      op: 'set_params',
+      submitted_at: 0,
+      effective_at: 86_400,
+      values: { max_market_usage_entries: 1 },
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(tuned.ok, true, tuned.message);
+
+  const before = storage.snapshotBytes();
+  const tooManyMarketEntries = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 86_400,
+      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2 }],
+      market_usage: [{}, {}],
+    },
+    admin.publicKey
+  );
+  assert.match(tooManyMarketEntries.message, /max_market_usage_entries/i);
+  assert.equal(storage.snapshotBytes(), before);
+});
+
 test('MayhemContract epochApply paginates settlement entries across free pages', async () => {
   const { admin, provider, user, storage, contract } = await setupLedgerContract();
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));

@@ -63,8 +63,8 @@ use mayhem_proto::{
     PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
     SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
     DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_STEP,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -279,6 +279,12 @@ pub struct ModelCaps {
     pub video: bool,
     #[serde(default)]
     pub audio: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_image_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_image_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_image_steps: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_modality: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1022,6 +1028,9 @@ impl GatewayState {
                     image: false,
                     video: false,
                     audio: false,
+                    max_image_width: None,
+                    max_image_height: None,
+                    max_image_steps: None,
                     output_modality: Some("text".to_owned()),
                     output_modalities: vec!["text".to_owned()],
                 },
@@ -2755,7 +2764,7 @@ fn dashboard_provider_live_session_rows(
                 r#"<tr><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td class="mono">{}</td><td class="mono">{}/{}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
                 html_escape(short_text(room, 18).as_ref()),
                 html_escape(short_text(&body.model_id, 24).as_ref()),
-                body.usage.input_tokens(),
+                body.usage.prompt_tokens(),
                 body.usage.output_tokens(),
                 format_elapsed_since(body.ts),
             )
@@ -2946,7 +2955,7 @@ fn dashboard_session_rows(receipts: &[StoredReceipt]) -> String {
                 r#"<tr><td class="mono">{}</td><td><div class="copy-row"><span class="mono">{}</span><button class="copy-chip" type="button">Copy</button></div></td><td class="mono">{}/{}</td><td class="mono">{}</td><td>{status}</td></tr>"#,
                 html_escape(short_text(&body.model_id, 28).as_ref()),
                 html_escape(short_text(&body.provider, 18).as_ref()),
-                body.usage.input_tokens(),
+                body.usage.prompt_tokens(),
                 body.usage.output_tokens(),
                 format_mu_usd(body.mu_owed_cum),
             )
@@ -6713,7 +6722,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     model: &GatewayModel,
 ) -> Result<Option<Value>, GatewaySessionError> {
     let observed_usage = observed_chat_usage(request, content, token_ids);
-    let claimed_prompt_tokens = receipt.body.usage.input_tokens();
+    let claimed_prompt_tokens = receipt.body.usage.prompt_tokens();
     let claimed_output_tokens = receipt.body.usage.output_tokens();
     if claimed_prompt_tokens != observed_usage.prompt_tokens {
         return Err(GatewaySessionError::new(
@@ -6761,7 +6770,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
 }
 
 fn usage_from_receipt_usage(usage: &ReceiptUsage) -> Usage {
-    let prompt_tokens = usage.input_tokens();
+    let prompt_tokens = usage.prompt_tokens();
     let completion_tokens = usage.output_tokens();
     Usage {
         prompt_tokens,
@@ -7017,14 +7026,20 @@ fn direct_session_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected = expected_provider_receipt(
-        model,
-        request,
-        output,
+    let usage = expected_text_usage_for_provider(
+        Some(&provider_receipt.body.usage),
+        output.usage.prompt_tokens,
+        output.usage.completion_tokens,
+        &invocation.spend_voucher.body.locked_rate_map,
+    )?;
+    let expected = ExpectedProviderReceipt {
         provider,
-        provider_receipt.body.seq,
-        invocation,
-    );
+        seq: provider_receipt.body.seq,
+        final_receipt: true,
+        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+        prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
+        usage,
+    };
     if expected.mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
         return Err(GatewaySessionError::new(
             "provider receipt exceeds signed spend voucher",
@@ -7142,10 +7157,12 @@ fn direct_session_partial_receipt_ack(
         ));
     }
     let body = &partial.provider_receipt.body;
-    let usage = ReceiptUsage::text(
+    let usage = expected_text_usage_for_provider(
+        Some(&partial.provider_receipt.body.usage),
         partial.output.usage.prompt_tokens,
         partial.output.usage.completion_tokens,
-    );
+        &invocation.spend_voucher.body.locked_rate_map,
+    )?;
     let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
     if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
         return Err(GatewaySessionError::new(
@@ -7244,23 +7261,43 @@ fn expected_audio_transcription_provider_receipt<'a>(
     }
 }
 
-fn expected_provider_receipt<'a>(
-    _model: &GatewayModel,
-    request: &ChatCompletionRequest,
-    output: &ChatOutput,
-    provider: &'a str,
-    seq: u64,
-    invocation: &GatewaySessionInvocation,
-) -> ExpectedProviderReceipt<'a> {
-    let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
-    ExpectedProviderReceipt {
-        provider,
-        seq,
-        final_receipt: true,
-        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
-        prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
-        usage,
+fn expected_text_usage_for_provider(
+    provider_usage: Option<&ReceiptUsage>,
+    observed_prompt_tokens: u64,
+    observed_completion_tokens: u64,
+    locked_rate_map: &[RateMapEntry],
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let Some(provider_usage) = provider_usage else {
+        return Ok(ReceiptUsage::text(
+            observed_prompt_tokens,
+            observed_completion_tokens,
+        ));
+    };
+    if provider_usage.cached_input_tokens() == 0 {
+        return Ok(ReceiptUsage::text(
+            observed_prompt_tokens,
+            observed_completion_tokens,
+        ));
     }
+    if !locked_rate_map
+        .iter()
+        .any(|entry| entry.unit == USAGE_CACHED_INPUT_TOKEN)
+    {
+        return Err(GatewaySessionError::new(
+            "provider receipt claimed cached input but locked rate_map lacks cached_input_token",
+        ));
+    }
+    if provider_usage.prompt_tokens() != observed_prompt_tokens {
+        return Err(GatewaySessionError::new(
+            "provider receipt cached prompt usage mismatch",
+        ));
+    }
+    if provider_usage.output_tokens() != observed_completion_tokens {
+        return Err(GatewaySessionError::new(
+            "provider receipt cached output usage mismatch",
+        ));
+    }
+    Ok(provider_usage.clone())
 }
 
 fn validate_provider_receipt(
@@ -10475,15 +10512,7 @@ async fn build_embedding(
         ));
     }
     let inputs = embedding_input_texts(&request)?;
-    if matches!(
-        request.encoding_format.as_deref().map(str::trim),
-        Some(value) if !value.eq_ignore_ascii_case("float")
-    ) {
-        return Err(ApiError::bad_request(
-            "only encoding_format=float is supported",
-            Some("encoding_format"),
-        ));
-    }
+    let encoding_format = embedding_encoding_format(&request)?;
     let id = make_id("embd");
     let created = now_secs();
     let GatewayEmbeddingRun {
@@ -10519,7 +10548,7 @@ async fn build_embedding(
             json!({
                 "object": "embedding",
                 "index": index,
-                "embedding": embedding,
+                "embedding": embedding_response_value(embedding, encoding_format),
             })
         })
         .collect::<Vec<_>>();
@@ -10559,7 +10588,7 @@ async fn build_image_generation(
             Some("model"),
         ));
     }
-    validate_image_generation_request(&request)?;
+    validate_image_generation_request(&model, &request)?;
     let id = make_id("img");
     let created = now_secs();
     let GatewayImageGenerationRun {
@@ -11902,15 +11931,6 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let prompt_text = chat_prompt_text(request);
-        let usage = ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
-        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
-            return Err(ApiError::payment_required(
-                "session usage exceeded signed spend voucher",
-                Some("model"),
-            ));
-        }
-
         if !self.receipt_config.cosign_enabled {
             self.pause_session(PausedSession {
                 session_id: invocation.session_id.clone(),
@@ -11928,6 +11948,20 @@ impl GatewayState {
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let receipt = if let Some(provider_receipt) = provider_receipt {
             let seq = provider_receipt.body.seq;
+            let usage = expected_text_usage_for_provider(
+                Some(&provider_receipt.body.usage),
+                output.usage.prompt_tokens,
+                output.usage.completion_tokens,
+                &invocation.spend_voucher.body.locked_rate_map,
+            )
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
+            if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+                return Err(ApiError::payment_required(
+                    "session usage exceeded signed spend voucher",
+                    Some("model"),
+                ));
+            }
             self.cosign_provider_receipt(
                 model,
                 invocation,
@@ -11942,6 +11976,15 @@ impl GatewayState {
                 },
             )?
         } else {
+            let usage =
+                ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
+            let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
+            if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+                return Err(ApiError::payment_required(
+                    "session usage exceeded signed spend voucher",
+                    Some("model"),
+                ));
+            }
             let body = ReceiptBody {
                 schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
                 session_id: invocation.session_id.clone(),
@@ -13248,6 +13291,15 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 image: caps.get("image").and_then(Value::as_bool).unwrap_or(false),
                 video: caps.get("video").and_then(Value::as_bool).unwrap_or(false),
                 audio: caps.get("audio").and_then(Value::as_bool).unwrap_or(false),
+                max_image_width: caps
+                    .get("max_image_width")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                max_image_height: caps
+                    .get("max_image_height")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                max_image_steps: caps.get("max_image_steps").and_then(Value::as_u64),
                 output_modality: caps
                     .get("output_modality")
                     .and_then(Value::as_str)
@@ -13829,16 +13881,43 @@ fn audio_transcription_prompt_hash(request: &AudioTranscriptionRequest) -> Strin
     stable_value_hash(&direct_session_audio_transcription_request_body(request))
 }
 
-fn validate_image_generation_request(request: &ImageGenerationRequest) -> Result<(), ApiError> {
+fn validate_image_generation_request(
+    model: &GatewayModel,
+    request: &ImageGenerationRequest,
+) -> Result<(), ApiError> {
     if request.prompt.trim().is_empty() {
         return Err(ApiError::bad_request(
             "prompt must not be empty",
             Some("prompt"),
         ));
     }
-    let _ = parse_image_generation_size(request)?;
+    let (width, height) = parse_image_generation_size(request)?;
+    if let Some(max_width) = model.mayhem.caps.max_image_width {
+        if width > max_width {
+            return Err(ApiError::bad_request(
+                format!("size width exceeds model maximum {max_width}"),
+                Some("size"),
+            ));
+        }
+    }
+    if let Some(max_height) = model.mayhem.caps.max_image_height {
+        if height > max_height {
+            return Err(ApiError::bad_request(
+                format!("size height exceeds model maximum {max_height}"),
+                Some("size"),
+            ));
+        }
+    }
     let _ = image_generation_count(request);
-    let _ = image_generation_steps(request);
+    let steps = image_generation_steps(request);
+    if let Some(max_steps) = model.mayhem.caps.max_image_steps {
+        if steps > max_steps {
+            return Err(ApiError::bad_request(
+                format!("steps exceed model maximum {max_steps}"),
+                Some("steps"),
+            ));
+        }
+    }
     let _ = image_generation_cfg_scale(request);
     match request.response_format.as_deref().unwrap_or("b64_json") {
         "b64_json" | "url" => Ok(()),
@@ -13897,9 +13976,11 @@ fn image_generation_failover_work_units(request: &ImageGenerationRequest) -> Res
 }
 
 fn image_generation_usage_for_request(request: &ImageGenerationRequest) -> ReceiptUsage {
+    let resolution_scale = image_generation_resolution_scale(request).unwrap_or(1);
     image_generation_usage_for_count(
         u64::from(image_generation_count(request)),
         image_generation_steps(request),
+        resolution_scale,
     )
 }
 
@@ -13907,17 +13988,29 @@ fn image_generation_usage_for_observed(
     request: &ImageGenerationRequest,
     observed_artifacts: usize,
 ) -> ReceiptUsage {
+    let resolution_scale = image_generation_resolution_scale(request).unwrap_or(1);
     image_generation_usage_for_count(
         u64::try_from(observed_artifacts).unwrap_or(u64::MAX),
         image_generation_steps(request),
+        resolution_scale,
     )
 }
 
-fn image_generation_usage_for_count(image_count: u64, steps: u64) -> ReceiptUsage {
-    ReceiptUsage::from_units([
-        (USAGE_IMAGE, image_count),
-        (USAGE_STEP, image_count.saturating_mul(steps)),
-    ])
+fn image_generation_resolution_scale(request: &ImageGenerationRequest) -> Result<u64, ApiError> {
+    let (width, height) = parse_image_generation_size(request)?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height)).max(1);
+    Ok(pixels.div_ceil(512 * 512).max(1))
+}
+
+fn image_generation_usage_for_count(
+    image_count: u64,
+    steps: u64,
+    resolution_scale: u64,
+) -> ReceiptUsage {
+    let billed_steps = image_count
+        .saturating_mul(steps)
+        .saturating_mul(resolution_scale.max(1));
+    ReceiptUsage::from_units([(USAGE_IMAGE, image_count), (USAGE_STEP, billed_steps)])
 }
 
 fn validate_audio_speech_request(request: &AudioSpeechRequest) -> Result<(), ApiError> {
@@ -14096,6 +14189,30 @@ fn embedding_usage_for_inputs(inputs: &[String]) -> Usage {
         prompt_tokens,
         completion_tokens: 0,
         total_tokens: prompt_tokens,
+    }
+}
+
+fn embedding_encoding_format(request: &EmbeddingRequest) -> Result<&'static str, ApiError> {
+    match request.encoding_format.as_deref().map(str::trim) {
+        None | Some("") => Ok("float"),
+        Some(value) if value.eq_ignore_ascii_case("float") => Ok("float"),
+        Some(value) if value.eq_ignore_ascii_case("base64") => Ok("base64"),
+        Some(_) => Err(ApiError::bad_request(
+            "only encoding_format=float or encoding_format=base64 is supported",
+            Some("encoding_format"),
+        )),
+    }
+}
+
+fn embedding_response_value(embedding: &[f32], encoding_format: &str) -> Value {
+    if encoding_format.eq_ignore_ascii_case("base64") {
+        let mut bytes = Vec::with_capacity(embedding.len().saturating_mul(4));
+        for value in embedding {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Value::String(BASE64_STANDARD.encode(bytes))
+    } else {
+        json!(embedding)
     }
 }
 
@@ -14854,6 +14971,62 @@ mod tests {
             .expect("checkpointed final receipt should be co-signed");
         assert_eq!(checkpointed_stored.receipt.body.seq, 3);
 
+        let cached_output = ChatOutput {
+            usage: Usage {
+                prompt_tokens: 1_000,
+                completion_tokens: 0,
+                total_tokens: 1_000,
+            },
+            ..output.clone()
+        };
+        let mut cached_receipt =
+            test_provider_receipt(&model, &request, &cached_output, &invocation);
+        cached_receipt.body.usage = ReceiptUsage::text_with_cached(500, 500, 0);
+        cached_receipt.body.mu_owed_cum =
+            calculate_locked_mu_owed(&invocation, &cached_receipt.body.usage);
+        cached_receipt.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&cached_receipt.body).unwrap(),
+        );
+        let cached_stored = state
+            .meter_chat_session(
+                &model,
+                &request,
+                &cached_output,
+                &invocation,
+                Some(&cached_receipt),
+            )
+            .expect("cached input receipt should be co-signed");
+        assert_eq!(
+            cached_stored
+                .receipt
+                .body
+                .usage
+                .get(USAGE_CACHED_INPUT_TOKEN),
+            500
+        );
+        assert_eq!(cached_stored.receipt.body.usage.prompt_tokens(), 1_000);
+        assert_eq!(cached_stored.receipt.body.mu_owed_cum, 13);
+
+        let mut false_cache = cached_receipt.clone();
+        false_cache.body.usage = ReceiptUsage::text_with_cached(100, 500, 0);
+        false_cache.body.mu_owed_cum =
+            calculate_locked_mu_owed(&invocation, &false_cache.body.usage);
+        false_cache.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&false_cache.body).unwrap(),
+        );
+        let err = state
+            .meter_chat_session(
+                &model,
+                &request,
+                &cached_output,
+                &invocation,
+                Some(&false_cache),
+            )
+            .expect_err("false cache hit must not be co-signed");
+        assert!(err.message.contains("cached prompt usage mismatch"));
+
         let mut wrong_amount = provider_receipt.clone();
         wrong_amount.body.mu_owed_cum = wrong_amount.body.mu_owed_cum.saturating_add(1);
         wrong_amount.enclave_sig = sign_hex(
@@ -15167,6 +15340,9 @@ mod tests {
                     image: false,
                     video: false,
                     audio: false,
+                    max_image_width: None,
+                    max_image_height: None,
+                    max_image_steps: None,
                     output_modality: Some("text".to_owned()),
                     output_modalities: vec!["text".to_owned()],
                 },
@@ -16186,7 +16362,11 @@ mod tests {
 
         let snapshot = contract_snapshot_for_route(&model, route, state.receipt_config.rules_ver);
         assert_eq!(snapshot.price_ver, 9);
-        assert_eq!(snapshot.rate_map, text_generation_rate_map(90, 180));
+        let expected_rate_map = normalize_rate_map(text_generation_rate_map(90, 180));
+        assert_eq!(
+            normalize_rate_map(snapshot.rate_map.clone()),
+            expected_rate_map
+        );
         assert_eq!(snapshot.per_req_mu, 123);
         assert_eq!(snapshot.min_session_mu, 456);
 
@@ -16209,7 +16389,7 @@ mod tests {
         assert_eq!(invocation.price_ver, 9);
         assert_eq!(
             invocation.spend_voucher.body.locked_rate_map,
-            text_generation_rate_map(90, 180)
+            expected_rate_map
         );
         assert_eq!(invocation.spend_voucher.body.locked_per_req_mu, 123);
         assert_eq!(invocation.spend_voucher.body.locked_min_session_mu, 456);

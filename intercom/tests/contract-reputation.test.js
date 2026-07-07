@@ -278,6 +278,48 @@ test('MayhemContract records underdelivery reputation events for throughput fair
   assert.equal(head.value.head, result.head);
 });
 
+test('MayhemContract anchors provenance violations from spot audits', async () => {
+  const { admin, provider, storage, contract } = await setupReputationContract();
+
+  const event = await recordEvent(
+    contract,
+    storage,
+    admin,
+    provider,
+    {
+      op: 'record_rep_event',
+      event_id: 'cached-token-spot-audit-failed',
+      kind: 'provenance_violation',
+      evidence_hash: 'c'.repeat(64),
+    },
+    4
+  );
+  assert.equal(event.ok, true, event.message);
+
+  const anchored = await execute(
+    contract,
+    storage,
+    'anchorReputation',
+    {
+      op: 'anchor_reputation',
+      provider: provider.publicKey,
+      epoch: 1,
+      folded_at: DAY_SECONDS,
+      events_head: event.head,
+      r_bps: 0,
+      raw_milli: 0,
+      successful_sessions: 0,
+      provenance_violation: true,
+    },
+    admin.publicKey,
+    5
+  );
+  assert.equal(anchored.ok, true, anchored.message);
+
+  const rep = await storage.get(`rep/${provider.publicKey}`);
+  assert.equal(rep.value.provenance_violation, true);
+});
+
 test('MayhemContract applies reputation anchors through free admin feature records', async () => {
   const { admin, provider, outsider, storage, contract } = await setupReputationContract();
   const event = await recordEvent(

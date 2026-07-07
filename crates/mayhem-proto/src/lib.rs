@@ -164,6 +164,7 @@ pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
 pub const DEFAULT_MODEL_CLASS: &str = "text-generation";
 pub const USAGE_INPUT_TOKEN: &str = "input_token";
+pub const USAGE_CACHED_INPUT_TOKEN: &str = "cached_input_token";
 pub const USAGE_OUTPUT_TOKEN: &str = "output_token";
 pub const USAGE_IMAGE: &str = "image";
 pub const USAGE_STEP: &str = "step";
@@ -377,6 +378,14 @@ impl ReceiptUsage {
         ])
     }
 
+    pub fn text_with_cached(in_tokens: u64, cached_in_tokens: u64, out_tokens: u64) -> Self {
+        Self::from_units([
+            (USAGE_INPUT_TOKEN, in_tokens),
+            (USAGE_CACHED_INPUT_TOKEN, cached_in_tokens),
+            (USAGE_OUTPUT_TOKEN, out_tokens),
+        ])
+    }
+
     pub fn units(&self) -> &BTreeMap<String, u64> {
         &self.units
     }
@@ -389,6 +398,15 @@ impl ReceiptUsage {
 
     pub fn input_tokens(&self) -> u64 {
         self.get(USAGE_INPUT_TOKEN)
+    }
+
+    pub fn cached_input_tokens(&self) -> u64 {
+        self.get(USAGE_CACHED_INPUT_TOKEN)
+    }
+
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens()
+            .saturating_add(self.cached_input_tokens())
     }
 
     pub fn output_tokens(&self) -> u64 {
@@ -439,6 +457,12 @@ pub fn canonical_usage_unit(unit: &str) -> Option<&'static str> {
         "in" | "in_tokens" | "input" | "input_tokens" | "prompt_tokens" | USAGE_INPUT_TOKEN => {
             Some(USAGE_INPUT_TOKEN)
         }
+        "cached_input"
+        | "cached_inputs"
+        | "cached_input_tokens"
+        | "cached_prompt_tokens"
+        | "cached_tokens"
+        | USAGE_CACHED_INPUT_TOKEN => Some(USAGE_CACHED_INPUT_TOKEN),
         "out" | "out_tokens" | "output" | "output_tokens" | "completion_tokens"
         | USAGE_OUTPUT_TOKEN => Some(USAGE_OUTPUT_TOKEN),
         "images" | USAGE_IMAGE => Some(USAGE_IMAGE),
@@ -1416,6 +1440,22 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&legacy_usage).unwrap(),
             serde_json::json!({ "input_token": 3, "output_token": 5 })
+        );
+        let cached_usage: ReceiptUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 7,
+            "cached_prompt_tokens": 11,
+            "completion_tokens": 13
+        }))
+        .unwrap();
+        assert_eq!(cached_usage, ReceiptUsage::text_with_cached(7, 11, 13));
+        assert_eq!(cached_usage.prompt_tokens(), 18);
+        assert_eq!(
+            serde_json::to_value(&cached_usage).unwrap(),
+            serde_json::json!({
+                "cached_input_token": 11,
+                "input_token": 7,
+                "output_token": 13
+            })
         );
         let mixed_alias_usage: ReceiptUsage = serde_json::from_value(serde_json::json!({
             "in": 3,

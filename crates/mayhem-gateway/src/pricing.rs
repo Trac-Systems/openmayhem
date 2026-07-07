@@ -1,9 +1,11 @@
-use mayhem_proto::{ReceiptUsage, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN};
+use mayhem_proto::{ReceiptUsage, USAGE_CACHED_INPUT_TOKEN, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN};
 
 pub use mayhem_proto::RateMapEntry;
 
 pub const INPUT_TOKEN_UNIT: &str = USAGE_INPUT_TOKEN;
+pub const CACHED_INPUT_TOKEN_UNIT: &str = USAGE_CACHED_INPUT_TOKEN;
 pub const OUTPUT_TOKEN_UNIT: &str = USAGE_OUTPUT_TOKEN;
+pub const CACHED_INPUT_TOKEN_RATE_BPS: u64 = 2_500;
 
 pub fn text_generation_rate_map(in_per_1k_mu: u64, out_per_1k_mu: u64) -> Vec<RateMapEntry> {
     vec![
@@ -13,11 +15,28 @@ pub fn text_generation_rate_map(in_per_1k_mu: u64, out_per_1k_mu: u64) -> Vec<Ra
             granularity: 1_000,
         },
         RateMapEntry {
+            unit: CACHED_INPUT_TOKEN_UNIT.to_owned(),
+            per_unit_mu: discounted_cached_input_rate_mu(in_per_1k_mu),
+            granularity: 1_000,
+        },
+        RateMapEntry {
             unit: OUTPUT_TOKEN_UNIT.to_owned(),
             per_unit_mu: out_per_1k_mu,
             granularity: 1_000,
         },
     ]
+}
+
+pub fn discounted_cached_input_rate_mu(in_per_1k_mu: u64) -> u64 {
+    if in_per_1k_mu == 0 {
+        return 0;
+    }
+    ceil_div_u128(
+        u128::from(in_per_1k_mu).saturating_mul(u128::from(CACHED_INPUT_TOKEN_RATE_BPS)),
+        10_000,
+    )
+    .max(1)
+    .min(u128::from(u64::MAX)) as u64
 }
 
 pub fn normalize_rate_map(mut rate_map: Vec<RateMapEntry>) -> Vec<RateMapEntry> {
@@ -150,7 +169,8 @@ fn ceil_div_u128(value: u128, divisor: u128) -> u128 {
 mod tests {
     use super::*;
     use mayhem_proto::{
-        ReceiptUsage, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+        ReceiptUsage, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE,
+        USAGE_INPUT_CHARACTER, USAGE_STEP,
     };
 
     #[test]
@@ -159,6 +179,20 @@ mod tests {
         let usage = ReceiptUsage::text(100, 250);
 
         assert_eq!(usage_map_mu(&rate_map, &usage), 17);
+    }
+
+    #[test]
+    fn text_rate_map_discounts_cached_input_tokens() {
+        let rate_map = text_generation_rate_map(20, 60);
+        let usage = ReceiptUsage::text_with_cached(100, 400, 250);
+
+        assert_eq!(
+            rate_for_unit(&rate_map, USAGE_CACHED_INPUT_TOKEN)
+                .unwrap()
+                .per_unit_mu,
+            5
+        );
+        assert_eq!(usage_map_mu(&rate_map, &usage), 19);
     }
 
     #[test]

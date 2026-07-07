@@ -1003,13 +1003,15 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
     assert_eq!(body["data"][0]["owned_by"], "mayhem");
     assert_eq!(body["data"][0]["mayhem"]["price_ref_mu"]["denom"], "mu_usd");
     assert_eq!(body["data"][0]["mayhem"]["price_ref_mu"]["ver"], 1);
+    let rate_units = body["data"][0]["mayhem"]["price_ref_mu"]["rate_map"]
+        .as_array()
+        .expect("rate map")
+        .iter()
+        .map(|entry| entry["unit"].as_str().expect("rate unit"))
+        .collect::<Vec<_>>();
     assert_eq!(
-        body["data"][0]["mayhem"]["price_ref_mu"]["rate_map"][0]["unit"],
-        "input_token"
-    );
-    assert_eq!(
-        body["data"][0]["mayhem"]["price_ref_mu"]["rate_map"][1]["unit"],
-        "output_token"
+        rate_units,
+        vec!["input_token", "cached_input_token", "output_token"]
     );
     assert_eq!(body["data"][0]["mayhem"]["caps"]["tools"], true);
     assert_eq!(
@@ -1092,6 +1094,38 @@ async fn embeddings_endpoint_uses_routed_engine_and_records_receipt() {
 }
 
 #[tokio::test]
+async fn embeddings_endpoint_supports_base64_float32_encoding() {
+    let state = GatewayState::from_models(vec![routed_embedding_test_model()])
+        .with_session_backend(Arc::new(EmbeddingDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/embed-fixture",
+        "input": ["alpha", "beta"],
+        "dimensions": 3,
+        "encoding_format": "base64"
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/embeddings", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let encoded = body["data"][0]["embedding"]
+        .as_str()
+        .expect("base64 embedding payload");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("embedding is base64");
+    assert_eq!(bytes.len(), 3 * 4);
+    let values = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert!((values[0] - 0.12).abs() < 0.0001);
+    assert!((values[1] - 0.34).abs() < 0.0001);
+    assert!((values[2] - 0.56).abs() < 0.0001);
+    assert_eq!(state.receipts().len(), 1);
+}
+
+#[tokio::test]
 async fn embeddings_endpoint_rejects_non_embedding_model() {
     let model = first_model_id().await;
     let (status, body) = json_request(
@@ -1155,6 +1189,49 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.usage.get(USAGE_IMAGE), 1);
     assert_eq!(receipt.body.usage.get(USAGE_STEP), 3);
     assert_eq!(receipt.body.mu_owed_cum, 506);
+}
+
+#[tokio::test]
+async fn image_generation_scales_step_usage_by_resolution_and_validates_size() {
+    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+        .with_session_backend(Arc::new(ImageGenerationDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/image-fixture",
+        "prompt": "a red cube",
+        "n": 1,
+        "size": "1024x1024",
+        "steps": 3,
+        "response_format": "b64_json"
+    });
+
+    let (status, body) =
+        json_request(app.clone(), Method::POST, "/v1/images/generations", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["usage"][USAGE_IMAGE], 1);
+    assert_eq!(body["usage"][USAGE_STEP], 12);
+    let receipt = &state.receipts()[0].receipt;
+    assert_eq!(receipt.body.usage.get(USAGE_STEP), 12);
+    assert_eq!(receipt.body.mu_owed_cum, 524);
+
+    let (bad_status, bad_body) = json_request(
+        app,
+        Method::POST,
+        "/v1/images/generations",
+        json!({
+            "model": "admin/image-fixture",
+            "prompt": "too large",
+            "size": "2048x2048",
+            "steps": 3
+        }),
+    )
+    .await;
+    assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+    assert!(bad_body["error"]["message"]
+        .as_str()
+        .expect("bad size message")
+        .contains("maximum"));
 }
 
 #[tokio::test]
@@ -2034,6 +2111,9 @@ fn routed_embedding_test_model() -> GatewayModel {
         image: false,
         video: false,
         audio: false,
+        max_image_width: None,
+        max_image_height: None,
+        max_image_steps: None,
         output_modality: Some("embedding".to_owned()),
         output_modalities: vec!["embedding".to_owned()],
     };
@@ -2080,6 +2160,9 @@ fn routed_image_generation_test_model() -> GatewayModel {
         image: true,
         video: false,
         audio: false,
+        max_image_width: Some(1024),
+        max_image_height: Some(1024),
+        max_image_steps: Some(50),
         output_modality: Some("image".to_owned()),
         output_modalities: vec!["image".to_owned()],
     };
@@ -2091,6 +2174,9 @@ fn routed_image_generation_test_model() -> GatewayModel {
         candidate.caps = serde_json::json!({
             "ctx_max": 4096,
             "image": true,
+            "max_image_width": 1024,
+            "max_image_height": 1024,
+            "max_image_steps": 50,
             "output_modality": "image",
             "output_modalities": ["image"]
         });
@@ -2129,6 +2215,9 @@ fn routed_audio_speech_test_model() -> GatewayModel {
         image: false,
         video: false,
         audio: true,
+        max_image_width: None,
+        max_image_height: None,
+        max_image_steps: None,
         output_modality: Some("audio".to_owned()),
         output_modalities: vec!["audio".to_owned()],
     };
@@ -2171,6 +2260,9 @@ fn routed_audio_transcription_test_model() -> GatewayModel {
         image: false,
         video: false,
         audio: true,
+        max_image_width: None,
+        max_image_height: None,
+        max_image_steps: None,
         output_modality: Some("text".to_owned()),
         output_modalities: vec!["text".to_owned()],
     };
@@ -2318,10 +2410,29 @@ fn signed_provider_receipt_for_test(
 fn image_usage_for_test(request: &ImageGenerationRequest) -> ReceiptUsage {
     let images = u64::from(request.n.unwrap_or(1).clamp(1, 4));
     let steps = image_steps_for_test(request);
+    let resolution_scale = image_resolution_scale_for_test(request);
     ReceiptUsage::from_units([
         (USAGE_IMAGE, images),
-        (USAGE_STEP, images.saturating_mul(steps)),
+        (
+            USAGE_STEP,
+            images
+                .saturating_mul(steps)
+                .saturating_mul(resolution_scale),
+        ),
     ])
+}
+
+fn image_resolution_scale_for_test(request: &ImageGenerationRequest) -> u64 {
+    let size = request.size.as_deref().unwrap_or("512x512");
+    let Some((width, height)) = size.split_once('x') else {
+        return 1;
+    };
+    let pixels = width
+        .parse::<u64>()
+        .unwrap_or(512)
+        .saturating_mul(height.parse::<u64>().unwrap_or(512))
+        .max(1);
+    pixels.div_ceil(512 * 512).max(1)
 }
 
 fn audio_speech_usage_for_test(request: &AudioSpeechRequest, audio: &[u8]) -> ReceiptUsage {
@@ -2533,6 +2644,9 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
                 image: false,
                 video: false,
                 audio: false,
+                max_image_width: None,
+                max_image_height: None,
+                max_image_steps: None,
                 output_modality: Some("text".to_owned()),
                 output_modalities: vec!["text".to_owned()],
             },

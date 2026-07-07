@@ -288,3 +288,23 @@ test('MayhemContract tnkSettlement uses the active admin max_tnk_settlement_outp
   assert.match(tooManyOutputs.message, /max_tnk_settlement_outputs/i);
   assert.equal(await ctx.storage.get('settle/tnk/1'), null);
 });
+
+test('MayhemContract tnkSettlement has no hidden output cap below the active admin param', async () => {
+  const ctx = await setupTnkSettlementContract({ max_tnk_settlement_outputs: 5_001 });
+  const settlement = await settlementValue(ctx);
+  const template = settlement.outputs.find((output) => output.role === 'provider');
+  const outputs = Array.from({ length: 5_001 }, (_, i) => ({
+    ...template,
+    provider: i.toString(16).padStart(64, '0'),
+  }));
+
+  const result = await executeTnkSettlementFeature(
+    ctx.contract,
+    ctx.storage,
+    { ...settlement, outputs },
+    ctx.admin.publicKey
+  );
+  assert.doesNotMatch(result.message, /max_tnk_settlement_outputs|exceeds limit/i);
+  assert.match(result.message, /provider count does not match outputs/i);
+  assert.equal(await ctx.storage.get('settle/tnk/1'), null);
+});
