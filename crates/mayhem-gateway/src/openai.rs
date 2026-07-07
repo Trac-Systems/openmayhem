@@ -56,13 +56,13 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{stream, Stream};
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
-    chunk_json_payload, ctx_bracket_for_tokens, default_model_class, migrate_receipt_body,
-    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, supported_receipt_signing_bytes,
-    AttestationReport, CheckpointPolicy, PayloadChunk, PayloadChunkManifest, ReceiptAck,
-    ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, CTX_BRACKET_TABLE_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    chunk_json_payload, ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule,
+    default_model_class, migrate_receipt_body, reassemble_json_payload, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    supported_receipt_signing_bytes, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
+    PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
+    SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
     USAGE_STEP,
 };
@@ -123,6 +123,7 @@ pub struct GatewayState {
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
     epoch_seconds: u64,
+    ctx_bracket_schedule: Arc<CtxBracketSchedule>,
     failover_policy: GatewayFailoverPolicyConfig,
     default_max_price_mu: Option<u64>,
     default_min_ctx: Option<u32>,
@@ -821,6 +822,7 @@ pub struct GatewaySessionInvocation {
     pub provider_pubkey: Option<String>,
     pub enclave_id: String,
     pub price_ver: u64,
+    pub opened_at: u64,
     pub served_ctx: u32,
     pub ctx_bracket: String,
     pub ctx_bracket_table_ver: u32,
@@ -1063,6 +1065,7 @@ impl GatewayState {
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
+            ctx_bracket_schedule: Arc::new(default_ctx_bracket_schedule()),
             failover_policy: GatewayFailoverPolicyConfig::default(),
             default_max_price_mu: None,
             default_min_ctx: None,
@@ -1154,6 +1157,15 @@ impl GatewayState {
 
     pub fn epoch_seconds(&self) -> u64 {
         self.epoch_seconds
+    }
+
+    pub fn with_ctx_bracket_schedule(mut self, schedule: CtxBracketSchedule) -> Self {
+        self.ctx_bracket_schedule = Arc::new(schedule);
+        self
+    }
+
+    pub fn ctx_bracket_table_version(&self) -> u32 {
+        self.ctx_bracket_schedule.current.ver
     }
 
     pub fn with_default_max_price_mu(mut self, max_price_mu: Option<u64>) -> Self {
@@ -4215,6 +4227,7 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "at": invocation.opened_at,
             "served_ctx": invocation.served_ctx,
             "ctx_bracket": invocation.ctx_bracket.clone(),
             "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
@@ -4434,6 +4447,7 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "at": invocation.opened_at,
             "served_ctx": invocation.served_ctx,
             "ctx_bracket": invocation.ctx_bracket.clone(),
             "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
@@ -4609,6 +4623,7 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "at": invocation.opened_at,
             "served_ctx": invocation.served_ctx,
             "ctx_bracket": invocation.ctx_bracket.clone(),
             "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
@@ -4784,6 +4799,7 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "at": invocation.opened_at,
             "served_ctx": invocation.served_ctx,
             "ctx_bracket": invocation.ctx_bracket.clone(),
             "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
@@ -4949,6 +4965,7 @@ impl ScBridgeGatewaySessionBackend {
             "user": invocation.user_pubkey.clone(),
             "enclave_id": invocation.enclave_id.clone(),
             "price_ver": invocation.price_ver,
+            "at": invocation.opened_at,
             "served_ctx": invocation.served_ctx,
             "ctx_bracket": invocation.ctx_bracket.clone(),
             "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
@@ -8079,6 +8096,7 @@ async fn open_live_direct_chat_session(
         "user": invocation.user_pubkey.clone(),
         "enclave_id": invocation.enclave_id.clone(),
         "price_ver": invocation.price_ver,
+        "at": invocation.opened_at,
         "served_ctx": invocation.served_ctx,
         "ctx_bracket": invocation.ctx_bracket.clone(),
         "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
@@ -9741,6 +9759,21 @@ impl GatewayState {
             .unwrap_or_else(|| route_caps_ctx(model, route))
     }
 
+    fn ctx_bracket_terms_for_served_ctx(
+        &self,
+        served_ctx: u32,
+        at: u64,
+    ) -> Result<(String, u32), ApiError> {
+        ctx_bracket_for_tokens_in_schedule(served_ctx, &self.ctx_bracket_schedule, at).ok_or_else(
+            || {
+                ApiError::bad_gateway(
+                    "active context bracket table does not cover served_ctx",
+                    Some("model"),
+                )
+            },
+        )
+    }
+
     fn apply_chat_affinity<'a>(
         &self,
         model: &GatewayModel,
@@ -11227,9 +11260,10 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
-        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
-        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
+        let (ctx_bracket, ctx_bracket_table_ver) =
+            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11254,6 +11288,7 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            opened_at,
             served_ctx: voucher_body.served_ctx,
             ctx_bracket,
             ctx_bracket_table_ver,
@@ -11320,9 +11355,10 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
-        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
-        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
+        let (ctx_bracket, ctx_bracket_table_ver) =
+            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11347,6 +11383,7 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            opened_at,
             served_ctx: voucher_body.served_ctx,
             ctx_bracket,
             ctx_bracket_table_ver,
@@ -11413,9 +11450,10 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
-        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
-        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
+        let (ctx_bracket, ctx_bracket_table_ver) =
+            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11440,6 +11478,7 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            opened_at,
             served_ctx: voucher_body.served_ctx,
             ctx_bracket,
             ctx_bracket_table_ver,
@@ -11506,9 +11545,10 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
-        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
-        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
+        let (ctx_bracket, ctx_bracket_table_ver) =
+            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11533,6 +11573,7 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            opened_at,
             served_ctx: voucher_body.served_ctx,
             ctx_bracket,
             ctx_bracket_table_ver,
@@ -11599,9 +11640,10 @@ impl GatewayState {
                 Some("model"),
             ));
         }
+        let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
-        let ctx_bracket = ctx_bracket_for_tokens(served_ctx).to_owned();
-        let ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
+        let (ctx_bracket, ctx_bracket_table_ver) =
+            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
@@ -11626,6 +11668,7 @@ impl GatewayState {
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
             enclave_id,
             price_ver,
+            opened_at,
             served_ctx: voucher_body.served_ctx,
             ctx_bracket,
             ctx_bracket_table_ver,
@@ -13839,8 +13882,8 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use mayhem_proto::{
-        attestation_signing_bytes, reassemble_json_payload, receipt_signing_bytes_for_version,
-        AttestationSigner,
+        attestation_signing_bytes, ctx_bracket_for_tokens, reassemble_json_payload,
+        receipt_signing_bytes_for_version, AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
 
     #[test]
@@ -14160,6 +14203,47 @@ mod tests {
             .prepare_chat_invocation_for_route(&model, &request, None, &max_bid)
             .expect_err("gateway rejects quotes above the user max-bid");
         assert_eq!(err.param, Some("X-Mayhem-Max-Price-Mu"));
+    }
+
+    #[test]
+    fn spend_voucher_uses_admin_ctx_bracket_schedule() {
+        let mut model = test_model();
+        model.mayhem.caps.ctx = 12_000;
+        let request = test_chat_request(&model.id);
+        let schedule = CtxBracketSchedule {
+            current: mayhem_proto::CtxBracketTableRecord {
+                ver: 2,
+                submitted_at: 1,
+                effective_at: 1,
+                brackets: vec![
+                    mayhem_proto::CtxBracketEntry {
+                        id: "le16k".to_owned(),
+                        max_ctx: Some(16_384),
+                    },
+                    mayhem_proto::CtxBracketEntry {
+                        id: "gt16k".to_owned(),
+                        max_ctx: None,
+                    },
+                ],
+            },
+            pending: None,
+        };
+        let invocation = GatewayState::from_models(vec![model.clone()])
+            .with_ctx_bracket_schedule(schedule)
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("invocation uses custom context table");
+
+        assert_eq!(invocation.served_ctx, 12_000);
+        assert_eq!(invocation.ctx_bracket, "le16k");
+        assert_eq!(invocation.ctx_bracket_table_ver, 2);
+        assert!(invocation.opened_at > 0);
+        assert_eq!(invocation.spend_voucher.body.ctx_bracket, "le16k");
+        assert_eq!(invocation.spend_voucher.body.ctx_bracket_table_ver, 2);
     }
 
     #[test]
@@ -14671,6 +14755,7 @@ mod tests {
             provider_pubkey: Some(verifying_key_hex(&test_provider_seed())),
             enclave_id,
             price_ver: 7,
+            opened_at: 1,
             served_ctx: voucher_body.served_ctx,
             ctx_bracket: voucher_body.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher_body.ctx_bracket_table_ver,

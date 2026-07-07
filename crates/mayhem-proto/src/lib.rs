@@ -19,11 +19,146 @@ pub const CTX_BRACKETS: &[(u32, &str)] = &[
     (131_072, "le128k"),
     (262_144, "le256k"),
 ];
+pub const CTX_BRACKET_UNBOUNDED_ID: &str = "gt256k";
 pub fn ctx_bracket_for_tokens(tokens: u32) -> &'static str {
     CTX_BRACKETS
         .iter()
         .find_map(|(max_ctx, bracket)| (tokens <= *max_ctx).then_some(*bracket))
-        .unwrap_or("gt256k")
+        .unwrap_or(CTX_BRACKET_UNBOUNDED_ID)
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CtxBracketEntry {
+    pub id: String,
+    pub max_ctx: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CtxBracketTableRecord {
+    pub ver: u32,
+    pub brackets: Vec<CtxBracketEntry>,
+    #[serde(default)]
+    pub submitted_at: u64,
+    #[serde(default)]
+    pub effective_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CtxBracketSchedule {
+    pub current: CtxBracketTableRecord,
+    #[serde(default)]
+    pub pending: Option<CtxBracketTableRecord>,
+}
+
+pub fn default_ctx_bracket_table_record() -> CtxBracketTableRecord {
+    let mut brackets = CTX_BRACKETS
+        .iter()
+        .map(|(max_ctx, id)| CtxBracketEntry {
+            id: (*id).to_owned(),
+            max_ctx: Some(u64::from(*max_ctx)),
+        })
+        .collect::<Vec<_>>();
+    brackets.push(CtxBracketEntry {
+        id: CTX_BRACKET_UNBOUNDED_ID.to_owned(),
+        max_ctx: None,
+    });
+    CtxBracketTableRecord {
+        ver: CTX_BRACKET_TABLE_VERSION,
+        brackets,
+        submitted_at: 0,
+        effective_at: 0,
+    }
+}
+
+pub fn default_ctx_bracket_schedule() -> CtxBracketSchedule {
+    CtxBracketSchedule {
+        current: default_ctx_bracket_table_record(),
+        pending: None,
+    }
+}
+
+pub fn validate_ctx_bracket_table(record: &CtxBracketTableRecord) -> Result<(), String> {
+    if record.ver == 0 {
+        return Err("context bracket table version must be positive".to_owned());
+    }
+    if record.brackets.is_empty() || record.brackets.len() > 32 {
+        return Err("context bracket table must contain 1..=32 entries".to_owned());
+    }
+    let mut previous_max = 0_u64;
+    let mut ids = BTreeMap::new();
+    for (idx, entry) in record.brackets.iter().enumerate() {
+        if entry.id.is_empty()
+            || entry.id.len() > 128
+            || entry
+                .id
+                .bytes()
+                .any(|byte| !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-'))
+        {
+            return Err(format!("invalid context bracket id {}", entry.id));
+        }
+        if ids.insert(entry.id.as_str(), ()).is_some() {
+            return Err(format!("duplicate context bracket id {}", entry.id));
+        }
+        let is_last = idx + 1 == record.brackets.len();
+        match (is_last, entry.max_ctx) {
+            (true, None) => {}
+            (true, Some(_)) => {
+                return Err("last context bracket max_ctx must be null".to_owned());
+            }
+            (false, None) => {
+                return Err("only the last context bracket may have null max_ctx".to_owned());
+            }
+            (false, Some(max_ctx)) if max_ctx > previous_max => {
+                previous_max = max_ctx;
+            }
+            (false, Some(_)) => {
+                return Err("context bracket max_ctx values must increase".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_ctx_bracket_schedule(schedule: &CtxBracketSchedule) -> Result<(), String> {
+    validate_ctx_bracket_table(&schedule.current)?;
+    if let Some(pending) = &schedule.pending {
+        validate_ctx_bracket_table(pending)?;
+        if pending.ver <= schedule.current.ver {
+            return Err("pending context bracket version must advance".to_owned());
+        }
+    }
+    Ok(())
+}
+
+pub fn ctx_bracket_table_at(schedule: &CtxBracketSchedule, at: u64) -> &CtxBracketTableRecord {
+    schedule
+        .pending
+        .as_ref()
+        .filter(|pending| pending.effective_at <= at)
+        .unwrap_or(&schedule.current)
+}
+
+pub fn ctx_bracket_for_tokens_in_table(
+    tokens: u32,
+    table: &CtxBracketTableRecord,
+) -> Option<String> {
+    let tokens = u64::from(tokens);
+    table
+        .brackets
+        .iter()
+        .find(|entry| match entry.max_ctx {
+            Some(max_ctx) => tokens <= max_ctx,
+            None => true,
+        })
+        .map(|entry| entry.id.clone())
+}
+
+pub fn ctx_bracket_for_tokens_in_schedule(
+    tokens: u32,
+    schedule: &CtxBracketSchedule,
+    at: u64,
+) -> Option<(String, u32)> {
+    let table = ctx_bracket_table_at(schedule, at);
+    ctx_bracket_for_tokens_in_table(tokens, table).map(|bracket| (bracket, table.ver))
 }
 pub const HARDWARE_QUOTE_BINDING_DOMAIN: &str = "mayhem-hardware-quote-binding-v1";
 pub const SESSION_ACCEPT_SIGNING_DOMAIN: &str = "mayhem/session-accept/v1";
@@ -1103,6 +1238,45 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-proto");
+    }
+
+    #[test]
+    fn context_bracket_schedule_selects_active_version() {
+        let mut schedule = default_ctx_bracket_schedule();
+        assert_eq!(
+            ctx_bracket_for_tokens_in_schedule(9_000, &schedule, 0),
+            Some(("le32k".to_owned(), CTX_BRACKET_TABLE_VERSION))
+        );
+        schedule.pending = Some(CtxBracketTableRecord {
+            ver: 2,
+            effective_at: 100,
+            submitted_at: 10,
+            brackets: vec![
+                CtxBracketEntry {
+                    id: "le16k".to_owned(),
+                    max_ctx: Some(16_384),
+                },
+                CtxBracketEntry {
+                    id: "gt16k".to_owned(),
+                    max_ctx: None,
+                },
+            ],
+        });
+        validate_ctx_bracket_schedule(&schedule).unwrap();
+        assert_eq!(
+            ctx_bracket_for_tokens_in_schedule(9_000, &schedule, 99),
+            Some(("le32k".to_owned(), CTX_BRACKET_TABLE_VERSION))
+        );
+        assert_eq!(
+            ctx_bracket_for_tokens_in_schedule(9_000, &schedule, 100),
+            Some(("le16k".to_owned(), 2))
+        );
+
+        let mut invalid = schedule.current.clone();
+        invalid.brackets[0].max_ctx = None;
+        assert!(validate_ctx_bracket_table(&invalid)
+            .unwrap_err()
+            .contains("only the last"));
     }
 
     #[test]

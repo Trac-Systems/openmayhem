@@ -58,11 +58,12 @@ use mayhem_hwprobe::{
     ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
-    chunk_json_payload, ctx_bracket_for_tokens, reassemble_json_payload, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, supported_receipt_signing_bytes,
-    supported_spend_voucher_signing_bytes, AttestationRuntimeConfig, CatalogEnclaveIdentity,
-    CheckpointPolicy, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, CONTRACT_VERSION, CTX_BRACKET_TABLE_VERSION, DEFAULT_MODEL_CLASS,
+    chunk_json_payload, ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule,
+    reassemble_json_payload, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, supported_receipt_signing_bytes, supported_spend_voucher_signing_bytes,
+    validate_ctx_bracket_schedule, AttestationRuntimeConfig, CatalogEnclaveIdentity,
+    CheckpointPolicy, CtxBracketSchedule, PayloadChunk, PayloadChunkManifest, ReceiptAck,
+    ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
     DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
     USAGE_STEP,
@@ -16061,6 +16062,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                     .with_provider_earnings(provider_earnings)
                     .with_failover_policy(failover_policy)
                     .with_epoch_seconds(gateway_epoch_seconds)
+                    .with_ctx_bracket_schedule(contract.ctx_bracket_schedule.clone())
                     .with_receipt_user_seed(user_seed)
                     .with_receipt_balance_mu(balance_mu)
                     .with_session_backend(Arc::new(backend)),
@@ -21899,6 +21901,7 @@ struct ContractCatalog {
     kyb: Vec<LedgerProviderKyb>,
     prices: Vec<LedgerPriceSchedule>,
     price_derivations: Vec<Value>,
+    ctx_bracket_schedule: CtxBracketSchedule,
     rules: Option<RulesRef>,
 }
 
@@ -22049,6 +22052,7 @@ struct ProviderCandidate {
     verdict: BackendVerdict,
     price: Option<LedgerPriceSchedule>,
     served_ctx: u64,
+    ctx_bracket_schedule: CtxBracketSchedule,
 }
 
 #[derive(Debug, Clone)]
@@ -22559,6 +22563,7 @@ struct ProviderSessionTerms {
     ctx: u64,
     ctx_bracket: String,
     ctx_bracket_table_ver: u32,
+    ctx_bracket_schedule: CtxBracketSchedule,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -25270,6 +25275,7 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         })
         .map(|entry| entry.value)
         .collect::<Vec<_>>();
+    let ctx_bracket_schedule = read_ctx_bracket_schedule(rpc).await?;
     Ok(ContractCatalog {
         enclaves: read_prefix_values_filtered(rpc, "enclave/", |tail| !tail.contains('/')).await?,
         rooms: read_prefix_values_filtered(rpc, "room/", |tail| !tail.contains('/')).await?,
@@ -25280,12 +25286,25 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         kyb: read_prefix_values_filtered(rpc, "kyb/", |tail| !tail.contains('/')).await?,
         prices,
         price_derivations,
+        ctx_bracket_schedule,
         rules: read_state_value(rpc, "rules/current")
             .await?
             .map(serde_json::from_value)
             .transpose()
             .context("parsing rules/current")?,
     })
+}
+
+async fn read_ctx_bracket_schedule(rpc: &PeerRpcClient) -> Result<CtxBracketSchedule> {
+    let schedule = match read_state_value(rpc, "ctx_brackets").await? {
+        Some(value) => {
+            serde_json::from_value(value).context("parsing contract ctx_brackets schedule")?
+        }
+        None => default_ctx_bracket_schedule(),
+    };
+    validate_ctx_bracket_schedule(&schedule)
+        .map_err(|err| anyhow::anyhow!("invalid contract ctx_brackets schedule: {err}"))?;
+    Ok(schedule)
 }
 
 async fn read_prefix_values<T>(rpc: &PeerRpcClient, prefix: &str) -> Result<Vec<T>>
@@ -26123,6 +26142,7 @@ fn build_provider_candidates(
             verdict: verdict.clone(),
             price: Some(price),
             served_ctx: resolve_provider_served_ctx(model, args.ctx),
+            ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
         });
     }
     if let Some(requested) = requested_enclave {
@@ -27392,13 +27412,15 @@ async fn serve_provider_sessions(
     provider_log(
         ctx.args,
         &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} min_ask_mu {} max_sessions {}",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask_mu {} max_sessions {}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
             responder.mode(),
             terms.price_ver,
             format_rate_map(&terms.rate_map),
+            terms.ctx_bracket.as_str(),
+            terms.ctx_bracket_table_ver,
             terms.min_ask_mu,
             protection_config.max_sessions
         ),
@@ -27814,7 +27836,12 @@ async fn handle_provider_session_frame(
                 .context("opening provider side direct session")?;
             provider_session_debug(format!("provider side session {session_id} opened"));
             let session_rail = provider_session_frame_rail(&frame).unwrap_or_default();
-            let static_decision = provider_session_open_decision(&frame, terms);
+            let contract = read_contract_catalog(runtime.rpc).await?;
+            let validation_terms = ProviderSessionTerms {
+                ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
+                ..terms.clone()
+            };
+            let static_decision = provider_session_open_decision(&frame, &validation_terms);
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
                     let protection_decision = if heartbeat_load.is_accepting_new() {
@@ -27833,13 +27860,12 @@ async fn handle_provider_session_frame(
                         provider_session_debug(
                             "s.open static decision accepted; rechecking contract",
                         );
-                        let live_decision = provider_session_current_state_decision(
-                            runtime.rpc,
+                        let live_decision = provider_session_contract_decision(
+                            &contract,
                             terms,
                             runtime.rooms,
                             &session_rail,
-                        )
-                        .await?;
+                        );
                         match live_decision {
                             ProviderSessionDecision::Accept => {
                                 provider_session_spend_reservation_decision(
@@ -27920,6 +27946,8 @@ async fn handle_provider_session_frame(
                         "att_report": session_attestation.report,
                         "engine": {
                             "ctx": terms.ctx,
+                            "ctx_bracket": spend_voucher.body.ctx_bracket.clone(),
+                            "ctx_bracket_table_ver": spend_voucher.body.ctx_bracket_table_ver,
                             "mode": "provider-session-server-v1",
                         },
                         "ts": ts,
@@ -29795,8 +29823,14 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         .as_ref()
         .and_then(current_mu_usd_price)
         .context("selected provider enclave has no current admin price")?;
-    let ctx_bracket =
-        ctx_bracket_for_tokens(u32::try_from(ctx.selected.served_ctx).unwrap_or(u32::MAX));
+    let started_at = unix_epoch_seconds()?;
+    let served_ctx = u32::try_from(ctx.selected.served_ctx).unwrap_or(u32::MAX);
+    let (ctx_bracket, ctx_bracket_table_ver) = ctx_bracket_for_tokens_in_schedule(
+        served_ctx,
+        &ctx.selected.ctx_bracket_schedule,
+        started_at,
+    )
+    .context("selected provider context is not covered by the active context bracket table")?;
     Ok(ProviderSessionTerms {
         contract_version: CONTRACT_VERSION,
         provider: ctx.wallet.public_key.clone(),
@@ -29811,24 +29845,10 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         min_ask_mu: ctx.args.min_ask_mu,
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.served_ctx,
-        ctx_bracket: ctx_bracket.to_owned(),
-        ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
+        ctx_bracket,
+        ctx_bracket_table_ver,
+        ctx_bracket_schedule: ctx.selected.ctx_bracket_schedule.clone(),
     })
-}
-
-async fn provider_session_current_state_decision(
-    rpc: &PeerRpcClient,
-    terms: &ProviderSessionTerms,
-    startup_rooms: &[LedgerRoom],
-    rail: &str,
-) -> Result<ProviderSessionDecision> {
-    let contract = read_contract_catalog(rpc).await?;
-    Ok(provider_session_contract_decision(
-        &contract,
-        terms,
-        startup_rooms,
-        rail,
-    ))
 }
 
 fn provider_session_contract_decision(
@@ -29973,7 +29993,10 @@ async fn provider_session_spend_reservation_decision(
         reason,
     };
     let epoch = active_billing_epoch(rpc).await?;
-    let at = unix_epoch_seconds()?;
+    let at = match provider_session_open_at(frame) {
+        Ok(at) => at,
+        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+    };
     let mut value = match provider_session_spend_reservation_value(terms, frame, rail, epoch, at) {
         Ok(value) => value,
         Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
@@ -30124,6 +30147,13 @@ fn spend_reservation_feature_key(value: &Value) -> Result<String> {
     ))
 }
 
+fn provider_session_open_at(frame: &Value) -> Result<u64> {
+    frame
+        .get("at")
+        .and_then(Value::as_u64)
+        .context("s.open missing contract policy timestamp at")
+}
+
 fn provider_session_open_decision(
     frame: &Value,
     terms: &ProviderSessionTerms,
@@ -30172,6 +30202,12 @@ fn provider_session_open_decision(
             "session price_ver does not match this admin-created enclave".to_owned(),
         );
     }
+    let Some(opened_at) = frame.get("at").and_then(Value::as_u64) else {
+        return reject(
+            "SCHEMA",
+            "session open frame is missing contract policy timestamp at".to_owned(),
+        );
+    };
     if frame.get("rules_ver").and_then(Value::as_u64) != Some(terms.rules_ver) {
         return reject(
             "CONSENT",
@@ -30240,22 +30276,39 @@ fn provider_session_open_decision(
             "voucher served_ctx does not match provider committed context".to_owned(),
         );
     }
-    if voucher.body.ctx_bracket != terms.ctx_bracket {
+    if frame.get("served_ctx").and_then(Value::as_u64) != Some(u64::from(voucher.body.served_ctx)) {
+        return reject("VOUCHER", "frame served_ctx mismatch".to_owned());
+    }
+    if frame.get("ctx_bracket").and_then(Value::as_str) != Some(voucher.body.ctx_bracket.as_str()) {
+        return reject("VOUCHER", "frame ctx_bracket mismatch".to_owned());
+    }
+    if frame.get("ctx_bracket_table_ver").and_then(Value::as_u64)
+        != Some(u64::from(voucher.body.ctx_bracket_table_ver))
+    {
+        return reject("VOUCHER", "frame ctx_bracket_table_ver mismatch".to_owned());
+    }
+    let Some((expected_ctx_bracket, expected_ctx_bracket_table_ver)) =
+        ctx_bracket_for_tokens_in_schedule(
+            voucher.body.served_ctx,
+            &terms.ctx_bracket_schedule,
+            opened_at,
+        )
+    else {
         return reject(
             "VOUCHER",
-            "voucher ctx_bracket does not match provider committed context".to_owned(),
+            "active context bracket table does not cover served_ctx".to_owned(),
+        );
+    };
+    if voucher.body.ctx_bracket != expected_ctx_bracket {
+        return reject(
+            "VOUCHER",
+            "voucher ctx_bracket does not match active admin context table".to_owned(),
         );
     }
-    if voucher.body.ctx_bracket_table_ver != terms.ctx_bracket_table_ver {
+    if voucher.body.ctx_bracket_table_ver != expected_ctx_bracket_table_ver {
         return reject(
             "VOUCHER",
-            "voucher ctx_bracket_table_ver does not match provider committed context".to_owned(),
-        );
-    }
-    if voucher.body.ctx_bracket != ctx_bracket_for_tokens(voucher.body.served_ctx) {
-        return reject(
-            "VOUCHER",
-            "voucher ctx_bracket does not match served_ctx".to_owned(),
+            "voucher ctx_bracket_table_ver does not match active admin context table".to_owned(),
         );
     }
     if voucher.body.max_spend_mu == 0 {
@@ -32386,6 +32439,7 @@ fn setup_admin_payout_notice(role: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use mayhem_proto::{ctx_bracket_for_tokens, CTX_BRACKET_TABLE_VERSION};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32991,6 +33045,7 @@ mod tests {
             },
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
         };
         let config: MayhemConfig = toml::from_str(
             r#"
@@ -36144,6 +36199,12 @@ mod tests {
             provider_session_open_decision(&frame, &terms),
             ProviderSessionDecision::Accept
         );
+        let mut missing_at = frame.clone();
+        missing_at.as_object_mut().unwrap().remove("at");
+        assert!(matches!(
+            provider_session_open_decision(&missing_at, &terms),
+            ProviderSessionDecision::Reject { code: "SCHEMA", .. }
+        ));
         let mut priced_out_terms = terms.clone();
         priced_out_terms.min_ask_mu = 1001;
         assert!(matches!(
@@ -36301,6 +36362,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn provider_session_open_uses_admin_ctx_bracket_schedule() {
+        let mut terms = test_provider_session_terms();
+        terms.ctx = 12_000;
+        terms.ctx_bracket = "le16k".to_owned();
+        terms.ctx_bracket_table_ver = 2;
+        terms.ctx_bracket_schedule = CtxBracketSchedule {
+            current: mayhem_proto::CtxBracketTableRecord {
+                ver: 2,
+                submitted_at: 1,
+                effective_at: 1,
+                brackets: vec![
+                    mayhem_proto::CtxBracketEntry {
+                        id: "le16k".to_owned(),
+                        max_ctx: Some(16_384),
+                    },
+                    mayhem_proto::CtxBracketEntry {
+                        id: "gt16k".to_owned(),
+                        max_ctx: None,
+                    },
+                ],
+            },
+            pending: None,
+        };
+        let frame = test_session_open_frame(&terms);
+        assert_eq!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Accept
+        );
+
+        let mut stale_table = frame.clone();
+        stale_table["ctx_bracket"] = json!("le32k");
+        stale_table["voucher"]["ctx_bracket"] = json!("le32k");
+        match provider_session_open_decision(&stale_table, &terms) {
+            ProviderSessionDecision::Reject { code, reason } => {
+                assert_eq!(code, "VOUCHER");
+                assert!(reason.contains("active admin context table"));
+            }
+            other => panic!("stale context table should reject: {other:?}"),
+        }
     }
 
     #[test]
@@ -37806,6 +37909,7 @@ mod tests {
             },
             price: None,
             served_ctx: 1,
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
         };
         let artifact_paths = ProviderArtifactPaths {
             primary: PathBuf::from("/tmp/admin-approved-voice"),
@@ -37884,6 +37988,7 @@ mod tests {
             verdict,
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
         };
         selected.enclave.caps = json!({ "tools": true, "json": true, "ctx": 4096 });
 
@@ -41588,6 +41693,7 @@ mod tests {
             ctx: 8192,
             ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
             ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
         }
     }
 
@@ -41626,6 +41732,7 @@ mod tests {
             "user": user,
             "enclave_id": &terms.enclave_id,
             "price_ver": terms.price_ver,
+            "at": 1,
             "rules_ver": terms.rules_ver,
             "served_ctx": voucher_body.served_ctx,
             "ctx_bracket": voucher_body.ctx_bracket.clone(),
@@ -42433,6 +42540,7 @@ mod tests {
                 pending: None,
             }],
             price_derivations: Vec::new(),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
             rules: Some(RulesRef {
                 ver: 3,
                 hash: "99".repeat(32),
