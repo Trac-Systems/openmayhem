@@ -292,6 +292,47 @@ test('MayhemContract canary mismatch slashes held earnings, tombstones serving, 
   assert.equal(slash.slash_hash.length, 64);
 });
 
+test('MayhemContract context needle canary mismatch is slashable', async () => {
+  const ctx = await setupSlashContract();
+  await setupProviderServing(ctx);
+  await seedHeldEarnings(ctx.storage, ctx.provider);
+
+  const registeredAuditor = await execute(
+    ctx.contract,
+    ctx.storage,
+    'auditorRegister',
+    { op: 'auditor_register', auditor: ctx.auditor.publicKey },
+    ctx.admin.publicKey,
+    9
+  );
+  assert.equal(registeredAuditor.ok, true, registeredAuditor.message);
+
+  const result = await execute(
+    ctx.contract,
+    ctx.storage,
+    'probeResult',
+    signedCanaryProbe(ctx, {
+      probe_id: 'context-needle-slash',
+      verification_method: 'context_needle',
+      match_bps: 0,
+      pass: false,
+    }),
+    ctx.auditor.publicKey,
+    10
+  );
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.provenance_violation, true);
+
+  const probe = (await ctx.storage.get('ev/probe/context-needle-slash')).value;
+  assert.equal(probe.verification_method, 'context_needle');
+  assert.equal(probe.pass, false);
+
+  const slash = (await ctx.storage.get(`ev/slash/${ctx.provider.publicKey}/${makeTxKey(10)}`)).value;
+  assert.equal(slash.reason, 'canary_mismatch');
+  assert.equal(slash.provider_banned, true);
+  assert.equal(slash.tombstone.serve_tombstoned, true);
+});
+
 test('MayhemContract canary mismatch uses admin-governed fraud_slash_bps', async () => {
   const ctx = await setupSlashContract();
   await setupProviderServing(ctx);

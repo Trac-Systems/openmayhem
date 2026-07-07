@@ -780,6 +780,83 @@ impl GatewaySessionBackend for CanarySubstitutionBackend {
     }
 }
 
+#[derive(Debug)]
+struct ContextNeedleBackend {
+    answer_needle: bool,
+}
+
+impl GatewaySessionBackend for ContextNeedleBackend {
+    fn name(&self) -> &str {
+        "test-context-needle"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            let prompt = request
+                .messages
+                .iter()
+                .map(|message| message.content.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let is_catalog_canary = prompt.contains("fixed canary");
+            let is_context_needle = prompt.contains("CONTEXT NEEDLE CODE:");
+            let content = if is_context_needle {
+                let code = prompt
+                    .split("CONTEXT NEEDLE CODE:")
+                    .nth(1)
+                    .and_then(|tail| tail.split_whitespace().next())
+                    .unwrap_or("MAYHEM-CTX-MISSING");
+                if self.answer_needle {
+                    code.to_owned()
+                } else {
+                    "needle omitted".to_owned()
+                }
+            } else if is_catalog_canary {
+                "substituted canary output".to_owned()
+            } else {
+                format!(
+                    "normal direct session response from {} via {}",
+                    model.id, invocation.session_id
+                )
+            };
+            let token_ids = if is_catalog_canary {
+                vec![9, 9, 9]
+            } else if is_context_needle && self.answer_needle {
+                vec![7, 7, 7]
+            } else if is_context_needle {
+                vec![0, 0, 0]
+            } else {
+                vec![1, 2, 3]
+            };
+            let prompt_tokens = request.messages.len() as u64;
+            let completion_tokens = token_ids.len() as u64;
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    content: Some(content),
+                    tool_call: None,
+                    artifacts: Vec::new(),
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids,
+                quality: None,
+            })
+        })
+    }
+}
+
 fn test_app() -> Router {
     openai_router(GatewayState::from_embedded_catalog().with_dev_session_shim())
 }
@@ -1490,6 +1567,61 @@ async fn automatic_canary_probe_accepts_exact_catalog_token_prefix() {
     assert_eq!(
         probes[0].reputation_event_kind,
         ReputationEventKind::ProbeOk
+    );
+}
+
+#[tokio::test]
+async fn automatic_context_needle_probe_marks_long_context_truncation_slashable() {
+    let mut model = routed_test_model();
+    model.mayhem.caps.ctx = 131_072;
+    model.mayhem.route_candidates[0].caps = json!({ "ctx": 131_072 });
+    let state = GatewayState::from_models(vec![model])
+        .with_receipt_balance_mu(10_000_000)
+        .with_canary_registry(test_canary_registry(&[9, 9, 9]))
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(ContextNeedleBackend {
+            answer_needle: false,
+        }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Use a direct session." }]
+    });
+
+    let (status, _body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let probes = state.probes();
+    assert_eq!(probes.len(), 2);
+    assert!(probes
+        .iter()
+        .any(|probe| probe.verification_method == "token_fingerprint" && probe.pass));
+    let needle = probes
+        .iter()
+        .find(|probe| probe.verification_method == "context_needle")
+        .expect("context needle probe");
+    assert!(!needle.pass);
+    assert_eq!(needle.match_bps, 0);
+    assert_eq!(needle.reputation_event_kind, ReputationEventKind::ProbeFail);
+    assert_eq!(needle.probe_command["probe_kind"], "canary");
+    assert_eq!(
+        needle.probe_command["verification_method"],
+        "context_needle"
+    );
+    assert_eq!(needle.probe_command["pass"], false);
+    assert_eq!(needle.evidence["evidence"]["served_ctx"], 131_072);
+    assert_eq!(needle.evidence["evidence"]["ctx_bracket"], "le128k");
+    assert!(
+        needle.evidence["evidence"]["needle_position_tokens"]
+            .as_u64()
+            .unwrap()
+            > 100_000
+    );
+    assert!(
+        needle.evidence["evidence"]["tail_tokens_after_needle"]
+            .as_u64()
+            .unwrap()
+            >= 16_384
     );
 }
 

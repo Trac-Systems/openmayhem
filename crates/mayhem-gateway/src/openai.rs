@@ -15,8 +15,8 @@ use crate::{
     audit::{
         aggregate_canary_fingerprints, evaluate_catalog_canary_token_prefix_probe,
         supported_canary_verification_method, token_fingerprint, CanaryProbeSpec,
-        CANARY_VERIFICATION_TOKEN_FINGERPRINT, DEFAULT_CANARY_MATCH_MIN_BPS,
-        DEFAULT_CANARY_TEMPERATURE,
+        CANARY_VERIFICATION_CONTEXT_NEEDLE, CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+        DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
         default_ttft_timeout_millis, midstream_stalled_after, x_mayhem_hedge_requested,
@@ -89,6 +89,9 @@ const X_MAYHEM_MIN_TOK_S_HEADER: &str = "x-mayhem-min-tok-s";
 const ROUTE_REPUTATION_PRIORITY_BPS_DELTA: u32 = 500;
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const DEFAULT_CANARY_SEED: i64 = 7;
+const CONTEXT_NEEDLE_MIN_CTX: u32 = 32_768;
+const CONTEXT_NEEDLE_MAX_TOKENS: u32 = 16;
+const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
@@ -11028,7 +11031,15 @@ impl GatewayState {
             .run_canary_probe_for_route(model, invocation, &config)
             .await
         {
-            Ok(probe) => self.record_probe(probe),
+            Ok(probe) => {
+                self.record_probe(probe);
+                if let Ok(Some(context_probe)) = self
+                    .run_context_needle_probe_for_route(model, invocation, &config)
+                    .await
+                {
+                    self.record_probe(context_probe);
+                }
+            }
             Err(err) => {
                 self.record_probe(failed_canary_runtime_probe(
                     model,
@@ -11040,6 +11051,161 @@ impl GatewayState {
                 ));
             }
         }
+    }
+
+    async fn run_context_needle_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<Option<StoredProbeEvent>, ApiError> {
+        if model.mayhem.model_class != DEFAULT_MODEL_CLASS {
+            return Ok(None);
+        }
+        if served_invocation.served_ctx < CONTEXT_NEEDLE_MIN_CTX {
+            return Ok(None);
+        }
+        let Some(route) = canary_served_route(model, served_invocation) else {
+            return Ok(None);
+        };
+        let spec = context_needle_spec(model, served_invocation, config, self.canary_policy.seed);
+        let request = context_needle_chat_request(&model.id, &spec);
+        let invocation = match self.prepare_chat_invocation_for_route(
+            model,
+            &request,
+            Some(&route),
+            &GatewayRequestOptions::default(),
+        ) {
+            Ok(invocation) => invocation,
+            Err(_) => return Ok(None),
+        };
+        let result = match self
+            .session_backend
+            .run_chat(model, &request, &invocation)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                return Ok(Some(failed_context_needle_runtime_probe(
+                    model,
+                    served_invocation,
+                    config,
+                    &spec,
+                    err.message,
+                    self.canary_policy.epoch,
+                    &self.receipt_config.user_seed,
+                )));
+            }
+        };
+        let response = result.output.content.clone().unwrap_or_default();
+        let pass = context_needle_response_matches(&response, &spec.answer);
+        let match_bps = if pass { 10_000 } else { 0 };
+        let token_fingerprint = token_fingerprint(result.token_ids.iter().copied()).digest;
+        let receipt = self.meter_chat_session(
+            model,
+            &request,
+            &result.output,
+            &invocation,
+            result.provider_receipt.as_ref(),
+        )?;
+        let receipt_hash = stable_value_hash(&json!(receipt));
+        let provider = served_invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let binary_hash = served_invocation
+            .attestation
+            .as_ref()
+            .map(|attestation| attestation.contract.binary_hash.clone())
+            .unwrap_or_default();
+        let expected_fingerprint = stable_value_hash(&json!({
+            "domain": "mayhem-context-needle-expected-v1",
+            "answer": spec.answer.clone(),
+        }));
+        let observed_fingerprint = stable_value_hash(&json!({
+            "domain": "mayhem-context-needle-observed-v1",
+            "response": response,
+            "token_fingerprint": token_fingerprint,
+        }));
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-context-needle-probe-evidence",
+            "model": model.id,
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
+            "canary_set": config.canary_set,
+            "verification_method": CANARY_VERIFICATION_CONTEXT_NEEDLE,
+            "served_ctx": served_invocation.served_ctx,
+            "ctx_bracket": served_invocation.ctx_bracket,
+            "ctx_bracket_table_ver": served_invocation.ctx_bracket_table_ver,
+            "needle_position_tokens": spec.needle_position_tokens,
+            "tail_tokens_after_needle": spec.tail_tokens_after_needle,
+            "answer_hash": expected_fingerprint,
+            "response": response,
+            "response_token_fingerprint": token_fingerprint,
+            "pass": pass,
+            "match_bps": match_bps,
+            "receipt_hash": receipt_hash,
+        });
+        let evidence_hash = stable_value_hash(&evidence);
+        let at = now_secs();
+        let probe_id = stable_value_hash(&json!({
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "canary_set": config.canary_set,
+            "verification_method": CANARY_VERIFICATION_CONTEXT_NEEDLE,
+            "epoch": self.canary_policy.epoch,
+            "served_ctx": served_invocation.served_ctx,
+            "needle_position_tokens": spec.needle_position_tokens,
+            "evidence_hash": evidence_hash,
+        }));
+        let mut probe_command = json!({
+            "op": "probe_result",
+            "probe_id": probe_id,
+            "probe_kind": "canary",
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
+            "epoch": self.canary_policy.epoch,
+            "at": at,
+            "canary_set": config.canary_set,
+            "verification_method": CANARY_VERIFICATION_CONTEXT_NEEDLE,
+            "match_bps": match_bps,
+            "pass": pass,
+            "session_receipt_hash": receipt_hash,
+            "evidence_hash": evidence_hash,
+        });
+        probe_command["auditor_sig"] = json!(probe_result_signature(
+            &self.receipt_config.user_seed,
+            &probe_command,
+            &verifying_key_hex(&self.receipt_config.user_seed),
+        ));
+        Ok(Some(StoredProbeEvent {
+            probe_id,
+            model_id: model.id.clone(),
+            provider,
+            enclave_id: served_invocation.enclave_id.clone(),
+            binary_hash,
+            canary_set: config.canary_set.clone(),
+            verification_method: CANARY_VERIFICATION_CONTEXT_NEEDLE.to_owned(),
+            expected_fingerprint,
+            observed_fingerprint,
+            match_bps,
+            pass,
+            reputation_event_kind: if pass {
+                ReputationEventKind::ProbeOk
+            } else {
+                ReputationEventKind::ProbeFail
+            },
+            session_receipt_hash: receipt_hash,
+            evidence: json!({
+                "evidence": evidence,
+                "receipts": [receipt],
+            }),
+            evidence_hash,
+            probe_command,
+        }))
     }
 
     async fn run_canary_probe_for_route(
@@ -12355,6 +12521,101 @@ fn canary_expected_token_prefixes(
         .or_else(|| config.default_token_prefixes.clone())
 }
 
+#[derive(Clone, Debug)]
+struct ContextNeedleSpec {
+    answer: String,
+    prompt: String,
+    needle_position_tokens: u32,
+    tail_tokens_after_needle: u32,
+}
+
+fn context_needle_spec(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    config: &GatewayCanaryModelConfig,
+    seed: i64,
+) -> ContextNeedleSpec {
+    let tail_tokens =
+        (invocation.served_ctx / 8).clamp(CONTEXT_NEEDLE_MIN_CTX / 2, invocation.served_ctx / 2);
+    let needle_position_tokens = invocation.served_ctx.saturating_sub(tail_tokens).max(1);
+    let digest = blake3::hash(
+        format!(
+            "mayhem-context-needle:{}:{}:{}:{}:{}",
+            model.id, invocation.enclave_id, config.canary_set, invocation.served_ctx, seed
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    let answer = format!("MAYHEM-CTX-{}", digest[..12].to_ascii_uppercase());
+    let before_words = needle_position_tokens.saturating_sub(64) as usize;
+    let after_words = tail_tokens.saturating_sub(64) as usize;
+    let mut prompt = String::new();
+    prompt.push_str("You are reading a Mayhem context canary. Return only the exact needle code requested at the end.\n\n");
+    push_context_needle_filler(&mut prompt, before_words);
+    prompt.push_str("\n\nCONTEXT NEEDLE CODE: ");
+    prompt.push_str(&answer);
+    prompt.push_str("\n\n");
+    push_context_needle_filler(&mut prompt, after_words);
+    prompt.push_str("\n\nQuestion: what is the CONTEXT NEEDLE CODE? Return only that code.");
+    ContextNeedleSpec {
+        answer,
+        prompt,
+        needle_position_tokens,
+        tail_tokens_after_needle: tail_tokens,
+    }
+}
+
+fn push_context_needle_filler(prompt: &mut String, words: usize) {
+    for idx in 0..words {
+        if idx > 0 {
+            prompt.push(' ');
+        }
+        prompt.push_str("haystack");
+        if (idx + 1) % CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE == 0 {
+            prompt.push('\n');
+        }
+    }
+}
+
+fn context_needle_response_matches(response: &str, answer: &str) -> bool {
+    response.to_ascii_uppercase().contains(answer)
+}
+
+fn context_needle_chat_request(model_id: &str, spec: &ContextNeedleSpec) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model_id.to_owned(),
+        messages: vec![
+            ChatMessage {
+                role: "system".to_owned(),
+                content: json!("Return only the exact context needle code."),
+                name: None,
+                extra: BTreeMap::new(),
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: json!(spec.prompt.clone()),
+                name: None,
+                extra: BTreeMap::new(),
+            },
+        ],
+        user: None,
+        metadata: BTreeMap::new(),
+        stream: true,
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        tools: None,
+        tool_choice: None,
+        response_format: None,
+        temperature: Some(DEFAULT_CANARY_TEMPERATURE),
+        top_p: None,
+        seed: Some(0),
+        stop: None,
+        max_tokens: Some(CONTEXT_NEEDLE_MAX_TOKENS),
+    }
+}
+
 fn canary_chat_request(
     model_id: &str,
     _config: &GatewayCanaryModelConfig,
@@ -12459,6 +12720,101 @@ fn failed_canary_runtime_probe(
             .as_str()
             .unwrap_or_default()
             .to_owned(),
+        evidence_hash,
+        evidence,
+        probe_command,
+    }
+}
+
+fn failed_context_needle_runtime_probe(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    config: &GatewayCanaryModelConfig,
+    spec: &ContextNeedleSpec,
+    reason: String,
+    epoch: u64,
+    auditor_seed: &[u8; 32],
+) -> StoredProbeEvent {
+    let provider = invocation
+        .provider_pubkey
+        .clone()
+        .unwrap_or_else(|| "local-provider".to_owned());
+    let binary_hash = invocation
+        .attestation
+        .as_ref()
+        .map(|attestation| attestation.contract.binary_hash.clone())
+        .unwrap_or_default();
+    let expected_fingerprint = stable_value_hash(&json!({
+        "domain": "mayhem-context-needle-expected-v1",
+        "answer": spec.answer.clone(),
+    }));
+    let evidence = json!({
+        "schema_version": 1,
+        "kind": "mayhem-context-needle-runtime-failure",
+        "model": model.id,
+        "provider": provider,
+        "enclave_id": invocation.enclave_id,
+        "binary_hash": binary_hash,
+        "canary_set": config.canary_set,
+        "verification_method": CANARY_VERIFICATION_CONTEXT_NEEDLE,
+        "served_ctx": invocation.served_ctx,
+        "ctx_bracket": invocation.ctx_bracket,
+        "ctx_bracket_table_ver": invocation.ctx_bracket_table_ver,
+        "needle_position_tokens": spec.needle_position_tokens,
+        "tail_tokens_after_needle": spec.tail_tokens_after_needle,
+        "answer_hash": expected_fingerprint,
+        "reason": reason,
+    });
+    let evidence_hash = stable_value_hash(&evidence);
+    let at = now_secs();
+    let session_receipt_hash = stable_value_hash(&json!({
+        "domain": "mayhem-context-needle-runtime-failure-v1",
+        "evidence_hash": evidence_hash,
+    }));
+    let probe_id = stable_value_hash(&json!({
+        "provider": provider,
+        "enclave_id": invocation.enclave_id,
+        "canary_set": config.canary_set,
+        "verification_method": CANARY_VERIFICATION_CONTEXT_NEEDLE,
+        "epoch": epoch,
+        "served_ctx": invocation.served_ctx,
+        "runtime_failure": evidence_hash,
+    }));
+    let mut probe_command = json!({
+        "op": "probe_result",
+        "probe_id": probe_id,
+        "probe_kind": "canary",
+        "provider": provider,
+        "enclave_id": invocation.enclave_id,
+        "binary_hash": binary_hash,
+        "epoch": epoch,
+        "at": at,
+        "canary_set": config.canary_set,
+        "verification_method": CANARY_VERIFICATION_CONTEXT_NEEDLE,
+        "match_bps": 0,
+        "pass": false,
+        "session_receipt_hash": session_receipt_hash,
+        "evidence_hash": evidence_hash,
+    });
+    probe_command["auditor_sig"] = json!(probe_result_signature(
+        auditor_seed,
+        &probe_command,
+        &verifying_key_hex(auditor_seed),
+    ));
+    StoredProbeEvent {
+        probe_id,
+        model_id: model.id.clone(),
+        provider,
+        enclave_id: invocation.enclave_id.clone(),
+        binary_hash,
+        canary_set: config.canary_set.clone(),
+        verification_method: CANARY_VERIFICATION_CONTEXT_NEEDLE.to_owned(),
+        expected_fingerprint,
+        observed_fingerprint: String::new(),
+        match_bps: 0,
+        pass: false,
+        reputation_event_kind: ReputationEventKind::ProbeFail,
+        session_receipt_hash,
         evidence_hash,
         evidence,
         probe_command,

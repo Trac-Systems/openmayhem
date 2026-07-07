@@ -8,6 +8,7 @@ use crate::ReputationEventKind;
 pub const DEFAULT_CANARY_MATCH_MIN_BPS: u32 = 9_000;
 pub const DEFAULT_CANARY_TEMPERATURE: f64 = 0.0;
 pub const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
+pub const CANARY_VERIFICATION_CONTEXT_NEEDLE: &str = "context_needle";
 pub const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
 pub const CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 
@@ -89,6 +90,7 @@ pub fn supported_canary_verification_method(method: &str) -> bool {
     matches!(
         method,
         CANARY_VERIFICATION_TOKEN_FINGERPRINT
+            | CANARY_VERIFICATION_CONTEXT_NEEDLE
             | CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
             | CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE
     )

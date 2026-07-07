@@ -110,6 +110,7 @@ const REPUTATION_EVENT_KINDS = new Set([
 const PROBE_KINDS = new Set(['canary', 'uptime_tick']);
 const PROBE_VERIFICATION_METHODS = new Set([
   'token_fingerprint',
+  'context_needle',
   'seed_perceptual_hash',
   'attestation_of_compute',
 ]);

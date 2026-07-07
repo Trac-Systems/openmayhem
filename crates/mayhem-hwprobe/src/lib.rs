@@ -373,6 +373,32 @@ fn nvidia_gpu_uses_host_unified_memory(profile: &HardwareProfile, gpu: &GpuInfo)
     gpu.unified_memory || nvidia_host_unified_memory_signal(&profile.host, gpu)
 }
 
+fn os_memory_reserve_bytes(memory_bytes: u64, unified: bool) -> u64 {
+    let (bps, floor) = if unified {
+        (1_500_u64, 4 * GIB)
+    } else {
+        (1_000_u64, 2 * GIB)
+    };
+    let percent = ((u128::from(memory_bytes) * u128::from(bps)) / 10_000)
+        .try_into()
+        .unwrap_or(u64::MAX);
+    percent.max(floor)
+}
+
+fn estimated_partial_offload_layers(memory_bytes: u64, unified: bool) -> Option<u32> {
+    if memory_bytes == 0 {
+        return None;
+    }
+    let usable = memory_bytes.saturating_sub(os_memory_reserve_bytes(memory_bytes, unified));
+    let per_layer_bytes = if unified { 768 * MIB } else { 512 * MIB };
+    let layers = usable / per_layer_bytes;
+    (layers > 0).then_some(u32::try_from(layers.min(80)).unwrap_or(80))
+}
+
+fn estimated_partial_offload_tok_s(layers: Option<u32>, base: f64, per_layer: f64) -> Option<f64> {
+    Some(base + f64::from(layers.unwrap_or(0)) * per_layer)
+}
+
 fn trt_llm_verdict(profile: &HardwareProfile) -> BackendVerdict {
     let nvidia = profile
         .gpus
@@ -399,8 +425,12 @@ fn trt_llm_verdict(profile: &HardwareProfile) -> BackendVerdict {
             backend: "trt-llm".to_owned(),
             status: VerdictStatus::PartialOffload,
             reason: Some("NVIDIA GPU detected but compute capability is unknown".to_owned()),
-            est_tok_s: Some(28.0),
-            n_layers_gpu: Some(24),
+            est_tok_s: estimated_partial_offload_tok_s(
+                estimated_partial_offload_layers(total_vram, false),
+                12.0,
+                0.9,
+            ),
+            n_layers_gpu: estimated_partial_offload_layers(total_vram, false),
             max_sessions: 2,
             kv_cache_bytes_budget: total_vram / 4,
         };
@@ -442,14 +472,15 @@ fn trt_llm_verdict(profile: &HardwareProfile) -> BackendVerdict {
             kv_cache_bytes_budget: total_vram / 2,
         }
     } else {
+        let n_layers_gpu = estimated_partial_offload_layers(total_vram, false);
         BackendVerdict {
             backend: "trt-llm".to_owned(),
             status: VerdictStatus::PartialOffload,
             reason: Some(
                 "NVIDIA GPU lacks launch quantization target or has limited VRAM".to_owned(),
             ),
-            est_tok_s: Some(35.0),
-            n_layers_gpu: Some(24),
+            est_tok_s: estimated_partial_offload_tok_s(n_layers_gpu, 14.0, 0.9),
+            n_layers_gpu,
             max_sessions: 2,
             kv_cache_bytes_budget: total_vram / 3,
         }
@@ -477,12 +508,13 @@ fn mlx_verdict(profile: &HardwareProfile) -> BackendVerdict {
             kv_cache_bytes_budget: memory / 3,
         }
     } else {
+        let n_layers_gpu = estimated_partial_offload_layers(memory, true);
         BackendVerdict {
             backend: "mlx".to_owned(),
             status: VerdictStatus::PartialOffload,
             reason: Some("Apple Metal is present but unified memory is tight".to_owned()),
-            est_tok_s: Some(18.0),
-            n_layers_gpu: Some(20),
+            est_tok_s: estimated_partial_offload_tok_s(n_layers_gpu, 6.0, 0.8),
+            n_layers_gpu,
             max_sessions: 1,
             kv_cache_bytes_budget: memory / 4,
         }
@@ -504,26 +536,37 @@ fn llama_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
     });
 
     if has_accel && total_gpu_mem >= 8 * GIB {
+        let n_layers_gpu = estimated_partial_offload_layers(total_gpu_mem, false);
         BackendVerdict {
             backend: "llama.cpp".to_owned(),
             status: VerdictStatus::PartialOffload,
             reason: Some(
                 "GPU acceleration available for GGUF partial/full layer offload".to_owned(),
             ),
-            est_tok_s: Some(26.0),
-            n_layers_gpu: Some(28),
+            est_tok_s: estimated_partial_offload_tok_s(n_layers_gpu, 7.0, 0.75),
+            n_layers_gpu,
             max_sessions: 2,
             kv_cache_bytes_budget: total_gpu_mem / 3,
         }
     } else if has_accel && profile.memory.total_bytes >= 16 * GIB {
+        let unified = profile.memory.unified_memory
+            || profile
+                .gpus
+                .iter()
+                .any(|gpu| gpu.unified_memory || gpu.vendor == GpuVendor::Apple);
+        let memory = profile
+            .memory
+            .available_bytes
+            .unwrap_or(profile.memory.total_bytes);
+        let n_layers_gpu = estimated_partial_offload_layers(memory, unified);
         BackendVerdict {
             backend: "llama.cpp".to_owned(),
             status: VerdictStatus::PartialOffload,
             reason: Some(
                 "accelerator detected but dedicated VRAM is unknown or limited".to_owned(),
             ),
-            est_tok_s: Some(16.0),
-            n_layers_gpu: Some(12),
+            est_tok_s: estimated_partial_offload_tok_s(n_layers_gpu, 5.0, 0.55),
+            n_layers_gpu,
             max_sessions: 1,
             kv_cache_bytes_budget: profile
                 .memory
@@ -1031,25 +1074,32 @@ fn probe_rocm() -> Vec<GpuInfo> {
     let Some(output) = command_stdout("rocm-smi", &["--showproductname"]) else {
         return Vec::new();
     };
+    let memory_bytes = command_stdout("rocm-smi", &["--showmeminfo", "vram"])
+        .map(|output| parse_rocm_vram_bytes(&output))
+        .unwrap_or_default();
     output
         .lines()
         .filter(|line| line.contains("GPU") && line.contains(':'))
-        .map(|line| GpuInfo {
-            vendor: GpuVendor::Amd,
-            name: line
+        .enumerate()
+        .map(|(idx, line)| {
+            let name = line
                 .split(':')
                 .nth(1)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("AMD ROCm GPU")
-                .to_owned(),
-            backend: GpuBackend::Rocm,
-            memory_bytes: None,
-            unified_memory: false,
-            compute_capability: None,
-            supports_nvfp4: false,
-            supports_fp8: false,
-            supports_tensor_parallel: false,
+                .to_owned();
+            GpuInfo {
+                vendor: GpuVendor::Amd,
+                name,
+                backend: GpuBackend::Rocm,
+                memory_bytes: memory_bytes.get(idx).copied(),
+                unified_memory: false,
+                compute_capability: None,
+                supports_nvfp4: false,
+                supports_fp8: false,
+                supports_tensor_parallel: false,
+            }
         })
         .collect()
 }
@@ -1058,6 +1108,9 @@ fn probe_vulkan() -> Vec<GpuInfo> {
     let Some(output) = command_stdout("vulkaninfo", &["--summary"]) else {
         return Vec::new();
     };
+    let memory_by_name = command_stdout("vulkaninfo", &[])
+        .map(|output| parse_vulkan_device_local_memory_bytes(&output))
+        .unwrap_or_default();
     output
         .lines()
         .filter_map(|line| {
@@ -1075,7 +1128,7 @@ fn probe_vulkan() -> Vec<GpuInfo> {
                 vendor: GpuVendor::Vulkan,
                 name: name.to_owned(),
                 backend: GpuBackend::Vulkan,
-                memory_bytes: None,
+                memory_bytes: memory_by_name.get(name).copied(),
                 unified_memory: false,
                 compute_capability: None,
                 supports_nvfp4: false,
@@ -1084,6 +1137,76 @@ fn probe_vulkan() -> Vec<GpuInfo> {
             })
         })
         .collect()
+}
+
+fn parse_rocm_vram_bytes(output: &str) -> Vec<u64> {
+    output
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("vram") && lower.contains("total")
+        })
+        .filter_map(parse_memory_bytes_line)
+        .collect()
+}
+
+fn parse_vulkan_device_local_memory_bytes(output: &str) -> std::collections::BTreeMap<String, u64> {
+    let mut memory_by_name = std::collections::BTreeMap::<String, u64>::new();
+    let mut current_name: Option<String> = None;
+    let mut pending_heap_size: Option<u64> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed
+            .strip_prefix("deviceName")
+            .and_then(|line| line.split('=').nth(1))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            current_name = Some(name.to_owned());
+            pending_heap_size = None;
+            continue;
+        }
+        if current_name.is_none() {
+            continue;
+        }
+        if trimmed.starts_with("size") {
+            pending_heap_size =
+                parse_memory_bytes_line(trimmed.split('(').next().unwrap_or(trimmed));
+            continue;
+        }
+        if trimmed.contains("DEVICE_LOCAL") {
+            if let (Some(name), Some(size)) = (current_name.as_ref(), pending_heap_size.take()) {
+                memory_by_name
+                    .entry(name.clone())
+                    .and_modify(|existing| *existing = (*existing).max(size))
+                    .or_insert(size);
+            }
+        }
+    }
+    memory_by_name
+}
+
+fn parse_memory_bytes_line(line: &str) -> Option<u64> {
+    let lower = line.to_ascii_lowercase();
+    let number = line
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .filter(|part| !part.is_empty())
+        .next_back()?;
+    let value = number.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let multiplier = if lower.contains("gib") || lower.contains(" gb") || lower.ends_with("gb") {
+        GIB as f64
+    } else if lower.contains("mib") || lower.contains(" mb") || lower.ends_with("mb") {
+        MIB as f64
+    } else if lower.contains("kib") || lower.contains(" kb") || lower.ends_with("kb") {
+        1024.0
+    } else {
+        1.0
+    };
+    let bytes = value * multiplier;
+    (bytes <= u64::MAX as f64).then_some(bytes.round() as u64)
 }
 
 fn dedupe_gpus(gpus: &mut Vec<GpuInfo>) {
@@ -1580,6 +1703,67 @@ mod tests {
 
         assert!(profile.memory.unified_memory);
         assert!(profile.gpus[0].unified_memory);
+    }
+
+    #[test]
+    fn partial_offload_layers_scale_with_gpu_memory() {
+        let mut small = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        small.gpus.truncate(1);
+        small.gpus[0].memory_bytes = Some(8 * GIB);
+        let small_report = report_from_profile(small);
+        let small_layers = small_report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "llama.cpp")
+            .and_then(|verdict| verdict.n_layers_gpu)
+            .unwrap();
+
+        let mut large = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        large.gpus.truncate(1);
+        large.gpus[0].memory_bytes = Some(24 * GIB);
+        let large_report = report_from_profile(large);
+        let large_layers = large_report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "llama.cpp")
+            .and_then(|verdict| verdict.n_layers_gpu)
+            .unwrap();
+
+        assert!(large_layers > small_layers);
+    }
+
+    #[test]
+    fn parses_rocm_vram_totals() {
+        let output = r#"
+GPU[0]          : VRAM Total Memory (B): 17163091968
+GPU[1]          : VRAM Total Memory (MiB): 24576
+"#;
+        assert_eq!(
+            parse_rocm_vram_bytes(output),
+            vec![17_163_091_968, 24_576 * MIB]
+        );
+    }
+
+    #[test]
+    fn parses_vulkan_device_local_heap_memory() {
+        let output = r#"
+VkPhysicalDeviceProperties:
+    deviceName        = AMD Radeon Test
+VkPhysicalDeviceMemoryProperties:
+    memoryHeaps[0]:
+        size          = 8589934592 (0x200000000)
+        flags: count = 1
+            MEMORY_HEAP_DEVICE_LOCAL_BIT
+VkPhysicalDeviceProperties:
+    deviceName        = Software Rasterizer
+VkPhysicalDeviceMemoryProperties:
+    memoryHeaps[0]:
+        size          = 1024 MiB
+        flags: count = 0
+"#;
+        let parsed = parse_vulkan_device_local_memory_bytes(output);
+        assert_eq!(parsed.get("AMD Radeon Test"), Some(&(8 * GIB)));
+        assert!(parsed.get("Software Rasterizer").is_none());
     }
 
     #[test]
