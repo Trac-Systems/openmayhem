@@ -3,11 +3,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import MayhemContract from '../contract/contract.js';
+import MayhemContract, { contractParamDefinitions } from '../contract/contract.js';
 
 const BPS = 10_000;
 const DEFAULT_EPOCH_SECONDS = 3_600;
-const DEFAULT_SEED_PRICE_MU = 1_000_000;
+const DEFAULT_SEED_PRICE_AU = '1000000000000000000';
+const ATTO_PER_LEGACY_DEMAND_POINT = 1_000_000_000_000n;
+const FLOAT_SCALE = 1_000_000n;
 const REPORT_DATE = '2026-07-07';
 
 const providerMinAskFactors = Object.freeze(
@@ -19,51 +21,82 @@ const throwIfError = (value) => {
   return value;
 };
 
+const parseAuBigInt = (value) => BigInt(value);
+const auString = (value) => value.toString();
+const compareAu = (left, right) => {
+  const leftAu = parseAuBigInt(left);
+  const rightAu = parseAuBigInt(right);
+  return leftAu < rightAu ? -1 : leftAu > rightAu ? 1 : 0;
+};
+const maxAu = (values) => values.reduce((max, value) => (
+  compareAu(value, max) > 0 ? value : max
+));
+const minAu = (values) => values.reduce((min, value) => (
+  compareAu(value, min) < 0 ? value : min
+));
+const scaleAuByFloat = (value, factor, { allowZero = false } = {}) => {
+  if (!Number.isFinite(factor) || factor < 0) {
+    throw new Error('Invalid market simulation factor.');
+  }
+  const scaledFactor = BigInt(Math.round(factor * Number(FLOAT_SCALE)));
+  const scaled = (parseAuBigInt(value) * scaledFactor + (FLOAT_SCALE / 2n)) / FLOAT_SCALE;
+  return auString(scaled > 0n || allowZero ? scaled : 1n);
+};
 const bpsDelta = (left, right) => {
-  if (right === 0) return left === 0 ? 0 : BPS;
-  return Math.floor((Math.abs(left - right) * BPS) / right);
+  const leftAu = parseAuBigInt(left);
+  const rightAu = parseAuBigInt(right);
+  if (rightAu === 0n) return leftAu === 0n ? 0 : BPS;
+  const delta = leftAu > rightAu ? leftAu - rightAu : rightAu - leftAu;
+  return Number((delta * BigInt(BPS)) / rightAu);
 };
 
 const pct = (bps) => `${(bps / 100).toFixed(2)}%`;
 
 const makeContract = () => new MayhemContract({}, {});
+const defaultParamValues = () => Object.fromEntries(
+  Object.entries(contractParamDefinitions()).map(([key, definition]) => [key, definition.default])
+);
 
 export function marketConstants() {
-  return makeContract().marketPriceConstants();
+  return makeContract().marketPriceConstants(defaultParamValues());
 }
 
-export function makeMarketAgents({ seedPriceMu = DEFAULT_SEED_PRICE_MU } = {}) {
-  const constants = marketConstants();
+export function makeMarketAgents({ seedPriceAu = DEFAULT_SEED_PRICE_AU, constants = marketConstants() } = {}) {
   const providers = providerMinAskFactors.map((factor, index) => ({
     id: `provider-${String(index + 1).padStart(2, '0')}`,
-    min_ask_mu: Math.round(seedPriceMu * factor),
+    min_ask_au: scaleAuByFloat(seedPriceAu, factor),
   }));
-  const seedActiveSupply = providers.filter((provider) => provider.min_ask_mu <= seedPriceMu).length;
-  const targetDemandMu = Math.floor(
-    (seedActiveSupply * constants.provider_epoch_target_mu * constants.target_utilization_bps) /
-    BPS
+  const seedActiveSupply = providers.filter((provider) => (
+    compareAu(provider.min_ask_au, seedPriceAu) <= 0
+  )).length;
+  const targetDemandAu = auString(
+    (BigInt(seedActiveSupply) *
+      parseAuBigInt(constants.provider_epoch_target_au) *
+      BigInt(constants.target_utilization_bps)) /
+    BigInt(BPS)
   );
 
   const users = Array.from({ length: 640 }, (_, index) => {
     const bidFactor = 0.72 + (index / 639) * 1.28;
-    const base = 35_000 + ((index * 37) % 43) * 1_250;
+    const base = BigInt(35_000 + ((index * 37) % 43) * 1_250) *
+      ATTO_PER_LEGACY_DEMAND_POINT;
     return {
       id: `user-${String(index + 1).padStart(3, '0')}`,
-      max_bid_mu: Math.round(seedPriceMu * bidFactor),
-      base_demand_mu: base,
+      max_bid_au: scaleAuByFloat(seedPriceAu, bidFactor),
+      base_demand_au: auString(base),
     };
   });
-  const seedDemandMu = users
-    .filter((user) => user.max_bid_mu >= seedPriceMu)
-    .reduce((sum, user) => sum + user.base_demand_mu, 0);
-  const demandScale = targetDemandMu / seedDemandMu;
+  const seedDemandAu = users
+    .filter((user) => compareAu(user.max_bid_au, seedPriceAu) >= 0)
+    .reduce((sum, user) => sum + parseAuBigInt(user.base_demand_au), 0n);
+  const demandScale = Number(parseAuBigInt(targetDemandAu)) / Number(seedDemandAu);
 
   return {
-    seed_price_mu: seedPriceMu,
+    seed_price_au: seedPriceAu,
     providers,
     users: users.map((user) => ({
       ...user,
-      base_demand_mu: Math.max(1, Math.round(user.base_demand_mu * demandScale)),
+      base_demand_au: scaleAuByFloat(user.base_demand_au, demandScale),
     })),
   };
 }
@@ -98,82 +131,90 @@ export const SCENARIOS = Object.freeze({
   }),
 });
 
-function activeProviderCount(agents, priceMu, scenario, epoch) {
-  let active = agents.providers.filter((provider) => provider.min_ask_mu <= priceMu);
+function activeProviderCount(agents, priceAu, scenario, epoch) {
+  let active = agents.providers.filter((provider) => compareAu(provider.min_ask_au, priceAu) <= 0);
   if (Number.isSafeInteger(scenario.providerCap)) active = active.slice(0, scenario.providerCap);
   const phantomSupply = scenario.phantomSupply ? scenario.phantomSupply(epoch) : 0;
   return active.length + phantomSupply;
 }
 
-function activeDemandMu(agents, priceMu, scenario, epoch) {
-  const seedPriceMu = agents.seed_price_mu;
+function activeDemandAu(agents, priceAu, scenario, epoch) {
+  const seedPriceAu = agents.seed_price_au;
   const multiplier = scenario.demandMultiplier ? scenario.demandMultiplier(epoch) : 1.0;
   const grossDemandElasticity = scenario.grossDemandElasticity ?? 0.72;
-  const priceFactor = Math.pow(seedPriceMu / Math.max(1, priceMu), grossDemandElasticity);
-  const demand = agents.users
-    .filter((user) => user.max_bid_mu >= priceMu)
-    .reduce((sum, user) => sum + user.base_demand_mu * multiplier * priceFactor, 0);
-  return Math.max(0, Math.round(demand));
+  const priceFactor = Math.pow(
+    Number(parseAuBigInt(seedPriceAu)) / Math.max(1, Number(parseAuBigInt(priceAu))),
+    grossDemandElasticity
+  );
+  return auString(agents.users
+    .filter((user) => compareAu(user.max_bid_au, priceAu) >= 0)
+    .reduce((sum, user) => (
+      sum + parseAuBigInt(scaleAuByFloat(user.base_demand_au, multiplier * priceFactor, {
+        allowZero: true,
+      }))
+    ), 0n));
 }
 
 export function nextMarketEpoch(contract, previous, observation) {
-  const constants = contract.marketPriceConstants();
+  const constants = observation.constants ?? marketConstants();
   const utilizationBps = throwIfError(
-    contract.marketUtilizationBps(observation.demand_mu, observation.active_supply)
+    contract.marketUtilizationBps(observation.demand_au, observation.active_supply, constants)
   );
   const frozen = observation.active_supply < constants.cold_start_min_providers;
   const emaUtilizationBps = frozen
     ? constants.target_utilization_bps
-    : contract.marketEmaUtilizationBps(previous.ema_utilization_bps, utilizationBps);
-  const multiplierBps = frozen ? BPS : contract.marketCurveMultiplierBps(emaUtilizationBps);
-  const desiredPriceMu = frozen
-    ? previous.seed_price_mu
-    : throwIfError(contract.scalePriceTerm(previous.seed_price_mu, multiplierBps));
-  const priceMu = frozen
-    ? previous.seed_price_mu
-    : throwIfError(contract.stepPriceTerm(previous.price_mu, desiredPriceMu));
+    : contract.marketEmaUtilizationBps(previous.ema_utilization_bps, utilizationBps, constants);
+  const multiplierBps = frozen ? BPS : contract.marketCurveMultiplierBps(emaUtilizationBps, constants);
+  const desiredPriceAu = frozen
+    ? previous.seed_price_au
+    : throwIfError(contract.scalePriceTerm(previous.seed_price_au, multiplierBps));
+  const priceAu = frozen
+    ? previous.seed_price_au
+    : throwIfError(contract.stepPriceTerm(previous.price_au, desiredPriceAu, constants));
 
   return {
-    seed_price_mu: previous.seed_price_mu,
-    price_mu: priceMu,
-    desired_price_mu: desiredPriceMu,
+    seed_price_au: previous.seed_price_au,
+    price_au: priceAu,
+    desired_price_au: desiredPriceAu,
     utilization_bps: utilizationBps,
     ema_utilization_bps: emaUtilizationBps,
     multiplier_bps: multiplierBps,
     active_supply: observation.active_supply,
-    demand_mu: observation.demand_mu,
+    demand_au: observation.demand_au,
     frozen,
   };
 }
 
 export function simulateScenario(name, scenario, options = {}) {
   const contract = options.contract ?? makeContract();
+  const constants = options.constants ?? marketConstants();
   const agents = options.agents ?? makeMarketAgents(options);
   let state = {
-    seed_price_mu: agents.seed_price_mu,
-    price_mu: agents.seed_price_mu,
-    ema_utilization_bps: contract.marketPriceConstants().target_utilization_bps,
+    seed_price_au: agents.seed_price_au,
+    price_au: agents.seed_price_au,
+    ema_utilization_bps: constants.target_utilization_bps,
   };
   const rows = [];
 
   for (let epoch = 0; epoch < scenario.epochs; epoch += 1) {
-    const previousPriceMu = state.price_mu;
+    const previousPriceAu = state.price_au;
     const observation = {
-      active_supply: activeProviderCount(agents, previousPriceMu, scenario, epoch),
-      demand_mu: activeDemandMu(agents, previousPriceMu, scenario, epoch),
+      active_supply: activeProviderCount(agents, previousPriceAu, scenario, epoch),
+      demand_au: activeDemandAu(agents, previousPriceAu, scenario, epoch),
+      constants,
     };
     state = nextMarketEpoch(contract, state, observation);
     rows.push({
       epoch,
-      previous_price_mu: previousPriceMu,
-      price_mu: state.price_mu,
-      desired_price_mu: state.desired_price_mu,
-      price_step_bps: bpsDelta(state.price_mu, previousPriceMu),
+      previous_price_au: previousPriceAu,
+      price_au: state.price_au,
+      desired_price_au: state.desired_price_au,
+      price_step_bps: bpsDelta(state.price_au, previousPriceAu),
       utilization_bps: state.utilization_bps,
       ema_utilization_bps: state.ema_utilization_bps,
       multiplier_bps: state.multiplier_bps,
       active_supply: state.active_supply,
-      demand_mu: state.demand_mu,
+      demand_au: state.demand_au,
       frozen: state.frozen,
     });
   }
@@ -183,35 +224,35 @@ export function simulateScenario(name, scenario, options = {}) {
     title: scenario.title,
     epochs: scenario.epochs,
     rows,
-    summary: summarizeRows(rows, agents.seed_price_mu, contract.marketPriceConstants()),
+    summary: summarizeRows(rows, agents.seed_price_au, constants),
   };
 }
 
-function summarizeRows(rows, seedPriceMu, constants) {
+function summarizeRows(rows, seedPriceAu, constants) {
   const final = rows.at(-1);
   const lastWindow = rows.slice(-8);
-  const lastPrices = lastWindow.map((row) => row.price_mu);
+  const lastPrices = lastWindow.map((row) => row.price_au);
   const lastUtilizations = lastWindow.map((row) => row.utilization_bps);
   const maxStepBps = Math.max(...rows.map((row) => row.price_step_bps));
-  const maxPriceMu = Math.max(...rows.map((row) => row.price_mu));
-  const minPriceMu = Math.min(...rows.map((row) => row.price_mu));
-  const lastPriceRangeBps = bpsDelta(Math.max(...lastPrices), Math.min(...lastPrices));
+  const maxPriceAu = maxAu(rows.map((row) => row.price_au));
+  const minPriceAu = minAu(rows.map((row) => row.price_au));
+  const lastPriceRangeBps = bpsDelta(maxAu(lastPrices), minAu(lastPrices));
   const lastUtilizationRangeBps = Math.max(...lastUtilizations) - Math.min(...lastUtilizations);
 
   return {
-    final_price_mu: final.price_mu,
-    final_price_deviation_bps: bpsDelta(final.price_mu, seedPriceMu),
+    final_price_au: final.price_au,
+    final_price_deviation_bps: bpsDelta(final.price_au, seedPriceAu),
     final_utilization_bps: final.utilization_bps,
     final_ema_utilization_bps: final.ema_utilization_bps,
     final_ema_deviation_bps: Math.abs(
       final.ema_utilization_bps - constants.target_utilization_bps
     ),
     max_step_bps: maxStepBps,
-    max_price_mu: maxPriceMu,
-    min_price_mu: minPriceMu,
+    max_price_au: maxPriceAu,
+    min_price_au: minPriceAu,
     max_price_deviation_bps: Math.max(
-      bpsDelta(maxPriceMu, seedPriceMu),
-      bpsDelta(minPriceMu, seedPriceMu)
+      bpsDelta(maxPriceAu, seedPriceAu),
+      bpsDelta(minPriceAu, seedPriceAu)
     ),
     last_price_range_bps: lastPriceRangeBps,
     last_utilization_range_bps: lastUtilizationRangeBps,
@@ -221,8 +262,8 @@ function summarizeRows(rows, seedPriceMu, constants) {
 
 export function runMarketSimulation(options = {}) {
   const contract = options.contract ?? makeContract();
-  const constants = contract.marketPriceConstants();
-  const agents = options.agents ?? makeMarketAgents(options);
+  const constants = options.constants ?? marketConstants();
+  const agents = options.agents ?? makeMarketAgents({ ...options, constants });
   const scenarios = Object.fromEntries(
     Object.entries(SCENARIOS).map(([name, scenario]) => [
       name,
@@ -232,7 +273,7 @@ export function runMarketSimulation(options = {}) {
   const report = {
     report_date: REPORT_DATE,
     controller: 'I3-F1 utilization-indexed market price controller',
-    seed_price_mu: agents.seed_price_mu,
+    seed_price_au: agents.seed_price_au,
     epoch_seconds: DEFAULT_EPOCH_SECONDS,
     constants,
     scenarios,
@@ -283,7 +324,7 @@ export function validateMarketSimulation(report) {
   const thin = requireScenario('thin_liquidity');
   if (thin) {
     const allPinned = thin.rows.every(
-      (row) => row.frozen && row.price_mu === report.seed_price_mu
+      (row) => row.frozen && row.price_au === report.seed_price_au
     );
     if (!allPinned) failures.push('thin_liquidity was not pinned at P0 while below S_min');
   }
@@ -317,7 +358,7 @@ export function formatMarketSimulationMarkdown(report) {
   lines.push('');
   lines.push(`Date: ${report.report_date}`);
   lines.push(`Controller: ${report.controller}`);
-  lines.push(`Seed price: ${report.seed_price_mu} muUSD`);
+  lines.push(`Seed price: ${report.seed_price_au} au`);
   lines.push(`Epoch length: ${report.epoch_seconds}s`);
   lines.push('');
   lines.push('## Protocol Constants Used');
@@ -335,7 +376,7 @@ export function formatMarketSimulationMarkdown(report) {
   for (const scenario of Object.values(report.scenarios)) {
     const summary = scenario.summary;
     lines.push(
-      `| ${scenario.title} | ${scenario.epochs} | ${summary.final_price_mu} | ` +
+      `| ${scenario.title} | ${scenario.epochs} | ${summary.final_price_au} | ` +
       `${pct(summary.final_utilization_bps)} | ${pct(summary.final_ema_utilization_bps)} | ` +
       `${pct(summary.max_step_bps)} | ${pct(summary.last_price_range_bps)} | pass |`
     );

@@ -16,12 +16,13 @@ import {
   encodeSetRootCalldata,
   encodeWithdrawOperatorCalldata,
   guardianPreSignReport,
-  muToTapWei,
+  auToTapWei,
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
 
-const TAP_USD_E6 = 1_000_000;
+const TAP_USD_AU = '1000000000000000000';
+const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
 const U = (n) => ethers.parseUnits(String(n), 18);
 const SCRIPT_PATH = fileURLToPath(new URL('../scripts/tap-settlement-roller.mjs', import.meta.url));
 const OPERATOR_KEY = `0x${'11'.repeat(32)}`;
@@ -60,7 +61,7 @@ function receipt({
   session,
   provider,
   user = 'user-a',
-  mu,
+  au,
   seq = 1,
   extra = {},
 }) {
@@ -71,7 +72,7 @@ function receipt({
         seq,
         user,
         provider,
-        mu_owed_cum: mu,
+        au_owed_cum: au,
       },
     },
     ...extra,
@@ -102,14 +103,14 @@ test('TAP settlement roller posts root and provider proof verifies independently
   };
   const bundle = {
     receipts: [
-      receipt({ session: 's1', provider: 'provider_a', mu: 1_000_000 }),
-      receipt({ session: 's2', provider: 'provider_b', mu: 3_000_000 }),
+      receipt({ session: 's1', provider: 'provider_a', au: usdAu(1) }),
+      receipt({ session: 's2', provider: 'provider_b', au: usdAu(3) }),
     ],
   };
   const rolled = await rollTapSettlement({
     bundle,
     providerAccounts,
-    tapUsdE6: TAP_USD_E6,
+    tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
@@ -117,8 +118,8 @@ test('TAP settlement roller posts root and provider proof verifies independently
     post: true,
   });
 
-  const spentA = muToTapWei(1_000_000, TAP_USD_E6);
-  const spentB = muToTapWei(3_000_000, TAP_USD_E6);
+  const spentA = auToTapWei(usdAu(1), TAP_USD_AU);
+  const spentB = auToTapWei(usdAu(3), TAP_USD_AU);
   const claimA = providerShareWei(spentA);
   const claimB = providerShareWei(spentB);
   const expectedDist = distribution([
@@ -166,17 +167,17 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   await (await pool.connect(buyer).deposit(U(5))).wait();
 
   const bundle = {
-    receipts: [receipt({ session: 's1', provider: 'provider_a', mu: 1_000_000 })],
+    receipts: [receipt({ session: 's1', provider: 'provider_a', au: usdAu(1) })],
   };
   assert.throws(
-    () => buildTapSettlement({ bundle, tapUsdE6: TAP_USD_E6, ledgerFeeBps: 1500 }),
+    () => buildTapSettlement({ bundle, tapUsdAu: TAP_USD_AU, ledgerFeeBps: 1500 }),
     /Missing TAP claim address/
   );
   assert.throws(
     () => buildTapSettlement({
       bundle,
       providerAccounts: { provider_a: '0x1111111111111111111111111111111111111111' },
-      tapUsdE6: TAP_USD_E6,
+      tapUsdAu: TAP_USD_AU,
       ledgerFeeBps: 1200,
     }),
     /must equal on-chain OPERATOR_BPS/
@@ -186,7 +187,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   const first = await rollTapSettlement({
     bundle,
     providerAccounts,
-    tapUsdE6: TAP_USD_E6,
+    tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
@@ -198,7 +199,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   const replay = await rollTapSettlement({
     bundle,
     providerAccounts,
-    tapUsdE6: TAP_USD_E6,
+    tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
@@ -214,7 +215,7 @@ test('TAP settlement roller supports weighted multi-provider receipts', () => {
   const a = '0x1111111111111111111111111111111111111111';
   const b = '0x2222222222222222222222222222222222222222';
   const settlement = buildTapSettlement({
-    tapUsdE6: TAP_USD_E6,
+    tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     bundle: {
       receipts: [{
@@ -226,14 +227,14 @@ test('TAP settlement roller supports weighted multi-provider receipts', () => {
             provider: 'ignored-primary',
             provider_refs: ['pa', 'pb'],
             contribution_weights_bps: [2_500, 7_500],
-            mu_owed_cum: 4_000_000,
+            au_owed_cum: usdAu(4),
           },
         },
       }],
     },
     providerAccounts: { pa: a, pb: b },
   });
-  const spent = muToTapWei(4_000_000, TAP_USD_E6);
+  const spent = auToTapWei(usdAu(4), TAP_USD_AU);
   assert.equal(settlement.cumulative_spent_wei, spent.toString());
   assert.equal(settlement.proofs[a].cumulative_wei, providerShareWei(spent, 2_500).toString());
   assert.equal(settlement.proofs[b].cumulative_wei, providerShareWei(spent, 7_500).toString());
@@ -353,7 +354,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   const bundlePath = path.join(tmp, 'bundle.json');
   const providerAccountsPath = path.join(tmp, 'providers.json');
   fs.writeFileSync(bundlePath, JSON.stringify({
-    receipts: [receipt({ session: 'cli-s1', provider: 'provider_cli', mu: 1_000_000 })],
+    receipts: [receipt({ session: 'cli-s1', provider: 'provider_cli', au: usdAu(1) })],
   }, null, 2));
   fs.writeFileSync(providerAccountsPath, JSON.stringify({
     provider_cli: await providerSigner.getAddress(),
@@ -363,7 +364,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     SCRIPT_PATH,
     '--bundle', bundlePath,
     '--provider-accounts', providerAccountsPath,
-    '--tap-usd-e6', String(TAP_USD_E6),
+    '--tap-usd-au', String(TAP_USD_AU),
     '--ledger-fee-bps', '1500',
     '--eth-rpc', rpc,
     '--pool', poolAddr,
@@ -397,7 +398,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     cumulativeSpentWei: report.cumulative_spent_wei,
   }));
   assert.equal(report.operator_fee.destination, (await operatorTreasury.getAddress()).toLowerCase());
-  assert.equal(report.operator_fee.predicted_claimable_wei, (muToTapWei(1_000_000, TAP_USD_E6) * 1500n / 10_000n).toString());
+  assert.equal(report.operator_fee.predicted_claimable_wei, (auToTapWei(usdAu(1), TAP_USD_AU) * 1500n / 10_000n).toString());
   assert.equal(report.operator_fee.calldata, encodeWithdrawOperatorCalldata({
     to: await operatorTreasury.getAddress(),
     amountWei: report.operator_fee.predicted_claimable_wei,

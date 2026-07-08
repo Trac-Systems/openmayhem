@@ -158,11 +158,16 @@ function maybeAddress(value) {
   }
 }
 
-function safeMu(value, label, { allowZero = false } = {}) {
-  if (!Number.isSafeInteger(value) || value < 0 || (!allowZero && value === 0)) {
-    throw new Error(`${label} must be a ${allowZero ? 'non-negative' : 'positive'} safe integer`);
+function safeAu(value, label, { allowZero = false } = {}) {
+  const raw = String(value ?? '').trim();
+  if (!/^(0|[1-9]\d*)$/.test(raw)) {
+    throw new Error(`${label} must be a canonical decimal au string`);
   }
-  return value;
+  const parsed = BigInt(raw);
+  if (parsed < 0n || (!allowZero && parsed === 0n)) {
+    throw new Error(`${label} must be ${allowZero ? 'non-negative' : 'positive'}`);
+  }
+  return parsed;
 }
 
 function addWei(map, account, amountWei) {
@@ -170,10 +175,10 @@ function addWei(map, account, amountWei) {
   map.set(account, (map.get(account) ?? 0n) + amountWei);
 }
 
-export function muToTapWei(mu, tapUsdE6) {
-  const safe = safeMu(mu, 'mu', { allowZero: true });
-  const rate = parsePositiveInt(tapUsdE6, 'tap_usd_e6');
-  return (BigInt(safe) * TAP_WEI) / BigInt(rate);
+export function auToTapWei(au, tapUsdAu) {
+  const safe = safeAu(au, 'au', { allowZero: true });
+  const rate = safeAu(tapUsdAu, 'tap_usd_au');
+  return (safe * TAP_WEI) / rate;
 }
 
 export function providerShareWei(spentWei, weightBps = 10_000) {
@@ -190,16 +195,19 @@ function receiptEnvelope(entry) {
   return { entry, body };
 }
 
-function receiptDeltaMu(entry, body, previousBySession) {
-  const explicit = entry.settle_mu ?? entry.mu_delta;
-  if (explicit !== undefined) return safeMu(explicit, 'receipt settle_mu');
-  const current = safeMu(body.mu_owed_cum, 'receipt mu_owed_cum');
+function receiptDeltaAu(entry, body, previousBySession) {
+  const explicit = entry.settle_au ?? entry.au_delta;
+  if (explicit !== undefined) return safeAu(explicit, 'receipt settle_au');
+  const current = safeAu(body.au_owed_cum, 'receipt au_owed_cum');
   const session = body.session_id;
   if (typeof session !== 'string' || session.length === 0) throw new Error('receipt session_id is required');
-  const previous = entry.previous_mu_owed_cum ?? previousBySession.get(session) ?? 0;
-  safeMu(previous, 'receipt previous_mu_owed_cum', { allowZero: true });
-  if (current < previous) throw new Error('receipt cumulative mu regressed');
-  previousBySession.set(session, current);
+  const previous = safeAu(
+    entry.previous_au_owed_cum ?? previousBySession.get(session) ?? '0',
+    'receipt previous_au_owed_cum',
+    { allowZero: true }
+  );
+  if (current < previous) throw new Error('receipt cumulative au regressed');
+  previousBySession.set(session, current.toString());
   return current - previous;
 }
 
@@ -354,7 +362,7 @@ export function buildTapSettlement({
   bundle,
   receipts,
   providerAccounts = {},
-  tapUsdE6,
+  tapUsdAu,
   ledgerFeeBps,
   prior = null,
   settleThroughEpoch = null,
@@ -363,7 +371,7 @@ export function buildTapSettlement({
 } = {}) {
   const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
-  const rate = parsePositiveInt(tapUsdE6, 'tap_usd_e6');
+  const rate = safeAu(tapUsdAu, 'tap_usd_au').toString();
   const feeBps = tapLedgerFeeBps(inputBundle, ledgerFeeBps);
   const policy = releasePolicy({ settleThroughEpoch, challengeEpochs, holdbackEpochs });
   const bundleEpoch = inputBundle?.epoch ?? inputBundle?.receipt_epoch ?? inputBundle?.settlement_epoch;
@@ -372,8 +380,8 @@ export function buildTapSettlement({
   let cumulativeSpentWei = parseBigIntString(prior?.cumulative_spent_wei ?? prior?.cumulativeSpentWei, 'prior cumulative spent wei');
   let receiptCount = 0;
   let heldReceiptCount = 0;
-  let spentMu = 0;
-  let heldMu = 0;
+  let spentAu = 0n;
+  let heldAu = 0n;
 
   const sorted = input
     .map(receiptEnvelope)
@@ -383,20 +391,18 @@ export function buildTapSettlement({
     ));
 
   for (const { entry, body } of sorted) {
-    const deltaMu = receiptDeltaMu(entry, body, previousBySession);
-    if (deltaMu === 0) continue;
+    const deltaAu = receiptDeltaAu(entry, body, previousBySession);
+    if (deltaAu === 0n) continue;
     const release = receiptReleaseInfo(entry, body, bundleEpoch, policy);
     if (!release.eligible) {
       heldReceiptCount += 1;
-      heldMu += deltaMu;
-      safeMu(heldMu, 'held_mu', { allowZero: true });
+      heldAu += deltaAu;
       continue;
     }
-    const spentWei = muToTapWei(deltaMu, rate);
+    const spentWei = auToTapWei(deltaAu, rate);
     if (spentWei <= 0n) throw new Error('receipt converts to zero TAP wei');
     receiptCount += 1;
-    spentMu += deltaMu;
-    safeMu(spentMu, 'spent_mu', { allowZero: true });
+    spentAu += deltaAu;
     cumulativeSpentWei += spentWei;
     const providers = receiptProviders(entry, body, providerAccounts);
     let weightTotal = 0;
@@ -417,12 +423,12 @@ export function buildTapSettlement({
       payout_model: 'non_custodial_claim',
       custodial_wallet: false,
       reason: heldReceiptCount > 0 ? 'no matured provider earnings' : 'no claimable provider earnings',
-      tap_usd_e6: rate,
+      tap_usd_au: rate,
       ledger_fee_bps: feeBps,
       receipt_count: receiptCount,
       held_receipt_count: heldReceiptCount,
-      spent_mu: spentMu,
-      held_mu: heldMu,
+      spent_au: spentAu.toString(),
+      held_au: heldAu.toString(),
       cumulative_spent_wei: cumulativeSpentWei.toString(),
       entries: [],
       release_policy: policy,
@@ -449,12 +455,12 @@ export function buildTapSettlement({
     posted: false,
     payout_model: 'non_custodial_claim',
     custodial_wallet: false,
-    tap_usd_e6: rate,
+    tap_usd_au: rate,
     ledger_fee_bps: feeBps,
     receipt_count: receiptCount,
     held_receipt_count: heldReceiptCount,
-    spent_mu: spentMu,
-    held_mu: heldMu,
+    spent_au: spentAu.toString(),
+    held_au: heldAu.toString(),
     cumulative_spent_wei: cumulativeSpentWei.toString(),
     provider_claimed_wei: providerClaimedWei.toString(),
     provider_cap_wei: providerCapWei.toString(),
@@ -640,7 +646,7 @@ export async function rollTapSettlement({
   bundle,
   receipts,
   providerAccounts,
-  tapUsdE6,
+  tapUsdAu,
   ledgerFeeBps,
   prior,
   settleThroughEpoch,
@@ -656,7 +662,7 @@ export async function rollTapSettlement({
     bundle,
     receipts,
     providerAccounts,
-    tapUsdE6,
+    tapUsdAu,
     ledgerFeeBps,
     prior,
     settleThroughEpoch,
@@ -814,18 +820,18 @@ async function readContractStateValue(rpcUrl, key, {
   return body?.value ?? null;
 }
 
-async function resolveTapUsdE6({ tapUsdE6, peerRpcUrl, fetchImpl } = {}) {
-  if (tapUsdE6 !== undefined && tapUsdE6 !== null && tapUsdE6 !== '') {
-    return parsePositiveInt(tapUsdE6, '--tap-usd-e6');
+async function resolveTapUsdAu({ tapUsdAu, peerRpcUrl, fetchImpl } = {}) {
+  if (tapUsdAu !== undefined && tapUsdAu !== null && tapUsdAu !== '') {
+    return safeAu(tapUsdAu, '--tap-usd-au').toString();
   }
   const rate = await readContractStateValue(peerRpcUrl, 'tap/rate/latest', { fetchImpl });
-  return parsePositiveInt(rate?.tap_usd_e6, 'tap/rate/latest.tap_usd_e6');
+  return safeAu(rate?.tap_usd_au, 'tap/rate/latest.tap_usd_au').toString();
 }
 
 function buildReplayCommand({
   bundlePath,
   providerAccountsPath,
-  tapUsdE6,
+  tapUsdAu,
   ledgerFeeBps,
   priorPath,
   settleThroughEpoch,
@@ -841,7 +847,7 @@ function buildReplayCommand({
   const args = ['node', 'contracts/scripts/tap-settlement-roller.mjs'];
   if (bundlePath) args.push('--bundle', bundlePath);
   if (providerAccountsPath) args.push('--provider-accounts', providerAccountsPath);
-  if (tapUsdE6) args.push('--tap-usd-e6', String(tapUsdE6));
+  if (tapUsdAu) args.push('--tap-usd-au', String(tapUsdAu));
   if (ledgerFeeBps !== undefined && ledgerFeeBps !== null) args.push('--ledger-fee-bps', String(ledgerFeeBps));
   if (priorPath) args.push('--prior', priorPath);
   if (settleThroughEpoch !== undefined && settleThroughEpoch !== null) {
@@ -880,8 +886,8 @@ async function main() {
   const priorPath = args.prior;
   const prior = priorPath ? readJson(path.resolve(priorPath), 'prior settlement') : null;
   const peerRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
-  const tapUsdE6 = await resolveTapUsdE6({
-    tapUsdE6: args['tap-usd-e6'],
+  const tapUsdAu = await resolveTapUsdAu({
+    tapUsdAu: args['tap-usd-au'],
     peerRpcUrl,
   });
   const ledgerFeeBps = args['ledger-fee-bps'];
@@ -908,7 +914,7 @@ async function main() {
     bundle,
     providerAccounts,
     prior,
-    tapUsdE6,
+    tapUsdAu,
     ledgerFeeBps,
     settleThroughEpoch: args['settle-through-epoch'],
     challengeEpochs: args['challenge-epochs'] ?? 0,
@@ -923,7 +929,7 @@ async function main() {
   report.copy_paste_replay_command = buildReplayCommand({
     bundlePath,
     providerAccountsPath,
-    tapUsdE6,
+    tapUsdAu,
     ledgerFeeBps,
     priorPath,
     settleThroughEpoch: args['settle-through-epoch'],
@@ -940,7 +946,7 @@ async function main() {
     report.copy_paste_confirm_command = buildReplayCommand({
       bundlePath,
       providerAccountsPath,
-      tapUsdE6,
+      tapUsdAu,
       ledgerFeeBps,
       priorPath,
       settleThroughEpoch: args['settle-through-epoch'],

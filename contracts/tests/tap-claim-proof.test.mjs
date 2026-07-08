@@ -7,15 +7,16 @@ import { ethers } from 'ethers';
 import { deployPool } from '../scripts/deploy-local.mjs';
 import { claimProofForAccount } from '../scripts/tap-claim-proof.mjs';
 import {
-  muToTapWei,
+  auToTapWei,
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
 
-const TAP_USD_E6 = 1_000_000;
+const TAP_USD_AU = '1000000000000000000';
+const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
 const U = (n) => ethers.parseUnits(String(n), 18);
 
-function receipt({ session, provider, user = 'user-a', mu, seq = 1 }) {
+function receipt({ session, provider, user = 'user-a', au, seq = 1 }) {
   return {
     receipt: {
       body: {
@@ -23,13 +24,13 @@ function receipt({ session, provider, user = 'user-a', mu, seq = 1 }) {
         seq,
         user,
         provider,
-        mu_owed_cum: mu,
+        au_owed_cum: au,
       },
     },
   };
 }
 
-test('claim-proof returns provider proof that submits to KnowledgePool.claim()', async () => {
+test('claim-proof returns provider proof that submits to MayhemInferencePool.claim()', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
     chain: { chainId: 61_000 },
@@ -47,19 +48,19 @@ test('claim-proof returns provider proof that submits to KnowledgePool.claim()',
   await (await pool.connect(buyer).deposit(U(3))).wait();
 
   const bundle = {
-    receipts: [receipt({ session: 's1', provider: 'provider_a', mu: 2_000_000 })],
+    receipts: [receipt({ session: 's1', provider: 'provider_a', au: usdAu(2) })],
   };
   const rolled = await rollTapSettlement({
     bundle,
     providerAccounts: { provider_a: providerAccount },
-    tapUsdE6: TAP_USD_E6,
+    tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     pool,
     ownerSigner: operator,
     operatorAddress: await operator.getAddress(),
     post: true,
   });
-  const expectedClaim = providerShareWei(muToTapWei(2_000_000, TAP_USD_E6));
+  const expectedClaim = providerShareWei(auToTapWei(usdAu(2), TAP_USD_AU));
 
   const proof = await claimProofForAccount({
     settlement: rolled,

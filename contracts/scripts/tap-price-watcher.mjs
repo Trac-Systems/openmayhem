@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 
 const scriptPath = fileURLToPath(import.meta.url);
-const USD_E6 = 1_000_000n;
+const USD_AU = 1_000_000_000_000_000_000n;
 
 export const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
 export const DEFAULT_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -125,13 +125,6 @@ function toPositiveBigInt(value, label) {
   }
 }
 
-function toSafePositiveNumber(value, label) {
-  if (value <= 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new Error(`${label} outside safe integer range`);
-  }
-  return Number(value);
-}
-
 function normalizeAddress(value, label) {
   try {
     return ethers.getAddress(String(value ?? '')).toLowerCase();
@@ -162,39 +155,50 @@ function withTimeout(promise, timeoutMs, label) {
   });
 }
 
-export function decimalUsdToE6(value) {
+function parsePositiveDecimalIntegerString(value, label) {
+  const raw = String(value ?? '').trim();
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${label} must be a positive integer string`);
+  }
+  const parsed = BigInt(raw);
+  if (parsed <= 0n) throw new Error(`${label} must be positive`);
+  return parsed.toString();
+}
+
+export function decimalUsdToAu(value) {
   const raw = String(value ?? '').trim();
   if (!/^\d+(\.\d+)?$/.test(raw)) {
     throw new Error(`Invalid decimal USD price: ${raw}`);
   }
   const [whole, fraction = ''] = raw.split('.');
-  const sevenDigits = `${fraction}0000000`.slice(0, 7);
-  const micros = BigInt(whole) * USD_E6 + BigInt(sevenDigits.slice(0, 6));
-  const rounded = micros + (Number(sevenDigits[6]) >= 5 ? 1n : 0n);
-  return toSafePositiveNumber(rounded, 'USD price');
+  const nineteenDigits = `${fraction}0000000000000000000`.slice(0, 19);
+  const atto = BigInt(whole) * USD_AU + BigInt(nineteenDigits.slice(0, 18));
+  const rounded = atto + (Number(nineteenDigits[18]) >= 5 ? 1n : 0n);
+  if (rounded <= 0n) throw new Error('USD price must be positive');
+  return rounded.toString();
 }
 
-export function parsePinnedTapUsdE6({
-  tapUsdE6,
+export function parsePinnedTapUsdAu({
+  tapUsdAu,
   tapUsd,
   env = process.env,
 } = {}) {
-  const e6 = tapUsdE6
-    ?? env.MAYHEM_TAP_USD_E6
-    ?? env.TAP_USD_E6;
-  if (e6 !== undefined && e6 !== null && e6 !== '') {
-    return parsePositiveInt(e6, 'TAP_USD_E6');
+  const au = tapUsdAu
+    ?? env.MAYHEM_TAP_USD_AU
+    ?? env.TAP_USD_AU;
+  if (au !== undefined && au !== null && au !== '') {
+    return parsePositiveDecimalIntegerString(au, 'TAP_USD_AU');
   }
   const decimal = tapUsd
     ?? env.MAYHEM_TAP_USD
     ?? env.TAP_USD;
   if (decimal !== undefined && decimal !== null && decimal !== '') {
-    return decimalUsdToE6(decimal);
+    return decimalUsdToAu(decimal);
   }
   return null;
 }
 
-export function tapUsdE6FromReserves({
+export function tapUsdAuFromReserves({
   tapReserve,
   usdtReserve,
   tapDecimals = 18,
@@ -202,9 +206,9 @@ export function tapUsdE6FromReserves({
 } = {}) {
   const tap = toPositiveBigInt(tapReserve, 'tap reserve');
   const usdt = toPositiveBigInt(usdtReserve, 'USDT reserve');
-  const numerator = usdt * pow10(tapDecimals) * USD_E6;
+  const numerator = usdt * pow10(tapDecimals) * USD_AU;
   const denominator = tap * pow10(usdtDecimals);
-  return toSafePositiveNumber(numerator / denominator, 'TAP/USD e6 price');
+  return (numerator / denominator).toString();
 }
 
 function reserveAt(reserves, index, name) {
@@ -213,7 +217,7 @@ function reserveAt(reserves, index, name) {
   return byName ?? byIndex;
 }
 
-export async function readTapUsdE6FromDex({
+export async function readTapUsdAuFromDex({
   provider,
   poolAddress = DEFAULT_TAP_USDT_POOL,
   tapAddress,
@@ -260,7 +264,7 @@ export async function readTapUsdE6FromDex({
   }
 
   return {
-    tap_usd_e6: tapUsdE6FromReserves({
+    tap_usd_au: tapUsdAuFromReserves({
       tapReserve,
       usdtReserve,
       tapDecimals,
@@ -294,7 +298,7 @@ export async function resolveTapUsdRate({
   tapAddress,
   usdtAddress = DEFAULT_USDT_ADDRESS,
   fallbackUsd,
-  fallbackUsdE6,
+  fallbackUsdAu,
   env = process.env,
   ttlMs = DEFAULT_CACHE_TTL_MS,
   timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
@@ -311,7 +315,7 @@ export async function resolveTapUsdRate({
   if (inFlight) return inFlight;
 
   inFlight = (async () => {
-    const fallback = parsePinnedTapUsdE6({ tapUsdE6: fallbackUsdE6, tapUsd: fallbackUsd, env });
+    const fallback = parsePinnedTapUsdAu({ tapUsdAu: fallbackUsdAu, tapUsd: fallbackUsd, env });
     const normalizedChainId = chainId === undefined || chainId === null || chainId === ''
       ? 0
       : parseNonNegativeInt(chainId, '--chain-id');
@@ -322,7 +326,7 @@ export async function resolveTapUsdRate({
       if (fallback === null) throw new Error('Missing pinned TAP_USD fallback for non-mainnet or RPC-less price resolution');
       return cacheRate({
         source: 'config',
-        tap_usd_e6: fallback,
+        tap_usd_au: fallback,
         ts: nowSeconds(),
         failures,
       }, now);
@@ -331,7 +335,7 @@ export async function resolveTapUsdRate({
     for (const candidate of candidates) {
       try {
         const provider = providerFactory(candidate);
-        const dex = await readTapUsdE6FromDex({
+        const dex = await readTapUsdAuFromDex({
           provider,
           poolAddress,
           tapAddress,
@@ -341,7 +345,7 @@ export async function resolveTapUsdRate({
         });
         return cacheRate({
           source: 'uniswap-v2',
-          tap_usd_e6: dex.tap_usd_e6,
+          tap_usd_au: dex.tap_usd_au,
           ts: nowSeconds(),
           pool_address: dex.pool_address,
           tap_reserve: dex.tap_reserve,
@@ -361,7 +365,7 @@ export async function resolveTapUsdRate({
     if (fallback !== null) {
       return cacheRate({
         source: 'config',
-        tap_usd_e6: fallback,
+        tap_usd_au: fallback,
         ts: nowSeconds(),
         failures,
       }, now);
@@ -369,7 +373,7 @@ export async function resolveTapUsdRate({
     if (cache) {
       return cacheRate({
         source: 'stale',
-        tap_usd_e6: cache.tap_usd_e6,
+        tap_usd_au: cache.tap_usd_au,
         ts: nowSeconds(),
         stale_from_ts: cache.ts,
         failures,
@@ -410,8 +414,8 @@ async function readContractStateValue(rpcUrl, key, {
 }
 
 export function tapRateStateMatches(rate, value) {
-  return value?.denom === 'tap_usd_e6'
-    && value?.tap_usd_e6 === rate.tap_usd_e6
+  return value?.denom === 'tap_usd_au'
+    && value?.tap_usd_au === rate.tap_usd_au
     && value?.source === rate.source
     && value?.ts === rate.ts
     && value?.posted_by_role === 'admin';
@@ -447,8 +451,8 @@ export function buildAdminCommandArgs(rate, {
   const args = [
     'admin',
     'tap-rate-oracle',
-    '--tap-usd-e6',
-    String(rate.tap_usd_e6),
+    '--tap-usd-au',
+    String(rate.tap_usd_au),
     '--source',
     rate.source,
     '--ts',
@@ -503,7 +507,7 @@ export async function runOnce(options = {}) {
     submitted: false,
     verified: false,
     source: rate.source,
-    tap_usd_e6: rate.tap_usd_e6,
+    tap_usd_au: rate.tap_usd_au,
     ts: rate.ts,
     pool_address: rate.pool_address ?? null,
     tap_reserve: rate.tap_reserve ?? null,
@@ -560,14 +564,11 @@ async function main() {
   const ethRpc = args['eth-rpc']
     || args.rpc
     || process.env.MAYHEM_TAP_ETH_RPC
-    || process.env.TK_ETH_RPC
     || process.env.ETH_RPC;
   const ethRpcFallbacks = args['eth-rpc-fallbacks']
     || args['eth-rpc-fallback']
     || process.env.MAYHEM_TAP_ETH_RPC_FALLBACKS
     || process.env.MAYHEM_TAP_ETH_RPC_FALLBACK
-    || process.env.TK_ETH_RPC_FALLBACKS
-    || process.env.TK_ETH_RPC_FALLBACK
     || process.env.ETH_RPC_FALLBACKS;
   const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
   const chainId = args['chain-id'] ?? process.env.MAYHEM_TAP_ETH_CHAIN_ID ?? (ethRpc ? DEFAULT_MAINNET_CHAIN_ID : 0);
@@ -584,7 +585,7 @@ async function main() {
     tapAddress: args['tap-token'] || process.env.MAYHEM_TAP_TOKEN_ADDR,
     usdtAddress: args['usdt-token'] || process.env.MAYHEM_USDT_TOKEN_ADDR || DEFAULT_USDT_ADDRESS,
     fallbackUsd: args['tap-usd'],
-    fallbackUsdE6: args['tap-usd-e6'],
+    fallbackUsdAu: args['tap-usd-au'] ?? args['fallback-usd-au'],
     env: process.env,
     ttlMs: parsePositiveInt(args['cache-ttl-ms'] ?? DEFAULT_CACHE_TTL_MS, '--cache-ttl-ms', DEFAULT_CACHE_TTL_MS),
     timeoutMs: parsePositiveInt(args['rpc-timeout-ms'] ?? DEFAULT_RPC_TIMEOUT_MS, '--rpc-timeout-ms', DEFAULT_RPC_TIMEOUT_MS),
@@ -610,7 +611,7 @@ async function main() {
       console.log('[tap:rate] TAP/USD oracle tick complete');
       console.log('[tap:rate] source:', report.source);
       if (report.rpc_source) console.log('[tap:rate] rpc_source:', report.rpc_source);
-      console.log('[tap:rate] tap_usd_e6:', report.tap_usd_e6);
+      console.log('[tap:rate] tap_usd_au:', report.tap_usd_au);
       console.log('[tap:rate] submitted:', report.submitted);
       console.log('Copy/paste admin TAP rate oracle submit command:');
       console.log(report.copy_paste_admin_submit_command);

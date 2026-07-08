@@ -5,15 +5,15 @@ import {
   DEFAULT_USDT_ADDRESS,
   buildAdminCommand,
   buildAdminCommandArgs,
-  decimalUsdToE6,
-  parsePinnedTapUsdE6,
-  readTapUsdE6FromDex,
+  decimalUsdToAu,
+  parsePinnedTapUsdAu,
+  readTapUsdAuFromDex,
   resetTapPriceCacheForTest,
   resolveTapUsdRate,
   rpcUrlCandidates,
   runOnce,
   tapRateStateMatches,
-  tapUsdE6FromReserves,
+  tapUsdAuFromReserves,
 } from '../scripts/tap-price-watcher.mjs';
 
 const TAP = '0x1111111111111111111111111111111111111111';
@@ -35,31 +35,33 @@ function fakePool({
 }
 
 test('TAP reserve conversion is integer-exact', () => {
-  assert.equal(tapUsdE6FromReserves({
+  assert.equal(tapUsdAuFromReserves({
     tapReserve: U18(100),
     usdtReserve: U6(250),
-  }), 2_500_000);
-  assert.equal(tapUsdE6FromReserves({
+  }), '2500000000000000000');
+  assert.equal(tapUsdAuFromReserves({
     tapReserve: 3n * 1_000_000_000_000_000_000n,
     usdtReserve: 1n * 1_000_000n,
-  }), 333_333);
-  assert.equal(decimalUsdToE6('0.1234567'), 123_457);
-  assert.equal(parsePinnedTapUsdE6({ env: { TAP_USD: '0.05' } }), 50_000);
-  assert.equal(parsePinnedTapUsdE6({ env: { MAYHEM_TAP_USD_E6: '50001' } }), 50_001);
+  }), '333333333333333333');
+  assert.equal(decimalUsdToAu('0.1234567890123456789'), '123456789012345679');
+  assert.equal(parsePinnedTapUsdAu({ env: { TAP_USD: '0.05' } }), '50000000000000000');
+  assert.equal(parsePinnedTapUsdAu({
+    env: { MAYHEM_TAP_USD_AU: '50001000000000000' },
+  }), '50001000000000000');
 });
 
 test('TAP DEX reader maps either Uniswap token order', async () => {
-  const forward = await readTapUsdE6FromDex({
+  const forward = await readTapUsdAuFromDex({
     provider: {},
     poolAddress: POOL,
     tapAddress: TAP,
     poolFactory: () => fakePool(),
   });
-  assert.equal(forward.tap_usd_e6, 2_500_000);
+  assert.equal(forward.tap_usd_au, '2500000000000000000');
   assert.equal(forward.tap_reserve, U18(100).toString());
   assert.equal(forward.usdt_reserve, U6(250).toString());
 
-  const reverse = await readTapUsdE6FromDex({
+  const reverse = await readTapUsdAuFromDex({
     provider: {},
     poolAddress: POOL,
     tapAddress: TAP,
@@ -70,7 +72,7 @@ test('TAP DEX reader maps either Uniswap token order', async () => {
       reserve1: U18(30),
     }),
   });
-  assert.equal(reverse.tap_usd_e6, 2_500_000);
+  assert.equal(reverse.tap_usd_au, '2500000000000000000');
 });
 
 test('TAP rate resolver caches DEX reads and falls back safely', async () => {
@@ -90,7 +92,7 @@ test('TAP rate resolver caches DEX reads and falls back safely', async () => {
     ttlMs: 1_000,
   });
   assert.equal(first.source, 'uniswap-v2');
-  assert.equal(first.tap_usd_e6, 2_500_000);
+  assert.equal(first.tap_usd_au, '2500000000000000000');
   assert.equal(calls, 1);
 
   const cached = await resolveTapUsdRate({
@@ -126,7 +128,7 @@ test('TAP rate resolver caches DEX reads and falls back safely', async () => {
     timeoutMs: 50,
   });
   assert.equal(stale.source, 'stale');
-  assert.equal(stale.tap_usd_e6, 2_500_000);
+  assert.equal(stale.tap_usd_au, '2500000000000000000');
   assert.equal(stale.stale_from_ts, 10);
   assert.match(stale.failures[0].error, /rpc down/);
 
@@ -148,18 +150,18 @@ test('TAP rate resolver caches DEX reads and falls back safely', async () => {
     timeoutMs: 50,
   });
   assert.equal(config.source, 'config');
-  assert.equal(config.tap_usd_e6, 125_000);
+  assert.equal(config.tap_usd_au, '125000000000000000');
   assert.match(config.failures[0].error, /rpc down/);
 
   resetTapPriceCacheForTest();
   const noRpc = await resolveTapUsdRate({
     chainId: 0,
-    fallbackUsdE6: 55_000,
+    fallbackUsdAu: '55000000000000000',
     nowMs: () => 5_000,
     nowSeconds: () => 50,
   });
   assert.equal(noRpc.source, 'config');
-  assert.equal(noRpc.tap_usd_e6, 55_000);
+  assert.equal(noRpc.tap_usd_au, '55000000000000000');
 });
 
 test('TAP rate resolver tries mainnet RPC fallbacks before stale/config', async () => {
@@ -203,7 +205,7 @@ test('TAP rate resolver tries mainnet RPC fallbacks before stale/config', async 
   ]);
   assert.equal(rate.source, 'uniswap-v2');
   assert.equal(rate.rpc_source, 'example.quiknode.pro');
-  assert.equal(rate.tap_usd_e6, 2_500_000);
+  assert.equal(rate.tap_usd_au, '2500000000000000000');
   assert.equal(rate.failures.length, 1);
   assert.equal(rate.failures[0].rpc_source, 'mainnet.infura.io');
   assert.doesNotMatch(rate.failures[0].error, /primary-placeholder/);
@@ -211,12 +213,12 @@ test('TAP rate resolver tries mainnet RPC fallbacks before stale/config', async 
 });
 
 test('TAP rate watcher builds redacted admin commands and verifies state shape', () => {
-  const rate = { source: 'config', tap_usd_e6: 50_000, ts: 3_600 };
+  const rate = { source: 'config', tap_usd_au: '50000000000000000', ts: 3_600 };
   const args = buildAdminCommandArgs(rate, {
     rpcUrl: 'http://127.0.0.1:49223/v1',
     walletPassword: 'secret',
   });
-  assert.deepEqual(args.slice(0, 5), ['admin', 'tap-rate-oracle', '--tap-usd-e6', '50000', '--source']);
+  assert.deepEqual(args.slice(0, 5), ['admin', 'tap-rate-oracle', '--tap-usd-au', '50000000000000000', '--source']);
   assert.equal(args.includes('--wallet-password'), true);
   assert.equal(args.includes('secret'), true);
 
@@ -225,20 +227,20 @@ test('TAP rate watcher builds redacted admin commands and verifies state shape',
     walletPassword: 'secret',
   });
   assert.match(command, /tap-rate-oracle/);
-  assert.match(command, /--tap-usd-e6/);
+  assert.match(command, /--tap-usd-au/);
   assert.doesNotMatch(command, /secret/);
   assert.doesNotMatch(command, /wallet-password/);
 
   assert.equal(tapRateStateMatches(rate, {
-    denom: 'tap_usd_e6',
-    tap_usd_e6: 50_000,
+    denom: 'tap_usd_au',
+    tap_usd_au: '50000000000000000',
     source: 'config',
     ts: 3_600,
     posted_by_role: 'admin',
   }), true);
   assert.equal(tapRateStateMatches(rate, {
-    denom: 'tap_usd_e6',
-    tap_usd_e6: 49_999,
+    denom: 'tap_usd_au',
+    tap_usd_au: '49999999999999999',
     source: 'config',
     ts: 3_600,
     posted_by_role: 'admin',
@@ -269,5 +271,5 @@ test('TAP rate watcher refuses non-live mainnet fallback unless explicitly allow
     nowSeconds: () => 110,
   });
   assert.equal(allowed.source, 'config');
-  assert.equal(allowed.tap_usd_e6, 50_000);
+  assert.equal(allowed.tap_usd_au, '50000000000000000');
 });

@@ -12,13 +12,14 @@ import {
   TAP_DEPOSIT_EVENT_SIGNATURE,
   TAP_DEPOSIT_WATCHER_ID,
   tapDepositStateMatches,
-  tapWeiToMu,
+  tapWeiToAu,
 } from '../scripts/tap-deposit-watcher.mjs';
 
 const CHAIN_ID = 61000;
+const TAP_USD_AU = '2000000000000000000';
 const U = (n) => ethers.parseUnits(String(n), 18);
 
-test('tap deposit watcher scans KnowledgePool Deposit logs and builds admin command', async () => {
+test('tap deposit watcher scans MayhemInferencePool Deposit logs and builds admin command', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
     chain: { chainId: CHAIN_ID },
@@ -38,7 +39,7 @@ test('tap deposit watcher scans KnowledgePool Deposit logs and builds admin comm
     pool,
     fromBlock: 0,
     toBlock: latest,
-    tapUsdE6: 2_000_000,
+    tapUsdAu: TAP_USD_AU,
     chainId: CHAIN_ID,
     poolAddress: poolAddr,
   });
@@ -47,8 +48,8 @@ test('tap deposit watcher scans KnowledgePool Deposit logs and builds admin comm
   const deposit = scan.deposits[0];
   assert.equal(deposit.who, (await buyer.getAddress()).toLowerCase());
   assert.equal(deposit.tap_wei, U(2).toString());
-  assert.equal(deposit.tap_usd_e6, 2_000_000);
-  assert.equal(deposit.mu, 4_000_000);
+  assert.equal(deposit.tap_usd_au, TAP_USD_AU);
+  assert.equal(deposit.au, '4000000000000000000');
   assert.equal(deposit.pool_address, poolAddr.toLowerCase());
   assert.equal(deposit.chain_id, CHAIN_ID);
   assert.match(deposit.eth_tx_hash, /^0x[0-9a-f]{64}$/);
@@ -69,7 +70,7 @@ test('tap deposit watcher scans KnowledgePool Deposit logs and builds admin comm
   assert.deepEqual(args.slice(0, 4), ['admin', 'tap-deposit', '--who', deposit.who]);
   assert.equal(args.includes('--wallet-password'), true);
   assert.equal(args.includes('secret'), true);
-  assert.equal(args.includes('--tap-usd-e6'), false);
+  assert.equal(args.includes('--tap-usd-au'), false);
   assert.equal(args.includes('--block-hash'), true);
   assert.equal(args.includes('--finalized-block-number'), true);
   assert.equal(args.includes('--confirmation-depth'), true);
@@ -87,17 +88,17 @@ test('tap deposit watcher scans KnowledgePool Deposit logs and builds admin comm
   assert.match(command, /--eth-tx-hash/);
   assert.match(command, /--block-hash/);
   assert.match(command, /--event-signature/);
-  assert.doesNotMatch(command, /tap-usd-e6/);
+  assert.doesNotMatch(command, /tap-usd-au/);
   assert.doesNotMatch(command, /secret/);
   assert.doesNotMatch(command, /wallet-password/);
 });
 
-test('tap deposit watcher helpers compute policy mu and verify replay-safe state shape', () => {
+test('tap deposit watcher helpers compute policy au and verify replay-safe state shape', () => {
   const deposit = {
     who: '0x1111111111111111111111111111111111111111',
     tap_wei: U(1).toString(),
-    tap_usd_e6: 2_000_000,
-    mu: 2_000_000,
+    tap_usd_au: TAP_USD_AU,
+    au: '2000000000000000000',
     eth_tx_hash: `0x${'a'.repeat(64)}`,
     log_index: 0,
     block_number: 123,
@@ -111,18 +112,18 @@ test('tap deposit watcher helpers compute policy mu and verify replay-safe state
     watcher_id: TAP_DEPOSIT_WATCHER_ID,
   };
 
-  assert.equal(tapWeiToMu(deposit.tap_wei, deposit.tap_usd_e6), 2_000_000);
+  assert.equal(tapWeiToAu(deposit.tap_wei, deposit.tap_usd_au), '2000000000000000000');
   assert.equal(tapDepositStateMatches(deposit, {
     epoch: 9,
     seen: { ...deposit },
-    balance: { user: deposit.who, denom: 'mu_usd', mu: 2_000_000 },
-    depositRoot: { type: 'deposit_root', epoch: 9, count: 1, mu_total: 2_000_000 },
+    balance: { user: deposit.who, rail: 'tap', denom: 'au_usd', au: '2000000000000000000' },
+    depositRoot: { type: 'deposit_root', epoch: 9, count: 1, au_total: '2000000000000000000' },
   }), true);
   assert.equal(tapDepositStateMatches(deposit, {
     epoch: 9,
     seen: null,
-    balance: { user: deposit.who, denom: 'mu_usd', mu: 2_000_000 },
-    depositRoot: { type: 'deposit_root', epoch: 9, count: 1, mu_total: 2_000_000 },
+    balance: { user: deposit.who, rail: 'tap', denom: 'au_usd', au: '2000000000000000000' },
+    depositRoot: { type: 'deposit_root', epoch: 9, count: 1, au_total: '2000000000000000000' },
   }), false);
 });
 
@@ -141,7 +142,7 @@ test('tap deposit watcher emits no credit for nonexistent Deposit logs', async (
     pool,
     fromBlock: 0,
     toBlock: latest,
-    tapUsdE6: 2_000_000,
+    tapUsdAu: TAP_USD_AU,
     chainId: CHAIN_ID,
     poolAddress: poolAddr,
   });

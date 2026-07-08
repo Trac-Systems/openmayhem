@@ -87,7 +87,9 @@ function normalizeBlockHash(value) {
 
 function positiveDecimalBigInt(value, label) {
   try {
-    const parsed = BigInt(String(value ?? '').trim());
+    const raw = String(value ?? '').trim();
+    if (!/^(0|[1-9]\d*)$/.test(raw)) throw new Error();
+    const parsed = BigInt(raw);
     if (parsed <= 0n) throw new Error();
     return parsed;
   } catch (_error) {
@@ -95,18 +97,16 @@ function positiveDecimalBigInt(value, label) {
   }
 }
 
-export function tapWeiToMu(tapWei, tapUsdE6) {
+export function tapWeiToAu(tapWei, tapUsdAu) {
   const wei = positiveDecimalBigInt(tapWei, 'tap_wei');
-  const rate = parsePositiveInt(tapUsdE6, 'tap_usd_e6');
-  const mu = (wei * BigInt(rate)) / TAP_WEI;
-  if (mu > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('mu value overflow');
-  return Number(mu);
+  const rate = positiveDecimalBigInt(tapUsdAu, 'tap_usd_au');
+  return ((wei * rate) / TAP_WEI).toString();
 }
 
 export function tapDepositFromLog(log, {
   chainId,
   poolAddress,
-  tapUsdE6,
+  tapUsdAu,
   finalizedBlockNumber,
   confirmationDepth,
   confirmationPolicy = 'depth',
@@ -125,9 +125,9 @@ export function tapDepositFromLog(log, {
   );
   const normalizedChainId = parsePositiveInt(chainId, 'chain_id');
   const tapWei = positiveDecimalBigInt(amount, 'tap_wei').toString();
-  const normalizedRate = tapUsdE6 === undefined || tapUsdE6 === null || tapUsdE6 === ''
+  const normalizedRate = tapUsdAu === undefined || tapUsdAu === null || tapUsdAu === ''
     ? null
-    : parsePositiveInt(tapUsdE6, 'tap_usd_e6');
+    : positiveDecimalBigInt(tapUsdAu, 'tap_usd_au').toString();
   const deposit = {
     who: normalizeAddress(buyer, 'buyer'),
     tap_wei: tapWei,
@@ -144,8 +144,8 @@ export function tapDepositFromLog(log, {
     watcher_id: String(watcherId),
   };
   if (normalizedRate !== null) {
-    deposit.tap_usd_e6 = normalizedRate;
-    deposit.mu = tapWeiToMu(tapWei, normalizedRate);
+    deposit.tap_usd_au = normalizedRate;
+    deposit.au = tapWeiToAu(tapWei, normalizedRate);
   }
   return deposit;
 }
@@ -245,11 +245,19 @@ export function tapDepositStateMatches(deposit, {
   depositRoot,
   epoch,
 } = {}) {
-  const balanceMu = Number(balance?.mu);
-  const rootMu = Number(depositRoot?.mu_total);
+  const readAu = (value) => {
+    try {
+      const parsed = BigInt(String(value ?? '').trim());
+      return parsed >= 0n ? parsed : null;
+    } catch (_error) {
+      return null;
+    }
+  };
+  const balanceAu = readAu(balance?.au);
+  const rootAu = readAu(depositRoot?.au_total);
   const rootCount = Number(depositRoot?.count);
-  const expectedMu = Number(deposit?.mu);
-  const hasExpectedMu = Number.isSafeInteger(expectedMu) && expectedMu > 0;
+  const expectedAu = readAu(deposit?.au);
+  const hasExpectedAu = expectedAu !== null && expectedAu > 0n;
   return seen !== null
     && seen?.eth_tx_hash === deposit.eth_tx_hash
     && Number(seen?.log_index) === deposit.log_index
@@ -261,17 +269,18 @@ export function tapDepositStateMatches(deposit, {
     && seen?.confirmation_policy === deposit.confirmation_policy
     && seen?.event_signature === deposit.event_signature
     && seen?.watcher_id === deposit.watcher_id
-    && (!hasExpectedMu || Number(seen?.mu) === expectedMu)
+    && (!hasExpectedAu || readAu(seen?.au) === expectedAu)
     && balance?.user === deposit.who
-    && balance?.denom === 'mu_usd'
-    && Number.isSafeInteger(balanceMu)
-    && (!hasExpectedMu || balanceMu >= expectedMu)
+    && balance?.rail === 'tap'
+    && balance?.denom === 'au_usd'
+    && balanceAu !== null
+    && (!hasExpectedAu || balanceAu >= expectedAu)
     && depositRoot?.type === 'deposit_root'
     && Number(depositRoot?.epoch) === Number(epoch)
     && Number.isSafeInteger(rootCount)
     && rootCount > 0
-    && Number.isSafeInteger(rootMu)
-    && (!hasExpectedMu || rootMu >= expectedMu);
+    && rootAu !== null
+    && (!hasExpectedAu || rootAu >= expectedAu);
 }
 
 export async function waitForTapDepositState(deposit, {
@@ -287,7 +296,7 @@ export async function waitForTapDepositState(deposit, {
   while (Date.now() <= deadline) {
     const [seen, balance, depositRoot] = await Promise.all([
       readContractStateValue(rpcUrl, seenKey, { fetchImpl }),
-      readContractStateValue(rpcUrl, `bal/${deposit.who}`, { fetchImpl }),
+      readContractStateValue(rpcUrl, `bal/${deposit.who}/tap`, { fetchImpl }),
       readContractStateValue(rpcUrl, `ev/dep/${epoch}`, { fetchImpl }),
     ]);
     state = { seen, balance, depositRoot };
@@ -345,7 +354,7 @@ export async function scanTapDeposits({
   confirmations = 12,
   blockTag,
   chunkSize = 5000,
-  tapUsdE6,
+  tapUsdAu,
   chainId,
   poolAddress,
 } = {}) {
@@ -371,7 +380,7 @@ export async function scanTapDeposits({
       deposits.push(tapDepositFromLog(event, {
         chainId: normalizedChainId,
         poolAddress: poolAddress ?? event.address ?? await pool.getAddress(),
-        tapUsdE6,
+        tapUsdAu,
         finalizedBlockNumber: safeTo,
         confirmationDepth: Math.max(0, safeTo - Number(event.blockNumber)),
         confirmationPolicy,
@@ -404,8 +413,8 @@ async function main() {
   if (!rpc) throw new Error('Missing --rpc or MAYHEM_TAP_ETH_RPC.');
   if (!poolAddress) throw new Error('Missing --pool or MAYHEM_TAP_POOL_ADDRESS.');
 
-  const tapUsdE6 = args['tap-usd-e6'] || process.env.MAYHEM_TAP_USD_E6
-    ? parsePositiveInt(args['tap-usd-e6'] || process.env.MAYHEM_TAP_USD_E6, '--tap-usd-e6')
+  const tapUsdAu = args['tap-usd-au'] || process.env.MAYHEM_TAP_USD_AU
+    ? positiveDecimalBigInt(args['tap-usd-au'] || process.env.MAYHEM_TAP_USD_AU, '--tap-usd-au').toString()
     : undefined;
   const epoch = parsePositiveInt(args.epoch, '--epoch');
   const at = parseNonNegativeInt(args.at ?? Math.floor(Date.now() / 1000), '--at');
@@ -432,7 +441,7 @@ async function main() {
     confirmations,
     blockTag: args['block-tag'],
     chunkSize,
-    tapUsdE6,
+    tapUsdAu,
     chainId: args['chain-id'] ? parsePositiveInt(args['chain-id'], '--chain-id') : undefined,
     poolAddress,
   });
@@ -463,6 +472,7 @@ async function main() {
       ...deposit,
       copy_paste_admin_submit_command: command,
       submitted: false,
+      preflighted: false,
       verified: false,
     };
     if (submit) {
@@ -471,7 +481,11 @@ async function main() {
         buildAdminCommandArgs(deposit, adminOptions),
         { encoding: 'utf8' }
       );
-      confirmation.submitted = child.status === 0;
+      if (sim) {
+        confirmation.preflighted = child.status === 0;
+      } else {
+        confirmation.submitted = child.status === 0;
+      }
       confirmation.exit_status = child.status;
       confirmation.stdout = child.stdout?.trim() || null;
       confirmation.stderr = child.stderr?.trim() || null;
@@ -515,7 +529,7 @@ async function main() {
     pool: normalizeAddress(poolAddress, 'pool'),
     epoch,
     at,
-    tap_usd_e6: tapUsdE6,
+    tap_usd_au: tapUsdAu,
     confirmations,
     from_block: scan.from,
     safe_to_block: scan.to,

@@ -1,18 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import MayhemContract from '../contract/contract.js';
 import {
   runMarketSimulation,
   validateMarketSimulation,
   formatMarketSimulationMarkdown,
+  marketConstants,
 } from '../scripts/market-sim.mjs';
 
 test('market simulation uses the live contract controller constants', () => {
   const report = runMarketSimulation();
-  const contract = new MayhemContract({}, {});
 
-  assert.deepEqual(report.constants, contract.marketPriceConstants());
+  assert.deepEqual(report.constants, marketConstants());
 });
 
 test('market simulation scenarios satisfy the F7 launch-gate invariants', () => {
@@ -37,9 +36,9 @@ test('thin-liquidity simulation remains pinned at P0 below S_min', () => {
   const thin = report.scenarios.thin_liquidity;
 
   assert.equal(thin.summary.frozen_epochs, thin.epochs);
-  assert.equal(thin.summary.max_price_mu, report.seed_price_mu);
-  assert.equal(thin.summary.min_price_mu, report.seed_price_mu);
-  assert.ok(thin.rows.every((row) => row.frozen && row.price_mu === report.seed_price_mu));
+  assert.equal(thin.summary.max_price_au, report.seed_price_au);
+  assert.equal(thin.summary.min_price_au, report.seed_price_au);
+  assert.ok(thin.rows.every((row) => row.frozen && row.price_au === report.seed_price_au));
 });
 
 test('one-epoch demand and phantom-supply attacks are bounded and recover', () => {
