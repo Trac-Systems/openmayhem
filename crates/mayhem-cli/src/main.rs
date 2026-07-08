@@ -83,6 +83,8 @@ const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
+const AU_PER_USD: MoneyAu = 1_000_000_000_000_000_000;
+const AU_PER_CENT: MoneyAu = AU_PER_USD / 100;
 const DEFAULT_HOLDBACK_EPOCHS: u64 = 24;
 const DEFAULT_NEW_PROVIDER_HOLDBACK_EPOCHS: u64 = 168;
 const DEFAULT_CHALLENGE_EPOCHS: u64 = 6;
@@ -4305,7 +4307,7 @@ struct ProviderLimitsSetArgs {
     #[arg(long)]
     accept_rate: Option<String>,
 
-    /// Exposure cap such as 2500000000000000000au/day, 500000tokens/day, or 2500000000000000000au/epoch.
+    /// Exposure cap such as 2.50usd/day, $2.50/epoch, 500000tokens/day, or an exact au amount for scripts.
     #[arg(long)]
     budget: Option<String>,
 
@@ -6738,8 +6740,10 @@ fn format_rate_map(rate_map: &[RateMapEntry]) -> String {
         .into_iter()
         .map(|entry| {
             format!(
-                "{}={}/{}au",
-                entry.unit, entry.per_unit_au, entry.granularity
+                "{}=${}/{}",
+                entry.unit,
+                au_to_usd_amount(entry.per_unit_au),
+                entry.granularity
             )
         })
         .collect::<Vec<_>>()
@@ -22483,16 +22487,20 @@ fn print_price_show_report(report: &Value) -> Result<()> {
             price.get("ver").and_then(Value::as_u64).unwrap_or(0)
         );
         println!("  price: {}", format_rate_map(&rate_map));
-        println!(
-            "  per_req_au={} min_session_au={} denom={}",
+        let per_request_usd = au_to_usd_amount(
             price
                 .get("per_req_au")
                 .and_then(value_money_au)
                 .unwrap_or(0),
+        );
+        let min_session_usd = au_to_usd_amount(
             price
                 .get("min_session_au")
                 .and_then(value_money_au)
                 .unwrap_or(0),
+        );
+        println!(
+            "  request_fee=${per_request_usd} min_session=${min_session_usd} denom={}",
             price
                 .get("denom")
                 .and_then(Value::as_str)
@@ -22500,7 +22508,7 @@ fn print_price_show_report(report: &Value) -> Result<()> {
         );
         match price.get("derivation").filter(|value| !value.is_null()) {
             Some(derivation) => {
-                println!("  derivation: {}", serde_json::to_string(derivation)?);
+                println!("  derivation: {}", price_derivation_summary(derivation));
             }
             None => {
                 println!("  derivation: not published yet; cold-start seed price is active");
@@ -22508,6 +22516,67 @@ fn print_price_show_report(report: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn price_derivation_summary(derivation: &Value) -> String {
+    let epoch = derivation_u64(derivation, &["epoch"])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let seed_ver = derivation_u64(derivation, &["seed_price", "ver"])
+        .map(|value| format!("v{value}"))
+        .unwrap_or_else(|| "?".to_owned());
+    let result_ver = derivation_u64(derivation, &["result_price", "ver"])
+        .or_else(|| derivation_u64(derivation, &["price_ver"]))
+        .map(|value| format!("v{value}"))
+        .unwrap_or_else(|| "price".to_owned());
+    let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
+        .map(format_bps)
+        .unwrap_or_else(|| "?".to_owned());
+    let demand = derivation_money_au(derivation, &["usage", "active_demand_au"])
+        .map(|au| format!("${}", au_to_usd_amount(au)))
+        .unwrap_or_else(|| "unknown demand".to_owned());
+    let sessions = derivation_u64(derivation, &["usage", "session_count"])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let supply = derivation_u64(derivation, &["controller", "active_supply"])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let source = derivation_str(derivation, &["controller", "source"])
+        .or_else(|| derivation_str(derivation, &["price_source"]))
+        .unwrap_or("market");
+    let root = derivation_str(derivation, &["price_root"])
+        .map(|value| format!(" root={}", short_hash(value)))
+        .unwrap_or_default();
+    let leaf = derivation_str(derivation, &["derivation_hash"])
+        .map(|value| format!(" leaf={}", short_hash(value)))
+        .unwrap_or_default();
+    format!(
+        "price = f(seed {seed_ver}, U {utilization}, demand {demand}, {sessions} sessions, supply {supply}) -> {result_ver}; epoch {epoch}; {source}{root}{leaf}"
+    )
+}
+
+fn derivation_u64(value: &Value, path: &[&str]) -> Option<u64> {
+    derivation_value(value, path)?.as_u64()
+}
+
+fn derivation_money_au(value: &Value, path: &[&str]) -> Option<MoneyAu> {
+    derivation_value(value, path).and_then(value_money_au)
+}
+
+fn derivation_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    derivation_value(value, path)?.as_str()
+}
+
+fn derivation_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn format_bps(value: u64) -> String {
+    format!("{}.{:02}%", value / 100, value % 100)
 }
 
 fn print_provider_limits_report(report: &Value) {
@@ -22532,11 +22601,12 @@ fn print_provider_limits_report(report: &Value) {
             .unwrap_or(0)
     );
     println!(
-        "budget_au: {}",
+        "budget_usd: ${}",
         limits
             .get("serve_budget_au")
             .and_then(value_money_au)
-            .unwrap_or(0)
+            .map(au_to_usd_amount)
+            .unwrap_or_else(|| "0.00".to_owned())
     );
     println!(
         "budget_tokens: {}",
@@ -24690,6 +24760,42 @@ fn parse_usd_amount_to_au(amount: &str) -> Result<MoneyAu> {
     Ok(total_au)
 }
 
+fn parse_precise_usd_amount_to_au(amount: &str, label: &str) -> Result<MoneyAu> {
+    let amount = amount.trim();
+    if amount.is_empty() {
+        bail!("{label} must be positive USD");
+    }
+    if amount.starts_with('-') || amount.starts_with('+') {
+        bail!("{label} must be positive USD");
+    }
+    let (dollars, fractional) = amount.split_once('.').unwrap_or((amount, ""));
+    if dollars.is_empty()
+        || !dollars.as_bytes().iter().all(u8::is_ascii_digit)
+        || !fractional.as_bytes().iter().all(u8::is_ascii_digit)
+        || fractional.len() > 18
+    {
+        bail!("{label} must be a USD decimal with at most 18 fractional digits");
+    }
+    let dollars = dollars.parse::<MoneyAu>()?;
+    let mut fractional_text = fractional.to_owned();
+    while fractional_text.len() < 18 {
+        fractional_text.push('0');
+    }
+    let fractional_au = if fractional_text.is_empty() {
+        0
+    } else {
+        fractional_text.parse::<MoneyAu>()?
+    };
+    let total_au = dollars
+        .checked_mul(AU_PER_USD)
+        .and_then(|value| value.checked_add(fractional_au))
+        .with_context(|| format!("{label} overflowed"))?;
+    if total_au == 0 {
+        bail!("{label} must be positive");
+    }
+    Ok(total_au)
+}
+
 fn parse_decimal_money_au(value: &str) -> Result<MoneyAu> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
@@ -24725,8 +24831,27 @@ fn money_au_map_json(map: &BTreeMap<String, MoneyAu>) -> Value {
 }
 
 fn au_to_usd_amount(au: MoneyAu) -> String {
-    let cents = au.saturating_add(5_000_000_000_000_000) / 10_000_000_000_000_000;
-    format!("{}.{:02}", cents / 100, cents % 100)
+    if au == 0 {
+        return "0.00".to_owned();
+    }
+    if au >= AU_PER_CENT / 2 {
+        let cents = au.saturating_add(AU_PER_CENT / 2) / AU_PER_CENT;
+        return format!("{}.{:02}", cents / 100, cents % 100);
+    }
+    au_to_usd_decimal(au)
+}
+
+fn au_to_usd_decimal(au: MoneyAu) -> String {
+    let whole = au / AU_PER_USD;
+    let fractional = au % AU_PER_USD;
+    if fractional == 0 {
+        return format!("{whole}.00");
+    }
+    let mut fraction = format!("{fractional:018}");
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{whole}.{fraction}")
 }
 
 fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
@@ -28297,7 +28422,7 @@ fn parse_provider_accept_rate(value: &str) -> Result<u32> {
 
 fn parse_provider_budget(value: &str) -> Result<ParsedProviderBudget> {
     let (amount_kind, period) = value.trim().split_once('/').with_context(|| {
-        format!("--budget must look like 1000000000000000000au/day or 500000tokens/epoch, got {value:?}")
+        format!("--budget must look like 2.50usd/day, $2.50/epoch, or 500000tokens/epoch, got {value:?}")
     })?;
     let period_seconds = match period.trim().to_ascii_lowercase().as_str() {
         "day" | "daily" => 86_400,
@@ -28314,19 +28439,40 @@ fn parse_provider_budget(value: &str) -> Result<ParsedProviderBudget> {
         bail!("budget period must be greater than zero");
     }
     let lower = amount_kind.trim().to_ascii_lowercase();
-    let (digits, kind) = if let Some(digits) = lower.strip_suffix("tokens") {
-        (digits, ProviderBudgetKind::Tokens)
+    let (amount, kind) = if let Some(digits) = lower.strip_suffix("tokens") {
+        (
+            digits.trim().parse::<u128>().with_context(|| {
+                format!("budget amount must be an integer, got {amount_kind:?}")
+            })?,
+            ProviderBudgetKind::Tokens,
+        )
     } else if let Some(digits) = lower.strip_suffix("token") {
-        (digits, ProviderBudgetKind::Tokens)
+        (
+            digits.trim().parse::<u128>().with_context(|| {
+                format!("budget amount must be an integer, got {amount_kind:?}")
+            })?,
+            ProviderBudgetKind::Tokens,
+        )
     } else if let Some(digits) = lower.strip_suffix("au") {
-        (digits, ProviderBudgetKind::Au)
+        (
+            digits.trim().parse::<u128>().with_context(|| {
+                format!("budget amount must be an integer, got {amount_kind:?}")
+            })?,
+            ProviderBudgetKind::Au,
+        )
+    } else if let Some(usd) = lower.strip_suffix("usd") {
+        (
+            parse_precise_usd_amount_to_au(usd, "--budget amount")?,
+            ProviderBudgetKind::Au,
+        )
+    } else if let Some(usd) = lower.strip_prefix('$') {
+        (
+            parse_precise_usd_amount_to_au(usd, "--budget amount")?,
+            ProviderBudgetKind::Au,
+        )
     } else {
-        bail!("budget amount must end in au or tokens");
+        bail!("budget amount must end in usd, au, or tokens");
     };
-    let amount = digits
-        .trim()
-        .parse::<u128>()
-        .with_context(|| format!("budget amount must be an integer, got {amount_kind:?}"))?;
     Ok(ParsedProviderBudget {
         amount,
         kind,
@@ -33191,8 +33337,8 @@ async fn serve_provider_sessions(
 
     provider_log(
         ctx.args,
-        &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask_au {} max_sessions {}",
+            &format!(
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask ${} max_sessions {}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
@@ -33201,7 +33347,7 @@ async fn serve_provider_sessions(
             format_rate_map(&terms.rate_map),
             terms.ctx_bracket.as_deref().unwrap_or("base"),
             terms.ctx_bracket_table_ver.unwrap_or(0),
-            terms.min_ask_au,
+            au_to_usd_amount(terms.min_ask_au),
             protection_config.max_sessions
         ),
     );
@@ -39339,6 +39485,22 @@ mod tests {
         assert!(normalize_provider_market_target("test/model:T9").is_err());
         assert_eq!(parse_provider_accept_rate("12/min").unwrap(), 12);
         assert_eq!(
+            parse_provider_budget("2.50usd/day").unwrap(),
+            ParsedProviderBudget {
+                amount: 2_500_000_000_000_000_000,
+                kind: ProviderBudgetKind::Au,
+                period_seconds: 86_400,
+            }
+        );
+        assert_eq!(
+            parse_provider_budget("$0.000000000001/epoch").unwrap(),
+            ParsedProviderBudget {
+                amount: 1_000_000,
+                kind: ProviderBudgetKind::Au,
+                period_seconds: DEFAULT_EPOCH_SECONDS,
+            }
+        );
+        assert_eq!(
             parse_provider_budget("2500au/day").unwrap(),
             ParsedProviderBudget {
                 amount: 2500,
@@ -40569,7 +40731,7 @@ mod tests {
             "--accept-rate",
             "10/min",
             "--budget",
-            "2500au/day",
+            "2.50usd/day",
             "--json",
         ])
         .unwrap();
@@ -40585,7 +40747,7 @@ mod tests {
         assert_eq!(args.enclave.as_deref(), Some("test/model:T3"));
         assert_eq!(args.max_concurrent, Some(2));
         assert_eq!(args.accept_rate.as_deref(), Some("10/min"));
-        assert_eq!(args.budget.as_deref(), Some("2500au/day"));
+        assert_eq!(args.budget.as_deref(), Some("2.50usd/day"));
         assert!(args.json);
 
         let price = Cli::try_parse_from([
@@ -46569,6 +46731,18 @@ mod tests {
         assert!(parse_usd_amount_to_au("0").is_err());
         assert!(parse_usd_amount_to_au("1.001").is_err());
         assert!(parse_usd_amount_to_au("-1").is_err());
+    }
+
+    #[test]
+    fn human_money_format_preserves_sub_cent_au() {
+        assert_eq!(au_to_usd_amount(0), "0.00");
+        assert_eq!(au_to_usd_amount(1), "0.000000000000000001");
+        assert_eq!(au_to_usd_amount(10_000_000), "0.00000000001");
+        assert_eq!(au_to_usd_amount(10_000_000_000_000_000), "0.01");
+        assert_eq!(
+            parse_precise_usd_amount_to_au("0.000000000001", "test").unwrap(),
+            1_000_000
+        );
     }
 
     #[test]

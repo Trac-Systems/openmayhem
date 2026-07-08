@@ -91,6 +91,8 @@ const X_MAYHEM_OPEN_TIMEOUT_MS_HEADER: &str = "x-mayhem-open-timeout-ms";
 const X_MAYHEM_TTFT_TIMEOUT_MS_HEADER: &str = "x-mayhem-ttft-timeout-ms";
 const X_MAYHEM_STALL_TIMEOUT_MS_HEADER: &str = "x-mayhem-stall-timeout-ms";
 const X_MAYHEM_MIN_TOK_S_HEADER: &str = "x-mayhem-min-tok-s";
+const AU_PER_USD: MoneyAu = 1_000_000_000_000_000_000;
+const AU_PER_CENT: MoneyAu = AU_PER_USD / 100;
 pub const DEFAULT_ROUTE_MAX_WAIT_MS: u64 = 10_000;
 pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
@@ -4379,11 +4381,11 @@ fn dashboard_price_chart_card(
         .map(|point| point.epoch.to_string())
         .unwrap_or_else(|| "?".to_owned());
     let latest_price = latest
-        .map(|point| format!("{}au/1k", point.price_au))
+        .map(|point| format!("{} / 1k", format_au_usd(point.price_au)))
         .unwrap_or_else(|| "pending".to_owned());
     let volume = latest
-        .map(|point| format!("{}au volume", point.volume_au))
-        .unwrap_or_else(|| "0mu volume".to_owned());
+        .map(|point| format!("{} volume", format_au_usd(point.volume_au)))
+        .unwrap_or_else(|| "$0.00 volume".to_owned());
     format!(
         r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2><p class="privacy-note">{} · {} · {}</p></div><a class="copy-chip" href="{}">{pin_label}</a></div>{controls}<div class="price-chart-shell">{chart}</div><div class="price-chart-legend"><span class="badge good">{}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge live">{}</span></div><div class="price-chart-footer"><span class="mono">epoch {latest_epoch}</span><span class="mono">{latest_price}</span><span class="mono">{volume}</span></div></article>"#,
         html_escape(&model.id),
@@ -4994,14 +4996,14 @@ fn dashboard_price_candles(
                 volume_au,
                 pinned,
                 title: format!(
-                    "epoch {}-{} OHLC {}/{}/{}/{}au volume {}au | {}",
+                    "epoch {}-{} OHLC {}/{}/{}/{} volume {} | {}",
                     start_epoch,
                     end_epoch,
-                    first.price_au,
-                    high_au,
-                    low_au,
-                    last.price_au,
-                    volume_au,
+                    format_au_usd(first.price_au),
+                    format_au_usd(high_au),
+                    format_au_usd(low_au),
+                    format_au_usd(last.price_au),
+                    format_au_usd(volume_au),
                     last.title
                 ),
             }
@@ -5236,8 +5238,10 @@ fn dashboard_price(price: &PriceRefAu) -> String {
         .take(3)
         .map(|entry| {
             format!(
-                "{}au/{}/{}",
-                entry.per_unit_au, entry.granularity, entry.unit
+                "{} / {} {}",
+                format_au_usd(entry.per_unit_au),
+                entry.granularity,
+                entry.unit
             )
         })
         .collect::<Vec<_>>();
@@ -5269,9 +5273,9 @@ fn dashboard_price_derivation_summary(derivation: &Value) -> String {
     let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
         .map(format_bps)
         .unwrap_or_else(|| "?".to_owned());
-    let demand_au = derivation_money_au(derivation, &["usage", "active_demand_au"])
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "?".to_owned());
+    let demand = derivation_money_au(derivation, &["usage", "active_demand_au"])
+        .map(format_au_usd)
+        .unwrap_or_else(|| "unknown demand".to_owned());
     let sessions = derivation_u64(derivation, &["usage", "session_count"])
         .map(|value| value.to_string())
         .unwrap_or_else(|| "?".to_owned());
@@ -5293,7 +5297,7 @@ fn dashboard_price_derivation_summary(derivation: &Value) -> String {
         .map(|value| format!(" · leaf {}", short_text(value, 12)))
         .unwrap_or_default();
     format!(
-        "price = f(seed {seed_ver}, U {utilization}, demand {demand_au}au, {sessions} sessions, supply {supply}) -> {result_ver} · epoch {epoch} · {source}{frozen}{root}{leaf}"
+        "price = f(seed {seed_ver}, U {utilization}, demand {demand}, {sessions} sessions, supply {supply}) -> {result_ver} · epoch {epoch} · {source}{frozen}{root}{leaf}"
     )
 }
 
@@ -5348,8 +5352,27 @@ fn dashboard_spend_body(receipts: &[StoredReceipt]) -> String {
 }
 
 fn format_au_usd(au: MoneyAu) -> String {
-    let cents = au.saturating_add(5_000_000_000_000_000) / 10_000_000_000_000_000;
-    format!("${}.{:02}", cents / 100, cents % 100)
+    if au == 0 {
+        return "$0.00".to_owned();
+    }
+    if au >= AU_PER_CENT / 2 {
+        let cents = au.saturating_add(AU_PER_CENT / 2) / AU_PER_CENT;
+        return format!("${}.{:02}", cents / 100, cents % 100);
+    }
+    format!("${}", format_au_usd_decimal(au))
+}
+
+fn format_au_usd_decimal(au: MoneyAu) -> String {
+    let whole = au / AU_PER_USD;
+    let fractional = au % AU_PER_USD;
+    if fractional == 0 {
+        return format!("{whole}.00");
+    }
+    let mut fraction = format!("{fractional:018}");
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{whole}.{fraction}")
 }
 
 fn value_as_money_au(value: &Value) -> Option<MoneyAu> {
@@ -20397,6 +20420,30 @@ mod tests {
 
         let err = finish_session_artifacts(builders).expect_err("digest mismatch must reject");
         assert!(err.message.contains("blake3 mismatch"));
+    }
+
+    #[test]
+    fn dashboard_money_format_preserves_sub_cent_au() {
+        assert_eq!(format_au_usd(0), "$0.00");
+        assert_eq!(format_au_usd(1), "$0.000000000000000001");
+        assert_eq!(format_au_usd(10_000_000), "$0.00000000001");
+        assert_eq!(format_au_usd(AU_PER_CENT), "$0.01");
+        let price = PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 1,
+            rate_map: vec![RateMapEntry {
+                unit: "input_token".to_owned(),
+                per_unit_au: 10_000_000,
+                granularity: 1000,
+            }],
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: Vec::new(),
+        };
+        let label = dashboard_price(&price);
+        assert!(label.contains("$0.00000000001 / 1000 input_token"));
+        assert!(!label.contains("au/"));
     }
 
     fn test_provider_receipt(

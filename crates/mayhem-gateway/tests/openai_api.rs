@@ -3634,7 +3634,7 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     assert!(body.contains("ETA measured after the first download chunk"));
     assert!(body.contains("T2"));
     assert!(body.contains("rep 87.50%"));
-    assert!(body.contains("price = f(seed v1, U 87.50%, demand 2500000000000000000au, 5 sessions, supply 2)"));
+    assert!(body.contains("price = f(seed v1, U 87.50%, demand $2.50, 5 sessions, supply 2)"));
     assert!(body.contains("epoch 12"));
     assert!(body.contains("root efefefefe..."));
     assert!(body.contains("leaf cdcdcdcdc..."));

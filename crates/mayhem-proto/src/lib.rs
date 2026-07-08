@@ -9,7 +9,6 @@ pub const CONTRACT_VERSION: u32 = 4;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 8;
-pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 8;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
 pub const CTX_BRACKETS: &[(u32, &str)] = &[
