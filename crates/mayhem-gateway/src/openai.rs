@@ -20,12 +20,12 @@ use crate::{
     },
     failover::{
         default_ttft_timeout_millis, midstream_stalled_after, x_mayhem_hedge_requested,
-        FailoverPolicy, RedispatchMode, SessionFailoverState, SessionPriceMu,
+        FailoverPolicy, RedispatchMode, SessionFailoverState, SessionPriceAu,
         DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
         DEFAULT_STALL_TIMEOUT_MILLIS, DEFAULT_TTFT_BASE_TIMEOUT_MILLIS,
     },
     pricing::{
-        normalize_rate_map, priced_usage_mu, rate_map_cost_basis_per_1k, text_generation_rate_map,
+        normalize_rate_map, priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map,
         RateMapEntry,
     },
     provider_table::{
@@ -64,11 +64,11 @@ use mayhem_proto::{
     default_model_class, migrate_receipt_body, reassemble_json_payload, receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
     supported_receipt_signing_bytes, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
-    PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt,
-    SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_STEP,
+    MoneyAu, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -83,7 +83,7 @@ const EMBEDDED_CANARY_LAUNCH_V1: &str =
 const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
-const X_MAYHEM_MAX_PRICE_MU_HEADER: &str = "x-mayhem-max-price-mu";
+const X_MAYHEM_MAX_PRICE_MU_HEADER: &str = "x-mayhem-max-price-au";
 const X_MAYHEM_MAX_WAIT_MS_HEADER: &str = "x-mayhem-max-wait-ms";
 const X_MAYHEM_MIN_CTX_HEADER: &str = "x-mayhem-min-ctx";
 const X_MAYHEM_QUANT_HEADER: &str = "x-mayhem-quant";
@@ -108,6 +108,7 @@ const DASHBOARD_USER_PINS_COOKIE_NAME: &str = "mayhem_dashboard_user_pins";
 const DASHBOARD_PROVIDER_PINS_COOKIE_NAME: &str = "mayhem_dashboard_provider_pins";
 const DASHBOARD_NETWORK_PINS_COOKIE_NAME: &str = "mayhem_dashboard_network_pins";
 const DASHBOARD_PIN_COOKIE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
+const DASHBOARD_PROVIDER_PROGRESS_ONLY_TTL_MS: u64 = 5 * 60 * 1000;
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
 const DASHBOARD_CSS: &str = r#"
 @font-face{font-family:Exo;src:url('/mayhem/dashboard/assets/exo-latin.woff2') format('woff2');font-style:normal;font-weight:400 700;font-display:swap}
@@ -115,7 +116,8 @@ const DASHBOARD_CSS: &str = r#"
 *{box-sizing:border-box;letter-spacing:0}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text-primary);font-family:Exo,system-ui,sans-serif;font-size:15px;line-height:1.5}.nav{position:sticky;top:0;z-index:2;min-height:64px;display:grid;grid-template-columns:auto minmax(180px,500px) auto auto;gap:20px;align-items:center;padding:0 24px;background:rgba(22,22,26,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand,.wordmark{font-weight:700;color:var(--text-primary)}.brand{font-size:17px;text-decoration:none;white-space:nowrap}.wordmark{margin:0;font-size:64px;line-height:1}.wordmark.compact{font-size:22px}.hem,.wordmark .hem{background:linear-gradient(90deg,var(--accent-primary),var(--accent-primary-light));-webkit-background-clip:text;background-clip:text;color:transparent}.search{height:38px;border:1px solid var(--border);border-radius:var(--radius-pill);background:rgb(16,16,19);display:flex;align-items:center;padding:0 14px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;overflow:hidden;white-space:nowrap}.nav-links{display:flex;gap:18px}.nav-links a{color:var(--text-inverse);text-decoration:none;font-size:15px}.local-pill{justify-self:end;display:inline-flex;align-items:center;gap:7px;border-radius:var(--radius-pill);background:var(--accent-secondary);color:rgb(4,24,19);font-weight:700;font-size:12px;padding:7px 11px}.local-pill::before,.status-dot::before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor}.dashboard{max-width:1280px;margin:0 auto;padding:48px 24px}.hero{text-align:center;margin:0 auto 34px;max-width:760px}.hero p{margin:12px auto 0;color:var(--text-muted);max-width:620px}.component-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-card);padding:20px;min-width:0}.card.strong{border:2px solid var(--border-strong)}.card-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:18px}.card h2{margin:0;color:var(--text-inverse);font-size:22px;font-weight:600}.link{color:var(--accent-primary);text-decoration:none;font-weight:600}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.label{display:block;color:var(--text-muted);font-size:12px;text-transform:uppercase}.value{margin:4px 0 0;font-size:18px;font-weight:700}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.copy-row{display:flex;gap:8px;align-items:center;min-width:0}.copy-row .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy-chip,.count-chip,.icon-toggle{border:1px solid var(--border);border-radius:var(--radius-sm);background:transparent;color:var(--text-primary);height:30px;display:inline-flex;align-items:center;justify-content:center}.copy-chip{padding:0 10px;font:inherit;font-size:13px;text-decoration:none}.count-chip{padding:0 10px;background:var(--surface-raised);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.status-dot{display:inline-flex;align-items:center;gap:8px;color:var(--accent-secondary);font-weight:600}.status-dot.muted{color:var(--text-muted)}.card-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:18px -20px -20px;padding:14px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:13px}.chart-shell{height:220px;border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.35),rgba(24,24,27,.25));border:1px solid rgba(42,42,46,.7);position:relative;overflow:hidden}.chart-grid{position:absolute;inset:0;background:linear-gradient(to right,rgba(136,138,140,.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(136,138,140,.08) 1px,transparent 1px);background-size:25% 25%}.chart-line{position:absolute;left:24px;right:24px;bottom:42px;height:88px;border-bottom:2px solid var(--accent-primary);transform:skewY(-8deg);box-shadow:0 26px 0 rgba(197,68,89,.1)}.chart-point{position:absolute;right:82px;top:70px;background:var(--accent-primary);color:var(--text-inverse);border-radius:var(--radius-sm);padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.toggle-row{display:flex;gap:8px;align-items:center}.icon-toggle{width:32px;background:var(--surface-raised)}.icon-toggle.active{border-color:var(--accent-primary);color:var(--accent-primary)}.empty-state{min-height:180px;display:grid;place-items:center;text-align:center;color:var(--text-muted)}.empty-icon{width:40px;height:40px;border-radius:var(--radius-md);border:1px solid var(--border);display:grid;place-items:center;margin:0 auto 12px;color:var(--accent-secondary)}.empty-icon::before{content:"";width:16px;height:16px;border-radius:50%;border:2px solid currentColor}.footer{border-top:1px solid var(--border);color:var(--text-muted);display:flex;justify-content:space-between;gap:16px;padding:18px 24px;font-size:13px}@media(max-width:900px){.nav{grid-template-columns:auto 1fr auto}.search{display:none}.nav-links{justify-content:flex-end}.component-grid,.detail-grid{grid-template-columns:1fr}.wordmark{font-size:48px}}@media(max-width:640px){.nav{padding:0 16px;gap:12px}.nav-links{gap:12px}.dashboard{padding:32px 16px}.wordmark{font-size:40px}.card-header,.card-footer,.footer{align-items:flex-start;flex-direction:column}}
 "#;
 const DASHBOARD_USER_CSS: &str = r#"
-.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider,.wide-grid.network{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.wide-grid.network .card{overflow:hidden}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment,.badge{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted);white-space:nowrap}.segment.active,.badge.good{border-color:var(--accent-primary);color:var(--accent-primary)}.badge.live{border-color:var(--accent-secondary);color:var(--accent-secondary)}.badge-row{display:flex;gap:8px;flex-wrap:wrap}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider,.wide-grid.network{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table th:nth-child(3),.table td:nth-child(3){display:none}.overview-grid{gap:12px}}
+.update-banner{border:1px solid var(--accent-secondary);border-radius:var(--radius-md);background:rgba(66,187,147,.1);padding:14px 16px;margin:0 0 24px}.update-banner.required{border-color:var(--accent-primary);background:rgba(197,68,89,.12)}.update-banner .label{color:var(--text-primary)}.update-banner p{margin:5px 0 0;color:var(--text-primary);overflow-wrap:anywhere}.update-banner .mono{color:var(--text-muted)}
+.overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:24px}.overview-grid.provider{grid-template-columns:repeat(4,minmax(0,1fr))}.metric-card .value{font-size:24px}.wide-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:24px}.wide-grid.provider,.wide-grid.network{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.wide-grid>.card{overflow-x:auto}.wide-grid.network .card{overflow-x:auto}.table{width:100%;min-width:560px;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--border);padding:11px 8px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}.table th{color:var(--text-muted);font-size:12px;text-transform:uppercase}.table td:last-child,.table th:last-child{text-align:right}.model-list{display:grid;gap:12px}.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid var(--border);border-radius:var(--radius-md);padding:14px}.model-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.model-meta{margin-top:5px;color:var(--text-muted);font-size:13px}.segmented{display:flex;gap:8px;flex-wrap:wrap}.segment,.badge{border:1px solid var(--border);border-radius:var(--radius-sm);height:30px;padding:0 10px;display:inline-flex;align-items:center;color:var(--text-muted);white-space:nowrap}.segment.active,.badge.good{border-color:var(--accent-primary);color:var(--accent-primary)}.badge.live{border-color:var(--accent-secondary);color:var(--accent-secondary)}.badge-row{display:flex;gap:8px;flex-wrap:wrap}.toggle{display:inline-flex;align-items:center;gap:8px;color:var(--text-muted)}.toggle::before{content:"";width:28px;height:16px;border-radius:999px;border:1px solid var(--border);background:var(--surface-raised)}.spend-bars{height:180px;display:flex;align-items:end;gap:10px;padding:18px 12px 8px;border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.24),rgba(24,24,27,.12))}.bar{flex:1;min-width:10px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:linear-gradient(180deg,var(--accent-primary-light),var(--accent-primary));height:var(--h)}.mini-bar{height:8px;border-radius:999px;background:var(--surface-raised);overflow:hidden}.mini-bar span{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--accent-secondary),var(--accent-primary-light))}.load-cell{min-width:150px}.load-cell .mini-bar{margin-top:6px}.load-cell .privacy-note{display:block;margin-top:4px}.opencode-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.gateway-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}.provider-scope{max-width:760px;margin:0 auto 20px;text-align:center}.privacy-note{color:var(--text-muted);font-size:13px}.claim-card pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}@media(max-width:1050px){.overview-grid,.overview-grid.provider,.wide-grid,.wide-grid.provider,.wide-grid.network{grid-template-columns:1fr}.table{font-size:14px}}@media(max-width:640px){.table{min-width:0;table-layout:fixed;font-size:12px}.table th,.table td{padding:10px 5px}.table th:nth-child(3),.table td:nth-child(3){display:none}.table td:last-child,.table th:last-child{text-align:left}.overview-grid{gap:12px}}
 "#;
 const DASHBOARD_CHART_CSS: &str = r#"
 .price-chart-grid{display:grid;grid-template-columns:1fr;gap:24px;margin:0 0 24px}.price-chart-card .card-header{align-items:flex-start}.price-chart-title{min-width:0}.price-chart-title h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.price-chart-toolbar{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;margin:0 0 14px}.price-chart-control{display:grid;gap:6px}.price-chart-control .segmented{gap:6px}.price-chart-control .segment{text-decoration:none}.price-chart-shell{border:1px solid var(--border);border-radius:var(--radius-md);background:linear-gradient(180deg,rgba(42,42,46,.3),rgba(16,16,19,.42));overflow:hidden}.price-chart-svg{display:block;width:100%;height:auto}.price-grid-line{stroke:rgba(136,138,140,.16);stroke-width:1}.price-axis{fill:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}.price-step{fill:none;stroke:var(--accent-primary);stroke-width:2.4;stroke-linejoin:round;stroke-linecap:round}.price-overlay{fill:none;stroke:var(--accent-secondary);stroke-width:1.4;stroke-linejoin:round;stroke-linecap:round;opacity:.65}.price-volume{fill:rgba(136,138,140,.36)}.price-candle .wick{stroke:var(--text-primary);stroke-width:1.4}.price-candle .body{stroke:transparent}.price-candle.up .body{fill:rgba(66,187,147,.76)}.price-candle.down .body{fill:rgba(197,68,89,.76)}.price-marker{fill:var(--surface-card);stroke:var(--accent-primary-light);stroke-width:1.4}.price-marker.pinned{stroke:var(--accent-secondary)}.price-chart-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.price-chart-empty{min-height:300px}.price-chart-footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px;color:var(--text-muted);font-size:13px}@media(max-width:640px){.price-chart-toolbar{gap:10px}.price-chart-title h2{white-space:normal}.price-chart-footer{display:grid}.price-axis{font-size:10px}}
@@ -141,10 +143,11 @@ pub struct GatewayState {
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
     access_control: Arc<GatewayAccessControl>,
+    hidden_update_models: Arc<Vec<GatewayUpdateModelNotice>>,
     epoch_seconds: u64,
     ctx_bracket_schedule: Arc<CtxBracketSchedule>,
     failover_policy: GatewayFailoverPolicyConfig,
-    default_max_price_mu: Option<u64>,
+    default_max_price_au: Option<MoneyAu>,
     default_max_wait_ms: u64,
     default_min_ctx: Option<u32>,
     dev_session_shim: bool,
@@ -205,7 +208,7 @@ pub struct MayhemModelInfo {
     pub model_class: String,
     pub providers_online: u32,
     pub rooms: u32,
-    pub price_ref_mu: PriceRefMu,
+    pub price_ref_au: PriceRefAu,
     pub attestation_tiers: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attestation_tier_labels: BTreeMap<String, String>,
@@ -226,6 +229,25 @@ pub struct MayhemModelInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GatewayUpdateModelNotice {
+    pub model_id: String,
+    pub min_app_version: String,
+    pub installed_app_version: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GatewayUpdateNotice {
+    pub level: String,
+    pub installed_app_version: String,
+    pub required_min_app_version: String,
+    pub affected_model_count: usize,
+    pub hidden_model_count: usize,
+    pub message: String,
+    pub models: Vec<GatewayUpdateModelNotice>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ProviderKybInfo {
     pub provider: String,
     pub legal_name: String,
@@ -243,9 +265,9 @@ pub struct GatewayRouteCandidate {
     pub room_id: String,
     pub price_ver: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price_ref_mu: Option<PriceRefMu>,
-    #[serde(default)]
-    pub min_ask_mu: u64,
+    pub price_ref_au: Option<PriceRefAu>,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub min_ask_au: MoneyAu,
     pub att_tier: u8,
     #[serde(default = "default_quant_bucket")]
     pub quant: String,
@@ -292,12 +314,14 @@ fn default_quant_bucket() -> String {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct PriceRefMu {
+pub struct PriceRefAu {
     pub denom: String,
     pub ver: u64,
     pub rate_map: Vec<RateMapEntry>,
-    pub per_req_mu: u64,
-    pub min_session_mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub per_req_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub min_session_au: MoneyAu,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derivation: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -479,14 +503,18 @@ pub struct GatewayTokenRecord {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_mu: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "mayhem_proto::optional_decimal_u128"
+    )]
+    pub budget_au: Option<MoneyAu>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_period: Option<GatewayTokenBudgetPeriod>,
-    #[serde(default)]
-    pub spent_total_mu: u64,
-    #[serde(default)]
-    pub spent_period_mu: u64,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub spent_total_au: MoneyAu,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub spent_period_au: MoneyAu,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period_started_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -518,20 +546,20 @@ impl GatewayTokenRecord {
         };
         let started_at = self.period_started_at.unwrap_or(self.created_at);
         if now.saturating_sub(started_at) >= window_seconds {
-            self.spent_period_mu = 0;
+            self.spent_period_au = 0;
             self.period_started_at = Some(now);
         } else {
             self.period_started_at = Some(started_at);
         }
     }
 
-    fn effective_spent_mu(&self) -> u64 {
+    fn effective_spent_au(&self) -> MoneyAu {
         match self
             .budget_period
             .unwrap_or(GatewayTokenBudgetPeriod::Total)
         {
-            GatewayTokenBudgetPeriod::Total => self.spent_total_mu,
-            GatewayTokenBudgetPeriod::Day | GatewayTokenBudgetPeriod::Month => self.spent_period_mu,
+            GatewayTokenBudgetPeriod::Total => self.spent_total_au,
+            GatewayTokenBudgetPeriod::Day | GatewayTokenBudgetPeriod::Month => self.spent_period_au,
         }
     }
 }
@@ -675,8 +703,8 @@ impl GatewayAccessControl {
         }
         token.reset_budget_window_if_needed(now);
         if token
-            .budget_mu
-            .is_some_and(|budget_mu| token.effective_spent_mu() >= budget_mu)
+            .budget_au
+            .is_some_and(|budget_au| token.effective_spent_au() >= budget_au)
         {
             return Err(ApiError::payment_required(
                 "bearer token budget cap reached",
@@ -696,7 +724,7 @@ impl GatewayAccessControl {
     fn ensure_budget_allows(
         &self,
         attribution: &Option<GatewayTokenAttribution>,
-        max_spend_mu: u64,
+        max_spend_au: MoneyAu,
     ) -> Result<(), ApiError> {
         let Some(attribution) = attribution else {
             return Ok(());
@@ -709,8 +737,8 @@ impl GatewayAccessControl {
             .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
             .ok_or_else(|| ApiError::unauthorized("invalid bearer token", Some("Authorization")))?;
         token.reset_budget_window_if_needed(now);
-        if token.budget_mu.is_some_and(|budget_mu| {
-            token.effective_spent_mu().saturating_add(max_spend_mu) > budget_mu
+        if token.budget_au.is_some_and(|budget_au| {
+            token.effective_spent_au().saturating_add(max_spend_au) > budget_au
         }) {
             return Err(ApiError::payment_required(
                 "bearer token budget cap reached",
@@ -723,9 +751,9 @@ impl GatewayAccessControl {
     fn record_spend(
         &self,
         attribution: &GatewayTokenAttribution,
-        spend_mu_delta: u64,
+        spend_au_delta: MoneyAu,
     ) -> Result<(), ApiError> {
-        if spend_mu_delta == 0 {
+        if spend_au_delta == 0 {
             return Ok(());
         }
         let now = now_secs();
@@ -738,8 +766,8 @@ impl GatewayAccessControl {
             return Ok(());
         };
         token.reset_budget_window_if_needed(now);
-        token.spent_total_mu = token.spent_total_mu.saturating_add(spend_mu_delta);
-        token.spent_period_mu = token.spent_period_mu.saturating_add(spend_mu_delta);
+        token.spent_total_au = token.spent_total_au.saturating_add(spend_au_delta);
+        token.spent_period_au = token.spent_period_au.saturating_add(spend_au_delta);
         self.persist_store(&store)
     }
 
@@ -756,11 +784,11 @@ impl GatewayAccessControl {
                     "token_id": token.token_id,
                     "active": active,
                     "expires_at": token.expires_at,
-                    "budget_mu": token.budget_mu,
+                    "budget_au": token.budget_au.map(money_au_json),
                     "budget_period": token.budget_period,
-                    "spent_total_mu": token.spent_total_mu,
-                    "spent_period_mu": token.spent_period_mu,
-                    "spent_total_usd": format_mu_usd(token.spent_total_mu),
+                    "spent_total_au": money_au_json(token.spent_total_au),
+                    "spent_period_au": money_au_json(token.spent_period_au),
+                    "spent_total_usd": format_au_usd(token.spent_total_au),
                     "last_used_at": token.last_used_at,
                     "revoked_at": token.revoked_at,
                     "max_rate_per_minute": token.max_rate_per_minute,
@@ -928,6 +956,14 @@ pub struct GatewayCanaryProbePolicy {
     pub epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GatewayCanaryHoldbackCadenceAudit {
+    pub enabled: bool,
+    pub max_interval_sessions: u64,
+    pub new_provider_holdback_epochs: u64,
+    pub compliant: bool,
+}
+
 #[derive(Debug, Default)]
 struct GatewayCanaryScheduler {
     counters: BTreeMap<String, u64>,
@@ -938,7 +974,7 @@ struct GatewayCanaryScheduler {
 #[derive(Clone, Debug)]
 struct ReceiptConfig {
     cosign_enabled: bool,
-    balance_mu: u64,
+    balance_au: MoneyAu,
     rail: String,
     rules_ver: u64,
     checkpoint_every: CheckpointPolicy,
@@ -1255,6 +1291,14 @@ pub struct GatewaySessionPartial {
 }
 
 #[derive(Clone, Debug)]
+pub struct GatewaySessionInterrupted {
+    pub output: ChatOutput,
+    pub token_ids: Vec<i32>,
+    pub quality: Option<GatewaySessionQuality>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ProviderSignedReceipt {
     pub body: ReceiptBody,
     pub enclave_sig: String,
@@ -1268,12 +1312,13 @@ pub struct GatewaySessionInvocation {
     pub rail: String,
     pub user_pubkey: String,
     pub provider_pubkey: Option<String>,
+    pub transport_peer: Option<String>,
     pub enclave_id: String,
     pub price_ver: u64,
     pub opened_at: u64,
     pub served_ctx: u32,
-    pub ctx_bracket: String,
-    pub ctx_bracket_table_ver: u32,
+    pub ctx_bracket: Option<String>,
+    pub ctx_bracket_table_ver: Option<u32>,
     pub rules_ver: u64,
     pub spend_voucher: SpendVoucher,
     pub attestation: Option<GatewaySessionAttestation>,
@@ -1285,6 +1330,19 @@ pub struct GatewaySessionInvocation {
 }
 
 impl GatewaySessionInvocation {
+    fn provider_pubkey_required(&self) -> Result<&str, GatewaySessionError> {
+        self.provider_pubkey
+            .as_deref()
+            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))
+    }
+
+    fn direct_peer(&self) -> Result<&str, GatewaySessionError> {
+        Ok(self
+            .transport_peer
+            .as_deref()
+            .unwrap_or(self.provider_pubkey_required()?))
+    }
+
     fn with_hedge_probe_outcome(mut self, outcome: &GatewayHedgeProbeOutcome) -> Self {
         self.hedge.actual_probe_count = outcome.actual_probe_count;
         if let Some(winner) = outcome.winner.as_ref() {
@@ -1327,6 +1385,7 @@ pub struct GatewaySessionError {
     pub clean_refusal: bool,
     pub clean_refusal_code: Option<String>,
     pub partial: Option<Box<GatewaySessionPartial>>,
+    pub interrupted: Option<Box<GatewaySessionInterrupted>>,
 }
 
 #[derive(Debug)]
@@ -1446,12 +1505,12 @@ impl GatewayState {
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 providers_online: 1,
                 rooms: 1,
-                price_ref_mu: PriceRefMu {
-                    denom: "mu_usd".to_owned(),
+                price_ref_au: PriceRefAu {
+                    denom: "au_usd".to_owned(),
                     ver: 1,
                     rate_map: text_generation_rate_map(20, 60),
-                    per_req_mu: 0,
-                    min_session_mu: 0,
+                    per_req_au: 0,
+                    min_session_au: 0,
                     derivation: None,
                     history: Vec::new(),
                 },
@@ -1519,10 +1578,11 @@ impl GatewayState {
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
             access_control: Arc::new(GatewayAccessControl::disabled()),
+            hidden_update_models: Arc::new(Vec::new()),
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
             ctx_bracket_schedule: Arc::new(default_ctx_bracket_schedule()),
             failover_policy: GatewayFailoverPolicyConfig::default(),
-            default_max_price_mu: None,
+            default_max_price_au: None,
             default_max_wait_ms: DEFAULT_ROUTE_MAX_WAIT_MS,
             default_min_ctx: None,
             dev_session_shim: false,
@@ -1544,8 +1604,8 @@ impl GatewayState {
         self
     }
 
-    pub fn with_receipt_balance_mu(mut self, balance_mu: u64) -> Self {
-        self.receipt_config.balance_mu = balance_mu;
+    pub fn with_receipt_balance_au(mut self, balance_au: MoneyAu) -> Self {
+        self.receipt_config.balance_au = balance_au;
         self
     }
 
@@ -1601,9 +1661,25 @@ impl GatewayState {
         self
     }
 
+    pub fn ingest_provider_heartbeat(&self, heartbeat: ProviderHeartbeat, received_at_millis: u64) {
+        self.provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .upsert_heartbeat(heartbeat, received_at_millis);
+    }
+
     pub fn with_access_control(mut self, access_control: GatewayAccessControl) -> Self {
         self.access_control = Arc::new(access_control);
         self
+    }
+
+    pub fn with_hidden_update_models(mut self, models: Vec<GatewayUpdateModelNotice>) -> Self {
+        self.hidden_update_models = Arc::new(models);
+        self
+    }
+
+    pub fn update_notice(&self) -> Option<GatewayUpdateNotice> {
+        gateway_update_notice(&self.models, &self.hidden_update_models)
     }
 
     pub fn with_failover_policy(mut self, policy: GatewayFailoverPolicyConfig) -> Self {
@@ -1629,8 +1705,8 @@ impl GatewayState {
         self.ctx_bracket_schedule.current.ver
     }
 
-    pub fn with_default_max_price_mu(mut self, max_price_mu: Option<u64>) -> Self {
-        self.default_max_price_mu = max_price_mu.filter(|value| *value > 0);
+    pub fn with_default_max_price_au(mut self, max_price_au: Option<MoneyAu>) -> Self {
+        self.default_max_price_au = max_price_au.filter(|value| *value > 0);
         self
     }
 
@@ -1651,8 +1727,8 @@ impl GatewayState {
         headers: &HeaderMap,
     ) -> Result<GatewayRequestOptions, ApiError> {
         let mut options = GatewayRequestOptions::from_headers(headers)?;
-        if options.max_price_mu.is_none() {
-            options.max_price_mu = self.default_max_price_mu;
+        if options.max_price_au.is_none() {
+            options.max_price_au = self.default_max_price_au;
         }
         if !headers.contains_key(X_MAYHEM_MAX_WAIT_MS_HEADER) {
             options.max_wait_ms = self.default_max_wait_ms;
@@ -1754,7 +1830,7 @@ impl GatewayState {
     fn record_receipt(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
         let spend_delta = receipt.access_token.as_ref().and_then(|access_token| {
             let session_id = receipt.receipt.body.session_id.as_str();
-            let cumulative = receipt.receipt.body.mu_owed_cum;
+            let cumulative = receipt.receipt.body.au_owed_cum;
             let receipts = self.receipts.lock().expect("receipt store poisoned");
             let previous = receipts
                 .iter()
@@ -1762,7 +1838,7 @@ impl GatewayState {
                     existing.access_token.as_ref() == Some(access_token)
                         && existing.receipt.body.session_id == session_id
                 })
-                .map(|existing| existing.receipt.body.mu_owed_cum)
+                .map(|existing| existing.receipt.body.au_owed_cum)
                 .max()
                 .unwrap_or(0);
             cumulative
@@ -1820,7 +1896,7 @@ impl Default for ReceiptConfig {
     fn default() -> Self {
         Self {
             cosign_enabled: true,
-            balance_mu: 1_000_000,
+            balance_au: 1_000_000,
             rail: "fiat".to_owned(),
             rules_ver: 1,
             checkpoint_every: CheckpointPolicy {
@@ -1854,6 +1930,24 @@ impl GatewayCanaryProbePolicy {
             max_interval_sessions: 1,
             seed: DEFAULT_CANARY_SEED,
             epoch: 0,
+        }
+    }
+
+    pub fn audit_against_new_provider_holdback(
+        &self,
+        new_provider_holdback_epochs: u64,
+    ) -> GatewayCanaryHoldbackCadenceAudit {
+        let max_interval_sessions = self
+            .max_interval_sessions
+            .max(self.min_interval_sessions)
+            .max(1);
+        GatewayCanaryHoldbackCadenceAudit {
+            enabled: self.enabled,
+            max_interval_sessions,
+            new_provider_holdback_epochs,
+            compliant: self.enabled
+                && new_provider_holdback_epochs > 0
+                && max_interval_sessions <= new_provider_holdback_epochs,
         }
     }
 }
@@ -2323,10 +2417,12 @@ async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> 
     if let Err(err) = state.authorize_gateway_request(&headers, None) {
         return err.into_response();
     }
+    let update_notice = state.update_notice();
     Json(json!({
         "ok": true,
         "version": 1,
         "contract_version": CONTRACT_VERSION,
+        "app_version": installed_app_version(),
         "backend": state.session_backend.name(),
         "dev_session_shim": state.dev_session_shim,
         "models": state.models.len(),
@@ -2334,6 +2430,7 @@ async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> 
         "sessions_paused": state.paused_session_count(),
         "receipts": state.receipt_count(),
         "probes": state.probes.lock().expect("probe store poisoned").len(),
+        "update_notice": update_notice,
         "access": state.access_summary(),
     }))
     .into_response()
@@ -2381,9 +2478,9 @@ async fn mayhem_balance(State(state): State<SharedState>, headers: HeaderMap) ->
         return err.into_response();
     }
     Json(json!({
-        "denom": "mu_usd",
-        "balance_mu": state.receipt_config.balance_mu,
-        "held_mu": 0
+        "denom": "au_usd",
+        "balance_au": money_au_json(state.receipt_config.balance_au),
+        "held_au": money_au_json(0)
     }))
     .into_response()
 }
@@ -2602,6 +2699,145 @@ fn dashboard_tier_tooltip() -> &'static str {
     "Tier 1: runs Mayhem software; trust is economic. Tier 2: proven Apple or NVIDIA hardware running the real app. Tier 3: Only Tier 3 keeps prompts private from the provider's own machine. Tier 4: admin-verified business identity, not prompt privacy; Tier 4 can still read prompts. Higher numbers are not a privacy ladder."
 }
 
+fn dashboard_update_banner(notice: Option<&GatewayUpdateNotice>) -> String {
+    let Some(notice) = notice else {
+        return String::new();
+    };
+    let class = if notice.level == "required" {
+        "update-banner required"
+    } else {
+        "update-banner"
+    };
+    let label = if notice.level == "required" {
+        "Update required"
+    } else {
+        "Update available"
+    };
+    format!(
+        r#"<section class="{class}" role="status"><span class="label">{}</span><p>{}</p><p class="mono">installed v{} / catalog min v{} / {} affected model(s)</p></section>"#,
+        html_escape(label),
+        html_escape(&notice.message),
+        html_escape(&notice.installed_app_version),
+        html_escape(&notice.required_min_app_version),
+        notice.affected_model_count,
+    )
+}
+
+fn installed_app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn gateway_update_notice(
+    models: &[GatewayModel],
+    hidden_update_models: &[GatewayUpdateModelNotice],
+) -> Option<GatewayUpdateNotice> {
+    let mut notices = BTreeMap::<String, GatewayUpdateModelNotice>::new();
+    let mut hidden_ids = BTreeSet::<String>::new();
+    for notice in hidden_update_models {
+        if notice.model_id.trim().is_empty() || notice.min_app_version.trim().is_empty() {
+            continue;
+        }
+        hidden_ids.insert(notice.model_id.clone());
+        notices.insert(notice.model_id.clone(), notice.clone());
+    }
+    for model in models {
+        if let Some(notice) = gateway_model_update_notice(model) {
+            notices.entry(notice.model_id.clone()).or_insert(notice);
+        }
+    }
+    if notices.is_empty() {
+        return None;
+    }
+    let models = notices.into_values().collect::<Vec<_>>();
+    let required_min_app_version = highest_min_app_version(&models);
+    let installed_app_version = models
+        .first()
+        .map(|notice| notice.installed_app_version.clone())
+        .unwrap_or_else(|| installed_app_version().to_owned());
+    let affected_model_count = models.len();
+    let hidden_model_count = models
+        .iter()
+        .filter(|notice| hidden_ids.contains(&notice.model_id))
+        .count();
+    let level = if hidden_model_count > 0 {
+        "required"
+    } else {
+        "available"
+    }
+    .to_owned();
+    let message = if hidden_model_count > 0 {
+        format!(
+            "Update required: this app is v{installed_app_version}, catalog requires >= v{required_min_app_version} for {affected_model_count} model(s); {hidden_model_count} model(s) are hidden until you update (run `mayhem update`)."
+        )
+    } else {
+        format!(
+            "Update available: this app is v{installed_app_version}, catalog requires >= v{required_min_app_version} for {affected_model_count} model(s) (run `mayhem update`)."
+        )
+    };
+    Some(GatewayUpdateNotice {
+        level,
+        installed_app_version,
+        required_min_app_version,
+        affected_model_count,
+        hidden_model_count,
+        message,
+        models,
+    })
+}
+
+fn gateway_model_update_notice(model: &GatewayModel) -> Option<GatewayUpdateModelNotice> {
+    let min_app_version = model
+        .mayhem
+        .min_app_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let installed_app_version = installed_app_version();
+    if gateway_app_version_satisfies_min(installed_app_version, min_app_version).unwrap_or(true) {
+        return None;
+    }
+    Some(GatewayUpdateModelNotice {
+        model_id: model.id.clone(),
+        min_app_version: min_app_version.to_owned(),
+        installed_app_version: installed_app_version.to_owned(),
+        message: gateway_update_model_message(&model.id, min_app_version, installed_app_version),
+    })
+}
+
+fn gateway_app_version_satisfies_min(installed: &str, min_app_version: &str) -> Option<bool> {
+    let installed = semver::Version::parse(installed.trim()).ok()?;
+    let min_app_version = semver::Version::parse(min_app_version.trim()).ok()?;
+    Some(installed >= min_app_version)
+}
+
+fn highest_min_app_version(notices: &[GatewayUpdateModelNotice]) -> String {
+    let mut highest: Option<(semver::Version, String)> = None;
+    for notice in notices {
+        let Ok(version) = semver::Version::parse(notice.min_app_version.trim()) else {
+            continue;
+        };
+        if highest
+            .as_ref()
+            .map_or(true, |(current, _)| version > *current)
+        {
+            highest = Some((version, notice.min_app_version.clone()));
+        }
+    }
+    highest
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| notices[0].min_app_version.clone())
+}
+
+fn gateway_update_model_message(
+    model_id: &str,
+    min_app_version: &str,
+    installed_app_version: &str,
+) -> String {
+    format!(
+        "model {model_id} requires Mayhem >= {min_app_version}; installed {installed_app_version}; run `mayhem update`"
+    )
+}
+
 fn dashboard_user_html(
     state: &GatewayState,
     expires_in_seconds: u64,
@@ -2615,10 +2851,10 @@ fn dashboard_user_html(
         .filter(|receipt| !receipt.receipt.body.final_receipt)
         .count()
         .saturating_add(state.paused_session_count());
-    let lifetime_spend_mu = latest_receipts
+    let lifetime_spend_au = latest_receipts
         .iter()
-        .map(|receipt| receipt.receipt.body.mu_owed_cum)
-        .sum::<u64>();
+        .map(|receipt| receipt.receipt.body.au_owed_cum)
+        .sum::<MoneyAu>();
     let gateway_root = origin.trim_end_matches('/');
     let openai_base_url = format!("{gateway_root}/v1");
     let session_rows = dashboard_session_rows(&latest_receipts);
@@ -2640,14 +2876,16 @@ fn dashboard_user_html(
     } else {
         "Optional local"
     };
-    let balance_usd = format_mu_usd(state.receipt_config.balance_mu);
-    let lifetime_spend = format_mu_usd(lifetime_spend_mu);
+    let balance_usd = format_au_usd(state.receipt_config.balance_au);
+    let lifetime_spend = format_au_usd(lifetime_spend_au);
     let api_key_masked = "mayhem-local";
     let tier_tooltip = html_escape(dashboard_tier_tooltip());
+    let update_notice = state.update_notice();
+    let update_banner = dashboard_update_banner(update_notice.as_ref());
     dashboard_html_document(
         "User Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section><section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{openai_base_url}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>User dashboard</p></section>{update_banner}<section class="overview-grid"><article class="card metric-card"><span class="label">Balance</span><p class="value mono">{balance_usd}</p><p class="privacy-note">TAP rate not loaded</p></article><article class="card metric-card"><span class="label">Lifetime spend</span><p class="value mono">{lifetime_spend}</p><p class="privacy-note">from local receipts</p></article><article class="card metric-card"><span class="label">Active sessions</span><p class="value"><span class="count-chip">{active_sessions}</span></p><p class="privacy-note">running plus paused</p></article></section>{price_charts}<section class="wide-grid"><article class="card"><div class="card-header"><h2>Sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Cost</th><th>Status</th></tr></thead><tbody>{session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Gateway</h2><span class="status-dot">Online</span></div><div class="detail-grid"><div><span class="label">Endpoint</span><div class="copy-row"><span class="mono">{openai_base_url}</span><button class="copy-chip" type="button">Copy</button></div></div><div><span class="label">Access</span><p class="mono">{auth_mode}</p></div><div><span class="label">Session</span><p class="mono">{expires_in_seconds}s</p></div><div><span class="label">Bind</span><p class="mono">127.0.0.1</p></div></div></article><article class="card"><div class="card-header"><h2>Access Tokens</h2><span class="count-chip">{token_count}</span></div><table class="table"><thead><tr><th>Name</th><th>Spend</th><th>Last Used</th><th>Status</th></tr></thead><tbody>{token_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Models</h2><div class="segmented" title="{tier_tooltip}" aria-label="{tier_tooltip}"><span class="segment active" title="{tier_tooltip}">T1+</span><span class="segment" title="{tier_tooltip}">T2+</span><span class="segment" title="{tier_tooltip}">T3+</span><span class="toggle" title="{tier_tooltip}">KYB</span></div></div><div class="model-list">{model_rows}</div></article><article class="card"><div class="card-header"><h2>Spend</h2><span class="count-chip">{lifetime_spend}</span></div>{spend_body}<div class="card-footer"><span>from local receipts</span><span class="mono">{receipt_count} receipts</span></div></article><article class="card opencode-card"><div class="card-header"><h2>opencode</h2><button class="copy-chip" type="button">Copy</button></div><pre>OPENAI_BASE_URL={openai_base_url}
 OPENAI_API_KEY={api_key_masked}</pre></article></section></main><footer class="footer"><span>Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
             receipt_count = receipts.len(),
         ),
@@ -2672,9 +2910,9 @@ fn dashboard_access_token_rows(access_summary: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             let spend = token
-                .get("spent_total_mu")
-                .and_then(Value::as_u64)
-                .map(format_mu_usd)
+                .get("spent_total_au")
+                .and_then(value_as_money_au)
+                .map(format_au_usd)
                 .unwrap_or_else(|| "$0.000000".to_owned());
             let last_used = token
                 .get("last_used_at")
@@ -2722,14 +2960,14 @@ fn dashboard_provider_html(
     );
     let earning_totals =
         dashboard_provider_earning_totals(state.provider_earnings.as_ref(), &provider_scope);
-    let local_earned_mu = dashboard_provider_receipt_mu(&latest_receipts, &provider_scope);
-    let earned_mu = if earning_totals.loaded {
-        earning_totals.total_mu
+    let local_earned_au = dashboard_provider_receipt_au(&latest_receipts, &provider_scope);
+    let earned_au = if earning_totals.loaded {
+        earning_totals.total_au
     } else {
-        local_earned_mu
+        local_earned_au
     };
     let claimable_value = if earning_totals.loaded {
-        format_mu_usd(earning_totals.claimable_mu)
+        format_au_usd(earning_totals.claimable_au)
     } else {
         "not loaded".to_owned()
     };
@@ -2750,13 +2988,15 @@ fn dashboard_provider_html(
         .map(|provider| format!("?provider={}", html_escape(provider)))
         .unwrap_or_default();
     let load_progress = dashboard_provider_load_progress(state);
+    let now_ms = now_millis_u64();
     let loading_rows =
-        dashboard_provider_loading_row_count(&candidates, &load_progress, provider_filter);
+        dashboard_provider_loading_row_count(&candidates, &load_progress, provider_filter, now_ms);
     let enclave_rows = dashboard_provider_enclave_rows(
         &candidates,
         &latest_receipts,
         &load_progress,
         provider_filter,
+        now_ms,
     );
     let live_session_rows =
         dashboard_provider_live_session_rows(&latest_receipts, &candidates, &provider_scope);
@@ -2768,17 +3008,19 @@ fn dashboard_provider_html(
         dashboard_provider_claim_body(provider_filter, &provider_scope, &earning_totals);
     let price_charts =
         dashboard_price_chart_cards(&state.models, chart_options, Some(&provider_scope));
+    let update_notice = state.update_notice();
+    let update_banner = dashboard_update_banner(update_notice.as_ref());
     dashboard_html_document(
         "Provider Dashboard",
         &format!(
-            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section><p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
-            earned = format_mu_usd(earned_mu),
+            r#"<nav class="nav"><a class="brand" href="/mayhem/dashboard">MAY<span class="hem">HEM</span></a><div class="search">{gateway_root}/mayhem/dashboard/provider{provider_query}</div><div class="nav-links"><a href="/mayhem/dashboard">User</a><a href="/mayhem/dashboard/network">Network</a><a href="/mayhem/dashboard/provider">Provider</a></div><span class="local-pill">LOCAL</span></nav><main class="dashboard"><section class="hero"><h1 class="wordmark">MAY<span class="hem">HEM</span></h1><p>Provider dashboard</p></section>{update_banner}<p class="provider-scope mono">{provider_scope_label}</p><section class="overview-grid provider"><article class="card metric-card"><span class="label">Earned this epoch</span><p class="value mono">{earned}</p><p class="privacy-note">{earned_source}</p></article><article class="card metric-card"><span class="label">Pending claim</span><p class="value mono">{claimable_value}</p><p class="privacy-note">from mayhem earnings</p></article><article class="card metric-card"><span class="label">Reputation</span><p class="value mono">{reputation}</p><p class="privacy-note">local receipt/probe evidence</p></article><article class="card metric-card"><span class="label">Saturation</span><p class="value mono">{saturation_pct}%</p><p class="privacy-note">{active_sessions} active sessions</p></article></section>{price_charts}<section class="wide-grid provider"><article class="card"><div class="card-header"><h2>Enclaves</h2><span class="count-chip">{candidate_count}</span></div><table class="table"><thead><tr><th>Model</th><th>Backend</th><th>Tier</th><th>Saturation</th><th>Status</th></tr></thead><tbody>{enclave_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Live sessions</h2><span class="count-chip">{receipt_count}</span></div><table class="table"><thead><tr><th>Room</th><th>Model</th><th>Tokens</th><th>Elapsed</th><th>Status</th></tr></thead><tbody>{live_session_rows}</tbody></table></article><article class="card"><div class="card-header"><h2>Earnings</h2><div class="segmented"><span class="segment active">Owed {claimable_value}</span><span class="segment">Paid {paid}</span></div></div>{earnings_body}<div class="card-footer"><span>{earnings_source}</span><span class="mono">{epoch_label}</span></div></article><article class="card"><div class="card-header"><h2>Reputation / Holdback</h2><span class="count-chip">{reputation}</span></div>{holdback_body}</article><article class="card"><div class="card-header"><h2>Hardware / Health</h2><span class="{hardware_status_class}">{hardware_status}</span></div>{hardware_body}</article><article class="card claim-card"><div class="card-header"><h2>Claim</h2><button class="copy-chip" type="button">Copy</button></div>{claim_body}</article></section></main><footer class="footer"><span>Local session {expires_in_seconds}s. Runs entirely on this machine. No external network calls.</span><span class="mono">127.0.0.1</span></footer>"#,
+            earned = format_au_usd(earned_au),
             earned_source = if earning_totals.loaded {
                 "ledger earn/* rows"
             } else {
                 "local receipts only"
             },
-            paid = format_mu_usd(earning_totals.paid_mu),
+            paid = format_au_usd(earning_totals.paid_au),
             earnings_source = if earning_totals.loaded {
                 "matches mayhem earnings"
             } else {
@@ -2905,7 +3147,7 @@ fn dashboard_network_model_rows(models: &[GatewayModel], entries: &[ProviderTabl
                 html_escape(&model.mayhem.source),
                 dashboard_badges(&dashboard_model_abilities(model), "badge"),
                 html_escape(&dashboard_model_price(model)),
-                model.mayhem.price_ref_mu.ver,
+                model.mayhem.price_ref_au.ver,
                 html_escape(&dashboard_model_price_derivation(model)),
             )
         })
@@ -2924,7 +3166,7 @@ fn dashboard_network_provider_rows(
             let rails = dashboard_route_rails(candidate);
             let quality = dashboard_route_quality(entry);
             let status = dashboard_route_status(model, candidate, entry);
-            let price = route_price_ref_mu(model, Some(candidate));
+            let price = route_price_ref_au(model, Some(candidate));
             rows.push_str(&format!(
                 r#"<tr><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">room {}</p></td><td><span class="mono">{}</span><p class="privacy-note">{}</p></td><td><span class="mono">{}</span><p class="privacy-note">{} · price v{}</p></td><td>{}<p class="privacy-note">{}</p></td></tr>"#,
                 html_escape(short_text(&candidate.provider, 18).as_ref()),
@@ -3251,10 +3493,10 @@ struct DashboardProviderLoadProgress {
 #[derive(Clone, Debug, Default)]
 struct DashboardProviderEarningTotals {
     loaded: bool,
-    total_mu: u64,
-    held_mu: u64,
-    paid_mu: u64,
-    claimable_mu: u64,
+    total_au: MoneyAu,
+    held_au: MoneyAu,
+    paid_au: MoneyAu,
+    claimable_au: MoneyAu,
     updated_epoch: Option<u64>,
     holdback_count: usize,
 }
@@ -3384,22 +3626,22 @@ fn dashboard_provider_earning_totals(
         if !provider.is_empty() && !dashboard_provider_in_scope(scope, provider) {
             continue;
         }
-        totals.total_mu = totals
-            .total_mu
-            .saturating_add(entry.get("total_mu").and_then(Value::as_u64).unwrap_or(0));
-        totals.held_mu = totals
-            .held_mu
-            .saturating_add(entry.get("held_mu").and_then(Value::as_u64).unwrap_or(0));
-        totals.paid_mu = totals.paid_mu.saturating_add(
+        totals.total_au = totals
+            .total_au
+            .saturating_add(entry.get("total_au").and_then(value_as_money_au).unwrap_or(0));
+        totals.held_au = totals
+            .held_au
+            .saturating_add(entry.get("held_au").and_then(value_as_money_au).unwrap_or(0));
+        totals.paid_au = totals.paid_au.saturating_add(
             entry
-                .get("paid_cum_mu")
-                .and_then(Value::as_u64)
+                .get("paid_cum_au")
+                .and_then(value_as_money_au)
                 .unwrap_or(0),
         );
-        totals.claimable_mu = totals.claimable_mu.saturating_add(
+        totals.claimable_au = totals.claimable_au.saturating_add(
             entry
-                .get("claimable_mu")
-                .and_then(Value::as_u64)
+                .get("claimable_au")
+                .and_then(value_as_money_au)
                 .unwrap_or(0),
         );
         totals.updated_epoch = entry
@@ -3418,11 +3660,11 @@ fn dashboard_provider_earning_totals(
     totals
 }
 
-fn dashboard_provider_receipt_mu(receipts: &[StoredReceipt], scope: &BTreeSet<String>) -> u64 {
+fn dashboard_provider_receipt_au(receipts: &[StoredReceipt], scope: &BTreeSet<String>) -> MoneyAu {
     receipts
         .iter()
         .filter(|receipt| dashboard_provider_in_scope(scope, &receipt.receipt.body.provider))
-        .map(|receipt| receipt.receipt.body.mu_owed_cum)
+        .map(|receipt| receipt.receipt.body.au_owed_cum)
         .sum()
 }
 
@@ -3470,6 +3712,7 @@ fn dashboard_provider_enclave_rows(
     receipts: &[StoredReceipt],
     load_progress: &BTreeMap<(String, String), DashboardProviderLoadProgress>,
     provider_filter: Option<&str>,
+    now_ms: u64,
 ) -> String {
     let mut seen = BTreeSet::new();
     let mut rows = candidates
@@ -3521,6 +3764,7 @@ fn dashboard_provider_enclave_rows(
             provider_filter.map_or(true, |filter| filter == provider)
                 && !seen.contains(&(provider.clone(), enclave_id.clone()))
         })
+        .filter(|(_, progress)| dashboard_provider_progress_only_fresh(progress, now_ms))
         .take(remaining)
     {
         rows.push_str(&dashboard_provider_progress_only_row(progress));
@@ -3536,6 +3780,7 @@ fn dashboard_provider_loading_row_count(
     candidates: &[DashboardProviderCandidate],
     load_progress: &BTreeMap<(String, String), DashboardProviderLoadProgress>,
     provider_filter: Option<&str>,
+    now_ms: u64,
 ) -> usize {
     let seen = candidates
         .iter()
@@ -3547,7 +3792,16 @@ fn dashboard_provider_loading_row_count(
             provider_filter.map_or(true, |filter| filter == provider)
                 && !seen.contains(&(provider.clone(), enclave_id.clone()))
         })
+        .filter(|(_, progress)| dashboard_provider_progress_only_fresh(progress, now_ms))
         .count()
+}
+
+fn dashboard_provider_progress_only_fresh(
+    progress: &DashboardProviderLoadProgress,
+    now_ms: u64,
+) -> bool {
+    progress.updated_at_ms > 0
+        && now_ms.saturating_sub(progress.updated_at_ms) <= DASHBOARD_PROVIDER_PROGRESS_ONLY_TTL_MS
 }
 
 fn dashboard_provider_progress_only_row(progress: &DashboardProviderLoadProgress) -> String {
@@ -3677,23 +3931,23 @@ fn dashboard_provider_earnings_body(
 ) -> String {
     if totals.loaded {
         let max = totals
-            .total_mu
-            .max(totals.held_mu)
-            .max(totals.paid_mu)
-            .max(totals.claimable_mu)
+            .total_au
+            .max(totals.held_au)
+            .max(totals.paid_au)
+            .max(totals.claimable_au)
             .max(1);
         let bars = [
-            ("total", totals.total_mu),
-            ("held", totals.held_mu),
-            ("paid", totals.paid_mu),
-            ("claimable", totals.claimable_mu),
+            ("total", totals.total_au),
+            ("held", totals.held_au),
+            ("paid", totals.paid_au),
+            ("claimable", totals.claimable_au),
         ]
         .into_iter()
         .map(|(label, value)| {
             let height = 8 + value.saturating_mul(92) / max;
             format!(
                 r#"<span class="bar" style="--h:{height}%" title="{label} {}"></span>"#,
-                format_mu_usd(value)
+                format_au_usd(value)
             )
         })
         .collect::<String>();
@@ -3712,16 +3966,16 @@ fn dashboard_provider_holdback_body(totals: &DashboardProviderEarningTotals) -> 
         return r#"<div class="empty-state"><div><div class="empty-icon"></div><p>Ledger holdback not loaded</p></div></div>"#
             .to_owned();
     }
-    let held_pct = if totals.total_mu == 0 {
+    let held_pct = if totals.total_au == 0 {
         0
     } else {
-        totals.held_mu.saturating_mul(100) / totals.total_mu
+        totals.held_au.saturating_mul(100) / totals.total_au
     };
     format!(
         r#"<div class="detail-grid"><div><span class="label">Held</span><p class="value mono">{}</p></div><div><span class="label">Release buckets</span><p class="value mono">{}</p></div><div><span class="label">Released</span><p class="value mono">{}</p></div><div><span class="label">Claim model</span><p class="value mono">TAP claim</p></div></div><div class="mini-bar"><span style="--w:{}%"></span></div>"#,
-        format_mu_usd(totals.held_mu),
+        format_au_usd(totals.held_au),
         totals.holdback_count,
-        format_mu_usd(totals.claimable_mu),
+        format_au_usd(totals.claimable_au),
         held_pct.min(100),
     )
 }
@@ -3751,9 +4005,20 @@ fn dashboard_provider_hwprobe_body(
     } else {
         format!("T{max_tier}")
     };
-    let providers = candidates
+    let workers = candidates
         .iter()
-        .map(|candidate| candidate.provider.as_str())
+        .map(|candidate| {
+            (
+                candidate.provider.as_str(),
+                candidate.enclave_id.as_str(),
+                candidate.room_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    let markets = candidates
+        .iter()
+        .map(|candidate| candidate.model_id.as_str())
         .collect::<BTreeSet<_>>()
         .len();
     let last_probe_label = last_probe
@@ -3766,7 +4031,7 @@ fn dashboard_provider_hwprobe_body(
         })
         .unwrap_or_else(|| "no probe evidence".to_owned());
     format!(
-        r#"<div class="detail-grid"><div><span class="label">Providers</span><p class="value mono">{providers}</p></div><div><span class="label">Max tier</span><p class="value mono">{}</p></div><div><span class="label">Last probe</span><p class="value mono">{}</p></div><div><span class="label">hwprobe</span><p class="value mono">not loaded</p></div></div>"#,
+        r#"<div class="detail-grid"><div><span class="label">Workers</span><p class="value mono">{workers}</p></div><div><span class="label">Markets</span><p class="value mono">{markets}</p></div><div><span class="label">Max tier</span><p class="value mono">{}</p></div><div><span class="label">Last probe</span><p class="value mono">{}</p></div></div>"#,
         html_escape(&max_tier_label),
         html_escape(&last_probe_label),
     )
@@ -3782,7 +4047,7 @@ fn dashboard_provider_claim_body(
         .map(|provider| format!(" --provider {}", shell_single_quote_dashboard(provider)))
         .unwrap_or_default();
     let claimable = if totals.loaded {
-        format_mu_usd(totals.claimable_mu)
+        format_au_usd(totals.claimable_au)
     } else {
         "not loaded".to_owned()
     };
@@ -3855,7 +4120,7 @@ fn dashboard_session_rows(receipts: &[StoredReceipt]) -> String {
                 html_escape(short_text(&body.provider, 18).as_ref()),
                 body.usage.prompt_tokens(),
                 body.usage.output_tokens(),
-                format_mu_usd(body.mu_owed_cum),
+                format_au_usd(body.au_owed_cum),
             )
         })
         .collect::<String>()
@@ -3871,6 +4136,12 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
         .iter()
         .take(6)
         .map(|model| {
+            let route_count = model.mayhem.route_candidates.len();
+            let worker_label = match route_count {
+                0 => "0 worker routes".to_owned(),
+                1 => "1 worker route".to_owned(),
+                count => format!("{count} worker routes"),
+            };
             let availability = if model.mayhem.providers_online > 0 {
                 r#"<span class="status-dot">Online</span>"#
             } else {
@@ -3897,7 +4168,7 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
             })
                 .unwrap_or_default();
             format!(
-                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta" title="{}" aria-label="{}">{} · {} · T{}{} · {}</div></div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
+                r#"<div class="model-row"><div><div class="model-title mono">{}</div><div class="model-meta" title="{}" aria-label="{}">{} · {} · T{}{} · {} · {}</div></div><a class="copy-chip" href="/mayhem/dashboard">Use</a></div>"#,
                 html_escape(&model.id),
                 tier_tooltip,
                 tier_tooltip,
@@ -3905,6 +4176,7 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
                 html_escape(&dashboard_model_price(model)),
                 max_tier,
                 kyb,
+                html_escape(&worker_label),
                 availability,
             )
         })
@@ -3912,14 +4184,14 @@ fn dashboard_model_rows(models: &[GatewayModel]) -> String {
 }
 
 fn dashboard_model_price(model: &GatewayModel) -> String {
-    dashboard_price(&model.mayhem.price_ref_mu)
+    dashboard_price(&model.mayhem.price_ref_au)
 }
 
 #[derive(Clone, Debug)]
 struct DashboardPricePoint {
     epoch: u64,
-    price_mu: u64,
-    volume_mu: u64,
+    price_au: MoneyAu,
+    volume_au: MoneyAu,
     pinned: bool,
     ctx_bracket: String,
     title: String,
@@ -3938,11 +4210,11 @@ struct DashboardPriceSeries {
 struct DashboardPriceCandle {
     start_epoch: u64,
     end_epoch: u64,
-    open_mu: u64,
-    high_mu: u64,
-    low_mu: u64,
-    close_mu: u64,
-    volume_mu: u64,
+    open_au: MoneyAu,
+    high_au: MoneyAu,
+    low_au: MoneyAu,
+    close_au: MoneyAu,
+    volume_au: MoneyAu,
     pinned: bool,
     title: String,
 }
@@ -4101,10 +4373,10 @@ fn dashboard_price_chart_card(
         .map(|point| point.epoch.to_string())
         .unwrap_or_else(|| "?".to_owned());
     let latest_price = latest
-        .map(|point| format!("{}mu/1k", point.price_mu))
+        .map(|point| format!("{}au/1k", point.price_au))
         .unwrap_or_else(|| "pending".to_owned());
     let volume = latest
-        .map(|point| format!("{}mu volume", point.volume_mu))
+        .map(|point| format!("{}au volume", point.volume_au))
         .unwrap_or_else(|| "0mu volume".to_owned());
     format!(
         r#"<article class="card price-chart-card"><div class="card-header"><div class="price-chart-title"><span class="label">Price</span><h2 class="mono">{}</h2><p class="privacy-note">{} · {} · {}</p></div><a class="copy-chip" href="{}">{pin_label}</a></div>{controls}<div class="price-chart-shell">{chart}</div><div class="price-chart-legend"><span class="badge good">{}</span><span class="badge">{}</span><span class="badge">{}</span><span class="badge live">{}</span></div><div class="price-chart-footer"><span class="mono">epoch {latest_epoch}</span><span class="mono">{latest_price}</span><span class="mono">{volume}</span></div></article>"#,
@@ -4279,7 +4551,7 @@ fn dashboard_model_price_series(
                 continue;
             }
         }
-        let price = route_price_ref_mu(model, Some(candidate));
+        let price = route_price_ref_au(model, Some(candidate));
         let tier = format!("T{}", candidate.att_tier.max(1));
         let quant = normalize_quant_bucket(&candidate.quant)
             .unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned());
@@ -4313,7 +4585,7 @@ fn dashboard_model_price_series(
             .next()
             .cloned()
             .unwrap_or_else(|| DEFAULT_QUANT_BUCKET.to_owned());
-        let series = dashboard_price_series_from_price(&model.mayhem.price_ref_mu, &tier, &quant);
+        let series = dashboard_price_series_from_price(&model.mayhem.price_ref_au, &tier, &quant);
         by_key.insert(
             (
                 series.tier.clone(),
@@ -4327,7 +4599,7 @@ fn dashboard_model_price_series(
 }
 
 fn dashboard_price_series_from_price(
-    price: &PriceRefMu,
+    price: &PriceRefAu,
     tier: &str,
     quant: &str,
 ) -> DashboardPriceSeries {
@@ -4352,8 +4624,8 @@ fn dashboard_price_series_from_price(
     }
 }
 
-fn dashboard_price_points_from_price(price: &PriceRefMu) -> Vec<DashboardPricePoint> {
-    let fallback_price = dashboard_price_basis_mu(price);
+fn dashboard_price_points_from_price(price: &PriceRefAu) -> Vec<DashboardPricePoint> {
+    let fallback_price = dashboard_price_basis_au(price);
     let history = if price.history.is_empty() {
         price.derivation.iter().collect::<Vec<_>>()
     } else {
@@ -4363,12 +4635,12 @@ fn dashboard_price_points_from_price(price: &PriceRefMu) -> Vec<DashboardPricePo
         .into_iter()
         .enumerate()
         .map(|(index, derivation)| {
-            let volume_mu = dashboard_derivation_volume_mu(derivation);
-            let pinned = dashboard_derivation_pinned(derivation, volume_mu);
+            let volume_au = dashboard_derivation_volume_au(derivation);
+            let pinned = dashboard_derivation_pinned(derivation, volume_au);
             DashboardPricePoint {
                 epoch: derivation_u64(derivation, &["epoch"]).unwrap_or(index as u64),
-                price_mu: dashboard_derivation_price_basis_mu(derivation).unwrap_or(fallback_price),
-                volume_mu,
+                price_au: dashboard_derivation_price_basis_au(derivation).unwrap_or(fallback_price),
+                volume_au,
                 pinned,
                 ctx_bracket: dashboard_ctx_bracket_from_derivation(derivation)
                     .unwrap_or_else(|| "base".to_owned()),
@@ -4379,8 +4651,8 @@ fn dashboard_price_points_from_price(price: &PriceRefMu) -> Vec<DashboardPricePo
     if points.is_empty() {
         points.push(DashboardPricePoint {
             epoch: price.ver,
-            price_mu: fallback_price,
-            volume_mu: 0,
+            price_au: fallback_price,
+            volume_au: 0,
             pinned: true,
             ctx_bracket: "base".to_owned(),
             title: format!("price v{} · derivation pending", price.ver),
@@ -4389,14 +4661,14 @@ fn dashboard_price_points_from_price(price: &PriceRefMu) -> Vec<DashboardPricePo
     points
 }
 
-fn dashboard_price_basis_mu(price: &PriceRefMu) -> u64 {
+fn dashboard_price_basis_au(price: &PriceRefAu) -> MoneyAu {
     rate_map_cost_basis_per_1k(&price.rate_map)
-        .max(price.per_req_mu)
-        .max(price.min_session_mu)
+        .max(price.per_req_au)
+        .max(price.min_session_au)
         .max(1)
 }
 
-fn dashboard_derivation_price_basis_mu(derivation: &Value) -> Option<u64> {
+fn dashboard_derivation_price_basis_au(derivation: &Value) -> Option<MoneyAu> {
     for path in [
         &["result_price", "rate_map"][..],
         &["rate_map"][..],
@@ -4411,18 +4683,27 @@ fn dashboard_derivation_price_basis_mu(derivation: &Value) -> Option<u64> {
             }
         }
     }
-    if let Some(input) = derivation_u64(derivation, &["result_price", "in_per_1k"]) {
-        let output = derivation_u64(derivation, &["result_price", "out_per_1k"]).unwrap_or(0);
-        return Some(rate_map_cost_basis_per_1k(&text_generation_rate_map(input, output)).max(1));
+    if let Some(input) =
+        derivation_value(derivation, &["result_price", "in_per_1k"]).and_then(value_as_money_au)
+    {
+        let output = derivation_value(derivation, &["result_price", "out_per_1k"])
+            .and_then(value_as_money_au)
+            .unwrap_or(0);
+        return Some(
+            rate_map_cost_basis_per_1k(&text_generation_rate_map(input, output)).max(1),
+        );
     }
     for path in [
-        &["result_price", "price_basis_mu"][..],
-        &["price_basis_mu"][..],
-        &["result_price", "per_req_mu"][..],
-        &["result_price", "min_session_mu"][..],
-        &["price_mu"][..],
+        &["result_price", "price_basis_au"][..],
+        &["price_basis_au"][..],
+        &["result_price", "per_req_au"][..],
+        &["result_price", "min_session_au"][..],
+        &["price_au"][..],
     ] {
-        if let Some(value) = derivation_u64(derivation, path).filter(|value| *value > 0) {
+        if let Some(value) = derivation_value(derivation, path)
+            .and_then(value_as_money_au)
+            .filter(|value| *value > 0)
+        {
             return Some(value);
         }
     }
@@ -4436,7 +4717,7 @@ fn dashboard_rate_map_from_value(value: &Value) -> Option<Vec<RateMapEntry>> {
         .filter_map(|entry| {
             Some(RateMapEntry {
                 unit: entry.get("unit")?.as_str()?.to_owned(),
-                per_unit_mu: entry.get("per_unit_mu")?.as_u64()?,
+                per_unit_au: entry.get("per_unit_au").and_then(value_as_money_au)?,
                 granularity: entry.get("granularity")?.as_u64()?,
             })
         })
@@ -4444,23 +4725,23 @@ fn dashboard_rate_map_from_value(value: &Value) -> Option<Vec<RateMapEntry>> {
     (!rate_map.is_empty()).then(|| normalize_rate_map(rate_map))
 }
 
-fn dashboard_derivation_volume_mu(derivation: &Value) -> u64 {
+fn dashboard_derivation_volume_au(derivation: &Value) -> MoneyAu {
     [
-        &["usage", "settled_mu"][..],
-        &["usage", "settled_work_mu"][..],
-        &["usage", "active_demand_mu"][..],
-        &["settled_mu"][..],
-        &["volume_mu"][..],
-        &["active_demand_mu"][..],
-        &["demand_mu"][..],
+        &["usage", "settled_au"][..],
+        &["usage", "settled_work_au"][..],
+        &["usage", "active_demand_au"][..],
+        &["settled_au"][..],
+        &["volume_au"][..],
+        &["active_demand_au"][..],
+        &["demand_au"][..],
     ]
     .into_iter()
-    .find_map(|path| derivation_u64(derivation, path))
+    .find_map(|path| derivation_value(derivation, path).and_then(value_as_money_au))
     .unwrap_or(0)
 }
 
-fn dashboard_derivation_pinned(derivation: &Value, volume_mu: u64) -> bool {
-    if derivation_bool(derivation, &["controller", "frozen"]).unwrap_or(false) || volume_mu == 0 {
+fn dashboard_derivation_pinned(derivation: &Value, volume_au: MoneyAu) -> bool {
+    if derivation_bool(derivation, &["controller", "frozen"]).unwrap_or(false) || volume_au == 0 {
         return true;
     }
     let source = derivation_str(derivation, &["controller", "source"])
@@ -4520,20 +4801,20 @@ fn dashboard_price_chart_svg(
         selected
             .points
             .iter()
-            .map(|point| point.volume_mu)
+            .map(|point| point.volume_au)
             .max()
             .unwrap_or(0)
     } else {
         selected_candles
             .iter()
-            .map(|candle| candle.volume_mu)
+            .map(|candle| candle.volume_au)
             .max()
             .unwrap_or(0)
     };
     let x_for_epoch =
         |epoch: u64| dashboard_chart_x(epoch, min_epoch, max_epoch, left, inner_right);
     let y_for_price =
-        |price: u64| dashboard_chart_y(price, min_price, max_price, plot_top, plot_bottom);
+        |price: MoneyAu| dashboard_chart_y(price, min_price, max_price, plot_top, plot_bottom);
     let mut body = String::new();
     for i in 0..=4 {
         let y = plot_top + (plot_bottom - plot_top) * f64::from(i) / 4.0;
@@ -4558,7 +4839,7 @@ fn dashboard_price_chart_svg(
         (min_price, y_for_price(min_price)),
     ] {
         body.push_str(&format!(
-            r#"<text class="price-axis" x="8" y="{}">{}mu</text>"#,
+            r#"<text class="price-axis" x="8" y="{}">{}au</text>"#,
             svg_num(y + 4.0),
             label,
         ));
@@ -4574,7 +4855,7 @@ fn dashboard_price_chart_svg(
                 overlay
                     .points
                     .iter()
-                    .map(|point| (point.epoch, point.price_mu)),
+                    .map(|point| (point.epoch, point.price_au)),
                 &x_for_epoch,
                 &y_for_price,
             );
@@ -4597,7 +4878,7 @@ fn dashboard_price_chart_svg(
             body.push_str(&dashboard_volume_bar(
                 x_for_epoch(point.epoch),
                 9.0,
-                point.volume_mu,
+                point.volume_au,
                 max_volume,
                 volume_top,
                 volume_bottom,
@@ -4606,7 +4887,7 @@ fn dashboard_price_chart_svg(
             if point.pinned {
                 body.push_str(&dashboard_price_marker(
                     x_for_epoch(point.epoch),
-                    y_for_price(point.price_mu),
+                    y_for_price(point.price_au),
                     "pinned",
                     &point.title,
                 ));
@@ -4617,7 +4898,7 @@ fn dashboard_price_chart_svg(
             let path = dashboard_price_line_path(
                 candles
                     .iter()
-                    .map(|candle| (candle.end_epoch, candle.close_mu)),
+                    .map(|candle| (candle.end_epoch, candle.close_au)),
                 &x_for_epoch,
                 &y_for_price,
             );
@@ -4636,7 +4917,7 @@ fn dashboard_price_chart_svg(
             body.push_str(&dashboard_volume_bar(
                 x,
                 candle_width,
-                candle.volume_mu,
+                candle.volume_au,
                 max_volume,
                 volume_top,
                 volume_bottom,
@@ -4651,7 +4932,7 @@ fn dashboard_price_chart_svg(
             if candle.pinned {
                 body.push_str(&dashboard_price_marker(
                     x,
-                    y_for_price(candle.close_mu),
+                    y_for_price(candle.close_au),
                     "pinned",
                     &candle.title,
                 ));
@@ -4681,42 +4962,42 @@ fn dashboard_price_candles(
             points.sort_by_key(|point| point.epoch);
             let first = points[0];
             let last = points[points.len() - 1];
-            let high_mu = points
+            let high_au = points
                 .iter()
-                .map(|point| point.price_mu)
+                .map(|point| point.price_au)
                 .max()
-                .unwrap_or(first.price_mu);
-            let low_mu = points
+                .unwrap_or(first.price_au);
+            let low_au = points
                 .iter()
-                .map(|point| point.price_mu)
+                .map(|point| point.price_au)
                 .min()
-                .unwrap_or(first.price_mu);
-            let volume_mu = points
+                .unwrap_or(first.price_au);
+            let volume_au = points
                 .iter()
-                .map(|point| point.volume_mu)
-                .fold(0_u64, u64::saturating_add);
-            let pinned = volume_mu == 0 || points.iter().all(|point| point.pinned);
+                .map(|point| point.volume_au)
+                .fold(0_u128, MoneyAu::saturating_add);
+            let pinned = volume_au == 0 || points.iter().all(|point| point.pinned);
             let end_epoch = start_epoch
                 .saturating_add(window_epochs.max(1))
                 .saturating_sub(1);
             DashboardPriceCandle {
                 start_epoch,
                 end_epoch,
-                open_mu: first.price_mu,
-                high_mu,
-                low_mu,
-                close_mu: last.price_mu,
-                volume_mu,
+                open_au: first.price_au,
+                high_au,
+                low_au,
+                close_au: last.price_au,
+                volume_au,
                 pinned,
                 title: format!(
-                    "epoch {}-{} OHLC {}/{}/{}/{}mu volume {}mu | {}",
+                    "epoch {}-{} OHLC {}/{}/{}/{}au volume {}au | {}",
                     start_epoch,
                     end_epoch,
-                    first.price_mu,
-                    high_mu,
-                    low_mu,
-                    last.price_mu,
-                    volume_mu,
+                    first.price_au,
+                    high_au,
+                    low_au,
+                    last.price_au,
+                    volume_au,
                     last.title
                 ),
             }
@@ -4770,22 +5051,22 @@ fn dashboard_chart_price_bounds(
     selected_candles: &[DashboardPriceCandle],
     overlay_candles: &[Vec<DashboardPriceCandle>],
     timeframe: DashboardPriceTimeframe,
-) -> (u64, u64) {
+) -> (MoneyAu, MoneyAu) {
     let mut prices = Vec::new();
     if timeframe == DashboardPriceTimeframe::H1 {
-        prices.extend(selected.points.iter().map(|point| point.price_mu));
+        prices.extend(selected.points.iter().map(|point| point.price_au));
         for overlay in overlays {
-            prices.extend(overlay.points.iter().map(|point| point.price_mu));
+            prices.extend(overlay.points.iter().map(|point| point.price_au));
         }
     } else {
         for candle in selected_candles {
-            prices.push(candle.open_mu);
-            prices.push(candle.high_mu);
-            prices.push(candle.low_mu);
-            prices.push(candle.close_mu);
+            prices.push(candle.open_au);
+            prices.push(candle.high_au);
+            prices.push(candle.low_au);
+            prices.push(candle.close_au);
         }
         for candles in overlay_candles {
-            prices.extend(candles.iter().map(|candle| candle.close_mu));
+            prices.extend(candles.iter().map(|candle| candle.close_au));
         }
     }
     let min = prices.iter().copied().min().unwrap_or(1);
@@ -4811,15 +5092,21 @@ fn dashboard_chart_x(epoch: u64, min_epoch: u64, max_epoch: u64, left: f64, righ
     left + (epoch.saturating_sub(min_epoch) as f64 / span) * (right - left)
 }
 
-fn dashboard_chart_y(price: u64, min_price: u64, max_price: u64, top: f64, bottom: f64) -> f64 {
+fn dashboard_chart_y(
+    price: MoneyAu,
+    min_price: MoneyAu,
+    max_price: MoneyAu,
+    top: f64,
+    bottom: f64,
+) -> f64 {
     let span = max_price.saturating_sub(min_price).max(1) as f64;
     bottom - (price.saturating_sub(min_price) as f64 / span) * (bottom - top)
 }
 
 fn dashboard_price_line_path<'a>(
-    pairs: impl Iterator<Item = (u64, u64)> + 'a,
+    pairs: impl Iterator<Item = (u64, MoneyAu)> + 'a,
     x_for_epoch: &impl Fn(u64) -> f64,
-    y_for_price: &impl Fn(u64) -> f64,
+    y_for_price: &impl Fn(MoneyAu) -> f64,
 ) -> String {
     let mut path = String::new();
     for (index, (epoch, price)) in pairs.enumerate() {
@@ -4837,19 +5124,19 @@ fn dashboard_price_line_path<'a>(
 fn dashboard_price_step_path(
     points: &[DashboardPricePoint],
     x_for_epoch: &impl Fn(u64) -> f64,
-    y_for_price: &impl Fn(u64) -> f64,
+    y_for_price: &impl Fn(MoneyAu) -> f64,
 ) -> String {
     if points.is_empty() {
         return String::new();
     }
     if points.len() == 1 {
-        let y = svg_num(y_for_price(points[0].price_mu));
+        let y = svg_num(y_for_price(points[0].price_au));
         return format!("M54 {y} H742");
     }
     let mut path = String::new();
     for (index, point) in points.iter().enumerate() {
         let x = svg_num(x_for_epoch(point.epoch));
-        let y = svg_num(y_for_price(point.price_mu));
+        let y = svg_num(y_for_price(point.price_au));
         if index == 0 {
             path.push_str(&format!("M{x} {y}"));
         } else {
@@ -4862,8 +5149,8 @@ fn dashboard_price_step_path(
 fn dashboard_volume_bar(
     x: f64,
     width: f64,
-    volume_mu: u64,
-    max_volume: u64,
+    volume_au: MoneyAu,
+    max_volume: MoneyAu,
     top: f64,
     bottom: f64,
     title: &str,
@@ -4871,7 +5158,7 @@ fn dashboard_volume_bar(
     let height = if max_volume == 0 {
         0.0
     } else {
-        (volume_mu as f64 / max_volume as f64) * (bottom - top)
+        (volume_au as f64 / max_volume as f64) * (bottom - top)
     };
     let y = bottom - height;
     format!(
@@ -4888,15 +5175,15 @@ fn dashboard_price_candle_svg(
     candle: &DashboardPriceCandle,
     x: f64,
     width: f64,
-    y_for_price: &impl Fn(u64) -> f64,
+    y_for_price: &impl Fn(MoneyAu) -> f64,
 ) -> String {
-    let open_y = y_for_price(candle.open_mu);
-    let close_y = y_for_price(candle.close_mu);
-    let high_y = y_for_price(candle.high_mu);
-    let low_y = y_for_price(candle.low_mu);
+    let open_y = y_for_price(candle.open_au);
+    let close_y = y_for_price(candle.close_au);
+    let high_y = y_for_price(candle.high_au);
+    let low_y = y_for_price(candle.low_au);
     let top = open_y.min(close_y);
     let height = (open_y - close_y).abs().max(2.0);
-    let class = if candle.close_mu >= candle.open_mu {
+    let class = if candle.close_au >= candle.open_au {
         "price-candle up"
     } else {
         "price-candle down"
@@ -4938,15 +5225,15 @@ fn svg_num(value: f64) -> String {
     text
 }
 
-fn dashboard_price(price: &PriceRefMu) -> String {
+fn dashboard_price(price: &PriceRefAu) -> String {
     let entries = price
         .rate_map
         .iter()
         .take(3)
         .map(|entry| {
             format!(
-                "{}mu/{}/{}",
-                entry.per_unit_mu, entry.granularity, entry.unit
+                "{}au/{}/{}",
+                entry.per_unit_au, entry.granularity, entry.unit
             )
         })
         .collect::<Vec<_>>();
@@ -4958,7 +5245,7 @@ fn dashboard_price(price: &PriceRefMu) -> String {
 }
 
 fn dashboard_model_price_derivation(model: &GatewayModel) -> String {
-    let Some(derivation) = model.mayhem.price_ref_mu.derivation.as_ref() else {
+    let Some(derivation) = model.mayhem.price_ref_au.derivation.as_ref() else {
         return "derivation pending".to_owned();
     };
     dashboard_price_derivation_summary(derivation)
@@ -4978,7 +5265,7 @@ fn dashboard_price_derivation_summary(derivation: &Value) -> String {
     let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
         .map(format_bps)
         .unwrap_or_else(|| "?".to_owned());
-    let demand_mu = derivation_u64(derivation, &["usage", "active_demand_mu"])
+    let demand_au = derivation_money_au(derivation, &["usage", "active_demand_au"])
         .map(|value| value.to_string())
         .unwrap_or_else(|| "?".to_owned());
     let sessions = derivation_u64(derivation, &["usage", "session_count"])
@@ -5002,12 +5289,16 @@ fn dashboard_price_derivation_summary(derivation: &Value) -> String {
         .map(|value| format!(" · leaf {}", short_text(value, 12)))
         .unwrap_or_default();
     format!(
-        "price = f(seed {seed_ver}, U {utilization}, demand {demand_mu}mu, {sessions} sessions, supply {supply}) -> {result_ver} · epoch {epoch} · {source}{frozen}{root}{leaf}"
+        "price = f(seed {seed_ver}, U {utilization}, demand {demand_au}au, {sessions} sessions, supply {supply}) -> {result_ver} · epoch {epoch} · {source}{frozen}{root}{leaf}"
     )
 }
 
 fn derivation_u64<'a>(value: &'a Value, path: &[&str]) -> Option<u64> {
     derivation_value(value, path)?.as_u64()
+}
+
+fn derivation_money_au<'a>(value: &'a Value, path: &[&str]) -> Option<MoneyAu> {
+    derivation_value(value, path).and_then(value_as_money_au)
 }
 
 fn derivation_bool<'a>(value: &'a Value, path: &[&str]) -> Option<bool> {
@@ -5037,7 +5328,7 @@ fn dashboard_spend_body(receipts: &[StoredReceipt]) -> String {
     }
     let max = receipts
         .iter()
-        .map(|receipt| receipt.receipt.body.mu_owed_cum)
+        .map(|receipt| receipt.receipt.body.au_owed_cum)
         .max()
         .unwrap_or(1)
         .max(1);
@@ -5045,16 +5336,31 @@ fn dashboard_spend_body(receipts: &[StoredReceipt]) -> String {
         .iter()
         .take(12)
         .map(|receipt| {
-            let height = 8 + (receipt.receipt.body.mu_owed_cum.saturating_mul(92) / max);
+            let height = 8 + (receipt.receipt.body.au_owed_cum.saturating_mul(92) / max);
             format!(r#"<span class="bar" style="--h:{height}%"></span>"#)
         })
         .collect::<String>();
     format!(r#"<div class="spend-bars">{bars}</div>"#)
 }
 
-fn format_mu_usd(mu: u64) -> String {
-    let cents = mu.saturating_add(5_000) / 10_000;
+fn format_au_usd(au: MoneyAu) -> String {
+    let cents = au.saturating_add(5_000_000_000_000_000) / 10_000_000_000_000_000;
     format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+fn value_as_money_au(value: &Value) -> Option<MoneyAu> {
+    let text = value.as_str()?;
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.as_bytes().iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    text.parse::<MoneyAu>().ok()
+}
+
+fn money_au_json(value: MoneyAu) -> Value {
+    Value::String(value.to_string())
 }
 
 fn short_text(value: &str, max: usize) -> String {
@@ -5166,9 +5472,11 @@ fn new_dashboard_token() -> String {
 }
 
 type SseEventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
-const LIVE_SSE_MIN_EVENT_BUFFER: usize = 512;
-const LIVE_SSE_MAX_EVENT_BUFFER: usize = 16_384;
+const LIVE_SSE_MIN_EVENT_BUFFER: usize = 1;
+const LIVE_SSE_MAX_EVENT_BUFFER: usize = 8;
 const LIVE_SSE_DEFAULT_MAX_TOKENS: usize = 1024;
+const LIVE_SSE_CLIENT_BACKPRESSURE_TIMEOUT_MS: u64 = 3_000;
+const LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS: u64 = 8;
 const DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS: u64 = 5_000;
 
 enum ChatResponse {
@@ -5190,7 +5498,7 @@ struct ResponseMayhemMeta<'a> {
 struct GatewayRequestOptions {
     hedge_requested: bool,
     min_att_tier: Option<u8>,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     max_wait_ms: u64,
     min_ctx: Option<u32>,
     quant: Option<String>,
@@ -5203,7 +5511,7 @@ impl Default for GatewayRequestOptions {
         Self {
             hedge_requested: false,
             min_att_tier: None,
-            max_price_mu: None,
+            max_price_au: None,
             max_wait_ms: DEFAULT_ROUTE_MAX_WAIT_MS,
             min_ctx: None,
             quant: None,
@@ -5325,7 +5633,7 @@ struct ExpectedProviderReceipt<'a> {
     seq: u64,
     final_receipt: bool,
     usage: ReceiptUsage,
-    mu_owed_cum: u64,
+    au_owed_cum: MoneyAu,
     prompt_hash: String,
 }
 
@@ -5543,7 +5851,7 @@ fn contract_snapshot_for_route(
     candidate: &GatewayRouteCandidate,
     rules_ver: u64,
 ) -> ContractProviderSnapshot {
-    let price = route_price_ref_mu(model, Some(candidate));
+    let price = route_price_ref_au(model, Some(candidate));
     ContractProviderSnapshot {
         provider: candidate.provider.clone(),
         provider_status: Some("active".to_owned()),
@@ -5554,8 +5862,8 @@ fn contract_snapshot_for_route(
         reputation: f64::from(candidate.reputation_bps.min(10_000)) / 10_000.0,
         price_ver: price.ver,
         rate_map: price.rate_map.clone(),
-        per_req_mu: price.per_req_mu,
-        min_session_mu: price.min_session_mu,
+        per_req_au: price.per_req_au,
+        min_session_au: price.min_session_au,
         ref_rate_map: price.rate_map.clone(),
         probation: candidate.probation.clone(),
         caps: heartbeat_caps_for_route(model, candidate),
@@ -5568,7 +5876,7 @@ fn heartbeat_for_route(
     candidate: &GatewayRouteCandidate,
     now_millis: u64,
 ) -> ProviderHeartbeat {
-    let price = route_price_ref_mu(model, Some(candidate));
+    let price = route_price_ref_au(model, Some(candidate));
     ProviderHeartbeat {
         t: "hb".to_owned(),
         v: crate::HEARTBEAT_SCHEMA_VERSION,
@@ -5593,7 +5901,9 @@ fn heartbeat_for_route(
             ttft_ms: 150,
         },
         price_ver: price.ver,
-        min_ask_mu: candidate.min_ask_mu,
+        min_ask_au: candidate.min_ask_au,
+        transport_peer: None,
+        identity_anchor: Some(format!("provider:{}", candidate.provider)),
         accepting_new: true,
         caps: heartbeat_caps_for_route(model, candidate),
         att: HeartbeatAttestation {
@@ -5714,6 +6024,7 @@ impl GatewaySessionError {
             clean_refusal: false,
             clean_refusal_code: None,
             partial: None,
+            interrupted: None,
         }
     }
 
@@ -5724,6 +6035,7 @@ impl GatewaySessionError {
             clean_refusal: false,
             clean_refusal_code: None,
             partial: None,
+            interrupted: None,
         }
     }
 
@@ -5738,6 +6050,7 @@ impl GatewaySessionError {
             clean_refusal: true,
             clean_refusal_code: code.map(str::to_owned),
             partial: None,
+            interrupted: None,
         }
     }
 
@@ -5748,6 +6061,21 @@ impl GatewaySessionError {
             clean_refusal: false,
             clean_refusal_code: None,
             partial: Some(Box::new(partial)),
+            interrupted: None,
+        }
+    }
+
+    pub fn retryable_interrupted(
+        message: impl Into<String>,
+        interrupted: GatewaySessionInterrupted,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            clean_refusal: false,
+            clean_refusal_code: None,
+            partial: None,
+            interrupted: Some(Box::new(interrupted)),
         }
     }
 
@@ -5762,7 +6090,7 @@ impl GatewayRequestOptions {
         Ok(Self {
             hedge_requested: parse_x_mayhem_hedge(headers)?,
             min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
-            max_price_mu: parse_x_mayhem_max_price_mu(headers)?,
+            max_price_au: parse_x_mayhem_max_price_au(headers)?,
             max_wait_ms: parse_x_mayhem_max_wait_ms(headers)?,
             min_ctx: parse_x_mayhem_min_ctx(headers)?,
             quant: parse_x_mayhem_quant(headers)?,
@@ -5797,26 +6125,26 @@ fn parse_x_mayhem_max_wait_ms(headers: &HeaderMap) -> Result<u64, ApiError> {
     Ok(parsed)
 }
 
-fn parse_x_mayhem_max_price_mu(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
+fn parse_x_mayhem_max_price_au(headers: &HeaderMap) -> Result<Option<MoneyAu>, ApiError> {
     let Some(value) = headers.get(X_MAYHEM_MAX_PRICE_MU_HEADER) else {
         return Ok(None);
     };
     let value = value.to_str().map_err(|_| {
         ApiError::bad_request(
-            "X-Mayhem-Max-Price-Mu must be an ASCII positive integer µUSD value",
-            Some("X-Mayhem-Max-Price-Mu"),
+            "X-Mayhem-Max-Price-Au must be an ASCII positive integer atto-USD value",
+            Some("X-Mayhem-Max-Price-Au"),
         )
     })?;
-    let parsed = value.trim().parse::<u64>().map_err(|_| {
+    let parsed = value.trim().parse::<MoneyAu>().map_err(|_| {
         ApiError::bad_request(
-            "X-Mayhem-Max-Price-Mu must be a positive integer µUSD value",
-            Some("X-Mayhem-Max-Price-Mu"),
+            "X-Mayhem-Max-Price-Au must be a positive integer atto-USD value",
+            Some("X-Mayhem-Max-Price-Au"),
         )
     })?;
     if parsed == 0 {
         return Err(ApiError::bad_request(
-            "X-Mayhem-Max-Price-Mu must be greater than 0",
-            Some("X-Mayhem-Max-Price-Mu"),
+            "X-Mayhem-Max-Price-Au must be greater than 0",
+            Some("X-Mayhem-Max-Price-Au"),
         ));
     }
     Ok(Some(parsed))
@@ -6169,10 +6497,8 @@ impl ScBridgeGatewaySessionBackend {
         &self,
         invocation: &GatewaySessionInvocation,
     ) -> Result<GatewayHedgeProbeResult, GatewaySessionError> {
-        let provider = invocation
-            .provider_pubkey
-            .as_deref()
-            .ok_or_else(|| GatewaySessionError::new("hedge probe has no canonical provider"))?;
+        let provider = invocation.provider_pubkey_required()?;
+        let direct_peer = invocation.direct_peer()?;
         let started = Instant::now();
         let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
             &self.config.url,
@@ -6183,21 +6509,21 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, invocation.failover.open_timeout())
+            .peer_connect(direct_peer, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "hedge peer connect to provider {} for session {} failed: {err}",
-                    provider, invocation.session_id
+                    "hedge peer connect to provider {} via transport peer {} for session {} failed: {err}",
+                    provider, direct_peer, invocation.session_id
                 ))
             })?;
         let opened = bridge
-            .session_open(provider, &invocation.session_id)
+            .session_open(direct_peer, &invocation.session_id)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "hedge session open {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "hedge session open {} to provider {} via transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
         if opened.get("direct").and_then(Value::as_bool) != Some(true)
@@ -6210,7 +6536,7 @@ impl ScBridgeGatewaySessionBackend {
         }
         let _ = bridge
             .session_send(
-                provider,
+                direct_peer,
                 &invocation.session_id,
                 json!({
                     "t": "s.close",
@@ -6232,10 +6558,8 @@ impl ScBridgeGatewaySessionBackend {
         request: &ChatCompletionRequest,
         invocation: &GatewaySessionInvocation,
     ) -> Result<GatewaySessionResult, GatewaySessionError> {
-        let provider = invocation
-            .provider_pubkey
-            .as_deref()
-            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let provider = invocation.provider_pubkey_required()?;
+        let direct_peer = invocation.direct_peer()?;
         let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
             &self.config.url,
             self.config.token.clone(),
@@ -6245,21 +6569,21 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, invocation.failover.open_timeout())
+            .peer_connect(direct_peer, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "connecting direct peer {} for session {} failed: {err}",
-                    provider, invocation.session_id
+                    "connecting provider {} transport peer {} for session {} failed: {err}",
+                    provider, direct_peer, invocation.session_id
                 ))
             })?;
         let opened = bridge
-            .session_open(provider, &invocation.session_id)
+            .session_open(direct_peer, &invocation.session_id)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "opening direct session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "opening direct session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
         if opened.get("direct").and_then(Value::as_bool) != Some(true)
@@ -6296,12 +6620,12 @@ impl ScBridgeGatewaySessionBackend {
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
         bridge
-            .session_send(provider, &invocation.session_id, open_frame)
+            .session_send(direct_peer, &invocation.session_id, open_frame)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "sending s.open for session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "sending s.open for session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
 
@@ -6341,7 +6665,7 @@ impl ScBridgeGatewaySessionBackend {
         let request_body = direct_session_request_body(request);
         send_direct_session_request_frames(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             &request_id,
             &request_body,
@@ -6368,7 +6692,7 @@ impl ScBridgeGatewaySessionBackend {
                     )?;
                     let _ = send_direct_session_frame_with_peer_reconnect(
                         &mut bridge,
-                        provider,
+                        direct_peer,
                         &invocation.session_id,
                         json!({
                             "t": "s.receipt_ack",
@@ -6384,7 +6708,7 @@ impl ScBridgeGatewaySessionBackend {
                     .await;
                     let _ = bridge
                         .session_send(
-                            provider,
+                            direct_peer,
                             &invocation.session_id,
                             json!({
                                 "t": "s.close",
@@ -6408,7 +6732,7 @@ impl ScBridgeGatewaySessionBackend {
         )?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             json!({
                 "t": "s.receipt_ack",
@@ -6423,7 +6747,7 @@ impl ScBridgeGatewaySessionBackend {
         .await?;
         let _ = bridge
             .session_send(
-                provider,
+                direct_peer,
                 &invocation.session_id,
                 json!({
                     "t": "s.close",
@@ -6450,10 +6774,8 @@ impl ScBridgeGatewaySessionBackend {
         request: &EmbeddingRequest,
         invocation: &GatewaySessionInvocation,
     ) -> Result<GatewayEmbeddingResult, GatewaySessionError> {
-        let provider = invocation
-            .provider_pubkey
-            .as_deref()
-            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let provider = invocation.provider_pubkey_required()?;
+        let direct_peer = invocation.direct_peer()?;
         let inputs =
             embedding_input_texts_from_value(&request.input).map_err(GatewaySessionError::new)?;
         let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
@@ -6465,21 +6787,21 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, invocation.failover.open_timeout())
+            .peer_connect(direct_peer, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "connecting direct peer {} for embedding session {} failed: {err}",
-                    provider, invocation.session_id
+                    "connecting provider {} transport peer {} for embedding session {} failed: {err}",
+                    provider, direct_peer, invocation.session_id
                 ))
             })?;
         let opened = bridge
-            .session_open(provider, &invocation.session_id)
+            .session_open(direct_peer, &invocation.session_id)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "opening direct embedding session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "opening direct embedding session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
         if opened.get("direct").and_then(Value::as_bool) != Some(true)
@@ -6516,12 +6838,12 @@ impl ScBridgeGatewaySessionBackend {
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
         bridge
-            .session_send(provider, &invocation.session_id, open_frame)
+            .session_send(direct_peer, &invocation.session_id, open_frame)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "sending s.open for embedding session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "sending s.open for embedding session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
 
@@ -6561,7 +6883,7 @@ impl ScBridgeGatewaySessionBackend {
         let request_body = direct_session_embedding_request_body(request);
         send_direct_session_request_frames(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             &request_id,
             &request_body,
@@ -6587,7 +6909,7 @@ impl ScBridgeGatewaySessionBackend {
         )?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             json!({
                 "t": "s.receipt_ack",
@@ -6602,7 +6924,7 @@ impl ScBridgeGatewaySessionBackend {
         .await?;
         let _ = bridge
             .session_send(
-                provider,
+                direct_peer,
                 &invocation.session_id,
                 json!({
                     "t": "s.close",
@@ -6628,10 +6950,8 @@ impl ScBridgeGatewaySessionBackend {
         request: &ImageGenerationRequest,
         invocation: &GatewaySessionInvocation,
     ) -> Result<GatewayImageGenerationResult, GatewaySessionError> {
-        let provider = invocation
-            .provider_pubkey
-            .as_deref()
-            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let provider = invocation.provider_pubkey_required()?;
+        let direct_peer = invocation.direct_peer()?;
         let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
             &self.config.url,
             self.config.token.clone(),
@@ -6641,21 +6961,21 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, invocation.failover.open_timeout())
+            .peer_connect(direct_peer, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "connecting direct peer {} for image session {} failed: {err}",
-                    provider, invocation.session_id
+                    "connecting provider {} transport peer {} for image session {} failed: {err}",
+                    provider, direct_peer, invocation.session_id
                 ))
             })?;
         let opened = bridge
-            .session_open(provider, &invocation.session_id)
+            .session_open(direct_peer, &invocation.session_id)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "opening direct image session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "opening direct image session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
         if opened.get("direct").and_then(Value::as_bool) != Some(true)
@@ -6692,12 +7012,12 @@ impl ScBridgeGatewaySessionBackend {
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
         bridge
-            .session_send(provider, &invocation.session_id, open_frame)
+            .session_send(direct_peer, &invocation.session_id, open_frame)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "sending s.open for image session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "sending s.open for image session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
 
@@ -6737,7 +7057,7 @@ impl ScBridgeGatewaySessionBackend {
         .collect::<String>();
         send_direct_session_request_frames(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             &request_id,
             &request_body,
@@ -6763,7 +7083,7 @@ impl ScBridgeGatewaySessionBackend {
         )?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             json!({
                 "t": "s.receipt_ack",
@@ -6778,7 +7098,7 @@ impl ScBridgeGatewaySessionBackend {
         .await?;
         let _ = bridge
             .session_send(
-                provider,
+                direct_peer,
                 &invocation.session_id,
                 json!({
                     "t": "s.close",
@@ -6804,10 +7124,8 @@ impl ScBridgeGatewaySessionBackend {
         request: &AudioSpeechRequest,
         invocation: &GatewaySessionInvocation,
     ) -> Result<GatewayAudioSpeechResult, GatewaySessionError> {
-        let provider = invocation
-            .provider_pubkey
-            .as_deref()
-            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let provider = invocation.provider_pubkey_required()?;
+        let direct_peer = invocation.direct_peer()?;
         let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
             &self.config.url,
             self.config.token.clone(),
@@ -6817,21 +7135,21 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, invocation.failover.open_timeout())
+            .peer_connect(direct_peer, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "connecting direct peer {} for audio speech session {} failed: {err}",
-                    provider, invocation.session_id
+                    "connecting provider {} transport peer {} for audio speech session {} failed: {err}",
+                    provider, direct_peer, invocation.session_id
                 ))
             })?;
         let opened = bridge
-            .session_open(provider, &invocation.session_id)
+            .session_open(direct_peer, &invocation.session_id)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "opening direct audio speech session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "opening direct audio speech session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
         if opened.get("direct").and_then(Value::as_bool) != Some(true)
@@ -6868,12 +7186,12 @@ impl ScBridgeGatewaySessionBackend {
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
         bridge
-            .session_send(provider, &invocation.session_id, open_frame)
+            .session_send(direct_peer, &invocation.session_id, open_frame)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "sending s.open for audio speech session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "sending s.open for audio speech session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
 
@@ -6903,7 +7221,7 @@ impl ScBridgeGatewaySessionBackend {
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
         send_direct_session_request_frames(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             &request_id,
             &request_body,
@@ -6929,7 +7247,7 @@ impl ScBridgeGatewaySessionBackend {
         )?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             json!({
                 "t": "s.receipt_ack",
@@ -6944,7 +7262,7 @@ impl ScBridgeGatewaySessionBackend {
         .await?;
         let _ = bridge
             .session_send(
-                provider,
+                direct_peer,
                 &invocation.session_id,
                 json!({
                     "t": "s.close",
@@ -6970,10 +7288,8 @@ impl ScBridgeGatewaySessionBackend {
         request: &AudioTranscriptionRequest,
         invocation: &GatewaySessionInvocation,
     ) -> Result<GatewayAudioTranscriptionResult, GatewaySessionError> {
-        let provider = invocation
-            .provider_pubkey
-            .as_deref()
-            .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+        let provider = invocation.provider_pubkey_required()?;
+        let direct_peer = invocation.direct_peer()?;
         let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
             &self.config.url,
             self.config.token.clone(),
@@ -6983,21 +7299,21 @@ impl ScBridgeGatewaySessionBackend {
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
         bridge
-            .peer_connect(provider, invocation.failover.open_timeout())
+            .peer_connect(direct_peer, invocation.failover.open_timeout())
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "connecting direct peer {} for audio transcription session {} failed: {err}",
-                    provider, invocation.session_id
+                    "connecting provider {} transport peer {} for audio transcription session {} failed: {err}",
+                    provider, direct_peer, invocation.session_id
                 ))
             })?;
         let opened = bridge
-            .session_open(provider, &invocation.session_id)
+            .session_open(direct_peer, &invocation.session_id)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "opening direct audio transcription session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "opening direct audio transcription session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
         if opened.get("direct").and_then(Value::as_bool) != Some(true)
@@ -7034,12 +7350,12 @@ impl ScBridgeGatewaySessionBackend {
         let open_head = session_frame_head(&open_frame)
             .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
         bridge
-            .session_send(provider, &invocation.session_id, open_frame)
+            .session_send(direct_peer, &invocation.session_id, open_frame)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "sending s.open for audio transcription session {} to provider {} failed: {err}",
-                    invocation.session_id, provider
+                    "sending s.open for audio transcription session {} to provider {} transport peer {} failed: {err}",
+                    invocation.session_id, provider, direct_peer
                 ))
             })?;
 
@@ -7069,7 +7385,7 @@ impl ScBridgeGatewaySessionBackend {
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
         send_direct_session_request_frames(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             &request_id,
             &request_body,
@@ -7095,7 +7411,7 @@ impl ScBridgeGatewaySessionBackend {
         )?;
         send_direct_session_frame_with_peer_reconnect(
             &mut bridge,
-            provider,
+            direct_peer,
             &invocation.session_id,
             json!({
                 "t": "s.receipt_ack",
@@ -7110,7 +7426,7 @@ impl ScBridgeGatewaySessionBackend {
         .await?;
         let _ = bridge
             .session_send(
-                provider,
+                direct_peer,
                 &invocation.session_id,
                 json!({
                     "t": "s.close",
@@ -7471,7 +7787,7 @@ fn request_id_for_body(session_id: &str, body: &Value) -> String {
 
 async fn send_direct_session_request_frames(
     bridge: &mut ScBridgeClient,
-    provider: &str,
+    direct_peer: &str,
     session_id: &str,
     request_id: &str,
     body: &Value,
@@ -7479,11 +7795,11 @@ async fn send_direct_session_request_frames(
     let max_frame_bytes = direct_session_max_frame_bytes();
     for frame in direct_session_request_frames(request_id, body, max_frame_bytes)? {
         bridge
-            .session_send(provider, session_id, frame)
+            .session_send(direct_peer, session_id, frame)
             .await
             .map_err(|err| {
                 GatewaySessionError::retryable(format!(
-                    "sending s.req for session {session_id} to provider {provider} failed: {err}"
+                    "sending s.req for session {session_id} to transport peer {direct_peer} failed: {err}"
                 ))
             })?;
     }
@@ -8655,6 +8971,7 @@ fn retryable_interrupted_direct_session_error(
 }
 
 fn client_disconnect_direct_session_error(
+    request: &ChatCompletionRequest,
     content: &str,
     tool_call: Option<ToolCallOutput>,
     provider_receipt: Option<&ProviderSignedReceipt>,
@@ -8662,15 +8979,45 @@ fn client_disconnect_direct_session_error(
     watchdog: &DirectSessionWatchdog,
     now_millis: u64,
 ) -> GatewaySessionError {
-    retryable_interrupted_direct_session_error(
+    let err = retryable_interrupted_direct_session_error(
         GatewaySessionError::retryable("end-user disconnected before stream completed"),
         content,
-        tool_call,
+        tool_call.clone(),
         provider_receipt,
         token_ids,
         watchdog,
         now_millis,
         "client_disconnect",
+    );
+    if err.partial.is_some() {
+        return err;
+    }
+    let Some(first_delta_at_millis) = watchdog.first_delta_at_millis else {
+        return err;
+    };
+    let usage = observed_chat_usage(request, content, token_ids);
+    let quality = Some(GatewaySessionQuality {
+        ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
+        tok_s: generated_tokens_per_second(
+            usage.completion_tokens,
+            first_delta_at_millis,
+            now_millis,
+        ),
+    });
+    GatewaySessionError::retryable_interrupted(
+        err.message,
+        GatewaySessionInterrupted {
+            output: ChatOutput {
+                content: tool_call.is_none().then_some(content.to_owned()),
+                tool_call,
+                artifacts: Vec::new(),
+                finish_reason: "interrupted".to_owned(),
+                usage,
+            },
+            token_ids: token_ids.to_vec(),
+            quality,
+            reason: "client_disconnect".to_owned(),
+        },
     )
 }
 
@@ -8713,35 +9060,35 @@ fn direct_session_checkpoint_partial(
 
 async fn send_direct_session_frame_with_peer_reconnect(
     bridge: &mut ScBridgeClient,
-    provider: &str,
+    direct_peer: &str,
     session_id: &str,
     frame: Value,
     open_timeout: Duration,
     action: &str,
 ) -> Result<(), GatewaySessionError> {
     match bridge
-        .session_send(provider, session_id, frame.clone())
+        .session_send(direct_peer, session_id, frame.clone())
         .await
     {
         Ok(_) => Ok(()),
         Err(err) if bridge_error_missing_direct_connection(&err) => {
-            bridge.peer_connect(provider, open_timeout).await.map_err(|connect_err| {
+            bridge.peer_connect(direct_peer, open_timeout).await.map_err(|connect_err| {
                 GatewaySessionError::retryable(format!(
-                    "{action} for session {session_id} to provider {provider} failed after direct connection was missing; reconnect failed: {connect_err}"
+                    "{action} for session {session_id} to transport peer {direct_peer} failed after direct connection was missing; reconnect failed: {connect_err}"
                 ))
             })?;
             bridge
-                .session_send(provider, session_id, frame)
+                .session_send(direct_peer, session_id, frame)
                 .await
                 .map_err(|send_err| {
                     GatewaySessionError::retryable(format!(
-                        "{action} for session {session_id} to provider {provider} failed after peer reconnect: {send_err}"
+                        "{action} for session {session_id} to transport peer {direct_peer} failed after peer reconnect: {send_err}"
                     ))
                 })?;
             Ok(())
         }
         Err(err) => Err(GatewaySessionError::retryable(format!(
-            "{action} for session {session_id} to provider {provider} failed: {err}"
+            "{action} for session {session_id} to transport peer {direct_peer} failed: {err}"
         ))),
     }
 }
@@ -8792,6 +9139,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     );
     let receipt_ack =
         direct_session_partial_receipt_ack(request, invocation, &partial, provider, model)?;
+    let direct_peer = invocation.direct_peer()?;
     let ack_frame = json!({
         "t": "s.receipt_ack",
         "v": 1,
@@ -8802,7 +9150,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     });
     send_direct_session_frame_with_peer_reconnect(
         bridge,
-        provider,
+        direct_peer,
         session_id,
         ack_frame.clone(),
         invocation.failover.open_timeout(),
@@ -9079,11 +9427,11 @@ fn direct_session_receipt_ack(
         provider,
         seq: provider_receipt.body.seq,
         final_receipt: true,
-        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+        au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
         usage,
     };
-    if expected.mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+    if expected.au_owed_cum > invocation.spend_voucher.body.max_spend_au {
         return Err(GatewaySessionError::new(
             "provider receipt exceeds signed spend voucher",
         ));
@@ -9206,8 +9554,8 @@ fn direct_session_partial_receipt_ack(
         partial.output.usage.completion_tokens,
         &invocation.spend_voucher.body.locked_rate_map,
     )?;
-    let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-    if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+    let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+    if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
         return Err(GatewaySessionError::new(
             "provider partial receipt exceeds signed spend voucher",
         ));
@@ -9220,7 +9568,7 @@ fn direct_session_partial_receipt_ack(
             provider,
             seq: body.seq,
             final_receipt: false,
-            mu_owed_cum,
+            au_owed_cum,
             usage,
             prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
         },
@@ -9244,7 +9592,7 @@ fn expected_embedding_provider_receipt<'a>(
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+        au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
         usage,
     }
@@ -9262,7 +9610,7 @@ fn expected_image_generation_provider_receipt<'a>(
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+        au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: image_generation_prompt_hash(request),
         usage,
     }
@@ -9280,7 +9628,7 @@ fn expected_audio_speech_provider_receipt<'a>(
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+        au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: audio_speech_prompt_hash(request),
         usage,
     }
@@ -9298,7 +9646,7 @@ fn expected_audio_transcription_provider_receipt<'a>(
         provider,
         seq: 1,
         final_receipt: true,
-        mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+        au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: audio_transcription_prompt_hash(request),
         usage,
     }
@@ -9390,12 +9738,12 @@ fn validate_provider_receipt(
             "provider receipt locked_rate_map mismatch",
         ),
         (
-            body.locked_per_req_mu == invocation.spend_voucher.body.locked_per_req_mu,
-            "provider receipt locked_per_req_mu mismatch",
+            body.locked_per_req_au == invocation.spend_voucher.body.locked_per_req_au,
+            "provider receipt locked_per_req_au mismatch",
         ),
         (
-            body.locked_min_session_mu == invocation.spend_voucher.body.locked_min_session_mu,
-            "provider receipt locked_min_session_mu mismatch",
+            body.locked_min_session_au == invocation.spend_voucher.body.locked_min_session_au,
+            "provider receipt locked_min_session_au mismatch",
         ),
         (
             body.served_ctx == invocation.served_ctx
@@ -9422,7 +9770,7 @@ fn validate_provider_receipt(
             "provider receipt usage mismatch",
         ),
         (
-            body.mu_owed_cum == expected.mu_owed_cum,
+            body.au_owed_cum == expected.au_owed_cum,
             "provider receipt amount mismatch",
         ),
         (
@@ -9918,7 +10266,7 @@ fn no_eligible_route_error(
             Some("model"),
         );
     }
-    if options.max_price_mu.is_some() {
+    if options.max_price_au.is_some() {
         return no_price_band_route_error();
     }
     ApiError::bad_request("no provider route is currently eligible", Some("model"))
@@ -10029,13 +10377,13 @@ fn route_wait_expired_error(options: &GatewayRequestOptions) -> ApiError {
 
 fn no_price_band_route_error() -> ApiError {
     ApiError::bad_request(
-        "no provider route is at or below X-Mayhem-Max-Price-Mu",
-        Some("X-Mayhem-Max-Price-Mu"),
+        "no provider route is at or below X-Mayhem-Max-Price-Au",
+        Some("X-Mayhem-Max-Price-Au"),
     )
 }
 
-fn ensure_max_price_allows(quote_mu: u64, max_price_mu: Option<u64>) -> Result<(), ApiError> {
-    if max_price_mu.is_some_and(|max_price_mu| quote_mu > max_price_mu) {
+fn ensure_max_price_allows(quote_au: MoneyAu, max_price_au: Option<MoneyAu>) -> Result<(), ApiError> {
+    if max_price_au.is_some_and(|max_price_au| quote_au > max_price_au) {
         return Err(no_price_band_route_error());
     }
     Ok(())
@@ -10159,6 +10507,7 @@ struct LiveDirectChatSession {
     attempt_started: Instant,
     bridge: ScBridgeClient,
     provider: String,
+    transport_peer: String,
     request_id: String,
     enclave_pubkey: String,
     id: String,
@@ -10239,7 +10588,7 @@ async fn prepare_live_direct_chat_session(
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match open_live_direct_chat_session(&config, &request, &invocation).await {
-            Ok((bridge, provider, request_id, enclave_pubkey)) => {
+            Ok((bridge, provider, transport_peer, request_id, enclave_pubkey)) => {
                 let include_usage = request
                     .stream_options
                     .as_ref()
@@ -10254,6 +10603,7 @@ async fn prepare_live_direct_chat_session(
                     attempt_started,
                     bridge,
                     provider,
+                    transport_peer,
                     request_id,
                     enclave_pubkey,
                     id,
@@ -10286,32 +10636,30 @@ async fn open_live_direct_chat_session(
     config: &ScBridgeGatewaySessionConfig,
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
-) -> Result<(ScBridgeClient, String, String, String), GatewaySessionError> {
-    let provider = invocation
-        .provider_pubkey
-        .as_deref()
-        .ok_or_else(|| GatewaySessionError::new("model has no canonical provider route"))?;
+) -> Result<(ScBridgeClient, String, String, String, String), GatewaySessionError> {
+    let provider = invocation.provider_pubkey_required()?;
+    let direct_peer = invocation.direct_peer()?;
     let mut bridge =
         ScBridgeClient::connect(ScBridgeConfig::new(&config.url, config.token.clone())?).await?;
     bridge
         .session_subscribe([invocation.session_id.as_str()])
         .await?;
     bridge
-        .peer_connect(provider, invocation.failover.open_timeout())
+        .peer_connect(direct_peer, invocation.failover.open_timeout())
         .await
         .map_err(|err| {
             GatewaySessionError::retryable(format!(
-                "connecting direct peer {} for session {} failed: {err}",
-                provider, invocation.session_id
+                "connecting provider {} transport peer {} for session {} failed: {err}",
+                provider, direct_peer, invocation.session_id
             ))
         })?;
     let opened = bridge
-        .session_open(provider, &invocation.session_id)
+        .session_open(direct_peer, &invocation.session_id)
         .await
         .map_err(|err| {
             GatewaySessionError::retryable(format!(
-                "opening direct session {} to provider {} failed: {err}",
-                invocation.session_id, provider
+                "opening direct session {} to provider {} transport peer {} failed: {err}",
+                invocation.session_id, provider, direct_peer
             ))
         })?;
     if opened.get("direct").and_then(Value::as_bool) != Some(true)
@@ -10348,12 +10696,12 @@ async fn open_live_direct_chat_session(
     let open_head = session_frame_head(&open_frame)
         .map_err(|err| GatewaySessionError::new(format!("s.open hash failed: {err}")))?;
     bridge
-        .session_send(provider, &invocation.session_id, open_frame)
+        .session_send(direct_peer, &invocation.session_id, open_frame)
         .await
         .map_err(|err| {
             GatewaySessionError::retryable(format!(
-                "sending s.open for session {} to provider {} failed: {err}",
-                invocation.session_id, provider
+                "sending s.open for session {} to provider {} transport peer {} failed: {err}",
+                invocation.session_id, provider, direct_peer
             ))
         })?;
 
@@ -10387,7 +10735,7 @@ async fn open_live_direct_chat_session(
     let request_body = direct_session_request_body(request);
     send_direct_session_request_frames(
         &mut bridge,
-        provider,
+        direct_peer,
         &invocation.session_id,
         &request_id,
         &request_body,
@@ -10396,6 +10744,7 @@ async fn open_live_direct_chat_session(
     Ok((
         bridge,
         provider.to_owned(),
+        direct_peer.to_owned(),
         request_id,
         accept_info.enclave_pubkey,
     ))
@@ -10454,7 +10803,7 @@ async fn run_live_direct_chat_sse(
                     let _ = session
                         .bridge
                         .session_send(
-                            &session.provider,
+                            &session.transport_peer,
                             &session.invocation.session_id,
                             json!({
                                 "t": "s.close",
@@ -10478,6 +10827,10 @@ fn is_client_disconnect_error(err: &GatewaySessionError) -> bool {
             .partial
             .as_ref()
             .is_some_and(|partial| partial.reason == "client_disconnect")
+        || err
+            .interrupted
+            .as_ref()
+            .is_some_and(|interrupted| interrupted.reason == "client_disconnect")
 }
 
 async fn finish_live_direct_chat_after_client_disconnect(
@@ -10494,11 +10847,25 @@ async fn finish_live_direct_chat_after_client_disconnect(
                 &partial,
             )
             .map_err(|err| GatewaySessionError::new(err.message))?;
+        let _ = session
+            .bridge
+            .session_send(
+                &session.transport_peer,
+                &session.invocation.session_id,
+                json!({
+                    "t": "s.close",
+                    "v": 1,
+                    "session_id": session.invocation.session_id,
+                    "reason": "client_disconnect",
+                }),
+            )
+            .await;
+        return Ok(());
     }
     let _ = session
         .bridge
         .session_send(
-            &session.provider,
+            &session.transport_peer,
             &session.invocation.session_id,
             json!({
                 "t": "s.close",
@@ -10508,7 +10875,86 @@ async fn finish_live_direct_chat_after_client_disconnect(
             }),
         )
         .await;
+    if let Some(interrupted) = err.interrupted.take() {
+        if let Some(partial) =
+            wait_for_client_disconnect_provider_receipt(session, *interrupted).await?
+        {
+            let stored = session
+                .state
+                .record_partial_provider_receipt(
+                    &session.model,
+                    &session.request,
+                    &session.invocation,
+                    &partial,
+                )
+                .map_err(|err| GatewaySessionError::new(err.message))?;
+            let _ = send_direct_session_frame_with_peer_reconnect(
+                &mut session.bridge,
+                &session.transport_peer,
+                &session.invocation.session_id,
+                json!({
+                    "t": "s.receipt_ack",
+                    "v": 1,
+                    "session_id": stored.receipt_ack.session_id,
+                    "seq": stored.receipt_ack.seq,
+                    "user_sig": stored.receipt_ack.user_sig,
+                    "reason": "client_disconnect",
+                }),
+                session.invocation.failover.open_timeout(),
+                "sending client-disconnect s.receipt_ack",
+            )
+            .await;
+        }
+    }
     Ok(())
+}
+
+async fn wait_for_client_disconnect_provider_receipt(
+    session: &mut LiveDirectChatSession,
+    interrupted: GatewaySessionInterrupted,
+) -> Result<Option<GatewaySessionPartial>, GatewaySessionError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let frame = match next_session_frame(
+            &mut session.bridge,
+            &session.invocation.session_id,
+            remaining,
+            &["s.receipt", "s.close", "s.error"],
+        )
+        .await
+        {
+            Ok(frame) => frame,
+            Err(err) if err.message.starts_with("timed out waiting") => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        match frame.get("t").and_then(Value::as_str) {
+            Some("s.receipt") => {
+                let receipt = provider_signed_receipt_from_frame(
+                    &frame,
+                    &session.invocation.session_id,
+                    &session.enclave_pubkey,
+                )?;
+                if receipt.body.final_receipt {
+                    continue;
+                }
+                return Ok(Some(GatewaySessionPartial {
+                    output: interrupted.output,
+                    provider_receipt: receipt,
+                    token_ids: interrupted.token_ids,
+                    quality: interrupted.quality,
+                    reason: interrupted.reason,
+                    redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
+                }));
+            }
+            Some("s.close") => return Ok(None),
+            Some("s.error") => return Ok(None),
+            _ => {}
+        }
+    }
 }
 
 async fn recover_live_direct_chat_after_partial(
@@ -10541,7 +10987,7 @@ async fn recover_live_direct_chat_after_partial(
     let _ = session
         .bridge
         .session_send(
-            &session.provider,
+            &session.transport_peer,
             &session.invocation.session_id,
             json!({
                 "t": "s.close",
@@ -10664,20 +11110,32 @@ async fn run_live_direct_chat_sse_inner(
         } else {
             remaining_millis
         };
-        let frame = match next_session_frame(
-            &mut session.bridge,
-            &session.invocation.session_id,
-            Duration::from_millis(wait_millis),
-            &[
-                "s.delta",
-                "s.delta_chunk",
-                "s.receipt",
-                "s.error",
-                "s.close",
-            ],
-        )
-        .await
-        {
+        let frame_result = tokio::select! {
+            _ = tx.closed() => {
+                return Err(client_disconnect_direct_session_error(
+                    &session.request,
+                    &content,
+                    tool_call.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now_millis_u64(),
+                ));
+            }
+            result = next_session_frame(
+                &mut session.bridge,
+                &session.invocation.session_id,
+                Duration::from_millis(wait_millis),
+                &[
+                    "s.delta",
+                    "s.delta_chunk",
+                    "s.receipt",
+                    "s.error",
+                    "s.close",
+                ],
+            ) => result,
+        };
+        let frame = match frame_result {
             Ok(frame) => frame,
             Err(err) if err.message.starts_with("timed out waiting") => {
                 let now = now_millis_u64();
@@ -10685,7 +11143,7 @@ async fn run_live_direct_chat_sse_inner(
                     if watchdog.next_wait_millis(now).is_ok() {
                         send_direct_session_frame_with_peer_reconnect(
                             &mut session.bridge,
-                            &session.provider,
+                            &session.transport_peer,
                             &session.invocation.session_id,
                             ack_frame,
                             session.invocation.failover.open_timeout(),
@@ -10773,6 +11231,7 @@ async fn run_live_direct_chat_sse_inner(
                         .await
                     {
                         return Err(client_disconnect_direct_session_error(
+                            &session.request,
                             &content,
                             tool_call.clone(),
                             latest_checkpoint_receipt.as_ref(),
@@ -10823,6 +11282,7 @@ async fn run_live_direct_chat_sse_inner(
                         .await
                         {
                             return Err(client_disconnect_direct_session_error(
+                                &session.request,
                                 &content,
                                 tool_call.clone(),
                                 latest_checkpoint_receipt.as_ref(),
@@ -11003,7 +11463,7 @@ async fn run_live_direct_chat_sse_inner(
     )?;
     send_direct_session_frame_with_peer_reconnect(
         &mut session.bridge,
-        &session.provider,
+        &session.transport_peer,
         &session.invocation.session_id,
         json!({
             "t": "s.receipt_ack",
@@ -11019,7 +11479,7 @@ async fn run_live_direct_chat_sse_inner(
     let _ = session
         .bridge
         .session_send(
-            &session.provider,
+            &session.transport_peer,
             &session.invocation.session_id,
             json!({
                 "t": "s.close",
@@ -11248,7 +11708,7 @@ async fn send_sse_value(
     tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     value: Value,
 ) -> bool {
-    tx.send(Ok(sse_event_from_value(value))).await.is_ok()
+    send_sse_event(tx, Ok(sse_event_from_value(value))).await
 }
 
 async fn send_sse_error(
@@ -11268,7 +11728,27 @@ async fn send_sse_error(
 }
 
 async fn send_sse_done(tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>) -> bool {
-    tx.send(Ok(Event::default().data("[DONE]"))).await.is_ok()
+    send_sse_event(tx, Ok(Event::default().data("[DONE]"))).await
+}
+
+async fn send_sse_event(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    event: Result<Event, Infallible>,
+) -> bool {
+    tokio::select! {
+        result = tx.send(event) => result.is_ok(),
+        _ = tx.closed() => false,
+        _ = tokio::time::sleep(live_sse_client_backpressure_timeout()) => false,
+    }
+}
+
+fn live_sse_client_backpressure_timeout() -> Duration {
+    std::env::var("MAYHEM_LIVE_SSE_CLIENT_BACKPRESSURE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(LIVE_SSE_CLIENT_BACKPRESSURE_TIMEOUT_MS))
 }
 
 fn sse_event_from_value(value: Value) -> Event {
@@ -11421,7 +11901,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
         model,
         request,
         options.min_att_tier,
-        options.max_price_mu,
+        options.max_price_au,
         options.min_ctx,
         options.quant.as_deref(),
         state.generation_floor_tok_s_for_model(model, options),
@@ -11441,7 +11921,7 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
         model,
         inputs,
         options.min_att_tier,
-        options.max_price_mu,
+        options.max_price_au,
         options.quant.as_deref(),
         state.throughput_floor_for_model(
             model,
@@ -11464,7 +11944,7 @@ fn ordered_route_candidates_for_image_generation_with_options<'a>(
         model,
         request,
         options.min_att_tier,
-        options.max_price_mu,
+        options.max_price_au,
         options.quant.as_deref(),
         state.throughput_floor_for_model(model, options, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S),
         seed,
@@ -11490,7 +11970,7 @@ fn ordered_route_candidates_for_audio_speech_with_options<'a>(
             model,
             request,
             now_millis,
-            options.max_price_mu,
+            options.max_price_au,
             state.throughput_floor_for_model(model, options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
         ),
         now_millis,
@@ -11516,7 +11996,7 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
             model,
             request,
             now_millis,
-            options.max_price_mu,
+            options.max_price_au,
             state.throughput_floor_for_model(model, options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
         ),
         now_millis,
@@ -11582,7 +12062,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     model: &'a GatewayModel,
     request: &ChatCompletionRequest,
     min_att_tier: Option<u8>,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     min_ctx: Option<u32>,
     quant: Option<&str>,
     min_throughput: Option<f64>,
@@ -11604,7 +12084,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
         model,
         request,
         now_millis,
-        max_price_mu,
+        max_price_au,
         min_ctx,
         min_throughput,
     );
@@ -11681,7 +12161,7 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     model: &'a GatewayModel,
     inputs: &[String],
     min_att_tier: Option<u8>,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     quant: Option<&str>,
     min_throughput: Option<f64>,
     seed: u64,
@@ -11702,7 +12182,7 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
         model,
         inputs,
         now_millis,
-        max_price_mu,
+        max_price_au,
         min_throughput,
     );
     let route_by_key = eligible_routes
@@ -11778,7 +12258,7 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
     model: &'a GatewayModel,
     request: &ImageGenerationRequest,
     min_att_tier: Option<u8>,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     quant: Option<&str>,
     min_throughput: Option<f64>,
     seed: u64,
@@ -11799,7 +12279,7 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
         model,
         request,
         now_millis,
-        max_price_mu,
+        max_price_au,
         min_throughput,
     );
     let route_by_key = eligible_routes
@@ -12007,6 +12487,20 @@ impl GatewayState {
             .unwrap_or_else(|| route_caps_ctx(model, route))
     }
 
+    fn transport_peer_for_route(&self, route: Option<&GatewayRouteCandidate>) -> Option<String> {
+        let route = route?;
+        let key = route_key(route);
+        self.provider_table
+            .lock()
+            .expect("provider table poisoned")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.heartbeat)
+            .and_then(|heartbeat| heartbeat.transport_peer)
+            .filter(|transport_peer| is_hex_len(transport_peer, 64))
+    }
+
     fn ctx_bracket_terms_for_served_ctx(
         &self,
         served_ctx: u32,
@@ -12020,6 +12514,20 @@ impl GatewayState {
                 )
             },
         )
+    }
+
+    fn ctx_bracket_terms_for_model_served_ctx(
+        &self,
+        model: &GatewayModel,
+        served_ctx: u32,
+        at: u64,
+    ) -> Result<(Option<String>, Option<u32>), ApiError> {
+        if model.mayhem.model_class != DEFAULT_MODEL_CLASS {
+            return Ok((None, None));
+        }
+        let (ctx_bracket, ctx_bracket_table_ver) =
+            self.ctx_bracket_terms_for_served_ctx(served_ctx, at)?;
+        Ok((Some(ctx_bracket), Some(ctx_bracket_table_ver)))
     }
 
     fn apply_chat_affinity<'a>(
@@ -12142,7 +12650,7 @@ fn request_requirements_for_chat(
     _model: &GatewayModel,
     request: &ChatCompletionRequest,
     now_millis: u64,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     explicit_min_ctx: Option<u32>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
@@ -12163,9 +12671,10 @@ fn request_requirements_for_chat(
         min_ctx: explicit_min_ctx.unwrap_or(0).max(prompt_min_ctx),
         input_tokens,
         output_tokens,
+        usage: ReceiptUsage::text(input_tokens, output_tokens),
         min_throughput,
         now_millis,
-        max_price_mu,
+        max_price_au,
         ..RequestRequirements::default()
     }
 }
@@ -12175,7 +12684,7 @@ fn request_requirements_for_embedding(
     _model: &GatewayModel,
     inputs: &[String],
     now_millis: u64,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = embedding_input_token_count(inputs);
@@ -12187,9 +12696,10 @@ fn request_requirements_for_embedding(
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
+        usage: ReceiptUsage::text(input_tokens, 0),
         min_throughput,
         now_millis,
-        max_price_mu,
+        max_price_au,
         ..RequestRequirements::default()
     }
 }
@@ -12199,7 +12709,7 @@ fn request_requirements_for_image_generation(
     _model: &GatewayModel,
     request: &ImageGenerationRequest,
     now_millis: u64,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
@@ -12211,9 +12721,10 @@ fn request_requirements_for_image_generation(
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
+        usage: image_generation_usage_for_request(request),
         min_throughput,
         now_millis,
-        max_price_mu,
+        max_price_au,
         ..RequestRequirements::default()
     }
 }
@@ -12223,7 +12734,7 @@ fn request_requirements_for_audio_speech(
     _model: &GatewayModel,
     request: &AudioSpeechRequest,
     now_millis: u64,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.input);
@@ -12235,9 +12746,10 @@ fn request_requirements_for_audio_speech(
         min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
         input_tokens,
         output_tokens: 0,
+        usage: audio_speech_usage_for_request(request),
         min_throughput,
         now_millis,
-        max_price_mu,
+        max_price_au,
         ..RequestRequirements::default()
     }
 }
@@ -12247,7 +12759,7 @@ fn request_requirements_for_audio_transcription(
     _model: &GatewayModel,
     request: &AudioTranscriptionRequest,
     now_millis: u64,
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     RequestRequirements {
@@ -12258,9 +12770,10 @@ fn request_requirements_for_audio_transcription(
         min_ctx: 1,
         input_tokens: audio_transcription_seconds(request),
         output_tokens: 0,
+        usage: audio_transcription_usage_for_request(request),
         min_throughput,
         now_millis,
-        max_price_mu,
+        max_price_au,
         ..RequestRequirements::default()
     }
 }
@@ -13335,6 +13848,22 @@ impl GatewayCanaryScheduler {
 }
 
 impl GatewayState {
+    fn receipt_checkpoint_every_for_request(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> CheckpointPolicy {
+        let mut checkpoint_every = self.receipt_config.checkpoint_every.clone();
+        if request.stream {
+            let live_tokens = std::env::var("MAYHEM_LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS);
+            checkpoint_every.tokens = checkpoint_every.tokens.min(live_tokens).max(1);
+        }
+        checkpoint_every
+    }
+
     async fn maybe_run_canary_probe_after_session(
         &self,
         model: &GatewayModel,
@@ -13724,7 +14253,7 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price = route_price_ref_mu(model, route);
+        let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
@@ -13749,33 +14278,34 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_max_spend_mu(price, request, &prompt_text);
-        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
-        if max_spend_mu > self.receipt_config.balance_mu {
+        let max_spend_au = estimate_max_spend_au(price, request, &prompt_text);
+        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        if max_spend_au > self.receipt_config.balance_au {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
             ));
         }
         self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
+            .ensure_budget_allows(&options.access_token, max_spend_au)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
-            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
+            self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
+        let checkpoint_every = self.receipt_checkpoint_every_for_request(request);
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: price.per_req_mu,
-            locked_min_session_mu: price.min_session_mu,
+            locked_per_req_au: price.per_req_au,
+            locked_min_session_au: price.min_session_au,
             served_ctx,
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
-            max_spend_mu,
-            checkpoint_every: self.receipt_config.checkpoint_every.clone(),
+            max_spend_au,
+            checkpoint_every,
         };
         let voucher_payload =
             spend_voucher_signing_bytes(&voucher_body).map_err(ApiError::internal)?;
@@ -13785,6 +14315,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            transport_peer: self.transport_peer_for_route(route),
             enclave_id,
             price_ver,
             opened_at,
@@ -13822,7 +14353,7 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price = route_price_ref_mu(model, route);
+        let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
@@ -13847,32 +14378,32 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_embedding_max_spend_mu(price, inputs);
-        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
-        if max_spend_mu > self.receipt_config.balance_mu {
+        let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
+        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        if max_spend_au > self.receipt_config.balance_au {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
             ));
         }
         self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
+            .ensure_budget_allows(&options.access_token, max_spend_au)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
-            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
+            self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: price.per_req_mu,
-            locked_min_session_mu: price.min_session_mu,
+            locked_per_req_au: price.per_req_au,
+            locked_min_session_au: price.min_session_au,
             served_ctx,
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
-            max_spend_mu,
+            max_spend_au,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
         let voucher_payload =
@@ -13883,6 +14414,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            transport_peer: self.transport_peer_for_route(route),
             enclave_id,
             price_ver,
             opened_at,
@@ -13920,7 +14452,7 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price = route_price_ref_mu(model, route);
+        let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
@@ -13945,32 +14477,32 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_image_generation_max_spend_mu(price, request);
-        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
-        if max_spend_mu > self.receipt_config.balance_mu {
+        let max_spend_au = estimate_image_generation_max_spend_au(price, request);
+        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        if max_spend_au > self.receipt_config.balance_au {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
             ));
         }
         self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
+            .ensure_budget_allows(&options.access_token, max_spend_au)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
-            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
+            self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: price.per_req_mu,
-            locked_min_session_mu: price.min_session_mu,
+            locked_per_req_au: price.per_req_au,
+            locked_min_session_au: price.min_session_au,
             served_ctx,
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
-            max_spend_mu,
+            max_spend_au,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
         let voucher_payload =
@@ -13981,6 +14513,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            transport_peer: self.transport_peer_for_route(route),
             enclave_id,
             price_ver,
             opened_at,
@@ -14018,7 +14551,7 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price = route_price_ref_mu(model, route);
+        let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
@@ -14043,32 +14576,32 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_audio_speech_max_spend_mu(price, request);
-        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
-        if max_spend_mu > self.receipt_config.balance_mu {
+        let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
+        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        if max_spend_au > self.receipt_config.balance_au {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
             ));
         }
         self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
+            .ensure_budget_allows(&options.access_token, max_spend_au)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
-            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
+            self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: price.per_req_mu,
-            locked_min_session_mu: price.min_session_mu,
+            locked_per_req_au: price.per_req_au,
+            locked_min_session_au: price.min_session_au,
             served_ctx,
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
-            max_spend_mu,
+            max_spend_au,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
         let voucher_payload =
@@ -14079,6 +14612,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            transport_peer: self.transport_peer_for_route(route),
             enclave_id,
             price_ver,
             opened_at,
@@ -14116,7 +14650,7 @@ impl GatewayState {
         let enclave_id = route
             .map(|candidate| candidate.enclave_id.clone())
             .unwrap_or_else(|| enclave_id_for_model(&model.id));
-        let price = route_price_ref_mu(model, route);
+        let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
         let attestation = route.map(|candidate| GatewaySessionAttestation {
@@ -14141,32 +14675,32 @@ impl GatewayState {
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
         });
-        let max_spend_mu = estimate_audio_transcription_max_spend_mu(price, request);
-        ensure_max_price_allows(max_spend_mu, options.max_price_mu)?;
-        if max_spend_mu > self.receipt_config.balance_mu {
+        let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
+        ensure_max_price_allows(max_spend_au, options.max_price_au)?;
+        if max_spend_au > self.receipt_config.balance_au {
             return Err(ApiError::payment_required(
                 "insufficient local balance for spend voucher",
                 Some("model"),
             ));
         }
         self.access_control
-            .ensure_budget_allows(&options.access_token, max_spend_mu)?;
+            .ensure_budget_allows(&options.access_token, max_spend_au)?;
         let opened_at = now_secs();
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
-            self.ctx_bracket_terms_for_served_ctx(served_ctx, opened_at)?;
+            self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
             session_id: session_id.clone(),
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
             locked_rate_map: locked_rate_map.clone(),
-            locked_per_req_mu: price.per_req_mu,
-            locked_min_session_mu: price.min_session_mu,
+            locked_per_req_au: price.per_req_au,
+            locked_min_session_au: price.min_session_au,
             served_ctx,
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
-            max_spend_mu,
+            max_spend_au,
             checkpoint_every: self.receipt_config.checkpoint_every.clone(),
         };
         let voucher_payload =
@@ -14177,6 +14711,7 @@ impl GatewayState {
             rail: self.receipt_config.rail.clone(),
             user_pubkey: verifying_key_hex(&self.receipt_config.user_seed),
             provider_pubkey: route.map(|candidate| candidate.provider.clone()),
+            transport_peer: self.transport_peer_for_route(route),
             enclave_id,
             price_ver,
             opened_at,
@@ -14272,8 +14807,8 @@ impl GatewayState {
                 &invocation.spend_voucher.body.locked_rate_map,
             )
             .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
-            let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-            if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+            if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
                 return Err(ApiError::payment_required(
                     "session usage exceeded signed spend voucher",
                     Some("model"),
@@ -14288,15 +14823,15 @@ impl GatewayState {
                     seq,
                     final_receipt: true,
                     usage: usage.clone(),
-                    mu_owed_cum,
+                    au_owed_cum,
                     prompt_hash: blake3_hex(prompt_text.as_bytes()),
                 },
             )?
         } else {
             let usage =
                 ReceiptUsage::text(output.usage.prompt_tokens, output.usage.completion_tokens);
-            let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-            if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+            let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+            if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
                 return Err(ApiError::payment_required(
                     "session usage exceeded signed spend voucher",
                     Some("model"),
@@ -14314,14 +14849,14 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+                locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
-                mu_owed_cum,
+                au_owed_cum,
                 prompt_hash: blake3_hex(prompt_text.as_bytes()),
                 ts: now_millis_u64(),
             };
@@ -14359,8 +14894,8 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
-        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+        let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -14392,7 +14927,7 @@ impl GatewayState {
                     seq: 1,
                     final_receipt: true,
                     usage: usage.clone(),
-                    mu_owed_cum,
+                    au_owed_cum,
                     prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
                 },
             )?
@@ -14409,14 +14944,14 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+                locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
-                mu_owed_cum,
+                au_owed_cum,
                 prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
                 ts: now_millis_u64(),
             };
@@ -14454,8 +14989,8 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
-        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+        let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -14487,7 +15022,7 @@ impl GatewayState {
                     seq: 1,
                     final_receipt: true,
                     usage: usage.clone(),
-                    mu_owed_cum,
+                    au_owed_cum,
                     prompt_hash: image_generation_prompt_hash(request),
                 },
             )?
@@ -14504,14 +15039,14 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+                locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
-                mu_owed_cum,
+                au_owed_cum,
                 prompt_hash: image_generation_prompt_hash(request),
                 ts: now_millis_u64(),
             };
@@ -14566,8 +15101,8 @@ impl GatewayState {
             partial.output.usage.prompt_tokens,
             partial.output.usage.completion_tokens,
         );
-        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+        let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
             return Err(ApiError::payment_required(
                 "provider partial receipt exceeds signed spend voucher",
                 Some("model"),
@@ -14581,7 +15116,7 @@ impl GatewayState {
                 provider: &provider,
                 seq: body.seq,
                 final_receipt: false,
-                mu_owed_cum,
+                au_owed_cum,
                 usage,
                 prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
             },
@@ -14611,8 +15146,8 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
-        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+        let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -14644,7 +15179,7 @@ impl GatewayState {
                     seq: 1,
                     final_receipt: true,
                     usage: usage.clone(),
-                    mu_owed_cum,
+                    au_owed_cum,
                     prompt_hash: audio_speech_prompt_hash(request),
                 },
             )?
@@ -14661,14 +15196,14 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+                locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
-                mu_owed_cum,
+                au_owed_cum,
                 prompt_hash: audio_speech_prompt_hash(request),
                 ts: now_millis_u64(),
             };
@@ -14706,8 +15241,8 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = output.usage.clone();
-        let mu_owed_cum = calculate_locked_mu_owed(invocation, &usage);
-        if mu_owed_cum > invocation.spend_voucher.body.max_spend_mu {
+        let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
+        if au_owed_cum > invocation.spend_voucher.body.max_spend_au {
             return Err(ApiError::payment_required(
                 "session usage exceeded signed spend voucher",
                 Some("model"),
@@ -14739,7 +15274,7 @@ impl GatewayState {
                     seq: 1,
                     final_receipt: true,
                     usage: usage.clone(),
-                    mu_owed_cum,
+                    au_owed_cum,
                     prompt_hash: audio_transcription_prompt_hash(request),
                 },
             )?
@@ -14756,14 +15291,14 @@ impl GatewayState {
                 model_id: model.id.clone(),
                 price_ver: invocation.price_ver,
                 locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-                locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-                locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+                locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+                locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
                 usage,
-                mu_owed_cum,
+                au_owed_cum,
                 prompt_hash: audio_transcription_prompt_hash(request),
                 ts: now_millis_u64(),
             };
@@ -15211,8 +15746,8 @@ fn hedge_invocation_for_model(
     };
     let failover_state = SessionFailoverState::new(
         policy,
-        SessionPriceMu {
-            rate_map: model.mayhem.price_ref_mu.rate_map.clone(),
+        SessionPriceAu {
+            rate_map: model.mayhem.price_ref_au.rate_map.clone(),
         },
         0,
         0,
@@ -15523,7 +16058,7 @@ fn receipt_summary(receipt: &StoredReceipt) -> Value {
         "session_id": receipt.receipt.body.session_id,
         "seq": receipt.receipt.body.seq,
         "final": receipt.receipt.body.final_receipt,
-        "mu_owed_cum": receipt.receipt.body.mu_owed_cum,
+        "au_owed_cum": receipt.receipt.body.au_owed_cum,
         "prompt_hash": receipt.receipt.body.prompt_hash,
         "receipt_ack": receipt.receipt_ack,
         "access_token": receipt.access_token,
@@ -15561,7 +16096,7 @@ fn sse_stream_response(events: SseEventStream) -> Response {
 fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel> {
     let id = model.get("model_id")?.as_str()?.to_owned();
     let caps = model.get("caps").unwrap_or(&Value::Null);
-    let price = model.get("price_ref_mu").unwrap_or(&Value::Null);
+    let price = model.get("price_ref_au").unwrap_or(&Value::Null);
     let rate_map = price_rate_map_from_catalog_value(price);
     let tiers = attestation_tiers_from_catalog_value(model);
     Some(GatewayModel {
@@ -15576,11 +16111,11 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                 .to_owned(),
             providers_online: 0,
             rooms: 0,
-            price_ref_mu: PriceRefMu {
+            price_ref_au: PriceRefAu {
                 denom: price
                     .get("denom")
                     .and_then(Value::as_str)
-                    .unwrap_or("mu_usd")
+                    .unwrap_or("au_usd")
                     .to_owned(),
                 ver: price
                     .get("ver")
@@ -15588,10 +16123,10 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .and_then(Value::as_u64)
                     .unwrap_or(1),
                 rate_map,
-                per_req_mu: price.get("per_req_mu").and_then(Value::as_u64).unwrap_or(0),
-                min_session_mu: price
-                    .get("min_session_mu")
-                    .and_then(Value::as_u64)
+                per_req_au: price.get("per_req_au").and_then(value_as_money_au).unwrap_or(0),
+                min_session_au: price
+                    .get("min_session_au")
+                    .and_then(value_as_money_au)
                     .unwrap_or(0),
                 derivation: price_derivation_from_catalog_value(price),
                 history: price_history_from_catalog_value(price),
@@ -15680,7 +16215,7 @@ fn price_rate_map_from_catalog_value(price: &Value) -> Vec<RateMapEntry> {
             .filter_map(|entry| {
                 Some(RateMapEntry {
                     unit: entry.get("unit")?.as_str()?.to_owned(),
-                    per_unit_mu: entry.get("per_unit_mu")?.as_u64()?,
+                    per_unit_au: entry.get("per_unit_au").and_then(value_as_money_au)?,
                     granularity: entry.get("granularity")?.as_u64()?,
                 })
             })
@@ -15691,8 +16226,14 @@ fn price_rate_map_from_catalog_value(price: &Value) -> Vec<RateMapEntry> {
     }
 
     text_generation_rate_map(
-        price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
-        price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
+        price
+            .get("in_per_1k")
+            .and_then(value_as_money_au)
+            .unwrap_or(0),
+        price
+            .get("out_per_1k")
+            .and_then(value_as_money_au)
+            .unwrap_or(0),
     )
 }
 
@@ -15915,33 +16456,33 @@ fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiE
     })
 }
 
-fn route_price_ref_mu<'a>(
+fn route_price_ref_au<'a>(
     model: &'a GatewayModel,
     route: Option<&'a GatewayRouteCandidate>,
-) -> &'a PriceRefMu {
+) -> &'a PriceRefAu {
     route
-        .and_then(|candidate| candidate.price_ref_mu.as_ref())
-        .unwrap_or(&model.mayhem.price_ref_mu)
+        .and_then(|candidate| candidate.price_ref_au.as_ref())
+        .unwrap_or(&model.mayhem.price_ref_au)
 }
 
-fn session_locked_rate_map(price: &PriceRefMu) -> Vec<RateMapEntry> {
+fn session_locked_rate_map(price: &PriceRefAu) -> Vec<RateMapEntry> {
     normalize_rate_map(price.rate_map.clone())
 }
 
-fn calculate_locked_mu_owed(invocation: &GatewaySessionInvocation, usage: &ReceiptUsage) -> u64 {
-    priced_usage_mu(
+fn calculate_locked_au_owed(invocation: &GatewaySessionInvocation, usage: &ReceiptUsage) -> MoneyAu {
+    priced_usage_au(
         &invocation.spend_voucher.body.locked_rate_map,
-        invocation.spend_voucher.body.locked_per_req_mu,
-        invocation.spend_voucher.body.locked_min_session_mu,
+        invocation.spend_voucher.body.locked_per_req_au,
+        invocation.spend_voucher.body.locked_min_session_au,
         usage,
     )
 }
 
-fn calculate_mu_owed(price: &PriceRefMu, usage: &ReceiptUsage) -> u64 {
-    priced_usage_mu(
+fn calculate_au_owed(price: &PriceRefAu, usage: &ReceiptUsage) -> MoneyAu {
+    priced_usage_au(
         &price.rate_map,
-        price.per_req_mu,
-        price.min_session_mu,
+        price.per_req_au,
+        price.min_session_au,
         usage,
     )
 }
@@ -16554,39 +17095,39 @@ fn embedding_response_value(embedding: &[f32], encoding_format: &str) -> Value {
     }
 }
 
-fn estimate_max_spend_mu(
-    price: &PriceRefMu,
+fn estimate_max_spend_au(
+    price: &PriceRefAu,
     request: &ChatCompletionRequest,
     prompt_text: &str,
-) -> u64 {
+) -> MoneyAu {
     let usage = ReceiptUsage::text(
         rough_tokens(prompt_text),
         u64::from(request.max_tokens.unwrap_or(1024).max(1)),
     );
-    calculate_mu_owed(price, &usage).max(1_000)
+    calculate_au_owed(price, &usage).max(1_000)
 }
 
-fn estimate_embedding_max_spend_mu(price: &PriceRefMu, inputs: &[String]) -> u64 {
+fn estimate_embedding_max_spend_au(price: &PriceRefAu, inputs: &[String]) -> MoneyAu {
     let usage = ReceiptUsage::text(embedding_input_token_count(inputs), 0);
-    calculate_mu_owed(price, &usage).max(1_000)
+    calculate_au_owed(price, &usage).max(1_000)
 }
 
-fn estimate_image_generation_max_spend_mu(
-    price: &PriceRefMu,
+fn estimate_image_generation_max_spend_au(
+    price: &PriceRefAu,
     request: &ImageGenerationRequest,
-) -> u64 {
-    calculate_mu_owed(price, &image_generation_usage_for_request(request)).max(1_000)
+) -> MoneyAu {
+    calculate_au_owed(price, &image_generation_usage_for_request(request)).max(1_000)
 }
 
-fn estimate_audio_speech_max_spend_mu(price: &PriceRefMu, request: &AudioSpeechRequest) -> u64 {
-    calculate_mu_owed(price, &audio_speech_usage_for_request(request)).max(1_000)
+fn estimate_audio_speech_max_spend_au(price: &PriceRefAu, request: &AudioSpeechRequest) -> MoneyAu {
+    calculate_au_owed(price, &audio_speech_usage_for_request(request)).max(1_000)
 }
 
-fn estimate_audio_transcription_max_spend_mu(
-    price: &PriceRefMu,
+fn estimate_audio_transcription_max_spend_au(
+    price: &PriceRefAu,
     request: &AudioTranscriptionRequest,
-) -> u64 {
-    calculate_mu_owed(price, &audio_transcription_usage_for_request(request)).max(1_000)
+) -> MoneyAu {
+    calculate_au_owed(price, &audio_transcription_usage_for_request(request)).max(1_000)
 }
 
 fn rough_tokens(text: &str) -> u64 {
@@ -16748,6 +17289,36 @@ mod tests {
         assert_eq!(config.open_timeout, Duration::from_secs(10));
         assert_eq!(config.ttft_timeout, Duration::from_secs(30));
         assert_eq!(config.frame_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn canary_cadence_audit_stays_inside_new_provider_holdback_window() {
+        let default_policy = GatewayCanaryProbePolicy::default();
+        assert_eq!(
+            default_policy.audit_against_new_provider_holdback(168),
+            GatewayCanaryHoldbackCadenceAudit {
+                enabled: true,
+                max_interval_sessions: 89,
+                new_provider_holdback_epochs: 168,
+                compliant: true,
+            }
+        );
+
+        let mut loose_policy = default_policy;
+        loose_policy.max_interval_sessions = 169;
+        assert!(
+            !loose_policy
+                .audit_against_new_provider_holdback(168)
+                .compliant
+        );
+
+        let mut disabled_policy = default_policy;
+        disabled_policy.enabled = false;
+        assert!(
+            !disabled_policy
+                .audit_against_new_provider_holdback(168)
+                .compliant
+        );
     }
 
     #[test]
@@ -16993,7 +17564,7 @@ mod tests {
         let user_seed = [12_u8; 32];
         let state = GatewayState::from_models(vec![model.clone()])
             .with_receipt_user_seed(user_seed)
-            .with_receipt_balance_mu(2_000_000)
+            .with_receipt_balance_au(2_000_000)
             .with_receipt_rail("tnk");
         let invocation = state
             .prepare_chat_invocation_for_route(
@@ -17010,7 +17581,7 @@ mod tests {
 
         let checkpointed = GatewayState::from_models(vec![model.clone()])
             .with_receipt_user_seed(user_seed)
-            .with_receipt_balance_mu(2_000_000)
+            .with_receipt_balance_au(2_000_000)
             .with_receipt_checkpoint_every(CheckpointPolicy {
                 tokens: 32,
                 ms: 2500,
@@ -17025,9 +17596,38 @@ mod tests {
         assert_eq!(checkpointed.spend_voucher.body.checkpoint_every.tokens, 32);
         assert_eq!(checkpointed.spend_voucher.body.checkpoint_every.ms, 2500);
 
+        let mut stream_request = request.clone();
+        stream_request.stream = true;
+        let stream_checkpointed = GatewayState::from_models(vec![model.clone()])
+            .with_receipt_user_seed(user_seed)
+            .with_receipt_balance_au(2_000_000)
+            .with_receipt_checkpoint_every(CheckpointPolicy {
+                tokens: 32,
+                ms: 2500,
+            })
+            .prepare_chat_invocation_for_route(
+                &model,
+                &stream_request,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("stream checkpoint policy should be accepted");
+        assert_eq!(
+            stream_checkpointed
+                .spend_voucher
+                .body
+                .checkpoint_every
+                .tokens,
+            LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS
+        );
+        assert_eq!(
+            stream_checkpointed.spend_voucher.body.checkpoint_every.ms,
+            2500
+        );
+
         let low_balance = GatewayState::from_models(vec![model.clone()])
             .with_receipt_user_seed(user_seed)
-            .with_receipt_balance_mu(1);
+            .with_receipt_balance_au(1);
         let err = low_balance
             .prepare_chat_invocation_for_route(
                 &model,
@@ -17039,13 +17639,13 @@ mod tests {
         assert!(err.message.contains("insufficient local balance"));
 
         let max_bid = GatewayRequestOptions {
-            max_price_mu: Some(999),
+            max_price_au: Some(999),
             ..GatewayRequestOptions::default()
         };
         let err = state
             .prepare_chat_invocation_for_route(&model, &request, None, &max_bid)
             .expect_err("gateway rejects quotes above the user max-bid");
-        assert_eq!(err.param, Some("X-Mayhem-Max-Price-Mu"));
+        assert_eq!(err.param, Some("X-Mayhem-Max-Price-Au"));
     }
 
     #[test]
@@ -17082,11 +17682,39 @@ mod tests {
             .expect("invocation uses custom context table");
 
         assert_eq!(invocation.served_ctx, 12_000);
-        assert_eq!(invocation.ctx_bracket, "le16k");
-        assert_eq!(invocation.ctx_bracket_table_ver, 2);
+        assert_eq!(invocation.ctx_bracket.as_deref(), Some("le16k"));
+        assert_eq!(invocation.ctx_bracket_table_ver, Some(2));
         assert!(invocation.opened_at > 0);
-        assert_eq!(invocation.spend_voucher.body.ctx_bracket, "le16k");
-        assert_eq!(invocation.spend_voucher.body.ctx_bracket_table_ver, 2);
+        assert_eq!(
+            invocation.spend_voucher.body.ctx_bracket.as_deref(),
+            Some("le16k")
+        );
+        assert_eq!(invocation.spend_voucher.body.ctx_bracket_table_ver, Some(2));
+    }
+
+    #[test]
+    fn non_text_spend_voucher_omits_ctx_bracket_terms() {
+        let mut model = test_model();
+        model.mayhem.model_class = "embedding".to_owned();
+        model.mayhem.price_ref_au.rate_map = vec![RateMapEntry {
+            unit: "input_token".to_owned(),
+            per_unit_au: 2,
+            granularity: 1000,
+        }];
+        let inputs = vec!["alpha".to_owned(), "beta".to_owned()];
+        let invocation = GatewayState::from_models(vec![model.clone()])
+            .prepare_embedding_invocation_for_route(
+                &model,
+                &inputs,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("embedding invocation omits context market");
+
+        assert_eq!(invocation.ctx_bracket, None);
+        assert_eq!(invocation.ctx_bracket_table_ver, None);
+        assert_eq!(invocation.spend_voucher.body.ctx_bracket, None);
+        assert_eq!(invocation.spend_voucher.body.ctx_bracket_table_ver, None);
     }
 
     #[test]
@@ -17115,7 +17743,7 @@ mod tests {
     fn request_failover_headers_parse_and_reject_invalid_values() {
         let mut headers = HeaderMap::new();
         headers.insert("x-mayhem-min-tok-s", HeaderValue::from_static("17.5"));
-        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
+        headers.insert("x-mayhem-max-price-au", HeaderValue::from_static("1234"));
         headers.insert("x-mayhem-max-wait-ms", HeaderValue::from_static("0"));
         headers.insert("x-mayhem-quant", HeaderValue::from_static("Q4_K_M"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("headers parse");
@@ -17123,7 +17751,7 @@ mod tests {
         assert_eq!(options.failover_overrides.ttft_timeout_ms, None);
         assert_eq!(options.failover_overrides.stall_timeout_ms, None);
         assert_eq!(options.failover_overrides.min_tok_s, Some(17.5));
-        assert_eq!(options.max_price_mu, Some(1_234));
+        assert_eq!(options.max_price_au, Some(1_234));
         assert_eq!(options.max_wait_ms, 0);
         assert_eq!(options.quant.as_deref(), Some("int4"));
 
@@ -17134,11 +17762,11 @@ mod tests {
         assert!(err.message.contains("admin catalog controlled"));
         headers.remove("x-mayhem-open-timeout-ms");
 
-        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("0"));
+        headers.insert("x-mayhem-max-price-au", HeaderValue::from_static("0"));
         let err =
             GatewayRequestOptions::from_headers(&headers).expect_err("zero max price rejects");
-        assert_eq!(err.param, Some("X-Mayhem-Max-Price-Mu"));
-        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
+        assert_eq!(err.param, Some("X-Mayhem-Max-Price-Au"));
+        headers.insert("x-mayhem-max-price-au", HeaderValue::from_static("1234"));
 
         headers.insert("x-mayhem-max-wait-ms", HeaderValue::from_static("60001"));
         let err = GatewayRequestOptions::from_headers(&headers).expect_err("too-long wait rejects");
@@ -17158,22 +17786,22 @@ mod tests {
     #[test]
     fn gateway_default_max_price_applies_when_header_is_absent() {
         let state = GatewayState::from_models(vec![test_model()])
-            .with_default_max_price_mu(Some(777))
+            .with_default_max_price_au(Some(777))
             .with_default_max_wait_ms(Some(3_000));
         let headers = HeaderMap::new();
         let options = state
             .request_options_from_headers(&headers)
             .expect("empty headers parse");
-        assert_eq!(options.max_price_mu, Some(777));
+        assert_eq!(options.max_price_au, Some(777));
         assert_eq!(options.max_wait_ms, 3_000);
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-mayhem-max-price-mu", HeaderValue::from_static("1234"));
+        headers.insert("x-mayhem-max-price-au", HeaderValue::from_static("1234"));
         headers.insert("x-mayhem-max-wait-ms", HeaderValue::from_static("0"));
         let options = state
             .request_options_from_headers(&headers)
             .expect("headers parse");
-        assert_eq!(options.max_price_mu, Some(1_234));
+        assert_eq!(options.max_price_au, Some(1_234));
         assert_eq!(options.max_wait_ms, 0);
     }
 
@@ -17200,10 +17828,10 @@ mod tests {
                 token_id: "tok_test".to_owned(),
                 created_at: 1,
                 expires_at: None,
-                budget_mu: None,
+                budget_au: None,
                 budget_period: None,
-                spent_total_mu: 0,
-                spent_period_mu: 0,
+                spent_total_au: 0,
+                spent_period_au: 0,
                 period_started_at: Some(1),
                 max_rate_per_minute: Some(1),
                 models: vec!["mayhem/dev-chat-tools".to_owned()],
@@ -17283,10 +17911,10 @@ mod tests {
             token_id: "tok_rejected".to_owned(),
             created_at: 1,
             expires_at: None,
-            budget_mu: None,
+            budget_au: None,
             budget_period: None,
-            spent_total_mu: 0,
-            spent_period_mu: 0,
+            spent_total_au: 0,
+            spent_period_au: 0,
             period_started_at: Some(1),
             max_rate_per_minute: None,
             models: Vec::new(),
@@ -17309,9 +17937,9 @@ mod tests {
         );
         assert_eq!(
             rejected_token(GatewayTokenRecord {
-                budget_mu: Some(7),
+                budget_au: Some(7),
                 budget_period: Some(GatewayTokenBudgetPeriod::Total),
-                spent_total_mu: 7,
+                spent_total_au: 7,
                 ..base
             }),
             StatusCode::PAYMENT_REQUIRED
@@ -17335,10 +17963,10 @@ mod tests {
                 token_id: access_token.token_id.clone(),
                 created_at: 1,
                 expires_at: None,
-                budget_mu: Some(1_000_000),
+                budget_au: Some(1_000_000),
                 budget_period: Some(GatewayTokenBudgetPeriod::Total),
-                spent_total_mu: 0,
-                spent_period_mu: 0,
+                spent_total_au: 0,
+                spent_period_au: 0,
                 period_started_at: Some(1),
                 max_rate_per_minute: None,
                 models: Vec::new(),
@@ -17355,15 +17983,23 @@ mod tests {
             .meter_chat_session(&model, &request, &output, &invocation, None)
             .expect("metering succeeds");
         let access = state.access_summary();
-        let spent = access["tokens"][0]["spent_total_mu"].as_u64().unwrap();
-        assert_eq!(spent, stored.receipt.body.mu_owed_cum);
+        let spent = access["tokens"][0]["spent_total_au"]
+            .as_str()
+            .unwrap()
+            .parse::<u128>()
+            .unwrap();
+        assert_eq!(spent, stored.receipt.body.au_owed_cum);
 
         state
             .record_receipt(stored.clone())
             .expect("duplicate cumulative receipt is accepted");
         let access = state.access_summary();
         assert_eq!(
-            access["tokens"][0]["spent_total_mu"].as_u64().unwrap(),
+            access["tokens"][0]["spent_total_au"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap(),
             spent
         );
     }
@@ -17599,8 +18235,8 @@ mod tests {
         let mut cached_receipt =
             test_provider_receipt(&model, &request, &cached_output, &invocation);
         cached_receipt.body.usage = ReceiptUsage::text_with_cached(500, 500, 0);
-        cached_receipt.body.mu_owed_cum =
-            calculate_locked_mu_owed(&invocation, &cached_receipt.body.usage);
+        cached_receipt.body.au_owed_cum =
+            calculate_locked_au_owed(&invocation, &cached_receipt.body.usage);
         cached_receipt.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&cached_receipt.body).unwrap(),
@@ -17623,12 +18259,12 @@ mod tests {
             500
         );
         assert_eq!(cached_stored.receipt.body.usage.prompt_tokens(), 1_000);
-        assert_eq!(cached_stored.receipt.body.mu_owed_cum, 13);
+        assert_eq!(cached_stored.receipt.body.au_owed_cum, 13);
 
         let mut false_cache = cached_receipt.clone();
         false_cache.body.usage = ReceiptUsage::text_with_cached(100, 500, 0);
-        false_cache.body.mu_owed_cum =
-            calculate_locked_mu_owed(&invocation, &false_cache.body.usage);
+        false_cache.body.au_owed_cum =
+            calculate_locked_au_owed(&invocation, &false_cache.body.usage);
         false_cache.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&false_cache.body).unwrap(),
@@ -17645,7 +18281,7 @@ mod tests {
         assert!(err.message.contains("cached prompt usage mismatch"));
 
         let mut wrong_amount = provider_receipt.clone();
-        wrong_amount.body.mu_owed_cum = wrong_amount.body.mu_owed_cum.saturating_add(1);
+        wrong_amount.body.au_owed_cum = wrong_amount.body.au_owed_cum.saturating_add(1);
         wrong_amount.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&wrong_amount.body).unwrap(),
@@ -17660,8 +18296,8 @@ mod tests {
             output.usage.prompt_tokens,
             output.usage.completion_tokens.saturating_add(1),
         );
-        wrong_usage.body.mu_owed_cum =
-            calculate_locked_mu_owed(&invocation, &wrong_usage.body.usage);
+        wrong_usage.body.au_owed_cum =
+            calculate_locked_au_owed(&invocation, &wrong_usage.body.usage);
         wrong_usage.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&wrong_usage.body).unwrap(),
@@ -17720,8 +18356,8 @@ mod tests {
             output.usage.prompt_tokens,
             output.usage.completion_tokens.saturating_add(1),
         );
-        inflated.provider_receipt.body.mu_owed_cum =
-            calculate_locked_mu_owed(&invocation, &inflated.provider_receipt.body.usage);
+        inflated.provider_receipt.body.au_owed_cum =
+            calculate_locked_au_owed(&invocation, &inflated.provider_receipt.body.usage);
         inflated.provider_receipt.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&inflated.provider_receipt.body).unwrap(),
@@ -17755,6 +18391,7 @@ mod tests {
         watchdog.record_delta(1_100);
 
         let err = client_disconnect_direct_session_error(
+            &request,
             output.content.as_deref().unwrap(),
             None,
             Some(&provider_receipt),
@@ -17774,6 +18411,48 @@ mod tests {
         assert_eq!(partial.token_ids, vec![1, 2, 3]);
         assert_eq!(partial.provider_receipt.body.seq, 2);
         assert!(!partial.provider_receipt.body.final_receipt);
+    }
+
+    #[test]
+    fn client_disconnect_without_checkpoint_keeps_delivered_prefix_for_close_receipt() {
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let mut watchdog = DirectSessionWatchdog::new(
+            1_000,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            None,
+            None,
+        );
+        watchdog.record_delta(1_100);
+
+        let err = client_disconnect_direct_session_error(
+            &request,
+            output.content.as_deref().unwrap(),
+            None,
+            None,
+            &[1, 2, 3],
+            &watchdog,
+            1_250,
+        );
+
+        assert!(err.retryable);
+        assert!(is_client_disconnect_error(&err));
+        assert!(err.partial.is_none());
+        let interrupted = err
+            .interrupted
+            .expect("disconnect without checkpoint should keep delivered prefix");
+        assert_eq!(interrupted.reason, "client_disconnect");
+        assert_eq!(
+            interrupted.output.content.as_deref(),
+            output.content.as_deref()
+        );
+        assert_eq!(interrupted.token_ids, vec![1, 2, 3]);
+        assert_eq!(
+            interrupted.output.usage,
+            observed_chat_usage(&request, output.content.as_deref().unwrap(), &[1, 2, 3])
+        );
     }
 
     #[test]
@@ -17815,8 +18494,8 @@ mod tests {
 
         let mut inflated_usage = provider_receipt.clone();
         inflated_usage.body.usage = ReceiptUsage::text(9, 0);
-        inflated_usage.body.mu_owed_cum =
-            calculate_locked_mu_owed(&invocation, &inflated_usage.body.usage);
+        inflated_usage.body.au_owed_cum =
+            calculate_locked_au_owed(&invocation, &inflated_usage.body.usage);
         inflated_usage.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&inflated_usage.body).unwrap(),
@@ -17833,7 +18512,7 @@ mod tests {
         assert!(err.message.contains("usage"));
 
         let mut wrong_amount = provider_receipt;
-        wrong_amount.body.mu_owed_cum = wrong_amount.body.mu_owed_cum.saturating_add(1);
+        wrong_amount.body.au_owed_cum = wrong_amount.body.au_owed_cum.saturating_add(1);
         wrong_amount.enclave_sig = sign_hex(
             &test_enclave_seed(),
             &receipt_signing_bytes(&wrong_amount.body).unwrap(),
@@ -17882,12 +18561,12 @@ mod tests {
             enclave_id: enclave_id.clone(),
             price_ver: 7,
             locked_rate_map: text_generation_rate_map(20, 60),
-            locked_per_req_mu: 0,
-            locked_min_session_mu: 0,
+            locked_per_req_au: 0,
+            locked_min_session_au: 0,
             served_ctx: 4096,
-            ctx_bracket: ctx_bracket_for_tokens(4096).to_owned(),
-            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
-            max_spend_mu: 1000,
+            ctx_bracket: Some(ctx_bracket_for_tokens(4096).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+            max_spend_au: 1000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 128,
                 ms: 30_000,
@@ -17899,6 +18578,7 @@ mod tests {
             rail: "fiat".to_owned(),
             user_pubkey: verifying_key_hex(&test_user_seed()),
             provider_pubkey: Some(verifying_key_hex(&test_provider_seed())),
+            transport_peer: None,
             enclave_id,
             price_ver: 7,
             opened_at: 1,
@@ -17935,12 +18615,12 @@ mod tests {
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 providers_online: 1,
                 rooms: 1,
-                price_ref_mu: PriceRefMu {
-                    denom: "mu_usd".to_owned(),
+                price_ref_au: PriceRefAu {
+                    denom: "au_usd".to_owned(),
                     ver: 7,
                     rate_map: text_generation_rate_map(20, 60),
-                    per_req_mu: 0,
-                    min_session_mu: 0,
+                    per_req_au: 0,
+                    min_session_au: 0,
                     derivation: None,
                     history: Vec::new(),
                 },
@@ -17972,6 +18652,79 @@ mod tests {
                 route_candidates: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn update_notice_escalates_when_catalog_gate_hides_models() {
+        let mut visible_model = test_model();
+        visible_model.id = "mayhem/visible-future".to_owned();
+        visible_model.mayhem.min_app_version = Some("9998.0.0".to_owned());
+        let hidden = GatewayUpdateModelNotice {
+            model_id: "mayhem/hidden-future".to_owned(),
+            min_app_version: "9999.0.0".to_owned(),
+            installed_app_version: installed_app_version().to_owned(),
+            message: gateway_update_model_message(
+                "mayhem/hidden-future",
+                "9999.0.0",
+                installed_app_version(),
+            ),
+        };
+        let state =
+            GatewayState::from_models(vec![visible_model]).with_hidden_update_models(vec![hidden]);
+
+        let notice = state
+            .update_notice()
+            .expect("future catalog gate is visible");
+        assert_eq!(notice.level, "required");
+        assert_eq!(notice.affected_model_count, 2);
+        assert_eq!(notice.hidden_model_count, 1);
+        assert_eq!(notice.required_min_app_version, "9999.0.0");
+        assert!(notice.message.contains("Update required"));
+        assert!(notice.message.contains("hidden until you update"));
+        assert!(notice.message.contains("mayhem update"));
+    }
+
+    #[test]
+    fn update_notice_renders_on_user_and_provider_dashboards() {
+        let state = GatewayState::from_models(vec![test_model()]).with_hidden_update_models(vec![
+            GatewayUpdateModelNotice {
+                model_id: "mayhem/future-route".to_owned(),
+                min_app_version: "9999.0.0".to_owned(),
+                installed_app_version: installed_app_version().to_owned(),
+                message: gateway_update_model_message(
+                    "mayhem/future-route",
+                    "9999.0.0",
+                    installed_app_version(),
+                ),
+            },
+        ]);
+        let chart_options = DashboardChartOptions {
+            surface: DashboardChartSurface::User,
+            selected_tier: None,
+            selected_timeframe: DashboardPriceTimeframe::H1,
+            selected_bucket: None,
+            selected_quant: None,
+            pinned_models: Vec::new(),
+            provider_filter: None,
+        };
+
+        let user_html = dashboard_user_html(&state, 60, "http://127.0.0.1:11435", &chart_options);
+        assert!(user_html.contains("update-banner required"));
+        assert!(user_html.contains("Update required"));
+        assert!(user_html.contains("catalog min v9999.0.0"));
+
+        let mut provider_chart_options = chart_options.clone();
+        provider_chart_options.surface = DashboardChartSurface::Provider;
+        let provider_html = dashboard_provider_html(
+            &state,
+            60,
+            "http://127.0.0.1:11435",
+            None,
+            &provider_chart_options,
+        );
+        assert!(provider_html.contains("update-banner required"));
+        assert!(provider_html.contains("Update required"));
+        assert!(provider_html.contains("catalog min v9999.0.0"));
     }
 
     #[test]
@@ -18040,21 +18793,24 @@ mod tests {
     }
 
     #[test]
-    fn live_sse_event_buffer_scales_with_token_budget() {
+    fn live_sse_event_buffer_keeps_client_disconnect_backpressure_tight() {
         let mut request = test_chat_request("mayhem/test-model");
         assert_eq!(
             live_sse_event_buffer_capacity(&request),
-            LIVE_SSE_DEFAULT_MAX_TOKENS * 2 + 64
+            LIVE_SSE_MAX_EVENT_BUFFER
         );
 
         request.max_tokens = Some(32);
         assert_eq!(
             live_sse_event_buffer_capacity(&request),
-            LIVE_SSE_MIN_EVENT_BUFFER
+            LIVE_SSE_MAX_EVENT_BUFFER
         );
 
         request.max_tokens = Some(2048);
-        assert_eq!(live_sse_event_buffer_capacity(&request), 4160);
+        assert_eq!(
+            live_sse_event_buffer_capacity(&request),
+            LIVE_SSE_MAX_EVENT_BUFFER
+        );
 
         request.max_tokens = Some(u32::MAX);
         assert_eq!(
@@ -18101,8 +18857,8 @@ mod tests {
             enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
             room_id: format!("{:02x}", idx.wrapping_add(160)).repeat(16),
             price_ver: 7,
-            price_ref_mu: None,
-            min_ask_mu: 0,
+            price_ref_au: None,
+            min_ask_au: 0,
             att_tier: 1,
             quant: DEFAULT_QUANT_BUCKET.to_owned(),
             admin_pubkey: "33".repeat(32),
@@ -18674,7 +19430,7 @@ mod tests {
         let mut model = test_routed_model(2);
         let request = test_chat_request(&model.id);
         let high_ask_provider = model.mayhem.route_candidates[0].provider.clone();
-        model.mayhem.route_candidates[0].min_ask_mu = u64::MAX;
+        model.mayhem.route_candidates[0].min_ask_au = u128::MAX;
         let state = GatewayState::from_models(vec![model.clone()]);
 
         let selected =
@@ -18700,7 +19456,7 @@ mod tests {
             &model,
             &request,
             None,
-            Some(u64::MAX),
+            Some(u128::MAX),
             None,
             None,
             None,
@@ -18934,45 +19690,45 @@ mod tests {
     fn route_selection_locks_matching_tier_market_price() {
         let mut model = test_routed_model(2);
         let request = test_chat_request(&model.id);
-        model.mayhem.price_ref_mu = PriceRefMu {
-            denom: "mu_usd".to_owned(),
+        model.mayhem.price_ref_au = PriceRefAu {
+            denom: "au_usd".to_owned(),
             ver: 1,
             rate_map: text_generation_rate_map(10, 20),
-            per_req_mu: 0,
-            min_session_mu: 0,
+            per_req_au: 0,
+            min_session_au: 0,
             derivation: None,
             history: Vec::new(),
         };
         model.mayhem.route_candidates[0].att_tier = 1;
         model.mayhem.route_candidates[0].quant = "int4".to_owned();
-        model.mayhem.route_candidates[0].price_ref_mu = Some(PriceRefMu {
-            denom: "mu_usd".to_owned(),
+        model.mayhem.route_candidates[0].price_ref_au = Some(PriceRefAu {
+            denom: "au_usd".to_owned(),
             ver: 1,
             rate_map: text_generation_rate_map(10, 20),
-            per_req_mu: 0,
-            min_session_mu: 0,
+            per_req_au: 0,
+            min_session_au: 0,
             derivation: None,
             history: Vec::new(),
         });
         model.mayhem.route_candidates[1].att_tier = 3;
         model.mayhem.route_candidates[1].quant = "fp16".to_owned();
-        model.mayhem.route_candidates[1].price_ref_mu = Some(PriceRefMu {
-            denom: "mu_usd".to_owned(),
+        model.mayhem.route_candidates[1].price_ref_au = Some(PriceRefAu {
+            denom: "au_usd".to_owned(),
             ver: 9,
             rate_map: text_generation_rate_map(90, 180),
-            per_req_mu: 123,
-            min_session_mu: 456,
+            per_req_au: 123,
+            min_session_au: 456,
             derivation: None,
             history: Vec::new(),
         });
-        let state = GatewayState::from_models(vec![model.clone()]).with_receipt_balance_mu(10_000);
+        let state = GatewayState::from_models(vec![model.clone()]).with_receipt_balance_au(10_000);
 
         let selected = ordered_route_candidates_for_request_with_max_price_seed(
             &state,
             &model,
             &request,
             Some(3),
-            Some(u64::MAX),
+            Some(u128::MAX),
             None,
             None,
             None,
@@ -18990,8 +19746,8 @@ mod tests {
             normalize_rate_map(snapshot.rate_map.clone()),
             expected_rate_map
         );
-        assert_eq!(snapshot.per_req_mu, 123);
-        assert_eq!(snapshot.min_session_mu, 456);
+        assert_eq!(snapshot.per_req_au, 123);
+        assert_eq!(snapshot.min_session_au, 456);
 
         let heartbeat = heartbeat_for_route(&model, route, now_millis_u64());
         assert_eq!(heartbeat.price_ver, 9);
@@ -19003,7 +19759,7 @@ mod tests {
                 Some(route),
                 &GatewayRequestOptions {
                     min_att_tier: Some(3),
-                    max_price_mu: Some(u64::MAX),
+                    max_price_au: Some(u128::MAX),
                     ..GatewayRequestOptions::default()
                 },
             )
@@ -19014,8 +19770,40 @@ mod tests {
             invocation.spend_voucher.body.locked_rate_map,
             expected_rate_map
         );
-        assert_eq!(invocation.spend_voucher.body.locked_per_req_mu, 123);
-        assert_eq!(invocation.spend_voucher.body.locked_min_session_mu, 456);
+        assert_eq!(invocation.spend_voucher.body.locked_per_req_au, 123);
+        assert_eq!(invocation.spend_voucher.body.locked_min_session_au, 456);
+    }
+
+    #[test]
+    fn chat_invocation_uses_signed_heartbeat_transport_peer() {
+        let model = test_routed_model(1);
+        let route = &model.mayhem.route_candidates[0];
+        let transport_peer = "77".repeat(32);
+        let mut heartbeat = heartbeat_for_route(&model, route, now_millis_u64());
+        heartbeat.transport_peer = Some(transport_peer.clone());
+        heartbeat.sig = "aa".repeat(64);
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_receipt_balance_au(10_000)
+            .with_provider_heartbeats(vec![heartbeat]);
+
+        let invocation = state
+            .prepare_chat_invocation_for_route(
+                &model,
+                &test_chat_request(&model.id),
+                Some(route),
+                &GatewayRequestOptions::default(),
+            )
+            .expect("route prepares");
+
+        assert_eq!(
+            invocation.provider_pubkey.as_deref(),
+            Some(route.provider.as_str())
+        );
+        assert_eq!(
+            invocation.transport_peer.as_deref(),
+            Some(transport_peer.as_str())
+        );
+        assert_eq!(invocation.direct_peer().unwrap(), transport_peer.as_str());
     }
 
     #[test]
@@ -19031,7 +19819,7 @@ mod tests {
             &model,
             &request,
             None,
-            Some(u64::MAX),
+            Some(u128::MAX),
             None,
             Some("fp16"),
             None,
@@ -19045,7 +19833,7 @@ mod tests {
             &model,
             &request,
             None,
-            Some(u64::MAX),
+            Some(u128::MAX),
             None,
             Some("fp8"),
             None,
@@ -19636,14 +20424,14 @@ mod tests {
             model_id: model.id.clone(),
             price_ver: invocation.price_ver,
             locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-            locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-            locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+            locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+            locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
             served_ctx: invocation.served_ctx,
             ctx_bracket: invocation.ctx_bracket.clone(),
             ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
-            mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+            au_owed_cum: calculate_locked_au_owed(invocation, &usage),
             prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
             ts: 123,
         };
@@ -19675,14 +20463,14 @@ mod tests {
             model_id: model.id.clone(),
             price_ver: invocation.price_ver,
             locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-            locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-            locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+            locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+            locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
             served_ctx: invocation.served_ctx,
             ctx_bracket: invocation.ctx_bracket.clone(),
             ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
             usage: usage.clone(),
-            mu_owed_cum: calculate_locked_mu_owed(invocation, &usage),
+            au_owed_cum: calculate_locked_au_owed(invocation, &usage),
             prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
             ts: 123,
         };

@@ -544,8 +544,8 @@ function verifyPriceRecord(record, key, enclaveId, enclave, admin, fail) {
     return false;
   }
   let ok = true;
-  if (record.denom !== 'mu_usd') {
-    fail(`${key} is not denominated in mu_usd`);
+  if (record.denom !== 'au_usd') {
+    fail(`${key} is not denominated in au_usd`);
     ok = false;
   }
   if (record.enclave_id !== enclaveId) {
@@ -564,7 +564,7 @@ function verifyPriceRecord(record, key, enclaveId, enclave, admin, fail) {
     fail(`${key}.set_by_role must be admin`);
     ok = false;
   }
-  for (const field of ['in_per_1k_mu', 'out_per_1k_mu', 'per_req_mu', 'min_session_mu', 'effective_at']) {
+  for (const field of ['in_per_1k_au', 'out_per_1k_au', 'per_req_au', 'min_session_au', 'effective_at']) {
     if (!Number.isInteger(record[field]) || record[field] < 0) {
       fail(`${key}.${field} must be a non-negative integer`);
       ok = false;
@@ -585,8 +585,8 @@ function verifyPriceSchedule(schedule, enclaveId, enclave, admin, fail) {
   let ok = true;
   const structured = hasOwn(schedule, 'current') || hasOwn(schedule, 'pending');
   if (structured) {
-    if (schedule.denom !== 'mu_usd') {
-      fail(`price/${enclaveId} schedule is not denominated in mu_usd`);
+    if (schedule.denom !== 'au_usd') {
+      fail(`price/${enclaveId} schedule is not denominated in au_usd`);
       ok = false;
     }
     if (schedule.enclave_id !== enclaveId) {

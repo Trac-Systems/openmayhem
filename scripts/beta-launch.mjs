@@ -807,7 +807,7 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
   if (requireObject(add, manifest.network, 'network')) {
     requireOnlyKeys(add, manifest.network, 'network', ['name', 'denom', 'msb', 'subnet', 'dht']);
     requireLiteral(add, manifest.network.name, 'testnet1', 'network.name');
-    requireLiteral(add, manifest.network.denom, 'mu_usd', 'network.denom');
+    requireLiteral(add, manifest.network.denom, 'au_usd', 'network.denom');
     if (requireObject(add, manifest.network.msb, 'network.msb')) {
       requireOnlyKeys(add, manifest.network.msb, 'network.msb', ['address_prefix', 'network_id', 'bootstrap', 'channel']);
       requireLiteral(add, manifest.network.msb.address_prefix, 'testtrac', 'network.msb.address_prefix');
@@ -884,14 +884,12 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       'health_path',
       'tnk_treasury_address',
       'stripe_enabled',
-      'coinbase_enabled',
       'checkout_urls',
     ]);
     const paygateOrigin = validatePaygatePublicBase(add, manifest.paygate);
     requireString(add, manifest.paygate.health_path, 'paygate.health_path');
     requireString(add, manifest.paygate.tnk_treasury_address, 'paygate.tnk_treasury_address', testtracAddress);
     requireLiteral(add, manifest.paygate.stripe_enabled, true, 'paygate.stripe_enabled');
-    requireLiteral(add, manifest.paygate.coinbase_enabled, false, 'paygate.coinbase_enabled');
     validateCheckoutUrls(add, manifest.paygate, paygateOrigin);
   }
 
@@ -958,8 +956,8 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
         'att_tier',
         'caps',
         'distribution',
-        'model_ref_mu',
-        'price_mu',
+        'model_ref_au',
+        'price_au',
         'rooms',
       ]);
       requireString(add, enclave.enclave_id, `${prefix}.enclave_id`, hex64);
@@ -1066,13 +1064,13 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       if (manifest.admin?.peer_pubkey) {
         verifyEnclaveDistributionSignature(add, manifest.admin.peer_pubkey, enclave, `${prefix}.distribution`);
       }
-      if (requireObject(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`)) {
-        requireOnlyKeys(add, enclave.model_ref_mu, `${prefix}.model_ref_mu`, ['in_per_1k', 'out_per_1k']);
-        requirePositiveInteger(add, enclave.model_ref_mu.in_per_1k, `${prefix}.model_ref_mu.in_per_1k`);
-        requirePositiveInteger(add, enclave.model_ref_mu.out_per_1k, `${prefix}.model_ref_mu.out_per_1k`);
+      if (requireObject(add, enclave.model_ref_au, `${prefix}.model_ref_au`)) {
+        requireOnlyKeys(add, enclave.model_ref_au, `${prefix}.model_ref_au`, ['in_per_1k', 'out_per_1k']);
+        requirePositiveInteger(add, enclave.model_ref_au.in_per_1k, `${prefix}.model_ref_au.in_per_1k`);
+        requirePositiveInteger(add, enclave.model_ref_au.out_per_1k, `${prefix}.model_ref_au.out_per_1k`);
       }
-      if (requireObject(add, enclave.price_mu, `${prefix}.price_mu`)) {
-        requireOnlyKeys(add, enclave.price_mu, `${prefix}.price_mu`, [
+      if (requireObject(add, enclave.price_au, `${prefix}.price_au`)) {
+        requireOnlyKeys(add, enclave.price_au, `${prefix}.price_au`, [
           'denom',
           'in_per_1k',
           'out_per_1k',
@@ -1080,19 +1078,19 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
           'min_session',
           'effective_at',
         ]);
-        if (enclave.price_mu.denom !== undefined) {
-          requireLiteral(add, enclave.price_mu.denom, 'mu_usd', `${prefix}.price_mu.denom`);
+        if (enclave.price_au.denom !== undefined) {
+          requireLiteral(add, enclave.price_au.denom, 'au_usd', `${prefix}.price_au.denom`);
         }
-        requirePositiveInteger(add, enclave.price_mu.in_per_1k, `${prefix}.price_mu.in_per_1k`);
-        requirePositiveInteger(add, enclave.price_mu.out_per_1k, `${prefix}.price_mu.out_per_1k`);
-        if (!Number.isInteger(enclave.price_mu.per_req) || enclave.price_mu.per_req < 0) {
-          add('error', `${prefix}.price_mu.per_req must be a non-negative integer`);
+        requirePositiveInteger(add, enclave.price_au.in_per_1k, `${prefix}.price_au.in_per_1k`);
+        requirePositiveInteger(add, enclave.price_au.out_per_1k, `${prefix}.price_au.out_per_1k`);
+        if (!Number.isInteger(enclave.price_au.per_req) || enclave.price_au.per_req < 0) {
+          add('error', `${prefix}.price_au.per_req must be a non-negative integer`);
         }
-        if (!Number.isInteger(enclave.price_mu.min_session) || enclave.price_mu.min_session < 0) {
-          add('error', `${prefix}.price_mu.min_session must be a non-negative integer`);
+        if (!Number.isInteger(enclave.price_au.min_session) || enclave.price_au.min_session < 0) {
+          add('error', `${prefix}.price_au.min_session must be a non-negative integer`);
         }
-        if (!Number.isInteger(enclave.price_mu.effective_at) || enclave.price_mu.effective_at < 0) {
-          add('error', `${prefix}.price_mu.effective_at must be a non-negative integer`);
+        if (!Number.isInteger(enclave.price_au.effective_at) || enclave.price_au.effective_at < 0) {
+          add('error', `${prefix}.price_au.effective_at must be a non-negative integer`);
         }
       }
       if (requireArray(add, enclave.rooms, `${prefix}.rooms`, 1)) {
@@ -1280,7 +1278,7 @@ async function buildCommands(manifest) {
     adminSetupTxs.push(txCommand({
       op: 'set_model_ref',
       model_id: enclave.model_id,
-      price_ref_mu: enclave.model_ref_mu,
+      price_ref_au: enclave.model_ref_au,
     }));
     adminSetupTxs.push(txCommand({
       op: 'register_enclave',
@@ -1299,11 +1297,11 @@ async function buildCommands(manifest) {
     adminSetupTxs.push(txCommand({
       op: 'set_price',
       enclave_id: enclave.enclave_id,
-      in_per_1k_mu: enclave.price_mu?.in_per_1k,
-      out_per_1k_mu: enclave.price_mu?.out_per_1k,
-      per_req_mu: enclave.price_mu?.per_req ?? 0,
-      min_session_mu: enclave.price_mu?.min_session ?? 0,
-      effective_at: enclave.price_mu?.effective_at ?? 0,
+      in_per_1k_au: enclave.price_au?.in_per_1k,
+      out_per_1k_au: enclave.price_au?.out_per_1k,
+      per_req_au: enclave.price_au?.per_req ?? 0,
+      min_session_au: enclave.price_au?.min_session ?? 0,
+      effective_at: enclave.price_au?.effective_at ?? 0,
     }));
     for (const room of enclave.rooms || []) {
       const derivedRoom = roomByLabel.get(room.label);

@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use mayhem_paygate::{
-    paygate_router, run_stripe_backfill_once, stripe_signature_header, BoxFuture, CoinbaseSettings,
+    paygate_router, run_stripe_backfill_once, stripe_signature_header, BoxFuture,
     ContractPostResult, ContractPoster, FiatChargebackFeature, FiatDepositFeature, OracleKeypair,
     PaygateConfig, PaygateState, RailConfig, StripeSettings, DEFAULT_STRIPE_API_BASE_URL,
 };
@@ -232,7 +232,6 @@ async fn start_mock_stripe() -> (String, StripeCapture) {
 }
 
 fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> PaygateConfig {
-    let coinbase_event_store_path = event_store_path.with_file_name("coinbase-events.jsonl");
     let backfill_cursor_path = event_store_path.with_file_name("stripe-backfill-cursor.json");
     PaygateConfig {
         contract_dry_run: true,
@@ -245,10 +244,6 @@ fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> Pay
                 event_store_path,
                 backfill_cursor_path,
                 ..StripeSettings::default()
-            },
-            coinbase: CoinbaseSettings {
-                event_store_path: coinbase_event_store_path,
-                ..CoinbaseSettings::default()
             },
         },
         ..PaygateConfig::default()

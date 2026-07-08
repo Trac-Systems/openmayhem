@@ -30,7 +30,6 @@ const configStructSections = new Map([
   ['ContractConfigFile', 'contract'],
   ['OracleConfigFile', 'oracle'],
   ['StripeConfigFile', 'stripe'],
-  ['CoinbaseConfigFile', 'coinbase'],
 ]);
 
 const sourceExtensions = new Set(['.rs', '.js', '.mjs', '.sh', '.py']);
@@ -43,9 +42,7 @@ const envPrefixes = [
   'SIDECHANNEL',
   'SESSION_',
   'STRIPE_',
-  'COINBASE_',
   'TAP_',
-  'TK_',
   'ETH_',
   'HF_',
   'CARGO_',
@@ -98,10 +95,15 @@ function run(command, args, options = {}) {
 }
 
 function gitFiles() {
-  return run('git', ['ls-files'])
+  const tracked = run('git', ['ls-files'])
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
+  const untracked = run('git', ['ls-files', '--others', '--exclude-standard'])
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return [...new Set([...tracked, ...untracked])].sort();
 }
 
 function sourceFiles() {
@@ -241,7 +243,8 @@ const contractParamDescriptions = new Map([
   ['fee_bps', 'Operator fee charged during epoch apply.'],
   ['challenge_epochs', 'Epoch commit/fraud-proof challenge window.'],
   ['holdback_epochs', 'Provider earnings holdback before payout maturity.'],
-  ['payout_min_mu', 'Minimum payout/settlement threshold.'],
+  ['min_tier_notice_epochs', 'Minimum notice window, in epochs, before an admin enclave min-tier policy can take effect.'],
+  ['payout_min_au', 'Minimum payout/settlement threshold.'],
   ['probation_successful_sessions', 'Successful sessions required before probation can clear.'],
   ['probation_seconds', 'Time window before probation can clear.'],
   ['probation_max_concurrent_sessions_per_user', 'Probation concurrent-session cap per user.'],
@@ -252,25 +255,26 @@ const contractParamDescriptions = new Map([
   ['canary_match_min_bps', 'Canary probe match threshold.'],
   ['canary_probe_holdback_bps', 'Extra probe-gated provider holdback share.'],
   ['canary_probe_release_min_passes', 'Probe passes needed for gated holdback release.'],
-  ['probe_reward_mu', 'Auditor probe reward.'],
+  ['probe_reward_au', 'Auditor probe reward.'],
   ['uptime_tick_seconds', 'Uptime probe cadence.'],
   ['fraud_slash_bps', 'Slash percentage for canary mismatch and fraud-proof provider penalties.'],
   ['dispute_lost_slash_bps', 'Slash percentage for provider-fault dispute losses.'],
+  ['new_provider_holdback_epochs', 'Long graduated holdback for providers that have not cleared probation.'],
   ['rate_staleness_seconds', 'Maximum accepted TNK/TAP oracle price age.'],
   ['price_min_bps', 'Admin seed price lower bound versus model reference.'],
   ['price_max_bps', 'Admin seed price upper bound versus model reference.'],
   ['rules_grace_seconds', 'Rules/app compatibility grace window.'],
   ['max_apply_batch', 'Maximum epochApply debits plus earnings per page.'],
   ['max_market_usage_entries', 'Maximum epochApply market usage entries per page.'],
-  ['max_tnk_settlement_outputs', 'Maximum TNK settlement outputs per epoch batch.'],
-  ['dispute_deposit_mu', 'Dispute bond amount.'],
+  ['max_tnk_settlement_outputs', 'Maximum TNK settlement outputs per epoch settlement.'],
+  ['dispute_deposit_au', 'Dispute bond amount.'],
   ['price_rate_limit_seconds', 'Admin seed price change throttle.'],
   ['market_target_utilization_bps', 'Target utilization for the market price curve.'],
   ['market_ema_alpha_bps', 'Utilization EMA weight per epoch.'],
   ['market_gain_bps', 'Dampening gain toward the desired market price.'],
   ['market_max_step_bps', 'Per-epoch market price movement clamp.'],
   ['market_cold_start_min_providers', 'Minimum active supply before floating away from the admin seed.'],
-  ['market_provider_epoch_target_mu', 'Per-provider epoch capacity unit for utilization.'],
+  ['market_provider_epoch_target_au', 'Per-provider epoch capacity unit for utilization.'],
   ['market_max_utilization_bps', 'Utilization cap used by the controller.'],
   ['market_below_target_discount_bps', 'Below-target discount slope cap.'],
   ['market_above_target_slope_bps', 'Above-target premium slope.'],

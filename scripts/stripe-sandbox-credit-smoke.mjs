@@ -310,9 +310,6 @@ secret_key = "${tomlString(secretKey)}"
 webhook_secret = "${tomlString(webhookSecret)}"
 event_store_path = "${tomlString(eventStore)}"
 webhook_tolerance_seconds = 300
-
-[coinbase]
-enabled = false
 `, { mode: 0o600 });
 }
 
@@ -627,7 +624,6 @@ async function main() {
       },
       paygate: {
         stripe_enabled: health.rails?.stripe?.enabled === true,
-        coinbase_enabled: health.rails?.coinbase?.enabled === true,
         event_log_lines: eventLogLines,
       },
       temp_dir: args.keepTemp ? tempDir : undefined,

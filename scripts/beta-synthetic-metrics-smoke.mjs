@@ -254,7 +254,7 @@ function buildParticipants(outDir, providerIds) {
   const userRows = Array.from({ length: 100 }, (_, index) => ({
     user: userPubkey(index),
     sessions: 1 + (index % 3),
-    mu_usd_spend: 100 + index,
+    au_usd_spend: 100 + index,
     synthetic: true,
   }));
   return {
@@ -269,44 +269,42 @@ function buildPaymentRailEvidence(outDir) {
     paygate_admin_controls_verified: true,
     fiat_enabled: true,
     tap_enabled: true,
-    coinbase_enabled: false,
     stripe_processor_enabled: true,
-    ledger_denom: 'mu_usd',
+    ledger_denom: 'au_usd',
   });
   const fiatCredit = writeJson(path.join(outDir, 'fiat-credit-proof.json'), {
     rail: 'fiat',
     processor: 'stripe',
-    ledger_denom: 'mu_usd',
-    credits_mu_usd: true,
+    ledger_denom: 'au_usd',
+    credits_au_usd: true,
     evidence_kind: 'synthetic-p8.5-credit',
   });
   const tapCredit = writeJson(path.join(outDir, 'tap-credit-proof.json'), {
     rail: 'tap',
-    ledger_denom: 'mu_usd',
-    credits_mu_usd: true,
+    ledger_denom: 'au_usd',
+    credits_au_usd: true,
     evidence_kind: 'synthetic-p8.5-credit',
   });
   const tnkCredit = writeJson(path.join(outDir, 'tnk-credit-proof.json'), {
     rail: 'tnk',
-    ledger_denom: 'mu_usd',
-    credits_mu_usd: true,
+    ledger_denom: 'au_usd',
+    credits_au_usd: true,
     evidence_kind: 'synthetic-p8.5-credit',
   });
   return writeJson(path.join(outDir, 'payment-rails-report.json'), {
     payment_rails: {
-      ledger_denom: 'mu_usd',
+      ledger_denom: 'au_usd',
       fiat_enabled: true,
       tap_enabled: true,
       tnk_enabled: true,
       stripe_processor_enabled: true,
-      coinbase_enabled: false,
-      rails_credit_mu_usd: true,
+      rails_credit_au_usd: true,
       paygate_admin_controls_verified: true,
       evidence: [
         fileEvidence(paygateHealth, ['paygate_admin_controls']),
-        fileEvidence(fiatCredit, ['rail:fiat', 'processor:stripe', 'credits_mu_usd']),
-        fileEvidence(tapCredit, ['rail:tap', 'credits_mu_usd']),
-        fileEvidence(tnkCredit, ['rail:tnk', 'credits_mu_usd']),
+        fileEvidence(fiatCredit, ['rail:fiat', 'processor:stripe', 'credits_au_usd']),
+        fileEvidence(tapCredit, ['rail:tap', 'credits_au_usd']),
+        fileEvidence(tnkCredit, ['rail:tnk', 'credits_au_usd']),
       ],
     },
   });
@@ -442,7 +440,7 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
     launch_id: 'mayhem-testnet-beta-v1',
     network: {
       name: 'testnet1',
-      denom: 'mu_usd',
+      denom: 'au_usd',
       msb: {
         address_prefix: 'testtrac',
         network_id: 919,
@@ -494,7 +492,6 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
       health_path: '/v1/health',
       tnk_treasury_address: testtracAddress,
       stripe_enabled: true,
-      coinbase_enabled: false,
       checkout_urls: {
         stripe: {
           success_url: 'https://paygate.trac.network/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}',
@@ -542,12 +539,12 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
           ctx: 131072,
         },
         distribution: enclave.distribution,
-        model_ref_mu: {
+        model_ref_au: {
           in_per_1k: 18,
           out_per_1k: 55,
         },
-        price_mu: {
-          denom: 'mu_usd',
+        price_au: {
+          denom: 'au_usd',
           in_per_1k: 18,
           out_per_1k: 55,
           per_req: 0,
@@ -666,15 +663,15 @@ function buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomI
       {
         enclave_id: enclave.enclave_id,
         model_id: enclave.model_id,
-        denom: 'mu_usd',
+        denom: 'au_usd',
         current: {
           enclave_id: enclave.enclave_id,
           model_id: enclave.model_id,
-          denom: 'mu_usd',
-          in_per_1k_mu: 18,
-          out_per_1k_mu: 55,
-          per_req_mu: 0,
-          min_session_mu: 100,
+          denom: 'au_usd',
+          in_per_1k_au: 18,
+          out_per_1k_au: 55,
+          per_req_au: 0,
+          min_session_au: 100,
           effective_at: 21600,
           ver: 1,
           set_by: adminPubkey,

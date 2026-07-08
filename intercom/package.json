@@ -29,6 +29,7 @@
     "compact-encoding": "^2.18.0",
     "crypto": "npm:bare-node-crypto",
     "fs": "npm:bare-node-fs",
+    "hyperschema": "1.20.0",
     "path": "npm:bare-node-path",
     "protomux": "^3.10.1",
     "trac-msb": "file:trac/msb",
@@ -37,6 +38,7 @@
     "util": "npm:bare-node-util"
   },
   "overrides": {
+    "hyperschema": "1.20.0",
     "trac-wallet": "1.0.1"
   }
 }

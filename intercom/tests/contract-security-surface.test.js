@@ -106,9 +106,9 @@ async function setupSecuritySurface() {
     modelId,
     admin: admin.publicKey,
     txNo: 6,
-    inPer1kMu: 20,
-    outPer1kMu: 60,
-    minSessionMu: 100,
+    inPer1kAu: 20,
+    outPer1kAu: 60,
+    minSessionAu: 100,
   });
 
   return { admin, provider, roomId, storage, contract };
@@ -206,8 +206,8 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
       op: 'set_price',
       enclave_id: enclaveId,
       rate_map: textRateMap(18, 55),
-      per_req_mu: 0,
-      min_session_mu: 100,
+      per_req_au: '0',
+      min_session_au: '100',
       effective_at: 21_600,
     },
   ],
@@ -220,7 +220,7 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
       kind: 'session_ok',
       epoch: 1,
       at: 3_600,
-      paid_mu: 100,
+      paid_au: '100',
       evidence_hash: 'a'.repeat(64),
     },
   ],
@@ -243,7 +243,7 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
       op: 'fiat_chargeback',
       rail: 'stripe',
       who: provider.publicKey,
-      mu: 1_000_000,
+      au: '1000000',
       ext_ref_hash: 'c'.repeat(64),
       dispute_ref_hash: 'd'.repeat(64),
       fiat_currency: 'usd',
@@ -291,7 +291,7 @@ const buildAdminOnlyFeatureAttempts = (provider) => [
     op: 'fiat_deposit',
     rail: 'stripe',
     who: provider.publicKey,
-    mu: 1_000_000,
+    au: '1000000',
     ext_ref_hash: 'c'.repeat(64),
     fiat_currency: 'usd',
     fiat_amount_minor: 100,
@@ -303,13 +303,13 @@ const buildAdminOnlyFeatureAttempts = (provider) => [
 const buildAdminOnlyRateFeatureAttempts = () => [
   {
     op: 'rate_oracle',
-    tnk_usd_e6: 2_000_000,
+    tnk_usd_au: '2000000000000000000',
     source: 'gate-spot',
     ts: 3_600,
   },
   {
     op: 'tap_rate_oracle',
-    tap_usd_e6: 2_000_000,
+    tap_usd_au: '2000000000000000000',
     source: 'uniswap-v2',
     ts: 3_600,
   },
@@ -347,7 +347,7 @@ test('MayhemContract rejects admin ops before genesis admin is present', async (
       epoch: 1,
       at: 3_600,
       debits: [],
-      earnings: [{ rail: 'fiat', provider: outsider.publicKey, gross_mu: 1_000 }],
+      earnings: [{ rail: 'fiat', provider: outsider.publicKey, gross_au: '1000' }],
     },
     outsider.publicKey
   );
@@ -392,7 +392,7 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
       epoch: 1,
       at: 3_600,
       debits: [],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 1_000 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000' }],
     },
     providerSender
   );

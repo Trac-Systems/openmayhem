@@ -8,7 +8,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
-/// @title KnowledgePool - Mayhem's TAP rail fund-holding contract (SAUCE direct port).
+/// @title MayhemInferencePool - Mayhem's TAP rail fund-holding contract (SAUCE direct port).
 /// @notice A metered **prepaid escrow + cumulative Merkle distributor** holding ERC-20 TAP. Buyers
 ///         prepay; the operator (root authority) periodically posts ONE cumulative root keyed by
 ///         address that covers BOTH providers' 75% earnings AND buyers' refunds; everyone claims
@@ -28,7 +28,7 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 ///      requires the new owner to accept), and (2) `maxEpochDelta` - one `setRoot` can add at most this much
 ///      new `cumulativeSpent`, so a compromised key is RATE-LIMITED per epoch rather than draining the pool
 ///      in one tx. Key custody + the external contract audit remain the real safeguards.
-contract KnowledgePool is ReentrancyGuard, Ownable2Step {
+contract MayhemInferencePool is ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
     /// @notice The ERC-20 TAP this pool escrows.

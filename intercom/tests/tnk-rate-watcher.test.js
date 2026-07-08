@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import {
   buildAdminCommand,
-  decimalUsdToE6,
+  decimalUsdToAu,
   parseGateTicker,
   parseMexcTicker,
   rateStateMatches,
@@ -11,25 +11,26 @@ import {
   runOnce,
 } from '../scripts/tnk-rate-watcher.mjs';
 
-test('tnk rate watcher converts decimal USD strings to e6 fixed point', () => {
-  assert.equal(decimalUsdToE6('1'), 1_000_000);
-  assert.equal(decimalUsdToE6('0.0500004'), 50_000);
-  assert.equal(decimalUsdToE6('0.0500005'), 50_001);
-  assert.equal(decimalUsdToE6('2.1234567'), 2_123_457);
-  assert.throws(() => decimalUsdToE6('1e-2'), /invalid decimal/i);
-  assert.throws(() => decimalUsdToE6('0.0000004'), /outside safe/i);
+test('tnk rate watcher converts decimal USD strings to atto fixed point', () => {
+  assert.equal(decimalUsdToAu('1'), '1000000000000000000');
+  assert.equal(decimalUsdToAu('0.0500004'), '50000400000000000');
+  assert.equal(decimalUsdToAu('0.0500000000000000004'), '50000000000000000');
+  assert.equal(decimalUsdToAu('0.0500000000000000005'), '50000000000000001');
+  assert.equal(decimalUsdToAu('2.1234567'), '2123456700000000000');
+  assert.throws(() => decimalUsdToAu('1e-2'), /invalid decimal/i);
+  assert.throws(() => decimalUsdToAu('0.0000000000000000004'), /outside positive atto/i);
 });
 
 test('tnk rate watcher parses Gate and MEXC ticker payloads', () => {
   assert.deepEqual(parseGateTicker([{ currency_pair: 'TNK_USDT', last: '0.0525' }]), {
     source: 'gate-spot',
     raw_price: '0.0525',
-    tnk_usd_e6: 52_500,
+    tnk_usd_au: '52500000000000000',
   });
   assert.deepEqual(parseMexcTicker({ symbol: 'TNKUSDT', price: '0.052501' }), {
     source: 'mexc-spot',
     raw_price: '0.052501',
-    tnk_usd_e6: 52_501,
+    tnk_usd_au: '52501000000000000',
   });
 });
 
@@ -53,7 +54,7 @@ test('tnk rate watcher uses Gate first and MEXC as fallback', async () => {
   assert.equal(calls.length, 2);
   assert.equal(rate.source, 'mexc-spot');
   assert.equal(rate.primary, false);
-  assert.equal(rate.tnk_usd_e6, 41_250);
+  assert.equal(rate.tnk_usd_au, '41250000000000000');
   assert.equal(rate.ts, 3_600);
   assert.match(rate.failures[0].error, /503/);
 });
@@ -62,7 +63,7 @@ test('tnk rate watcher copy/paste command redacts wallet password', () => {
   const command = buildAdminCommand(
     {
       source: 'gate-spot',
-      tnk_usd_e6: 52_500,
+      tnk_usd_au: '52500000000000000',
       ts: 3_600,
     },
     {
@@ -75,6 +76,7 @@ test('tnk rate watcher copy/paste command redacts wallet password', () => {
   );
   assert.match(command, /mayhem/);
   assert.match(command, /rate-oracle/);
+  assert.match(command, /'--tnk-usd-au' '52500000000000000'/);
   assert.match(command, /'--source' 'gate-spot'/);
   assert.match(command, /'--rpc-url' 'http:\/\/127\.0\.0\.1:49223\/v1'/);
   assert.match(command, /--submit/);
@@ -84,24 +86,24 @@ test('tnk rate watcher copy/paste command redacts wallet password', () => {
 
 test('tnk rate watcher verifies exact admin rate state after submit', async () => {
   const matchingState = {
-    denom: 'tnk_usd_e6',
-    tnk_usd_e6: 52_500,
+    denom: 'tnk_usd_au',
+    tnk_usd_au: '52500000000000000',
     source: 'gate-spot',
     ts: 3_600,
     posted_by_role: 'admin',
   };
   assert.equal(rateStateMatches({
-    tnk_usd_e6: 52_500,
+    tnk_usd_au: '52500000000000000',
     source: 'gate-spot',
     ts: 3_600,
   }, matchingState), true);
   assert.equal(rateStateMatches({
-    tnk_usd_e6: 52_500,
+    tnk_usd_au: '52500000000000000',
     source: 'gate-spot',
     ts: 3_600,
   }, { ...matchingState, posted_by_role: 'provider' }), false);
   assert.equal(rateStateMatches({
-    tnk_usd_e6: 52_500,
+    tnk_usd_au: '52500000000000000',
     source: 'gate-spot',
     ts: 3_601,
   }, matchingState), false);
@@ -153,8 +155,8 @@ test('tnk rate watcher fails submit when contract state is not admin evidence', 
           status: 200,
           json: async () => ({
             value: {
-              denom: 'tnk_usd_e6',
-              tnk_usd_e6: 52_500,
+              denom: 'tnk_usd_au',
+              tnk_usd_au: '52500000000000000',
               source: 'gate-spot',
               ts: 3_600,
               posted_by_role: 'provider',

@@ -1,4 +1,4 @@
-// Off-chain Merkle distributor helper - matches the on-chain KnowledgePool verification exactly:
+// Off-chain Merkle distributor helper - matches the on-chain MayhemInferencePool verification exactly:
 //   - leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))))  (OZ StandardMerkleTree
 //     double-hash encoding - second-preimage safe),
 //   - internal nodes = COMMUTATIVE keccak256 (sorted pair), the OZ MerkleProof default.

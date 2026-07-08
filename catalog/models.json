@@ -68,10 +68,10 @@
           "mlx-4bit": "7f3e07ae395c027fc93aec6e81421cff17bcc4385d184f88178c2865fd95be1b"
         }
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 20,
-        "out_per_1k": 60
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "20",
+        "out_per_1k": "60"
       }
     },
     {
@@ -139,10 +139,10 @@
           "gguf-q4_k_m": "c6e8983e4120bcc7f68c7f3185ff44c7e02fc71dcc06b8e8ece7f65bd04a329c"
         }
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 18,
-        "out_per_1k": 55
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "18",
+        "out_per_1k": "55"
       }
     },
     {
@@ -1088,10 +1088,10 @@
           }
         }
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 8,
-        "out_per_1k": 24
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "8",
+        "out_per_1k": "24"
       }
     },
     {
@@ -1900,10 +1900,10 @@
           }
         }
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 18,
-        "out_per_1k": 55
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "18",
+        "out_per_1k": "55"
       }
     },
     {
@@ -2617,10 +2617,10 @@
           }
         }
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 22,
-        "out_per_1k": 66
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "22",
+        "out_per_1k": "66"
       }
     },
     {
@@ -2876,10 +2876,10 @@
           }
         }
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 24,
-        "out_per_1k": 72
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "24",
+        "out_per_1k": "72"
       }
     },
     {
@@ -2959,10 +2959,10 @@
         "match_min": 0.9,
         "verification_method": "attestation_of_compute"
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 2,
-        "out_per_1k": 0
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "2",
+        "out_per_1k": "0"
       }
     },
     {
@@ -3057,10 +3057,10 @@
         "match_min": 0.9,
         "verification_method": "attestation_of_compute"
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
-        "in_per_1k": 4,
-        "out_per_1k": 12
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "4",
+        "out_per_1k": "12"
       }
     },
     {
@@ -3147,17 +3147,17 @@
           }
         }
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
+      "price_ref_au": {
+        "denom": "au_usd",
         "rate_map": [
           {
             "unit": "image",
-            "per_unit_mu": 500,
+            "per_unit_au": "500",
             "granularity": 1
           },
           {
             "unit": "step",
-            "per_unit_mu": 2,
+            "per_unit_au": "2",
             "granularity": 1
           }
         ]
@@ -3242,12 +3242,12 @@
         "match_min": 0.9,
         "verification_method": "attestation_of_compute"
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
+      "price_ref_au": {
+        "denom": "au_usd",
         "rate_map": [
           {
             "unit": "audio_second",
-            "per_unit_mu": 250,
+            "per_unit_au": "250",
             "granularity": 1
           }
         ]
@@ -3346,17 +3346,17 @@
         "match_min": 0.9,
         "verification_method": "attestation_of_compute"
       },
-      "price_ref_mu": {
-        "denom": "mu_usd",
+      "price_ref_au": {
+        "denom": "au_usd",
         "rate_map": [
           {
             "unit": "input_character",
-            "per_unit_mu": 1,
+            "per_unit_au": "1",
             "granularity": 1
           },
           {
             "unit": "audio_second",
-            "per_unit_mu": 100,
+            "per_unit_au": "100",
             "granularity": 1
           }
         ]

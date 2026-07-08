@@ -13,26 +13,25 @@
   },
   "network": {
     "name": "testnet1",
-    "denom": "mu_usd",
+    "denom": "au_usd",
     "msb": {
       "address_prefix": "testtrac",
       "network_id": 919
     }
   },
   "payment_rails": {
-    "ledger_denom": "mu_usd",
+    "ledger_denom": "au_usd",
     "fiat_enabled": true,
     "tap_enabled": true,
     "tnk_enabled": true,
     "stripe_processor_enabled": true,
-    "coinbase_enabled": false,
-    "rails_credit_mu_usd": true,
+    "rails_credit_au_usd": true,
     "paygate_admin_controls_verified": true,
     "evidence": [
       "<file:paygate-health.json#sha256:64-hex#paygate_admin_controls>",
-      "<file:fiat-credit-proof.json#sha256:64-hex#rail:fiat#processor:stripe#credits_mu_usd>",
-      "<file:tap-credit-proof.json#sha256:64-hex#rail:tap#credits_mu_usd>",
-      "<file:tnk-credit-proof.json#sha256:64-hex#rail:tnk#credits_mu_usd>"
+      "<file:fiat-credit-proof.json#sha256:64-hex#rail:fiat#processor:stripe#credits_au_usd>",
+      "<file:tap-credit-proof.json#sha256:64-hex#rail:tap#credits_au_usd>",
+      "<file:tnk-credit-proof.json#sha256:64-hex#rail:tnk#credits_au_usd>"
     ]
   },
   "window": {

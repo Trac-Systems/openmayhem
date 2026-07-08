@@ -1,7 +1,13 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
-import { TerminalHandlers } from 'trac-peer/src/terminal/handlers.js';
 import b4a from 'b4a';
 import ws from 'bare-ws';
+import {
+  isLocalPeer,
+  keyHex,
+  localPeerKey,
+  loopbackSessionInfo,
+  normalizePeerKey,
+} from './loopback.js';
 
 const normalizeText = (value) => {
   if (value === null || value === undefined) return '';
@@ -55,20 +61,6 @@ const matchesFilter = (filter, text) => {
   return filter.some((group) => group.every((word) => haystack.includes(word)));
 };
 
-const keyHex = (value) => {
-  if (!value) return null;
-  if (b4a.isBuffer(value)) return b4a.toString(value, 'hex');
-  if (typeof value === 'string') return value.trim().toLowerCase();
-  if (typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data)) {
-    try {
-      return b4a.toString(b4a.from(value.data), 'hex');
-    } catch (_e) {
-      return null;
-    }
-  }
-  return String(value).trim().toLowerCase();
-};
-
 class ScBridge extends Feature {
   constructor(peer, config = {}) {
     super(peer, config);
@@ -78,7 +70,7 @@ class ScBridge extends Feature {
     this.server = null;
     this.started = false;
     this.clients = new Set();
-    this.cliHandlers = new TerminalHandlers(peer);
+    this.cliHandlers = null;
     this.cliQueue = Promise.resolve();
 
     this.host = typeof config.host === 'string' ? config.host : '127.0.0.1';
@@ -198,6 +190,35 @@ class ScBridge extends Feature {
       }
       this._broadcastToClient(client, payload);
     }
+  }
+
+  _localPeerKey() {
+    return localPeerKey(this.peer, this.info);
+  }
+
+  _isLocalPeer(remote) {
+    return isLocalPeer(remote, this.peer, this.info);
+  }
+
+  _loopbackSessionInfo(remote, sessionId, extra = {}) {
+    return loopbackSessionInfo(remote, sessionId, extra);
+  }
+
+  _emitLoopbackSessionFrame(remote, sessionId, frame) {
+    if (typeof this.directSession?._validateFrame === 'function') {
+      this.directSession._validateFrame(frame);
+    }
+    const session = this._loopbackSessionInfo(remote, sessionId, { opened: true });
+    this.handleSessionFrame({
+      session_id: session.session_id,
+      channel: session.channel,
+      protocol: session.protocol,
+      remote: session.remote,
+      direct: true,
+      relayed: false,
+      frame,
+    });
+    return session;
   }
 
   _sendError(client, error) {
@@ -367,6 +388,17 @@ class ScBridge extends Feature {
         if (this.debug) {
           console.log(`[sc-bridge] client ${client.id} peer_connect ${remote}`);
         }
+        if (this._isLocalPeer(remote)) {
+          reply({
+            type: 'peer_connected',
+            remote: normalizePeerKey(remote),
+            connected: true,
+            direct: true,
+            relayed: false,
+            loopback: true,
+          });
+          return;
+        }
         this.directSession
           .connectPeer(remote, waitMs)
           .then((peer) => reply({ type: 'peer_connected', ...peer }))
@@ -384,6 +416,17 @@ class ScBridge extends Feature {
         const sessionId = String(message.session_id || '').trim();
         if (this.debug) {
           console.log(`[sc-bridge] client ${client.id} session_open ${sessionId} -> ${remote}`);
+        }
+        if (this._isLocalPeer(remote)) {
+          try {
+            reply({
+              type: 'session_opened',
+              ...this._loopbackSessionInfo(remote, sessionId, { opened: true }),
+            });
+          } catch (err) {
+            sendError(err?.message ? `Session open failed: ${err.message}` : 'Session open failed.');
+          }
+          return;
         }
         this.directSession
           .open(remote, sessionId)
@@ -406,6 +449,15 @@ class ScBridge extends Feature {
               `${message.frame?.t || 'frame'} ${sessionId} -> ${remote}`
           );
         }
+        if (this._isLocalPeer(remote)) {
+          try {
+            const session = this._emitLoopbackSessionFrame(remote, sessionId, message.frame);
+            reply({ type: 'session_sent', ...session });
+          } catch (err) {
+            sendError(err?.message ? `Session send failed: ${err.message}` : 'Session send failed.');
+          }
+          return;
+        }
         this.directSession
           .send(remote, sessionId, message.frame)
           .then((session) => reply({ type: 'session_sent', ...session }))
@@ -420,6 +472,13 @@ class ScBridge extends Feature {
           return;
         }
         try {
+          if (this._isLocalPeer(message.remote)) {
+            reply({
+              type: 'session_closed',
+              ...this._loopbackSessionInfo(message.remote, message.session_id, { closed: true }),
+            });
+            return;
+          }
           const result = this.directSession.close(message.remote, message.session_id);
           reply({ type: 'session_closed', ...result });
         } catch (err) {
@@ -472,6 +531,11 @@ class ScBridge extends Feature {
           sendError('Send denied (invite required or invalid).');
           return;
         }
+        this.handleSidechannelMessage(channel, {
+          message: payload,
+          origin: 'local',
+          ts: Date.now(),
+        });
         reply({ type: 'sent', channel });
         return;
       }
@@ -665,32 +729,41 @@ class ScBridge extends Feature {
     return this.cliQueue;
   }
 
+  async _ensureCliHandlers() {
+    if (!this.cliHandlers) {
+      const { TerminalHandlers } = await import('trac-peer/src/terminal/handlers.js');
+      this.cliHandlers = new TerminalHandlers(this.peer);
+    }
+    return this.cliHandlers;
+  }
+
   async _dispatchCli(input) {
+    const cliHandlers = await this._ensureCliHandlers();
     const handlers = [
-      { rule: (line) => line === '/stats', handler: (line) => this.cliHandlers.verifyDag(line) },
+      { rule: (line) => line === '/stats', handler: (line) => cliHandlers.verifyDag(line) },
       { rule: (line) => line === '/help', handler: () => this._printHelpToConsole() },
-      { rule: (line) => line === '/exit', handler: () => this.cliHandlers.exit({}) },
-      { rule: (line) => line === '/get_keys', handler: () => this.cliHandlers.getKeys() },
-      { rule: (line) => line.startsWith('/tx'), handler: (line) => this.cliHandlers.tx(line) },
-      { rule: (line) => line.startsWith('/add_indexer'), handler: (line) => this.cliHandlers.addIndexer(line) },
-      { rule: (line) => line.startsWith('/add_writer'), handler: (line) => this.cliHandlers.addWriter(line) },
-      { rule: (line) => line.startsWith('/remove_writer'), handler: (line) => this.cliHandlers.removeWriter(line) },
-      { rule: (line) => line.startsWith('/remove_indexer'), handler: (line) => this.cliHandlers.removeIndexer(line) },
-      { rule: (line) => line.startsWith('/add_admin'), handler: (line) => this.cliHandlers.addAdmin(line) },
-      { rule: (line) => line.startsWith('/update_admin'), handler: (line) => this.cliHandlers.updateAdmin(line) },
-      { rule: (line) => line.startsWith('/enable_transactions'), handler: (line) => this.cliHandlers.enableTransactions(line) },
-      { rule: (line) => line.startsWith('/set_auto_add_writers'), handler: (line) => this.cliHandlers.setAutoAddWriters(line) },
-      { rule: (line) => line.startsWith('/set_chat_status'), handler: (line) => this.cliHandlers.setChatStatus(line) },
-      { rule: (line) => line.startsWith('/post'), handler: (line) => this.cliHandlers.postMessage(line) },
-      { rule: (line) => line.startsWith('/set_nick'), handler: (line) => this.cliHandlers.setNick(line) },
-      { rule: (line) => line.startsWith('/mute_status'), handler: (line) => this.cliHandlers.muteStatus(line) },
-      { rule: (line) => line.startsWith('/pin_message'), handler: (line) => this.cliHandlers.pinMessage(line) },
-      { rule: (line) => line.startsWith('/unpin_message'), handler: (line) => this.cliHandlers.unpinMessage(line) },
-      { rule: (line) => line.startsWith('/set_mod'), handler: (line) => this.cliHandlers.setMod(line) },
-      { rule: (line) => line.startsWith('/delete_message'), handler: (line) => this.cliHandlers.deleteMessage(line) },
-      { rule: (line) => line.startsWith('/enable_whitelist'), handler: (line) => this.cliHandlers.enableWhitelist(line) },
-      { rule: (line) => line.startsWith('/set_whitelist_status'), handler: (line) => this.cliHandlers.setWhitelistStatus(line) },
-      { rule: (line) => line.startsWith('/deploy_subnet'), handler: (line) => this.cliHandlers.deploySubnet(line) },
+      { rule: (line) => line === '/exit', handler: () => cliHandlers.exit({}) },
+      { rule: (line) => line === '/get_keys', handler: () => cliHandlers.getKeys() },
+      { rule: (line) => line.startsWith('/tx'), handler: (line) => cliHandlers.tx(line) },
+      { rule: (line) => line.startsWith('/add_indexer'), handler: (line) => cliHandlers.addIndexer(line) },
+      { rule: (line) => line.startsWith('/add_writer'), handler: (line) => cliHandlers.addWriter(line) },
+      { rule: (line) => line.startsWith('/remove_writer'), handler: (line) => cliHandlers.removeWriter(line) },
+      { rule: (line) => line.startsWith('/remove_indexer'), handler: (line) => cliHandlers.removeIndexer(line) },
+      { rule: (line) => line.startsWith('/add_admin'), handler: (line) => cliHandlers.addAdmin(line) },
+      { rule: (line) => line.startsWith('/update_admin'), handler: (line) => cliHandlers.updateAdmin(line) },
+      { rule: (line) => line.startsWith('/enable_transactions'), handler: (line) => cliHandlers.enableTransactions(line) },
+      { rule: (line) => line.startsWith('/set_auto_add_writers'), handler: (line) => cliHandlers.setAutoAddWriters(line) },
+      { rule: (line) => line.startsWith('/set_chat_status'), handler: (line) => cliHandlers.setChatStatus(line) },
+      { rule: (line) => line.startsWith('/post'), handler: (line) => cliHandlers.postMessage(line) },
+      { rule: (line) => line.startsWith('/set_nick'), handler: (line) => cliHandlers.setNick(line) },
+      { rule: (line) => line.startsWith('/mute_status'), handler: (line) => cliHandlers.muteStatus(line) },
+      { rule: (line) => line.startsWith('/pin_message'), handler: (line) => cliHandlers.pinMessage(line) },
+      { rule: (line) => line.startsWith('/unpin_message'), handler: (line) => cliHandlers.unpinMessage(line) },
+      { rule: (line) => line.startsWith('/set_mod'), handler: (line) => cliHandlers.setMod(line) },
+      { rule: (line) => line.startsWith('/delete_message'), handler: (line) => cliHandlers.deleteMessage(line) },
+      { rule: (line) => line.startsWith('/enable_whitelist'), handler: (line) => cliHandlers.enableWhitelist(line) },
+      { rule: (line) => line.startsWith('/set_whitelist_status'), handler: (line) => cliHandlers.setWhitelistStatus(line) },
+      { rule: (line) => line.startsWith('/deploy_subnet'), handler: (line) => cliHandlers.deploySubnet(line) },
       { rule: () => true, handler: (line) => this.peer?.protocol?.instance?.customCommand(line) },
     ];
 

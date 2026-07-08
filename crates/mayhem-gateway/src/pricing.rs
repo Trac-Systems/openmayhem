@@ -1,4 +1,6 @@
-use mayhem_proto::{ReceiptUsage, USAGE_CACHED_INPUT_TOKEN, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN};
+use mayhem_proto::{
+    MoneyAu, ReceiptUsage, USAGE_CACHED_INPUT_TOKEN, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+};
 
 pub use mayhem_proto::RateMapEntry;
 
@@ -7,36 +9,35 @@ pub const CACHED_INPUT_TOKEN_UNIT: &str = USAGE_CACHED_INPUT_TOKEN;
 pub const OUTPUT_TOKEN_UNIT: &str = USAGE_OUTPUT_TOKEN;
 pub const CACHED_INPUT_TOKEN_RATE_BPS: u64 = 2_500;
 
-pub fn text_generation_rate_map(in_per_1k_mu: u64, out_per_1k_mu: u64) -> Vec<RateMapEntry> {
+pub fn text_generation_rate_map(in_per_1k_au: MoneyAu, out_per_1k_au: MoneyAu) -> Vec<RateMapEntry> {
     vec![
         RateMapEntry {
             unit: INPUT_TOKEN_UNIT.to_owned(),
-            per_unit_mu: in_per_1k_mu,
+            per_unit_au: in_per_1k_au,
             granularity: 1_000,
         },
         RateMapEntry {
             unit: CACHED_INPUT_TOKEN_UNIT.to_owned(),
-            per_unit_mu: discounted_cached_input_rate_mu(in_per_1k_mu),
+            per_unit_au: discounted_cached_input_rate_au(in_per_1k_au),
             granularity: 1_000,
         },
         RateMapEntry {
             unit: OUTPUT_TOKEN_UNIT.to_owned(),
-            per_unit_mu: out_per_1k_mu,
+            per_unit_au: out_per_1k_au,
             granularity: 1_000,
         },
     ]
 }
 
-pub fn discounted_cached_input_rate_mu(in_per_1k_mu: u64) -> u64 {
-    if in_per_1k_mu == 0 {
+pub fn discounted_cached_input_rate_au(in_per_1k_au: MoneyAu) -> MoneyAu {
+    if in_per_1k_au == 0 {
         return 0;
     }
     ceil_div_u128(
-        u128::from(in_per_1k_mu).saturating_mul(u128::from(CACHED_INPUT_TOKEN_RATE_BPS)),
+        in_per_1k_au.saturating_mul(u128::from(CACHED_INPUT_TOKEN_RATE_BPS)),
         10_000,
     )
     .max(1)
-    .min(u128::from(u64::MAX)) as u64
 }
 
 pub fn normalize_rate_map(mut rate_map: Vec<RateMapEntry>) -> Vec<RateMapEntry> {
@@ -48,48 +49,47 @@ pub fn rate_for_unit<'a>(rate_map: &'a [RateMapEntry], unit: &str) -> Option<&'a
     rate_map.iter().find(|entry| entry.unit == unit)
 }
 
-pub fn text_rate_per_1k_mu(rate_map: &[RateMapEntry], unit: &str) -> u64 {
+pub fn text_rate_per_1k_au(rate_map: &[RateMapEntry], unit: &str) -> MoneyAu {
     rate_for_unit(rate_map, unit)
         .map(|entry| {
             if entry.granularity == 0 {
                 0
             } else {
                 ceil_div_u128(
-                    u128::from(entry.per_unit_mu).saturating_mul(1_000),
+                    entry.per_unit_au.saturating_mul(1_000),
                     u128::from(entry.granularity),
                 )
-                .min(u128::from(u64::MAX)) as u64
             }
         })
         .unwrap_or(0)
 }
 
-pub fn text_usage_mu(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> u64 {
-    usage_map_mu(rate_map, usage)
+pub fn text_usage_au(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> MoneyAu {
+    usage_map_au(rate_map, usage)
 }
 
-pub fn priced_usage_mu(
+pub fn priced_usage_au(
     rate_map: &[RateMapEntry],
-    per_req_mu: u64,
-    min_session_mu: u64,
+    per_req_au: MoneyAu,
+    min_session_au: MoneyAu,
     usage: &ReceiptUsage,
-) -> u64 {
-    usage_map_mu(rate_map, usage)
-        .saturating_add(per_req_mu)
-        .max(min_session_mu)
+) -> MoneyAu {
+    usage_map_au(rate_map, usage)
+        .saturating_add(per_req_au)
+        .max(min_session_au)
 }
 
-pub fn usage_map_mu(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> u64 {
+pub fn usage_map_au(rate_map: &[RateMapEntry], usage: &ReceiptUsage) -> MoneyAu {
     let counts = usage
         .units()
         .iter()
         .map(|(unit, count)| (unit.as_str(), *count))
         .collect::<Vec<_>>();
-    usage_units_mu(rate_map, &counts)
+    usage_units_au(rate_map, &counts)
 }
 
-pub fn text_units_mu(rate_map: &[RateMapEntry], in_tokens: u64, out_tokens: u64) -> u64 {
-    usage_units_mu(
+pub fn text_units_au(rate_map: &[RateMapEntry], in_tokens: u64, out_tokens: u64) -> MoneyAu {
+    usage_units_au(
         rate_map,
         &[
             (INPUT_TOKEN_UNIT, in_tokens),
@@ -98,17 +98,17 @@ pub fn text_units_mu(rate_map: &[RateMapEntry], in_tokens: u64, out_tokens: u64)
     )
 }
 
-pub fn usage_units_mu(rate_map: &[RateMapEntry], counts: &[(&str, u64)]) -> u64 {
+pub fn usage_units_au(rate_map: &[RateMapEntry], counts: &[(&str, u64)]) -> MoneyAu {
     let mut priced = counts
         .iter()
         .filter_map(|(unit, count)| {
             let rate = rate_for_unit(rate_map, unit)?;
-            if *count == 0 || rate.per_unit_mu == 0 || rate.granularity == 0 {
+            if *count == 0 || rate.per_unit_au == 0 || rate.granularity == 0 {
                 return None;
             }
             Some((
                 u128::from(*count),
-                u128::from(rate.per_unit_mu),
+                rate.per_unit_au,
                 rate.granularity,
             ))
         })
@@ -127,7 +127,7 @@ pub fn usage_units_mu(rate_map: &[RateMapEntry], counts: &[(&str, u64)]) -> u64 
         let raw = priced.iter().fold(0u128, |acc, (count, per_unit, _)| {
             acc.saturating_add(count.saturating_mul(*per_unit))
         });
-        return ceil_div_u128(raw, granularity).min(u128::from(u64::MAX)) as u64;
+        return ceil_div_u128(raw, granularity);
     }
 
     priced
@@ -138,10 +138,9 @@ pub fn usage_units_mu(rate_map: &[RateMapEntry], counts: &[(&str, u64)]) -> u64 
                 u128::from(*granularity),
             ))
         })
-        .min(u128::from(u64::MAX)) as u64
 }
 
-pub fn rate_map_cost_basis_per_1k(rate_map: &[RateMapEntry]) -> u64 {
+pub fn rate_map_cost_basis_per_1k(rate_map: &[RateMapEntry]) -> MoneyAu {
     rate_map
         .iter()
         .fold(0u128, |acc, entry| {
@@ -149,12 +148,11 @@ pub fn rate_map_cost_basis_per_1k(rate_map: &[RateMapEntry]) -> u64 {
                 acc
             } else {
                 acc.saturating_add(ceil_div_u128(
-                    u128::from(entry.per_unit_mu).saturating_mul(1_000),
+                    entry.per_unit_au.saturating_mul(1_000),
                     u128::from(entry.granularity),
                 ))
             }
         })
-        .min(u128::from(u64::MAX)) as u64
 }
 
 fn ceil_div_u128(value: u128, divisor: u128) -> u128 {
@@ -178,7 +176,7 @@ mod tests {
         let rate_map = text_generation_rate_map(20, 60);
         let usage = ReceiptUsage::text(100, 250);
 
-        assert_eq!(usage_map_mu(&rate_map, &usage), 17);
+        assert_eq!(usage_map_au(&rate_map, &usage), 17);
     }
 
     #[test]
@@ -189,10 +187,10 @@ mod tests {
         assert_eq!(
             rate_for_unit(&rate_map, USAGE_CACHED_INPUT_TOKEN)
                 .unwrap()
-                .per_unit_mu,
+                .per_unit_au,
             5
         );
-        assert_eq!(usage_map_mu(&rate_map, &usage), 19);
+        assert_eq!(usage_map_au(&rate_map, &usage), 19);
     }
 
     #[test]
@@ -205,12 +203,12 @@ mod tests {
         let rate_map = vec![
             RateMapEntry {
                 unit: USAGE_IMAGE.to_owned(),
-                per_unit_mu: 500,
+                per_unit_au: 500,
                 granularity: 1,
             },
             RateMapEntry {
                 unit: USAGE_STEP.to_owned(),
-                per_unit_mu: 2,
+                per_unit_au: 2,
                 granularity: 1,
             },
         ];
@@ -219,7 +217,7 @@ mod tests {
             serde_json::to_value(&usage).unwrap(),
             serde_json::json!({ "image": 2, "step": 60 })
         );
-        assert_eq!(usage_map_mu(&rate_map, &usage), 1_120);
+        assert_eq!(usage_map_au(&rate_map, &usage), 1_120);
     }
 
     #[test]
@@ -232,12 +230,12 @@ mod tests {
         let rate_map = vec![
             RateMapEntry {
                 unit: USAGE_INPUT_CHARACTER.to_owned(),
-                per_unit_mu: 1,
+                per_unit_au: 1,
                 granularity: 1,
             },
             RateMapEntry {
                 unit: USAGE_AUDIO_SECOND.to_owned(),
-                per_unit_mu: 100,
+                per_unit_au: 100,
                 granularity: 1,
             },
         ];
@@ -246,6 +244,6 @@ mod tests {
             serde_json::to_value(&usage).unwrap(),
             serde_json::json!({ "audio_second": 3, "input_character": 12 })
         );
-        assert_eq!(usage_map_mu(&rate_map, &usage), 312);
+        assert_eq!(usage_map_au(&rate_map, &usage), 312);
     }
 }

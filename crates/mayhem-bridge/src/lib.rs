@@ -255,6 +255,10 @@ impl ScBridgeClient {
         self.next_event_of_type("session_frame", wait).await
     }
 
+    pub fn requeue_event_front(&mut self, event: Value) {
+        self.queued_events.push_front(event);
+    }
+
     async fn next_event_of_type(&mut self, expected_type: &str, wait: Duration) -> Result<Value> {
         timeout(wait, async {
             loop {

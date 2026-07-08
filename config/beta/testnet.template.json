@@ -60,7 +60,6 @@
     "health_path": "/v1/health",
     "tnk_treasury_address": "<testtrac1-network-treasury-address>",
     "stripe_enabled": true,
-    "coinbase_enabled": false,
     "checkout_urls": {
       "stripe": {
         "success_url": "<https://paygate.testnet.example/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}>",

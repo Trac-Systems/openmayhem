@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use mayhem_proto::{
-    default_model_class, DEFAULT_MODEL_CLASS, USAGE_AUDIO_SECOND, USAGE_IMAGE,
+    default_model_class, MoneyAu, DEFAULT_MODEL_CLASS, USAGE_AUDIO_SECOND, USAGE_IMAGE,
     USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,7 @@ pub(crate) struct CatalogModel {
     #[serde(default)]
     pub(crate) adapter: CatalogAdapter,
     pub(crate) canary: CanaryRef,
-    pub(crate) price_ref_mu: PriceRef,
+    pub(crate) price_ref_au: PriceRef,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,10 +270,10 @@ pub(crate) struct CanaryRef {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PriceRef {
     pub(crate) denom: String,
-    #[serde(default)]
-    pub(crate) in_per_1k: u64,
-    #[serde(default)]
-    pub(crate) out_per_1k: u64,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub(crate) in_per_1k: MoneyAu,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub(crate) out_per_1k: MoneyAu,
     #[serde(default)]
     pub(crate) rate_map: Vec<CatalogRateMapEntry>,
 }
@@ -281,7 +281,8 @@ pub(crate) struct PriceRef {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CatalogRateMapEntry {
     pub(crate) unit: String,
-    pub(crate) per_unit_mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub(crate) per_unit_au: MoneyAu,
     pub(crate) granularity: u64,
 }
 
@@ -654,9 +655,9 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     validate_canary_verification(model, errors);
-    if model.price_ref_mu.denom != "mu_usd" {
+    if model.price_ref_au.denom != "au_usd" {
         errors.push(format!(
-            "{} price_ref_mu.denom must be mu_usd",
+            "{} price_ref_au.denom must be au_usd",
             model.model_id
         ));
     }
@@ -664,19 +665,19 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
 }
 
 fn validate_price_ref(model: &CatalogModel, errors: &mut Vec<String>) {
-    if !model.price_ref_mu.rate_map.is_empty() {
+    if !model.price_ref_au.rate_map.is_empty() {
         validate_price_rate_map(model, errors);
         return;
     }
-    if model.price_ref_mu.in_per_1k == 0 {
+    if model.price_ref_au.in_per_1k == 0 {
         errors.push(format!(
-            "{} price_ref_mu.in_per_1k must be positive",
+            "{} price_ref_au.in_per_1k must be positive",
             model.model_id
         ));
     }
-    if model.model_class != "embedding" && model.price_ref_mu.out_per_1k == 0 {
+    if model.model_class != "embedding" && model.price_ref_au.out_per_1k == 0 {
         errors.push(format!(
-            "{} price_ref_mu.out_per_1k must be positive for non-embedding models",
+            "{} price_ref_au.out_per_1k must be positive for non-embedding models",
             model.model_id
         ));
     }
@@ -684,29 +685,29 @@ fn validate_price_ref(model: &CatalogModel, errors: &mut Vec<String>) {
 
 fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
     let mut units = BTreeSet::new();
-    for entry in &model.price_ref_mu.rate_map {
+    for entry in &model.price_ref_au.rate_map {
         if entry.unit.trim().is_empty() {
             errors.push(format!(
-                "{} price_ref_mu.rate_map unit is required",
+                "{} price_ref_au.rate_map unit is required",
                 model.model_id
             ));
             continue;
         }
         if !units.insert(entry.unit.as_str()) {
             errors.push(format!(
-                "{} price_ref_mu.rate_map duplicates unit {}",
+                "{} price_ref_au.rate_map duplicates unit {}",
                 model.model_id, entry.unit
             ));
         }
-        if entry.per_unit_mu == 0 {
+        if entry.per_unit_au == 0 {
             errors.push(format!(
-                "{} price_ref_mu.rate_map {} per_unit_mu must be positive",
+                "{} price_ref_au.rate_map {} per_unit_au must be positive",
                 model.model_id, entry.unit
             ));
         }
         if entry.granularity == 0 {
             errors.push(format!(
-                "{} price_ref_mu.rate_map {} granularity must be positive",
+                "{} price_ref_au.rate_map {} granularity must be positive",
                 model.model_id, entry.unit
             ));
         }
@@ -722,7 +723,7 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
     for unit in required_units {
         if !units.contains(unit) {
             errors.push(format!(
-                "{} price_ref_mu.rate_map missing required unit {}",
+                "{} price_ref_au.rate_map missing required unit {}",
                 model.model_id, unit
             ));
         }
@@ -1975,8 +1976,8 @@ mod tests {
                 token_prefixes: BTreeMap::new(),
                 perceptual_hashes: BTreeMap::new(),
             },
-            price_ref_mu: PriceRef {
-                denom: "mu_usd".to_owned(),
+            price_ref_au: PriceRef {
+                denom: "au_usd".to_owned(),
                 in_per_1k: 1,
                 out_per_1k: 1,
                 rate_map: Vec::new(),
@@ -2180,7 +2181,7 @@ mod tests {
         );
         model.adapter.request_shape_family = "openai_embeddings".to_owned();
         model.adapter.response_normalization = "openai_embeddings".to_owned();
-        model.price_ref_mu.out_per_1k = 0;
+        model.price_ref_au.out_per_1k = 0;
 
         let mut errors = Vec::new();
         validate_model(&model, &mut errors);
@@ -2211,11 +2212,11 @@ mod tests {
                 perceptual_hashes: BTreeMap::new(),
             },
         );
-        text_with_zero_output.price_ref_mu.out_per_1k = 0;
+        text_with_zero_output.price_ref_au.out_per_1k = 0;
         let mut errors = Vec::new();
         validate_model(&text_with_zero_output, &mut errors);
         assert!(errors.iter().any(|error| error
-            .contains("price_ref_mu.out_per_1k must be positive for non-embedding models")));
+            .contains("price_ref_au.out_per_1k must be positive for non-embedding models")));
     }
 
     #[test]
@@ -2238,17 +2239,17 @@ mod tests {
         model.adapter.response_normalization = "openai_images".to_owned();
         model.adapter.tool_call_strategy = "none".to_owned();
         model.adapter.modality_set = vec!["image".to_owned()];
-        model.price_ref_mu.in_per_1k = 0;
-        model.price_ref_mu.out_per_1k = 0;
-        model.price_ref_mu.rate_map = vec![
+        model.price_ref_au.in_per_1k = 0;
+        model.price_ref_au.out_per_1k = 0;
+        model.price_ref_au.rate_map = vec![
             CatalogRateMapEntry {
                 unit: USAGE_IMAGE.to_owned(),
-                per_unit_mu: 500,
+                per_unit_au: 500,
                 granularity: 1,
             },
             CatalogRateMapEntry {
                 unit: USAGE_STEP.to_owned(),
-                per_unit_mu: 2,
+                per_unit_au: 2,
                 granularity: 1,
             },
         ];
@@ -2259,14 +2260,14 @@ mod tests {
 
         let mut missing_step_price = model.clone();
         missing_step_price
-            .price_ref_mu
+            .price_ref_au
             .rate_map
             .retain(|entry| entry.unit != USAGE_STEP);
         let mut errors = Vec::new();
         validate_model(&missing_step_price, &mut errors);
         assert!(errors
             .iter()
-            .any(|error| { error.contains("price_ref_mu.rate_map missing required unit step") }));
+            .any(|error| { error.contains("price_ref_au.rate_map missing required unit step") }));
 
         let mut wrong_shape = model.clone();
         wrong_shape.adapter.request_shape_family = "openai_chat".to_owned();
@@ -2398,8 +2399,8 @@ mod tests {
                 ..CatalogAdapter::default()
             },
             canary,
-            price_ref_mu: PriceRef {
-                denom: "mu_usd".to_owned(),
+            price_ref_au: PriceRef {
+                denom: "au_usd".to_owned(),
                 in_per_1k: 1,
                 out_per_1k: 1,
                 rate_map: Vec::new(),

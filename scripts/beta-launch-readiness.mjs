@@ -311,9 +311,8 @@ function checkCanary(manifest) {
 function expectedPaygateControls(manifest) {
   return {
     ok: true,
-    denom: 'mu_usd',
+    denom: 'au_usd',
     stripe_enabled: manifest.paygate?.stripe_enabled,
-    coinbase_enabled: manifest.paygate?.coinbase_enabled,
     controls: manifest.controls || {},
   };
 }
@@ -370,7 +369,6 @@ async function checkPaygate(manifest, args) {
       response.json?.ok === expected.ok &&
       response.json?.denom === expected.denom &&
       rails.stripe?.enabled === expected.stripe_enabled &&
-      rails.coinbase?.enabled === expected.coinbase_enabled &&
       controls.admin_controls_economy === expected.controls.admin_controls_economy &&
       controls.admin_sets_prices === expected.controls.admin_sets_prices &&
       controls.admin_sets_rules === expected.controls.admin_sets_rules &&
@@ -398,7 +396,7 @@ async function checkPaygate(manifest, args) {
       )
       : advisory(
         'paygate.public_health',
-        'public paygate health did not match mu_usd processor/admin-control flags; Stripe checkout handoff evidence remains sufficient for beta',
+        'public paygate health did not match au_usd processor/admin-control flags; Stripe checkout handoff evidence remains sufficient for beta',
         {
           url: url.href,
           status_code: response.status,

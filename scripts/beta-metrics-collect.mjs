@@ -26,7 +26,7 @@ Accepted evidence shapes are intentionally plain:
 - launch-manifest: a strict P8.4 beta launch manifest accepted by scripts/beta-launch.mjs
 - epoch: mayhem receipts export --json output, recompute-epoch-roots output, or roots record
 - canonical-service: contract-state audit proving admin enclaves/rooms and provider joins
-- payment-rails: rail report proving fiat, TAP, and TNK credit mu_usd; Stripe is only the fiat processor; Coinbase is retired and must remain coinbase_enabled:false
+- payment-rails: rail report proving fiat, TAP, and TNK credit au_usd; Stripe is only the fiat processor
 - guardian: small summary JSON; the source file hash is recorded as evidence
 - canary: small summary JSON; the source file hash is recorded as evidence
 - browser: small summary JSON; browser handoffs may also be a text log`);
@@ -561,8 +561,7 @@ function collectPaymentRails(args) {
     tap_enabled: firstDefined(record, ['tap_enabled', 'tap.enabled', 'rails.tap.enabled']) === true,
     tnk_enabled: firstDefined(record, ['tnk_enabled', 'tnk.enabled', 'rails.tnk.enabled']) === true,
     stripe_processor_enabled: stripeProcessorEnabled,
-    coinbase_enabled: false,
-    rails_credit_mu_usd: firstDefined(record, ['rails_credit_mu_usd', 'credit_mu_usd', 'credits_mu_usd']) === true,
+    rails_credit_au_usd: firstDefined(record, ['rails_credit_au_usd', 'credit_au_usd', 'credits_au_usd']) === true,
     paygate_admin_controls_verified:
       firstDefined(record, ['paygate_admin_controls_verified', 'admin_economy_controls_verified']) === true
       || paygateAdminControlsVerified(value),
@@ -611,7 +610,7 @@ function buildMetrics(args) {
     launch,
     network: {
       name: 'testnet1',
-      denom: 'mu_usd',
+      denom: 'au_usd',
       msb: {
         address_prefix: 'testtrac',
         network_id: 919,

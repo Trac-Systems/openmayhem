@@ -144,23 +144,23 @@ const evidence = {
   [`ev/dep/${r.epoch}`]: {
     merkle_root: r.roots.dep,
     count: r.totals.dep_count,
-    mu_total: r.totals.dep_mu,
+    au_total: r.totals.dep_au,
   },
   [`ev/use/${r.epoch}`]: {
     merkle_root: r.roots.use,
     sessions: r.totals.use_count,
-    mu_total: r.totals.use_mu,
+    au_total: r.totals.use_au,
     providers: r.totals.provider_count,
   },
   [`ev/earn/${r.epoch}`]: {
     merkle_root: r.roots.earn,
     provider_count: r.totals.provider_count,
-    mu_cum_total: r.totals.earn_mu,
+    au_cum_total: r.totals.earn_au,
   },
   [`ev/fee/${r.epoch}`]: {
     merkle_root: r.roots.fee,
-    mu_fee_epoch: r.totals.fee_mu,
-    mu_fee_cum: r.totals.fee_cum_mu,
+    au_fee_epoch: r.totals.fee_au,
+    au_fee_cum: r.totals.fee_cum_au,
   },
 };
 fs.writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
@@ -199,8 +199,8 @@ console.log(JSON.stringify({
   epoch: recomputed.epoch,
   fee_bps: recomputed.params.fee_bps,
   receipts: report.bundle.receipts.length,
-  use_mu: recomputed.totals.use_mu,
-  fee_mu: recomputed.totals.fee_mu,
+  use_au: recomputed.totals.use_au,
+  fee_au: recomputed.totals.fee_au,
   checks: report.checks.length,
   bundle_path: report.bundle_path,
 }, null, 2));

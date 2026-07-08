@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import DirectSession from '../features/direct-session/index.js';
+import { isLocalPeer, loopbackSessionInfo } from '../features/sc-bridge/loopback.js';
 
 const sessionId = 'ab'.repeat(32);
 const remote = 'cd'.repeat(32);
+const localPeer = '12'.repeat(32);
 
 test('DirectSession exposes raised mx/s rate limits without relay semantics', () => {
   const directSession = new DirectSession({}, {});
@@ -80,4 +82,27 @@ test('DirectSession receive bucket drops frames beyond the mx/s burst', () => {
   assert.equal(frames[0].direct, true);
   assert.equal(frames[0].relayed, false);
   assert.deepEqual(frames[0].frame, frame);
+});
+
+test('ScBridge loopback helpers identify local direct session routes', () => {
+  const peer = { wallet: { publicKey: localPeer.toUpperCase() } };
+  assert.equal(isLocalPeer(localPeer, peer, null), true);
+  assert.equal(isLocalPeer(remote, peer, null), false);
+  assert.equal(isLocalPeer(localPeer, {}, { peerPubkey: localPeer }), true);
+
+  assert.deepEqual(loopbackSessionInfo(localPeer.toUpperCase(), sessionId.toUpperCase(), {
+    opened: true,
+  }), {
+    session_id: sessionId,
+    channel: `mx/s/${sessionId}`,
+    protocol: 'mx/s',
+    remote: localPeer,
+    direct: true,
+    relayed: false,
+    loopback: true,
+    opened: true,
+  });
+
+  assert.throws(() => loopbackSessionInfo('bad', sessionId), /Invalid remote peer key/);
+  assert.throws(() => loopbackSessionInfo(localPeer, 'bad'), /Invalid session_id/);
 });

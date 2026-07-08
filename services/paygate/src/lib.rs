@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -23,31 +23,31 @@ use axum::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use hmac::{Hmac, Mac};
+use mayhem_proto::MoneyAu;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{net::TcpListener, sync::Mutex, time::sleep};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const SERVICE_NAME: &str = "mayhem-paygate";
 pub const SERVICE_VERSION: u32 = 1;
-pub const CREDIT_DENOM: &str = "mu_usd";
+pub const CREDIT_DENOM: &str = "au_usd";
 pub const DEFAULT_BIND: &str = "127.0.0.1:11436";
 pub const DEFAULT_CONTRACT_RPC_URL: &str = "http://127.0.0.1:49223/v1";
 pub const DEFAULT_STRIPE_API_BASE_URL: &str = "https://api.stripe.com";
-pub const DEFAULT_COINBASE_COMMERCE_API_BASE_URL: &str = "https://api.commerce.coinbase.com";
-pub const COINBASE_RETIRED_MESSAGE: &str =
-    "Coinbase Commerce is retired for Mayhem; use Stripe fiat checkout or TAP.";
 pub const DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS: u64 = 300;
+pub const DEFAULT_STRIPE_BACKFILL_INTERVAL_SECONDS: u64 = 300;
 pub const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
-pub const MU_PER_USD_CENT: u64 = 10_000;
+pub const AU_PER_USD_CENT: MoneyAu = 10_000_000_000_000_000;
 pub const STRIPE_MIN_USD_CENTS: u64 = 50;
 pub const DEFAULT_STRIPE_CURRENCY: &str = "usd";
 pub const DEFAULT_STRIPE_LOCALE: &str = "en";
+const HANDLED_STRIPE_EVENT_TYPES: &[&str] = &["payment_intent.succeeded", "charge.dispute.created"];
 
 type HmacSha256 = Hmac<Sha256>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -70,8 +70,6 @@ pub enum PaygateError {
     InvalidConfig(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
-    #[error("{0}")]
-    RailRetired(&'static str),
     #[error("Stripe error: {0}")]
     Stripe(String),
     #[error("Stripe signature error: {0}")]
@@ -95,7 +93,6 @@ pub struct PaygateConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RailConfig {
     pub stripe: StripeSettings,
-    pub coinbase: CoinbaseSettings,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -112,6 +109,9 @@ pub struct StripeSettings {
     pub api_base_url: String,
     pub event_store_path: PathBuf,
     pub webhook_tolerance_seconds: u64,
+    pub backfill_enabled: bool,
+    pub backfill_cursor_path: PathBuf,
+    pub backfill_interval_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -120,15 +120,6 @@ pub enum StripeMode {
     #[default]
     Test,
     Live,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CoinbaseSettings {
-    pub enabled: bool,
-    pub api_key: Option<String>,
-    pub webhook_secret: Option<String>,
-    pub api_base_url: String,
-    pub event_store_path: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -141,8 +132,6 @@ struct ConfigFile {
     oracle: OracleConfigFile,
     #[serde(default)]
     stripe: StripeConfigFile,
-    #[serde(default)]
-    coinbase: CoinbaseConfigFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -171,15 +160,9 @@ struct StripeConfigFile {
     api_base_url: Option<String>,
     event_store_path: Option<PathBuf>,
     webhook_tolerance_seconds: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct CoinbaseConfigFile {
-    enabled: Option<bool>,
-    api_key: Option<String>,
-    webhook_secret: Option<String>,
-    api_base_url: Option<String>,
-    event_store_path: Option<PathBuf>,
+    backfill_enabled: Option<bool>,
+    backfill_cursor_path: Option<PathBuf>,
+    backfill_interval_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -234,7 +217,6 @@ struct HealthContract {
 #[derive(Debug, Serialize)]
 struct HealthRails {
     stripe: HealthStripeRail,
-    coinbase: HealthCoinbaseRail,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,14 +225,7 @@ struct HealthStripeRail {
     mode: &'static str,
     api_configured: bool,
     webhook_configured: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct HealthCoinbaseRail {
-    enabled: bool,
-    api_configured: bool,
-    webhook_configured: bool,
-    retired: bool,
+    backfill_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -275,7 +250,8 @@ struct HealthControls {
 #[derive(Debug, Deserialize)]
 pub struct StripeCreatePaymentIntentRequest {
     pub who: String,
-    pub mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub au: MoneyAu,
     #[serde(default)]
     pub currency: Option<String>,
     #[serde(default)]
@@ -285,7 +261,8 @@ pub struct StripeCreatePaymentIntentRequest {
 #[derive(Debug, Deserialize)]
 pub struct StripeCreateCheckoutSessionRequest {
     pub who: String,
-    pub mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub au: MoneyAu,
     pub success_url: String,
     pub cancel_url: String,
     #[serde(default)]
@@ -303,7 +280,8 @@ pub struct StripeCreatePaymentIntentResponse {
     pub processor_rail: &'static str,
     pub denom: &'static str,
     pub who: String,
-    pub mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub au: MoneyAu,
     pub payment_intent: StripePaymentIntentSummary,
 }
 
@@ -314,7 +292,8 @@ pub struct StripeCreateCheckoutSessionResponse {
     pub processor_rail: &'static str,
     pub denom: &'static str,
     pub who: String,
-    pub mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub au: MoneyAu,
     pub checkout_session: StripeCheckoutSessionSummary,
     pub copy_paste: CheckoutCopyPaste,
 }
@@ -350,7 +329,8 @@ pub struct FiatDepositFeature {
     pub op: &'static str,
     pub rail: &'static str,
     pub who: String,
-    pub mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub au: MoneyAu,
     pub ext_ref_hash: String,
     pub fiat_currency: String,
     pub fiat_amount_minor: u64,
@@ -363,7 +343,8 @@ pub struct FiatChargebackFeature {
     pub op: &'static str,
     pub rail: &'static str,
     pub who: String,
-    pub mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub au: MoneyAu,
     pub ext_ref_hash: String,
     pub dispute_ref_hash: String,
     pub fiat_currency: String,
@@ -425,10 +406,34 @@ struct StripeWebhookResponse {
     charge: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dispute: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mu: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "mayhem_proto::optional_decimal_u128"
+    )]
+    au: Option<MoneyAu>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contract: Option<ContractPostResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StripeBackfillCursor {
+    schema_version: u32,
+    last_created: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StripeBackfillReport {
+    pub ok: bool,
+    pub fetched: usize,
+    pub processed: usize,
+    pub duplicates: usize,
+    pub credited: usize,
+    pub clawed_back: usize,
+    pub ignored: usize,
+    pub cursor_path: PathBuf,
+    pub previous_last_created: u64,
+    pub last_created: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -443,7 +448,8 @@ struct StripeEventRecord {
     #[serde(default)]
     dispute: Option<String>,
     who: String,
-    mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    au: MoneyAu,
     #[serde(default)]
     currency: Option<String>,
     #[serde(default)]
@@ -510,18 +516,9 @@ impl Default for StripeSettings {
             api_base_url: DEFAULT_STRIPE_API_BASE_URL.to_owned(),
             event_store_path: default_stripe_event_store_path(),
             webhook_tolerance_seconds: DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
-        }
-    }
-}
-
-impl Default for CoinbaseSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: None,
-            webhook_secret: None,
-            api_base_url: DEFAULT_COINBASE_COMMERCE_API_BASE_URL.to_owned(),
-            event_store_path: default_coinbase_event_store_path(),
+            backfill_enabled: true,
+            backfill_cursor_path: default_stripe_backfill_cursor_path(),
+            backfill_interval_seconds: DEFAULT_STRIPE_BACKFILL_INTERVAL_SECONDS,
         }
     }
 }
@@ -595,6 +592,14 @@ impl PaygateConfig {
                     "stripe.webhook_tolerance_seconds cannot be zero".to_owned(),
                 ));
             }
+            if self.rails.stripe.backfill_enabled
+                && self.rails.stripe.backfill_interval_seconds == 0
+            {
+                return Err(PaygateError::InvalidConfig(
+                    "stripe.backfill_interval_seconds cannot be zero when backfill is enabled"
+                        .to_owned(),
+                ));
+            }
             if self.rails.stripe.mode == StripeMode::Live {
                 if self.rails.stripe.api_base_url.trim_end_matches('/')
                     != DEFAULT_STRIPE_API_BASE_URL
@@ -615,11 +620,6 @@ impl PaygateConfig {
                     ));
                 }
             }
-        }
-        if self.rails.coinbase.enabled {
-            return Err(PaygateError::InvalidConfig(
-                COINBASE_RETIRED_MESSAGE.to_owned(),
-            ));
         }
         Ok(())
     }
@@ -667,20 +667,14 @@ impl PaygateConfig {
         if let Some(tolerance) = file.stripe.webhook_tolerance_seconds {
             self.rails.stripe.webhook_tolerance_seconds = tolerance;
         }
-        if let Some(enabled) = file.coinbase.enabled {
-            self.rails.coinbase.enabled = enabled;
+        if let Some(enabled) = file.stripe.backfill_enabled {
+            self.rails.stripe.backfill_enabled = enabled;
         }
-        if let Some(api_key) = file.coinbase.api_key {
-            self.rails.coinbase.api_key = Some(api_key);
+        if let Some(path) = file.stripe.backfill_cursor_path {
+            self.rails.stripe.backfill_cursor_path = expand_home(path);
         }
-        if let Some(webhook_secret) = file.coinbase.webhook_secret {
-            self.rails.coinbase.webhook_secret = Some(webhook_secret);
-        }
-        if let Some(api_base_url) = file.coinbase.api_base_url {
-            self.rails.coinbase.api_base_url = api_base_url;
-        }
-        if let Some(path) = file.coinbase.event_store_path {
-            self.rails.coinbase.event_store_path = expand_home(path);
+        if let Some(seconds) = file.stripe.backfill_interval_seconds {
+            self.rails.stripe.backfill_interval_seconds = seconds;
         }
         Ok(())
     }
@@ -723,20 +717,16 @@ impl PaygateConfig {
             self.rails.stripe.webhook_tolerance_seconds =
                 parse_u64("MAYHEM_STRIPE_WEBHOOK_TOLERANCE_SECONDS", &tolerance)?;
         }
-        if let Ok(enabled) = env::var("MAYHEM_PAYGATE_COINBASE_ENABLED") {
-            self.rails.coinbase.enabled = parse_bool("MAYHEM_PAYGATE_COINBASE_ENABLED", &enabled)?;
+        if let Ok(enabled) = env::var("MAYHEM_STRIPE_BACKFILL_ENABLED") {
+            self.rails.stripe.backfill_enabled =
+                parse_bool("MAYHEM_STRIPE_BACKFILL_ENABLED", &enabled)?;
         }
-        if let Ok(api_key) = env::var("MAYHEM_COINBASE_COMMERCE_API_KEY") {
-            self.rails.coinbase.api_key = Some(api_key);
+        if let Ok(path) = env::var("MAYHEM_STRIPE_BACKFILL_CURSOR_PATH") {
+            self.rails.stripe.backfill_cursor_path = expand_home(PathBuf::from(path));
         }
-        if let Ok(webhook_secret) = env::var("MAYHEM_COINBASE_COMMERCE_WEBHOOK_SECRET") {
-            self.rails.coinbase.webhook_secret = Some(webhook_secret);
-        }
-        if let Ok(api_base_url) = env::var("MAYHEM_COINBASE_COMMERCE_API_BASE_URL") {
-            self.rails.coinbase.api_base_url = api_base_url;
-        }
-        if let Ok(path) = env::var("MAYHEM_PAYGATE_COINBASE_EVENTS_PATH") {
-            self.rails.coinbase.event_store_path = expand_home(PathBuf::from(path));
+        if let Ok(seconds) = env::var("MAYHEM_STRIPE_BACKFILL_INTERVAL_SECONDS") {
+            self.rails.stripe.backfill_interval_seconds =
+                parse_u64("MAYHEM_STRIPE_BACKFILL_INTERVAL_SECONDS", &seconds)?;
         }
         Ok(())
     }
@@ -874,12 +864,7 @@ impl PaygateState {
                     mode: self.config.rails.stripe.mode.as_str(),
                     api_configured: self.config.rails.stripe.secret_key.is_some(),
                     webhook_configured: self.config.rails.stripe.webhook_secret.is_some(),
-                },
-                coinbase: HealthCoinbaseRail {
-                    enabled: false,
-                    api_configured: self.config.rails.coinbase.api_key.is_some(),
-                    webhook_configured: self.config.rails.coinbase.webhook_secret.is_some(),
-                    retired: true,
+                    backfill_enabled: self.config.rails.stripe.backfill_enabled,
                 },
             },
             controls: HealthControls {
@@ -1103,18 +1088,16 @@ pub fn paygate_router(state: PaygateState) -> Router {
         .route("/v1/stripe/cancel", get(stripe_cancel))
         .route("/stripe/webhook", post(stripe_webhook))
         .route("/v1/stripe/webhook", post(stripe_webhook))
-        .route("/coinbase/charges", post(create_coinbase_charge))
-        .route("/v1/coinbase/charges", post(create_coinbase_charge))
-        .route("/coinbase/return", get(coinbase_return))
-        .route("/v1/coinbase/return", get(coinbase_return))
-        .route("/coinbase/cancel", get(coinbase_cancel))
-        .route("/v1/coinbase/cancel", get(coinbase_cancel))
-        .route("/coinbase/webhook", post(coinbase_webhook))
-        .route("/v1/coinbase/webhook", post(coinbase_webhook))
         .with_state(Arc::new(state))
 }
 
 pub async fn serve(bind: SocketAddr, state: PaygateState) -> std::io::Result<()> {
+    if state.config.rails.stripe.enabled && state.config.rails.stripe.backfill_enabled {
+        let backfill_state = state.clone();
+        tokio::spawn(async move {
+            stripe_backfill_loop(backfill_state).await;
+        });
+    }
     let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, paygate_router(state)).await
 }
@@ -1162,26 +1145,6 @@ async fn stripe_webhook(
     }
 }
 
-fn coinbase_retired_response() -> Response {
-    ApiError::from(PaygateError::RailRetired(COINBASE_RETIRED_MESSAGE)).into_response()
-}
-
-async fn create_coinbase_charge() -> Response {
-    coinbase_retired_response()
-}
-
-async fn coinbase_return() -> Response {
-    coinbase_retired_response()
-}
-
-async fn coinbase_cancel() -> Response {
-    coinbase_retired_response()
-}
-
-async fn coinbase_webhook() -> Response {
-    coinbase_retired_response()
-}
-
 async fn create_payment_intent(
     state: &PaygateState,
     request: StripeCreatePaymentIntentRequest,
@@ -1194,7 +1157,7 @@ async fn create_payment_intent(
     }
     validate_safe_key_part("who", &request.who)?;
     let currency = normalize_stripe_currency(request.currency.as_deref())?;
-    let amount_cents = mu_to_stripe_minor(request.mu, &currency)?;
+    let amount_cents = au_to_stripe_minor(request.au, &currency)?;
     let secret_key = stripe
         .secret_key
         .as_deref()
@@ -1213,7 +1176,7 @@ async fn create_payment_intent(
         processor_rail: "stripe",
         denom: CREDIT_DENOM,
         who: request.who,
-        mu: request.mu,
+        au: request.au,
         payment_intent: intent,
     })
 }
@@ -1233,7 +1196,7 @@ async fn create_checkout_session(
     validate_checkout_url("cancel_url", &request.cancel_url)?;
     let currency = normalize_stripe_currency(request.currency.as_deref())?;
     let _locale = normalize_stripe_locale(request.locale.as_deref())?;
-    let amount_cents = mu_to_stripe_minor(request.mu, &currency)?;
+    let amount_cents = au_to_stripe_minor(request.au, &currency)?;
     let secret_key = stripe
         .secret_key
         .as_deref()
@@ -1258,7 +1221,7 @@ async fn create_checkout_session(
         processor_rail: "stripe",
         denom: CREDIT_DENOM,
         who: request.who,
-        mu: request.mu,
+        au: request.au,
         checkout_session: session,
         copy_paste,
     })
@@ -1280,7 +1243,7 @@ async fn stripe_create_payment_intent(
             "true".to_owned(),
         ),
         ("metadata[mayhem_who]".to_owned(), request.who.to_owned()),
-        ("metadata[mayhem_mu]".to_owned(), request.mu.to_string()),
+        ("metadata[mayhem_au]".to_owned(), request.au.to_string()),
         ("metadata[mayhem_denom]".to_owned(), CREDIT_DENOM.to_owned()),
         ("metadata[mayhem_fiat_currency]".to_owned(), currency),
         (
@@ -1345,7 +1308,7 @@ async fn stripe_create_checkout_session(
         ("line_items[0][quantity]".to_owned(), "1".to_owned()),
         ("client_reference_id".to_owned(), request.who.to_owned()),
         ("metadata[mayhem_who]".to_owned(), request.who.to_owned()),
-        ("metadata[mayhem_mu]".to_owned(), request.mu.to_string()),
+        ("metadata[mayhem_au]".to_owned(), request.au.to_string()),
         ("metadata[mayhem_denom]".to_owned(), CREDIT_DENOM.to_owned()),
         (
             "metadata[mayhem_fiat_currency]".to_owned(),
@@ -1360,8 +1323,8 @@ async fn stripe_create_checkout_session(
             request.who.to_owned(),
         ),
         (
-            "payment_intent_data[metadata][mayhem_mu]".to_owned(),
-            request.mu.to_string(),
+            "payment_intent_data[metadata][mayhem_au]".to_owned(),
+            request.au.to_string(),
         ),
         (
             "payment_intent_data[metadata][mayhem_denom]".to_owned(),
@@ -1492,10 +1455,14 @@ async fn handle_stripe_webhook(
         stripe.webhook_tolerance_seconds,
     )?;
     let event: StripeEventEnvelope = serde_json::from_slice(payload)?;
-    let handles_event = matches!(
-        event.event_type.as_str(),
-        "payment_intent.succeeded" | "charge.dispute.created"
-    );
+    handle_stripe_event(state, event).await
+}
+
+async fn handle_stripe_event(
+    state: &PaygateState,
+    event: StripeEventEnvelope,
+) -> Result<StripeWebhookResponse> {
+    let handles_event = HANDLED_STRIPE_EVENT_TYPES.contains(&event.event_type.as_str());
     if !handles_event {
         return Ok(StripeWebhookResponse {
             ok: true,
@@ -1508,7 +1475,7 @@ async fn handle_stripe_webhook(
             payment_intent: None,
             charge: None,
             dispute: None,
-            mu: None,
+            au: None,
             contract: None,
         });
     }
@@ -1527,7 +1494,7 @@ async fn handle_stripe_webhook(
                 payment_intent: None,
                 charge: None,
                 dispute: None,
-                mu: None,
+                au: None,
                 contract: None,
             });
         }
@@ -1553,7 +1520,7 @@ async fn handle_stripe_webhook(
                 payment_intent: record.payment_intent,
                 charge: record.charge,
                 dispute: record.dispute,
-                mu: Some(record.mu),
+                au: Some(record.au),
                 contract: Some(contract),
             })
         }
@@ -1563,6 +1530,157 @@ async fn handle_stripe_webhook(
             Err(err)
         }
     }
+}
+
+pub async fn run_stripe_backfill_once(state: &PaygateState) -> Result<StripeBackfillReport> {
+    let stripe = &state.config.rails.stripe;
+    if !stripe.enabled {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe processor is not enabled".to_owned(),
+        ));
+    }
+    if !stripe.backfill_enabled {
+        return Ok(StripeBackfillReport {
+            ok: true,
+            fetched: 0,
+            processed: 0,
+            duplicates: 0,
+            credited: 0,
+            clawed_back: 0,
+            ignored: 0,
+            cursor_path: stripe.backfill_cursor_path.clone(),
+            previous_last_created: 0,
+            last_created: 0,
+        });
+    }
+    let secret_key = stripe
+        .secret_key
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("stripe.secret_key missing".to_owned()))?;
+    let cursor = StripeBackfillCursor::load(&stripe.backfill_cursor_path)?;
+    let previous_last_created = cursor.last_created;
+    let mut events =
+        stripe_fetch_backfill_events(&state.http, stripe, secret_key, cursor.last_created).await?;
+    events.sort_by(|left, right| {
+        (left.created.unwrap_or(0), left.id.as_str())
+            .cmp(&(right.created.unwrap_or(0), right.id.as_str()))
+    });
+
+    let mut report = StripeBackfillReport {
+        ok: true,
+        fetched: events.len(),
+        processed: 0,
+        duplicates: 0,
+        credited: 0,
+        clawed_back: 0,
+        ignored: 0,
+        cursor_path: stripe.backfill_cursor_path.clone(),
+        previous_last_created,
+        last_created: previous_last_created,
+    };
+
+    for event in events {
+        report.last_created = report.last_created.max(event.created.unwrap_or(0));
+        let response = handle_stripe_event(state, event).await?;
+        report.processed += 1;
+        if response.duplicate {
+            report.duplicates += 1;
+        }
+        if response.credited {
+            report.credited += 1;
+        }
+        if response.clawed_back {
+            report.clawed_back += 1;
+        }
+        if response.ignored {
+            report.ignored += 1;
+        }
+    }
+
+    StripeBackfillCursor {
+        schema_version: 1,
+        last_created: report.last_created,
+    }
+    .save(&stripe.backfill_cursor_path)?;
+    Ok(report)
+}
+
+async fn stripe_backfill_loop(state: PaygateState) {
+    loop {
+        if let Err(err) = run_stripe_backfill_once(&state).await {
+            eprintln!("mayhem-paygate Stripe backfill failed: {err}");
+        }
+        let seconds = state.config.rails.stripe.backfill_interval_seconds.max(1);
+        sleep(Duration::from_secs(seconds)).await;
+    }
+}
+
+async fn stripe_fetch_backfill_events(
+    http: &reqwest::Client,
+    stripe: &StripeSettings,
+    secret_key: &str,
+    created_gte: u64,
+) -> Result<Vec<StripeEventEnvelope>> {
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+    for event_type in HANDLED_STRIPE_EVENT_TYPES {
+        let mut starting_after: Option<String> = None;
+        let mut pages = 0_u32;
+        loop {
+            pages += 1;
+            if pages > 1_000 {
+                return Err(PaygateError::Stripe(
+                    "Stripe events backfill exceeded pagination limit".to_owned(),
+                ));
+            }
+            let mut url = reqwest::Url::parse(&format!(
+                "{}/v1/events",
+                stripe.api_base_url.trim_end_matches('/')
+            ))
+            .map_err(|err| PaygateError::Stripe(format!("Stripe events URL invalid: {err}")))?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("limit", "100");
+                query.append_pair("type", event_type);
+                query.append_pair("created[gte]", &created_gte.to_string());
+                if let Some(cursor) = starting_after.as_deref() {
+                    query.append_pair("starting_after", cursor);
+                }
+            }
+            let response = http
+                .get(url)
+                .basic_auth(secret_key, Some(""))
+                .send()
+                .await?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                return Err(PaygateError::Stripe(format!(
+                    "Stripe events backfill returned {status}: {body}"
+                )));
+            }
+            let value: Value = serde_json::from_str(&body)?;
+            let data = value.get("data").and_then(Value::as_array).ok_or_else(|| {
+                PaygateError::Stripe("Stripe events response missing data".to_owned())
+            })?;
+            let mut last_id = None;
+            for raw in data {
+                let event: StripeEventEnvelope = serde_json::from_value(raw.clone())?;
+                last_id = Some(event.id.clone());
+                if seen.insert(event.id.clone()) {
+                    events.push(event);
+                }
+            }
+            if value.get("has_more").and_then(Value::as_bool) != Some(true) {
+                break;
+            }
+            let Some(cursor) = last_id else {
+                break;
+            };
+            starting_after = Some(cursor);
+        }
+    }
+    Ok(events)
 }
 
 async fn handle_stripe_payment_intent_succeeded(
@@ -1575,8 +1693,8 @@ async fn handle_stripe_payment_intent_succeeded(
         .amount_received
         .or(object.amount)
         .ok_or_else(|| PaygateError::Stripe("PaymentIntent missing amount".to_owned()))?;
-    let mu_from_amount = amount_cents
-        .checked_mul(MU_PER_USD_CENT)
+    let au_from_amount = MoneyAu::from(amount_cents)
+        .checked_mul(AU_PER_USD_CENT)
         .ok_or_else(|| PaygateError::Stripe("PaymentIntent amount overflow".to_owned()))?;
     let who = object
         .metadata
@@ -1586,15 +1704,15 @@ async fn handle_stripe_payment_intent_succeeded(
         })?
         .to_owned();
     validate_safe_key_part("mayhem_who", &who)?;
-    let mu = object
+    let au = object
         .metadata
-        .get("mayhem_mu")
-        .ok_or_else(|| PaygateError::Stripe("PaymentIntent missing mayhem_mu metadata".to_owned()))?
-        .parse::<u64>()
-        .map_err(|_| PaygateError::Stripe("PaymentIntent mayhem_mu is invalid".to_owned()))?;
-    if mu != mu_from_amount {
+        .get("mayhem_au")
+        .ok_or_else(|| PaygateError::Stripe("PaymentIntent missing mayhem_au metadata".to_owned()))?
+        .parse::<MoneyAu>()
+        .map_err(|_| PaygateError::Stripe("PaymentIntent mayhem_au is invalid".to_owned()))?;
+    if au != au_from_amount {
         return Err(PaygateError::Stripe(
-            "PaymentIntent amount does not match mayhem_mu metadata".to_owned(),
+            "PaymentIntent amount does not match mayhem_au metadata".to_owned(),
         ));
     }
     let denom = object
@@ -1604,7 +1722,7 @@ async fn handle_stripe_payment_intent_succeeded(
         .unwrap_or(CREDIT_DENOM);
     if denom != CREDIT_DENOM {
         return Err(PaygateError::Stripe(
-            "PaymentIntent denomination must be mu_usd".to_owned(),
+            "PaymentIntent denomination must be au_usd".to_owned(),
         ));
     }
     let metadata_currency = object.metadata.get("mayhem_fiat_currency").ok_or_else(|| {
@@ -1634,13 +1752,13 @@ async fn handle_stripe_payment_intent_succeeded(
         .contract
         .epoch_seconds_at(at, state.config.epoch_seconds)
         .await?;
-    let ext_ref_hash = stripe_ext_ref_hash(&event.id, &object.id);
+    let ext_ref_hash = stripe_ext_ref_hash(&object.id);
     let charge = payment_intent_charge_id(&object);
     let feature = FiatDepositFeature {
         op: "fiat_deposit",
         rail: "stripe",
         who: who.clone(),
-        mu,
+        au,
         ext_ref_hash: ext_ref_hash.clone(),
         fiat_currency: currency.clone(),
         fiat_amount_minor: amount_cents,
@@ -1659,7 +1777,7 @@ async fn handle_stripe_payment_intent_succeeded(
             charge,
             dispute: None,
             who,
-            mu,
+            au,
             currency: Some(currency),
             amount_minor: Some(amount_cents),
             ext_ref_hash,
@@ -1699,15 +1817,15 @@ async fn handle_stripe_dispute_created(
             ));
         }
     }
-    let mu = amount_cents
-        .checked_mul(MU_PER_USD_CENT)
+    let au = MoneyAu::from(amount_cents)
+        .checked_mul(AU_PER_USD_CENT)
         .ok_or_else(|| PaygateError::Stripe("Dispute amount overflow".to_owned()))?;
-    if mu == 0 {
+    if au == 0 {
         return Err(PaygateError::Stripe(
             "Dispute amount must be positive".to_owned(),
         ));
     }
-    if mu > deposit.mu {
+    if au > deposit.au {
         return Err(PaygateError::Stripe(
             "Dispute amount exceeds original deposit".to_owned(),
         ));
@@ -1721,7 +1839,6 @@ async fn handle_stripe_dispute_created(
         .epoch_seconds_at(at, state.config.epoch_seconds)
         .await?;
     let dispute_ref_hash = stripe_dispute_ref_hash(
-        &event.id,
         &dispute,
         charge
             .as_deref()
@@ -1732,7 +1849,7 @@ async fn handle_stripe_dispute_created(
         op: "fiat_chargeback",
         rail: "stripe",
         who: deposit.who.clone(),
-        mu,
+        au,
         ext_ref_hash: deposit.ext_ref_hash.clone(),
         dispute_ref_hash: dispute_ref_hash.clone(),
         fiat_currency: currency.clone(),
@@ -1752,7 +1869,7 @@ async fn handle_stripe_dispute_created(
             charge: charge.or(deposit.charge),
             dispute: Some(dispute),
             who: deposit.who,
-            mu,
+            au,
             currency: Some(currency),
             amount_minor: Some(amount_cents),
             ext_ref_hash: deposit.ext_ref_hash,
@@ -1926,11 +2043,46 @@ impl StripeEventStore {
     }
 }
 
+impl StripeBackfillCursor {
+    fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self {
+                schema_version: 1,
+                last_created: 0,
+            });
+        }
+        let cursor: Self = serde_json::from_str(&fs::read_to_string(path)?)?;
+        if cursor.schema_version != 1 {
+            return Err(PaygateError::InvalidConfig(format!(
+                "unsupported Stripe backfill cursor schema_version {}",
+                cursor.schema_version
+            )));
+        }
+        Ok(cursor)
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        serde_json::to_writer_pretty(&mut file, self)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
 impl From<PaygateError> for ApiError {
     fn from(err: PaygateError) -> Self {
         let status = match err {
             PaygateError::InvalidConfig(_) => StatusCode::SERVICE_UNAVAILABLE,
-            PaygateError::RailRetired(_) => StatusCode::GONE,
             PaygateError::InvalidRequest(_)
             | PaygateError::StripeSignature(_)
             | PaygateError::Stripe(_) => StatusCode::BAD_REQUEST,
@@ -2067,8 +2219,10 @@ fn default_stripe_event_store_path() -> PathBuf {
     mayhem_home().join("paygate").join("stripe-events.jsonl")
 }
 
-fn default_coinbase_event_store_path() -> PathBuf {
-    mayhem_home().join("paygate").join("coinbase-events.jsonl")
+fn default_stripe_backfill_cursor_path() -> PathBuf {
+    mayhem_home()
+        .join("paygate")
+        .join("stripe-backfill-cursor.json")
 }
 
 fn mayhem_home() -> PathBuf {
@@ -2168,40 +2322,37 @@ fn is_safe_key_part(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn mu_to_stripe_minor(mu: u64, currency: &str) -> Result<u64> {
-    if mu == 0 {
+fn au_to_stripe_minor(au: MoneyAu, currency: &str) -> Result<u64> {
+    if au == 0 {
         return Err(PaygateError::InvalidRequest(
-            "mu must be positive".to_owned(),
+            "au must be positive".to_owned(),
         ));
     }
-    if mu % MU_PER_USD_CENT != 0 {
+    if au % AU_PER_USD_CENT != 0 {
         return Err(PaygateError::InvalidRequest(format!(
             "Stripe {currency} deposits must be whole cents"
         )));
     }
-    let cents = mu / MU_PER_USD_CENT;
+    let cents = u64::try_from(au / AU_PER_USD_CENT)
+        .map_err(|_| PaygateError::InvalidRequest("Stripe amount exceeds u64 cents".to_owned()))?;
     if cents < STRIPE_MIN_USD_CENTS {
         return Err(PaygateError::InvalidRequest(
-            "Stripe minimum deposit is 500000 mu_usd".to_owned(),
+            "Stripe minimum deposit is 500000000000000000 au_usd".to_owned(),
         ));
     }
     Ok(cents)
 }
 
-fn stripe_ext_ref_hash(event_id: &str, payment_intent: &str) -> String {
+fn stripe_ext_ref_hash(payment_intent: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"mayhem-stripe-deposit-v1");
-    hasher.update(event_id.as_bytes());
-    hasher.update(b"\0");
+    hasher.update(b"mayhem-stripe-deposit-v2");
     hasher.update(payment_intent.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
-fn stripe_dispute_ref_hash(event_id: &str, dispute: &str, source: &str) -> String {
+fn stripe_dispute_ref_hash(dispute: &str, source: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"mayhem-stripe-dispute-v1");
-    hasher.update(event_id.as_bytes());
-    hasher.update(b"\0");
+    hasher.update(b"mayhem-stripe-dispute-v2");
     hasher.update(dispute.as_bytes());
     hasher.update(b"\0");
     hasher.update(source.as_bytes());
@@ -2292,12 +2443,6 @@ mod tests {
             api_base_url = "http://127.0.0.1:19999"
             event_store_path = "/tmp/mayhem-paygate-stripe-events.jsonl"
 
-            [coinbase]
-            enabled = false
-            api_key = "cc_test_local"
-            webhook_secret = "ccwhsec_local"
-            api_base_url = "http://127.0.0.1:19998"
-            event_store_path = "/tmp/mayhem-paygate-coinbase-events.jsonl"
             "#,
         )?;
 
@@ -2318,15 +2463,6 @@ mod tests {
         assert_eq!(
             config.rails.stripe.webhook_secret.as_deref(),
             Some("whsec_local")
-        );
-        assert!(!config.rails.coinbase.enabled);
-        assert_eq!(
-            config.rails.coinbase.api_key.as_deref(),
-            Some("cc_test_local")
-        );
-        assert_eq!(
-            config.rails.coinbase.webhook_secret.as_deref(),
-            Some("ccwhsec_local")
         );
         Ok(())
     }
@@ -2460,11 +2596,17 @@ mod tests {
     }
 
     #[test]
-    fn stripe_mu_to_cents_requires_cent_aligned_minimum() {
-        assert_eq!(mu_to_stripe_minor(500_000, "usd").unwrap(), 50);
-        assert_eq!(mu_to_stripe_minor(500_000, "eur").unwrap(), 50);
-        assert!(mu_to_stripe_minor(499_999, "usd").is_err());
-        assert!(mu_to_stripe_minor(10_001, "eur").is_err());
+    fn stripe_au_to_cents_requires_cent_aligned_minimum() {
+        assert_eq!(
+            au_to_stripe_minor(500_000_000_000_000_000, "usd").unwrap(),
+            50
+        );
+        assert_eq!(
+            au_to_stripe_minor(500_000_000_000_000_000, "eur").unwrap(),
+            50
+        );
+        assert!(au_to_stripe_minor(499_999_999_999_999_999, "usd").is_err());
+        assert!(au_to_stripe_minor(10_001, "eur").is_err());
         assert_eq!(normalize_stripe_currency(None).unwrap(), "usd");
         assert_eq!(normalize_stripe_currency(Some("EUR")).unwrap(), "eur");
         assert!(normalize_stripe_currency(Some("gbp")).is_err());

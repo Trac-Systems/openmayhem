@@ -549,7 +549,7 @@ test("operations: feature executes contract when admin-signed", async (t) => {
   const opObj = {
     type: "feature",
     key: "my_feature",
-    value: { dispatch: { value: dispatchValue, nonce, hash: signature } },
+    value: { dispatch: { value: dispatchValue, nonce, hash: signature, address: adminWallet.publicKey } },
   };
   const node = makeNode(opObj);
 
@@ -566,6 +566,54 @@ test("operations: feature executes contract when admin-signed", async (t) => {
   t.is(featureResult?.ok, true);
   t.is(featureResult?.status, "applied");
   t.is(featureResult?.feature_key, "my_feature");
+});
+
+test("operations: feature executes contract when non-admin signer owns dispatch address", async (t) => {
+  const adminWallet = new Wallet();
+  await adminWallet.generateKeyPair();
+  const providerWallet = new Wallet();
+  await providerWallet.generateKeyPair();
+  const nonce = makeHex32(35);
+  const dispatchValue = { op: "consent" };
+  const strDispatchValue = JSON.stringify(dispatchValue);
+  const signature = providerWallet.sign(`${strDispatchValue}${nonce}`);
+
+  const batch = makeBatch({ admin: adminWallet.publicKey });
+  const base = makeBase();
+
+  const contractInstance = {
+    execute: async (_op, b) => {
+      await b.put("provider_feature_called", true);
+      return { ok: true };
+    },
+  };
+
+  const opObj = {
+    type: "feature",
+    key: "mayhem_consent/provider/1/hash",
+    value: {
+      dispatch: {
+        value: dispatchValue,
+        nonce,
+        hash: signature,
+        address: providerWallet.publicKey,
+      },
+    },
+  };
+  const node = makeNode(opObj);
+
+  const op = new FeatureOperation(new FeatureCheck(), {
+    wallet: adminWallet,
+    protocolInstance: makeProtocolStub({ featMaxBytes: 4096 }),
+    contractInstance,
+  });
+  await op.handle(opObj, batch, base, node);
+
+  t.is((await batch.get("provider_feature_called"))?.value ?? null, true);
+  t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
+  const featureResult = (await batch.get(`fr/${signature}`))?.value ?? null;
+  t.is(featureResult?.ok, true);
+  t.is(featureResult?.address, providerWallet.publicKey);
 });
 
 test("operations: feature does not burn replay hash when contract returns an error", async (t) => {
@@ -592,7 +640,7 @@ test("operations: feature does not burn replay hash when contract returns an err
   const opObj = {
     type: "feature",
     key: "my_feature",
-    value: { dispatch: { value: dispatchValue, nonce, hash: signature } },
+    value: { dispatch: { value: dispatchValue, nonce, hash: signature, address: adminWallet.publicKey } },
   };
   const node = makeNode(opObj);
 
@@ -634,7 +682,7 @@ test("operations: feature does not burn replay hash when contract returns undefi
   const opObj = {
     type: "feature",
     key: "my_feature",
-    value: { dispatch: { value: dispatchValue, nonce, hash: signature } },
+    value: { dispatch: { value: dispatchValue, nonce, hash: signature, address: adminWallet.publicKey } },
   };
   const node = makeNode(opObj);
 

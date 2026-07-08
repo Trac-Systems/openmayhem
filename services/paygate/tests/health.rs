@@ -40,7 +40,15 @@ async fn health_reports_oracle_public_key_and_redacts_seed() {
     assert_eq!(body["oracle_pubkey"], oracle_pubkey);
     assert_eq!(body["rails"]["stripe"]["enabled"], true);
     assert_eq!(body["rails"]["stripe"]["mode"], "test");
-    assert_eq!(body["rails"]["coinbase"]["enabled"], false);
+    assert_eq!(
+        body["rails"]
+            .as_object()
+            .expect("rails object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["stripe"]
+    );
     assert_eq!(body["controls"]["admin_controls_economy"], true);
     assert_eq!(body["controls"]["admin_sets_terms"], true);
     assert_eq!(body["controls"]["admin_sets_prices"], true);

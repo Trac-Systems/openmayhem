@@ -217,9 +217,9 @@ function validatePaymentRailEvidence(add, value, requiredRails = canonicalLedger
       isFileEvidence(item)
       && hasEvidenceTag(item, `rail:${rail}`)
       && (rail !== 'fiat' || hasEvidenceTag(item, 'processor:stripe'))
-      && hasEvidenceTag(item, 'credits_mu_usd')
+      && hasEvidenceTag(item, 'credits_au_usd')
     ))) {
-      add('error', `payment_rails.evidence must include file-bound mu_usd credit evidence for ${rail}`);
+      add('error', `payment_rails.evidence must include file-bound au_usd credit evidence for ${rail}`);
     }
   }
   if (!value.some((item) => isFileEvidence(item) && hasEvidenceTag(item, 'paygate_admin_controls'))) {
@@ -322,7 +322,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
 
   if (requireObject(add, metrics.network, 'network')) {
     requireLiteral(add, metrics.network.name, 'testnet1', 'network.name');
-    requireLiteral(add, metrics.network.denom, 'mu_usd', 'network.denom');
+    requireLiteral(add, metrics.network.denom, 'au_usd', 'network.denom');
     if (requireObject(add, metrics.network.msb, 'network.msb')) {
       requireLiteral(add, metrics.network.msb.address_prefix, 'testtrac', 'network.msb.address_prefix');
       requireLiteral(add, metrics.network.msb.network_id, 919, 'network.msb.network_id');
@@ -330,13 +330,12 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
   }
 
   if (requireObject(add, metrics.payment_rails, 'payment_rails')) {
-    requireLiteral(add, metrics.payment_rails.ledger_denom, 'mu_usd', 'payment_rails.ledger_denom');
+    requireLiteral(add, metrics.payment_rails.ledger_denom, 'au_usd', 'payment_rails.ledger_denom');
     requireBoolean(add, metrics.payment_rails.fiat_enabled, true, 'payment_rails.fiat_enabled');
     requireBoolean(add, metrics.payment_rails.tap_enabled, true, 'payment_rails.tap_enabled');
     requireBoolean(add, metrics.payment_rails.tnk_enabled, true, 'payment_rails.tnk_enabled');
     requireBoolean(add, metrics.payment_rails.stripe_processor_enabled, true, 'payment_rails.stripe_processor_enabled');
-    requireBoolean(add, metrics.payment_rails.coinbase_enabled, false, 'payment_rails.coinbase_enabled');
-    requireBoolean(add, metrics.payment_rails.rails_credit_mu_usd, true, 'payment_rails.rails_credit_mu_usd');
+    requireBoolean(add, metrics.payment_rails.rails_credit_au_usd, true, 'payment_rails.rails_credit_au_usd');
     requireBoolean(
       add,
       metrics.payment_rails.paygate_admin_controls_verified,

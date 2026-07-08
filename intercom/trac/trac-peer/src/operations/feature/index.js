@@ -50,20 +50,19 @@ export class FeatureOperation {
     }
     async handle(op, batch, base, node) {
         if(false === this.#validator.validateNode(node)) return;
-        // Feature apply: admin-signed feature/contract op (replay-protected by sh/<hash>).
+        // Feature apply: signer-signed feature/contract op (replay-protected by sh/<hash>).
         if(b4a.byteLength(jsonStringify(op)) > this.#protocolInstance.featMaxBytes()) return;
         if(false === this.#validator.validate(op)) return;
-        const strDispatchValue = jsonStringify(op.value.dispatch.value);
-        const admin = await batch.get('admin');
-        if(null !== admin &&
-            null === await batch.get(`sh/${op.value.dispatch.hash}`)){
-            const verified = this.#wallet.verify(op.value.dispatch.hash, `${strDispatchValue}${op.value.dispatch.nonce}`, admin.value);
+        const dispatch = op.value.dispatch;
+        const strDispatchValue = jsonStringify(dispatch.value);
+        if(null === await batch.get(`sh/${dispatch.hash}`)){
+            const verified = this.#wallet.verify(dispatch.hash, `${strDispatchValue}${dispatch.nonce}`, dispatch.address);
             if(true === verified) {
                 const result = await this.#contractInstance.execute(op, batch);
                 const err = this.#protocolInstance.getError(result);
-                await batch.put(`fr/${op.value.dispatch.hash}`, featureResultRecord(op, result, err));
+                await batch.put(`fr/${dispatch.hash}`, featureResultRecord(op, result, err));
                 if(undefined !== result && null === err) {
-                    await batch.put(`sh/${op.value.dispatch.hash}`, '');
+                    await batch.put(`sh/${dispatch.hash}`, '');
                 }
                 //console.log(`Feature ${op.key} appended`);
             }
@@ -88,7 +87,8 @@ export class FeatureCheck extends BaseCheck {
                     $$type : "object",
                     value : { type : "any", nullable : true },
                     nonce: { type : "string", min : 1, max : 256 },
-                    hash: { type : "is_hex" }
+                    hash: { type : "is_hex" },
+                    address: { type : "is_hex" }
                 }
             }
         };

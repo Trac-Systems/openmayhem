@@ -400,17 +400,15 @@ await peer.ready();
 let mayhemFeature = null;
 {
   const admin = await peer.base.view.get('admin');
-  if (peer.base.writable) {
-    mayhemFeature = new MayhemFeature(peer, {});
-    await peer.protocol.instance.addFeature('mayhem', mayhemFeature);
-    peer.mayhemFeature = mayhemFeature;
-    if (admin && admin.value === peer.wallet.publicKey) {
-      console.log('Mayhem Feature: ready (free admin-oracle lifecycle/evidence writer)');
-    } else {
-      console.log('Mayhem Feature: ready (free lifecycle/evidence writer)');
-    }
+  mayhemFeature = new MayhemFeature(peer, {});
+  await peer.protocol.instance.addFeature('mayhem', mayhemFeature);
+  peer.mayhemFeature = mayhemFeature;
+  if (admin && admin.value === peer.wallet.publicKey) {
+    console.log('Mayhem Feature: ready (free admin-oracle lifecycle/evidence writer)');
+  } else if (peer.base.writable) {
+    console.log('Mayhem Feature: ready (free lifecycle/evidence writer)');
   } else {
-    console.log('Mayhem Feature: read-only (not admin/writable)');
+    console.log('Mayhem Feature: ready (read-only until writer admission)');
   }
 }
 

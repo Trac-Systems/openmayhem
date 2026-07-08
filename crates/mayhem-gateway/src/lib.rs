@@ -24,6 +24,7 @@ use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
     AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind,
     ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    MoneyAu,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -175,8 +176,12 @@ pub struct ProviderHeartbeat {
     pub q: HeartbeatQueue,
     pub perf: HeartbeatPerf,
     pub price_ver: u64,
-    #[serde(default)]
-    pub min_ask_mu: u64,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub min_ask_au: MoneyAu,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_peer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_anchor: Option<String>,
     #[serde(default = "default_heartbeat_accepting_new")]
     pub accepting_new: bool,
     pub caps: HeartbeatCaps,
@@ -1297,6 +1302,12 @@ fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
     validate_hex_field("provider", &heartbeat.provider, 32)?;
     validate_hex_field("enclave_id", &heartbeat.enclave_id, 32)?;
     validate_hex_field("room_id", &heartbeat.room_id, 16)?;
+    if let Some(transport_peer) = heartbeat.transport_peer.as_deref() {
+        validate_hex_field("transport_peer", transport_peer, 32)?;
+    }
+    if let Some(identity_anchor) = heartbeat.identity_anchor.as_deref() {
+        validate_identity_anchor(identity_anchor)?;
+    }
     validate_hex_field("att.head", &heartbeat.att.head, 32)?;
     validate_hex_field("nonce", &heartbeat.nonce, 32)?;
     validate_hex_field("sig", &heartbeat.sig, 64)?;
@@ -1498,6 +1509,22 @@ fn validate_hex_field(field: &'static str, value: &str, bytes: usize) -> Result<
             reason: format!("must be {bytes} bytes of hex"),
         })
     }
+}
+
+fn validate_identity_anchor(value: &str) -> Result<()> {
+    let Some((kind, digest)) = value.split_once(':') else {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "identity_anchor",
+            reason: "must be kind:32-byte-hex".to_owned(),
+        });
+    };
+    if !matches!(kind, "device" | "fingerprint" | "kyb" | "provider") {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "identity_anchor",
+            reason: "kind must be device, fingerprint, kyb, or provider".to_owned(),
+        });
+    }
+    validate_hex_field("identity_anchor", digest, 32)
 }
 
 fn validate_hex_nonce(value: &str) -> Result<()> {
@@ -1758,7 +1785,7 @@ mod tests {
             "q": { "free_slots": 1, "engine_backlog": 0, "est_wait_ms": 0 },
             "perf": { "tok_s": 42.0, "ttft_ms": 120 },
             "price_ver": 3,
-            "min_ask_mu": 0,
+            "min_ask_au": "0",
             "caps": { "tools": true, "json": true, "ctx": 8192, "vision": false },
             "att": { "epoch": 81, "head": "44".repeat(32) },
             "ts": now_millis,

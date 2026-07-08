@@ -904,6 +904,12 @@ fn cpu_flags(host: &HostInfo) -> CpuFlags {
         amx: false,
     };
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        flags.avx2 |= std::is_x86_feature_detected!("avx2");
+        flags.avx512 |= std::is_x86_feature_detected!("avx512f");
+    }
+
     if host.os == "linux" {
         if let Ok(text) = fs::read_to_string("/proc/cpuinfo") {
             let lower = text.to_ascii_lowercase();

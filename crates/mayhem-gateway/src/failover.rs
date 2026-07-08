@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use mayhem_proto::{CheckpointPolicy, ReceiptUsage};
+use mayhem_proto::{CheckpointPolicy, MoneyAu, ReceiptUsage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{text_generation_rate_map, usage_map_mu, ProviderKey, RateMapEntry};
+use crate::{text_generation_rate_map, usage_map_au, ProviderKey, RateMapEntry};
 
 pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = 10_000;
 pub const DEFAULT_MAX_OPEN_ATTEMPTS: u8 = 4;
@@ -41,7 +41,7 @@ pub struct FailoverPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SessionPriceMu {
+pub struct SessionPriceAu {
     pub rate_map: Vec<RateMapEntry>,
 }
 
@@ -69,7 +69,7 @@ pub struct ReceiptCheckpoint {
     pub seq: u64,
     pub final_receipt: bool,
     pub usage: ReceiptUsage,
-    pub mu_owed_cum: u64,
+    pub au_owed_cum: MoneyAu,
     pub uncheckpointed_usage: ReceiptUsage,
     pub reason: String,
     pub ts_millis: u64,
@@ -111,11 +111,11 @@ pub struct HedgeRace {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionFailoverState {
     policy: FailoverPolicy,
-    price: SessionPriceMu,
+    price: SessionPriceAu,
     input_tokens: u64,
     delivered_output_tokens: u64,
     last_receipted_usage: ReceiptUsage,
-    last_receipted_mu: u64,
+    last_receipted_au: MoneyAu,
     next_receipt_seq: u64,
     open_attempts: u8,
     cooloffs: BTreeMap<ProviderKey, u64>,
@@ -166,22 +166,22 @@ impl Default for FailoverPolicy {
     }
 }
 
-impl SessionPriceMu {
-    pub fn text(in_per_1k_mu: u64, out_per_1k_mu: u64) -> Self {
+impl SessionPriceAu {
+    pub fn text(in_per_1k_au: MoneyAu, out_per_1k_au: MoneyAu) -> Self {
         Self {
-            rate_map: text_generation_rate_map(in_per_1k_mu, out_per_1k_mu),
+            rate_map: text_generation_rate_map(in_per_1k_au, out_per_1k_au),
         }
     }
 
-    pub fn mu_for_usage(&self, usage: &ReceiptUsage) -> u64 {
-        usage_map_mu(&self.rate_map, usage)
+    pub fn au_for_usage(&self, usage: &ReceiptUsage) -> MoneyAu {
+        usage_map_au(&self.rate_map, usage)
     }
 }
 
 impl SessionFailoverState {
     pub fn new(
         policy: FailoverPolicy,
-        price: SessionPriceMu,
+        price: SessionPriceAu,
         input_tokens: u64,
         started_at_millis: u64,
     ) -> Self {
@@ -191,7 +191,7 @@ impl SessionFailoverState {
             input_tokens,
             delivered_output_tokens: 0,
             last_receipted_usage: ReceiptUsage::default(),
-            last_receipted_mu: 0,
+            last_receipted_au: 0,
             next_receipt_seq: 1,
             open_attempts: 0,
             cooloffs: BTreeMap::new(),
@@ -334,7 +334,7 @@ impl SessionFailoverState {
         ReceiptCheckpoint {
             seq: self.next_receipt_seq,
             final_receipt,
-            mu_owed_cum: self.price.mu_for_usage(&usage),
+            au_owed_cum: self.price.au_for_usage(&usage),
             uncheckpointed_usage: usage_delta(&self.last_receipted_usage, &usage),
             usage,
             reason: reason.into(),
@@ -359,12 +359,12 @@ impl SessionFailoverState {
         {
             return Err(FailoverError::ReceiptUsageRegression);
         }
-        if checkpoint.mu_owed_cum < self.last_receipted_mu {
+        if checkpoint.au_owed_cum < self.last_receipted_au {
             return Err(FailoverError::ReceiptMuRegression);
         }
 
         self.last_receipted_usage = checkpoint.usage.clone();
-        self.last_receipted_mu = checkpoint.mu_owed_cum;
+        self.last_receipted_au = checkpoint.au_owed_cum;
         self.last_receipt_at_millis = now_millis;
         self.next_receipt_seq = self.next_receipt_seq.saturating_add(1);
         Ok(())
@@ -509,8 +509,8 @@ mod tests {
         )
     }
 
-    fn price() -> SessionPriceMu {
-        SessionPriceMu::text(10, 100)
+    fn price() -> SessionPriceAu {
+        SessionPriceAu::text(10, 100)
     }
 
     #[test]
@@ -628,13 +628,13 @@ mod tests {
         let final_receipt = state.receipt_checkpoint(true, "final", 15_700);
         assert_eq!(final_receipt.usage, ReceiptUsage::text(1_000, 15));
         assert_eq!(
-            final_receipt.mu_owed_cum,
-            price().mu_for_usage(&final_receipt.usage)
+            final_receipt.au_owed_cum,
+            price().au_for_usage(&final_receipt.usage)
         );
 
-        let duplicated_prompt_charge = redispatch.partial_receipt.mu_owed_cum
-            + price().mu_for_usage(&ReceiptUsage::text(1_000, 5));
-        assert!(final_receipt.mu_owed_cum < duplicated_prompt_charge);
+        let duplicated_prompt_charge = redispatch.partial_receipt.au_owed_cum
+            + price().au_for_usage(&ReceiptUsage::text(1_000, 5));
+        assert!(final_receipt.au_owed_cum < duplicated_prompt_charge);
     }
 
     #[test]

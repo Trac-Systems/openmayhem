@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
@@ -134,6 +134,20 @@ struct SupervisorRuntime {
     state_file: PathBuf,
 }
 
+type SupervisorControlReply = oneshot::Sender<std::result::Result<serde_json::Value, String>>;
+
+#[derive(Debug)]
+enum SupervisorCommand {
+    Add {
+        child: ChildConfig,
+        reply: SupervisorControlReply,
+    },
+    Remove {
+        name: String,
+        reply: SupervisorControlReply,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -237,37 +251,120 @@ async fn run_supervisor(
     exit_after_ms: Option<u64>,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (control_tx, mut control_rx) = mpsc::channel(32);
     let mut tasks = JoinSet::new();
+    let mut child_shutdowns = BTreeMap::<String, watch::Sender<bool>>::new();
 
     tasks.spawn(status_server(
         status_listener,
         runtime.clone(),
         shutdown_rx.clone(),
+        control_tx,
     ));
     for child in children {
-        tasks.spawn(supervise_child(child, runtime.clone(), shutdown_rx.clone()));
+        spawn_supervised_child(child, &runtime, &mut tasks, &mut child_shutdowns)?;
     }
 
-    tokio::select! {
-        signal = wait_for_shutdown_signal() => {
-            signal?;
-        }
-        _ = async {
-            if let Some(ms) = exit_after_ms {
-                sleep(Duration::from_millis(ms)).await;
-            } else {
-                std::future::pending::<()>().await;
+    let mut exit_sleep = exit_after_ms.map(|ms| Box::pin(sleep(Duration::from_millis(ms))));
+    loop {
+        tokio::select! {
+            signal = wait_for_shutdown_signal() => {
+                signal?;
+                break;
             }
-        } => {}
+            _ = async {
+                if let Some(sleep) = exit_sleep.as_mut() {
+                    sleep.as_mut().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                break;
+            }
+            command = control_rx.recv() => {
+                let Some(command) = command else {
+                    continue;
+                };
+                handle_supervisor_command(
+                    command,
+                    &runtime,
+                    &mut tasks,
+                    &mut child_shutdowns,
+                )
+                .await;
+            }
+        }
     }
 
     let _ = shutdown_tx.send(true);
+    for shutdown in child_shutdowns.values() {
+        let _ = shutdown.send(true);
+    }
     while let Some(result) = tasks.join_next().await {
         if let Err(err) = result {
             eprintln!("mayhemd task failed: {err}");
         }
     }
     Ok(())
+}
+
+fn spawn_supervised_child(
+    child: ChildConfig,
+    runtime: &SupervisorRuntime,
+    tasks: &mut JoinSet<Result<()>>,
+    child_shutdowns: &mut BTreeMap<String, watch::Sender<bool>>,
+) -> Result<()> {
+    if child_shutdowns.contains_key(&child.name) {
+        bail!("duplicate supervisor child name {}", child.name);
+    }
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    child_shutdowns.insert(child.name.clone(), shutdown_tx);
+    tasks.spawn(supervise_child(child, runtime.clone(), shutdown_rx));
+    Ok(())
+}
+
+async fn handle_supervisor_command(
+    command: SupervisorCommand,
+    runtime: &SupervisorRuntime,
+    tasks: &mut JoinSet<Result<()>>,
+    child_shutdowns: &mut BTreeMap<String, watch::Sender<bool>>,
+) {
+    match command {
+        SupervisorCommand::Add { child, reply } => {
+            let result = async {
+                validate_children(std::slice::from_ref(&child))?;
+                if child_shutdowns.contains_key(&child.name) {
+                    bail!("supervisor child {} already exists", child.name);
+                }
+                runtime.add_child_config(&child).await?;
+                let name = child.name.clone();
+                spawn_supervised_child(child, runtime, tasks, child_shutdowns)?;
+                Ok(json!({ "ok": true, "name": name }))
+            }
+            .await
+            .map_err(|err: anyhow::Error| err.to_string());
+            let _ = reply.send(result);
+        }
+        SupervisorCommand::Remove { name, reply } => {
+            let result = async {
+                let stopping = if let Some(shutdown) = child_shutdowns.remove(&name) {
+                    let _ = shutdown.send(true);
+                    true
+                } else {
+                    false
+                };
+                let removed = runtime.remove_child_config(&name).await?;
+                if stopping || removed {
+                    Ok(json!({ "ok": true, "name": name, "stopping": stopping }))
+                } else {
+                    bail!("supervisor child {name} is not running or does not exist");
+                }
+            }
+            .await
+            .map_err(|err: anyhow::Error| err.to_string());
+            let _ = reply.send(result);
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
@@ -386,14 +483,16 @@ async fn status_server(
     listener: TcpListener,
     runtime: SupervisorRuntime,
     mut shutdown: watch::Receiver<bool>,
+    control_tx: mpsc::Sender<SupervisorCommand>,
 ) -> Result<()> {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("accepting status connection")?;
                 let runtime = runtime.clone();
+                let control_tx = control_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_status_connection(stream, runtime).await {
+                    if let Err(err) = handle_status_connection(stream, runtime, control_tx).await {
                         eprintln!("mayhemd status request failed: {err}");
                     }
                 });
@@ -408,20 +507,67 @@ async fn status_server(
     }
 }
 
-async fn handle_status_connection(mut stream: TcpStream, runtime: SupervisorRuntime) -> Result<()> {
-    let mut buffer = [0_u8; 2048];
+async fn handle_status_connection(
+    mut stream: TcpStream,
+    runtime: SupervisorRuntime,
+    control_tx: mpsc::Sender<SupervisorCommand>,
+) -> Result<()> {
+    let mut buffer = [0_u8; 65_536];
     let read = stream.read(&mut buffer).await.context("reading request")?;
     let request = String::from_utf8_lossy(&buffer[..read]);
-    let path = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
-    match path {
-        "/health" => write_http_json(&mut stream, 200, &json!({ "ok": true })).await,
-        "/status" | "/" => {
+    let first_line = request.lines().next().unwrap_or("");
+    let mut first = first_line.split_whitespace();
+    let method = first.next().unwrap_or("");
+    let path = first.next().unwrap_or("/");
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    match (method, path) {
+        ("GET", "/health") => write_http_json(&mut stream, 200, &json!({ "ok": true })).await,
+        ("GET", "/status") | ("GET", "/") => {
             let snapshot = runtime.snapshot().await;
             write_http_json(&mut stream, 200, &snapshot).await
+        }
+        ("POST", "/children/add") => {
+            let child = serde_json::from_str::<ChildConfig>(body.trim())
+                .context("parsing child add request")?;
+            let (reply, response) = oneshot::channel();
+            control_tx
+                .send(SupervisorCommand::Add { child, reply })
+                .await
+                .context("sending child add command")?;
+            match response.await.context("waiting for child add response")? {
+                Ok(body) => write_http_json(&mut stream, 200, &body).await,
+                Err(error) => {
+                    write_http_json(&mut stream, 409, &json!({ "ok": false, "error": error })).await
+                }
+            }
+        }
+        ("POST", "/children/remove") => {
+            let body = serde_json::from_str::<serde_json::Value>(body.trim())
+                .context("parsing child remove request")?;
+            let name = body
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("child remove request requires name")?
+                .to_owned();
+            let (reply, response) = oneshot::channel();
+            control_tx
+                .send(SupervisorCommand::Remove { name, reply })
+                .await
+                .context("sending child remove command")?;
+            match response
+                .await
+                .context("waiting for child remove response")?
+            {
+                Ok(body) => write_http_json(&mut stream, 200, &body).await,
+                Err(error) => {
+                    write_http_json(&mut stream, 404, &json!({ "ok": false, "error": error })).await
+                }
+            }
         }
         _ => {
             write_http_json(
@@ -520,6 +666,28 @@ impl SupervisorRuntime {
             }
         }
         self.persist_state().await
+    }
+
+    async fn add_child_config(&self, child: &ChildConfig) -> Result<()> {
+        {
+            let mut state = self.state.lock().await;
+            if state.children.contains_key(&child.name) {
+                bail!("supervisor child {} already exists", child.name);
+            }
+            state
+                .children
+                .insert(child.name.clone(), child.initial_state());
+        }
+        self.persist_state().await
+    }
+
+    async fn remove_child_config(&self, name: &str) -> Result<bool> {
+        let removed = {
+            let mut state = self.state.lock().await;
+            state.children.remove(name).is_some()
+        };
+        self.persist_state().await?;
+        Ok(removed)
     }
 }
 
@@ -731,5 +899,97 @@ mod tests {
         assert!(!state.running);
         assert_eq!(state.command, "pear");
         assert_eq!(state.args, ["run", "intercom"]);
+    }
+
+    fn long_running_test_child(name: &str) -> ChildConfig {
+        #[cfg(windows)]
+        {
+            ChildConfig {
+                name: name.to_owned(),
+                command: "cmd".to_owned(),
+                args: vec!["/C".to_owned(), "ping 127.0.0.1 -n 6 > nul".to_owned()],
+                cwd: None,
+                env: BTreeMap::new(),
+                restart: false,
+                restart_backoff_ms: 250,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ChildConfig {
+                name: name.to_owned(),
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "sleep 5".to_owned()],
+                cwd: None,
+                env: BTreeMap::new(),
+                restart: false,
+                restart_backoff_ms: 250,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_control_add_remove_child_updates_state() {
+        let temp = env::temp_dir().join(format!("mayhemd-control-test-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        let runtime = SupervisorRuntime {
+            state: Arc::new(Mutex::new(SupervisorState {
+                ok: true,
+                pid: std::process::id(),
+                started_at_ms: unix_epoch_millis().unwrap(),
+                bind: "127.0.0.1:0".to_owned(),
+                config_path: None,
+                pid_file: temp.join("mayhemd.pid"),
+                state_file: temp.join("mayhemd-state.json"),
+                children: BTreeMap::new(),
+            })),
+            state_file: temp.join("mayhemd-state.json"),
+        };
+        let mut tasks = JoinSet::new();
+        let mut child_shutdowns = BTreeMap::new();
+
+        let (reply, response) = oneshot::channel();
+        handle_supervisor_command(
+            SupervisorCommand::Add {
+                child: long_running_test_child("provider-live-test"),
+                reply,
+            },
+            &runtime,
+            &mut tasks,
+            &mut child_shutdowns,
+        )
+        .await;
+        assert!(response.await.unwrap().unwrap()["ok"].as_bool().unwrap());
+        assert!(runtime
+            .snapshot()
+            .await
+            .children
+            .contains_key("provider-live-test"));
+        assert!(child_shutdowns.contains_key("provider-live-test"));
+
+        let (reply, response) = oneshot::channel();
+        handle_supervisor_command(
+            SupervisorCommand::Remove {
+                name: "provider-live-test".to_owned(),
+                reply,
+            },
+            &runtime,
+            &mut tasks,
+            &mut child_shutdowns,
+        )
+        .await;
+        assert!(response.await.unwrap().unwrap()["ok"].as_bool().unwrap());
+        assert!(!runtime
+            .snapshot()
+            .await
+            .children
+            .contains_key("provider-live-test"));
+        assert!(!child_shutdowns.contains_key("provider-live-test"));
+
+        let joined = tokio::time::timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .expect("removed child task should stop");
+        assert!(joined.expect("child task result").is_ok());
+        let _ = fs::remove_dir_all(temp);
     }
 }

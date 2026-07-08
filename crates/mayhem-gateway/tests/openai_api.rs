@@ -15,11 +15,11 @@ use mayhem_gateway::openai::{
     GatewayImageGenerationResult, GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate,
     GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation,
     GatewaySessionResult, GatewayState, ImageGenerationOutput, ImageGenerationRequest,
-    MayhemModelInfo, ModelCaps, PriceRefMu, ProviderSignedReceipt, ShapeAdapterInfo,
+    MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt, ShapeAdapterInfo,
     ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
-    aggregate_canary_fingerprints, priced_usage_mu, text_generation_rate_map, token_fingerprint,
+    aggregate_canary_fingerprints, priced_usage_au, text_generation_rate_map, token_fingerprint,
     HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
     ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
@@ -35,7 +35,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
 
@@ -868,6 +868,14 @@ fn test_state_and_app() -> (GatewayState, Router) {
     (state, app)
 }
 
+fn current_test_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 async fn json_request(app: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     json_request_with_headers(app, method, uri, body, &[]).await
 }
@@ -1002,9 +1010,9 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
     assert!(body["data"].as_array().expect("model data").len() >= 2);
     assert_eq!(body["data"][0]["object"], "model");
     assert_eq!(body["data"][0]["owned_by"], "mayhem");
-    assert_eq!(body["data"][0]["mayhem"]["price_ref_mu"]["denom"], "mu_usd");
-    assert_eq!(body["data"][0]["mayhem"]["price_ref_mu"]["ver"], 1);
-    let rate_units = body["data"][0]["mayhem"]["price_ref_mu"]["rate_map"]
+    assert_eq!(body["data"][0]["mayhem"]["price_ref_au"]["denom"], "au_usd");
+    assert_eq!(body["data"][0]["mayhem"]["price_ref_au"]["ver"], 1);
+    let rate_units = body["data"][0]["mayhem"]["price_ref_au"]["rate_map"]
         .as_array()
         .expect("rate map")
         .iter()
@@ -1028,12 +1036,12 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
             "model_id": "mayhem/tier2-model",
             "model_class": "embedding",
             "caps": { "tools": true, "json": true, "ctx_max": 4096, "vision": false },
-            "price_ref_mu": {
-                "denom": "mu_usd",
+            "price_ref_au": {
+                "denom": "au_usd",
                 "ver": 1,
                 "rate_map": [
-                    { "unit": "input_token", "per_unit_mu": 10, "granularity": 1000 },
-                    { "unit": "output_token", "per_unit_mu": 30, "granularity": 1000 }
+                    { "unit": "input_token", "per_unit_au": "10", "granularity": 1000 },
+                    { "unit": "output_token", "per_unit_au": "30", "granularity": 1000 }
                 ]
             },
             "attestation_tiers": { "T1": 1, "T2": 2 }
@@ -1091,7 +1099,7 @@ async fn embeddings_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.price_ver, 3);
     assert_eq!(receipt.body.usage.input_tokens(), 2);
     assert_eq!(receipt.body.usage.output_tokens(), 0);
-    assert_eq!(receipt.body.mu_owed_cum, 1);
+    assert_eq!(receipt.body.au_owed_cum, 1);
 }
 
 #[tokio::test]
@@ -1189,7 +1197,7 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.price_ver, 4);
     assert_eq!(receipt.body.usage.get(USAGE_IMAGE), 1);
     assert_eq!(receipt.body.usage.get(USAGE_STEP), 3);
-    assert_eq!(receipt.body.mu_owed_cum, 506);
+    assert_eq!(receipt.body.au_owed_cum, 506);
 }
 
 #[tokio::test]
@@ -1214,7 +1222,7 @@ async fn image_generation_scales_step_usage_by_resolution_and_validates_size() {
     assert_eq!(body["usage"][USAGE_STEP], 12);
     let receipt = &state.receipts()[0].receipt;
     assert_eq!(receipt.body.usage.get(USAGE_STEP), 12);
-    assert_eq!(receipt.body.mu_owed_cum, 524);
+    assert_eq!(receipt.body.au_owed_cum, 524);
 
     let (bad_status, bad_body) = json_request(
         app,
@@ -1275,7 +1283,7 @@ async fn image_generation_endpoint_real_sd_cli_records_receipt_when_enabled() {
     let receipt = &receipts[0].receipt;
     assert_eq!(receipt.body.usage.get(USAGE_IMAGE), 1);
     assert_eq!(receipt.body.usage.get(USAGE_STEP), 1);
-    assert_eq!(receipt.body.mu_owed_cum, 502);
+    assert_eq!(receipt.body.au_owed_cum, 502);
 }
 
 #[tokio::test]
@@ -1313,7 +1321,7 @@ async fn audio_speech_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.price_ver, 5);
     assert_eq!(receipt.body.usage.get(USAGE_INPUT_CHARACTER), 12);
     assert_eq!(receipt.body.usage.get(USAGE_AUDIO_SECOND), 1);
-    assert_eq!(receipt.body.mu_owed_cum, 112);
+    assert_eq!(receipt.body.au_owed_cum, 112);
 }
 
 #[tokio::test]
@@ -1377,7 +1385,7 @@ async fn audio_transcription_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.model_id, "admin/stt-fixture");
     assert_eq!(receipt.body.price_ver, 6);
     assert_eq!(receipt.body.usage.get(USAGE_AUDIO_SECOND), 2);
-    assert_eq!(receipt.body.mu_owed_cum, 500);
+    assert_eq!(receipt.body.au_owed_cum, 500);
 }
 
 #[tokio::test]
@@ -1654,7 +1662,7 @@ async fn automatic_context_needle_probe_marks_long_context_truncation_slashable(
     model.mayhem.caps.ctx = 131_072;
     model.mayhem.route_candidates[0].caps = json!({ "ctx": 131_072 });
     let state = GatewayState::from_models(vec![model])
-        .with_receipt_balance_mu(10_000_000)
+        .with_receipt_balance_au(10_000_000)
         .with_canary_registry(test_canary_registry(&[9, 9, 9]))
         .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
         .with_session_backend(Arc::new(ContextNeedleBackend {
@@ -2092,16 +2100,16 @@ fn routed_embedding_test_model() -> GatewayModel {
     let mut model = routed_test_model_with_providers(&["55".repeat(32)]);
     model.id = "admin/embed-fixture".to_owned();
     model.mayhem.model_class = "embedding".to_owned();
-    model.mayhem.price_ref_mu = PriceRefMu {
-        denom: "mu_usd".to_owned(),
+    model.mayhem.price_ref_au = PriceRefAu {
+        denom: "au_usd".to_owned(),
         ver: 3,
         rate_map: vec![mayhem_gateway::RateMapEntry {
             unit: "input_token".to_owned(),
-            per_unit_mu: 10,
+            per_unit_au: 10,
             granularity: 1_000,
         }],
-        per_req_mu: 0,
-        min_session_mu: 0,
+        per_req_au: 0,
+        min_session_au: 0,
         derivation: None,
         history: Vec::new(),
     };
@@ -2135,23 +2143,23 @@ fn routed_image_generation_test_model() -> GatewayModel {
     let mut model = routed_test_model_with_providers(&["55".repeat(32)]);
     model.id = "admin/image-fixture".to_owned();
     model.mayhem.model_class = "image-generation".to_owned();
-    model.mayhem.price_ref_mu = PriceRefMu {
-        denom: "mu_usd".to_owned(),
+    model.mayhem.price_ref_au = PriceRefAu {
+        denom: "au_usd".to_owned(),
         ver: 4,
         rate_map: vec![
             mayhem_gateway::RateMapEntry {
                 unit: USAGE_IMAGE.to_owned(),
-                per_unit_mu: 500,
+                per_unit_au: 500,
                 granularity: 1,
             },
             mayhem_gateway::RateMapEntry {
                 unit: USAGE_STEP.to_owned(),
-                per_unit_mu: 2,
+                per_unit_au: 2,
                 granularity: 1,
             },
         ],
-        per_req_mu: 0,
-        min_session_mu: 0,
+        per_req_au: 0,
+        min_session_au: 0,
         derivation: None,
         history: Vec::new(),
     };
@@ -2191,23 +2199,23 @@ fn routed_audio_speech_test_model() -> GatewayModel {
     let mut model = routed_test_model_with_providers(&["56".repeat(32)]);
     model.id = "admin/tts-fixture".to_owned();
     model.mayhem.model_class = "tts".to_owned();
-    model.mayhem.price_ref_mu = PriceRefMu {
-        denom: "mu_usd".to_owned(),
+    model.mayhem.price_ref_au = PriceRefAu {
+        denom: "au_usd".to_owned(),
         ver: 5,
         rate_map: vec![
             mayhem_gateway::RateMapEntry {
                 unit: USAGE_INPUT_CHARACTER.to_owned(),
-                per_unit_mu: 1,
+                per_unit_au: 1,
                 granularity: 1,
             },
             mayhem_gateway::RateMapEntry {
                 unit: USAGE_AUDIO_SECOND.to_owned(),
-                per_unit_mu: 100,
+                per_unit_au: 100,
                 granularity: 1,
             },
         ],
-        per_req_mu: 0,
-        min_session_mu: 0,
+        per_req_au: 0,
+        min_session_au: 0,
         derivation: None,
         history: Vec::new(),
     };
@@ -2244,16 +2252,16 @@ fn routed_audio_transcription_test_model() -> GatewayModel {
     let mut model = routed_test_model_with_providers(&["57".repeat(32)]);
     model.id = "admin/stt-fixture".to_owned();
     model.mayhem.model_class = "stt".to_owned();
-    model.mayhem.price_ref_mu = PriceRefMu {
-        denom: "mu_usd".to_owned(),
+    model.mayhem.price_ref_au = PriceRefAu {
+        denom: "au_usd".to_owned(),
         ver: 6,
         rate_map: vec![mayhem_gateway::RateMapEntry {
             unit: USAGE_AUDIO_SECOND.to_owned(),
-            per_unit_mu: 250,
+            per_unit_au: 250,
             granularity: 1,
         }],
-        per_req_mu: 0,
-        min_session_mu: 0,
+        per_req_au: 0,
+        min_session_au: 0,
         derivation: None,
         history: Vec::new(),
     };
@@ -2310,17 +2318,17 @@ fn signed_image_provider_receipt(
         model_id: model.id.clone(),
         price_ver: invocation.price_ver,
         locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-        locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-        locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+        locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+        locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
         served_ctx: invocation.served_ctx,
         ctx_bracket: invocation.ctx_bracket.clone(),
         ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: priced_usage_mu(
+        au_owed_cum: priced_usage_au(
             &invocation.spend_voucher.body.locked_rate_map,
-            invocation.spend_voucher.body.locked_per_req_mu,
-            invocation.spend_voucher.body.locked_min_session_mu,
+            invocation.spend_voucher.body.locked_per_req_au,
+            invocation.spend_voucher.body.locked_min_session_au,
             usage,
         ),
         prompt_hash: image_prompt_hash_for_test(request),
@@ -2387,17 +2395,17 @@ fn signed_provider_receipt_for_test(
         model_id: model.id.clone(),
         price_ver: invocation.price_ver,
         locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
-        locked_per_req_mu: invocation.spend_voucher.body.locked_per_req_mu,
-        locked_min_session_mu: invocation.spend_voucher.body.locked_min_session_mu,
+        locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+        locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
         served_ctx: invocation.served_ctx,
         ctx_bracket: invocation.ctx_bracket.clone(),
         ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: priced_usage_mu(
+        au_owed_cum: priced_usage_au(
             &invocation.spend_voucher.body.locked_rate_map,
-            invocation.spend_voucher.body.locked_per_req_mu,
-            invocation.spend_voucher.body.locked_min_session_mu,
+            invocation.spend_voucher.body.locked_per_req_au,
+            invocation.spend_voucher.body.locked_min_session_au,
             usage,
         ),
         prompt_hash,
@@ -2626,12 +2634,12 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
             model_class: DEFAULT_MODEL_CLASS.to_owned(),
             providers_online: 1,
             rooms: 1,
-            price_ref_mu: PriceRefMu {
-                denom: "mu_usd".to_owned(),
+            price_ref_au: PriceRefAu {
+                denom: "au_usd".to_owned(),
                 ver: 7,
                 rate_map: text_generation_rate_map(20, 60),
-                per_req_mu: 0,
-                min_session_mu: 0,
+                per_req_au: 0,
+                min_session_au: 0,
                 derivation: None,
                 history: Vec::new(),
             },
@@ -2678,8 +2686,8 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         enclave_id: catalog_enclave_id(&identity),
         room_id,
         price_ver: 7,
-        price_ref_mu: None,
-        min_ask_mu: 0,
+        price_ref_au: None,
+        min_ask_au: 0,
         att_tier: 1,
         quant: "int4".to_owned(),
         admin_pubkey: identity.admin_pubkey,
@@ -2725,7 +2733,9 @@ fn test_provider_heartbeat(
         },
         perf: HeartbeatPerf { tok_s, ttft_ms },
         price_ver: candidate.price_ver,
-        min_ask_mu: 0,
+        min_ask_au: 0,
+        transport_peer: None,
+        identity_anchor: None,
         accepting_new: true,
         caps: HeartbeatCaps {
             tools: candidate
@@ -2991,7 +3001,7 @@ async fn mayhem_local_endpoints_report_status_receipts_and_balance() {
     let (status, body) =
         json_request(test_app(), Method::GET, "/mayhem/balance", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["denom"], "mu_usd");
+    assert_eq!(body["denom"], "au_usd");
 }
 
 #[tokio::test]
@@ -3155,7 +3165,9 @@ async fn dashboard_price_chart_follow_list_persists_in_cookie() {
 
 #[tokio::test]
 async fn user_dashboard_renders_live_gateway_data() {
-    let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
+    let state = GatewayState::from_embedded_catalog()
+        .with_dev_session_shim()
+        .with_receipt_balance_au(1_000_000_000_000_000_000);
     let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
     let dashboard_path = dashboard_url
         .strip_prefix("http://127.0.0.1:11435")
@@ -3200,6 +3212,32 @@ async fn user_dashboard_renders_live_gateway_data() {
 }
 
 #[tokio::test]
+async fn user_dashboard_shows_model_worker_route_counts() {
+    let providers = vec!["41".repeat(32), "42".repeat(32), "43".repeat(32)];
+    let mut model = routed_test_model_with_providers(&providers);
+    model.mayhem.providers_online = 2;
+    let state = GatewayState::from_models(vec![model]);
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let app = openai_router(state);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        dashboard_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("user dashboard html");
+    assert!(body.contains("mayhem/routed-test"));
+    assert!(body.contains("3 worker routes"));
+}
+
+#[tokio::test]
 async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     let provider = "55".repeat(32);
     let state = GatewayState::from_models(vec![routed_test_model_with_providers(
@@ -3207,14 +3245,14 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     )])
     .with_provider_earnings(vec![json!({
         "provider": provider,
-        "denom": "mu_usd",
-        "total_mu": 2_500_000_u64,
-        "held_mu": 500_000_u64,
-        "paid_cum_mu": 250_000_u64,
-        "released_mu": 1_750_000_u64,
-        "claimable_mu": 1_750_000_u64,
+        "denom": "au_usd",
+        "total_au": "2500000000000000000",
+        "held_au": "500000000000000000",
+        "paid_cum_au": "250000000000000000",
+        "released_au": "1750000000000000000",
+        "claimable_au": "1750000000000000000",
         "claim_model": "tap_non_custodial_claim",
-        "holdbacks": [{"epoch": 7, "mu": 500_000_u64}],
+        "holdbacks": [{"epoch": 7, "au": "500000000000000000"}],
         "updated_epoch": 9_u64
     })])
     .with_session_backend(Arc::new(TestDirectSessionBackend));
@@ -3258,12 +3296,55 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert!(body.contains("Earnings"));
     assert!(body.contains("Reputation / Holdback"));
     assert!(body.contains("Hardware / Health"));
+    assert!(body.contains("Workers"));
+    assert!(body.contains("Markets"));
     assert!(body.contains("price-chart-svg"));
     assert!(body.contains("Ctx bucket"));
     assert!(body.contains("mayhem earnings --provider"));
     assert!(body.contains("mayhem withdraw --claim-proof"));
     assert!(!body.contains("ledger earnings not loaded"));
     assert_no_external_urls(&body);
+}
+
+#[tokio::test]
+async fn provider_dashboard_counts_multi_enclave_workers_and_markets() {
+    let provider = "58".repeat(32);
+    let mut chat = routed_test_model_with_providers(std::slice::from_ref(&provider));
+    chat.id = "mayhem/chat-small".to_owned();
+    chat.mayhem.route_candidates[0].enclave_id = "11".repeat(32);
+    chat.mayhem.route_candidates[0].room_id = "aa".repeat(16);
+    let mut embedding = routed_test_model_with_providers(std::slice::from_ref(&provider));
+    embedding.id = "mayhem/embed-small".to_owned();
+    embedding.mayhem.model_class = "embedding".to_owned();
+    embedding.mayhem.caps.output_modality = Some("embedding".to_owned());
+    embedding.mayhem.caps.output_modalities = vec!["embedding".to_owned()];
+    embedding.mayhem.route_candidates[0].enclave_id = "22".repeat(32);
+    embedding.mayhem.route_candidates[0].room_id = "bb".repeat(16);
+    let state = GatewayState::from_models(vec![chat, embedding]);
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let query = dashboard_path
+        .strip_prefix("/mayhem/dashboard?")
+        .expect("dashboard token query");
+    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let app = openai_router(state);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &provider_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("provider dashboard html");
+    assert!(body.contains(r#"<span class="label">Workers</span><p class="value mono">2</p>"#));
+    assert!(body.contains(r#"<span class="label">Markets</span><p class="value mono">2</p>"#));
+    assert!(body.contains("mayhem/chat-small"));
+    assert!(body.contains("mayhem/embed-small"));
 }
 
 #[tokio::test]
@@ -3324,6 +3405,7 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
     let provider = "77".repeat(32);
     let enclave_id = "88".repeat(32);
     let progress_dir = tempfile::tempdir().expect("progress tempdir");
+    let updated_at_ms = current_test_millis();
     fs::write(
         progress_dir.path().join("provider-progress.json"),
         serde_json::to_vec_pretty(&json!({
@@ -3338,7 +3420,7 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
             "position": 7_u64,
             "total": 10_u64,
             "percent": 70_u64,
-            "updated_at_ms": 1_782_950_400_000_u64
+            "updated_at_ms": updated_at_ms
         }))
         .expect("progress json"),
     )
@@ -3374,24 +3456,76 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
 }
 
 #[tokio::test]
+async fn provider_dashboard_hides_stale_progress_before_route_exists() {
+    let provider = "77".repeat(32);
+    let enclave_id = "88".repeat(32);
+    let progress_dir = tempfile::tempdir().expect("progress tempdir");
+    let stale_at_ms = current_test_millis().saturating_sub(10 * 60 * 1000);
+    fs::write(
+        progress_dir.path().join("provider-progress.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "provider": provider,
+            "model_id": "mayhem/stale-loading-test",
+            "enclave_id": enclave_id,
+            "artifact": "gguf-q4_k_m",
+            "label": "gguf-q4_k_m artifact",
+            "phase": "download",
+            "status": "running",
+            "position": 7_u64,
+            "total": 10_u64,
+            "percent": 70_u64,
+            "updated_at_ms": stale_at_ms
+        }))
+        .expect("progress json"),
+    )
+    .expect("write progress");
+    let state = GatewayState::from_models(Vec::new())
+        .with_provider_load_progress_dir(progress_dir.path().to_path_buf());
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let dashboard_path = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard url is rooted at gateway");
+    let query = dashboard_path
+        .strip_prefix("/mayhem/dashboard?")
+        .expect("dashboard token query");
+    let provider_path = format!("/mayhem/dashboard/provider?{query}&provider={provider}");
+    let app = openai_router(state);
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &provider_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("provider dashboard html");
+    assert!(!body.contains("mayhem/stale-loading-test"));
+    assert!(body.contains("No provider routes loaded"));
+    assert_no_external_urls(&body);
+}
+
+#[tokio::test]
 async fn network_dashboard_renders_live_catalog_and_provider_state() {
     let provider_a = "88".repeat(32);
     let provider_b = "99".repeat(32);
     let mut model = routed_test_model_with_providers(&[provider_a.clone(), provider_b.clone()]);
     model.mayhem.providers_online = 2;
     model.mayhem.rooms = 2;
-    model.mayhem.price_ref_mu.derivation = Some(json!({
+    model.mayhem.price_ref_au.derivation = Some(json!({
         "type": "price_derivation",
         "schema_version": 1,
         "epoch": 12,
         "enclave_id": model.mayhem.route_candidates[0].enclave_id,
         "model_id": model.id,
-        "denom": "mu_usd",
+        "denom": "au_usd",
         "price_ver": 7,
         "price_source": "market_float",
         "usage": {
             "usage_root": "ab".repeat(32),
-            "active_demand_mu": 2_500_000u64,
+            "active_demand_au": "2500000000000000000",
             "session_count": 5u64
         },
         "controller": {
@@ -3407,8 +3541,8 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
                 "max_step_bps": 1_000u64
             }
         },
-        "seed_price": { "ver": 1, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
-        "result_price": { "ver": 7, "rate_map": [], "per_req_mu": 0u64, "min_session_mu": 0u64 },
+        "seed_price": { "ver": 1, "rate_map": [], "per_req_au": "0", "min_session_au": "0" },
+        "result_price": { "ver": 7, "rate_map": [], "per_req_au": "0", "min_session_au": "0" },
         "derivation_hash": "cd".repeat(32),
         "price_root": "ef".repeat(32)
     }));
@@ -3500,7 +3634,7 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     assert!(body.contains("ETA measured after the first download chunk"));
     assert!(body.contains("T2"));
     assert!(body.contains("rep 87.50%"));
-    assert!(body.contains("price = f(seed v1, U 87.50%, demand 2500000mu, 5 sessions, supply 2)"));
+    assert!(body.contains("price = f(seed v1, U 87.50%, demand 2500000000000000000au, 5 sessions, supply 2)"));
     assert!(body.contains("epoch 12"));
     assert!(body.contains("root efefefefe..."));
     assert!(body.contains("leaf cdcdcdcdc..."));

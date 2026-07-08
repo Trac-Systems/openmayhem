@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use mayhem_proto::ReceiptUsage;
+use mayhem_proto::{MoneyAu, ReceiptUsage};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    priced_usage_mu, text_usage_mu, HeartbeatCaps, ProviderHeartbeat, ProviderProbation,
+    priced_usage_au, text_usage_au, HeartbeatCaps, ProviderHeartbeat, ProviderProbation,
     RateMapEntry,
 };
 
@@ -50,10 +50,10 @@ pub struct ContractProviderSnapshot {
     pub reputation: f64,
     pub price_ver: u64,
     pub rate_map: Vec<RateMapEntry>,
-    #[serde(default)]
-    pub per_req_mu: u64,
-    #[serde(default)]
-    pub min_session_mu: u64,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub per_req_au: MoneyAu,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub min_session_au: MoneyAu,
     pub ref_rate_map: Vec<RateMapEntry>,
     pub probation: Option<ProviderProbation>,
     pub caps: HeartbeatCaps,
@@ -139,7 +139,9 @@ pub struct RequestRequirements {
     pub min_ctx: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub max_price_mu: Option<u64>,
+    #[serde(default)]
+    pub usage: ReceiptUsage,
+    pub max_price_au: Option<MoneyAu>,
     /// Minimum acceptable throughput in the request modality's natural unit.
     pub min_throughput: Option<f64>,
     pub now_millis: u64,
@@ -178,7 +180,7 @@ pub struct SelectionWeights {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SelectionCandidate {
     pub entry: ProviderTableEntry,
-    pub estimated_price_mu: u64,
+    pub estimated_price_au: MoneyAu,
     pub effective_ttft_ms: f64,
     pub latency_factor: f64,
     pub price_norm: f64,
@@ -188,6 +190,8 @@ pub struct SelectionCandidate {
     pub engine_backlog: u32,
     pub engine_backlog_factor: f64,
     pub capacity_mismatch_factor: f64,
+    pub capacity_group: String,
+    pub capacity_group_factor: f64,
     pub weight: f64,
 }
 
@@ -269,7 +273,8 @@ impl Default for RequestRequirements {
             min_ctx: 0,
             input_tokens: 0,
             output_tokens: 0,
-            max_price_mu: None,
+            usage: ReceiptUsage::default(),
+            max_price_au: None,
             min_throughput: None,
             now_millis: 0,
             max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
@@ -569,7 +574,7 @@ impl ProviderTable {
 pub fn evaluate_eligibility(
     entry: &ProviderTableEntry,
     request: &RequestRequirements,
-) -> Result<u64, IneligibilityReason> {
+) -> Result<MoneyAu, IneligibilityReason> {
     if entry.contract.consent_ver != request.current_rules_ver {
         return Err(IneligibilityReason::ConsentVersion);
     }
@@ -606,22 +611,23 @@ pub fn evaluate_eligibility(
     {
         return Err(IneligibilityReason::Capabilities);
     }
-    let estimated_price_mu = estimate_request_price_mu(&entry.contract, request);
+    let estimated_price_au = estimate_request_price_au(&entry.contract, request);
     if request
-        .max_price_mu
-        .is_some_and(|max_price_mu| estimated_price_mu > max_price_mu)
+        .max_price_au
+        .is_some_and(|max_price_au| estimated_price_au > max_price_au)
     {
         return Err(IneligibilityReason::Price);
     }
-    if heartbeat.min_ask_mu > estimated_price_mu {
+    if MoneyAu::from(heartbeat.min_ask_au) > estimated_price_au {
         return Err(IneligibilityReason::ProviderMinAsk);
     }
-    if request
+    if let Some(floor) = request
         .min_throughput
         .filter(|value| value.is_finite() && *value > 0.0)
-        .is_some_and(|floor| effective_throughput(entry).unwrap_or(0.0) < floor)
     {
-        return Err(IneligibilityReason::ThroughputFloor);
+        if effective_throughput(entry).is_some_and(|throughput| throughput < floor) {
+            return Err(IneligibilityReason::ThroughputFloor);
+        }
     }
     if let Some(probation) = entry
         .contract
@@ -637,10 +643,10 @@ pub fn evaluate_eligibility(
         if active_sessions >= probation.caps.max_concurrent_sessions_per_user {
             return Err(IneligibilityReason::ProbationConcurrentLimit);
         }
-        let reference_price_mu = estimate_reference_request_price_mu(&entry.contract, request);
+        let reference_price_au = estimate_reference_request_price_au(&entry.contract, request);
         if probation_price_over_cap(
-            estimated_price_mu,
-            reference_price_mu,
+            estimated_price_au,
+            reference_price_au,
             probation.caps.price_max_bps,
         ) {
             return Err(IneligibilityReason::ProbationPriceCap);
@@ -656,7 +662,7 @@ pub fn evaluate_eligibility(
     if attestation_age > request.max_attestation_head_age_millis {
         return Err(IneligibilityReason::AttestationStale);
     }
-    Ok(estimated_price_mu)
+    Ok(estimated_price_au)
 }
 
 pub fn eligible_candidates(
@@ -667,10 +673,10 @@ pub fn eligible_candidates(
     let mut base = entries
         .iter()
         .filter_map(|entry| {
-            let estimated_price_mu = evaluate_eligibility(entry, request).ok()?;
+            let estimated_price_au = evaluate_eligibility(entry, request).ok()?;
             Some((
                 entry.clone(),
-                estimated_price_mu,
+                estimated_price_au,
                 effective_ttft_ms(entry).max(1.0),
             ))
         })
@@ -687,15 +693,16 @@ pub fn eligible_candidates(
     )
     .max(1.0);
 
-    base.drain(..)
-        .map(|(entry, estimated_price_mu, effective_ttft_ms)| {
+    let mut candidates = base
+        .drain(..)
+        .map(|(entry, estimated_price_au, effective_ttft_ms)| {
             let heartbeat = entry
                 .heartbeat
                 .as_ref()
                 .expect("eligible candidates have live heartbeats");
             let reputation = entry.contract.reputation.clamp(0.0, 1.0);
             let available = (1.0 - heartbeat.sat).clamp(0.0, 1.0);
-            let price_norm = ((estimated_price_mu.max(1) as f64) / median_price).max(f64::EPSILON);
+            let price_norm = ((estimated_price_au.max(1) as f64) / median_price).max(f64::EPSILON);
             let latency_factor = (median_ttft / effective_ttft_ms).clamp(0.25, 4.0);
             let error_factor = (1.0 - entry.observed.ewma_error_rate).clamp(0.05, 1.0);
             let throughput_ratio = throughput_delivery_ratio(&entry);
@@ -704,6 +711,7 @@ pub fn eligible_candidates(
             let engine_backlog = heartbeat.q.engine_backlog;
             let engine_backlog_factor = engine_backlog_factor(engine_backlog);
             let capacity_mismatch_factor = capacity_mismatch_factor(&entry);
+            let capacity_group = capacity_group_key(&entry);
             let weight = reputation.powf(weights.reputation_alpha)
                 * available.powf(weights.saturation_beta)
                 * (1.0 / price_norm).powf(weights.price_gamma)
@@ -715,7 +723,7 @@ pub fn eligible_candidates(
                 * probation_weight_multiplier(&entry);
             SelectionCandidate {
                 entry,
-                estimated_price_mu,
+                estimated_price_au,
                 effective_ttft_ms,
                 latency_factor,
                 price_norm,
@@ -725,10 +733,14 @@ pub fn eligible_candidates(
                 engine_backlog,
                 engine_backlog_factor,
                 capacity_mismatch_factor,
+                capacity_group,
+                capacity_group_factor: 1.0,
                 weight,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    apply_capacity_group_factors(&mut candidates);
+    candidates
 }
 
 pub fn select_weighted_p2c(
@@ -760,33 +772,31 @@ pub fn select_weighted_p2c(
     })
 }
 
-pub fn estimate_request_price_mu(
+pub fn estimate_request_price_au(
     contract: &ContractProviderSnapshot,
     request: &RequestRequirements,
-) -> u64 {
-    let usage = ReceiptUsage::text(request.input_tokens, request.output_tokens);
-    priced_usage_mu(
+) -> MoneyAu {
+    priced_usage_au(
         &contract.rate_map,
-        contract.per_req_mu,
-        contract.min_session_mu,
-        &usage,
+        contract.per_req_au,
+        contract.min_session_au,
+        &request.usage,
     )
 }
 
-pub fn estimate_reference_request_price_mu(
+pub fn estimate_reference_request_price_au(
     contract: &ContractProviderSnapshot,
     request: &RequestRequirements,
-) -> u64 {
-    let usage = ReceiptUsage::text(request.input_tokens, request.output_tokens);
-    text_usage_mu(&contract.ref_rate_map, &usage)
+) -> MoneyAu {
+    text_usage_au(&contract.ref_rate_map, &request.usage)
 }
 
 fn probation_price_over_cap(
-    estimated_price_mu: u64,
-    reference_price_mu: u64,
+    estimated_price_au: MoneyAu,
+    reference_price_au: MoneyAu,
     cap_bps: u32,
 ) -> bool {
-    u128::from(estimated_price_mu) * 10_000 > u128::from(reference_price_mu) * u128::from(cap_bps)
+    estimated_price_au * 10_000 > reference_price_au * u128::from(cap_bps)
 }
 
 fn update_ewma(current: Option<f64>, sample: f64, alpha: f64) -> f64 {
@@ -891,6 +901,43 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
 }
 
+fn capacity_group_key(entry: &ProviderTableEntry) -> String {
+    entry
+        .heartbeat
+        .as_ref()
+        .and_then(|heartbeat| heartbeat.identity_anchor.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("provider:{}", entry.contract.provider))
+}
+
+fn apply_capacity_group_factors(candidates: &mut [SelectionCandidate]) {
+    let mut groups = BTreeMap::<String, (f64, f64)>::new();
+    for candidate in candidates.iter() {
+        let weight = candidate.weight.max(0.0);
+        if !weight.is_finite() || weight <= f64::EPSILON {
+            continue;
+        }
+        let entry = groups
+            .entry(candidate.capacity_group.clone())
+            .or_insert((0.0, 0.0));
+        entry.0 += weight;
+        entry.1 = entry.1.max(weight);
+    }
+    for candidate in candidates {
+        let factor = groups
+            .get(&candidate.capacity_group)
+            .and_then(|(total, strongest)| {
+                (*total > f64::EPSILON && *strongest > f64::EPSILON)
+                    .then(|| (strongest / total).clamp(0.0, 1.0))
+            })
+            .unwrap_or(1.0);
+        candidate.capacity_group_factor = factor;
+        candidate.weight *= factor;
+    }
+}
+
 fn weighted_sample_index(
     candidates: &[SelectionCandidate],
     excluded: Option<usize>,
@@ -986,6 +1033,8 @@ fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mayhem_proto::USAGE_AUDIO_SECOND;
+
     use crate::text_generation_rate_map;
     use crate::{
         HeartbeatAttestation, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProbationCaps,
@@ -1024,8 +1073,8 @@ mod tests {
             reputation: 0.8,
             price_ver: 5,
             rate_map: text_generation_rate_map(20, 60),
-            per_req_mu: 0,
-            min_session_mu: 0,
+            per_req_au: 0,
+            min_session_au: 0,
             ref_rate_map: text_generation_rate_map(20, 60),
             probation: None,
             caps: caps(),
@@ -1045,8 +1094,8 @@ mod tests {
             reputation: 0.72,
             price_ver: 5,
             rate_map: text_generation_rate_map(20, 60),
-            per_req_mu: 0,
-            min_session_mu: 0,
+            per_req_au: 0,
+            min_session_au: 0,
             ref_rate_map: text_generation_rate_map(20, 60),
             probation: None,
             caps: caps(),
@@ -1087,7 +1136,9 @@ mod tests {
                 ttft_ms,
             },
             price_ver: 5,
-            min_ask_mu: 0,
+            min_ask_au: 0,
+            transport_peer: None,
+            identity_anchor: None,
             accepting_new: true,
             caps: caps(),
             att: HeartbeatAttestation {
@@ -1126,7 +1177,9 @@ mod tests {
                 ttft_ms: 140,
             },
             price_ver: 5,
-            min_ask_mu: 0,
+            min_ask_au: 0,
+            transport_peer: None,
+            identity_anchor: None,
             accepting_new: true,
             caps: caps(),
             att: HeartbeatAttestation {
@@ -1155,7 +1208,8 @@ mod tests {
             min_ctx: 4096,
             input_tokens: 1000,
             output_tokens: 1000,
-            max_price_mu: Some(100),
+            usage: ReceiptUsage::text(1000, 1000),
+            max_price_au: Some(100),
             now_millis: now,
             ..RequestRequirements::default()
         }
@@ -1174,6 +1228,35 @@ mod tests {
                 weight_bps: 5_000,
             },
         }
+    }
+
+    #[test]
+    fn non_text_usage_prices_audio_candidates() {
+        let now = 1_000_000;
+        let audio_rate_map = vec![RateMapEntry {
+            unit: USAGE_AUDIO_SECOND.to_owned(),
+            per_unit_au: 250,
+            granularity: 1,
+        }];
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.contract.rate_map = audio_rate_map.clone();
+        entry.contract.ref_rate_map = audio_rate_map;
+        entry.heartbeat.as_mut().unwrap().min_ask_au = 1;
+        let request = RequestRequirements {
+            requires_tools: false,
+            requires_json: false,
+            min_ctx: 1,
+            input_tokens: 6,
+            output_tokens: 0,
+            usage: ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, 6)]),
+            max_price_au: Some(2_000),
+            ..eligible_request(now + 1)
+        };
+
+        assert_eq!(evaluate_eligibility(&entry, &request), Ok(1_500));
+        let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].estimated_price_au, 1_500);
     }
 
     struct ScriptedRng {
@@ -1475,7 +1558,7 @@ mod tests {
         );
 
         let mut price_limited = request.clone();
-        price_limited.max_price_mu = Some(79);
+        price_limited.max_price_au = Some(79);
         assert_eq!(
             evaluate_eligibility(&good, &price_limited),
             Err(IneligibilityReason::Price)
@@ -1486,7 +1569,7 @@ mod tests {
             .heartbeat
             .as_mut()
             .expect("heartbeat")
-            .min_ask_mu = 81;
+            .min_ask_au = 81;
         assert_eq!(
             evaluate_eligibility(&ask_limited, &request),
             Err(IneligibilityReason::ProviderMinAsk)
@@ -1495,7 +1578,7 @@ mod tests {
             .heartbeat
             .as_mut()
             .expect("heartbeat")
-            .min_ask_mu = 80;
+            .min_ask_au = 80;
         assert_eq!(evaluate_eligibility(&ask_limited, &request), Ok(80));
 
         let mut throughput_limited = request.clone();
@@ -1506,6 +1589,14 @@ mod tests {
         );
         throughput_limited.min_throughput = Some(50.0);
         assert_eq!(evaluate_eligibility(&good, &throughput_limited), Ok(80));
+        let mut cold_start = good.clone();
+        cold_start.heartbeat.as_mut().expect("heartbeat").perf.tok_s = None;
+        cold_start.observed.ewma_tok_s = None;
+        throughput_limited.min_throughput = Some(60.0);
+        assert_eq!(
+            evaluate_eligibility(&cold_start, &throughput_limited),
+            Ok(80)
+        );
 
         let mut bad = good.clone();
         bad.attestation_head = None;
@@ -1620,6 +1711,62 @@ mod tests {
         let selected =
             select_weighted_p2c(&entries, &request, &weights, &mut rng).expect("provider selected");
         assert_eq!(selected.selected.entry.key, idle.key);
+    }
+
+    #[test]
+    fn shared_identity_anchor_caps_combined_capacity_weight() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let weights = SelectionWeights::default();
+        let mut first_wallet = entry_for(1, now, 0.2, 100);
+        let mut second_wallet = entry_for(2, now, 0.2, 100);
+        let honest_machine = entry_for(3, now, 0.2, 100);
+        let shared_anchor = format!("fingerprint:{}", "ab".repeat(32));
+        first_wallet.heartbeat.as_mut().unwrap().identity_anchor = Some(shared_anchor.clone());
+        second_wallet.heartbeat.as_mut().unwrap().identity_anchor = Some(shared_anchor.clone());
+
+        let candidates = eligible_candidates(
+            &[
+                first_wallet.clone(),
+                second_wallet.clone(),
+                honest_machine.clone(),
+            ],
+            &request,
+            &weights,
+        );
+        let sybil_weight = candidates
+            .iter()
+            .filter(|candidate| candidate.capacity_group == shared_anchor)
+            .map(|candidate| candidate.weight)
+            .sum::<f64>();
+        let honest = candidates
+            .iter()
+            .find(|candidate| candidate.entry.key == honest_machine.key)
+            .expect("honest machine candidate");
+        assert!((sybil_weight - honest.weight).abs() < 1e-12);
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.capacity_group == shared_anchor)
+        {
+            assert!((candidate.capacity_group_factor - 0.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn cold_start_provider_keeps_positive_bootstrap_weight() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.observed = ProviderObservation::default();
+        entry.contract.probation = Some(active_probation());
+        entry.heartbeat.as_mut().unwrap().identity_anchor =
+            Some(format!("fingerprint:{}", "cd".repeat(32)));
+
+        let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].weight > 0.0);
+        assert_eq!(candidates[0].capacity_group_factor, 1.0);
+        assert!(candidates[0].throughput_ratio.is_none());
     }
 
     #[test]

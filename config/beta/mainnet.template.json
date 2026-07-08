@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "launch_id": "mayhem-mainnet-v1",
+  "network": {
+    "name": "mainnet",
+    "denom": "au_usd",
+    "msb": {
+      "address_prefix": "trac",
+      "network_id": 918,
+      "bootstrap": "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685",
+      "channel": "0000trac0network0msb0mainnet0000"
+    },
+    "subnet": {
+      "channel": "mayhem-router-subnet",
+      "bootstrap": "<mainnet-mayhem-subnet-bootstrap-64-hex-after-admin-start>"
+    },
+    "dht": {
+      "peer_bootstrap": [
+        "116.202.214.149:10001",
+        "157.180.12.214:10001",
+        "node1.hyperdht.org:49737",
+        "node2.hyperdht.org:49737",
+        "node3.hyperdht.org:49737"
+      ],
+      "msb_bootstrap": [
+        "116.202.214.149:10001",
+        "157.180.12.214:10001",
+        "node1.hyperdht.org:49737",
+        "node2.hyperdht.org:49737",
+        "node3.hyperdht.org:49737"
+      ]
+    }
+  },
+  "startup": {
+    "runtime": "pear",
+    "network_arg": "mainnet",
+    "peer_store_name": "mayhem-mainnet",
+    "msb_store_name": "mayhem-mainnet-msb",
+    "peer_rpc_url": "http://127.0.0.1:49223/v1",
+    "sc_bridge_url": "ws://127.0.0.1:49222",
+    "sc_bridge_token_env": "MAYHEM_SC_BRIDGE_TOKEN"
+  },
+  "controls": {
+    "admin_controls_economy": true,
+    "admin_sets_prices": true,
+    "admin_sets_rules": true,
+    "admin_sets_params": true,
+    "admin_sets_provider_payout_targets": true,
+    "admin_can_ban_providers": true,
+    "providers_set_prices": false,
+    "providers_set_rules": false,
+    "providers_set_params": false,
+    "providers_set_payout_terms": false,
+    "providers_submit_models": false,
+    "providers_create_canonical_rooms": false,
+    "providers_only_join_admin_rooms": true,
+    "provider_payout_targets_admin_verified": true,
+    "browser_handoffs_print_copy_paste_url": true
+  },
+  "contract": {
+    "admin_peer_pubkey": "<admin-peer-public-key-64-hex>",
+    "key_env": {
+      "admin_trac_keypair_path": "MAYHEM_TRAC_ADMIN_KEYPAIR_PATH",
+      "tnk_epoch_treasury_keypair_path": "MAYHEM_TNK_TREASURY_KEYPAIR_PATH",
+      "paygate_oracle_key_path": "MAYHEM_PAYGATE_ORACLE_KEY_PATH",
+      "catalog_admin_seed_hex": "MAYHEM_CATALOG_ADMIN_SEED_HEX",
+      "tap_deployer_private_key": "MAYHEM_TAP_DEPLOYER_PRIVATE_KEY",
+      "tap_roller_private_key": "MAYHEM_TAP_ROLLER_PRIVATE_KEY",
+      "etherscan_api_key": "MAYHEM_ETHERSCAN_API_KEY",
+      "stripe_secret_key": "MAYHEM_STRIPE_SECRET_KEY",
+      "stripe_webhook_secret": "MAYHEM_STRIPE_WEBHOOK_SECRET"
+    },
+    "params": {
+      "probation_successful_sessions": 50,
+      "probation_seconds": 604800,
+      "probation_max_concurrent_sessions_per_user": 2,
+      "probation_price_max_bps": 10000,
+      "probation_weight_bps": 5000,
+      "auditor_min_reputation_bps": 8000,
+      "auditor_min_age_seconds": 2592000,
+      "canary_match_min_bps": 9000,
+      "canary_probe_holdback_bps": 0,
+      "canary_probe_release_min_passes": 1,
+      "probe_reward_au": "5000000000000000",
+      "uptime_tick_seconds": 21600,
+      "fraud_slash_bps": 10000,
+      "dispute_lost_slash_bps": 2000,
+      "new_provider_holdback_epochs": 168,
+      "holdback_epochs": 24,
+      "min_tier_notice_epochs": 24,
+      "fee_bps": 1500,
+      "dispute_deposit_au": "1000000000000000000",
+      "payout_min_au": "1000000000000000000",
+      "price_min_bps": 2500,
+      "price_max_bps": 40000,
+      "price_rate_limit_seconds": 21600,
+      "market_target_utilization_bps": 8500,
+      "market_ema_alpha_bps": 2500,
+      "market_gain_bps": 5000,
+      "market_max_step_bps": 1000,
+      "market_cold_start_min_providers": 2,
+      "market_provider_epoch_target_au": "1000000000000000000",
+      "market_max_utilization_bps": 50000,
+      "market_below_target_discount_bps": 2500,
+      "market_above_target_slope_bps": 15000,
+      "epoch_seconds": 3600,
+      "rate_staleness_seconds": 2700,
+      "rules_grace_seconds": 1209600,
+      "challenge_epochs": 6,
+      "max_apply_batch": 2000,
+      "max_market_usage_entries": 5000,
+      "max_tnk_settlement_outputs": 5000,
+      "param_activation_delay_seconds": 86400
+    }
+  },
+  "payments": {
+    "rails": [
+      "fiat",
+      "tap",
+      "tnk"
+    ],
+    "tnk": {
+      "address_prefix": "trac",
+      "treasury_address": "<trac1-funded-epoch-treasury-address>",
+      "operator_fee_address": "<trac1-operator-fee-address>",
+      "min_epoch_wallet_balance_tnk_e18": "1000000000000000000",
+      "sponsors_only": [
+        "epoch_commit",
+        "payment_proof_rollup",
+        "settlement_evidence"
+      ]
+    },
+    "tap": {
+      "chain_id": 1,
+      "token_address": "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454",
+      "pool_address": "<MayhemInferencePool-mainnet-address-after-C5>",
+      "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
+      "eth_rpc_env": "MAYHEM_TAP_ETH_RPC",
+      "eth_rpc_fallbacks_env": "MAYHEM_TAP_ETH_RPC_FALLBACKS",
+      "max_epoch_delta_wei": "500000000000000000000",
+      "operator_address": "<0x-operator-fee-address>"
+    },
+    "fiat": {
+      "processor": "stripe",
+      "mode": "live",
+      "public_base_url": "<https://paygate.mainnet.example>",
+      "webhook_path": "/v1/stripe/webhook",
+      "connect_enabled": true
+    }
+  },
+  "catalog": {
+    "source": "ledger_anchor",
+    "admin_signed": true,
+    "models_command": "mayhem models"
+  }
+}

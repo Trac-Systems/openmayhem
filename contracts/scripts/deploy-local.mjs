@@ -1,4 +1,4 @@
-// Deploy MockTTAP + KnowledgePool locally. As a CLI it connects to MAYHEM_TAP_ETH_RPC and writes
+// Deploy MockTTAP + MayhemInferencePool locally. As a CLI it connects to MAYHEM_TAP_ETH_RPC and writes
 // .mayhem-local/contracts/eth-addresses.json for the oracle
 // runners. As a module it exports deployPool(signer) so the in-process oracle e2e can deploy + wire
 // the same contracts without a standing node. No external network.
@@ -15,11 +15,11 @@ import {
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const ADDRESSES_FILE = join(REPO, '.mayhem-local', 'contracts', 'eth-addresses.json');
 
-/** Deploy ONLY the KnowledgePool bound to an EXISTING token (no mock). Public deployments should call this
+/** Deploy ONLY the MayhemInferencePool bound to an EXISTING token (no mock). Public deployments should call this
  *  with canonical TAP. `maxEpochDelta` is the C1 per-epoch spend cap (0 = disabled). */
 export async function deployPoolWithToken(signer, tokenAddr, ownerAddr, maxEpochDelta = 0n, art = compileAll()) {
   const owner = ownerAddr || (await signer.getAddress());
-  const pool = await new ethers.ContractFactory(art.KnowledgePool.abi, art.KnowledgePool.bytecode, signer).deploy(tokenAddr, owner, maxEpochDelta);
+  const pool = await new ethers.ContractFactory(art.MayhemInferencePool.abi, art.MayhemInferencePool.bytecode, signer).deploy(tokenAddr, owner, maxEpochDelta);
   await pool.waitForDeployment();
   return { pool, poolAddr: await pool.getAddress(), art };
 }

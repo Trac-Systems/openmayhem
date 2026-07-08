@@ -10,7 +10,7 @@ const scriptPath = fileURLToPath(import.meta.url);
 export const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
 export const GATE_TICKER_URL = 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=TNK_USDT';
 export const MEXC_TICKER_URL = 'https://api.mexc.com/api/v3/ticker/price?symbol=TNKUSDT';
-const USD_E6 = 1_000_000n;
+const USD_AU = 1_000_000_000_000_000_000n;
 
 function shellQuote(value) {
   const raw = String(value ?? '');
@@ -18,19 +18,19 @@ function shellQuote(value) {
   return `'${raw.replaceAll("'", "'\\''")}'`;
 }
 
-export function decimalUsdToE6(value) {
+export function decimalUsdToAu(value) {
   const raw = String(value ?? '').trim();
   if (!/^\d+(\.\d+)?$/.test(raw)) {
     throw new Error(`Invalid decimal USD price: ${raw}`);
   }
   const [whole, fraction = ''] = raw.split('.');
-  const sevenDigits = `${fraction}0000000`.slice(0, 7);
-  const micros = BigInt(whole) * USD_E6 + BigInt(sevenDigits.slice(0, 6));
-  const rounded = micros + (Number(sevenDigits[6]) >= 5 ? 1n : 0n);
-  if (rounded <= 0n || rounded > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new Error(`USD price outside safe e6 range: ${raw}`);
+  const nineteenDigits = `${fraction}0000000000000000000`.slice(0, 19);
+  const atto = BigInt(whole) * USD_AU + BigInt(nineteenDigits.slice(0, 18));
+  const rounded = atto + (Number(nineteenDigits[18]) >= 5 ? 1n : 0n);
+  if (rounded <= 0n) {
+    throw new Error(`USD price outside positive atto range: ${raw}`);
   }
-  return Number(rounded);
+  return rounded.toString();
 }
 
 export function parseGateTicker(payload) {
@@ -42,7 +42,7 @@ export function parseGateTicker(payload) {
   return {
     source: 'gate-spot',
     raw_price: String(price),
-    tnk_usd_e6: decimalUsdToE6(price),
+    tnk_usd_au: decimalUsdToAu(price),
   };
 }
 
@@ -57,7 +57,7 @@ export function parseMexcTicker(payload) {
   return {
     source: 'mexc-spot',
     raw_price: String(price),
-    tnk_usd_e6: decimalUsdToE6(price),
+    tnk_usd_au: decimalUsdToAu(price),
   };
 }
 
@@ -88,8 +88,8 @@ async function readContractStateValue(rpcUrl, key, {
 }
 
 export function rateStateMatches(rate, value) {
-  return value?.denom === 'tnk_usd_e6'
-    && value?.tnk_usd_e6 === rate.tnk_usd_e6
+  return value?.denom === 'tnk_usd_au'
+    && value?.tnk_usd_au === rate.tnk_usd_au
     && value?.source === rate.source
     && value?.ts === rate.ts
     && value?.posted_by_role === 'admin';
@@ -159,8 +159,8 @@ export function buildAdminCommandArgs(rate, {
   const args = [
     'admin',
     'rate-oracle',
-    '--tnk-usd-e6',
-    String(rate.tnk_usd_e6),
+    '--tnk-usd-au',
+    String(rate.tnk_usd_au),
     '--source',
     rate.source,
     '--ts',
@@ -202,7 +202,7 @@ export async function runOnce(options = {}) {
     source: rate.source,
     primary: rate.primary,
     raw_price: rate.raw_price,
-    tnk_usd_e6: rate.tnk_usd_e6,
+    tnk_usd_au: rate.tnk_usd_au,
     ts: rate.ts,
     failures: rate.failures,
     copy_paste_admin_submit_command: buildAdminCommand(rate, adminOptions),
@@ -286,7 +286,7 @@ async function main() {
       console.log('[tnk:rate] TNK/USD oracle tick complete');
       console.log('[tnk:rate] source:', report.source);
       console.log('[tnk:rate] raw USDT price:', report.raw_price);
-      console.log('[tnk:rate] tnk_usd_e6:', report.tnk_usd_e6);
+      console.log('[tnk:rate] tnk_usd_au:', report.tnk_usd_au);
       console.log('[tnk:rate] submitted:', report.submitted);
       console.log('Copy/paste admin TNK rate oracle submit command:');
       console.log(report.copy_paste_admin_submit_command);

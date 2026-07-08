@@ -22,6 +22,8 @@ const manifestHash = '3'.repeat(64);
 const binaryHash = '4'.repeat(64);
 const artifactRoot = '5'.repeat(64);
 const updatedArtifactRoot = '6'.repeat(64);
+const hardwareFingerprint = '8'.repeat(64);
+const deviceKey = '9'.repeat(64);
 const artifactSource = {
   kind: 'huggingface',
   repo: 'mayhem-catalog/qwen2.5-4b-instruct-GGUF',
@@ -118,8 +120,8 @@ const priceSchedule = {
   op: 'set_price',
   enclave_id: enclaveId,
   rate_map: textRateMap(20, 60),
-  per_req_mu: 0,
-  min_session_mu: 0,
+  per_req_au: '0',
+  min_session_au: '0',
   effective_at: 0,
 };
 
@@ -372,7 +374,7 @@ test('MayhemContract model_class defaults old text records and allows new admin 
       op: 'set_model_ref',
       model_id: embeddingRegistration.model_id,
       model_class: 'embedding',
-      rate_map: [{ unit: 'embedding', per_unit_mu: 2, granularity: 1 }],
+      rate_map: [{ unit: 'embedding', per_unit_au: '2', granularity: 1 }],
     },
     admin.publicKey,
     4
@@ -1249,6 +1251,126 @@ test('MayhemContract keeps launch enclave attestation tier at 1 until quote gene
   assert.equal(await storage.get(`enclave/${'e'.repeat(64)}`), null);
 });
 
+test('MayhemContract schedules enclave min-tier notice without stranding active providers', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerEnclave',
+      value: enclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: enclaveRegistration.model_id,
+    admin: admin.publicKey,
+    txNo: 5,
+  });
+
+  const joined = await execute(contract, storage, 'joinEnclave', providerJoin, provider.publicKey, 6);
+  assert.equal(joined.ok, true, joined.message);
+
+  const shortNotice = await execute(
+    contract,
+    storage,
+    'setEnclaveMinTier',
+    {
+      op: 'set_enclave_min_tier',
+      enclave_id: enclaveId,
+      min_att_tier: 1,
+      submitted_epoch: 10,
+      effective_epoch: 20,
+      submitted_at: 0,
+      reason_hash: 'e'.repeat(64),
+    },
+    admin.publicKey,
+    7
+  );
+  assert.notEqual(shortNotice.ok, true);
+  assert.match(shortNotice.message, /min_tier_notice_epochs/i);
+
+  const tier2 = await execute(
+    contract,
+    storage,
+    'setEnclaveMinTier',
+    {
+      op: 'set_enclave_min_tier',
+      enclave_id: enclaveId,
+      min_att_tier: 2,
+      submitted_epoch: 10,
+      effective_epoch: 34,
+      submitted_at: 0,
+      reason_hash: 'f'.repeat(64),
+    },
+    admin.publicKey,
+    8
+  );
+  assert.notEqual(tier2.ok, true);
+  assert.match(tier2.message, /not launch-advertisable/i);
+  assert.equal(await storage.get(`tierpolicy/enclave/${enclaveId}`), null);
+
+  const scheduled = await execute(
+    contract,
+    storage,
+    'setEnclaveMinTier',
+    {
+      op: 'set_enclave_min_tier',
+      enclave_id: enclaveId,
+      min_att_tier: 1,
+      submitted_epoch: 10,
+      effective_epoch: 34,
+      submitted_at: 0,
+      reason_hash: 'a'.repeat(64),
+    },
+    admin.publicKey,
+    9
+  );
+  assert.equal(scheduled.ok, true, scheduled.message);
+  const policy = await storage.get(`tierpolicy/enclave/${enclaveId}`);
+  assert.equal(policy.value.current_min_att_tier, 1);
+  assert.equal(policy.value.pending.min_att_tier, 1);
+  assert.equal(policy.value.pending.effective_epoch, 34);
+  assert.equal(policy.value.pending.reason_hash, 'a'.repeat(64));
+  const enclave = await storage.get(`enclave/${enclaveId}`);
+  assert.equal(enclave.value.min_att_tier, 1);
+  assert.equal(enclave.value.pending_min_att_tier.effective_epoch, 34);
+  const serving = await storage.get(`serve/${provider.publicKey}/${enclaveId}`);
+  assert.equal(serving.value.status, 'active');
+  assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
+});
+
 test('MayhemContract rejects provider-authored payout and probation hints', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
@@ -1286,7 +1408,7 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
     {
       op: 'register_provider',
       payout_addr: 'provider-picked-target',
-      payout_method: 'coinbase',
+      payout_method: 'unsupported',
       registered_at_seconds: 123_456,
     },
     provider.publicKey,
@@ -1338,22 +1460,6 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
     6
   );
   assert.match(unsupported.message, /unsupported payout method/i);
-
-  const retiredCoinbase = await execute(
-    contract,
-    storage,
-    'setProviderPayout',
-    {
-      op: 'set_provider_payout',
-      provider: provider.publicKey,
-      payout_addr: 'admin-approved-target',
-      payout_method: 'coinbase',
-      payout_currency: 'usd',
-    },
-    admin.publicKey,
-    7
-  );
-  assert.match(retiredCoinbase.message, /unsupported payout method/i);
 
   const adminPayout = await execute(
     contract,
@@ -1426,18 +1532,18 @@ test('MayhemContract lets providers declare accepted payment rails without legac
   assert.equal(registered.accepted_rails_schema_version, 1);
   assert.equal(registered.accepted_rails_set_by, provider.publicKey);
 
-  const rejectedCoinbase = await execute(
+  const rejectedUnsupportedRail = await execute(
     contract,
     storage,
     'setProviderRails',
     {
       op: 'set_provider_rails',
-      rails: ['coinbase'],
+      rails: ['unsupported'],
     },
     provider.publicKey,
     4
   );
-  assert.match(rejectedCoinbase.message, /unsupported provider payment rail/i);
+  assert.match(rejectedUnsupportedRail.message, /unsupported provider payment rail/i);
 
   const rejectedEmpty = await execute(
     contract,
@@ -2102,6 +2208,8 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
     op: 'banProvider',
     provider: provider.publicKey,
     tombstoned_enclaves: [enclaveId],
+    device_key: null,
+    hardware_fingerprint: null,
   });
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
@@ -2134,6 +2242,179 @@ test('MayhemContract admin can ban providers from future serving mutations', asy
     9
   );
   assert.match(joinAfterBan.message, /provider registration required/i);
+});
+
+test('MayhemContract provider/device bans are reversible and Tier-1 fingerprint matches only flag review', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const replacement = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+
+  for (const op of [
+    {
+      type: 'setRules',
+      value: { op: 'set_rules', ver: 1, hash: rulesHash },
+      sender: admin.publicKey,
+      txNo: 1,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(provider.wallet, 1, rulesHash),
+      },
+      sender: provider.publicKey,
+      txNo: 2,
+    },
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(replacement.wallet, 1, rulesHash),
+      },
+      sender: replacement.publicKey,
+      txNo: 3,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: provider.publicKey,
+      txNo: 4,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: replacement.publicKey,
+      txNo: 5,
+    },
+    {
+      type: 'registerEnclave',
+      value: enclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 6,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await seedCurrentAdminPrice(storage, {
+    enclaveId,
+    modelId: enclaveRegistration.model_id,
+    admin: admin.publicKey,
+    txNo: 7,
+  });
+
+  const firstJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { ...providerJoin, hardware_fingerprint: hardwareFingerprint, device_key: deviceKey },
+    provider.publicKey,
+    7
+  );
+  assert.equal(firstJoin.ok, true, firstJoin.message);
+
+  const banned = await execute(
+    contract,
+    storage,
+    'banProvider',
+    {
+      op: 'ban_provider',
+      provider: provider.publicKey,
+      reason_hash: 'a'.repeat(64),
+      device_key: deviceKey,
+      hardware_fingerprint: hardwareFingerprint,
+    },
+    admin.publicKey,
+    8
+  );
+  assert.equal(banned.ok, true, banned.message);
+  assert.equal((await storage.get(`ban/provider/${provider.publicKey}`)).value.status, 'banned');
+  assert.equal((await storage.get(`ban/device/${deviceKey}`)).value.status, 'banned');
+  assert.equal((await storage.get(`ban/fingerprint/${hardwareFingerprint}`)).value.status, 'banned');
+
+  const rejectedDevice = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { ...providerJoin, hardware_fingerprint: hardwareFingerprint, device_key: deviceKey },
+    replacement.publicKey,
+    9
+  );
+  assert.match(rejectedDevice.message, /device key is banned/i);
+
+  const providerUnban = await execute(
+    contract,
+    storage,
+    'unban',
+    {
+      op: 'unban',
+      target_type: 'provider',
+      target: provider.publicKey,
+      reason_hash: 'b'.repeat(64),
+    },
+    admin.publicKey,
+    10
+  );
+  assert.equal(providerUnban.ok, true, providerUnban.message);
+  assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
+  assert.equal((await storage.get(`ban/provider/${provider.publicKey}`)).value.status, 'unbanned');
+
+  const deviceUnban = await execute(
+    contract,
+    storage,
+    'unban',
+    {
+      op: 'unban',
+      target_type: 'device',
+      target: deviceKey,
+      reason_hash: 'c'.repeat(64),
+    },
+    admin.publicKey,
+    11
+  );
+  assert.equal(deviceUnban.ok, true, deviceUnban.message);
+  assert.equal((await storage.get(`ban/device/${deviceKey}`)).value.status, 'unbanned');
+
+  const rebound = await execute(
+    contract,
+    storage,
+    'deviceRebind',
+    {
+      op: 'device_rebind',
+      device_key: deviceKey,
+      provider: replacement.publicKey,
+      reason_hash: 'd'.repeat(64),
+    },
+    admin.publicKey,
+    12
+  );
+  assert.equal(rebound.ok, true, rebound.message);
+  assert.equal((await storage.get(`device/${deviceKey}`)).value.provider, replacement.publicKey);
+
+  const reviewJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { ...providerJoin, hardware_fingerprint: hardwareFingerprint, device_key: deviceKey },
+    replacement.publicKey,
+    13
+  );
+  assert.equal(reviewJoin.ok, true, reviewJoin.message);
+  const review = await storage.get(
+    `review/fingerprint/${hardwareFingerprint}/${replacement.publicKey}/${makeTxKey(13)}`
+  );
+  assert.equal(review.value.status, 'needs_admin_review');
+  assert.equal(review.value.auto_reject, false);
+  const serving = await storage.get(`serve/${replacement.publicKey}/${enclaveId}`);
+  assert.equal(serving.value.status, 'active');
+  assert.equal(serving.value.fingerprint_review.auto_reject, false);
 });
 
 test('MayhemContract admin retirement tombstones indexed provider room serving', async () => {

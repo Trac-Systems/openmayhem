@@ -159,7 +159,7 @@ function checkCatalogAndReadme() {
     assertCheck(`catalog.${model.model_id}.proof`, launchProofs.has(model.model_id), `${model.model_id} has launch proof mapping`);
     assertCheck(`catalog.${model.model_id}.class`, !!classRoutes[modelClass], `${model.model_id} has routable class ${modelClass}`);
     assertCheck(`catalog.${model.model_id}.routes`, routeListFor(model).length > 0, `${model.model_id} has gateway routes`);
-    assertCheck(`catalog.${model.model_id}.denom`, model.price_ref_mu?.denom === 'mu_usd', `${model.model_id} is priced in mu_usd`);
+    assertCheck(`catalog.${model.model_id}.denom`, model.price_ref_au?.denom === 'au_usd', `${model.model_id} is priced in au_usd`);
     const artifacts = Object.entries(model.artifacts || {});
     assertCheck(`catalog.${model.model_id}.artifacts`, artifacts.length > 0, `${model.model_id} has signed artifacts`);
     for (const [name, artifact] of artifacts) {

@@ -1,4 +1,4 @@
-// Mayhem KnowledgePool test suite (I2-B1) - deploy MockTTAP + KnowledgePool on in-process
+// MayhemInferencePool test suite (I2-B1) - deploy MockTTAP + MayhemInferencePool on in-process
 // ganache; exercise deposit -> setRoot -> O(1) cumulative claim -> operator 15% cap -> conservation ->
 // non-custodial property -> all the revert guards. Exit 0 = green. No external network.
 import Ganache from 'ganache';
@@ -34,15 +34,15 @@ async function main() {
   const [buyer1, buyer2, provA, provB, anyone, opTreasury] = [await A(1), await A(2), await A(3), await A(4), await A(5), await A(6)];
 
   const U = (n) => ethers.parseUnits(String(n), 18);
-  const DEAD = ethers.getAddress('0x000000000000000000000000000000000000dead'); // burn sink (== KnowledgePool.BURN_SINK)
+  const DEAD = ethers.getAddress('0x000000000000000000000000000000000000dead'); // burn sink (== MayhemInferencePool.BURN_SINK)
 
   // deploy MockTTAP + pool
   const token = await new ethers.ContractFactory(art.MockTTAP.abi, art.MockTTAP.bytecode, operator).deploy();
   await token.waitForDeployment();
-  const pool = await new ethers.ContractFactory(art.KnowledgePool.abi, art.KnowledgePool.bytecode, operator).deploy(await token.getAddress(), await A(0), 0n);
+  const pool = await new ethers.ContractFactory(art.MayhemInferencePool.abi, art.MayhemInferencePool.bytecode, operator).deploy(await token.getAddress(), await A(0), 0n);
   await pool.waitForDeployment();
   const poolAddr = await pool.getAddress();
-  console.log(`MockTTAP @ ${await token.getAddress()} - KnowledgePool @ ${poolAddr}`);
+  console.log(`MockTTAP @ ${await token.getAddress()} - MayhemInferencePool @ ${poolAddr}`);
 
   // fund buyers + approve
   for (const b of [1, 2]) { await (await token.mint(await A(b), U(1000))).wait(); await (await token.connect(await S(b)).approve(poolAddr, U(1000))).wait(); }
@@ -127,7 +127,7 @@ async function main() {
   console.log('\n5) C1 cap + zero-addr guard + M11 measured-delta + rescue (security remediation)');
   const ZERO = '0x0000000000000000000000000000000000000000';
   const cap = U(100);
-  const pool2 = await new ethers.ContractFactory(art.KnowledgePool.abi, art.KnowledgePool.bytecode, operator).deploy(await token.getAddress(), await A(0), cap);
+  const pool2 = await new ethers.ContractFactory(art.MayhemInferencePool.abi, art.MayhemInferencePool.bytecode, operator).deploy(await token.getAddress(), await A(0), cap);
   await pool2.waitForDeployment();
   const pool2Addr = await pool2.getAddress();
   ok((await pool2.maxEpochDelta()) === cap, 'maxEpochDelta set in constructor (C1)');

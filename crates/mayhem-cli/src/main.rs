@@ -41927,7 +41927,7 @@ mod tests {
             vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()]
         );
         assert!(normalize_provider_accepted_rails_arg("fiat,fiat").is_err());
-        assert!(normalize_provider_accepted_rails_arg("coinbase").is_err());
+        assert!(normalize_provider_accepted_rails_arg("unsupported").is_err());
 
         let serve_plan = Cli::try_parse_from([
             "mayhem",
@@ -41999,7 +41999,7 @@ mod tests {
         assert_eq!(args.target, "enclave-a");
         assert!(args.json);
 
-        assert!(Cli::try_parse_from(["mayhem", "pay", "coinbase"]).is_err());
+        assert!(Cli::try_parse_from(["mayhem", "pay", "unsupported"]).is_err());
     }
 
     #[test]
@@ -43723,7 +43723,7 @@ mod tests {
         ));
 
         let mut bad_rail = frame.clone();
-        bad_rail["rail"] = json!("coinbase");
+        bad_rail["rail"] = json!("unsupported");
         assert!(matches!(
             provider_session_open_decision(&bad_rail, &terms),
             ProviderSessionDecision::Reject { code: "RAIL", .. }

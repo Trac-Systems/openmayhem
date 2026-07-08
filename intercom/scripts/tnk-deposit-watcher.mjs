@@ -184,8 +184,8 @@ export function matchPendingTransfers({
     const expectedSender = pubKeyHexToMsbAddress(pending.user, addressPrefix);
     const expectedTreasury = pending.treasury_address ?? treasuryAddress;
     const expectedAmount = canonicalAmount(pending.tnk_e18);
-    const quotedMu = positiveSafeInteger(pending.quoted_mu);
-    const rateTnkUsdE6 = positiveSafeInteger(pending.rate_tnk_usd_e6);
+    const quotedAu = canonicalAmount(pending.quoted_au);
+    const rateTnkUsdAu = canonicalAmount(pending.rate_tnk_usd_au);
     const rateSource = String(pending.rate_source ?? '').trim();
 
     if (!expectedSender) {
@@ -200,11 +200,11 @@ export function matchPendingTransfers({
       skipped.push({ memo_hash: memoHash, reason: 'pending intent has no quoted TNK amount' });
       continue;
     }
-    if (!quotedMu) {
-      skipped.push({ memo_hash: memoHash, reason: 'pending intent has no quoted mu_usd credit' });
+    if (!quotedAu) {
+      skipped.push({ memo_hash: memoHash, reason: 'pending intent has no quoted au_usd credit' });
       continue;
     }
-    if (!rateTnkUsdE6 || !rateSource) {
+    if (!rateTnkUsdAu || !rateSource) {
       skipped.push({ memo_hash: memoHash, reason: 'pending intent has no quoted TNK/USD rate evidence' });
       continue;
     }
@@ -240,8 +240,8 @@ export function matchPendingTransfers({
       tnk_e18: transfer.tnk_e18,
       msb_tx_hash: transfer.hash,
       confirmed_length: transfer.confirmed_length,
-      quoted_mu: quotedMu,
-      rate_tnk_usd_e6: rateTnkUsdE6,
+      quoted_au: quotedAu,
+      rate_tnk_usd_au: rateTnkUsdAu,
       rate_source: rateSource,
     });
   }
@@ -297,23 +297,23 @@ export function depositStateMatches(match, {
   depositRoot,
   epoch,
 } = {}) {
-  const quotedMu = positiveSafeInteger(match?.quoted_mu);
-  if (!quotedMu) return false;
-  const balanceMu = nonNegativeSafeInteger(balance?.mu);
+  const quotedAu = canonicalAmount(match?.quoted_au);
+  if (!quotedAu) return false;
+  const balanceAu = canonicalAmount(balance?.au);
   const depositCount = nonNegativeSafeInteger(depositRoot?.count);
-  const depositMuTotal = nonNegativeSafeInteger(depositRoot?.mu_total);
+  const depositAuTotal = canonicalAmount(depositRoot?.au_total);
   return pending === null
     && balance?.user === match.user
     && balance?.rail === 'tnk'
-    && balance?.denom === 'mu_usd'
-    && balanceMu !== null
-    && balanceMu >= quotedMu
+    && balance?.denom === 'au_usd'
+    && balanceAu !== null
+    && BigInt(balanceAu) >= BigInt(quotedAu)
     && depositRoot?.type === 'deposit_root'
     && Number(depositRoot?.epoch) === Number(epoch)
     && depositCount !== null
     && depositCount > 0
-    && depositMuTotal !== null
-    && depositMuTotal >= quotedMu;
+    && depositAuTotal !== null
+    && BigInt(depositAuTotal) >= BigInt(quotedAu);
 }
 
 export async function waitForDepositState(match, {
@@ -495,6 +495,7 @@ async function main() {
       ...match,
       copy_paste_admin_submit_command: command,
       submitted: false,
+      preflighted: false,
       verified: false,
     };
     if (submit) {
@@ -503,7 +504,11 @@ async function main() {
         buildAdminCommandArgs(match, adminOptions),
         { encoding: 'utf8' }
       );
-      confirmation.submitted = child.status === 0;
+      if (sim) {
+        confirmation.preflighted = child.status === 0;
+      } else {
+        confirmation.submitted = child.status === 0;
+      }
       confirmation.exit_status = child.status;
       confirmation.stdout = child.stdout?.trim() || null;
       confirmation.stderr = child.stderr?.trim() || null;
