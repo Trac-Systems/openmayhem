@@ -73,7 +73,10 @@ pub mod optional_decimal_u128 {
         D: Deserializer<'de>,
     {
         let value = Option::<String>::deserialize(deserializer)?;
-        value.map(parse_decimal_u128).transpose().map_err(D::Error::custom)
+        value
+            .map(parse_decimal_u128)
+            .transpose()
+            .map_err(D::Error::custom)
     }
 
     fn parse_decimal_u128(value: String) -> Result<u128, String> {
@@ -1720,12 +1723,12 @@ mod tests {
         let frame = json!({
             "t": "s.open",
             "session_id": "aa".repeat(32),
-            "voucher": { "price_ver": 1, "max_spend_au": 1000 },
+            "voucher": { "price_ver": 1, "max_spend_au": "1000" },
             "sig": "11".repeat(64),
         });
         let reordered = json!({
             "sig": "11".repeat(64),
-            "voucher": { "max_spend_au": 1000, "price_ver": 1 },
+            "voucher": { "max_spend_au": "1000", "price_ver": 1 },
             "session_id": "aa".repeat(32),
             "t": "s.open",
         });

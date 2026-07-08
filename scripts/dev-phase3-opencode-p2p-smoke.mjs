@@ -61,7 +61,7 @@ Runs the P3.6 acceptance smoke:
   - opencode tool task through the local OpenAI-compatible gateway
 
 Environment:
-  MAYHEM_PHASE3_MACMINI_FILE   Mac mini credential file (default: ../gpd/macmini.txt)
+  MAYHEM_PHASE3_MACMINI_FILE   Mac mini credential file (default: .mayhem-local/secrets/macmini.txt)
   MAYHEM_PHASE3_REMOTE_ROOT    Remote checkout/staging root (default: ~/mayhem-macmini-p33)
   MAYHEM_PHASE3_MODEL          Catalog model id (default: ${DEFAULT_MODEL})
   MAYHEM_PHASE3_ARTIFACT       Local artifact path (default: cached Qwen GGUF)
@@ -115,10 +115,10 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function textRateMapJson(inPer1kMu, outPer1kMu) {
+function textRateMapJson(inPer1kAu, outPer1kAu) {
   return JSON.stringify([
-    { unit: 'input_token', per_unit_mu: Number(inPer1kMu), granularity: 1000 },
-    { unit: 'output_token', per_unit_mu: Number(outPer1kMu), granularity: 1000 },
+    { unit: 'input_token', per_unit_au: String(inPer1kAu), granularity: 1000 },
+    { unit: 'output_token', per_unit_au: String(outPer1kAu), granularity: 1000 },
   ]);
 }
 
@@ -402,14 +402,14 @@ async function waitForLedgerMovement(rpcUrl, user, provider, before, expected, t
   while (Date.now() < deadline) {
     latest = await readLedgerSnapshot(rpcUrl, user, provider);
     const actual = {
-      debit_mu: before.balance_mu - latest.balance_mu,
-      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
-      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+      debit_au: auDelta(before.balance_au, latest.balance_au, 'fiat debit au'),
+      provider_net_au: auDelta(latest.provider_total_au, before.provider_total_au, 'fiat provider net au'),
+      fee_au: auDelta(latest.fee_cum_au, before.fee_cum_au, 'fiat fee au'),
     };
     if (
-      actual.debit_mu === expected.debit_mu &&
-      actual.provider_net_mu === expected.provider_net_mu &&
-      actual.fee_mu === expected.fee_mu
+      actual.debit_au === expected.debit_au &&
+      actual.provider_net_au === expected.provider_net_au &&
+      actual.fee_au === expected.fee_au
     ) {
       return { after: latest, actual };
     }
@@ -419,17 +419,31 @@ async function waitForLedgerMovement(rpcUrl, user, provider, before, expected, t
   return {
     after: latest,
     actual: {
-      debit_mu: before.balance_mu - latest.balance_mu,
-      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
-      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+      debit_au: auDelta(before.balance_au, latest.balance_au, 'fiat debit au'),
+      provider_net_au: auDelta(latest.provider_total_au, before.provider_total_au, 'fiat provider net au'),
+      fee_au: auDelta(latest.fee_cum_au, before.fee_cum_au, 'fiat fee au'),
     },
   };
 }
 
-function safeMu(value, label) {
+function safeCount(value, label) {
   const number = Number(value ?? 0);
   if (!Number.isSafeInteger(number) || number < 0) fail(`${label} is not a non-negative safe integer: ${value}`);
   return number;
+}
+
+function parseAu(value, label) {
+  const raw = String(value ?? '0');
+  if (!/^(0|[1-9]\d*)$/.test(raw)) fail(`${label} is not a canonical non-negative atto-USD integer: ${value}`);
+  return BigInt(raw);
+}
+
+function auString(value, label) {
+  return parseAu(value, label).toString();
+}
+
+function auDelta(left, right, label) {
+  return (parseAu(left, `${label} left`) - parseAu(right, `${label} right`)).toString();
 }
 
 async function readDepositRootSnapshot(rpcUrl, epoch) {
@@ -438,8 +452,8 @@ async function readDepositRootSnapshot(rpcUrl, epoch) {
   if (value.type !== 'deposit_root') fail(`ev/dep/${epoch} is not a deposit root`);
   return {
     merkle_root: value.merkle_root,
-    count: safeMu(value.count, `ev/dep/${epoch} count`),
-    mu_total: safeMu(value.mu_total, `ev/dep/${epoch} mu_total`),
+    count: safeCount(value.count, `ev/dep/${epoch} count`),
+    au_total: auString(value.au_total, `ev/dep/${epoch} au_total`),
     source: `ev/dep/${epoch}`,
   };
 }
@@ -457,9 +471,9 @@ async function readLedgerSnapshot(rpcUrl, user, provider) {
     balance,
     earning,
     fee,
-    balance_mu: safeMu(balance?.mu, 'fiat balance mu'),
-    provider_total_mu: safeMu(earning?.total_mu, 'fiat provider total_mu'),
-    fee_cum_mu: safeMu(fee?.cum_mu, 'fiat fee cum_mu'),
+    balance_au: auString(balance?.au, 'fiat balance au'),
+    provider_total_au: auString(earning?.total_au, 'fiat provider total_au'),
+    fee_cum_au: auString(fee?.cum_au, 'fiat fee cum_au'),
   };
 }
 
@@ -508,18 +522,19 @@ async function settleGatewayReceiptEpoch({
   const recomputedStdout = runSync('node', [path.join(ROOT, 'intercom/scripts/recompute-epoch-roots.mjs'), bundlePath]);
   fs.writeFileSync(recomputedPath, recomputedStdout);
   const recomputed = readJson(recomputedPath);
-  if (safeMu(recomputed?.totals?.use_mu, 'recomputed use_mu') <= 0) {
+  if (parseAu(recomputed?.totals?.use_au, 'recomputed use_au') <= 0n) {
     fail('epoch recompute produced zero usage; refusing to mark billing moved');
   }
   const providerEarning = (recomputed.earnings || []).find(
     (entry) => entry.rail === 'fiat' && entry.provider === provider
   );
   if (!providerEarning) fail(`epoch recompute did not include fiat earnings for provider ${provider}`);
-  const expectedDebitMu = safeMu(recomputed.totals.use_mu, 'expected debit mu');
-  const expectedProviderNetMu =
-    safeMu(providerEarning.gross_mu, 'provider gross_mu') -
-    Math.floor((safeMu(providerEarning.gross_mu, 'provider gross_mu') * feeBps) / 10_000);
-  const expectedFeeMu = safeMu(recomputed.totals.fee_mu, 'expected fee_mu');
+  const expectedDebitAu = auString(recomputed.totals.use_au, 'expected debit au');
+  const providerGrossAu = parseAu(providerEarning.gross_au, 'provider gross_au');
+  const expectedProviderNetAu = (
+    providerGrossAu - ((providerGrossAu * BigInt(feeBps)) / 10_000n)
+  ).toString();
+  const expectedFeeAu = auString(recomputed.totals.fee_au, 'expected fee_au');
 
   const adminEpochCommon = [
     '--home', adminHome,
@@ -544,22 +559,22 @@ async function settleGatewayReceiptEpoch({
   const apply = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-apply', ...adminEpochCommon], applyPath);
 
   const expected = {
-    debit_mu: expectedDebitMu,
-    provider_net_mu: expectedProviderNetMu,
-    fee_mu: expectedFeeMu,
+    debit_au: expectedDebitAu,
+    provider_net_au: expectedProviderNetAu,
+    fee_au: expectedFeeAu,
   };
   const { after, actual } = await waitForLedgerMovement(adminRpcUrl, user, provider, before, expected);
-  const actualDebitMu = actual.debit_mu;
-  const actualProviderNetMu = actual.provider_net_mu;
-  const actualFeeMu = actual.fee_mu;
-  if (actualDebitMu !== expectedDebitMu) {
-    fail(`fiat balance debit mismatch; expected ${expectedDebitMu}, got ${actualDebitMu}`);
+  const actualDebitAu = actual.debit_au;
+  const actualProviderNetAu = actual.provider_net_au;
+  const actualFeeAu = actual.fee_au;
+  if (actualDebitAu !== expectedDebitAu) {
+    fail(`fiat balance debit mismatch; expected ${expectedDebitAu}, got ${actualDebitAu}`);
   }
-  if (actualProviderNetMu !== expectedProviderNetMu) {
-    fail(`fiat provider earning mismatch; expected ${expectedProviderNetMu}, got ${actualProviderNetMu}`);
+  if (actualProviderNetAu !== expectedProviderNetAu) {
+    fail(`fiat provider earning mismatch; expected ${expectedProviderNetAu}, got ${actualProviderNetAu}`);
   }
-  if (actualFeeMu !== expectedFeeMu) {
-    fail(`fiat fee movement mismatch; expected ${expectedFeeMu}, got ${actualFeeMu}`);
+  if (actualFeeAu !== expectedFeeAu) {
+    fail(`fiat fee movement mismatch; expected ${expectedFeeAu}, got ${actualFeeAu}`);
   }
 
   return {
@@ -1377,7 +1392,10 @@ async function main() {
   }
   const opencodeBin = process.env.MAYHEM_PHASE3_OPENCODE_BIN || 'opencode';
   const servedCtx = envPositiveInt('MAYHEM_PHASE3_SERVED_CTX', 8192);
-  const macminiFile = path.resolve(ROOT, process.env.MAYHEM_PHASE3_MACMINI_FILE || '../gpd/macmini.txt');
+  const macminiFile = path.resolve(
+    ROOT,
+    process.env.MAYHEM_PHASE3_MACMINI_FILE || '.mayhem-local/secrets/macmini.txt'
+  );
 
   if (!fs.existsSync(artifactPath)) fail(`missing artifact ${artifactPath}`);
 
@@ -1409,9 +1427,9 @@ async function main() {
   const catalog = readJson(path.join(ROOT, 'catalog/models.json'));
   const model = catalog.models.find((entry) => entry.model_id === modelId);
   if (!model) fail(`catalog model not found: ${modelId}`);
-  const inPer1kMu = model.price_ref_mu?.in_per_1k || 18;
-  const outPer1kMu = model.price_ref_mu?.out_per_1k || 55;
-  const rateMapJson = textRateMapJson(inPer1kMu, outPer1kMu);
+  const inPer1kAu = model.price_ref_au?.in_per_1k || 18;
+  const outPer1kAu = model.price_ref_au?.out_per_1k || 55;
+  const rateMapJson = textRateMapJson(inPer1kAu, outPer1kAu);
   const artifactEntry = Object.entries(model.artifacts).find(([, artifact]) => artifact.engine === 'llama.cpp');
   if (!artifactEntry) fail(`model ${modelId} has no llama.cpp artifact`);
   const [artifactName, artifact] = artifactEntry;
@@ -1683,7 +1701,7 @@ async function main() {
     'set-params',
     '--submitted-at', '0',
     '--effective-at', '86400',
-    '--values-json', '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_mu":0,"rate_staleness_seconds":86400}',
+    '--values-json', '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_au":"0","rate_staleness_seconds":86400}',
   ]);
   adminRun('admin-set-model-ref', [
     'set-model-ref',
@@ -1720,13 +1738,13 @@ async function main() {
     '--nonce', roomNonce,
     '--label', 'phase3-opencode-p2p',
   ]);
-  const gatewayCreditMu = 10_000_000;
+  const gatewayCreditAu = '10000000000000000000';
   const fiatDepositRef = (await b3(Buffer.from(`phase3-fiat-credit:${tag}:${userPubkey[1]}`, 'utf8'))).toString('hex');
   adminRun('admin-fiat-deposit', [
     'fiat-deposit',
     '--rail', 'stripe',
     '--who', userPubkey[1],
-    '--mu', String(gatewayCreditMu),
+    '--au', gatewayCreditAu,
     '--ext-ref-hash', fiatDepositRef,
     '--fiat-currency', 'usd',
     '--fiat-amount-minor', '1000',
@@ -2224,7 +2242,7 @@ async function main() {
     admin: {
       pubkey: adminPubkey[1],
       credited_user: userPubkey[1],
-      gateway_credit_mu: gatewayCreditMu,
+      gateway_credit_au: gatewayCreditAu,
       room_nonce: roomNonce,
       room_id: roomId,
       rules_hash: rulesHash,

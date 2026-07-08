@@ -368,11 +368,11 @@ admin_run admin-set-rules set-rules --ver 1 --hash "$RULES_HASH"
 admin_run admin-set-params set-params \
   --submitted-at 0 \
   --effective-at 86400 \
-  --values-json '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_mu":0,"rate_staleness_seconds":86400,"canary_match_min_bps":9000,"probe_reward_mu":5000,"uptime_tick_seconds":21600}'
+  --values-json '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_au":"0","rate_staleness_seconds":86400,"canary_match_min_bps":9000,"probe_reward_au":"5000","uptime_tick_seconds":21600}'
 admin_run admin-set-model-ref set-model-ref \
   --model "$MODEL_ID" \
-  --in-per-1k-mu 18 \
-  --out-per-1k-mu 55
+  --in-per-1k-au 18 \
+  --out-per-1k-au 55
 admin_run admin-register-enclave register-enclave \
   --enclave-id "$ENCLAVE_ID" \
   --model "$MODEL_ID" \
@@ -390,8 +390,8 @@ admin_run admin-register-enclave register-enclave \
   --caps-json '{"chat":true,"tools":true,"json":true,"ctx":8192}'
 admin_run admin-set-price set-price \
   --enclave-id "$ENCLAVE_ID" \
-  --in-per-1k-mu 18 \
-  --out-per-1k-mu 55 \
+  --in-per-1k-au 18 \
+  --out-per-1k-au 55 \
   --effective-at 0
 admin_run admin-open-room open-room \
   --enclave-id "$ENCLAVE_ID" \

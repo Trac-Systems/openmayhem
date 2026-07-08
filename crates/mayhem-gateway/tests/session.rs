@@ -99,7 +99,7 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
         "price_ver": 7,
         "rules_ver": 1,
         "voucher": {
-            "max_spend_mu": 5000,
+            "max_spend_au": "5000",
             "checkpoint": { "tokens": 8192, "ms": 30000 },
             "user_sig": "22".repeat(64)
         },
@@ -279,7 +279,7 @@ async fn direct_session_streams_completion_frames_without_relay() -> anyhow::Res
                 "seq": 1,
                 "in_tokens": 3,
                 "out_tokens": 3,
-                "mu_owed_cum": 1,
+                "au_owed_cum": "1",
                 "enclave_sig": "aa".repeat(64)
             }),
         )

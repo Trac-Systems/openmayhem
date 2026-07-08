@@ -1,3 +1,4 @@
+use mayhem_proto::{decimal_u128, MoneyAu};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_REPUTATION_HALF_LIFE_SECONDS: u64 = 14 * 24 * 60 * 60;
@@ -21,9 +22,18 @@ pub struct ReputationEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReputationEventKind {
-    SessionOk { paid_mu: u64 },
-    SessionPartial { paid_mu: u64 },
-    SessionFail { max_spend_mu: u64 },
+    SessionOk {
+        #[serde(with = "decimal_u128")]
+        paid_au: MoneyAu,
+    },
+    SessionPartial {
+        #[serde(with = "decimal_u128")]
+        paid_au: MoneyAu,
+    },
+    SessionFail {
+        #[serde(with = "decimal_u128")]
+        max_spend_au: MoneyAu,
+    },
     ProbeOk,
     ProbeFail,
     UptimeTick,
@@ -121,9 +131,9 @@ impl ProviderProbation {
 impl ReputationEventKind {
     pub fn raw_score_and_weight(&self) -> Option<(f64, f64)> {
         match self {
-            Self::SessionOk { paid_mu } => Some((1.0, paid_weight(*paid_mu))),
-            Self::SessionPartial { paid_mu } => Some((0.25, paid_weight(*paid_mu))),
-            Self::SessionFail { max_spend_mu } => Some((-4.0, paid_weight(*max_spend_mu))),
+            Self::SessionOk { paid_au } => Some((1.0, paid_weight(*paid_au))),
+            Self::SessionPartial { paid_au } => Some((0.25, paid_weight(*paid_au))),
+            Self::SessionFail { max_spend_au } => Some((-4.0, paid_weight(*max_spend_au))),
             Self::ProbeOk => Some((0.5, 1.0)),
             Self::ProbeFail => Some((-6.0, 1.0)),
             Self::UptimeTick => Some((0.1, 1.0)),
@@ -208,8 +218,8 @@ pub fn logistic_reputation(raw: f64) -> f64 {
     1.0 / (1.0 + (-raw / DEFAULT_REPUTATION_KAPPA).exp())
 }
 
-fn paid_weight(mu: u64) -> f64 {
-    (1.0 + mu as f64).log10()
+fn paid_weight(au: MoneyAu) -> f64 {
+    (1.0 + au as f64).log10()
 }
 
 #[cfg(test)]
@@ -232,7 +242,7 @@ mod tests {
     #[test]
     fn reputation_fold_matches_normative_formula_and_is_deterministic() {
         let events = vec![
-            event("ok-1", 0, ReputationEventKind::SessionOk { paid_mu: 9_999 }),
+            event("ok-1", 0, ReputationEventKind::SessionOk { paid_au: 9_999 }),
             event("tick-1", 0, ReputationEventKind::UptimeTick),
         ];
 
@@ -255,7 +265,7 @@ mod tests {
         let events = vec![event(
             "ok-1",
             0,
-            ReputationEventKind::SessionOk { paid_mu: 9_999 },
+            ReputationEventKind::SessionOk { paid_au: 9_999 },
         )];
 
         let folded = fold_reputation(
@@ -270,6 +280,21 @@ mod tests {
         .unwrap();
 
         assert!((folded.raw - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reputation_event_money_serializes_as_decimal_strings() {
+        let event = event(
+            "big-ok",
+            0,
+            ReputationEventKind::SessionOk {
+                paid_au: 100_000_000_000_000_000_000,
+            },
+        );
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["kind"]["paid_au"], "100000000000000000000");
+        let decoded: ReputationEvent = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, event);
     }
 
     #[test]

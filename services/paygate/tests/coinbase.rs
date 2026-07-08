@@ -139,7 +139,7 @@ async fn coinbase_routes_are_retired_and_do_not_credit_contract() {
             uri,
             json!({
                 "who": "d".repeat(64),
-                "mu": 2_500_000u64
+                "au": "2500000000000000000"
             }),
         )
         .await;

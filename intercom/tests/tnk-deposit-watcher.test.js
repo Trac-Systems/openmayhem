@@ -26,8 +26,8 @@ test('tnk deposit watcher matches quoted pending intents by user-derived MSB sen
           status: 'pending',
           treasury_address: treasury,
           tnk_e18: '1000000000000000000',
-          quoted_mu: 50_000,
-          rate_tnk_usd_e6: 50_000,
+          quoted_au: '50000000000000000',
+          rate_tnk_usd_au: '50000000000000000',
           rate_source: 'gate-spot',
         },
       },
@@ -60,8 +60,8 @@ test('tnk deposit watcher matches quoted pending intents by user-derived MSB sen
       tnk_e18: '1000000000000000000',
       msb_tx_hash: 'a'.repeat(64),
       confirmed_length: 42,
-      quoted_mu: 50_000,
-      rate_tnk_usd_e6: 50_000,
+      quoted_au: '50000000000000000',
+      rate_tnk_usd_au: '50000000000000000',
       rate_source: 'gate-spot',
     },
   ]);
@@ -115,7 +115,7 @@ test('tnk deposit watcher skips unquoted intents because canonical intents must 
     addressPrefix: 'testtrac',
   });
   assert.equal(amountOnly.matches.length, 0);
-  assert.match(amountOnly.skipped[0].reason, /no quoted mu_usd/i);
+  assert.match(amountOnly.skipped[0].reason, /no quoted au_usd/i);
 });
 
 test('tnk deposit watcher normalizes MSB transfer details and redacts password from copy/paste command', () => {
@@ -165,21 +165,21 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
   const match = {
     memo_hash: 'memo-a',
     user: pubkey,
-    quoted_mu: 50_000,
+    quoted_au: '50000000000000000',
   };
   const state = {
     pending: null,
     balance: {
       user: pubkey,
       rail: 'tnk',
-      denom: 'mu_usd',
-      mu: 50_000,
+      denom: 'au_usd',
+      au: '50000000000000000',
     },
     depositRoot: {
       type: 'deposit_root',
       epoch: 7,
       count: 1,
-      mu_total: 50_000,
+      au_total: '50000000000000000',
     },
   };
   assert.equal(depositStateMatches(match, { ...state, epoch: 7 }), true);
@@ -190,7 +190,7 @@ test('tnk deposit watcher verifies pending removal, balance credit, and deposit 
   }), false);
   assert.equal(depositStateMatches(match, {
     ...state,
-    balance: { ...state.balance, mu: 49_999 },
+    balance: { ...state.balance, au: '49999' },
     epoch: 7,
   }), false);
 

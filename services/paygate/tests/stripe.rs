@@ -1,27 +1,30 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     body::{to_bytes, Body, Bytes},
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, Method, Request, StatusCode},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use mayhem_paygate::{
-    paygate_router, stripe_signature_header, BoxFuture, CoinbaseSettings, ContractPostResult,
-    ContractPoster, FiatChargebackFeature, FiatDepositFeature, OracleKeypair, PaygateConfig,
-    PaygateState, RailConfig, StripeSettings,
+    paygate_router, run_stripe_backfill_once, stripe_signature_header, BoxFuture, CoinbaseSettings,
+    ContractPostResult, ContractPoster, FiatChargebackFeature, FiatDepositFeature, OracleKeypair,
+    PaygateConfig, PaygateState, RailConfig, StripeSettings, DEFAULT_STRIPE_API_BASE_URL,
 };
 use serde_json::{json, Value};
+use tokio::time::{sleep, Duration};
 use tokio::{net::TcpListener, sync::Mutex};
 use tower::ServiceExt;
 
 #[derive(Clone, Default)]
 struct StripeCapture {
     requests: Arc<Mutex<Vec<StripeRequest>>>,
+    events: Arc<Mutex<Vec<Value>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,7 +73,7 @@ impl ContractPoster for RecordingContractPoster {
                     "op": "fiatDeposit",
                     "rail": feature.rail,
                     "who": feature.who,
-                    "mu": feature.mu,
+                    "au": feature.au.to_string(),
                     "fiat_currency": feature.fiat_currency,
                     "fiat_amount_minor": feature.fiat_amount_minor,
                     "epoch": feature.epoch,
@@ -95,11 +98,11 @@ impl ContractPoster for RecordingContractPoster {
                     "op": "fiatChargeback",
                     "rail": feature.rail,
                     "who": feature.who,
-                    "mu": feature.mu,
+                    "au": feature.au.to_string(),
                     "fiat_currency": feature.fiat_currency,
                     "fiat_amount_minor": feature.fiat_amount_minor,
-                    "clawback_mu": feature.mu,
-                    "network_absorbed_mu": 0,
+                    "clawback_au": feature.au.to_string(),
+                    "network_absorbed_au": "0",
                     "deposit_root": "6".repeat(64),
                 }),
             })
@@ -166,11 +169,55 @@ async fn mock_create_checkout_session(
     }))
 }
 
+async fn mock_list_events(
+    State(capture): State<StripeCapture>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    capture.requests.lock().await.push(StripeRequest {
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        idempotency_key: None,
+        body: format!("events:{query:?}"),
+    });
+    let event_type = query.get("type").map(String::as_str);
+    let created_gte = query
+        .get("created[gte]")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let mut data = capture.events.lock().await.clone();
+    data.retain(|event| {
+        let type_ok = event_type
+            .map(|expected| event.get("type").and_then(Value::as_str) == Some(expected))
+            .unwrap_or(true);
+        let created_ok = event.get("created").and_then(Value::as_u64).unwrap_or(0) >= created_gte;
+        type_ok && created_ok
+    });
+    data.sort_by(|left, right| {
+        (
+            right.get("created").and_then(Value::as_u64).unwrap_or(0),
+            right.get("id").and_then(Value::as_str).unwrap_or(""),
+        )
+            .cmp(&(
+                left.get("created").and_then(Value::as_u64).unwrap_or(0),
+                left.get("id").and_then(Value::as_str).unwrap_or(""),
+            ))
+    });
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "has_more": false
+    }))
+}
+
 async fn start_mock_stripe() -> (String, StripeCapture) {
     let capture = StripeCapture::default();
     let app = Router::new()
         .route("/v1/payment_intents", post(mock_create_payment_intent))
         .route("/v1/checkout/sessions", post(mock_create_checkout_session))
+        .route("/v1/events", get(mock_list_events))
         .with_state(capture.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -186,6 +233,7 @@ async fn start_mock_stripe() -> (String, StripeCapture) {
 
 fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> PaygateConfig {
     let coinbase_event_store_path = event_store_path.with_file_name("coinbase-events.jsonl");
+    let backfill_cursor_path = event_store_path.with_file_name("stripe-backfill-cursor.json");
     PaygateConfig {
         contract_dry_run: true,
         rails: RailConfig {
@@ -195,6 +243,7 @@ fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> Pay
                 webhook_secret: Some("whsec_test".to_owned()),
                 api_base_url: stripe_base,
                 event_store_path,
+                backfill_cursor_path,
                 ..StripeSettings::default()
             },
             coinbase: CoinbaseSettings {
@@ -234,7 +283,7 @@ fn now_seconds() -> u64 {
 }
 
 #[tokio::test]
-async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
+async fn stripe_payment_intent_route_posts_canonical_au_metadata_to_stripe() {
     let (stripe_base, capture) = start_mock_stripe().await;
     let temp = tempfile::tempdir().expect("tempdir");
     let poster = Arc::new(RecordingContractPoster::default());
@@ -252,7 +301,7 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
         "/v1/stripe/payment-intents",
         json!({
             "who": "a".repeat(64),
-            "mu": 2_500_000u64,
+            "au": "2500000000000000000",
             "currency": "eur",
             "idempotency_key": "stripe-route-test-1"
         }),
@@ -261,7 +310,7 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], true);
-    assert_eq!(body["denom"], "mu_usd");
+    assert_eq!(body["denom"], "au_usd");
     assert_eq!(body["payment_intent"]["id"], "pi_test_123");
     assert_eq!(body["payment_intent"]["amount"], 250);
     assert_eq!(body["payment_intent"]["currency"], "eur");
@@ -282,10 +331,12 @@ async fn stripe_payment_intent_route_posts_canonical_mu_metadata_to_stripe() {
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_who%5D=aaaaaaaa"));
-    assert!(requests[0].body.contains("metadata%5Bmayhem_mu%5D=2500000"));
     assert!(requests[0]
         .body
-        .contains("metadata%5Bmayhem_denom%5D=mu_usd"));
+        .contains("metadata%5Bmayhem_au%5D=2500000000000000000"));
+    assert!(requests[0]
+        .body
+        .contains("metadata%5Bmayhem_denom%5D=au_usd"));
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_fiat_currency%5D=eur"));
@@ -313,7 +364,7 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
         "/v1/stripe/checkout-sessions",
         json!({
             "who": "a".repeat(64),
-            "mu": 2_500_000u64,
+            "au": "2500000000000000000",
             "success_url": "http://127.0.0.1:11436/v1/stripe/return?session_id={CHECKOUT_SESSION_ID}",
             "cancel_url": "http://127.0.0.1:11436/v1/stripe/cancel",
             "currency": "usd",
@@ -325,7 +376,7 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], true);
-    assert_eq!(body["denom"], "mu_usd");
+    assert_eq!(body["denom"], "au_usd");
     assert_eq!(body["checkout_session"]["id"], "cs_test_123");
     assert_eq!(
         body["checkout_session"]["url"],
@@ -355,7 +406,7 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
         .contains("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=250"));
     assert!(requests[0]
         .body
-        .contains("metadata%5Bmayhem_denom%5D=mu_usd"));
+        .contains("metadata%5Bmayhem_denom%5D=au_usd"));
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_fiat_currency%5D=usd"));
@@ -367,10 +418,10 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
         .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_who%5D=aaaaaaaa"));
     assert!(requests[0]
         .body
-        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_mu%5D=2500000"));
+        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_au%5D=2500000000000000000"));
     assert!(requests[0]
         .body
-        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_denom%5D=mu_usd"));
+        .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_denom%5D=au_usd"));
     assert!(requests[0]
         .body
         .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_fiat_currency%5D=usd"));
@@ -407,8 +458,8 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
                 "currency": "usd",
                 "metadata": {
                     "mayhem_who": "b".repeat(64),
-                    "mayhem_mu": "2500000",
-                    "mayhem_denom": "mu_usd",
+                    "mayhem_au": "2500000000000000000",
+                    "mayhem_denom": "au_usd",
                     "mayhem_fiat_currency": "usd",
                     "mayhem_fiat_amount_minor": "250"
                 }
@@ -446,7 +497,7 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
     assert_eq!(deposits[0].op, "fiat_deposit");
     assert_eq!(deposits[0].rail, "stripe");
     assert_eq!(deposits[0].who, "b".repeat(64));
-    assert_eq!(deposits[0].mu, 2_500_000);
+    assert_eq!(deposits[0].au, 2_500_000_000_000_000_000u128);
     assert_eq!(deposits[0].fiat_currency, "usd");
     assert_eq!(deposits[0].fiat_amount_minor, 250);
     assert_eq!(deposits[0].epoch, 2);
@@ -457,6 +508,232 @@ async fn stripe_webhook_verifies_signature_posts_contract_once_and_dedups_replay
         std::fs::read_to_string(temp.path().join("stripe-events.jsonl")).expect("event log");
     assert_eq!(event_log.lines().count(), 1);
     assert!(event_log.contains("evt_test_replay"));
+}
+
+#[tokio::test]
+async fn stripe_backfill_pulls_events_api_from_cursor_and_dedups_replay() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let poster = Arc::new(RecordingContractPoster::default());
+    let state = PaygateState::try_new_with_contract_poster(
+        test_config(stripe_base, temp.path().join("stripe-events.jsonl")),
+        OracleKeypair::from_seed_hex(&"55".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+
+    *capture.events.lock().await = vec![
+        json!({
+            "id": "evt_backfill_dispute",
+            "object": "event",
+            "type": "charge.dispute.created",
+            "created": 7_200,
+            "data": {
+                "object": {
+                    "id": "dp_backfill",
+                    "object": "dispute",
+                    "amount": 250,
+                    "currency": "usd",
+                    "charge": "ch_backfill",
+                    "payment_intent": "pi_backfill",
+                    "reason": "fraudulent",
+                    "status": "needs_response"
+                }
+            }
+        }),
+        json!({
+            "id": "evt_backfill_deposit",
+            "object": "event",
+            "type": "payment_intent.succeeded",
+            "created": 3_600,
+            "data": {
+                "object": {
+                    "id": "pi_backfill",
+                    "object": "payment_intent",
+                    "latest_charge": "ch_backfill",
+                    "amount_received": 250,
+                    "currency": "usd",
+                    "metadata": {
+                        "mayhem_who": "f".repeat(64),
+                        "mayhem_au": "2500000000000000000",
+                        "mayhem_denom": "au_usd",
+                        "mayhem_fiat_currency": "usd",
+                        "mayhem_fiat_amount_minor": "250"
+                    }
+                }
+            }
+        }),
+    ];
+
+    let first = run_stripe_backfill_once(&state)
+        .await
+        .expect("first backfill");
+    assert_eq!(first.ok, true);
+    assert_eq!(first.fetched, 2);
+    assert_eq!(first.processed, 2);
+    assert_eq!(first.duplicates, 0);
+    assert_eq!(first.credited, 1);
+    assert_eq!(first.clawed_back, 1);
+    assert_eq!(first.previous_last_created, 0);
+    assert_eq!(first.last_created, 7_200);
+
+    let deposits = poster.deposits.lock().await;
+    let chargebacks = poster.chargebacks.lock().await;
+    assert_eq!(deposits.len(), 1);
+    assert_eq!(chargebacks.len(), 1);
+    assert_eq!(deposits[0].ext_ref_hash, chargebacks[0].ext_ref_hash);
+    assert_eq!(deposits[0].ext_ref_hash.len(), 64);
+    assert_eq!(chargebacks[0].dispute_ref_hash.len(), 64);
+    drop(deposits);
+    drop(chargebacks);
+
+    let cursor_text =
+        std::fs::read_to_string(temp.path().join("stripe-backfill-cursor.json")).expect("cursor");
+    let cursor: Value = serde_json::from_str(&cursor_text).expect("cursor json");
+    assert_eq!(cursor["schema_version"], 1);
+    assert_eq!(cursor["last_created"], 7_200);
+
+    let second = run_stripe_backfill_once(&state)
+        .await
+        .expect("second backfill");
+    assert_eq!(second.previous_last_created, 7_200);
+    assert_eq!(second.last_created, 7_200);
+    assert_eq!(second.fetched, 1);
+    assert_eq!(second.processed, 1);
+    assert_eq!(second.duplicates, 1);
+    assert_eq!(second.credited, 0);
+    assert_eq!(second.clawed_back, 0);
+    assert_eq!(poster.deposits.lock().await.len(), 1);
+    assert_eq!(poster.chargebacks.lock().await.len(), 1);
+
+    let event_log =
+        std::fs::read_to_string(temp.path().join("stripe-events.jsonl")).expect("event log");
+    assert_eq!(event_log.lines().count(), 2);
+    assert!(event_log.contains("evt_backfill_deposit"));
+    assert!(event_log.contains("evt_backfill_dispute"));
+}
+
+#[tokio::test]
+#[ignore = "requires a real Stripe test key and MAYHEM_STRIPE_REAL_BACKFILL=1"]
+async fn stripe_real_events_api_backfill_credits_created_test_payment_intent() {
+    if std::env::var("MAYHEM_STRIPE_REAL_BACKFILL").as_deref() != Ok("1") {
+        panic!("set MAYHEM_STRIPE_REAL_BACKFILL=1 to run the real Stripe backfill proof");
+    }
+    let secret_key = std::env::var("MAYHEM_STRIPE_SECRET_KEY")
+        .or_else(|_| std::env::var("STRIPE_SECRET_KEY"))
+        .expect("MAYHEM_STRIPE_SECRET_KEY or STRIPE_SECRET_KEY must be set");
+    assert!(
+        secret_key.starts_with("sk_test_"),
+        "real Stripe backfill proof must use a Stripe test-mode key"
+    );
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let poster = Arc::new(RecordingContractPoster::default());
+    let mut config = test_config(
+        DEFAULT_STRIPE_API_BASE_URL.to_owned(),
+        temp.path().join("stripe-events.jsonl"),
+    );
+    config.rails.stripe.secret_key = Some(secret_key.clone());
+    let cursor_path = config.rails.stripe.backfill_cursor_path.clone();
+    let state = PaygateState::try_new_with_contract_poster(
+        config,
+        OracleKeypair::from_seed_hex(&"66".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+
+    let who = "9".repeat(64);
+    let request_marker = format!("mayhem-a16-backfill-{}", now_seconds());
+    let params = vec![
+        ("amount", "100".to_owned()),
+        ("currency", "usd".to_owned()),
+        ("payment_method", "pm_card_visa".to_owned()),
+        ("confirm", "true".to_owned()),
+        ("automatic_payment_methods[enabled]", "true".to_owned()),
+        (
+            "automatic_payment_methods[allow_redirects]",
+            "never".to_owned(),
+        ),
+        ("metadata[mayhem_who]", who.clone()),
+        ("metadata[mayhem_au]", "1000000000000000000".to_owned()),
+        ("metadata[mayhem_denom]", "au_usd".to_owned()),
+        ("metadata[mayhem_fiat_currency]", "usd".to_owned()),
+        ("metadata[mayhem_fiat_amount_minor]", "100".to_owned()),
+        ("metadata[mayhem_test_marker]", request_marker),
+    ];
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "{}/v1/payment_intents",
+            DEFAULT_STRIPE_API_BASE_URL.trim_end_matches('/')
+        ))
+        .basic_auth(&secret_key, Some(""))
+        .form(&params)
+        .send()
+        .await
+        .expect("create Stripe test PaymentIntent");
+    let status = response.status();
+    let body = response.text().await.expect("Stripe response body");
+    assert!(
+        status.is_success(),
+        "Stripe test PaymentIntent create failed {status}: {body}"
+    );
+    let payment_intent: Value = serde_json::from_str(&body).expect("PaymentIntent JSON");
+    let payment_intent_id = payment_intent
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("PaymentIntent id");
+    assert_eq!(
+        payment_intent.get("status").and_then(Value::as_str),
+        Some("succeeded")
+    );
+    let created = payment_intent
+        .get("created")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(now_seconds);
+    std::fs::write(
+        &cursor_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "last_created": created
+        }))
+        .expect("cursor JSON"),
+    )
+    .expect("write cursor");
+
+    let mut saw_credit_report = false;
+    let mut total_fetched = 0_usize;
+    for _ in 0..10 {
+        let report = run_stripe_backfill_once(&state)
+            .await
+            .expect("real Stripe events backfill");
+        total_fetched += report.fetched;
+        saw_credit_report |= report.credited > 0;
+        let deposits = poster.deposits.lock().await;
+        if deposits
+            .iter()
+            .any(|deposit| deposit.who == who && deposit.au == 1_000_000_000_000_000_000u128)
+        {
+            break;
+        }
+        drop(deposits);
+        sleep(Duration::from_secs(2)).await;
+    }
+
+    let deposits = poster.deposits.lock().await;
+    let deposit = deposits
+        .iter()
+        .find(|deposit| deposit.who == who && deposit.au == 1_000_000_000_000_000_000u128)
+        .expect("backfill credited the created Stripe test PaymentIntent");
+    assert_eq!(deposit.rail, "stripe");
+    assert_eq!(deposit.fiat_currency, "usd");
+    assert_eq!(deposit.fiat_amount_minor, 100);
+    assert_eq!(deposit.ext_ref_hash.len(), 64);
+    assert!(total_fetched >= 1);
+    assert!(saw_credit_report);
+    let event_log =
+        std::fs::read_to_string(temp.path().join("stripe-events.jsonl")).expect("event log");
+    assert!(event_log.contains(payment_intent_id));
 }
 
 #[tokio::test]
@@ -488,8 +765,8 @@ async fn stripe_webhook_uses_contract_epoch_seconds_for_deposit_epoch() {
                 "currency": "usd",
                 "metadata": {
                     "mayhem_who": "e".repeat(64),
-                    "mayhem_mu": "2500000",
-                    "mayhem_denom": "mu_usd",
+                    "mayhem_au": "2500000000000000000",
+                    "mayhem_denom": "au_usd",
                     "mayhem_fiat_currency": "usd",
                     "mayhem_fiat_amount_minor": "250"
                 }
@@ -547,8 +824,8 @@ async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
                 "currency": "usd",
                 "metadata": {
                     "mayhem_who": "c".repeat(64),
-                    "mayhem_mu": "2500000",
-                    "mayhem_denom": "mu_usd",
+                    "mayhem_au": "2500000000000000000",
+                    "mayhem_denom": "au_usd",
                     "mayhem_fiat_currency": "usd",
                     "mayhem_fiat_amount_minor": "250"
                 }
@@ -630,7 +907,7 @@ async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
     assert_eq!(chargebacks[0].op, "fiat_chargeback");
     assert_eq!(chargebacks[0].rail, "stripe");
     assert_eq!(chargebacks[0].who, "c".repeat(64));
-    assert_eq!(chargebacks[0].mu, 2_500_000);
+    assert_eq!(chargebacks[0].au, 2_500_000_000_000_000_000u128);
     assert_eq!(chargebacks[0].fiat_currency, "usd");
     assert_eq!(chargebacks[0].fiat_amount_minor, 250);
     assert_eq!(chargebacks[0].ext_ref_hash, deposits[0].ext_ref_hash);
@@ -673,8 +950,8 @@ async fn stripe_dispute_cannot_claw_back_more_than_original_deposit() {
                 "currency": "usd",
                 "metadata": {
                     "mayhem_who": "d".repeat(64),
-                    "mayhem_mu": "2500000",
-                    "mayhem_denom": "mu_usd",
+                    "mayhem_au": "2500000000000000000",
+                    "mayhem_denom": "au_usd",
                     "mayhem_fiat_currency": "usd",
                     "mayhem_fiat_amount_minor": "250"
                 }

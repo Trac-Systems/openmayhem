@@ -4305,7 +4305,7 @@ struct ProviderLimitsSetArgs {
     #[arg(long)]
     accept_rate: Option<String>,
 
-    /// Exposure cap such as 2500000mu/day, 500000tokens/day, or 2500000mu/epoch.
+    /// Exposure cap such as 2500000000000000000au/day, 500000tokens/day, or 2500000000000000000au/epoch.
     #[arg(long)]
     budget: Option<String>,
 
@@ -12484,7 +12484,7 @@ fn dispute_summary(record: &Value, now: u64) -> Value {
         "epoch": record.get("epoch").and_then(Value::as_u64),
         "session_id": record.get("session_id").and_then(Value::as_str),
         "reason": record.get("reason").and_then(Value::as_str),
-        "deposit_au": record.get("deposit_au").and_then(Value::as_u64),
+        "deposit_au": record.get("deposit_au").and_then(value_money_au).map(money_au_json),
         "evidence_hash": record.get("evidence_hash").and_then(Value::as_str),
         "dispute_hash": record.get("dispute_hash").and_then(Value::as_str),
         "resolution_hash": record.get("resolution_hash").and_then(Value::as_str),
@@ -13016,19 +13016,19 @@ fn contract_reputation_event_to_fold_event(entry: &PrefixStateEntry) -> Result<R
         "session_ok" => ReputationEventKind::SessionOk {
             paid_au: value
                 .get("paid_au")
-                .and_then(Value::as_u64)
+                .and_then(value_money_au)
                 .with_context(|| format!("{} session_ok missing paid_au", entry.key))?,
         },
         "session_partial" => ReputationEventKind::SessionPartial {
             paid_au: value
                 .get("paid_au")
-                .and_then(Value::as_u64)
+                .and_then(value_money_au)
                 .with_context(|| format!("{} session_partial missing paid_au", entry.key))?,
         },
         "session_fail" => ReputationEventKind::SessionFail {
             max_spend_au: value
                 .get("max_spend_au")
-                .and_then(Value::as_u64)
+                .and_then(value_money_au)
                 .with_context(|| format!("{} session_fail missing max_spend_au", entry.key))?,
         },
         "probe_ok" => ReputationEventKind::ProbeOk,
@@ -20004,7 +20004,10 @@ fn print_session_history_report(report: &Value) -> Result<()> {
                 entry["receipts"].as_u64().unwrap_or(0),
                 latest["provider"].as_str().unwrap_or(""),
                 latest["model_id"].as_str().unwrap_or(""),
-                latest["au_owed_cum"].as_u64().unwrap_or(0),
+                latest
+                    .get("au_owed_cum")
+                    .and_then(value_money_au)
+                    .unwrap_or(0),
             );
         }
     } else {
@@ -20016,7 +20019,10 @@ fn print_session_history_report(report: &Value) -> Result<()> {
                 entry["seq"].as_u64().unwrap_or(0),
                 entry["provider"].as_str().unwrap_or(""),
                 entry["model_id"].as_str().unwrap_or(""),
-                entry["au_owed_cum"].as_u64().unwrap_or(0),
+                entry
+                    .get("au_owed_cum")
+                    .and_then(value_money_au)
+                    .unwrap_or(0),
             );
         }
     }
@@ -20049,10 +20055,22 @@ fn print_reputation_report(report: &Value) {
     }
     println!(
         "Earnings: total={} held={} paid={} claimable={} au_usd",
-        report["earnings"]["total_au"].as_u64().unwrap_or(0),
-        report["earnings"]["held_au"].as_u64().unwrap_or(0),
-        report["earnings"]["paid_cum_au"].as_u64().unwrap_or(0),
-        report["earnings"]["claimable_au"].as_u64().unwrap_or(0),
+        report["earnings"]
+            .get("total_au")
+            .and_then(value_money_au)
+            .unwrap_or(0),
+        report["earnings"]
+            .get("held_au")
+            .and_then(value_money_au)
+            .unwrap_or(0),
+        report["earnings"]
+            .get("paid_cum_au")
+            .and_then(value_money_au)
+            .unwrap_or(0),
+        report["earnings"]
+            .get("claimable_au")
+            .and_then(value_money_au)
+            .unwrap_or(0),
     );
 }
 
@@ -22592,7 +22610,10 @@ fn attestation_summary_for_model(model: &Value) -> String {
 
 fn print_balance_report(report: &Value) {
     let balance = &report["balance"];
-    let au = report["credit"]["au"].as_u64().unwrap_or(0);
+    let au = report["credit"]
+        .get("au")
+        .and_then(value_money_au)
+        .unwrap_or(0);
     println!("Mayhem balance");
     println!("Public key: {}", report["who"].as_str().unwrap_or(""));
     println!("Rail: {}", report["rail"].as_str().unwrap_or(""));
@@ -41001,7 +41022,7 @@ mod tests {
     fn admin_oracle_payment_payloads_match_contract_schemas() {
         let rate_payload = admin_rate_oracle_payload(&AdminRateOracleArgs {
             tx: test_admin_tx_args(),
-            tnk_usd_au: 50_000,
+            tnk_usd_au: 50_000_000_000_000_000,
             source: AdminRateSource::GateSpot,
             ts: 3_600,
         });
@@ -41009,7 +41030,7 @@ mod tests {
             rate_payload,
             json!({
                 "op": "rate_oracle",
-                "tnk_usd_au": "50000",
+                "tnk_usd_au": "50000000000000000",
                 "source": "gate-spot",
                 "ts": 3_600,
             })
@@ -41024,7 +41045,7 @@ mod tests {
         assert_eq!(
             admin_command_payload(&AdminCommands::RateOracle(AdminRateOracleArgs {
                 tx: test_admin_tx_args(),
-                tnk_usd_au: 50_000,
+                tnk_usd_au: 50_000_000_000_000_000,
                 source: AdminRateSource::GateSpot,
                 ts: 3_600,
             }))
@@ -41035,7 +41056,7 @@ mod tests {
 
         let tap_rate_payload = admin_tap_rate_oracle_payload(&AdminTapRateOracleArgs {
             tx: test_admin_tx_args(),
-            tap_usd_au: 50_000,
+            tap_usd_au: 50_000_000_000_000_000,
             source: AdminTapRateSource::UniswapV2,
             ts: 3_600,
         });
@@ -41043,7 +41064,7 @@ mod tests {
             tap_rate_payload,
             json!({
                 "op": "tap_rate_oracle",
-                "tap_usd_au": "50000",
+                "tap_usd_au": "50000000000000000",
                 "source": "uniswap-v2",
                 "ts": 3_600,
             })
@@ -41058,7 +41079,7 @@ mod tests {
         assert_eq!(
             admin_command_payload(&AdminCommands::TapRateOracle(AdminTapRateOracleArgs {
                 tx: test_admin_tx_args(),
-                tap_usd_au: 50_000,
+                tap_usd_au: 50_000_000_000_000_000,
                 source: AdminTapRateSource::UniswapV2,
                 ts: 3_600,
             }))
@@ -41076,21 +41097,21 @@ mod tests {
             "treasury_from": "testtrac1treasury",
             "operator_to": "testtrac1operator",
             "epoch_apply_hash": "a".repeat(64),
-            "rate_tnk_usd_au": "50000",
+            "rate_tnk_usd_au": "50000000000000000",
             "rate_source": "gate-spot",
             "rate_ts": 25_200,
             "msb_tx_hashes": ["b".repeat(64)],
             "transfer_root": "c".repeat(64),
             "provider_count": 0,
-            "provider_au": 0,
-            "operator_fee_au": 1,
-            "gross_au": "1",
-            "tnk_e18": "20000000000000",
+            "provider_au": "0",
+            "operator_fee_au": "50000000000000000",
+            "gross_au": "50000000000000000",
+            "tnk_e18": "1000000000000000000",
             "outputs": [{
                 "role": "operator_fee",
                 "to": "testtrac1operator",
-                "au": "1",
-                "tnk_e18": "20000000000000"
+                "au": "50000000000000000",
+                "tnk_e18": "1000000000000000000"
             }]
         });
         assert_eq!(
@@ -41206,7 +41227,7 @@ mod tests {
                 tx: test_admin_tx_args(),
                 rail: AdminFiatRail::Stripe,
                 who: "user-a".to_owned(),
-                au: 10_000_000,
+                au: 10_000_000_000_000_000_000,
                 ext_ref_hash: "stripe-ref-hash".to_owned(),
                 fiat_currency: "usd".to_owned(),
                 fiat_amount_minor: 1_000,
@@ -41218,7 +41239,7 @@ mod tests {
                 "op": "fiat_deposit",
                 "rail": "stripe",
                 "who": "user-a",
-                "au": "10000000",
+                "au": "10000000000000000000",
                 "ext_ref_hash": "stripe-ref-hash",
                 "fiat_currency": "usd",
                 "fiat_amount_minor": 1_000,
@@ -41232,7 +41253,7 @@ mod tests {
                 tx: test_admin_tx_args(),
                 rail: AdminFiatRail::Stripe,
                 who: "user-a".to_owned(),
-                au: 5_000_000,
+                au: 5_000_000_000_000_000_000,
                 ext_ref_hash: "stripe-ref-hash".to_owned(),
                 dispute_ref_hash: "stripe-dispute-hash".to_owned(),
                 fiat_currency: "eur".to_owned(),
@@ -41245,7 +41266,7 @@ mod tests {
                 "op": "fiat_chargeback",
                 "rail": "stripe",
                 "who": "user-a",
-                "au": "5000000",
+                "au": "5000000000000000000",
                 "ext_ref_hash": "stripe-ref-hash",
                 "dispute_ref_hash": "stripe-dispute-hash",
                 "fiat_currency": "eur",
@@ -46751,11 +46772,15 @@ mod tests {
 
     #[test]
     fn pay_tnk_helpers_prepare_deposit_bound_transfer() {
-        let tnk_e18 = au_to_tnk_e18_ceil_u128(10_000_000, 50_000).unwrap();
+        let tnk_e18 =
+            au_to_tnk_e18_ceil_u128(10_000_000_000_000_000_000, 50_000_000_000_000_000).unwrap();
         assert_eq!(tnk_e18, 200 * TNK_E18);
         assert_eq!(tnk_e18_to_decimal(tnk_e18), "200");
         assert_eq!(tnk_e18_to_decimal(1_234_567_890_000_000_000), "1.23456789");
-        assert_eq!(tnk_e18_to_au_floor(tnk_e18, 50_000).unwrap(), 10_000_000);
+        assert_eq!(
+            tnk_e18_to_au_floor(tnk_e18, 50_000_000_000_000_000).unwrap(),
+            10_000_000_000_000_000_000
+        );
 
         let pubkey = "00".repeat(32);
         let nonce = "11".repeat(32);
@@ -46770,9 +46795,9 @@ mod tests {
                 &memo_hash,
                 "testtrac1treasury",
                 tnk_e18,
-                10_000_000,
+                10_000_000_000_000_000_000,
                 &PayTnkRate {
-                    tnk_usd_au: 50_000,
+                    tnk_usd_au: 50_000_000_000_000_000,
                     source: "gate-spot".to_owned(),
                     ts: Some(3_600),
                 },
@@ -46782,8 +46807,8 @@ mod tests {
                 "memo_hash": memo_hash,
                 "treasury_address": "testtrac1treasury",
                 "tnk_e18": "200000000000000000000",
-                "quoted_au": "10000000",
-                "rate_tnk_usd_au": "50000",
+                "quoted_au": "10000000000000000000",
+                "rate_tnk_usd_au": "50000000000000000",
                 "rate_source": "gate-spot",
             })
         );
@@ -46795,14 +46820,14 @@ mod tests {
             "10.00",
             "testtrac1treasury",
             &"cd".repeat(32),
-            50_000,
+            50_000_000_000_000_000,
             None,
             None,
         );
         assert!(!command.to_lowercase().contains("memo"));
         assert_eq!(
             command,
-            "mayhem pay tnk --amount '10.00' --treasury-address 'testtrac1treasury' --nonce 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd' --tnk-usd-au 50000 --submit-intent"
+            "mayhem pay tnk --amount '10.00' --treasury-address 'testtrac1treasury' --nonce 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd' --tnk-usd-au 50000000000000000 --submit-intent"
         );
     }
 
@@ -46812,7 +46837,7 @@ mod tests {
             "10.25",
             "testtrac1treasury",
             &"ab".repeat(32),
-            50_000,
+            50_000_000_000_000_000,
             Some(Path::new("/tmp/mayhem/stores/main/db/keypair.json")),
             Some("http://127.0.0.1:49223/v1"),
         );
@@ -46820,7 +46845,7 @@ mod tests {
         assert!(command.starts_with("mayhem pay tnk "));
         assert!(command.contains("--amount '10.25'"));
         assert!(command.contains("--treasury-address 'testtrac1treasury'"));
-        assert!(command.contains("--tnk-usd-au 50000"));
+        assert!(command.contains("--tnk-usd-au 50000000000000000"));
         assert!(command.contains(" --submit-intent"));
         assert!(command.contains(" --keypair '/tmp/mayhem/stores/main/db/keypair.json'"));
         assert!(command.ends_with(" --rpc-url 'http://127.0.0.1:49223/v1'"));

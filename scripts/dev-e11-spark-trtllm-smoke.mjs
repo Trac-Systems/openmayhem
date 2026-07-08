@@ -64,7 +64,7 @@ Runs the I3-E11 acceptance smoke:
   - local Apple fixture provider-start fallback selects GGUF
 
 Environment:
-  MAYHEM_E11_CLUSTER_FILE          Spark credential file (default: ../gpd/cluster.txt)
+  MAYHEM_E11_CLUSTER_FILE          Spark credential file (default: .mayhem-local/secrets/cluster.txt)
   MAYHEM_E11_TAG                   Reuse a named run directory/tag instead of generating one
   MAYHEM_E11_DEVNET_CLEANUP        Remove dev-net stores before starting (default: 1)
   MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: $HOME/mayhem/i3-e11-operationmayhem)
@@ -73,7 +73,7 @@ Environment:
   MAYHEM_E11_ACCEL_ARTIFACT        Accelerated catalog artifact to prove (default: ${DEFAULT_ACCEL_ARTIFACT}; E14 uses vllm-fp16)
   MAYHEM_E11_TRTLLM_PYTHON         Spark TensorRT-LLM Python wrapper (default: $HOME/mayhem/bin/trtllm-python)
   MAYHEM_E11_VLLM_PYTHON           Spark vLLM Python wrapper (default: $HOME/mayhem/bin/vllm-python-e14)
-  MAYHEM_E11_HF_TOKEN_FILE         HF token file copied temporarily to Spark if present (default: ../gpd/hf.txt)
+  MAYHEM_E11_HF_TOKEN_FILE         HF token file copied temporarily to Spark if present (default: .mayhem-local/secrets/hf.txt)
   MAYHEM_E11_CATALOG_RELEASE_REPO  HF repo for the signed catalog release (default: ${DEFAULT_CATALOG_RELEASE_REPO})
   MAYHEM_E11_CATALOG_RELEASE_REVISION  40-hex signed catalog release revision (default: ${DEFAULT_CATALOG_RELEASE_REVISION})
   MAYHEM_E11_SYNC_NODE_MODULES     Sync intercom/node_modules when missing on Spark (default: 1)
@@ -1321,8 +1321,14 @@ async function main() {
 
   const mayhemBin = path.join(ROOT, 'target/debug/mayhem');
   const enclaveBin = path.join(ROOT, 'target/debug/mayhem-enclave');
-  const clusterFile = path.resolve(ROOT, process.env.MAYHEM_E11_CLUSTER_FILE || '../gpd/cluster.txt');
-  const hfTokenFile = path.resolve(ROOT, process.env.MAYHEM_E11_HF_TOKEN_FILE || '../gpd/hf.txt');
+  const clusterFile = path.resolve(
+    ROOT,
+    process.env.MAYHEM_E11_CLUSTER_FILE || '.mayhem-local/secrets/cluster.txt'
+  );
+  const hfTokenFile = path.resolve(
+    ROOT,
+    process.env.MAYHEM_E11_HF_TOKEN_FILE || '.mayhem-local/secrets/hf.txt'
+  );
   const remote = parseCluster(clusterFile);
   const localTmpDir = path.join(ROOT, '.mayhem-local/tmp');
   await fsp.mkdir(localTmpDir, { recursive: true });
@@ -1502,7 +1508,7 @@ async function main() {
     'set-params',
     '--submitted-at', '0',
     '--effective-at', '86400',
-    '--values-json', '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_au":0,"rate_staleness_seconds":86400,"canary_match_min_bps":9000,"probe_reward_au":5000}',
+    '--values-json', '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_au":"0","rate_staleness_seconds":86400,"canary_match_min_bps":9000,"probe_reward_au":"5000"}',
   ]);
   adminRun('admin-publish-catalog', [
     'publish-catalog',
@@ -1572,7 +1578,7 @@ async function main() {
     'fiat-deposit',
     '--rail', 'stripe',
     '--who', userPubkey,
-    '--au', '10000000',
+    '--au', '10000000000000000000',
     '--ext-ref-hash', fiatDepositRef,
     '--fiat-currency', 'usd',
     '--fiat-amount-minor', '1000',
