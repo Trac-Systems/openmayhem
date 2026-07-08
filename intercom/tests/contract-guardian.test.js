@@ -12,11 +12,11 @@ import {
 
 const rulesHash = '8'.repeat(64);
 
-const seededBalance = (user, mu, rail = 'fiat') => ({
+const seededBalance = (user, au, rail = 'fiat') => ({
   user,
   rail,
-  denom: 'mu_usd',
-  mu,
+  denom: 'au_usd',
+  au: String(au),
   updated_epoch: 0,
   updated_at: null,
 });
@@ -62,22 +62,22 @@ async function setupGuardianContract() {
   return { admin, provider, user, storage, contract };
 }
 
-const epochApply = (epoch, user, provider, grossMu = 1_000) => ({
+const epochApply = (epoch, user, provider, grossAu = 1_000) => ({
   op: 'epoch_apply',
   epoch,
   at: epoch * 3_600,
-  debits: [{ rail: 'fiat', user, mu: grossMu }],
-  earnings: [{ rail: 'fiat', provider, gross_mu: grossMu }],
+  debits: [{ rail: 'fiat', user, au: String(grossAu) }],
+  earnings: [{ rail: 'fiat', provider, gross_au: String(grossAu) }],
 });
 
 test('MayhemContract guardian halts epochApply on conservation failure', async () => {
   const { admin, provider, user, storage, contract } = await setupGuardianContract();
   await storage.put('fee/fiat/cum', {
     rail: 'fiat',
-    denom: 'mu_usd',
-    cum_mu: 5_000,
-    swept_cum_mu: 0,
-    settled_cum_mu: 4_000,
+    denom: 'au_usd',
+    cum_au: '5000',
+    swept_cum_au: '0',
+    settled_cum_au: '4000',
     updated_epoch: 0,
     updated_at: null,
     last_apply_hash: null,

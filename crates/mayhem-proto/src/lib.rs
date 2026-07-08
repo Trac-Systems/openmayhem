@@ -5,11 +5,11 @@ use std::{collections::BTreeMap, fmt};
 use serde::{Deserialize, Serialize};
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 4;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
 pub const ATTESTATION_ALG: &str = "ed25519";
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 6;
-pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 7;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 8;
+pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 8;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
@@ -19,6 +19,79 @@ pub const CTX_BRACKETS: &[(u32, &str)] = &[
     (131_072, "le128k"),
     (262_144, "le256k"),
 ];
+pub type MoneyAu = u128;
+
+pub mod decimal_u128 {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_decimal_u128(&value).map_err(D::Error::custom)
+    }
+
+    fn parse_decimal_u128(value: &str) -> Result<u128, String> {
+        if value.is_empty() {
+            return Err("money amount must be a decimal string".to_owned());
+        }
+        if value.len() > 1 && value.starts_with('0') {
+            return Err("money amount must be canonical without leading zeros".to_owned());
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("money amount must contain only decimal digits".to_owned());
+        }
+        value
+            .parse::<u128>()
+            .map_err(|_| "money amount exceeds u128".to_owned())
+    }
+}
+
+pub mod optional_decimal_u128 {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<u128>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u128>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value.map(parse_decimal_u128).transpose().map_err(D::Error::custom)
+    }
+
+    fn parse_decimal_u128(value: String) -> Result<u128, String> {
+        if value.is_empty() {
+            return Err("money amount must be a decimal string".to_owned());
+        }
+        if value.len() > 1 && value.starts_with('0') {
+            return Err("money amount must be canonical without leading zeros".to_owned());
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("money amount must contain only decimal digits".to_owned());
+        }
+        value
+            .parse::<u128>()
+            .map_err(|_| "money amount exceeds u128".to_owned())
+    }
+}
+
 pub const CTX_BRACKET_UNBOUNDED_ID: &str = "gt256k";
 pub fn ctx_bracket_for_tokens(tokens: u32) -> &'static str {
     CTX_BRACKETS
@@ -310,7 +383,8 @@ pub struct CheckpointPolicy {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct RateMapEntry {
     pub unit: String,
-    pub per_unit_mu: u64,
+    #[serde(with = "decimal_u128")]
+    pub per_unit_au: MoneyAu,
     pub granularity: u64,
 }
 
@@ -321,12 +395,17 @@ pub struct SpendVoucherBody {
     pub enclave_id: String,
     pub price_ver: u64,
     pub locked_rate_map: Vec<RateMapEntry>,
-    pub locked_per_req_mu: u64,
-    pub locked_min_session_mu: u64,
+    #[serde(with = "decimal_u128")]
+    pub locked_per_req_au: MoneyAu,
+    #[serde(with = "decimal_u128")]
+    pub locked_min_session_au: MoneyAu,
     pub served_ctx: u32,
-    pub ctx_bracket: String,
-    pub ctx_bracket_table_ver: u32,
-    pub max_spend_mu: u64,
+    #[serde(default)]
+    pub ctx_bracket: Option<String>,
+    #[serde(default)]
+    pub ctx_bracket_table_ver: Option<u32>,
+    #[serde(with = "decimal_u128")]
+    pub max_spend_au: MoneyAu,
     pub checkpoint_every: CheckpointPolicy,
 }
 
@@ -489,14 +568,19 @@ pub struct ReceiptBody {
     pub model_id: String,
     pub price_ver: u64,
     pub locked_rate_map: Vec<RateMapEntry>,
-    pub locked_per_req_mu: u64,
-    pub locked_min_session_mu: u64,
+    #[serde(with = "decimal_u128")]
+    pub locked_per_req_au: MoneyAu,
+    #[serde(with = "decimal_u128")]
+    pub locked_min_session_au: MoneyAu,
     pub served_ctx: u32,
-    pub ctx_bracket: String,
-    pub ctx_bracket_table_ver: u32,
+    #[serde(default)]
+    pub ctx_bracket: Option<String>,
+    #[serde(default)]
+    pub ctx_bracket_table_ver: Option<u32>,
     pub rules_ver: u64,
     pub usage: ReceiptUsage,
-    pub mu_owed_cum: u64,
+    #[serde(with = "decimal_u128")]
+    pub au_owed_cum: MoneyAu,
     pub prompt_hash: String,
     pub ts: u64,
 }
@@ -554,15 +638,17 @@ pub fn migrate_receipt_body_to_schema(
             3 => migrated.schema_version = 4,
             4 => migrated.schema_version = 5,
             5 => {
-                if migrated.ctx_bracket.is_empty() {
-                    migrated.ctx_bracket = ctx_bracket_for_tokens(migrated.served_ctx).to_owned();
+                if migrated.ctx_bracket.is_none() {
+                    migrated.ctx_bracket =
+                        Some(ctx_bracket_for_tokens(migrated.served_ctx).to_owned());
                 }
-                if migrated.ctx_bracket_table_ver == 0 {
-                    migrated.ctx_bracket_table_ver = CTX_BRACKET_TABLE_VERSION;
+                if migrated.ctx_bracket_table_ver.is_none() {
+                    migrated.ctx_bracket_table_ver = Some(CTX_BRACKET_TABLE_VERSION);
                 }
                 migrated.schema_version = 6;
             }
             6 => migrated.schema_version = 7,
+            7 => migrated.schema_version = 8,
             from => {
                 return Err(ReceiptSchemaMigrationError::Unsupported {
                     from,
@@ -1248,12 +1334,12 @@ mod tests {
         vec![
             RateMapEntry {
                 unit: USAGE_INPUT_TOKEN.to_owned(),
-                per_unit_mu: 20,
+                per_unit_au: 20,
                 granularity: 1_000,
             },
             RateMapEntry {
                 unit: USAGE_OUTPUT_TOKEN.to_owned(),
-                per_unit_mu: 60,
+                per_unit_au: 60,
                 granularity: 1_000,
             },
         ]
@@ -1371,12 +1457,12 @@ mod tests {
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
-            locked_per_req_mu: 7,
-            locked_min_session_mu: 11,
+            locked_per_req_au: 7,
+            locked_min_session_au: 11,
             served_ctx: 8192,
-            ctx_bracket: "le8k".to_owned(),
-            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
-            max_spend_mu: 5000,
+            ctx_bracket: Some("le8k".to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+            max_spend_au: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
                 ms: 30000,
@@ -1401,19 +1487,19 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
-            locked_per_req_mu: 7,
-            locked_min_session_mu: 11,
+            locked_per_req_au: 7,
+            locked_min_session_au: 11,
             served_ctx: voucher.served_ctx,
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
-            mu_owed_cum: 1,
+            au_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,
         };
         let mut changed = receipt.clone();
-        changed.mu_owed_cum = 2;
+        changed.au_owed_cum = 2;
         assert_ne!(
             receipt_signing_bytes(&receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
@@ -1425,7 +1511,7 @@ mod tests {
             receipt_signing_bytes(&changed).unwrap()
         );
         changed = receipt.clone();
-        changed.ctx_bracket = "le32k".to_owned();
+        changed.ctx_bracket = Some("le32k".to_owned());
         assert_ne!(
             receipt_signing_bytes(&receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
@@ -1478,14 +1564,14 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
-            locked_per_req_mu: 0,
-            locked_min_session_mu: 0,
+            locked_per_req_au: 0,
+            locked_min_session_au: 0,
             served_ctx: 8192,
-            ctx_bracket: "le8k".to_owned(),
-            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
+            ctx_bracket: Some("le8k".to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
-            mu_owed_cum: 1,
+            au_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,
         };
@@ -1510,11 +1596,8 @@ mod tests {
         );
 
         assert_eq!(
-            migrate_receipt_body_to_schema(&migrated, SESSION_RECEIPT_SCHEMA_VERSION).unwrap_err(),
-            ReceiptSchemaMigrationError::Unsupported {
-                from: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
-                to: SESSION_RECEIPT_SCHEMA_VERSION,
-            }
+            migrate_receipt_body_to_schema(&migrated, SESSION_RECEIPT_SCHEMA_VERSION).unwrap(),
+            migrated
         );
     }
 
@@ -1526,12 +1609,12 @@ mod tests {
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
-            locked_per_req_mu: 7,
-            locked_min_session_mu: 11,
+            locked_per_req_au: 7,
+            locked_min_session_au: 11,
             served_ctx: 8192,
-            ctx_bracket: "le8k".to_owned(),
-            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
-            max_spend_mu: 5000,
+            ctx_bracket: Some("le8k".to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+            max_spend_au: 5000,
             checkpoint_every: CheckpointPolicy {
                 tokens: 8192,
                 ms: 30000,
@@ -1563,14 +1646,14 @@ mod tests {
             model_id: "model".to_owned(),
             price_ver: 1,
             locked_rate_map: locked_rate_map(),
-            locked_per_req_mu: 7,
-            locked_min_session_mu: 11,
+            locked_per_req_au: 7,
+            locked_min_session_au: 11,
             served_ctx: voucher.served_ctx,
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
             usage: ReceiptUsage::text(3, 5),
-            mu_owed_cum: 1,
+            au_owed_cum: 1,
             prompt_hash: "hash".to_owned(),
             ts: 10,
         };
@@ -1637,12 +1720,12 @@ mod tests {
         let frame = json!({
             "t": "s.open",
             "session_id": "aa".repeat(32),
-            "voucher": { "price_ver": 1, "max_spend_mu": 1000 },
+            "voucher": { "price_ver": 1, "max_spend_au": 1000 },
             "sig": "11".repeat(64),
         });
         let reordered = json!({
             "sig": "11".repeat(64),
-            "voucher": { "max_spend_mu": 1000, "price_ver": 1 },
+            "voucher": { "max_spend_au": 1000, "price_ver": 1 },
             "session_id": "aa".repeat(32),
             "t": "s.open",
         });

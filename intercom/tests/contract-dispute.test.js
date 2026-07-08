@@ -13,6 +13,8 @@ import {
 const rulesHash = '7'.repeat(64);
 const enclaveId = '6'.repeat(64);
 const DAY_SECONDS = 24 * 60 * 60;
+const DISPUTE_DEPOSIT_AU = '1000000000000000000';
+const DOUBLE_DISPUTE_DEPOSIT_AU = '2000000000000000000';
 
 async function setupDisputeContract() {
   const admin = await makeIdentity();
@@ -65,8 +67,8 @@ async function setupDisputeContract() {
   await storage.put(`bal/${user.publicKey}/fiat`, {
     user: user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 2_000_000,
+    denom: 'au_usd',
+    au: DOUBLE_DISPUTE_DEPOSIT_AU,
     updated_epoch: 0,
     updated_at: null,
   });
@@ -98,13 +100,13 @@ function seedProviderHoldback(storage, provider, overrides = {}) {
   return storage.put(`earn/fiat/${provider.publicKey}`, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 20_000,
-    held_mu: 10_000,
-    paid_cum_mu: 0,
+    denom: 'au_usd',
+    total_au: '20000',
+    held_au: '10000',
+    paid_cum_au: '0',
     holdbacks: [
-      { epoch: 1, mu: 4_000 },
-      { epoch: 2, mu: 6_000 },
+      { epoch: 1, au: '4000' },
+      { epoch: 2, au: '6000' },
     ],
     updated_epoch: 2,
     updated_at: null,
@@ -117,8 +119,8 @@ test('MayhemContract dispute default bond blocks half-cent spam-scale opens', as
   await storage.put(`bal/${user.publicKey}/fiat`, {
     user: user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 10_000,
+    denom: 'au_usd',
+    au: '10000',
     updated_epoch: 0,
     updated_at: null,
   });
@@ -149,8 +151,8 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
   );
   assert.equal(opened.ok, true, opened.message);
   assert.equal(opened.dispute_id, 1);
-  assert.equal(opened.deposit_mu, 1_000_000);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
+  assert.equal(opened.deposit_au, DISPUTE_DEPOSIT_AU);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, DISPUTE_DEPOSIT_AU);
 
   const nonAdmin = await execute(
     contract,
@@ -187,35 +189,35 @@ test('MayhemContract dispute lifecycle refunds deposit and applies provider_faul
     7
   );
   assert.equal(resolved.ok, true, resolved.message);
-  assert.equal(resolved.deposit_refunded_mu, 1_000_000);
-  assert.equal(resolved.deposit_forfeited_mu, 0);
-  assert.equal(resolved.slash.forfeited_mu, 2_000);
-  assert.equal(resolved.slash.beneficiary_mu, 1_000);
-  assert.equal(resolved.slash.treasury_mu, 1_000);
+  assert.equal(resolved.deposit_refunded_au, DISPUTE_DEPOSIT_AU);
+  assert.equal(resolved.deposit_forfeited_au, '0');
+  assert.equal(resolved.slash.forfeited_au, '2000');
+  assert.equal(resolved.slash.beneficiary_au, '1000');
+  assert.equal(resolved.slash.treasury_au, '1000');
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 2_001_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '2000000000000001000');
   assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 18_000,
-    held_mu: 8_000,
-    paid_cum_mu: 0,
+    denom: 'au_usd',
+    total_au: '18000',
+    held_au: '8000',
+    paid_cum_au: '0',
     holdbacks: [
-      { epoch: 1, mu: 4_000 },
-      { epoch: 2, mu: 4_000 },
+      { epoch: 1, au: '4000' },
+      { epoch: 2, au: '4000' },
     ],
     updated_epoch: 2,
     updated_at: makeTxKey(7),
-    slashed_cum_mu: 2_000,
+    slashed_cum_au: '2000',
     last_slash_at: makeTxKey(7),
   });
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 1_000);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '1000');
 
   const dispute = (await storage.get('disp/1')).value;
   assert.equal(dispute.status, 'resolved');
   assert.equal(dispute.deposit_action, 'refund');
-  assert.equal(dispute.deposit_refunded_mu, 1_000_000);
+  assert.equal(dispute.deposit_refunded_au, DISPUTE_DEPOSIT_AU);
   assert.equal(dispute.reputation_event.kind, 'dispute_lost');
   assert.equal(dispute.slash.reason, 'dispute_lost');
   assert.equal(dispute.resolution_hash.length, 64);
@@ -291,10 +293,10 @@ test('MayhemContract dispute resolution uses admin-governed dispute_lost_slash_b
   );
   assert.equal(resolved.ok, true, resolved.message);
   assert.equal(resolved.slash.slash_bps, 1_000);
-  assert.equal(resolved.slash.forfeited_mu, 1_000);
-  assert.equal(resolved.slash.beneficiary_mu, 500);
-  assert.equal(resolved.slash.treasury_mu, 500);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 2_000_500);
+  assert.equal(resolved.slash.forfeited_au, '1000');
+  assert.equal(resolved.slash.beneficiary_au, '500');
+  assert.equal(resolved.slash.treasury_au, '500');
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '2000000000000000500');
 });
 
 test('MayhemContract dispute resolution validates slash target before mutating funds', async () => {
@@ -313,7 +315,7 @@ test('MayhemContract dispute resolution validates slash target before mutating f
     5
   );
   assert.equal(opened.ok, true, opened.message);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, DISPUTE_DEPOSIT_AU);
 
   const invalid = await execute(
     contract,
@@ -334,7 +336,7 @@ test('MayhemContract dispute resolution validates slash target before mutating f
   );
   assert.match(invalid.message, /invalid slash beneficiary/i);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, DISPUTE_DEPOSIT_AU);
   assert.equal((await storage.get('disp/1')).value.status, 'open');
   assert.equal(await storage.get(`ev/rep/${provider.publicKey}/dispute-1-lost`), null);
   assert.equal(await storage.get(`ev/slash/${provider.publicKey}/${makeTxKey(6)}`), null);
@@ -375,12 +377,12 @@ test('MayhemContract dispute lifecycle forfeits opener deposit to treasury', asy
     6
   );
   assert.equal(resolved.ok, true, resolved.message);
-  assert.equal(resolved.deposit_refunded_mu, 0);
-  assert.equal(resolved.deposit_forfeited_mu, 1_000_000);
+  assert.equal(resolved.deposit_refunded_au, '0');
+  assert.equal(resolved.deposit_forfeited_au, DISPUTE_DEPOSIT_AU);
   assert.equal(resolved.slash, null);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, DISPUTE_DEPOSIT_AU);
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, DISPUTE_DEPOSIT_AU);
   const dispute = (await storage.get('disp/1')).value;
   assert.equal(dispute.status, 'resolved');
   assert.equal(dispute.outcome, 'opener_fault');

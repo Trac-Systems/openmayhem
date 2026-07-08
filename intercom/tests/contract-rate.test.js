@@ -66,7 +66,7 @@ async function setupRateContract() {
 
 const rateOracle = (overrides = {}) => ({
   op: 'rate_oracle',
-  tnk_usd_e6: 2_000_000,
+  tnk_usd_au: '2000000000000000000',
   source: 'gate-spot',
   ts: 1_000,
   ...overrides,
@@ -74,7 +74,7 @@ const rateOracle = (overrides = {}) => ({
 
 const tapRateOracle = (overrides = {}) => ({
   op: 'tap_rate_oracle',
-  tap_usd_e6: 2_000_000,
+  tap_usd_au: '2000000000000000000',
   source: 'uniswap-v2',
   ts: 1_000,
   ...overrides,
@@ -86,8 +86,8 @@ async function tnkDepositIntent(contract, storage, user, memoHash, overrides = {
     memo_hash: memoHash,
     treasury_address: 'testtrac1treasury',
     tnk_e18: oneTnkE18,
-    quoted_mu: 2_000_000,
-    rate_tnk_usd_e6: 2_000_000,
+    quoted_au: '2000000000000000000',
+    rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
     ...overrides,
   };
@@ -153,8 +153,8 @@ test('MayhemContract rateOracle feature is admin controlled and monotonic', asyn
     source: 'gate-spot',
   });
   assert.deepEqual((await storage.get('rate/latest')).value, {
-    denom: 'tnk_usd_e6',
-    tnk_usd_e6: 2_000_000,
+    denom: 'tnk_usd_au',
+    tnk_usd_au: '2000000000000000000',
     source: 'gate-spot',
     ts: 1_000,
     updated_at: firstKey,
@@ -230,8 +230,8 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     source: 'uniswap-v2',
   });
   assert.deepEqual((await storage.get('tap/rate/latest')).value, {
-    denom: 'tap_usd_e6',
-    tap_usd_e6: 2_000_000,
+    denom: 'tap_usd_au',
+    tap_usd_au: '2000000000000000000',
     source: 'uniswap-v2',
     ts: 1_000,
     updated_at: firstKey,
@@ -265,19 +265,19 @@ test('MayhemContract tapRateOracle drives TAP deposits and fails closed when sta
     admin.publicKey
   );
   assert.equal(freshDeposit.ok, true, freshDeposit.message);
-  assert.equal(freshDeposit.mu, 2_000_000);
+  assert.equal(freshDeposit.au, '2000000000000000000');
   assert.equal(freshDeposit.rate_ts, 1_000);
   assert.deepEqual((await storage.get(`bal/${buyer}/tap`)).value, {
     user: buyer,
     rail: 'tap',
-    denom: 'mu_usd',
-    mu: 2_000_000,
+    denom: 'au_usd',
+    au: '2000000000000000000',
     updated_epoch: 1,
     updated_at: freshTapKey,
     last_deposit_rail: 'tap',
     last_deposit_rate_ts: 1_000,
     last_deposit_rate_source: 'uniswap-v2',
-    last_deposit_tap_usd_e6: 2_000_000,
+    last_deposit_tap_usd_au: '2000000000000000000',
   });
 });
 
@@ -329,15 +329,15 @@ test('MayhemContract refuses TNK deposit credits when the rate is stale', async 
   assert.equal(freshDeposit.ok, true, freshDeposit.message);
   assert.equal(freshDeposit.op, 'tnkDeposit');
   assert.equal(freshDeposit.who, user.publicKey);
-  assert.equal(freshDeposit.mu, 2_000_000);
+  assert.equal(freshDeposit.au, '2000000000000000000');
   assert.equal(freshDeposit.epoch, 1);
   assert.equal(freshDeposit.deposit_root.length, 64);
   assert.equal(freshDeposit.rate_ts, 1_000);
   assert.deepEqual((await storage.get(`bal/${user.publicKey}/tnk`)).value, {
     user: user.publicKey,
     rail: 'tnk',
-    denom: 'mu_usd',
-    mu: 2_000_000,
+    denom: 'au_usd',
+    au: '2000000000000000000',
     updated_epoch: 0,
     updated_at: freshTnkKey,
     last_deposit_rail: 'tnk',

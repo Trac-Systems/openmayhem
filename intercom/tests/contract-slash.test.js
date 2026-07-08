@@ -192,13 +192,13 @@ function seedHeldEarnings(storage, provider, overrides = {}) {
   return storage.put(`earn/fiat/${provider.publicKey}`, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 10_000,
-    held_mu: 6_000,
-    paid_cum_mu: 1_000,
+    denom: 'au_usd',
+    total_au: '10000',
+    held_au: '6000',
+    paid_cum_au: '1000',
     holdbacks: [
-      { epoch: 1, mu: 2_000 },
-      { epoch: 2, mu: 4_000 },
+      { epoch: 1, au: '2000' },
+      { epoch: 2, au: '4000' },
     ],
     updated_epoch: 2,
     updated_at: null,
@@ -235,34 +235,34 @@ test('MayhemContract canary mismatch slashes held earnings, tombstones serving, 
   assert.deepEqual((await ctx.storage.get(`earn/fiat/${ctx.provider.publicKey}`)).value, {
     provider: ctx.provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 4_000,
-    held_mu: 0,
-    paid_cum_mu: 1_000,
+    denom: 'au_usd',
+    total_au: '4000',
+    held_au: '0',
+    paid_cum_au: '1000',
     holdbacks: [],
     updated_epoch: 2,
     updated_at: makeTxKey(10),
-    slashed_cum_mu: 6_000,
+    slashed_cum_au: '6000',
     last_slash_at: makeTxKey(10),
   });
   assert.deepEqual((await ctx.storage.get(`bal/${ctx.auditor.publicKey}/fiat`)).value, {
     user: ctx.auditor.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 3_000,
+    denom: 'au_usd',
+    au: '3000',
     updated_epoch: 3,
     updated_at: makeTxKey(10),
   });
   assert.deepEqual((await ctx.storage.get('fee/fiat/cum')).value, {
     rail: 'fiat',
-    denom: 'mu_usd',
-    cum_mu: 3_000,
-    swept_cum_mu: 0,
+    denom: 'au_usd',
+    cum_au: '3000',
+    swept_cum_au: '0',
     updated_epoch: 3,
     updated_at: makeTxKey(10),
     last_apply_hash: null,
     last_fee_bps: null,
-    settled_cum_mu: 3_000,
+    settled_cum_au: '3000',
     last_slash_at: makeTxKey(10),
   });
 
@@ -282,10 +282,10 @@ test('MayhemContract canary mismatch slashes held earnings, tombstones serving, 
   const slash = (await ctx.storage.get(`ev/slash/${ctx.provider.publicKey}/${makeTxKey(10)}`)).value;
   assert.equal(slash.reason, 'canary_mismatch');
   assert.equal(slash.source, 'probe');
-  assert.equal(slash.forfeited_mu, 6_000);
+  assert.equal(slash.forfeited_au, '6000');
   assert.equal(slash.beneficiary, ctx.auditor.publicKey);
-  assert.equal(slash.beneficiary_mu, 3_000);
-  assert.equal(slash.treasury_mu, 3_000);
+  assert.equal(slash.beneficiary_au, '3000');
+  assert.equal(slash.treasury_au, '3000');
   assert.equal(slash.provider_banned, true);
   assert.equal(slash.tombstone.serve_tombstoned, true);
   assert.deepEqual(slash.tombstone.rooms_tombstoned, [roomId]);
@@ -375,28 +375,28 @@ test('MayhemContract canary mismatch uses admin-governed fraud_slash_bps', async
 
   const slash = (await ctx.storage.get(`ev/slash/${ctx.provider.publicKey}/${makeTxKey(11)}`)).value;
   assert.equal(slash.slash_bps, 5_000);
-  assert.equal(slash.forfeited_mu, 3_000);
-  assert.equal(slash.beneficiary_mu, 1_500);
-  assert.equal(slash.treasury_mu, 1_500);
+  assert.equal(slash.forfeited_au, '3000');
+  assert.equal(slash.beneficiary_au, '1500');
+  assert.equal(slash.treasury_au, '1500');
 
   const earning = (await ctx.storage.get(`earn/fiat/${ctx.provider.publicKey}`)).value;
-  assert.equal(earning.total_mu, 7_000);
-  assert.equal(earning.held_mu, 3_000);
+  assert.equal(earning.total_au, '7000');
+  assert.equal(earning.held_au, '3000');
   assert.deepEqual(earning.holdbacks, [
-    { epoch: 1, mu: 2_000 },
-    { epoch: 2, mu: 1_000 },
+    { epoch: 1, au: '2000' },
+    { epoch: 2, au: '1000' },
   ]);
 });
 
 test('MayhemContract dispute_lost reputation event partially slashes held earnings without ban', async () => {
   const ctx = await setupSlashContract();
   await seedHeldEarnings(ctx.storage, ctx.provider, {
-    total_mu: 20_000,
-    held_mu: 10_000,
-    paid_cum_mu: 2_000,
+    total_au: '20000',
+    held_au: '10000',
+    paid_cum_au: '2000',
     holdbacks: [
-      { epoch: 1, mu: 4_000 },
-      { epoch: 2, mu: 6_000 },
+      { epoch: 1, au: '4000' },
+      { epoch: 2, au: '6000' },
     ],
   });
 
@@ -419,27 +419,27 @@ test('MayhemContract dispute_lost reputation event partially slashes held earnin
   );
   assert.equal(result.ok, true, result.message);
   assert.equal(result.slash.reason, 'dispute_lost');
-  assert.equal(result.slash.forfeited_mu, 2_000);
+  assert.equal(result.slash.forfeited_au, '2000');
 
   assert.deepEqual((await ctx.storage.get(`earn/fiat/${ctx.provider.publicKey}`)).value, {
     provider: ctx.provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 18_000,
-    held_mu: 8_000,
-    paid_cum_mu: 2_000,
+    denom: 'au_usd',
+    total_au: '18000',
+    held_au: '8000',
+    paid_cum_au: '2000',
     holdbacks: [
-      { epoch: 1, mu: 4_000 },
-      { epoch: 2, mu: 4_000 },
+      { epoch: 1, au: '4000' },
+      { epoch: 2, au: '4000' },
     ],
     updated_epoch: 2,
     updated_at: makeTxKey(5),
-    slashed_cum_mu: 2_000,
+    slashed_cum_au: '2000',
     last_slash_at: makeTxKey(5),
   });
   assert.equal((await ctx.storage.get(`prov/${ctx.provider.publicKey}`)).value.status, 'active');
-  assert.equal((await ctx.storage.get(`bal/${ctx.admin.publicKey}/fiat`)).value.mu, 1_000);
-  assert.equal((await ctx.storage.get('fee/fiat/cum')).value.cum_mu, 1_000);
+  assert.equal((await ctx.storage.get(`bal/${ctx.admin.publicKey}/fiat`)).value.au, '1000');
+  assert.equal((await ctx.storage.get('fee/fiat/cum')).value.cum_au, '1000');
 
   const slash = (await ctx.storage.get(`ev/slash/${ctx.provider.publicKey}/${makeTxKey(5)}`)).value;
   assert.equal(slash.source, 'dispute');
@@ -450,12 +450,12 @@ test('MayhemContract dispute_lost reputation event partially slashes held earnin
 test('MayhemContract dispute_lost reputation event uses admin-governed dispute_lost_slash_bps', async () => {
   const ctx = await setupSlashContract();
   await seedHeldEarnings(ctx.storage, ctx.provider, {
-    total_mu: 20_000,
-    held_mu: 10_000,
-    paid_cum_mu: 2_000,
+    total_au: '20000',
+    held_au: '10000',
+    paid_cum_au: '2000',
     holdbacks: [
-      { epoch: 1, mu: 4_000 },
-      { epoch: 2, mu: 6_000 },
+      { epoch: 1, au: '4000' },
+      { epoch: 2, au: '6000' },
     ],
   });
 
@@ -493,7 +493,7 @@ test('MayhemContract dispute_lost reputation event uses admin-governed dispute_l
   );
   assert.equal(result.ok, true, result.message);
   assert.equal(result.slash.slash_bps, 1_000);
-  assert.equal(result.slash.forfeited_mu, 1_000);
-  assert.equal(result.slash.beneficiary_mu, 500);
-  assert.equal(result.slash.treasury_mu, 500);
+  assert.equal(result.slash.forfeited_au, '1000');
+  assert.equal(result.slash.beneficiary_au, '500');
+  assert.equal(result.slash.treasury_au, '500');
 });

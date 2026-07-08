@@ -22,8 +22,8 @@ import {
 
 const rulesHash = '6'.repeat(64);
 const versioningLockedRateMap = [
-  { unit: 'input_token', per_unit_mu: 100, granularity: 30 },
-  { unit: 'output_token', per_unit_mu: 100, granularity: 30 },
+  { unit: 'input_token', per_unit_au: '100', granularity: 30 },
+  { unit: 'output_token', per_unit_au: '100', granularity: 30 },
 ];
 
 test('contract reports the exported contract version', async () => {
@@ -133,7 +133,7 @@ test('receipt verifier accepts v1 and v2 receipt signing payloads', async () => 
     locked_rate_map: versioningLockedRateMap,
     rules_ver: 1,
     usage: { in: 10, out: 20 },
-    mu_owed_cum: 100,
+    au_owed_cum: '100',
     prompt_hash: 'a'.repeat(64),
     ts: 1_000,
   };
@@ -171,7 +171,7 @@ test('receipt schema migration normalizes legacy usage maps', async () => {
     locked_rate_map: versioningLockedRateMap,
     rules_ver: 1,
     usage: { in: 10, out_tokens: 20 },
-    mu_owed_cum: 100,
+    au_owed_cum: '100',
     prompt_hash: 'a'.repeat(64),
     ts: 1_000,
   };
@@ -182,6 +182,14 @@ test('receipt schema migration normalizes legacy usage maps', async () => {
     enclave_sig: b4a.toString(enclave.wallet.sign(message), 'hex'),
     user_sig: b4a.toString(user.wallet.sign(message), 'hex'),
   };
+  contract.storage = new MemoryStorage({
+    [`enclave/${body.enclave_id}`]: {
+      enclave_id: body.enclave_id,
+      model_id: body.model_id,
+      model_class: 'text-generation',
+      caps: { chat: true, ctx: 8192 },
+    },
+  });
 
   const migrated = await contract.normalizeReceiptEnvelope(envelope, {
     targetSchemaVersion: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,

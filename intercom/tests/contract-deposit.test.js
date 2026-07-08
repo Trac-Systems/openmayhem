@@ -78,7 +78,7 @@ async function setRate(ctx) {
     ctx.storage,
     {
       op: 'rate_oracle',
-      tnk_usd_e6: 2_000_000,
+      tnk_usd_au: '2000000000000000000',
       source: 'gate-spot',
       ts: 1_000,
     },
@@ -91,8 +91,8 @@ async function depositIntent(ctx, memoHash, txNo, extra = {}) {
   const quoted = {
     treasury_address: 'testtrac1treasury',
     tnk_e18: oneTnkE18,
-    quoted_mu: 2_000_000,
-    rate_tnk_usd_e6: 2_000_000,
+    quoted_au: '2000000000000000000',
+    rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
     ...extra,
   };
@@ -147,8 +147,8 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     requested_at: ctx.lastDepositIntentKey,
     treasury_address: 'testtrac1treasury',
     tnk_e18: oneTnkE18,
-    quoted_mu: 2_000_000,
-    rate_tnk_usd_e6: 2_000_000,
+    quoted_au: '2000000000000000000',
+    rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
   });
 
@@ -174,7 +174,7 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.op, 'tnkDeposit');
   assert.equal(confirmed.who, ctx.user.publicKey);
-  assert.equal(confirmed.mu, 2_000_000);
+  assert.equal(confirmed.au, '2000000000000000000');
   assert.equal(confirmed.epoch, 1);
   assert.equal(confirmed.deposit_root.length, 64);
   assert.equal(confirmed.rate_ts, 1_000);
@@ -183,8 +183,8 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
   assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value, {
     user: ctx.user.publicKey,
     rail: 'tnk',
-    denom: 'mu_usd',
-    mu: 2_000_000,
+    denom: 'au_usd',
+    au: '2000000000000000000',
     updated_epoch: 0,
     updated_at: confirmedKey,
     last_deposit_rail: 'tnk',
@@ -195,7 +195,7 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     epoch: 1,
     merkle_root: confirmed.deposit_root,
     count: 1,
-    mu_total: 2_000_000,
+    au_total: '2000000000000000000',
     ts: 1_500,
     updated_at: confirmedKey,
   });
@@ -212,8 +212,8 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
   const intent = await depositIntent(ctx, 'memo-quoted', 4, {
     treasury_address: 'testtrac1treasury',
     tnk_e18: oneTnkE18,
-    quoted_mu: 2_000_000,
-    rate_tnk_usd_e6: 2_000_000,
+    quoted_au: '2000000000000000000',
+    rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
   });
   assert.equal(intent.ok, true, intent.message);
@@ -224,8 +224,8 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
     requested_at: ctx.lastDepositIntentKey,
     treasury_address: 'testtrac1treasury',
     tnk_e18: oneTnkE18,
-    quoted_mu: 2_000_000,
-    rate_tnk_usd_e6: 2_000_000,
+    quoted_au: '2000000000000000000',
+    rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
   });
 
@@ -235,7 +235,7 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
 
   const confirmed = await confirmDeposit(ctx, 'memo-quoted', oneTnkE18, 'e'.repeat(64), 6);
   assert.equal(confirmed.ok, true, confirmed.message);
-  assert.equal(confirmed.mu, 2_000_000);
+  assert.equal(confirmed.au, '2000000000000000000');
   assert.equal(await ctx.storage.get('dep/pending/memo-quoted'), null);
 });
 
@@ -261,7 +261,7 @@ test('MayhemContract deposit root accumulation is deterministic and root-only', 
 
     const secondIntent = await depositIntent(ctx, 'memo-2', 6, {
       tnk_e18: halfTnkE18,
-      quoted_mu: 1_000_000,
+      quoted_au: '1000000000000000000',
     });
     assert.equal(secondIntent.ok, true, secondIntent.message);
     const second = await confirmDeposit(ctx, 'memo-2', halfTnkE18, '2'.repeat(64), 7);
@@ -272,7 +272,7 @@ test('MayhemContract deposit root accumulation is deterministic and root-only', 
   assert.equal(left.storage.snapshotBytes(), right.storage.snapshotBytes());
   const root = (await left.storage.get('ev/dep/1')).value;
   assert.equal(root.count, 2);
-  assert.equal(root.mu_total, 3_000_000);
+  assert.equal(root.au_total, '3000000000000000000');
   assert.equal(root.merkle_root.length, 64);
   assert.notEqual(root.merkle_root, firstRoot);
 
@@ -334,7 +334,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     ctx.storage,
     {
       op: 'tap_rate_oracle',
-      tap_usd_e6: 2_000_000,
+      tap_usd_au: '2000000000000000000',
       source: 'uniswap-v2',
       ts: 1_000,
     },
@@ -348,7 +348,7 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.equal(confirmed.op, 'tapDeposit');
   assert.equal(confirmed.duplicate, false);
   assert.equal(confirmed.who, buyer);
-  assert.equal(confirmed.mu, 2_000_000);
+  assert.equal(confirmed.au, '2000000000000000000');
   assert.equal(confirmed.eth_tx_hash, ethTxHash);
   assert.equal(confirmed.log_index, 0);
   assert.equal(confirmed.rate_ts, 1_000);
@@ -359,10 +359,10 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
     rail: 'tap',
     who: buyer,
     tap_wei: oneTnkE18,
-    tap_usd_e6: 2_000_000,
+    tap_usd_au: '2000000000000000000',
     rate_ts: 1_000,
     rate_source: 'uniswap-v2',
-    mu: 2_000_000,
+    au: '2000000000000000000',
     eth_tx_hash: ethTxHash,
     log_index: 0,
     block_number: 123,
@@ -383,19 +383,19 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   assert.deepEqual((await ctx.storage.get(`bal/${buyer}/tap`)).value, {
     user: buyer,
     rail: 'tap',
-    denom: 'mu_usd',
-    mu: 2_000_000,
+    denom: 'au_usd',
+    au: '2000000000000000000',
     updated_epoch: 1,
     updated_at: confirmedKey,
     last_deposit_rail: 'tap',
     last_deposit_rate_ts: 1_000,
     last_deposit_rate_source: 'uniswap-v2',
-    last_deposit_tap_usd_e6: 2_000_000,
+    last_deposit_tap_usd_au: '2000000000000000000',
   });
   const root = (await ctx.storage.get('ev/dep/1')).value;
   assert.equal(root.type, 'deposit_root');
   assert.equal(root.count, 1);
-  assert.equal(root.mu_total, 2_000_000);
+  assert.equal(root.au_total, '2000000000000000000');
   assert.equal(root.merkle_root, confirmed.deposit_root);
   assert.equal(JSON.stringify(root).includes(buyer), false);
   assert.equal(root.merkle_root.includes(ethTxHash), false);
@@ -403,14 +403,14 @@ test('MayhemContract tapDeposit credits a finalized event exactly once under rep
   const replay = await executeDepositFeature(ctx.contract, ctx.storage, value, ctx.admin.publicKey);
   assert.equal(replay.ok, true, replay.message);
   assert.equal(replay.duplicate, true);
-  assert.equal(replay.mu, 0);
-  assert.equal(replay.credited_mu, 2_000_000);
+  assert.equal(replay.au, '0');
+  assert.equal(replay.credited_au, '2000000000000000000');
   assert.equal(replay.deposit_root, confirmed.deposit_root);
-  assert.deepEqual((await ctx.storage.get(`bal/${buyer}/tap`)).value.mu, 2_000_000);
+  assert.deepEqual((await ctx.storage.get(`bal/${buyer}/tap`)).value.au, '2000000000000000000');
   assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
 });
 
-test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', async () => {
+test('MayhemContract fiatDeposit credits au_usd and folds root-only evidence', async () => {
   const ctx = await setupDepositContract();
   await consentUser(ctx, 2);
 
@@ -418,7 +418,7 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
     op: 'fiat_deposit',
     rail: 'stripe',
     who: ctx.user.publicKey,
-    mu: 2_500_000,
+    au: '2500000',
     ext_ref_hash: 'a'.repeat(64),
     fiat_currency: 'usd',
     fiat_amount_minor: 250,
@@ -443,7 +443,7 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   assert.equal(confirmed.rail, 'fiat');
   assert.equal(confirmed.processor_rail, 'stripe');
   assert.equal(confirmed.who, ctx.user.publicKey);
-  assert.equal(confirmed.mu, 2_500_000);
+  assert.equal(confirmed.au, '2500000');
   assert.equal(confirmed.fiat_currency, 'usd');
   assert.equal(confirmed.fiat_amount_minor, 250);
   assert.equal(confirmed.deposit_root.length, 64);
@@ -451,8 +451,8 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value, {
     user: ctx.user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 2_500_000,
+    denom: 'au_usd',
+    au: '2500000',
     updated_epoch: 1,
     updated_at: confirmedKey,
     last_deposit_rail: 'fiat',
@@ -462,10 +462,49 @@ test('MayhemContract fiatDeposit credits mu_usd and folds root-only evidence', a
   const root = (await ctx.storage.get('ev/dep/1')).value;
   assert.equal(root.type, 'deposit_root');
   assert.equal(root.count, 1);
-  assert.equal(root.mu_total, 2_500_000);
+  assert.equal(root.au_total, '2500000');
   assert.equal(root.merkle_root, confirmed.deposit_root);
   assert.equal(JSON.stringify(root).includes(ctx.user.publicKey), false);
   assert.equal(root.merkle_root.includes('a'.repeat(64)), false);
+
+  const seenKey = `dep/fiat/${fiatValue.ext_ref_hash}`;
+  assert.deepEqual((await ctx.storage.get(seenKey)).value, {
+    rail: 'fiat',
+    processor_rail: 'stripe',
+    who: ctx.user.publicKey,
+    au: '2500000',
+    ext_ref_hash: 'a'.repeat(64),
+    fiat_currency: 'usd',
+    fiat_amount_minor: 250,
+    epoch: 1,
+    at: 1_800,
+    credited_at: confirmedKey,
+    credited_by: ctx.admin.publicKey,
+    credited_by_role: 'admin',
+    chargeback_au_cum: '0',
+    network_absorbed_au_cum: '0',
+  });
+
+  const replay = await executeDepositFeature(
+    ctx.contract,
+    ctx.storage,
+    {
+      ...fiatValue,
+      who: ctx.outsider.publicKey,
+      au: '3000000',
+      fiat_amount_minor: 300,
+      at: 1_900,
+    },
+    ctx.admin.publicKey
+  );
+  assert.equal(replay.ok, true, replay.message);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.au, '0');
+  assert.equal(replay.credited_au, '2500000');
+  assert.equal(replay.deposit_root, confirmed.deposit_root);
+  assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.au, '2500000');
+  assert.equal((await ctx.storage.get(`bal/${ctx.outsider.publicKey}/fiat`))?.value ?? null, null);
+  assert.deepEqual((await ctx.storage.get('ev/dep/1')).value, root);
 });
 
 test('MayhemContract fiatDeposit accepts paygate admin-oracle tx path', async () => {
@@ -476,7 +515,7 @@ test('MayhemContract fiatDeposit accepts paygate admin-oracle tx path', async ()
     op: 'fiat_deposit',
     rail: 'stripe',
     who: ctx.user.publicKey,
-    mu: 1_000_000,
+    au: '1000000',
     ext_ref_hash: 'd'.repeat(64),
     fiat_currency: 'eur',
     fiat_amount_minor: 100,
@@ -491,12 +530,12 @@ test('MayhemContract fiatDeposit accepts paygate admin-oracle tx path', async ()
   assert.equal(confirmed.op, 'fiatDeposit');
   assert.equal(confirmed.rail, 'fiat');
   assert.equal(confirmed.processor_rail, 'stripe');
-  assert.equal(confirmed.mu, 1_000_000);
+  assert.equal(confirmed.au, '1000000');
   assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value, {
     user: ctx.user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 1_000_000,
+    denom: 'au_usd',
+    au: '1000000',
     updated_epoch: 1,
     updated_at: makeTxKey(6),
     last_deposit_rail: 'fiat',
@@ -516,7 +555,7 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
       op: 'fiat_deposit',
       rail: 'stripe',
       who: ctx.user.publicKey,
-      mu: 2_500_000,
+      au: '2500000',
       ext_ref_hash: 'b'.repeat(64),
       fiat_currency: 'eur',
       fiat_amount_minor: 250,
@@ -535,11 +574,11 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
       op: 'fiat_chargeback',
       rail: 'stripe',
       who: ctx.user.publicKey,
-      mu: 3_000_000,
+      au: '2500000',
       ext_ref_hash: 'b'.repeat(64),
       dispute_ref_hash: 'c'.repeat(64),
       fiat_currency: 'eur',
-      fiat_amount_minor: 300,
+      fiat_amount_minor: 250,
       epoch: 2,
       at: 3_600,
     },
@@ -550,18 +589,18 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
   assert.equal(chargeback.op, 'fiatChargeback');
   assert.equal(chargeback.rail, 'fiat');
   assert.equal(chargeback.processor_rail, 'stripe');
-  assert.equal(chargeback.clawback_mu, 2_500_000);
-  assert.equal(chargeback.network_absorbed_mu, 500_000);
+  assert.equal(chargeback.clawback_au, '2500000');
+  assert.equal(chargeback.network_absorbed_au, '0');
   assert.equal(chargeback.fiat_currency, 'eur');
-  assert.equal(chargeback.fiat_amount_minor, 300);
+  assert.equal(chargeback.fiat_amount_minor, 250);
   assert.equal(chargeback.frozen, true);
   assert.equal(chargeback.deposit_root.length, 64);
 
   assert.deepEqual((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value, {
     user: ctx.user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 0,
+    denom: 'au_usd',
+    au: '0',
     updated_epoch: 2,
     updated_at: makeTxKey(4),
     last_deposit_rail: 'fiat',
@@ -583,9 +622,9 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
     updated_at_seconds: 3_600,
     updated_epoch: 2,
     dispute_count: 1,
-    disputed_mu_cum: 3_000_000,
-    clawback_mu_cum: 2_500_000,
-    network_absorbed_mu_cum: 500_000,
+    disputed_au_cum: '2500000',
+    clawback_au_cum: '2500000',
+    network_absorbed_au_cum: '0',
     last_ext_ref_hash: 'b'.repeat(64),
     last_dispute_ref_hash: 'c'.repeat(64),
     last_fiat_currency: 'eur',
@@ -596,12 +635,85 @@ test('MayhemContract fiatChargeback claws back remaining credits and freezes buy
   assert.equal(reversalRoot.reversed, true);
   assert.equal(reversalRoot.count, 1);
   assert.equal(reversalRoot.reversal_count, 1);
-  assert.equal(reversalRoot.mu_total, 0);
-  assert.equal(reversalRoot.reversed_mu_total, 3_000_000);
-  assert.equal(reversalRoot.clawback_mu_total, 2_500_000);
-  assert.equal(reversalRoot.network_absorbed_mu_total, 500_000);
+  assert.equal(reversalRoot.au_total, '0');
+  assert.equal(reversalRoot.reversed_au_total, '2500000');
+  assert.equal(reversalRoot.clawback_au_total, '2500000');
+  assert.equal(reversalRoot.network_absorbed_au_total, '0');
   assert.equal(JSON.stringify(reversalRoot).includes(ctx.user.publicKey), false);
   assert.equal(JSON.stringify(reversalRoot).includes('c'.repeat(64)), false);
+
+  assert.deepEqual((await ctx.storage.get(`dep/fiat/${'b'.repeat(64)}/chargeback/${'c'.repeat(64)}`)).value, {
+    rail: 'fiat',
+    processor_rail: 'stripe',
+    who: ctx.user.publicKey,
+    au: '2500000',
+    clawback_au: '2500000',
+    network_absorbed_au: '0',
+    ext_ref_hash: 'b'.repeat(64),
+    dispute_ref_hash: 'c'.repeat(64),
+    fiat_currency: 'eur',
+    fiat_amount_minor: 250,
+    epoch: 2,
+    at: 3_600,
+    credited_at: makeTxKey(4),
+    credited_by: ctx.admin.publicKey,
+    credited_by_role: 'admin',
+  });
+  assert.deepEqual((await ctx.storage.get(`dep/fiat/${'b'.repeat(64)}`)).value, {
+    rail: 'fiat',
+    processor_rail: 'stripe',
+    who: ctx.user.publicKey,
+    au: '2500000',
+    ext_ref_hash: 'b'.repeat(64),
+    fiat_currency: 'eur',
+    fiat_amount_minor: 250,
+    epoch: 1,
+    at: 1_800,
+    credited_at: await depositFeatureKey(ctx.contract, {
+      op: 'fiat_deposit',
+      rail: 'stripe',
+      who: ctx.user.publicKey,
+      au: '2500000',
+      ext_ref_hash: 'b'.repeat(64),
+      fiat_currency: 'eur',
+      fiat_amount_minor: 250,
+      epoch: 1,
+      at: 1_800,
+    }),
+    credited_by: ctx.admin.publicKey,
+    credited_by_role: 'admin',
+    chargeback_au_cum: '2500000',
+    network_absorbed_au_cum: '0',
+    disputed_au_cum: '2500000',
+    last_dispute_ref_hash: 'c'.repeat(64),
+    last_chargeback_at: makeTxKey(4),
+    last_chargeback_at_seconds: 3_600,
+    last_chargeback_epoch: 2,
+  });
+  const chargebackReplay = await execute(
+    ctx.contract,
+    ctx.storage,
+    'fiatChargeback',
+    {
+      op: 'fiat_chargeback',
+      rail: 'stripe',
+      who: ctx.user.publicKey,
+      au: '2500000',
+      ext_ref_hash: 'b'.repeat(64),
+      dispute_ref_hash: 'c'.repeat(64),
+      fiat_currency: 'eur',
+      fiat_amount_minor: 250,
+      epoch: 2,
+      at: 3_700,
+    },
+    ctx.admin.publicKey,
+    6
+  );
+  assert.equal(chargebackReplay.ok, true, chargebackReplay.message);
+  assert.equal(chargebackReplay.duplicate, true);
+  assert.equal(chargebackReplay.au, '0');
+  assert.equal(chargebackReplay.credited_clawback_au, '2500000');
+  assert.deepEqual((await ctx.storage.get('ev/dep/2')).value, reversalRoot);
 
   const frozenDeposit = await depositIntent(ctx, 'memo-frozen', 5);
   assert.match(frozenDeposit.message, /frozen/i);

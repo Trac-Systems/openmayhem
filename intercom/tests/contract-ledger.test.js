@@ -21,8 +21,11 @@ import {
 
 const rulesHash = '7'.repeat(64);
 const TEXT_LOCKED_RATE_MAP = Object.freeze([
-  { unit: 'input_token', per_unit_mu: 20, granularity: 1_000 },
-  { unit: 'output_token', per_unit_mu: 60, granularity: 1_000 },
+  { unit: 'input_token', per_unit_au: '20', granularity: 1_000 },
+  { unit: 'output_token', per_unit_au: '60', granularity: 1_000 },
+]);
+const EMBEDDING_LOCKED_RATE_MAP = Object.freeze([
+  { unit: 'input_token', per_unit_au: '2', granularity: 1_000 },
 ]);
 const CTX_BRACKET_TABLE_VERSION = 1;
 const ctxBracketForTokens = (tokens) => {
@@ -37,11 +40,13 @@ const providerRegistration = {
   op: 'register_provider',
 };
 
-const seededBalance = (user, mu, rail = 'fiat') => ({
+const auString = (value) => String(value);
+
+const seededBalance = (user, au, rail = 'fiat') => ({
   user,
   rail,
-  denom: 'mu_usd',
-  mu,
+  denom: 'au_usd',
+  au: auString(au),
   updated_epoch: 0,
   updated_at: null,
 });
@@ -51,13 +56,16 @@ const paymentKeys = (storage) =>
     .filter((key) => key.startsWith('bal/') || key.startsWith('earn/') || key.startsWith('fee/'))
     .sort();
 
-const makeEpochApply = (epoch, user, provider, grossMu) => ({
-  op: 'epoch_apply',
-  epoch,
-  at: epoch * 3600,
-  debits: [{ rail: 'fiat', user, mu: grossMu }],
-  earnings: [{ rail: 'fiat', provider, gross_mu: grossMu }],
-});
+const makeEpochApply = (epoch, user, provider, grossAu) => {
+  const au = auString(grossAu);
+  return {
+    op: 'epoch_apply',
+    epoch,
+    at: epoch * 3600,
+    debits: [{ rail: 'fiat', user, au }],
+    earnings: [{ rail: 'fiat', provider, gross_au: au }],
+  };
+};
 
 const mapPaidOps = (commands) => {
   const protocol = new MayhemProtocol({}, {});
@@ -162,10 +170,54 @@ async function seedReservationServing(ctx, provider = ctx.provider) {
     admin: ctx.admin.publicKey,
     txNo: 12,
     ver: 1,
-    inPer1kMu: 20,
-    outPer1kMu: 60,
-    minSessionMu: 100,
+    inPer1kAu: 20,
+    outPer1kAu: 60,
+    minSessionAu: 100,
     effectiveAt: 0,
+  });
+  return { enclaveId, modelId };
+}
+
+async function seedNonTextReservationServing(ctx, provider = ctx.provider) {
+  const enclaveId = 'e2'.repeat(32);
+  const modelId = 'test/embedding@q8';
+  await ctx.storage.put(`enclave/${enclaveId}`, {
+    enclave_id: enclaveId,
+    model_id: modelId,
+    model_class: 'embedding',
+    backend: 'llama.cpp',
+    artifact_root: 'a2'.repeat(32),
+    artifact_root_kind: 'blake3_merkle_v1',
+    artifact_source: 'huggingface://trac-network/test/embedding.gguf',
+    manifest_hash: 'b2'.repeat(32),
+    binary_hash: 'c2'.repeat(32),
+    att_tier: 1,
+    caps: { embedding: true, ctx: 512, ctx_max: 512 },
+    status: 'active',
+    created_by: ctx.admin.publicKey,
+    created_by_role: 'admin',
+    created_at: makeTxKey(20),
+    updated_at: makeTxKey(20),
+  });
+  await ctx.storage.put(`serve/${provider.publicKey}/${enclaveId}`, {
+    provider: provider.publicKey,
+    enclave_id: enclaveId,
+    model_id: modelId,
+    status: 'active',
+    joined_at: makeTxKey(21),
+    updated_at: makeTxKey(21),
+    via: 'feature',
+  });
+  await seedCurrentAdminPrice(ctx.storage, {
+    enclaveId,
+    modelId,
+    admin: ctx.admin.publicKey,
+    txNo: 22,
+    ver: 1,
+    rateMap: EMBEDDING_LOCKED_RATE_MAP,
+    minSessionAu: 10,
+    effectiveAt: 0,
+    ctxBracket: null,
   });
   return { enclaveId, modelId };
 }
@@ -176,30 +228,33 @@ function signedSpendReservation(
     provider = ctx.provider,
     enclaveId,
     sessionId,
-    maxSpendMu,
+    maxSpendAu,
     epoch = 1,
     priceVer = 1,
     lockedRateMap = TEXT_LOCKED_RATE_MAP,
-    lockedPerReqMu = 0,
-    lockedMinSessionMu = 100,
+    lockedPerReqAu = 0,
+    lockedMinSessionAu = 100,
     servedCtx = 8192,
     ctxBracket = ctxBracketForTokens(servedCtx),
     ctxBracketTableVer = CTX_BRACKET_TABLE_VERSION,
     at = epoch * 3_600,
   } = {}
 ) {
+  const maxSpendAuString = auString(maxSpendAu);
+  const lockedPerReqAuString = auString(lockedPerReqAu);
+  const lockedMinSessionAuString = auString(lockedMinSessionAu);
   const voucherBody = {
     session_id: sessionId,
     rail: 'fiat',
     enclave_id: enclaveId,
     price_ver: priceVer,
     locked_rate_map: lockedRateMap,
-    locked_per_req_mu: lockedPerReqMu,
-    locked_min_session_mu: lockedMinSessionMu,
+    locked_per_req_au: lockedPerReqAuString,
+    locked_min_session_au: lockedMinSessionAuString,
     served_ctx: servedCtx,
     ctx_bracket: ctxBracket,
     ctx_bracket_table_ver: ctxBracketTableVer,
-    max_spend_mu: maxSpendMu,
+    max_spend_au: maxSpendAuString,
     checkpoint_every: { tokens: 8192, ms: 30_000 },
   };
   const unsigned = {
@@ -217,7 +272,7 @@ function signedSpendReservation(
     served_ctx: servedCtx,
     ctx_bracket: ctxBracket,
     ctx_bracket_table_ver: ctxBracketTableVer,
-    max_spend_mu: maxSpendMu,
+    max_spend_au: maxSpendAuString,
     voucher: {
       ...voucherBody,
       user_sig: signSpendVoucher(ctx.user.wallet, voucherBody),
@@ -272,7 +327,7 @@ test('MayhemProtocol keeps deposit evidence off the paid tx route', () => {
       op: 'fiat_deposit',
       rail: 'stripe',
       who: 'user-a',
-      mu: 1_000_000,
+      au: '1000000',
       ext_ref_hash: 'c'.repeat(64),
       fiat_currency: 'usd',
       fiat_amount_minor: 100,
@@ -302,7 +357,7 @@ test('MayhemProtocol keeps spend reservations off the paid tx route', () => {
       enclave_id: 'd'.repeat(64),
       price_ver: 1,
       rules_ver: 1,
-      max_spend_mu: 1000,
+      max_spend_au: '1000',
       voucher: {},
       provider_sig: 'e'.repeat(128),
     },
@@ -321,7 +376,7 @@ test('MayhemProtocol keeps payout claims off the paid tx route', () => {
       op: 'payout_confirm',
       epoch: 1,
       who: 'provider-a',
-      mu: 100,
+      au: '100',
       tnk_e18: '1000000000000000000',
       msb_tx_hash: 'a'.repeat(64),
       at: 3_600,
@@ -335,21 +390,21 @@ test('MayhemProtocol keeps payout claims off the paid tx route', () => {
       treasury_from: 'testtrac1treasury',
       operator_to: 'testtrac1operator',
       epoch_apply_hash: 'a'.repeat(64),
-      rate_tnk_usd_e6: 50_000,
+      rate_tnk_usd_au: '50000000000000000',
       rate_source: 'gate-spot',
       rate_ts: 3_600,
       msb_tx_hash: 'b'.repeat(64),
       transfer_root: 'c'.repeat(64),
       provider_count: 0,
-      provider_mu: 0,
-      operator_fee_mu: 1,
-      gross_mu: 1,
+      provider_au: '0',
+      operator_fee_au: '1',
+      gross_au: '1',
       tnk_e18: '20000000000000',
       outputs: [
         {
           role: 'operator_fee',
           to: 'testtrac1operator',
-          mu: 1,
+          au: '1',
           tnk_e18: '20000000000000',
         },
       ],
@@ -358,7 +413,7 @@ test('MayhemProtocol keeps payout claims off the paid tx route', () => {
       op: 'payout_confirm',
       epoch: 1,
       who: 'provider-b',
-      mu: 200,
+      au: '200',
       rail: 'stripe',
       external_ref: 'tr_provider_b',
       fiat_currency: 'usd',
@@ -375,10 +430,10 @@ test('MayhemProtocol keeps payout claims off the paid tx route', () => {
 test('MayhemProtocol keeps rate oracle updates off the paid tx route', () => {
   const commands = [
     { op: 'epoch_commit', epoch: 1, at: 3_600, roots: {}, totals: {} },
-    { op: 'rate_oracle', tnk_usd_e6: 50_000, source: 'gate-spot', ts: 3_600 },
-    { op: 'rate_oracle', tnk_usd_e6: 51_000, source: 'mexc-spot', ts: 5_400 },
-    { op: 'tap_rate_oracle', tap_usd_e6: 50_000, source: 'uniswap-v2', ts: 3_600 },
-    { op: 'tap_rate_oracle', tap_usd_e6: 52_000, source: 'config', ts: 5_400 },
+    { op: 'rate_oracle', tnk_usd_au: '50000000000000000', source: 'gate-spot', ts: 3_600 },
+    { op: 'rate_oracle', tnk_usd_au: '51000000000000000', source: 'mexc-spot', ts: 5_400 },
+    { op: 'tap_rate_oracle', tap_usd_au: '50000000000000000', source: 'uniswap-v2', ts: 3_600 },
+    { op: 'tap_rate_oracle', tap_usd_au: '52000000000000000', source: 'config', ts: 5_400 },
   ];
 
   assert.deepEqual(mapPaidOps(commands).map((op) => op.type), ['epochCommit']);
@@ -391,8 +446,8 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
   for (let epoch = 1; epoch <= activeEpochs; epoch += 1) {
     commands.push({ op: 'epoch_commit', epoch, at: epoch * 3_600, roots: {}, totals: {} });
     commands.push(makeEpochApply(epoch, `user-${epoch}`, `provider-${epoch}`, 1_000 + epoch));
-    commands.push({ op: 'rate_oracle', tnk_usd_e6: 50_000 + epoch, source: 'gate-spot', ts: epoch * 3_600 });
-    commands.push({ op: 'tap_rate_oracle', tap_usd_e6: 50_000 + epoch, source: 'uniswap-v2', ts: epoch * 3_600 });
+    commands.push({ op: 'rate_oracle', tnk_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'gate-spot', ts: epoch * 3_600 });
+    commands.push({ op: 'tap_rate_oracle', tap_usd_au: `${50_000n + BigInt(epoch)}000000000000`, source: 'uniswap-v2', ts: epoch * 3_600 });
 
     for (let i = 0; i < 4; i += 1) {
       commands.push({
@@ -425,7 +480,7 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
         op: 'fiat_deposit',
         rail: 'stripe',
         who: `user-${epoch}-${i}`,
-        mu: 1_000_000,
+        au: '1000000',
         ext_ref_hash: `${epoch}${i}`.padEnd(64, 'c'),
         fiat_currency: 'usd',
         fiat_amount_minor: 100,
@@ -436,7 +491,7 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
         op: 'payout_confirm',
         epoch,
         who: `provider-${epoch}-${i}`,
-        mu: 100 + i,
+        au: '100' + i,
         tnk_e18: '1000000000000000000',
         msb_tx_hash: `${epoch}${i}`.padEnd(64, 'd'),
         at: epoch * 3_600 + i,
@@ -466,7 +521,7 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
     provider: ctx.provider,
     enclaveId,
     sessionId: 'a1'.repeat(32),
-    maxSpendMu: 700_000,
+    maxSpendAu: 700_000,
   });
   const firstKey = await spendReservationFeatureKey(ctx.contract, first, ctx.storage);
   const firstResult = await executeSpendReservationFeature(
@@ -477,14 +532,14 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
   );
   assert.equal(firstResult.ok, true, firstResult.message);
   assert.equal(firstResult.idempotent, false);
-  assert.equal(firstResult.available_mu, 300_000);
+  assert.equal(firstResult.available_au, '300000');
 
   const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
   assert.equal(hold.user, ctx.user.publicKey);
   assert.equal(hold.rail, 'fiat');
   assert.equal(hold.epoch, 1);
-  assert.equal(hold.reserved_mu, 700_000);
-  assert.equal(hold.balance_mu_at_last_reserve, 1_000_000);
+  assert.equal(hold.reserved_au, '700000');
+  assert.equal(hold.balance_au_at_last_reserve, '1000000');
   assert.equal(hold.sessions.length, 1);
   assert.equal(hold.sessions[0].session_id, 'a1'.repeat(32));
   assert.equal(hold.sessions[0].provider, ctx.provider.publicKey);
@@ -502,13 +557,13 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
   );
   assert.equal(replay.ok, true, replay.message);
   assert.equal(replay.idempotent, true);
-  assert.equal(replay.reserved_mu, 700_000);
+  assert.equal(replay.reserved_au, '700000');
 
   const second = signedSpendReservation(ctx, {
     provider: ctx.provider2,
     enclaveId,
     sessionId: 'a2'.repeat(32),
-    maxSpendMu: 400_000,
+    maxSpendAu: 400_000,
   });
   const secondResult = await executeSpendReservationFeature(
     ctx.contract,
@@ -517,7 +572,51 @@ test('MayhemContract spend reservation enforces active-epoch unreserved user bal
     ctx.provider2.publicKey
   );
   assert.match(secondResult.message, /Insufficient unreserved credit balance/);
-  assert.equal((await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value.reserved_mu, 700_000);
+  assert.equal((await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value.reserved_au, '700000');
+});
+
+test('MayhemContract spend reservation accepts unbracketed non-text markets only', async () => {
+  const ctx = await setupLedgerContract();
+  const { enclaveId } = await seedNonTextReservationServing(ctx, ctx.provider);
+
+  const accepted = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'e3'.repeat(32),
+    maxSpendAu: 100_000,
+    lockedRateMap: EMBEDDING_LOCKED_RATE_MAP,
+    lockedMinSessionAu: 10,
+    servedCtx: 512,
+    ctxBracket: null,
+    ctxBracketTableVer: null,
+  });
+  const result = await executeSpendReservationFeature(
+    ctx.contract,
+    ctx.storage,
+    accepted,
+    ctx.provider.publicKey
+  );
+  assert.equal(result.ok, true, result.message);
+
+  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
+  assert.equal(hold.sessions[0].ctx_bracket, null);
+  assert.equal(hold.sessions[0].ctx_bracket_table_ver, null);
+
+  const rejected = signedSpendReservation(ctx, {
+    provider: ctx.provider,
+    enclaveId,
+    sessionId: 'e4'.repeat(32),
+    maxSpendAu: 100_000,
+    lockedRateMap: EMBEDDING_LOCKED_RATE_MAP,
+    lockedMinSessionAu: 10,
+    servedCtx: 512,
+    ctxBracket: 'le8k',
+    ctxBracketTableVer: CTX_BRACKET_TABLE_VERSION,
+  });
+  await assert.rejects(
+    () => spendReservationFeatureKey(ctx.contract, rejected, ctx.storage),
+    /only valid for text-generation enclaves/
+  );
 });
 
 test('MayhemContract spend reservation keeps the locked quote after market price advances', async () => {
@@ -528,14 +627,14 @@ test('MayhemContract spend reservation keeps the locked quote after market price
     provider: ctx.provider,
     enclaveId,
     sessionId: 'f3'.repeat(32),
-    maxSpendMu: 100_000,
+    maxSpendAu: 100_000,
     priceVer: 1,
     lockedRateMap: TEXT_LOCKED_RATE_MAP,
   });
 
   const v2RateMap = [
-    { unit: 'input_token', per_unit_mu: 40, granularity: 1_000 },
-    { unit: 'output_token', per_unit_mu: 120, granularity: 1_000 },
+    { unit: 'input_token', per_unit_au: '40', granularity: 1_000 },
+    { unit: 'output_token', per_unit_au: '120', granularity: 1_000 },
   ];
   await seedCurrentAdminPrice(ctx.storage, {
     enclaveId,
@@ -543,9 +642,9 @@ test('MayhemContract spend reservation keeps the locked quote after market price
     admin: ctx.admin.publicKey,
     txNo: 20,
     ver: 2,
-    inPer1kMu: 40,
-    outPer1kMu: 120,
-    minSessionMu: 100,
+    inPer1kAu: 40,
+    outPer1kAu: 120,
+    minSessionAu: 100,
     effectiveAt: 3_600,
   });
   assert.equal((await ctx.storage.get(`price/${enclaveId}/le8k`)).value.current.ver, 2);
@@ -562,8 +661,8 @@ test('MayhemContract spend reservation keeps the locked quote after market price
   assert.equal(hold.sessions.length, 1);
   assert.equal(hold.sessions[0].price_ver, 1);
   assert.deepEqual(hold.sessions[0].locked_rate_map, TEXT_LOCKED_RATE_MAP);
-  assert.equal(hold.sessions[0].locked_per_req_mu, 0);
-  assert.equal(hold.sessions[0].locked_min_session_mu, 100);
+  assert.equal(hold.sessions[0].locked_per_req_au, '0');
+  assert.equal(hold.sessions[0].locked_min_session_au, '100');
   assert.equal(hold.sessions[0].served_ctx, 8192);
   assert.equal(hold.sessions[0].ctx_bracket, 'le8k');
   assert.equal(hold.sessions[0].ctx_bracket_table_ver, CTX_BRACKET_TABLE_VERSION);
@@ -572,7 +671,7 @@ test('MayhemContract spend reservation keeps the locked quote after market price
     provider: ctx.provider,
     enclaveId,
     sessionId: 'f4'.repeat(32),
-    maxSpendMu: 100_000,
+    maxSpendAu: 100_000,
     priceVer: 1,
     lockedRateMap: v2RateMap,
   });
@@ -593,7 +692,7 @@ test('MayhemContract spend reservation moves to next epoch after epochApply', as
     provider: ctx.provider,
     enclaveId,
     sessionId: 'b1'.repeat(32),
-    maxSpendMu: 900_000,
+    maxSpendAu: 900_000,
   });
   const firstResult = await executeSpendReservationFeature(
     ctx.contract,
@@ -606,13 +705,13 @@ test('MayhemContract spend reservation moves to next epoch after epochApply', as
   const applyValue = makeEpochApply(1, ctx.user.publicKey, ctx.provider.publicKey, 100_000);
   const applied = await executeEpochApplyFeature(ctx.contract, ctx.storage, applyValue, ctx.admin.publicKey);
   assert.equal(applied.ok, true, applied.message);
-  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.mu, 900_000);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.au, '900000');
 
   const nextEpoch = signedSpendReservation(ctx, {
     provider: ctx.provider,
     enclaveId,
     sessionId: 'b2'.repeat(32),
-    maxSpendMu: 900_000,
+    maxSpendAu: 900_000,
     epoch: 2,
   });
   const nextResult = await executeSpendReservationFeature(
@@ -622,7 +721,7 @@ test('MayhemContract spend reservation moves to next epoch after epochApply', as
     ctx.provider.publicKey
   );
   assert.equal(nextResult.ok, true, nextResult.message);
-  assert.equal(nextResult.available_mu, 0);
+  assert.equal(nextResult.available_au, '0');
 });
 
 test('MayhemContract context bracket tables are admin scheduled and pinned by version', async () => {
@@ -675,7 +774,7 @@ test('MayhemContract context bracket tables are admin scheduled and pinned by ve
     servedCtx: 12_000,
     ctxBracket: 'le32k',
     ctxBracketTableVer: 1,
-    maxSpendMu: 100_000,
+    maxSpendAu: 100_000,
     at: 86_400,
   });
   await assert.rejects(
@@ -690,7 +789,7 @@ test('MayhemContract context bracket tables are admin scheduled and pinned by ve
     servedCtx: 12_000,
     ctxBracket: 'le16k',
     ctxBracketTableVer: 2,
-    maxSpendMu: 100_000,
+    maxSpendAu: 100_000,
     at: 86_400,
   });
   const key = await spendReservationFeatureKey(ctx.contract, currentTableAfterActivation, ctx.storage);
@@ -725,8 +824,8 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
       op: 'epoch_apply',
       epoch: 1,
       at: 3600,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 1_500 }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 1_400 }],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '1500' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1400' }],
     },
     admin.publicKey
   );
@@ -737,12 +836,12 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     epoch: 1,
     at: 3600,
     debits: [
-      { rail: 'fiat', user: user.publicKey, mu: 1_000 },
-      { rail: 'fiat', user: user.publicKey, mu: 500 },
+      { rail: 'fiat', user: user.publicKey, au: '1000' },
+      { rail: 'fiat', user: user.publicKey, au: '500' },
     ],
     earnings: [
-      { rail: 'fiat', provider: provider.publicKey, gross_mu: 1_250 },
-      { rail: 'fiat', provider: provider.publicKey, gross_mu: 250 },
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '1250' },
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '250' },
     ],
   };
   const firstApplyKey = await epochApplyFeatureKey(contract, firstApply);
@@ -769,36 +868,36 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     op: 'epochApply',
     epoch: 1,
     idempotent: false,
-    debited_mu: 1_500,
-    earned_mu: 1_275,
-    fee_mu: 225,
+    debited_au: '1500',
+    earned_au: '1275',
+    fee_au: '225',
     rails: ['fiat'],
   });
 
   assert.deepEqual((await storage.get(`bal/${user.publicKey}/fiat`)).value, {
     user: user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 998_500,
+    denom: 'au_usd',
+    au: '998500',
     updated_epoch: 1,
     updated_at: firstApplyKey,
   });
   assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 1_275,
-    held_mu: 1_275,
-    paid_cum_mu: 0,
-    holdbacks: [{ epoch: 1, mu: 1_275 }],
+    denom: 'au_usd',
+    total_au: '1275',
+    held_au: '1275',
+    paid_cum_au: '0',
+    holdbacks: [{ epoch: 1, au: '1275', locked_epochs: 168 }],
     updated_epoch: 1,
     updated_at: firstApplyKey,
     last_holdback_release_epoch: 1,
   });
   const feeAfterFirst = (await storage.get('fee/fiat/cum')).value;
-  assert.equal(feeAfterFirst.denom, 'mu_usd');
-  assert.equal(feeAfterFirst.cum_mu, 225);
-  assert.equal(feeAfterFirst.swept_cum_mu, 0);
+  assert.equal(feeAfterFirst.denom, 'au_usd');
+  assert.equal(feeAfterFirst.cum_au, '225');
+  assert.equal(feeAfterFirst.swept_cum_au, '0');
   assert.equal(feeAfterFirst.updated_epoch, 1);
   assert.equal(feeAfterFirst.updated_at, firstApplyKey);
   assert.equal(feeAfterFirst.last_fee_bps, 1_500);
@@ -816,9 +915,9 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
     op: 'epochApply',
     epoch: 1,
     idempotent: true,
-    debited_mu: 0,
-    earned_mu: 0,
-    fee_mu: 0,
+    debited_au: '0',
+    earned_au: '0',
+    fee_au: '0',
   });
   assert.equal(storage.snapshotBytes(), snapshotBeforeReplay);
 
@@ -849,6 +948,50 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   assert.equal(storage.snapshotBytes(), insufficientSnapshot);
 });
 
+test('MayhemContract graduated holdback steps down without shortening older buckets', async () => {
+  const contract = new MayhemContract({}, {});
+  const params = {
+    holdback_epochs: 24,
+    challenge_epochs: 6,
+    new_provider_holdback_epochs: 168,
+    probation_successful_sessions: 50,
+  };
+
+  assert.equal(
+    contract.providerLockedEarningEpochs({ probation: { successful_sessions: 0 } }, params),
+    168
+  );
+  assert.equal(
+    contract.providerLockedEarningEpochs({ probation: { successful_sessions: 49 } }, params),
+    168
+  );
+  assert.equal(
+    contract.providerLockedEarningEpochs({ probation: { successful_sessions: 50 } }, params),
+    24
+  );
+
+  const refreshed = contract.refreshEarningHoldback(
+    {
+      provider: 'provider-a',
+      rail: 'fiat',
+      denom: 'au_usd',
+      total_au: '1700',
+      held_au: '1700',
+      paid_cum_au: '0',
+      updated_epoch: 2,
+      holdbacks: [
+        { epoch: 1, au: '850', locked_epochs: 168 },
+        { epoch: 2, au: '850', locked_epochs: 24 },
+      ],
+    },
+    26,
+    24
+  );
+  assert.equal(refreshed.held_au, '850');
+  assert.deepEqual(refreshed.holdbacks, [{ epoch: 1, au: '850', locked_epochs: 168 }]);
+  assert.equal(refreshed.last_holdback_release_epoch, 26);
+});
+
 test('MayhemContract epochApply is deterministic and payment key growth stays flat over 100 epochs', async () => {
   const identities = {
     admin: await makeIdentity(),
@@ -859,23 +1002,23 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   };
   const left = await setupLedgerContract(identities);
   const right = await setupLedgerContract(identities);
-  let expectedDebited = 0;
-  let expectedFee = 0;
+  let expectedDebited = 0n;
+  let expectedFee = 0n;
   const netEarningsByEpoch = [];
 
   let totalKeysAfterFirst = null;
   let paymentKeysAfterFirst = null;
   for (let epoch = 1; epoch <= 100; epoch++) {
-    const grossMu = 1_000 + (epoch % 7);
-    const feeMu = Math.floor((grossMu * 1_500) / 10_000);
-    expectedDebited += grossMu;
-    expectedFee += feeMu;
-    netEarningsByEpoch.push(grossMu - feeMu);
+    const grossAu = 1_000 + (epoch % 7);
+    const feeAu = (BigInt(grossAu) * 1_500n) / 10_000n;
+    expectedDebited += BigInt(grossAu);
+    expectedFee += feeAu;
+    netEarningsByEpoch.push(BigInt(grossAu) - feeAu);
     for (const ctx of [left, right]) {
       const result = await executeEpochApplyFeature(
         ctx.contract,
         ctx.storage,
-        makeEpochApply(epoch, identities.user.publicKey, identities.provider.publicKey, grossMu),
+        makeEpochApply(epoch, identities.user.publicKey, identities.provider.publicKey, grossAu),
         identities.admin.publicKey
       );
       assert.equal(result.ok, true, result.message);
@@ -900,12 +1043,12 @@ test('MayhemContract epochApply is deterministic and payment key growth stays fl
   const balance = (await left.storage.get(`bal/${identities.user.publicKey}/fiat`)).value;
   const earning = (await left.storage.get(`earn/fiat/${identities.provider.publicKey}`)).value;
   const fee = (await left.storage.get('fee/fiat/cum')).value;
-  const expectedHeld = netEarningsByEpoch.slice(-24).reduce((sum, mu) => sum + mu, 0);
-  assert.equal(balance.mu, 1_000_000 - expectedDebited);
-  assert.equal(earning.total_mu, expectedDebited - expectedFee);
-  assert.equal(earning.held_mu, expectedHeld);
-  assert.equal(earning.paid_cum_mu, 0);
-  assert.equal(fee.cum_mu, expectedFee);
+  const expectedHeld = netEarningsByEpoch.slice(-168).reduce((sum, au) => sum + au, 0n);
+  assert.equal(balance.au, (1_000_000n - expectedDebited).toString());
+  assert.equal(earning.total_au, (expectedDebited - expectedFee).toString());
+  assert.equal(earning.held_au, expectedHeld.toString());
+  assert.equal(earning.paid_cum_au, '0');
+  assert.equal(fee.cum_au, expectedFee.toString());
   assert.equal(fee.updated_epoch, 100);
 });
 
@@ -939,12 +1082,12 @@ test('MayhemContract epochApply replays codepoint-sorted varied keys determinist
     epoch: 1,
     at: 3600,
     debits: [
-      { rail: 'fiat', user: users[1], mu: 700 },
-      { rail: 'fiat', user: users[0], mu: 500 },
+      { rail: 'fiat', user: users[1], au: '700' },
+      { rail: 'fiat', user: users[0], au: '500' },
     ],
     earnings: [
-      { rail: 'fiat', provider: providers[1], gross_mu: 700 },
-      { rail: 'fiat', provider: providers[0], gross_mu: 500 },
+      { rail: 'fiat', provider: providers[1], gross_au: '700' },
+      { rail: 'fiat', provider: providers[0], gross_au: '500' },
     ],
   };
   const rightApply = {
@@ -956,8 +1099,8 @@ test('MayhemContract epochApply replays codepoint-sorted varied keys determinist
   for (const [ctx, value] of [[left, leftApply], [right, rightApply]]) {
     const result = await executeEpochApplyFeature(ctx.contract, ctx.storage, value, identities.admin.publicKey);
     assert.equal(result.ok, true, result.message);
-    assert.equal(result.fee_mu, 180);
-    assert.equal(result.earned_mu, 1020);
+    assert.equal(result.fee_au, '180');
+    assert.equal(result.earned_au, '1020');
   }
 
   const stripTxStamps = (record) => {
@@ -982,30 +1125,31 @@ test('MayhemContract epochApply replays codepoint-sorted varied keys determinist
 
 test('MayhemContract epochApply computes large fee bps with exact BigInt math', async () => {
   const { admin, provider, user, storage, contract } = await setupLedgerContract();
-  const grossMu = 2_000_000_000_001;
-  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, grossMu));
+  const grossAu = '2000000000001';
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, grossAu));
 
   const result = await executeEpochApplyFeature(
     contract,
     storage,
-    makeEpochApply(1, user.publicKey, provider.publicKey, grossMu),
+    makeEpochApply(1, user.publicKey, provider.publicKey, grossAu),
     admin.publicKey
   );
   assert.equal(result.ok, true, result.message);
 
-  const expectedFee = Number((BigInt(grossMu) * 1_500n) / 10_000n);
-  const expectedProvider = grossMu - expectedFee;
-  assert.equal(result.fee_mu, expectedFee);
-  assert.equal(result.earned_mu, expectedProvider);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 0);
-  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_mu, expectedProvider);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, expectedFee);
+  const expectedFee = (BigInt(grossAu) * 1_500n) / 10_000n;
+  const expectedProvider = BigInt(grossAu) - expectedFee;
+  assert.equal(result.fee_au, expectedFee.toString());
+  assert.equal(result.earned_au, expectedProvider.toString());
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '0');
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_au, expectedProvider.toString());
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, expectedFee.toString());
 });
 
-test('MayhemContract guarded mu helpers reject over-safe-integer results', async () => {
+test('MayhemContract au helpers reject numeric money inputs', async () => {
   const { contract } = await setupLedgerContract();
-  assert.match(contract.safeAddMu(Number.MAX_SAFE_INTEGER, 1).message, /overflow/i);
-  assert.match(contract.safeMulDivMu(Number.MAX_SAFE_INTEGER, 10_000, 1).message, /overflow/i);
+  assert.match(contract.safeAddAu(Number.MAX_SAFE_INTEGER, '1').message, /canonical decimal string/i);
+  assert.match(contract.safeMulDivAu(Number.MAX_SAFE_INTEGER, 10_000, 1).message, /canonical decimal string/i);
+  assert.equal(contract.safeAddAu('9007199254740993', '1'), '9007199254740994');
 });
 
 test('MayhemContract epochApply enforces max_apply_batch before writing', async () => {
@@ -1014,7 +1158,7 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
   const tooManyDebits = Array.from({ length: 2_001 }, (_, i) => ({
     rail: 'fiat',
     user: `user-${i}`,
-    mu: 1,
+    au: '1',
   }));
   const tooLarge = await executeEpochApplyFeature(
     contract,
@@ -1024,7 +1168,7 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
       epoch: 1,
       at: 3600,
       debits: tooManyDebits,
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_001 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2001' }],
     },
     admin.publicKey
   );
@@ -1058,11 +1202,11 @@ test('MayhemContract epochApply uses the active admin max_apply_batch param', as
       epoch: 1,
       at: 86_400,
       debits: [
-        { rail: 'fiat', user: 'user-a', mu: 1 },
-        { rail: 'fiat', user: 'user-b', mu: 1 },
-        { rail: 'fiat', user: 'user-c', mu: 1 },
+        { rail: 'fiat', user: 'user-a', au: '1' },
+        { rail: 'fiat', user: 'user-b', au: '1' },
+        { rail: 'fiat', user: 'user-c', au: '1' },
       ],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 3 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '3' }],
     },
     admin.publicKey
   );
@@ -1091,7 +1235,7 @@ test('MayhemContract epochApply accepts admin-raised max_apply_batch above defau
   const manyDebits = Array.from({ length: 5_500 }, () => ({
     rail: 'fiat',
     user: user.publicKey,
-    mu: 1,
+    au: '1',
   }));
   const applied = await executeEpochApplyFeature(
     contract,
@@ -1101,14 +1245,14 @@ test('MayhemContract epochApply accepts admin-raised max_apply_batch above defau
       epoch: 1,
       at: 86_400,
       debits: manyDebits,
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 5_500 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '5500' }],
     },
     admin.publicKey
   );
   assert.equal(applied.ok, true, applied.message);
-  assert.equal(applied.debited_mu, 5_500);
-  assert.equal(applied.earned_mu, 4_675);
-  assert.equal(applied.fee_mu, 825);
+  assert.equal(applied.debited_au, '5500');
+  assert.equal(applied.earned_au, '4675');
+  assert.equal(applied.fee_au, '825');
 });
 
 test('MayhemContract epochApply uses the active admin max_market_usage_entries param', async () => {
@@ -1136,8 +1280,8 @@ test('MayhemContract epochApply uses the active admin max_market_usage_entries p
       op: 'epoch_apply',
       epoch: 1,
       at: 86_400,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2 }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2 }],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '2' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2' }],
       market_usage: [{}, {}],
     },
     admin.publicKey
@@ -1152,12 +1296,12 @@ test('MayhemContract epochApply paginates settlement entries across free pages',
   const firstDebits = Array.from({ length: 1_999 }, () => ({
     rail: 'fiat',
     user: user.publicKey,
-    mu: 1,
+    au: '1',
   }));
   const secondDebits = Array.from({ length: 501 }, () => ({
     rail: 'fiat',
     user: user.publicKey,
-    mu: 1,
+    au: '1',
   }));
 
   const firstPage = await executeEpochApplyFeature(
@@ -1170,14 +1314,14 @@ test('MayhemContract epochApply paginates settlement entries across free pages',
       last_page: false,
       at: 3600,
       debits: firstDebits,
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 1_999 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1999' }],
     },
     admin.publicKey
   );
   assert.equal(firstPage.ok, true, firstPage.message);
   assert.equal(firstPage.page, 0);
   assert.equal(firstPage.last_page, false);
-  assert.equal(firstPage.debited_mu, 1_999);
+  assert.equal(firstPage.debited_au, '1999');
   let applyState = (await storage.get('epoch/apply/state')).value;
   assert.equal(applyState.updated_epoch, 0);
   assert.equal(applyState.pending_epoch, 1);
@@ -1193,20 +1337,20 @@ test('MayhemContract epochApply paginates settlement entries across free pages',
       last_page: true,
       at: 3600,
       debits: secondDebits,
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 501 }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '501' }],
     },
     admin.publicKey
   );
   assert.equal(secondPage.ok, true, secondPage.message);
   assert.equal(secondPage.page, 1);
   assert.equal(secondPage.last_page, true);
-  assert.equal(secondPage.debited_mu, 501);
+  assert.equal(secondPage.debited_au, '501');
   applyState = (await storage.get('epoch/apply/state')).value;
   assert.equal(applyState.updated_epoch, 1);
   assert.equal(applyState.pending_epoch, null);
   assert.equal(applyState.pending_next_page, 0);
 
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 7_500);
-  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_mu, 2_126);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 374);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '7500');
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_au, '2126');
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '374');
 });

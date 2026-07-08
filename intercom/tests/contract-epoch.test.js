@@ -24,22 +24,46 @@ const enclaveId = 'e'.repeat(64);
 const modelId = 'meta/llama-3.1-8b-instruct@4bit';
 const DAY_SECONDS = 24 * 60 * 60;
 
-const textLockedRateMapFor = (mu) => [
-  { unit: 'input_token', per_unit_mu: mu, granularity: 350 },
-  { unit: 'output_token', per_unit_mu: mu, granularity: 350 },
+const textLockedRateMapFor = (au) => [
+  { unit: 'input_token', per_unit_au: String(au), granularity: 350 },
+  { unit: 'output_token', per_unit_au: String(au), granularity: 350 },
 ];
 
 const imageLockedRateMap = [
-  { unit: 'image', per_unit_mu: 500, granularity: 1 },
-  { unit: 'step', per_unit_mu: 2, granularity: 1 },
+  { unit: 'image', per_unit_au: '500', granularity: 1 },
+  { unit: 'step', per_unit_au: '2', granularity: 1 },
 ];
 const scriptPath = fileURLToPath(new URL('../scripts/recompute-epoch-roots.mjs', import.meta.url));
+const epochEnclaveRegistration = {
+  op: 'register_enclave',
+  enclave_id: enclaveId,
+  model_id: modelId,
+  backend: 'llama.cpp',
+  artifact_root: '5'.repeat(64),
+  artifact_root_kind: 'blake3_merkle_v1',
+  artifact_source: {
+    kind: 'huggingface',
+    repo: 'mayhem-catalog/epoch-fixture-GGUF',
+    revision: '7'.repeat(40),
+    path: 'epoch-fixture-Q4_K_M.gguf',
+  },
+  manifest_hash: '3'.repeat(64),
+  att_tier: 1,
+  quant: 'INT4',
+  binary_hash: '4'.repeat(64),
+  caps: {
+    chat: true,
+    embeddings: false,
+    tools: false,
+    ctx: 32768,
+  },
+};
 
-const seededBalance = (user, mu, rail = 'fiat') => ({
+const seededBalance = (user, au, rail = 'fiat') => ({
   user,
   rail,
-  denom: 'mu_usd',
-  mu,
+  denom: 'au_usd',
+  au: String(au),
   updated_epoch: 0,
   updated_at: null,
 });
@@ -77,6 +101,12 @@ async function setupEpochContract() {
       sender: provider.publicKey,
       txNo: 3,
     },
+    {
+      type: 'registerEnclave',
+      value: epochEnclaveRegistration,
+      sender: admin.publicKey,
+      txNo: 4,
+    },
   ]) {
     const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
     assert.equal(result.ok, true, result.message);
@@ -107,7 +137,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       locked_rate_map: textLockedRateMapFor(2_000),
       rules_ver: 1,
       usage: { in: 100, out: 250 },
-      mu_owed_cum: 2_000,
+      au_owed_cum: '2000',
       prompt_hash: 'a'.repeat(64),
       ts: 3_600,
       enclave_sig: 'b'.repeat(128),
@@ -142,7 +172,7 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
         model_id: 'admin/image-small@fp16',
         locked_rate_map: imageLockedRateMap,
         usage: { images: 2, steps: 60 },
-        mu_owed_cum: 1_120,
+        au_owed_cum: '1120',
       },
     ],
   });
@@ -154,7 +184,7 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
         model_id: 'admin/image-small@fp16',
         locked_rate_map: imageLockedRateMap,
         usage: { image: 2, step: 60 },
-        mu_owed_cum: 1_120,
+        au_owed_cum: '1120',
       },
     ],
   });
@@ -163,7 +193,7 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
 
   assert.deepEqual(imageAliasRoll.roots, imageCanonicalRoll.roots);
   assert.equal(imageAliasRoll.totals.use_count, 1);
-  assert.equal(imageAliasRoll.totals.use_mu, 1_120);
+  assert.equal(imageAliasRoll.totals.use_au, '1120');
 });
 
 const signedReceipt = (user, provider, enclave, overrides = {}) => {
@@ -181,7 +211,7 @@ const signedReceipt = (user, provider, enclave, overrides = {}) => {
     locked_rate_map: textLockedRateMapFor(1_000),
     rules_ver: 1,
     usage: { in: 100, out: 250 },
-    mu_owed_cum: 1_000,
+    au_owed_cum: '1000',
     prompt_hash: 'a'.repeat(64),
     ts: 3_600,
     ...overrides,
@@ -285,28 +315,28 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     op: 'epochApply',
     epoch: 1,
     idempotent: false,
-    debited_mu: 2_000,
-    earned_mu: 1_700,
-    fee_mu: 300,
+    debited_au: '2000',
+    earned_au: '1700',
+    fee_au: '300',
     rails: ['fiat'],
   });
 
   assert.deepEqual((await storage.get(`bal/${user.publicKey}/fiat`)).value, {
     user: user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 998_000,
+    denom: 'au_usd',
+    au: '998000',
     updated_epoch: 1,
     updated_at: applyKey,
   });
   assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 1_700,
-    held_mu: 1_700,
-    paid_cum_mu: 0,
-    holdbacks: [{ epoch: 1, mu: 1_700 }],
+    denom: 'au_usd',
+    total_au: '1700',
+    held_au: '1700',
+    paid_cum_au: '0',
+    holdbacks: [{ epoch: 1, au: '1700', locked_epochs: 168 }],
     updated_epoch: 1,
     updated_at: applyKey,
     last_holdback_release_epoch: 1,
@@ -317,7 +347,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     epoch_seconds: 3_600,
     merkle_root: roll.roots.dep,
     count: 0,
-    mu_total: 0,
+    au_total: '0',
     ts: 3_600,
     updated_at: applyKey,
   });
@@ -327,7 +357,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     epoch_seconds: 3_600,
     merkle_root: roll.roots.use,
     sessions: 1,
-    mu_total: 2_000,
+    au_total: '2000',
     providers: 1,
     ts: 3_600,
     updated_at: applyKey,
@@ -338,7 +368,7 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     epoch_seconds: 3_600,
     merkle_root: roll.roots.earn,
     provider_count: 1,
-    mu_cum_total: 1_700,
+    au_cum_total: '1700',
     ts: 3_600,
     updated_at: applyKey,
   });
@@ -347,8 +377,8 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
     epoch: 1,
     epoch_seconds: 3_600,
     merkle_root: roll.roots.fee,
-    mu_fee_epoch: 300,
-    mu_fee_cum: 300,
+    au_fee_epoch: '300',
+    au_fee_cum: '300',
     sweep_msb_tx_hash: null,
     ts: 3_600,
     updated_at: applyKey,
@@ -449,12 +479,12 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
   const enclave = await makeIdentity();
   const prover = await makeIdentity();
   const otherSubmitter = await makeIdentity();
-  const receipt = signedReceipt(user, provider, enclave, { mu_owed_cum: 1_000 });
+  const receipt = signedReceipt(user, provider, enclave, { au_owed_cum: '1000' });
   const inflatedReceipt = {
     ...receipt,
     body: {
       ...receipt.body,
-      mu_owed_cum: 2_000,
+      au_owed_cum: '2000',
     },
   };
   const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
@@ -476,7 +506,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
     4
   );
   assert.equal(commit.ok, true, commit.message);
-  assert.equal(inflatedRoll.totals.use_mu, 2_000);
+  assert.equal(inflatedRoll.totals.use_au, '2000');
 
   const proof = await execute(
     contract,
@@ -489,7 +519,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
       at: 7_200,
       reason: 'over_credit',
       receipt,
-      claimed_mu_owed_cum: 2_000,
+      claimed_au_owed_cum: '2000',
     },
     prover.publicKey,
     5
@@ -507,8 +537,8 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
   assert.equal(commitRecord.fraud_proof_hash, proof.proof_hash);
 
   const fraudRecord = (await storage.get(`ev/fraud/1/${proof.proof_hash}`)).value;
-  assert.equal(fraudRecord.actual_mu, 1_000);
-  assert.equal(fraudRecord.claimed_mu, 2_000);
+  assert.equal(fraudRecord.actual_au, '1000');
+  assert.equal(fraudRecord.claimed_au, '2000');
   assert.equal(fraudRecord.voided_commit, commit.commit_hash);
 
   assert.deepEqual((await storage.get(`committer/ban/${submitter.publicKey}`)).value, {
@@ -532,7 +562,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
       at: 7_200,
       reason: 'over_credit',
       receipt,
-      claimed_mu_owed_cum: 2_000,
+      claimed_au_owed_cum: '2000',
     },
     otherSubmitter.publicKey,
     6
@@ -563,7 +593,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
   );
   assert.match(voidApply.message, /commit is void/i);
   assert.equal((await storage.get('ev/use/1')), null);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '1000000');
 
   const emptyEpoch = await recomputeEpoch({
     epoch: 2,
@@ -605,18 +635,59 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
     9
   );
   assert.equal(allowedCommit.ok, true, allowedCommit.message);
+
+  const unbanned = await execute(
+    contract,
+    storage,
+    'unban',
+    {
+      op: 'unban',
+      target_type: 'committer',
+      target: submitter.publicKey,
+      reason_hash: 'a'.repeat(64),
+    },
+    admin.publicKey,
+    10
+  );
+  assert.equal(unbanned.ok, true, unbanned.message);
+  assert.equal((await storage.get(`committer/ban/${submitter.publicKey}`)).value.status, 'unbanned');
+
+  const emptyEpoch3 = await recomputeEpoch({
+    epoch: 3,
+    params: {
+      fee_bps: 1_500,
+    },
+    deposits: [],
+    receipts: [],
+    payouts: [],
+  });
+  const restoredCommit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 3,
+      at: 10_800,
+      roots: emptyEpoch3.roots,
+      totals: emptyEpoch3.totals,
+    },
+    submitter.publicKey,
+    11
+  );
+  assert.equal(restoredCommit.ok, true, restoredCommit.message);
 });
 
 test('MayhemContract fraudProof slashes a registered provider committer', async () => {
   const { admin, provider, user, storage, contract } = await setupEpochContract();
   const enclave = await makeIdentity();
   const prover = await makeIdentity();
-  const receipt = signedReceipt(user, provider, enclave, { mu_owed_cum: 1_000 });
+  const receipt = signedReceipt(user, provider, enclave, { au_owed_cum: '1000' });
   const inflatedReceipt = {
     ...receipt,
     body: {
       ...receipt.body,
-      mu_owed_cum: 2_000,
+      au_owed_cum: '2000',
     },
   };
   const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
@@ -625,11 +696,11 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
   await storage.put(`earn/fiat/${provider.publicKey}`, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 8_500,
-    held_mu: 8_500,
-    paid_cum_mu: 0,
-    holdbacks: [{ epoch: 1, mu: 8_500 }],
+    denom: 'au_usd',
+    total_au: '8500',
+    held_au: '8500',
+    paid_cum_au: '0',
+    holdbacks: [{ epoch: 1, au: '8500' }],
     updated_epoch: 1,
     updated_at: null,
   });
@@ -686,7 +757,7 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
       at: DAY_SECONDS,
       reason: 'over_credit',
       receipt,
-      claimed_mu_owed_cum: 2_000,
+      claimed_au_owed_cum: '2000',
     },
     prover.publicKey,
     6
@@ -694,25 +765,25 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
   assert.equal(proof.ok, true, proof.message);
   assert.equal(proof.slash.reason, 'receipt_forgery');
   assert.equal(proof.slash.slash_bps, 5_000);
-  assert.equal(proof.slash.forfeited_mu, 4_250);
-  assert.equal(proof.slash.beneficiary_mu, 2_125);
-  assert.equal(proof.slash.treasury_mu, 2_125);
+  assert.equal(proof.slash.forfeited_au, '4250');
+  assert.equal(proof.slash.beneficiary_au, '2125');
+  assert.equal(proof.slash.treasury_au, '2125');
 
   assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 4_250,
-    held_mu: 4_250,
-    paid_cum_mu: 0,
-    holdbacks: [{ epoch: 1, mu: 4_250 }],
+    denom: 'au_usd',
+    total_au: '4250',
+    held_au: '4250',
+    paid_cum_au: '0',
+    holdbacks: [{ epoch: 1, au: '4250' }],
     updated_epoch: 1,
     updated_at: makeTxKey(6),
-    slashed_cum_mu: 4_250,
+    slashed_cum_au: '4250',
     last_slash_at: makeTxKey(6),
   });
-  assert.equal((await storage.get(`bal/${prover.publicKey}/fiat`)).value.mu, 2_125);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 2_125);
+  assert.equal((await storage.get(`bal/${prover.publicKey}/fiat`)).value.au, '2125');
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '2125');
   assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'banned');
   assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.status, 'tombstoned');
 
@@ -727,13 +798,13 @@ test('MayhemContract fraudProof rejects proofs after the challenge window', asyn
   const { provider, user, submitter, storage, contract } = await setupEpochContract();
   const enclave = await makeIdentity();
   const prover = await makeIdentity();
-  const receipt = signedReceipt(user, provider, enclave, { mu_owed_cum: 1_000 });
+  const receipt = signedReceipt(user, provider, enclave, { au_owed_cum: '1000' });
   const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
     receipts: [{
       ...receipt,
       body: {
         ...receipt.body,
-        mu_owed_cum: 2_000,
+        au_owed_cum: '2000',
       },
     }],
   }));
@@ -765,7 +836,7 @@ test('MayhemContract fraudProof rejects proofs after the challenge window', asyn
       at: 28_800,
       reason: 'over_credit',
       receipt,
-      claimed_mu_owed_cum: 2_000,
+      claimed_au_owed_cum: '2000',
     },
     prover.publicKey,
     5
@@ -830,7 +901,7 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
   assert.match(mismatch.message, /do not match committed roots/i);
   assert.equal((await storage.get('fee/fiat/cum')), null);
   assert.equal((await storage.get('ev/use/1')), null);
-  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.mu, 1_000_000);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '1000000');
 });
 
 test('epoch root recompute script CLI matches the imported independent recompute function', async () => {

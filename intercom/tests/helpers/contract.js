@@ -12,10 +12,11 @@ import {
 } from '../../contract/contract.js';
 
 export const ZERO_HEX = '0'.repeat(64);
-export const textRateMap = (inPer1kMu = 20, outPer1kMu = 60) => [
-  { unit: 'input_token', per_unit_mu: inPer1kMu, granularity: 1000 },
-  { unit: 'output_token', per_unit_mu: outPer1kMu, granularity: 1000 },
+export const textRateMap = (inPer1kAu = 20, outPer1kAu = 60) => [
+  { unit: 'input_token', per_unit_au: String(inPer1kAu), granularity: 1000 },
+  { unit: 'output_token', per_unit_au: String(outPer1kAu), granularity: 1000 },
 ];
+const auString = (value) => String(value);
 
 const ctxBracketForTokens = (tokens) => {
   if (tokens <= 8_192) return 'le8k';
@@ -210,13 +211,14 @@ export async function seedCurrentAdminPrice(
     admin,
     txNo = 1,
     ver = 1,
-    inPer1kMu = 10,
-    outPer1kMu = 30,
-    perReqMu = 0,
-    minSessionMu = 0,
+    inPer1kAu = 10,
+    outPer1kAu = 30,
+    perReqAu = 0,
+    minSessionAu = 0,
     effectiveAt = 0,
     ctxBracket,
     ctxBracketTableVer = 1,
+    rateMap,
   }
 ) {
   let resolvedCtxBracket = ctxBracket;
@@ -232,11 +234,11 @@ export async function seedCurrentAdminPrice(
   const record = {
     enclave_id: enclaveId,
     model_id: modelId,
-    denom: 'mu_usd',
+    denom: 'au_usd',
     ver,
-    rate_map: textRateMap(inPer1kMu, outPer1kMu),
-    per_req_mu: perReqMu,
-    min_session_mu: minSessionMu,
+    rate_map: rateMap ?? textRateMap(inPer1kAu, outPer1kAu),
+    per_req_au: auString(perReqAu),
+    min_session_au: auString(minSessionAu),
     effective_at: effectiveAt,
     effective_from: makeTxKey(txNo),
     updated_at: makeTxKey(txNo),
@@ -253,7 +255,7 @@ export async function seedCurrentAdminPrice(
   await storage.put(scheduleKey, {
     enclave_id: enclaveId,
     model_id: modelId,
-    denom: 'mu_usd',
+    denom: 'au_usd',
     ...(resolvedCtxBracket
       ? { ctx_bracket: resolvedCtxBracket, ctx_bracket_table_ver: ctxBracketTableVer }
       : {}),

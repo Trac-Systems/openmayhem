@@ -397,7 +397,12 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
   const goodProbe = await storage.get('ev/probe/canary-good');
   assert.equal(goodProbe.value.pass, true);
   assert.equal(goodProbe.value.verification_method, 'token_fingerprint');
-  assert.equal(goodProbe.value.probe_reward_mu, 5_000);
+  assert.equal(goodProbe.value.probe_reward_au, '5000000000000000');
+  const uptimeProbe = await storage.get('ev/probe/uptime-1');
+  assert.equal(uptimeProbe.value.pass, true);
+  assert.equal(uptimeProbe.value.probe_reward_au, '5000000000000000');
+  assert.equal(await storage.get(`bal/${provider.publicKey}/fiat`), null);
+  assert.equal(await storage.get(`bal/${auditor.publicKey}/fiat`), null);
 
   const badProbe = await storage.get('ev/probe/canary-bad');
   assert.equal(badProbe.value.pass, false);

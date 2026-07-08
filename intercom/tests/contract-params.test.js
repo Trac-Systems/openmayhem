@@ -25,14 +25,16 @@ const EPOCH_OPERATING_PARAM_VALUES = {
   canary_match_min_bps: 8_500,
   canary_probe_holdback_bps: 1_500,
   canary_probe_release_min_passes: 2,
-  probe_reward_mu: 6_000,
+  probe_reward_au: '6000',
   uptime_tick_seconds: 1_800,
   fraud_slash_bps: 5_000,
   dispute_lost_slash_bps: 1_000,
+  min_tier_notice_epochs: 2,
+  new_provider_holdback_epochs: 120,
   holdback_epochs: 12,
   fee_bps: 1_200,
-  dispute_deposit_mu: 2_000_000,
-  payout_min_mu: 500_000,
+  dispute_deposit_au: '2000000',
+  payout_min_au: '500000',
   price_min_bps: 2_000,
   price_max_bps: 30_000,
   price_rate_limit_seconds: 900,
@@ -41,7 +43,7 @@ const EPOCH_OPERATING_PARAM_VALUES = {
   market_gain_bps: 6_000,
   market_max_step_bps: 1_500,
   market_cold_start_min_providers: 5,
-  market_provider_epoch_target_mu: 2_000_000,
+  market_provider_epoch_target_au: '2000000',
   market_max_utilization_bps: 60_000,
   market_below_target_discount_bps: 1_000,
   market_above_target_slope_bps: 20_000,
@@ -121,7 +123,7 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       'max_apply_batch',
       'max_market_usage_entries',
       'max_tnk_settlement_outputs',
-      'dispute_deposit_mu',
+      'dispute_deposit_au',
       'rate_staleness_seconds',
       'uptime_tick_seconds',
       'fraud_slash_bps',
@@ -129,7 +131,7 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       'price_rate_limit_seconds',
       'param_activation_delay_seconds',
       'market_target_utilization_bps',
-      'market_provider_epoch_target_mu',
+      'market_provider_epoch_target_au',
     ]),
     outsider.publicKey,
     4
@@ -147,7 +149,7 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       max_apply_batch: 2_000,
       max_market_usage_entries: 5_000,
       max_tnk_settlement_outputs: 5_000,
-      dispute_deposit_mu: 1_000_000,
+      dispute_deposit_au: '1000000000000000000',
       rate_staleness_seconds: 2_700,
       uptime_tick_seconds: 21_600,
       fraud_slash_bps: 10_000,
@@ -155,7 +157,7 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       price_rate_limit_seconds: 21_600,
       param_activation_delay_seconds: 86_400,
       market_target_utilization_bps: 8_500,
-      market_provider_epoch_target_mu: 1_000_000,
+      market_provider_epoch_target_au: '1000000000000000000',
     },
   });
 
@@ -273,16 +275,17 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       values: {
         epoch_seconds: 7_200,
         challenge_epochs: 3,
+        new_provider_holdback_epochs: 120,
         holdback_epochs: 12,
         max_apply_batch: 2_500,
         max_market_usage_entries: 750,
         max_tnk_settlement_outputs: 100,
-        dispute_deposit_mu: 2_000_000,
+        dispute_deposit_au: '2000000',
         rate_staleness_seconds: 120,
         uptime_tick_seconds: 1_800,
         price_rate_limit_seconds: 900,
         market_target_utilization_bps: 7_500,
-        market_provider_epoch_target_mu: 2_000_000,
+        market_provider_epoch_target_au: '2000000',
         param_activation_delay_seconds: 3_600,
       },
     }),
@@ -298,16 +301,17 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     readParams(2 * DAY_SECONDS, [
       'epoch_seconds',
       'challenge_epochs',
+      'new_provider_holdback_epochs',
       'holdback_epochs',
       'max_apply_batch',
       'max_market_usage_entries',
       'max_tnk_settlement_outputs',
-      'dispute_deposit_mu',
+      'dispute_deposit_au',
       'rate_staleness_seconds',
       'uptime_tick_seconds',
       'price_rate_limit_seconds',
       'market_target_utilization_bps',
-      'market_provider_epoch_target_mu',
+      'market_provider_epoch_target_au',
       'param_activation_delay_seconds',
     ]),
     outsider.publicKey,
@@ -316,16 +320,17 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
   assert.deepEqual(tuned.params, {
     epoch_seconds: 7_200,
     challenge_epochs: 3,
+    new_provider_holdback_epochs: 120,
     holdback_epochs: 12,
     max_apply_batch: 2_500,
     max_market_usage_entries: 750,
     max_tnk_settlement_outputs: 100,
-    dispute_deposit_mu: 2_000_000,
+    dispute_deposit_au: '2000000',
     rate_staleness_seconds: 120,
     uptime_tick_seconds: 1_800,
     price_rate_limit_seconds: 900,
     market_target_utilization_bps: 7_500,
-    market_provider_epoch_target_mu: 2_000_000,
+    market_provider_epoch_target_au: '2000000',
     param_activation_delay_seconds: 3_600,
   });
 });
@@ -354,6 +359,16 @@ test('MayhemContract epoch and market epoch controls are admin-governed params',
     const definition = definitions[key];
     assert.ok(definition, `${key} must be registered in contract PARAM_DEFINITIONS`);
     assert.deepEqual(epochDefinitions[key], definition, `${key} must be exported in the epoch admin map`);
+    if (definition.money) {
+      assert.equal(typeof definition.default, 'string', `${key} default must be an au string`);
+      assert.equal(typeof definition.min, 'string', `${key} min must be an au string`);
+      assert.match(definition.default, /^(0|[1-9]\d*)$/, `${key} default must be canonical au`);
+      assert.match(definition.min, /^(0|[1-9]\d*)$/, `${key} min must be canonical au`);
+      assert.equal(typeof value, 'string', `${key} test value must be an au string`);
+      assert.match(value, /^(0|[1-9]\d*)$/, `${key} test value must be canonical au`);
+      assert.ok(BigInt(value) >= BigInt(definition.min), `${key} test value must fit lower bound`);
+      continue;
+    }
     assert.equal(Number.isInteger(definition.default), true, `${key} default must be integer`);
     assert.equal(Number.isInteger(definition.min), true, `${key} min must be integer`);
     assert.equal(Number.isInteger(definition.max), true, `${key} max must be integer`);

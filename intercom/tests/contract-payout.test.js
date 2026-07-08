@@ -18,8 +18,8 @@ const enclaveId = '7'.repeat(64);
 const modelId = 'mayhem/payout-rollup-test@q4';
 const retiredPayoutMessage = /unknown contract operation type|function not registered/i;
 const payoutLockedRateMap = [
-  { unit: 'input_token', per_unit_mu: 2_000_000, granularity: 350 },
-  { unit: 'output_token', per_unit_mu: 2_000_000, granularity: 350 },
+  { unit: 'input_token', per_unit_au: '2000000', granularity: 350 },
+  { unit: 'output_token', per_unit_au: '2000000', granularity: 350 },
 ];
 
 async function setupPayoutContract() {
@@ -74,20 +74,20 @@ async function setupPayoutContract() {
   await storage.put(`bal/${user.publicKey}/fiat`, {
     user: user.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    mu: 5_000_000,
+    denom: 'au_usd',
+    au: '5000000',
     updated_epoch: 0,
     updated_at: null,
   });
   return { admin, provider, user, submitter, storage, contract };
 }
 
-const epochApply = (epoch, user, provider, grossMu, overrides = {}) => ({
+const epochApply = (epoch, user, provider, grossAu, overrides = {}) => ({
   op: 'epoch_apply',
   epoch,
   at: epoch * 3_600,
-  debits: [{ rail: 'fiat', user, mu: grossMu }],
-  earnings: [{ rail: 'fiat', provider, gross_mu: grossMu }],
+  debits: [{ rail: 'fiat', user, au: String(grossAu) }],
+  earnings: [{ rail: 'fiat', provider, gross_au: String(grossAu) }],
   ...overrides,
 });
 
@@ -112,7 +112,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       locked_rate_map: payoutLockedRateMap,
       rules_ver: 1,
       usage: { in: 100, out: 250 },
-      mu_owed_cum: 2_000_000,
+      au_owed_cum: '2000000',
       prompt_hash: 'a'.repeat(64),
       ts: 3_600,
       enclave_sig: 'b'.repeat(128),
@@ -127,7 +127,7 @@ const payoutConfirm = (provider, overrides = {}) => ({
   op: 'payout_confirm',
   epoch: 169,
   who: provider,
-  mu: 1_000_000,
+  au: '1000000',
   tnk_e18: '500000000000000000',
   msb_tx_hash: 'a'.repeat(64),
   at: 1_900,
@@ -235,20 +235,20 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
     op: 'epochApply',
     epoch: 1,
     idempotent: false,
-    debited_mu: 2_000_000,
-    earned_mu: 1_700_000,
-    fee_mu: 300_000,
+    debited_au: '2000000',
+    earned_au: '1700000',
+    fee_au: '300000',
     rails: ['fiat'],
   });
 
   assert.deepEqual((await storage.get(`earn/fiat/${provider.publicKey}`)).value, {
     provider: provider.publicKey,
     rail: 'fiat',
-    denom: 'mu_usd',
-    total_mu: 1_700_000,
-    held_mu: 1_700_000,
-    paid_cum_mu: 0,
-    holdbacks: [{ epoch: 1, mu: 1_700_000 }],
+    denom: 'au_usd',
+    total_au: '1700000',
+    held_au: '1700000',
+    paid_cum_au: '0',
+    holdbacks: [{ epoch: 1, au: '1700000', locked_epochs: 168 }],
     updated_epoch: 1,
     updated_at: applyKey,
     last_holdback_release_epoch: 1,
@@ -259,7 +259,7 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
     epoch_seconds: 3_600,
     merkle_root: roll.roots.earn,
     provider_count: 1,
-    mu_cum_total: 1_700_000,
+    au_cum_total: '1700000',
     ts: 3_600,
     updated_at: applyKey,
   });
@@ -268,8 +268,8 @@ test('MayhemContract epoch roots commit provider entitlements without ev/pay evi
     epoch: 1,
     epoch_seconds: 3_600,
     merkle_root: roll.roots.fee,
-    mu_fee_epoch: 300_000,
-    mu_fee_cum: 300_000,
+    au_fee_epoch: '300000',
+    au_fee_cum: '300000',
     sweep_msb_tx_hash: null,
     ts: 3_600,
     updated_at: applyKey,
@@ -306,10 +306,10 @@ test('MayhemContract fee-sweep payoutConfirm is retired and cannot mutate fee ev
   const { admin, storage, contract } = await setupPayoutContract();
   await storage.put('fee/fiat/cum', {
     rail: 'fiat',
-    denom: 'mu_usd',
-    cum_mu: 2_000_000,
-    swept_cum_mu: 0,
-    settled_cum_mu: 2_000_000,
+    denom: 'au_usd',
+    cum_au: '2000000',
+    swept_cum_au: '0',
+    settled_cum_au: '2000000',
     updated_epoch: 1,
     updated_at: null,
     last_apply_hash: null,
@@ -319,8 +319,8 @@ test('MayhemContract fee-sweep payoutConfirm is retired and cannot mutate fee ev
     type: 'fee_root',
     epoch: 169,
     merkle_root: 'f'.repeat(64),
-    mu_fee_epoch: 0,
-    mu_fee_cum: 2_000_000,
+    au_fee_epoch: '0',
+    au_fee_cum: '2000000',
     sweep_msb_tx_hash: null,
     ts: 1_900,
     updated_at: null,

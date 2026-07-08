@@ -25,16 +25,18 @@ const providerRegistration = {
   op: 'register_provider',
 };
 
-const seededBalance = (user, mu, rail = 'fiat') => ({
+const auString = (value) => String(value);
+
+const seededBalance = (user, au, rail = 'fiat') => ({
   user,
   rail,
-  denom: 'mu_usd',
-  mu,
+  denom: 'au_usd',
+  au: auString(au),
   updated_epoch: 0,
   updated_at: null,
 });
 
-const rateFor = (rateMap, unit) => rateMap.find((entry) => entry.unit === unit)?.per_unit_mu;
+const rateFor = (rateMap, unit) => rateMap.find((entry) => entry.unit === unit)?.per_unit_au;
 const assertHash = (value) => assert.match(value, /^[0-9a-f]{64}$/);
 
 const enclaveRegistration = {
@@ -64,19 +66,20 @@ const makePrice = (overrides = {}) => ({
   op: 'set_price',
   enclave_id: enclaveId,
   rate_map: textRateMap(18, 55),
-  per_req_mu: 0,
-  min_session_mu: 100,
+  per_req_au: '0',
+  min_session_au: '100',
   effective_at: 21_600,
   ctx_bracket: priceCtxBracket,
   ...overrides,
 });
 
-const makeMarketUsage = (demandMu, sessionCount, overrides = {}) => ({
+const makeMarketUsage = (demandAu, sessionCount, overrides = {}) => ({
   enclave_id: enclaveId,
   ctx_bracket: priceCtxBracket,
   ctx_bracket_table_ver: priceCtxBracketTableVer,
-  demand_mu: demandMu,
+  demand_au: auString(demandAu),
   session_count: sessionCount,
+  provider_count: 1,
   ...overrides,
 });
 
@@ -90,6 +93,17 @@ async function setupRegisteredEnclave() {
   await storage.put(`modelref/${modelId}`, {
     model_id: modelId,
     rate_map: textRateMap(20, 60),
+  });
+  await storage.put('params/market_provider_epoch_target_au', {
+    key: 'market_provider_epoch_target_au',
+    current: {
+      value: '1000000',
+      ver: 1,
+      submitted_at: 0,
+      effective_at: 0,
+      set_at: null,
+    },
+    pending: null,
   });
 
   for (const op of [
@@ -242,19 +256,19 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
   assert.deepEqual(price.value, {
     enclave_id: enclaveId,
     model_id: modelId,
-    denom: 'mu_usd',
+    denom: 'au_usd',
     ctx_bracket: priceCtxBracket,
     ctx_bracket_table_ver: priceCtxBracketTableVer,
     current: {
       enclave_id: enclaveId,
       model_id: modelId,
-      denom: 'mu_usd',
+      denom: 'au_usd',
       ver: 1,
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       rate_map: textRateMap(18, 55),
-      per_req_mu: 0,
-      min_session_mu: 100,
+      per_req_au: '0',
+      min_session_au: '100',
       effective_at: 21_600,
       effective_from: makeTxKey(8),
       updated_at: makeTxKey(8),
@@ -264,13 +278,13 @@ test('MayhemContract setPrice enforces modelref bounds and six-hour rate limit',
     pending: {
       enclave_id: enclaveId,
       model_id: modelId,
-      denom: 'mu_usd',
+      denom: 'au_usd',
       ver: 2,
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       rate_map: textRateMap(19, 56),
-      per_req_mu: 0,
-      min_session_mu: 100,
+      per_req_au: '0',
+      min_session_au: '100',
       effective_at: 43_200,
       effective_from: makeTxKey(10),
       updated_at: makeTxKey(10),
@@ -324,8 +338,8 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
       op: 'epoch_apply',
       epoch: 1,
       at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 10_000_000 }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 10_000_000 }],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '10000000' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '10000000' }],
       market_usage: [makeMarketUsage(10_000_000, 4)],
     },
     admin.publicKey
@@ -342,7 +356,7 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
       utilization_bps: 50_000,
       ema_utilization_bps: 8_500,
       active_supply: 1,
-      active_demand_mu: 10_000_000,
+      active_demand_au: '10000000',
       frozen: true,
       derivation_hash: '<hash>',
     }
@@ -359,6 +373,47 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
   assert.equal(priceRoot.price_count, 1);
   const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.equal(derivation.price_root, applied.price_root);
+  assert.equal(derivation.controller.frozen, true);
+});
+
+test('MayhemContract epochApply counts settled-work supply, not idle joined wallets', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+  const idleProvider = await makeIdentity();
+
+  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
+  assert.equal(seeded.ok, true, seeded.message);
+  const joined = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: enclaveId },
+    provider.publicKey,
+    6
+  );
+  assert.equal(joined.ok, true, joined.message);
+  await registerAndJoinExtraProvider(contract, storage, admin, idleProvider, 7);
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 5_000_000));
+
+  const applied = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 1,
+      at: 43_201,
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2000000' }],
+      market_usage: [makeMarketUsage(2_000_000, 2)],
+    },
+    admin.publicKey
+  );
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(applied.market_prices[0].active_supply, 1);
+  assert.equal(applied.market_prices[0].frozen, true);
+
+  const derivation = (await storage.get(priceEvidenceKey)).value;
+  assert.equal(derivation.controller.active_supply, 1);
   assert.equal(derivation.controller.frozen, true);
 });
 
@@ -388,9 +443,12 @@ test('MayhemContract epochApply floats market price from settled usage with clam
       op: 'epoch_apply',
       epoch: 1,
       at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
-      market_usage: [makeMarketUsage(2_000_000, 4)],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+      earnings: [
+        { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
+        { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
+      ],
+      market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
     },
     admin.publicKey
   );
@@ -405,7 +463,7 @@ test('MayhemContract epochApply floats market price from settled usage with clam
       utilization_bps: 10_000,
       ema_utilization_bps: 8_875,
       active_supply: 2,
-      active_demand_mu: 2_000_000,
+      active_demand_au: '2000000',
       frozen: false,
       derivation_hash: '<hash>',
     }
@@ -416,10 +474,10 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   assert.equal(raised.ver, 2);
   assert.equal(raised.price_source, 'market_float');
   assert.equal(raised.seed.ver, 1);
-  assert.equal(rateFor(raised.rate_map, 'input_token'), 19);
-  assert.equal(rateFor(raised.rate_map, 'output_token'), 60);
-  assert.ok(rateFor(raised.rate_map, 'input_token') <= Math.floor(18 * 1.1));
-  assert.ok(rateFor(raised.rate_map, 'output_token') <= Math.floor(55 * 1.1));
+  assert.equal(rateFor(raised.rate_map, 'input_token'), '19');
+  assert.equal(rateFor(raised.rate_map, 'output_token'), '60');
+  assert.ok(Number(rateFor(raised.rate_map, 'input_token')) <= Math.floor(18 * 1.1));
+  assert.ok(Number(rateFor(raised.rate_map, 'output_token')) <= Math.floor(55 * 1.1));
 
   const lowDemand = await executeEpochApplyFeature(
     contract,
@@ -428,9 +486,12 @@ test('MayhemContract epochApply floats market price from settled usage with clam
       op: 'epoch_apply',
       epoch: 2,
       at: 46_801,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 10_000 }],
-      earnings: [{ rail: 'fiat', provider: providerTwo.publicKey, gross_mu: 10_000 }],
-      market_usage: [makeMarketUsage(10_000, 1)],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '10000' }],
+      earnings: [
+        { rail: 'fiat', provider: provider.publicKey, gross_au: '5000' },
+        { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '5000' },
+      ],
+      market_usage: [makeMarketUsage(10_000, 1, { provider_count: 2 })],
     },
     admin.publicKey
   );
@@ -438,8 +499,8 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   schedule = await storage.get(priceKey);
   const lowered = schedule.value.current;
   assert.equal(lowered.ver, 3);
-  assert.equal(rateFor(lowered.rate_map, 'input_token'), 18);
-  assert.ok(rateFor(lowered.rate_map, 'output_token') < rateFor(raised.rate_map, 'output_token'));
+  assert.equal(rateFor(lowered.rate_map, 'input_token'), '18');
+  assert.ok(Number(rateFor(lowered.rate_map, 'output_token')) < Number(rateFor(raised.rate_map, 'output_token')));
 
   const reseed = await execute(
     contract,
@@ -467,7 +528,7 @@ test('MayhemContract keeps context brackets as independent price markets', async
     makePrice({
       ctx_bracket: 'le128k',
       rate_map: textRateMap(30, 90),
-      min_session_mu: 150,
+      min_session_au: '150',
     }),
     admin.publicKey,
     6
@@ -492,8 +553,8 @@ test('MayhemContract keeps context brackets as independent price markets', async
       op: 'epoch_apply',
       epoch: 1,
       at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 3_000_000 }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 3_000_000 }],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '3000000' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '3000000' }],
       market_usage: [
         makeMarketUsage(1_000_000, 2),
         makeMarketUsage(2_000_000, 3, { ctx_bracket: 'le128k' }),
@@ -506,8 +567,8 @@ test('MayhemContract keeps context brackets as independent price markets', async
   const byBracket = new Map(applied.market_prices.map((entry) => [entry.ctx_bracket, entry]));
   assert.equal(byBracket.get(priceCtxBracket).ver, 2);
   assert.equal(byBracket.get('le128k').ver, 2);
-  assert.equal(byBracket.get(priceCtxBracket).active_demand_mu, 1_000_000);
-  assert.equal(byBracket.get('le128k').active_demand_mu, 2_000_000);
+  assert.equal(byBracket.get(priceCtxBracket).active_demand_au, '1000000');
+  assert.equal(byBracket.get('le128k').active_demand_au, '2000000');
   assertHash(byBracket.get(priceCtxBracket).derivation_hash);
   assertHash(byBracket.get('le128k').derivation_hash);
 
@@ -516,15 +577,15 @@ test('MayhemContract keeps context brackets as independent price markets', async
   assert.equal(shortSchedule.current.ctx_bracket, priceCtxBracket);
   assert.equal(longSchedule.current.ctx_bracket, 'le128k');
   assert.notDeepEqual(shortSchedule.current.rate_map, longSchedule.current.rate_map);
-  assert.equal(rateFor(shortSchedule.current.seed.rate_map, 'input_token'), 18);
-  assert.equal(rateFor(longSchedule.current.seed.rate_map, 'input_token'), 30);
+  assert.equal(rateFor(shortSchedule.current.seed.rate_map, 'input_token'), '18');
+  assert.equal(rateFor(longSchedule.current.seed.rate_map, 'input_token'), '30');
 
   const shortDerivation = (await storage.get(priceEvidenceKey)).value;
   const longDerivation = (await storage.get(`ev/price/1/${enclaveId}/le128k`)).value;
   assert.equal(shortDerivation.ctx_bracket, priceCtxBracket);
   assert.equal(longDerivation.ctx_bracket, 'le128k');
-  assert.equal(shortDerivation.usage.active_demand_mu, 1_000_000);
-  assert.equal(longDerivation.usage.active_demand_mu, 2_000_000);
+  assert.equal(shortDerivation.usage.active_demand_au, '1000000');
+  assert.equal(longDerivation.usage.active_demand_au, '2000000');
   assert.equal(shortDerivation.price_root, longDerivation.price_root);
 });
 
@@ -545,7 +606,7 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
       effective_at: DAY_SECONDS,
       values: {
         market_target_utilization_bps: 7_500,
-        market_provider_epoch_target_mu: 2_000_000,
+        market_provider_epoch_target_au: '2000000',
         market_cold_start_min_providers: 1,
         market_gain_bps: 10_000,
         market_max_step_bps: 10_000,
@@ -574,9 +635,12 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
       op: 'epoch_apply',
       epoch: 1,
       at: DAY_SECONDS + 1,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
-      market_usage: [makeMarketUsage(2_000_000, 4)],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+      earnings: [
+        { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
+        { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
+      ],
+      market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
     },
     admin.publicKey
   );
@@ -588,7 +652,7 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
     gain_bps: 10_000,
     max_step_bps: 10_000,
     cold_start_min_providers: 1,
-    provider_epoch_target_mu: 2_000_000,
+    provider_epoch_target_au: '2000000',
     max_utilization_bps: 50_000,
     below_target_discount_bps: 2_500,
     above_target_slope_bps: 15_000,
@@ -620,9 +684,12 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
     op: 'epoch_apply',
     epoch: 1,
     at: 43_201,
-    debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000_000 }],
-    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000_000 }],
-    market_usage: [makeMarketUsage(2_000_000, 1)],
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+    earnings: [
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
+      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
+    ],
+    market_usage: [makeMarketUsage(2_000_000, 1, { provider_count: 2 })],
   };
   const usageRoot = '2'.repeat(64);
   const roots = {
@@ -634,13 +701,13 @@ test('MayhemContract anchors committed price derivations with epoch evidence roo
   };
   const totals = {
     dep_count: 0,
-    dep_mu: 0,
+    dep_au: '0',
     use_count: 1,
-    use_mu: 2_000_000,
-    provider_count: 1,
-    earn_mu: 1_700_000,
-    fee_mu: 300_000,
-    fee_cum_mu: 300_000,
+    use_au: '2000000',
+    provider_count: 2,
+    earn_au: '1700000',
+    fee_au: '300000',
+    fee_cum_au: '300000',
     price_count: 1,
   };
 
@@ -715,13 +782,13 @@ test('MayhemContract fraudProof voids a fabricated price derivation root', async
   };
   const totals = {
     dep_count: 0,
-    dep_mu: 0,
+    dep_au: '0',
     use_count: 1,
-    use_mu: 2_000_000,
+    use_au: '2000000',
     provider_count: 1,
-    earn_mu: 1_700_000,
-    fee_mu: 300_000,
-    fee_cum_mu: 300_000,
+    earn_au: '1700000',
+    fee_au: '300000',
+    fee_cum_au: '300000',
     price_count: 1,
   };
   const commit = await execute(
@@ -761,7 +828,7 @@ test('MayhemContract fraudProof voids a fabricated price derivation root', async
   assertHash(fraudRecord.price_derivation_hash);
   assert.equal(fraudRecord.price_derivation.enclave_id, enclaveId);
   assert.equal(fraudRecord.price_derivation.ctx_bracket, priceCtxBracket);
-  assert.equal(fraudRecord.price_derivation.usage.active_demand_mu, 2_000_000);
+  assert.equal(fraudRecord.price_derivation.usage.active_demand_au, '2000000');
 });
 
 test('MayhemContract keeps one enclave price while conserving mixed rail settlement', async () => {
@@ -803,14 +870,14 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       epoch: 1,
       at: 43_201,
       debits: [
-        { rail: 'fiat', user: fiatUser.publicKey, mu: 500_000 },
-        { rail: 'tap', user: tapUser.publicKey, mu: 500_000 },
+        { rail: 'fiat', user: fiatUser.publicKey, au: '500000' },
+        { rail: 'tap', user: tapUser.publicKey, au: '500000' },
       ],
       earnings: [
-        { rail: 'fiat', provider: provider.publicKey, gross_mu: 500_000 },
-        { rail: 'tap', provider: tapProvider.publicKey, gross_mu: 500_000 },
+        { rail: 'fiat', provider: provider.publicKey, gross_au: '500000' },
+        { rail: 'tap', provider: tapProvider.publicKey, gross_au: '500000' },
       ],
-      market_usage: [makeMarketUsage(1_000_000, 2)],
+      market_usage: [makeMarketUsage(1_000_000, 2, { provider_count: 2 })],
     },
     admin.publicKey
   );
@@ -825,7 +892,7 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       utilization_bps: 5_000,
       ema_utilization_bps: 7_625,
       active_supply: 2,
-      active_demand_mu: 1_000_000,
+      active_demand_au: '1000000',
       frozen: false,
       derivation_hash: applied.market_prices[0].derivation_hash,
     },
@@ -838,12 +905,12 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
   assert.equal(await storage.get(`price/${enclaveId}/fiat`), null);
   assert.equal(await storage.get(`price/${enclaveId}/tap`), null);
   assert.equal(await storage.get(`price/${enclaveId}`), null);
-  assert.equal((await storage.get(`bal/${fiatUser.publicKey}/fiat`)).value.mu, 1_500_000);
-  assert.equal((await storage.get(`bal/${tapUser.publicKey}/tap`)).value.mu, 1_500_000);
-  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_mu, 425_000);
-  assert.equal((await storage.get(`earn/tap/${tapProvider.publicKey}`)).value.total_mu, 425_000);
-  assert.equal((await storage.get('fee/fiat/cum')).value.cum_mu, 75_000);
-  assert.equal((await storage.get('fee/tap/cum')).value.cum_mu, 75_000);
+  assert.equal((await storage.get(`bal/${fiatUser.publicKey}/fiat`)).value.au, '1500000');
+  assert.equal((await storage.get(`bal/${tapUser.publicKey}/tap`)).value.au, '1500000');
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_au, '425000');
+  assert.equal((await storage.get(`earn/tap/${tapProvider.publicKey}`)).value.total_au, '425000');
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '75000');
+  assert.equal((await storage.get('fee/tap/cum')).value.cum_au, '75000');
 
   const crossRailMismatch = await executeEpochApplyFeature(
     contract,
@@ -852,8 +919,8 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       op: 'epoch_apply',
       epoch: 2,
       at: 46_801,
-      debits: [{ rail: 'fiat', user: fiatUser.publicKey, mu: 100 }],
-      earnings: [{ rail: 'tap', provider: tapProvider.publicKey, gross_mu: 100 }],
+      debits: [{ rail: 'fiat', user: fiatUser.publicKey, au: '100' }],
+      earnings: [{ rail: 'tap', provider: tapProvider.publicKey, gross_au: '100' }],
       market_usage: [makeMarketUsage(100, 1)],
     },
     admin.publicKey
@@ -875,8 +942,8 @@ test('MayhemContract epochApply rejects market usage that does not reconcile to 
       op: 'epoch_apply',
       epoch: 1,
       at: 43_201,
-      debits: [{ rail: 'fiat', user: user.publicKey, mu: 2_000 }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_mu: 2_000 }],
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '2000' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '2000' }],
       market_usage: [makeMarketUsage(1_999, 1)],
     },
     admin.publicKey
@@ -944,7 +1011,7 @@ test('MayhemContract setModelRef is admin-only and forward-facing', async () => 
   assert.deepEqual((await storage.get(`modelref/${modelId}`)).value, {
     model_id: modelId,
     model_class: 'text-generation',
-    denom: 'mu_usd',
+    denom: 'au_usd',
     rate_map: textRateMap(21, 63),
     ver: 2,
     source_hash: 'd'.repeat(64),
@@ -984,7 +1051,7 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
       op: 'set_model_ref',
       model_id: imageEnclave.model_id,
       model_class: 'image-generation',
-      rate_map: [{ unit: 'image', per_unit_mu: 500, granularity: 1 }],
+      rate_map: [{ unit: 'image', per_unit_au: '500', granularity: 1 }],
     },
     admin.publicKey,
     2
@@ -999,8 +1066,8 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
       op: 'set_price',
       enclave_id: imageEnclave.enclave_id,
       rate_map: textRateMap(20, 60),
-      per_req_mu: 0,
-      min_session_mu: 0,
+      per_req_au: '0',
+      min_session_au: '0',
       effective_at: 0,
     },
     admin.publicKey,
@@ -1015,9 +1082,9 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
     {
       op: 'set_price',
       enclave_id: imageEnclave.enclave_id,
-      rate_map: [{ unit: 'image', per_unit_mu: 600, granularity: 1 }],
-      per_req_mu: 0,
-      min_session_mu: 0,
+      rate_map: [{ unit: 'image', per_unit_au: '600', granularity: 1 }],
+      per_req_au: '0',
+      min_session_au: '0',
       effective_at: 0,
     },
     admin.publicKey,
@@ -1025,7 +1092,7 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
   );
   assert.equal(result.ok, true, result.message);
   assert.deepEqual((await storage.get(`price/${imageEnclave.enclave_id}`)).value.current.rate_map, [
-    { unit: 'image', per_unit_mu: 600, granularity: 1 },
+    { unit: 'image', per_unit_au: '600', granularity: 1 },
   ]);
 });
 

@@ -88,7 +88,7 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
       provider: provider.publicKey,
       event_id: 'session-ok-1',
       kind: 'session_ok',
-      paid_mu: 1_000,
+      paid_au: '1000',
       epoch: 1,
       at: DAY_SECONDS,
     },
@@ -106,7 +106,7 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
       op: 'record_rep_event',
       event_id: 'session-ok-1',
       kind: 'session_ok',
-      paid_mu: 1_000,
+      paid_au: '1000',
     },
     5
   );
@@ -122,7 +122,7 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
       op: 'record_rep_event',
       event_id: 'session-partial-1',
       kind: 'session_partial',
-      paid_mu: 250,
+      paid_au: '250',
     },
     6
   );
@@ -138,7 +138,7 @@ test('MayhemContract records reputation events and anchors rep snapshots with pr
       op: 'record_rep_event',
       event_id: 'session-ok-1',
       kind: 'session_ok',
-      paid_mu: 1_000,
+      paid_au: '1000',
     },
     7
   );
@@ -422,7 +422,8 @@ test('MayhemContract reputation event log replays deterministically', async () =
         op: 'record_rep_event',
         event_id: 'session-ok-1',
         kind: 'session_ok',
-        paid_mu: 1_000,
+        paid_au: '1000',
+        max_spend_au: '1000',
       },
       4
     );
@@ -436,7 +437,8 @@ test('MayhemContract reputation event log replays deterministically', async () =
         op: 'record_rep_event',
         event_id: 'session-fail-1',
         kind: 'session_fail',
-        max_spend_mu: 5_000,
+        paid_au: '5000',
+        max_spend_au: '5000',
       },
       5
     );
@@ -481,7 +483,7 @@ test('MayhemContract reputation event head is stable across object key order', a
     epoch: 1,
     at: DAY_SECONDS,
     evidence_hash: 'b'.repeat(64),
-    paid_mu: 100,
+    paid_au: '100',
     nested: {
       zeta: 1,
       alpha: 2,
@@ -492,7 +494,7 @@ test('MayhemContract reputation event head is stable across object key order', a
       alpha: 2,
       zeta: 1,
     },
-    paid_mu: 100,
+    paid_au: '100',
     evidence_hash: 'b'.repeat(64),
     at: DAY_SECONDS,
     epoch: 1,

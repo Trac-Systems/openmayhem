@@ -11,24 +11,63 @@ import {
   makeIdentity,
   makeVerifier,
   signConsent,
+  textRateMap,
   tnkSettlementFeatureKey,
 } from './helpers/contract.js';
 
 const rulesHash = 'a'.repeat(64);
 const rate = {
   op: 'rate_oracle',
-  tnk_usd_e6: 50_000,
+  tnk_usd_au: '50000000000000000',
   source: 'gate-spot',
   ts: 90_000,
 };
 
-const tnkE18 = (whole) => `${whole}000000000000000000`;
+const tnkE18 = (value) => String(value);
+const cleanExitEnclaveId = '3'.repeat(64);
+const cleanExitEnclave = {
+  op: 'register_enclave',
+  enclave_id: cleanExitEnclaveId,
+  model_id: 'mayhem/clean-exit-tnk@q4',
+  backend: 'llama.cpp',
+  artifact_root: '4'.repeat(64),
+  artifact_root_kind: 'blake3_merkle_v1',
+  artifact_source: {
+    kind: 'huggingface',
+    repo: 'mayhem-test/clean-exit-tnk',
+    revision: '5'.repeat(40),
+    path: 'clean-exit-tnk.gguf',
+  },
+  manifest_hash: '6'.repeat(64),
+  att_tier: 1,
+  quant: 'INT4',
+  binary_hash: '7'.repeat(64),
+  caps: {
+    chat: true,
+    embeddings: false,
+    tools: false,
+    ctx: 8192,
+  },
+};
+const cleanExitModelRef = {
+  op: 'set_model_ref',
+  model_id: cleanExitEnclave.model_id,
+  rate_map: textRateMap(20, 60),
+};
+const cleanExitPrice = {
+  op: 'set_price',
+  enclave_id: cleanExitEnclaveId,
+  rate_map: textRateMap(20, 60),
+  per_req_au: '0',
+  min_session_au: '0',
+  effective_at: 0,
+};
 
 async function setupTnkSettlementContract(paramOverrides = {}) {
   const admin = await makeIdentity();
   const providers = [
-    { identity: await makeIdentity(), target: 'testtrac1providerone', gross_mu: 2_000_000 },
-    { identity: await makeIdentity(), target: 'testtrac1providertwo', gross_mu: 1_000_000 },
+    { identity: await makeIdentity(), target: 'testtrac1providerone', gross_au: '2000000' },
+    { identity: await makeIdentity(), target: 'testtrac1providertwo', gross_au: '1000000' },
   ];
   const user = await makeIdentity();
   const outsider = await makeIdentity();
@@ -51,7 +90,12 @@ async function setupTnkSettlementContract(paramOverrides = {}) {
         op: 'set_params',
         submitted_at: 0,
         effective_at: 86_400,
-        values: { holdback_epochs: 0, challenge_epochs: 0, ...paramOverrides },
+        values: {
+          holdback_epochs: 0,
+          new_provider_holdback_epochs: 0,
+          challenge_epochs: 0,
+          ...paramOverrides,
+        },
       },
       sender: admin.publicKey,
       txNo: 2,
@@ -104,8 +148,8 @@ async function setupTnkSettlementContract(paramOverrides = {}) {
   await storage.put(`bal/${user.publicKey}/tnk`, {
     user: user.publicKey,
     rail: 'tnk',
-    denom: 'mu_usd',
-    mu: 3_000_000,
+    denom: 'au_usd',
+    au: '3000000',
     updated_epoch: 0,
     updated_at: null,
   });
@@ -116,11 +160,11 @@ async function setupTnkSettlementContract(paramOverrides = {}) {
     op: 'epoch_apply',
     epoch: 1,
     at: 90_000,
-    debits: [{ rail: 'tnk', user: user.publicKey, mu: 3_000_000 }],
+    debits: [{ rail: 'tnk', user: user.publicKey, au: '3000000' }],
     earnings: providers.map((provider) => ({
       rail: 'tnk',
       provider: provider.identity.publicKey,
-      gross_mu: provider.gross_mu,
+      gross_au: provider.gross_au,
     })),
   };
   const applied = await executeEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
@@ -129,9 +173,9 @@ async function setupTnkSettlementContract(paramOverrides = {}) {
     op: 'epochApply',
     epoch: 1,
     idempotent: false,
-    debited_mu: 3_000_000,
-    earned_mu: 2_550_000,
-    fee_mu: 450_000,
+    debited_au: '3000000',
+    earned_au: '2550000',
+    fee_au: '450000',
     rails: ['tnk'],
   });
   const applyState = (await storage.get('epoch/apply/state')).value;
@@ -144,8 +188,8 @@ async function settlementValue(ctx, overrides = {}) {
       role: 'provider',
       provider: provider.identity.publicKey,
       to: provider.target,
-      mu: provider.gross_mu === 2_000_000 ? 1_700_000 : 850_000,
-      tnk_e18: provider.gross_mu === 2_000_000 ? tnkE18(34) : tnkE18(17),
+      au: provider.gross_au === '2000000' ? '1700000' : '850000',
+      tnk_e18: provider.gross_au === '2000000' ? tnkE18(34_000_000) : tnkE18(17_000_000),
     }))
     .sort((left, right) => left.provider.localeCompare(right.provider));
   const outputs = [
@@ -153,8 +197,8 @@ async function settlementValue(ctx, overrides = {}) {
     {
       role: 'operator_fee',
       to: 'testtrac1operator',
-      mu: 450_000,
-      tnk_e18: tnkE18(9),
+      au: '450000',
+      tnk_e18: tnkE18(9_000_000),
     },
   ];
   const transferRoot = await ctx.contract.tnkSettlementTransferRoot(outputs);
@@ -167,22 +211,22 @@ async function settlementValue(ctx, overrides = {}) {
     treasury_from: 'testtrac1treasury',
     operator_to: 'testtrac1operator',
     epoch_apply_hash: ctx.applyState.last_apply_hash,
-    rate_tnk_usd_e6: rate.tnk_usd_e6,
+    rate_tnk_usd_au: rate.tnk_usd_au,
     rate_source: rate.source,
     rate_ts: rate.ts,
-    msb_tx_hash: 'b'.repeat(64),
+    msb_tx_hashes: ["b".repeat(64), "c".repeat(64), "d".repeat(64)],
     transfer_root: transferRoot,
     provider_count: 2,
-    provider_mu: 2_550_000,
-    operator_fee_mu: 450_000,
-    gross_mu: 3_000_000,
-    tnk_e18: tnkE18(60),
+    provider_au: '2550000',
+    operator_fee_au: '450000',
+    gross_au: '3000000',
+    tnk_e18: tnkE18(60_000_000),
     outputs,
     ...overrides,
   };
 }
 
-test('MayhemContract tnkSettlement records one real batch and is idempotent', async () => {
+test('MayhemContract tnkSettlement records official per-output transfers and is idempotent', async () => {
   const ctx = await setupTnkSettlementContract();
   const settlement = await settlementValue(ctx);
 
@@ -192,7 +236,7 @@ test('MayhemContract tnkSettlement records one real batch and is idempotent', as
     ctx.storage,
     'mayhem_feature',
     `settle/tnk/1/${'0'.repeat(64)}`,
-    { ...settlement, msb_tx_hash: 'not-a-real-msb-tx-hash' },
+    { ...settlement, msb_tx_hashes: ['not-a-real-msb-tx-hash'] },
     ctx.admin.publicKey
   );
   const placeholder = placeholderResult ?? ctx.contract._mayhemLastFeatureResult;
@@ -222,30 +266,36 @@ test('MayhemContract tnkSettlement records one real batch and is idempotent', as
     epoch: 1,
     rail: 'tnk',
     idempotent: false,
-    provider_mu: 2_550_000,
-    operator_fee_mu: 450_000,
-    gross_mu: 3_000_000,
-    msb_tx_hash: 'b'.repeat(64),
+    provider_au: '2550000',
+    operator_fee_au: '450000',
+    gross_au: '3000000',
+    msb_tx_hashes: ["b".repeat(64), "c".repeat(64), "d".repeat(64)],
     transfer_root: settlement.transfer_root,
   });
 
   for (const provider of ctx.providers) {
     const earning = (await ctx.storage.get(`earn/tnk/${provider.identity.publicKey}`)).value;
-    assert.equal(earning.held_mu, 0);
+    const outputIndex = settlement.outputs.findIndex((output) => (
+      output.role === 'provider' && output.provider === provider.identity.publicKey
+    ));
+    assert.notEqual(outputIndex, -1);
+    assert.equal(earning.held_au, '0');
     assert.deepEqual(earning.holdbacks, []);
     assert.equal(
-      earning.paid_cum_mu,
-      provider.gross_mu === 2_000_000 ? 1_700_000 : 850_000
+      earning.paid_cum_au,
+      provider.gross_au === '2000000' ? '1700000' : '850000'
     );
-    assert.equal(earning.last_settlement_msb_tx_hash, 'b'.repeat(64));
+    assert.equal(earning.last_settlement_msb_tx_hash, settlement.msb_tx_hashes[outputIndex]);
   }
   const fee = (await ctx.storage.get('fee/tnk/cum')).value;
-  assert.equal(fee.cum_mu, 450_000);
-  assert.equal(fee.swept_cum_mu, 450_000);
-  assert.equal(fee.last_settlement_msb_tx_hash, 'b'.repeat(64));
+  const operatorOutputIndex = settlement.outputs.findIndex((output) => output.role === 'operator_fee');
+  assert.notEqual(operatorOutputIndex, -1);
+  assert.equal(fee.cum_au, '450000');
+  assert.equal(fee.swept_cum_au, '450000');
+  assert.equal(fee.last_settlement_msb_tx_hash, settlement.msb_tx_hashes[operatorOutputIndex]);
   const record = (await ctx.storage.get('settle/tnk/1')).value;
   assert.equal(record.idempotency_key, `mayhem:tnk:settle:v1:testnet1:mayhem:1:${ctx.applyState.last_apply_hash}`);
-  assert.equal(record.msb_tx_hash, 'b'.repeat(64));
+  assert.deepEqual(record.msb_tx_hashes, settlement.msb_tx_hashes);
   assert.deepEqual(record.outputs, settlement.outputs);
 
   const snapshot = ctx.storage.snapshotBytes();
@@ -261,18 +311,136 @@ test('MayhemContract tnkSettlement records one real batch and is idempotent', as
     epoch: 1,
     rail: 'tnk',
     idempotent: true,
-    msb_tx_hash: 'b'.repeat(64),
+    msb_tx_hashes: ["b".repeat(64), "c".repeat(64), "d".repeat(64)],
   });
   assert.equal(ctx.storage.snapshotBytes(), snapshot);
 
   const changed = await executeTnkSettlementFeature(
     ctx.contract,
     ctx.storage,
-    { ...settlement, msb_tx_hash: 'c'.repeat(64) },
+    { ...settlement, msb_tx_hashes: ["c".repeat(64), "d".repeat(64), "e".repeat(64)] },
     ctx.admin.publicKey
   );
   assert.match(changed.message, /already exists/i);
   assert.equal(ctx.storage.snapshotBytes(), snapshot);
+});
+
+test('MayhemContract tnkSettlement releases clean-exit provider earnings after holdback maturity', async () => {
+  const ctx = await setupTnkSettlementContract({
+    holdback_epochs: 2,
+    new_provider_holdback_epochs: 2,
+  });
+  const provider = ctx.providers[0].identity;
+
+  const registeredEnclave = await execute(
+    ctx.contract,
+    ctx.storage,
+    'registerEnclave',
+    cleanExitEnclave,
+    ctx.admin.publicKey,
+    20
+  );
+  assert.equal(registeredEnclave.ok, true, registeredEnclave.message);
+  const modelRef = await execute(
+    ctx.contract,
+    ctx.storage,
+    'setModelRef',
+    cleanExitModelRef,
+    ctx.admin.publicKey,
+    21
+  );
+  assert.equal(modelRef.ok, true, modelRef.message);
+  const price = await execute(
+    ctx.contract,
+    ctx.storage,
+    'setPrice',
+    cleanExitPrice,
+    ctx.admin.publicKey,
+    22
+  );
+  assert.equal(price.ok, true, price.message);
+  const joinedEnclave = await execute(
+    ctx.contract,
+    ctx.storage,
+    'joinEnclave',
+    { op: 'join_enclave', enclave_id: cleanExitEnclaveId },
+    provider.publicKey,
+    23
+  );
+  assert.equal(joinedEnclave.ok, true, joinedEnclave.message);
+  const leftEnclave = await execute(
+    ctx.contract,
+    ctx.storage,
+    'leaveEnclave',
+    { op: 'leave_enclave', enclave_id: cleanExitEnclaveId },
+    provider.publicKey,
+    24
+  );
+  assert.equal(leftEnclave.ok, true, leftEnclave.message);
+  assert.equal((await ctx.storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
+  assert.deepEqual((await ctx.storage.get(`prov/${provider.publicKey}`)).value.enclaves, []);
+  assert.equal(
+    (await ctx.storage.get(`serve/${provider.publicKey}/${cleanExitEnclaveId}`)).value.status,
+    'inactive'
+  );
+
+  const earlySettlement = await executeTnkSettlementFeature(
+    ctx.contract,
+    ctx.storage,
+    await settlementValue(ctx, { msb_tx_hashes: ["c".repeat(64), "d".repeat(64), "e".repeat(64)] }),
+    ctx.admin.publicKey
+  );
+  assert.match(earlySettlement.message, /no payable earnings/i);
+  assert.equal(await ctx.storage.get('settle/tnk/1'), null);
+
+  for (const epoch of [2, 3]) {
+    const applied = await executeEpochApplyFeature(
+      ctx.contract,
+      ctx.storage,
+      {
+        op: 'epoch_apply',
+        epoch,
+        at: 90_000 + epoch,
+        debits: [],
+        earnings: [],
+      },
+      ctx.admin.publicKey
+    );
+    assert.equal(applied.ok, true, applied.message);
+    assert.equal(applied.debited_au, '0');
+    assert.equal(applied.earned_au, '0');
+    assert.equal(applied.fee_au, '0');
+  }
+  ctx.applyState = (await ctx.storage.get('epoch/apply/state')).value;
+  const maturedSettlement = await settlementValue(ctx, {
+    epoch: 3,
+    at: 92_000,
+    msb_tx_hashes: ["d".repeat(64), "e".repeat(64), "f".repeat(64)],
+  });
+  const settled = await executeTnkSettlementFeature(
+    ctx.contract,
+    ctx.storage,
+    maturedSettlement,
+    ctx.admin.publicKey
+  );
+  assert.equal(settled.ok, true, settled.message);
+  assert.equal(settled.epoch, 3);
+
+  for (const providerRecord of ctx.providers) {
+    const earning = (await ctx.storage.get(`earn/tnk/${providerRecord.identity.publicKey}`)).value;
+    const outputIndex = maturedSettlement.outputs.findIndex((output) => (
+      output.role === 'provider' && output.provider === providerRecord.identity.publicKey
+    ));
+    assert.notEqual(outputIndex, -1);
+    assert.equal(earning.held_au, '0');
+    assert.deepEqual(earning.holdbacks, []);
+    assert.equal(
+      earning.paid_cum_au,
+      providerRecord.gross_au === '2000000' ? '1700000' : '850000'
+    );
+    assert.equal(earning.last_settlement_epoch, 3);
+    assert.equal(earning.last_settlement_msb_tx_hash, maturedSettlement.msb_tx_hashes[outputIndex]);
+  }
 });
 
 test('MayhemContract tnkSettlement uses the active admin max_tnk_settlement_outputs param', async () => {
@@ -301,7 +469,11 @@ test('MayhemContract tnkSettlement has no hidden output cap below the active adm
   const result = await executeTnkSettlementFeature(
     ctx.contract,
     ctx.storage,
-    { ...settlement, outputs },
+    {
+      ...settlement,
+      outputs,
+      msb_tx_hashes: outputs.map((_, i) => (i + 1).toString(16).padStart(64, '0')),
+    },
     ctx.admin.publicKey
   );
   assert.doesNotMatch(result.message, /max_tnk_settlement_outputs|exceeds limit/i);

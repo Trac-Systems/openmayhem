@@ -2,7 +2,7 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
-export const CONTRACT_VERSION = 2;
+export const CONTRACT_VERSION = 4;
 const SIGNING_MESSAGE_VERSION = 2;
 const SUPPORTED_SIGNING_MESSAGE_VERSIONS = Object.freeze([2, 1]);
 const CURRENT_RULES_KEY = 'rules/current';
@@ -12,7 +12,7 @@ const PROVIDER_RAIL_SCHEMA_VERSION = 1;
 const PAYOUT_TARGET_METHODS = new Set(['tnk', 'stripe', 'tap']);
 const FIAT_DEPOSIT_RAILS = new Set(['stripe']);
 const FIAT_CURRENCIES = new Set(['usd', 'eur']);
-const PRICE_DENOMINATION = 'mu_usd';
+const PRICE_DENOMINATION = 'au_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
 const TAP_RATE_SOURCES = new Set(['uniswap-v2', 'config', 'stale']);
 const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
@@ -30,7 +30,10 @@ const DEFAULT_MARKET_PRICE_EMA_ALPHA_BPS = 2_500;
 const DEFAULT_MARKET_PRICE_GAIN_BPS = 5_000;
 const DEFAULT_MARKET_PRICE_MAX_STEP_BPS = 1_000;
 const DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS = 2;
-const DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU = 1_000_000;
+const ZERO_AU = '0';
+const ONE_USD_AU = '1000000000000000000';
+const FIVE_MILLI_USD_AU = '5000000000000000';
+const DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_AU = ONE_USD_AU;
 const DEFAULT_MARKET_PRICE_MAX_UTILIZATION_BPS = 50_000;
 const DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS = 2_500;
 const DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS = 15_000;
@@ -40,14 +43,14 @@ const DEFAULT_FRAUD_SLASH_BPS = 10_000;
 const DEFAULT_DISPUTE_LOST_SLASH_BPS = 2_000;
 const MAX_OPERATOR_FEE_BPS = 5_000;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 1;
-const DEFAULT_DISPUTE_DEPOSIT_MU = 1_000_000;
+const DEFAULT_DISPUTE_DEPOSIT_AU = ONE_USD_AU;
 const DEFAULT_MAX_APPLY_BATCH = 2_000;
 const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 6;
-export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 7;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 8;
+export const NEXT_SESSION_RECEIPT_SCHEMA_VERSION = 8;
 const CTX_BRACKET_TABLE_VERSION = 1;
 const CTX_BRACKETS = Object.freeze([
   { id: 'le8k', max_ctx: 8_192 },
@@ -58,6 +61,7 @@ const CTX_BRACKETS = Object.freeze([
 ]);
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
+const USD_AU = 1_000_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 const PARAM_DEFINITIONS = Object.freeze({
@@ -71,14 +75,16 @@ const PARAM_DEFINITIONS = Object.freeze({
   canary_match_min_bps: { default: 9_000, min: 0, max: 10_000 },
   canary_probe_holdback_bps: { default: 0, min: 0, max: 10_000 },
   canary_probe_release_min_passes: { default: 1, min: 0, max: 1_000_000 },
-  probe_reward_mu: { default: 5_000, min: 0, max: Number.MAX_SAFE_INTEGER },
+  probe_reward_au: { default: FIVE_MILLI_USD_AU, min: ZERO_AU, money: true },
   uptime_tick_seconds: { default: 6 * 60 * 60, min: 60, max: 30 * DAY_SECONDS },
   fraud_slash_bps: { default: DEFAULT_FRAUD_SLASH_BPS, min: 0, max: 10_000 },
   dispute_lost_slash_bps: { default: DEFAULT_DISPUTE_LOST_SLASH_BPS, min: 0, max: 10_000 },
+  new_provider_holdback_epochs: { default: 168, min: 0, max: 1_000_000 },
   holdback_epochs: { default: 24, min: 0, max: 1_000_000 },
+  min_tier_notice_epochs: { default: 24, min: 1, max: 1_000_000 },
   fee_bps: { default: 1_500, min: 0, max: MAX_OPERATOR_FEE_BPS },
-  dispute_deposit_mu: { default: DEFAULT_DISPUTE_DEPOSIT_MU, min: 1, max: Number.MAX_SAFE_INTEGER },
-  payout_min_mu: { default: 1_000_000, min: 0, max: Number.MAX_SAFE_INTEGER },
+  dispute_deposit_au: { default: DEFAULT_DISPUTE_DEPOSIT_AU, min: '1', money: true },
+  payout_min_au: { default: ONE_USD_AU, min: ZERO_AU, money: true },
   price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
   price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },
   price_rate_limit_seconds: { default: DEFAULT_PRICE_RATE_LIMIT_SECONDS, min: 0, max: 365 * DAY_SECONDS },
@@ -87,7 +93,7 @@ const PARAM_DEFINITIONS = Object.freeze({
   market_gain_bps: { default: DEFAULT_MARKET_PRICE_GAIN_BPS, min: 1, max: 10_000 },
   market_max_step_bps: { default: DEFAULT_MARKET_PRICE_MAX_STEP_BPS, min: 1, max: 10_000 },
   market_cold_start_min_providers: { default: DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS, min: 0, max: 1_000_000 },
-  market_provider_epoch_target_mu: { default: DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_MU, min: 1, max: Number.MAX_SAFE_INTEGER },
+  market_provider_epoch_target_au: { default: DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_AU, min: '1', money: true },
   market_max_utilization_bps: { default: DEFAULT_MARKET_PRICE_MAX_UTILIZATION_BPS, min: 1, max: 1_000_000 },
   market_below_target_discount_bps: { default: DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS, min: 0, max: 10_000 },
   market_above_target_slope_bps: { default: DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS, min: 0, max: 1_000_000 },
@@ -111,14 +117,16 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'canary_match_min_bps',
   'canary_probe_holdback_bps',
   'canary_probe_release_min_passes',
-  'probe_reward_mu',
+  'probe_reward_au',
   'uptime_tick_seconds',
   'fraud_slash_bps',
   'dispute_lost_slash_bps',
+  'new_provider_holdback_epochs',
   'holdback_epochs',
+  'min_tier_notice_epochs',
   'fee_bps',
-  'dispute_deposit_mu',
-  'payout_min_mu',
+  'dispute_deposit_au',
+  'payout_min_au',
   'price_min_bps',
   'price_max_bps',
   'price_rate_limit_seconds',
@@ -127,7 +135,7 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'market_gain_bps',
   'market_max_step_bps',
   'market_cold_start_min_providers',
-  'market_provider_epoch_target_mu',
+  'market_provider_epoch_target_au',
   'market_max_utilization_bps',
   'market_below_target_discount_bps',
   'market_above_target_slope_bps',
@@ -158,21 +166,23 @@ const PROBE_VERIFICATION_METHODS = new Set([
   'seed_perceptual_hash',
   'attestation_of_compute',
 ]);
+const BAN_TARGET_TYPES = new Set(['provider', 'device', 'fingerprint', 'committer']);
 const FRAUD_PROOF_REASONS = new Set(['over_credit', 'price_derivation']);
 const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
 const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit']);
 const EPOCH_ROOT_KEYS = ['dep', 'use', 'earn', 'fee', 'price'];
 const EPOCH_TOTAL_KEYS = [
   'dep_count',
-  'dep_mu',
+  'dep_au',
   'use_count',
-  'use_mu',
+  'use_au',
   'provider_count',
-  'earn_mu',
-  'fee_mu',
-  'fee_cum_mu',
+  'earn_au',
+  'fee_au',
+  'fee_cum_au',
   'price_count',
 ];
+const EPOCH_TOTAL_MONEY_KEYS = new Set(['dep_au', 'use_au', 'earn_au', 'fee_au', 'fee_cum_au']);
 const ENCLAVE_UPDATE_FIELDS = [
   'model_class',
   'backend',
@@ -352,7 +362,7 @@ export const spendReservationEvidence = (value) => ({
   served_ctx: value.served_ctx,
   ctx_bracket: value.ctx_bracket,
   ctx_bracket_table_ver: value.ctx_bracket_table_ver,
-  max_spend_mu: value.max_spend_mu,
+  max_spend_au: value.max_spend_au,
   voucher: stableValue(value.voucher),
 });
 export const spendReservationMessage = (value) =>
@@ -593,6 +603,30 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         provider: { type: 'string', min: 1, max: 128 },
         reason_hash: { type: 'string', min: 1, max: 128, optional: true },
+        device_key: { type: 'string', min: 1, max: 128, optional: true },
+        hardware_fingerprint: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
+    this.addSchema('unban', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        target_type: { type: 'string', min: 1, max: 32 },
+        target: { type: 'string', min: 1, max: 128 },
+        reason_hash: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
+    this.addSchema('deviceRebind', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        device_key: { type: 'string', min: 1, max: 128 },
+        provider: { type: 'string', min: 1, max: 128 },
+        reason_hash: { type: 'string', min: 1, max: 128 },
       },
     });
 
@@ -670,12 +704,28 @@ class MayhemContract extends Contract {
       },
     });
 
+    this.addSchema('setEnclaveMinTier', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        enclave_id: { type: 'string', min: 1, max: 128 },
+        min_att_tier: { type: 'number', integer: true, min: 1, max: 4 },
+        submitted_epoch: { type: 'number', integer: true, min: 0 },
+        effective_epoch: { type: 'number', integer: true, min: 0 },
+        submitted_at: { type: 'number', integer: true, min: 0 },
+        reason_hash: { type: 'string', min: 1, max: 128 },
+      },
+    });
+
     this.addSchema('joinEnclave', {
       value: {
         $$strict: true,
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
+        hardware_fingerprint: { type: 'string', min: 1, max: 128, optional: true },
+        device_key: { type: 'string', min: 1, max: 128, optional: true },
       },
     });
 
@@ -746,8 +796,8 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
         rate_map: { type: 'array', min: 1, max: RATE_MAP_MAX_ENTRIES, items: { type: 'any' } },
-        per_req_mu: { type: 'number', integer: true, min: 0 },
-        min_session_mu: { type: 'number', integer: true, min: 0 },
+        per_req_au: { type: 'string', min: 1, max: 80 },
+        min_session_au: { type: 'string', min: 1, max: 80 },
         effective_at: { type: 'number', integer: true, min: 0 },
         ctx_bracket: { type: 'string', min: 1, max: 64, optional: true },
       },
@@ -774,8 +824,8 @@ class MayhemContract extends Contract {
         kind: { type: 'string', min: 1, max: 64 },
         epoch: { type: 'number', integer: true, min: 0 },
         at: { type: 'number', integer: true, min: 0 },
-        paid_mu: { type: 'number', integer: true, min: 0, optional: true },
-        max_spend_mu: { type: 'number', integer: true, min: 0, optional: true },
+        paid_au: { type: 'string', min: 1, max: 80, optional: true },
+        max_spend_au: { type: 'string', min: 1, max: 80, optional: true },
         evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
         beneficiary: { type: 'string', min: 1, max: 128, optional: true },
         enclave_id: { type: 'string', min: 1, max: 128, optional: true },
@@ -852,8 +902,8 @@ class MayhemContract extends Contract {
         at: { type: 'number', integer: true, min: 0 },
         reason: { type: 'string', min: 1, max: 64 },
         receipt: { type: 'any', optional: true },
-        claimed_mu_owed_cum: { type: 'number', integer: true, min: 0, optional: true },
-        previous_mu_owed_cum: { type: 'number', integer: true, min: 0, optional: true },
+        claimed_au_owed_cum: { type: 'string', min: 1, max: 80, optional: true },
+        previous_au_owed_cum: { type: 'string', min: 1, max: 80, optional: true },
         price_usage: { type: 'any', optional: true },
       },
     });
@@ -898,7 +948,7 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         rail: { type: 'string', min: 1, max: 64 },
         who: { type: 'string', min: 1, max: 128 },
-        mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        au: { type: 'string', min: 1, max: 80 },
         ext_ref_hash: { type: 'string', min: 1, max: 128 },
         fiat_currency: { type: 'string', min: 3, max: 3 },
         fiat_amount_minor: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
@@ -914,7 +964,7 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         rail: { type: 'string', min: 1, max: 64 },
         who: { type: 'string', min: 1, max: 128 },
-        mu: { type: 'number', integer: true, min: 1, max: Number.MAX_SAFE_INTEGER },
+        au: { type: 'string', min: 1, max: 80 },
         ext_ref_hash: { type: 'string', min: 1, max: 128 },
         dispute_ref_hash: { type: 'string', min: 1, max: 128 },
         fiat_currency: { type: 'string', min: 3, max: 3 },
@@ -1066,7 +1116,13 @@ class MayhemContract extends Contract {
       case 'register_provider':
         return await this.applyRegisterProvider(intent.provider, key);
       case 'join_enclave':
-        return await this.applyJoinEnclave(intent.provider, intent.enclave_id, key);
+        return await this.applyJoinEnclave(
+          intent.provider,
+          intent.enclave_id,
+          key,
+          intent.hardware_fingerprint ?? null,
+          intent.device_key ?? null
+        );
       case 'leave_enclave':
         return await this.applyLeaveEnclave(intent.provider, intent.enclave_id, key);
       case 'join_room':
@@ -1111,10 +1167,11 @@ class MayhemContract extends Contract {
     if (!serve || serve.status !== 'active') {
       return new Error('Provider is not actively serving this admin enclave.');
     }
-    const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id, normalized.ctx_bracket);
+    const priceCtxBracket = normalized.ctx_bracket ?? null;
+    const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id, priceCtxBracket);
     if (priceError) return priceError;
     const lockedPrice = await this.get(
-      this.priceRecordKey(normalized.enclave_id, normalized.price_ver, normalized.ctx_bracket)
+      this.priceRecordKey(normalized.enclave_id, normalized.price_ver, priceCtxBracket)
     );
     if (!lockedPrice || lockedPrice.denom !== PRICE_DENOMINATION) {
       return new Error('Spend reservation locked price version is not known.');
@@ -1122,20 +1179,20 @@ class MayhemContract extends Contract {
     if (lockedPrice.set_by_role !== 'admin') {
       return new Error('Spend reservation locked price is not admin-set.');
     }
-    if (lockedPrice.ctx_bracket !== normalized.ctx_bracket) {
+    if ((lockedPrice.ctx_bracket ?? null) !== priceCtxBracket) {
       return new Error('Spend reservation locked price context bracket mismatch.');
     }
-    if (lockedPrice.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver) {
+    if ((lockedPrice.ctx_bracket_table_ver ?? null) !== (normalized.ctx_bracket_table_ver ?? null)) {
       return new Error('Spend reservation locked price context bracket table mismatch.');
     }
     if (stableJson(normalized.locked_rate_map) !== stableJson(lockedPrice.rate_map)) {
       return new Error('Spend reservation locked rate_map does not match price version.');
     }
-    if (normalized.locked_per_req_mu !== (lockedPrice.per_req_mu ?? 0)) {
-      return new Error('Spend reservation locked per_req_mu does not match price version.');
+    if (this.compareAu(normalized.locked_per_req_au, lockedPrice.per_req_au ?? ZERO_AU) !== 0) {
+      return new Error('Spend reservation locked per_req_au does not match price version.');
     }
-    if (normalized.locked_min_session_mu !== (lockedPrice.min_session_mu ?? 0)) {
-      return new Error('Spend reservation locked min_session_mu does not match price version.');
+    if (this.compareAu(normalized.locked_min_session_au, lockedPrice.min_session_au ?? ZERO_AU) !== 0) {
+      return new Error('Spend reservation locked min_session_au does not match price version.');
     }
     const rules = await this.currentRules();
     if (!rules || rules.ver !== normalized.rules_ver) {
@@ -1162,20 +1219,20 @@ class MayhemContract extends Contract {
         existing.enclave_id !== normalized.enclave_id ||
         existing.price_ver !== normalized.price_ver ||
         stableJson(existing.locked_rate_map) !== stableJson(normalized.locked_rate_map) ||
-        existing.locked_per_req_mu !== normalized.locked_per_req_mu ||
-        existing.locked_min_session_mu !== normalized.locked_min_session_mu ||
+        this.compareAu(existing.locked_per_req_au, normalized.locked_per_req_au) !== 0 ||
+        this.compareAu(existing.locked_min_session_au, normalized.locked_min_session_au) !== 0 ||
         existing.served_ctx !== normalized.served_ctx ||
         existing.ctx_bracket !== normalized.ctx_bracket ||
         existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
-        existing.max_spend_mu !== normalized.max_spend_mu ||
+        this.compareAu(existing.max_spend_au, normalized.max_spend_au) !== 0 ||
         existing.voucher_hash !== normalized.voucher_hash
       ) {
         return new Error('Spend reservation session already exists with different terms.');
       }
-      const availableMu = hold.reserved_mu >= balance.mu
-        ? 0
-        : this.safeSubMu(balance.mu, hold.reserved_mu);
-      if (availableMu instanceof Error) return availableMu;
+      const availableAu = this.compareAu(hold.reserved_au, balance.au) >= 0
+        ? ZERO_AU
+        : this.safeSubAu(balance.au, hold.reserved_au);
+      if (availableAu instanceof Error) return availableAu;
       return {
         ok: true,
         op: 'spendReserve',
@@ -1184,15 +1241,15 @@ class MayhemContract extends Contract {
         rail: normalized.rail,
         user: normalized.user,
         provider: normalized.provider,
-        reserved_mu: hold.reserved_mu,
-        available_mu: availableMu,
+        reserved_au: hold.reserved_au,
+        available_au: availableAu,
         idempotent: true,
       };
     }
 
-    const nextReservedMu = this.safeAddMu(hold.reserved_mu, normalized.max_spend_mu);
-    if (nextReservedMu instanceof Error) return nextReservedMu;
-    if (nextReservedMu > balance.mu) {
+    const nextReservedAu = this.safeAddAu(hold.reserved_au, normalized.max_spend_au);
+    if (nextReservedAu instanceof Error) return nextReservedAu;
+    if (this.compareAu(nextReservedAu, balance.au) > 0) {
       return new Error('Insufficient unreserved credit balance.');
     }
     const session = {
@@ -1201,13 +1258,13 @@ class MayhemContract extends Contract {
       enclave_id: normalized.enclave_id,
       price_ver: normalized.price_ver,
       locked_rate_map: normalized.locked_rate_map,
-      locked_per_req_mu: normalized.locked_per_req_mu,
-      locked_min_session_mu: normalized.locked_min_session_mu,
+      locked_per_req_au: normalized.locked_per_req_au,
+      locked_min_session_au: normalized.locked_min_session_au,
       served_ctx: normalized.served_ctx,
       ctx_bracket: normalized.ctx_bracket,
       ctx_bracket_table_ver: normalized.ctx_bracket_table_ver,
       rules_ver: normalized.rules_ver,
-      max_spend_mu: normalized.max_spend_mu,
+      max_spend_au: normalized.max_spend_au,
       voucher_hash: normalized.voucher_hash,
       feature_key: key,
       reserved_at: normalized.at,
@@ -1215,14 +1272,14 @@ class MayhemContract extends Contract {
     };
     const nextHold = {
       ...hold,
-      balance_mu_at_last_reserve: balance.mu,
-      reserved_mu: nextReservedMu,
+      balance_au_at_last_reserve: balance.au,
+      reserved_au: nextReservedAu,
       sessions: [...hold.sessions, session].sort((a, b) => compareCodepoint(a.session_id, b.session_id)),
       updated_at: this.tx,
     };
     await this.put(holdKey, nextHold);
-    const availableMu = this.safeSubMu(balance.mu, nextHold.reserved_mu);
-    if (availableMu instanceof Error) return availableMu;
+    const availableAu = this.safeSubAu(balance.au, nextHold.reserved_au);
+    if (availableAu instanceof Error) return availableAu;
     return {
       ok: true,
       op: 'spendReserve',
@@ -1231,8 +1288,8 @@ class MayhemContract extends Contract {
       rail: normalized.rail,
       user: normalized.user,
       provider: normalized.provider,
-      reserved_mu: nextHold.reserved_mu,
-      available_mu: availableMu,
+      reserved_au: nextHold.reserved_au,
+      available_au: availableAu,
       idempotent: false,
     };
   }
@@ -1387,18 +1444,20 @@ class MayhemContract extends Contract {
 
     const valuesError = this.validateParamValues(this.value.values);
     if (valuesError) return valuesError;
+    const normalizedValues = this.normalizeParamValues(this.value.values);
+    if (normalizedValues instanceof Error) return normalizedValues;
 
     const existingAtEffective = await this.activeParamsAt(this.value.effective_at);
-    const mergedAtEffective = { ...existingAtEffective, ...this.value.values };
+    const mergedAtEffective = { ...existingAtEffective, ...normalizedValues };
     const boundsError = this.validateParamBounds(mergedAtEffective);
     if (boundsError) return boundsError;
 
     const meta = await this.get('params/current');
     const ver = meta ? meta.ver + 1 : 1;
-    const keys = Object.keys(this.value.values).sort();
+    const keys = Object.keys(normalizedValues).sort();
     const update = {
       ver,
-      values: cloneValue(this.value.values),
+      values: cloneValue(normalizedValues),
       submitted_at: this.value.submitted_at,
       effective_at: this.value.effective_at,
       set_by: this.address,
@@ -1417,7 +1476,7 @@ class MayhemContract extends Contract {
         key,
         current,
         pending: {
-          value: this.value.values[key],
+          value: normalizedValues[key],
           ver,
           submitted_at: this.value.submitted_at,
           effective_at: this.value.effective_at,
@@ -1815,6 +1874,12 @@ class MayhemContract extends Contract {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
     if (!this.isSafeKeyPart(this.value.provider)) return new Error('Invalid provider id.');
+    if (this.value.device_key !== undefined && !this.isHexBytes(this.value.device_key, 32)) {
+      return new Error('Invalid provider device key.');
+    }
+    if (this.value.hardware_fingerprint !== undefined && !this.isHexBytes(this.value.hardware_fingerprint, 32)) {
+      return new Error('Invalid provider hardware fingerprint.');
+    }
 
     const key = `prov/${this.value.provider}`;
     const record = await this.get(key);
@@ -1839,13 +1904,162 @@ class MayhemContract extends Contract {
       ban_reason_hash: this.value.reason_hash ?? null,
       updated_at: this.tx,
     };
+    const providerBan = {
+      target_type: 'provider',
+      target: this.value.provider,
+      provider: this.value.provider,
+      status: 'banned',
+      reason_hash: this.value.reason_hash ?? null,
+      banned_at: this.tx,
+      banned_by: this.address,
+      banned_by_role: 'admin',
+      reversible: true,
+    };
+    const deviceKey = this.value.device_key ?? record.device_key ?? null;
+    const fingerprint = this.value.hardware_fingerprint ?? record.hardware_fingerprint ?? null;
     await this.put(key, updated);
+    await this.put(`ban/provider/${this.value.provider}`, providerBan);
+    if (deviceKey) {
+      await this.put(`ban/device/${deviceKey}`, {
+        target_type: 'device',
+        target: deviceKey,
+        provider: this.value.provider,
+        status: 'banned',
+        reason_hash: this.value.reason_hash ?? null,
+        banned_at: this.tx,
+        banned_by: this.address,
+        banned_by_role: 'admin',
+        reversible: true,
+      });
+    }
+    if (fingerprint) {
+      const fpKey = `ban/fingerprint/${fingerprint}`;
+      const current = await this.get(fpKey);
+      const wallets = {
+        ...(current?.wallets ?? {}),
+        [this.value.provider]: {
+          provider: this.value.provider,
+          reason_hash: this.value.reason_hash ?? null,
+          banned_at: this.tx,
+        },
+      };
+      await this.put(fpKey, {
+        target_type: 'fingerprint',
+        target: fingerprint,
+        status: 'banned',
+        wallets,
+        reason_hash: this.value.reason_hash ?? null,
+        banned_at: current?.banned_at ?? this.tx,
+        updated_at: this.tx,
+        banned_by: this.address,
+        banned_by_role: 'admin',
+        reversible: true,
+        auto_reject: false,
+      });
+    }
     console.log('mayhem banProvider', updated);
     return {
       ok: true,
       op: 'banProvider',
       provider: this.value.provider,
       tombstoned_enclaves: updated.tombstoned_enclaves,
+      device_key: deviceKey,
+      hardware_fingerprint: fingerprint,
+    };
+  }
+
+  async unban() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'target_type', 'target', 'reason_hash'],
+      'unban'
+    );
+    if (shapeError) return shapeError;
+    const targetType = String(this.value.target_type).toLowerCase();
+    if (!BAN_TARGET_TYPES.has(targetType)) return new Error('Unsupported ban target type.');
+    if (!this.isHexBytes(this.value.target, 32)) return new Error('Invalid ban target.');
+    if (!this.isHexBytes(this.value.reason_hash, 32)) return new Error('Invalid unban reason hash.');
+
+    if (targetType === 'provider') {
+      const provider = await this.get(`prov/${this.value.target}`);
+      if (!provider) return new Error('Provider not found.');
+      if (provider.status === 'banned') {
+        await this.put(`prov/${this.value.target}`, {
+          ...provider,
+          status: 'active',
+          unbanned_at: this.tx,
+          unbanned_by: this.address,
+          unbanned_by_role: 'admin',
+          unban_reason_hash: this.value.reason_hash,
+          updated_at: this.tx,
+        });
+      }
+    }
+
+    const key = this.banRecordKey(targetType, this.value.target);
+    const current = await this.get(key);
+    const record = {
+      ...(current ?? {}),
+      target_type: targetType,
+      target: this.value.target,
+      status: 'unbanned',
+      unbanned_at: this.tx,
+      unbanned_by: this.address,
+      unbanned_by_role: 'admin',
+      unban_reason_hash: this.value.reason_hash,
+      reversible: true,
+    };
+    await this.put(key, record);
+    console.log('mayhem unban', record);
+    return {
+      ok: true,
+      op: 'unban',
+      target_type: targetType,
+      target: this.value.target,
+    };
+  }
+
+  async deviceRebind() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'device_key', 'provider', 'reason_hash'],
+      'device_rebind'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isHexBytes(this.value.device_key, 32)) return new Error('Invalid device key.');
+    if (!this.isHexBytes(this.value.provider, 32)) return new Error('Invalid provider id.');
+    if (!this.isHexBytes(this.value.reason_hash, 32)) return new Error('Invalid rebind reason hash.');
+    const provider = await this.get(`prov/${this.value.provider}`);
+    if (!provider || provider.status !== 'active') return new Error('Active provider not found.');
+    const deviceBan = await this.get(`ban/device/${this.value.device_key}`);
+    if (deviceBan?.status === 'banned') return new Error('Device key is banned.');
+    const current = await this.get(`device/${this.value.device_key}`);
+    const record = {
+      ...(current ?? {}),
+      device_key: this.value.device_key,
+      provider: this.value.provider,
+      status: 'active',
+      rebound_at: this.tx,
+      rebound_by: this.address,
+      rebound_by_role: 'admin',
+      rebind_reason_hash: this.value.reason_hash,
+      previous_provider: current?.provider ?? null,
+    };
+    await this.put(`device/${this.value.device_key}`, record);
+    await this.put(`prov/${this.value.provider}`, {
+      ...provider,
+      device_key: this.value.device_key,
+      device_key_bound_at: this.tx,
+      updated_at: this.tx,
+    });
+    console.log('mayhem deviceRebind', record);
+    return {
+      ok: true,
+      op: 'deviceRebind',
+      device_key: this.value.device_key,
+      provider: this.value.provider,
     };
   }
 
@@ -1945,6 +2159,8 @@ class MayhemContract extends Contract {
       source_sha256: this.value.source_sha256 ?? null,
       manifest_hash: this.value.manifest_hash,
       att_tier: this.value.att_tier,
+      min_att_tier: this.value.att_tier,
+      pending_min_att_tier: null,
       quant,
       binary_hash: this.value.binary_hash,
       caps: cloneValue(this.value.caps),
@@ -2003,6 +2219,87 @@ class MayhemContract extends Contract {
     return { ok: true, op: 'updateEnclave', enclave_id: updated.enclave_id };
   }
 
+  async setEnclaveMinTier() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(
+      [
+        'op',
+        'enclave_id',
+        'min_att_tier',
+        'submitted_epoch',
+        'effective_epoch',
+        'submitted_at',
+        'reason_hash',
+      ],
+      'set_enclave_min_tier'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
+    if (!this.isHexBytes(this.value.reason_hash, 32)) return new Error('Invalid min-tier reason hash.');
+
+    const tierError = this.validateLaunchEnclaveAttestationTier(this.value.min_att_tier);
+    if (tierError) return tierError;
+    if (this.value.effective_epoch <= this.value.submitted_epoch) {
+      return new Error('Enclave min-tier effective_epoch must be after submitted_epoch.');
+    }
+
+    const enclaveKey = `enclave/${this.value.enclave_id}`;
+    const enclave = await this.get(enclaveKey);
+    if (!enclave) return new Error('Enclave not found.');
+    if (enclave.status !== 'active') return new Error('Enclave is not active.');
+    const enclaveRoleError = this.requireAdminCreatedEnclave(enclave);
+    if (enclaveRoleError) return enclaveRoleError;
+
+    const params = await this.activeParamsAt(this.value.submitted_at, ['min_tier_notice_epochs']);
+    if (
+      this.value.effective_epoch - this.value.submitted_epoch <
+      params.min_tier_notice_epochs
+    ) {
+      return new Error('Enclave min-tier changes require at least min_tier_notice_epochs notice.');
+    }
+
+    const currentEpoch = await this.currentAppliedEpoch();
+    const activePolicy = await this.enclaveMinTierPolicy(enclave, currentEpoch);
+    const pending = {
+      min_att_tier: this.value.min_att_tier,
+      previous_min_att_tier: activePolicy.min_att_tier,
+      submitted_epoch: this.value.submitted_epoch,
+      effective_epoch: this.value.effective_epoch,
+      submitted_at: this.value.submitted_at,
+      reason_hash: this.value.reason_hash,
+      scheduled_at: this.tx,
+      scheduled_by: this.address,
+      scheduled_by_role: 'admin',
+    };
+    const record = {
+      enclave_id: this.value.enclave_id,
+      current_min_att_tier: activePolicy.min_att_tier,
+      current_epoch: currentEpoch,
+      pending,
+      updated_at: this.tx,
+      updated_by: this.address,
+      updated_by_role: 'admin',
+    };
+    await this.put(`tierpolicy/enclave/${this.value.enclave_id}`, record);
+    await this.put(enclaveKey, {
+      ...enclave,
+      min_att_tier: activePolicy.min_att_tier,
+      pending_min_att_tier: pending,
+      updated_at: this.tx,
+      updated_by: this.address,
+      updated_by_role: 'admin',
+    });
+    console.log('mayhem setEnclaveMinTier', record);
+    return {
+      ok: true,
+      op: 'setEnclaveMinTier',
+      enclave_id: this.value.enclave_id,
+      min_att_tier: this.value.min_att_tier,
+      effective_epoch: this.value.effective_epoch,
+    };
+  }
+
   async retireEnclave() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
@@ -2046,18 +2343,34 @@ class MayhemContract extends Contract {
   }
 
   async joinEnclave() {
-    const shapeError = this.validateExactCommandValue(['op', 'enclave_id'], 'join_enclave');
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'enclave_id'],
+      'join_enclave',
+      ['hardware_fingerprint', 'device_key']
+    );
     if (shapeError) return shapeError;
     if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
 
-    return this.applyJoinEnclave(this.address, this.value.enclave_id, this.tx);
+    return this.applyJoinEnclave(
+      this.address,
+      this.value.enclave_id,
+      this.tx,
+      this.value.hardware_fingerprint ?? null,
+      this.value.device_key ?? null
+    );
   }
 
-  async applyJoinEnclave(providerId, enclaveId, stamp) {
+  async applyJoinEnclave(providerId, enclaveId, stamp, hardwareFingerprint = null, deviceKey = null) {
     const consentError = await this.requireConsent(providerId);
     if (consentError) return consentError;
     const providerError = await this.requireProvider(providerId);
     if (providerError) return providerError;
+    if (hardwareFingerprint !== null && !this.isHexBytes(hardwareFingerprint, 32)) {
+      return new Error('Invalid provider hardware fingerprint.');
+    }
+    if (deviceKey !== null && !this.isHexBytes(deviceKey, 32)) {
+      return new Error('Invalid provider device key.');
+    }
 
     const enclave = await this.get(`enclave/${enclaveId}`);
     if (!enclave) return new Error('Enclave not found.');
@@ -2066,18 +2379,56 @@ class MayhemContract extends Contract {
     if (enclaveRoleError) return enclaveRoleError;
     const priceError = await this.requireCurrentAdminPrice(enclaveId);
     if (priceError) return priceError;
+    const minTierPolicy = await this.enclaveMinTierPolicy(enclave);
+    if (enclave.att_tier < minTierPolicy.min_att_tier) {
+      return new Error(
+        `Enclave now requires minimum attestation tier ${minTierPolicy.min_att_tier}; lower-tier providers finish in-flight work and held earnings settle on the normal schedule.`
+      );
+    }
 
     const key = `serve/${providerId}/${enclaveId}`;
     const existing = await this.get(key);
     if (existing && existing.status === 'active') return new Error('Provider already serving enclave.');
     const provider = await this.get(`prov/${providerId}`);
     if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    if (deviceKey !== null) {
+      const deviceBan = await this.get(`ban/device/${deviceKey}`);
+      if (deviceBan?.status === 'banned') return new Error('Provider device key is banned.');
+      const binding = await this.get(`device/${deviceKey}`);
+      if (binding?.provider && binding.provider !== providerId) {
+        return new Error('Provider device key is bound to a different wallet; admin rebind required.');
+      }
+    }
+
+    let fingerprintReview = null;
+    if (hardwareFingerprint !== null) {
+      const fingerprintBan = await this.get(`ban/fingerprint/${hardwareFingerprint}`);
+      if (fingerprintBan?.status === 'banned') {
+        fingerprintReview = {
+          target_type: 'fingerprint',
+          hardware_fingerprint: hardwareFingerprint,
+          provider: providerId,
+          enclave_id: enclaveId,
+          status: 'needs_admin_review',
+          reason: 'fingerprint_matches_ban_record',
+          auto_reject: false,
+          recorded_at: stamp,
+        };
+        await this.put(
+          `review/fingerprint/${hardwareFingerprint}/${providerId}/${stamp}`,
+          fingerprintReview
+        );
+      }
+    }
 
     const record = {
       provider: providerId,
       enclave_id: enclaveId,
       model_id: enclave.model_id,
       status: 'active',
+      ...(hardwareFingerprint !== null ? { hardware_fingerprint: hardwareFingerprint } : {}),
+      ...(deviceKey !== null ? { device_key: deviceKey } : {}),
+      ...(fingerprintReview !== null ? { fingerprint_review: fingerprintReview } : {}),
       joined_at: existing?.joined_at ?? stamp,
       updated_at: stamp,
       left_at: null,
@@ -2089,9 +2440,23 @@ class MayhemContract extends Contract {
       providers: this.enclaveProvidersWith(enclave, providerId),
       updated_at: stamp,
     });
+    if (deviceKey !== null) {
+      const currentDevice = await this.get(`device/${deviceKey}`);
+      await this.put(`device/${deviceKey}`, {
+        ...(currentDevice ?? {}),
+        device_key: deviceKey,
+        provider: providerId,
+        status: 'active',
+        bound_at: stamp,
+        updated_at: stamp,
+      });
+    }
     await this.put(`prov/${providerId}`, {
       ...provider,
       enclaves: this.providerEnclavesWith(provider, enclaveId),
+      ...(hardwareFingerprint !== null ? { hardware_fingerprint: hardwareFingerprint } : {}),
+      ...(deviceKey !== null ? { device_key: deviceKey, device_key_bound_at: stamp } : {}),
+      ...(fingerprintReview !== null ? { fingerprint_review: fingerprintReview } : {}),
       updated_at: stamp,
     });
     console.log('mayhem joinEnclave', record);
@@ -2397,6 +2762,10 @@ class MayhemContract extends Contract {
     });
     if (rateError) return rateError;
     const priceRateMap = this.normalizeRateMap(this.value.rate_map);
+    const perReqAu = this.normalizeAu(this.value.per_req_au, 'Enclave price per_req_au');
+    if (perReqAu instanceof Error) return perReqAu;
+    const minSessionAu = this.normalizeAu(this.value.min_session_au, 'Enclave price min_session_au');
+    if (minSessionAu instanceof Error) return minSessionAu;
     const params = await this.activeParamsAt(this.value.effective_at, [
       'price_min_bps',
       'price_max_bps',
@@ -2424,8 +2793,8 @@ class MayhemContract extends Contract {
       denom: PRICE_DENOMINATION,
       ver: latest ? latest.ver + 1 : 1,
       rate_map: priceRateMap,
-      per_req_mu: this.value.per_req_mu,
-      min_session_mu: this.value.min_session_mu,
+      per_req_au: perReqAu,
+      min_session_au: minSessionAu,
       effective_at: this.value.effective_at,
       effective_from: this.tx,
       updated_at: this.tx,
@@ -2523,8 +2892,12 @@ class MayhemContract extends Contract {
       kind: this.value.kind,
       epoch: this.value.epoch,
       at: this.value.at,
-      paid_mu: this.value.paid_mu ?? null,
-      max_spend_mu: this.value.max_spend_mu ?? null,
+      paid_au: this.value.paid_au !== undefined
+        ? this.normalizeAu(this.value.paid_au, 'reputation paid amount')
+        : null,
+      max_spend_au: this.value.max_spend_au !== undefined
+        ? this.normalizeAu(this.value.max_spend_au, 'reputation max spend')
+        : null,
       evidence_hash: this.value.evidence_hash ?? null,
     });
     if (record instanceof Error) return record;
@@ -2704,7 +3077,7 @@ class MayhemContract extends Contract {
 
     const params = await this.activeParamsAt(this.value.at, [
       'canary_match_min_bps',
-      'probe_reward_mu',
+      'probe_reward_au',
       'uptime_tick_seconds',
       'fraud_slash_bps',
     ]);
@@ -2723,8 +3096,8 @@ class MayhemContract extends Contract {
           : 'probe_fail',
       epoch: this.value.epoch,
       at: this.value.at,
-      paid_mu: null,
-      max_spend_mu: null,
+      paid_au: null,
+      max_spend_au: null,
       evidence_hash: this.value.evidence_hash ?? null,
     });
     if (reputationEvent instanceof Error) return reputationEvent;
@@ -2739,8 +3112,8 @@ class MayhemContract extends Contract {
         kind: 'provenance_violation',
         epoch: this.value.epoch,
         at: this.value.at,
-        paid_mu: null,
-        max_spend_mu: null,
+        paid_au: null,
+        max_spend_au: null,
         evidence_hash: this.value.evidence_hash ?? null,
       });
       if (violationEvent instanceof Error) return violationEvent;
@@ -2780,7 +3153,7 @@ class MayhemContract extends Contract {
       auditor_sig: this.value.auditor_sig ?? null,
       reputation_head: (await this.get(`ev/rep/head/${this.value.provider}`))?.head ?? null,
       provenance_violation: provenanceViolation,
-      probe_reward_mu: params.probe_reward_mu,
+      probe_reward_au: params.probe_reward_au,
       slash,
       recorded_at: this.tx,
     };
@@ -2835,8 +3208,12 @@ class MayhemContract extends Contract {
       'fee_bps',
       'max_apply_batch',
       'max_market_usage_entries',
+      'probation_successful_sessions',
+      'new_provider_holdback_epochs',
       'holdback_epochs',
       'challenge_epochs',
+      'probation_successful_sessions',
+      'new_provider_holdback_epochs',
       'canary_probe_holdback_bps',
       'canary_probe_release_min_passes',
     ]);
@@ -2847,23 +3224,23 @@ class MayhemContract extends Contract {
       return new Error('Epoch market usage batch exceeds max_market_usage_entries.');
     }
 
-    const debitMap = this.aggregateRailLedgerEntries(this.value.debits, 'user', 'mu', 'debit');
+    const debitMap = this.aggregateRailLedgerEntries(this.value.debits, 'user', 'au', 'debit');
     if (debitMap instanceof Error) return debitMap;
     const grossEarningMap = this.aggregateRailLedgerEntries(
       this.value.earnings,
       'provider',
-      'gross_mu',
+      'gross_au',
       'earning'
     );
     if (grossEarningMap instanceof Error) return grossEarningMap;
 
-    const debitTotal = this.sumRailMu(debitMap, 'mu');
+    const debitTotal = this.sumRailAu(debitMap, 'au');
     if (debitTotal instanceof Error) return debitTotal;
-    const grossTotal = this.sumRailMu(grossEarningMap, 'gross_mu');
+    const grossTotal = this.sumRailAu(grossEarningMap, 'gross_au');
     if (grossTotal instanceof Error) return grossTotal;
-    const debitRailTotals = this.railTotals(debitMap, 'mu');
+    const debitRailTotals = this.railTotals(debitMap, 'au');
     if (debitRailTotals instanceof Error) return debitRailTotals;
-    const grossRailTotals = this.railTotals(grossEarningMap, 'gross_mu');
+    const grossRailTotals = this.railTotals(grossEarningMap, 'gross_au');
     if (grossRailTotals instanceof Error) return grossRailTotals;
     const railTotalError = this.assertMatchingRailTotals(debitRailTotals, grossRailTotals);
     if (railTotalError) return railTotalError;
@@ -2872,9 +3249,9 @@ class MayhemContract extends Contract {
       ? this.aggregateMarketUsageEntries(this.value.market_usage)
       : new Map();
     if (marketUsageMap instanceof Error) return marketUsageMap;
-    const marketUsageTotal = this.sumMarketDemandMu(marketUsageMap);
+    const marketUsageTotal = this.sumMarketDemandAu(marketUsageMap);
     if (marketUsageTotal instanceof Error) return marketUsageTotal;
-    if (marketUsageProvided && marketUsageTotal !== grossTotal) {
+    if (marketUsageProvided && this.compareAu(marketUsageTotal, grossTotal) !== 0) {
       return new Error('Epoch market usage demand must equal gross provider earnings.');
     }
 
@@ -2887,8 +3264,8 @@ class MayhemContract extends Contract {
       at: this.value.at,
       epoch_seconds: params.epoch_seconds,
       fee_bps: params.fee_bps,
-      debits: this.mapRailEntriesForHash(debitMap, 'user', 'mu'),
-      earnings: this.mapRailEntriesForHash(grossEarningMap, 'provider', 'gross_mu'),
+      debits: this.mapRailEntriesForHash(debitMap, 'user', 'au'),
+      earnings: this.mapRailEntriesForHash(grossEarningMap, 'provider', 'gross_au'),
       roots,
       totals,
     };
@@ -2905,9 +3282,9 @@ class MayhemContract extends Contract {
         op: 'epochApply',
         epoch: this.value.epoch,
         idempotent: true,
-        debited_mu: 0,
-        earned_mu: 0,
-        fee_mu: 0,
+        debited_au: ZERO_AU,
+        earned_au: ZERO_AU,
+        fee_au: ZERO_AU,
       };
       if (pagedApply) {
         result.page = page;
@@ -2920,28 +3297,28 @@ class MayhemContract extends Contract {
 
     const balances = new Map();
     for (const debit of debitMap.values()) {
-      const { rail, user, mu: debitMu } = debit;
+      const { rail, user, au: debitAu } = debit;
       const balance = await this.balanceRecord(user, rail);
       if (balance instanceof Error) return balance;
       const balanceError = this.guardianValidateBalanceRecord(balance, user, rail);
       if (balanceError) return balanceError;
-      if (balance.mu < debitMu) return new Error('Insufficient credit balance.');
-      const nextBalanceMu = this.safeSubMu(balance.mu, debitMu);
-      if (nextBalanceMu instanceof Error) return nextBalanceMu;
+      if (this.compareAu(balance.au, debitAu) < 0) return new Error('Insufficient credit balance.');
+      const nextBalanceAu = this.safeSubAu(balance.au, debitAu);
+      if (nextBalanceAu instanceof Error) return nextBalanceAu;
       balances.set(stableJson([rail, user]), {
         ...balance,
         rail,
-        mu: nextBalanceMu,
+        au: nextBalanceAu,
         updated_epoch: this.value.epoch,
         updated_at: this.tx,
       });
     }
 
     const earningDeltas = new Map();
-    const feeDeltaByRail = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, 0]));
-    let feeDeltaTotalMu = 0;
+    const feeDeltaByRail = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, ZERO_AU]));
+    let feeDeltaTotalAu = ZERO_AU;
     for (const earning of grossEarningMap.values()) {
-      const { rail, provider, gross_mu: grossMu } = earning;
+      const { rail, provider, gross_au: grossAu } = earning;
       const providerRecord = await this.get(`prov/${provider}`);
       if (!providerRecord) return new Error('Provider not found.');
       if (!Array.isArray(providerRecord.accepted_rails)) {
@@ -2951,64 +3328,71 @@ class MayhemContract extends Contract {
         return new Error('Provider does not accept payment rail.');
       }
 
-      const feeMu = this.safeMulDivMu(grossMu, params.fee_bps, 10_000);
-      if (feeMu instanceof Error) return feeMu;
-      const providerMu = this.safeSubMu(grossMu, feeMu);
-      if (providerMu instanceof Error) return providerMu;
-      feeDeltaTotalMu = this.safeAddMu(feeDeltaTotalMu, feeMu);
-      if (feeDeltaTotalMu instanceof Error) return feeDeltaTotalMu;
-      const nextRailFee = this.safeAddMu(feeDeltaByRail.get(rail) ?? 0, feeMu);
+      const feeAu = this.safeMulDivAu(grossAu, params.fee_bps, 10_000);
+      if (feeAu instanceof Error) return feeAu;
+      const providerAu = this.safeSubAu(grossAu, feeAu);
+      if (providerAu instanceof Error) return providerAu;
+      feeDeltaTotalAu = this.safeAddAu(feeDeltaTotalAu, feeAu);
+      if (feeDeltaTotalAu instanceof Error) return feeDeltaTotalAu;
+      const nextRailFee = this.safeAddAu(feeDeltaByRail.get(rail) ?? ZERO_AU, feeAu);
       if (nextRailFee instanceof Error) return nextRailFee;
       feeDeltaByRail.set(rail, nextRailFee);
       const key = stableJson([rail, provider]);
-      const current = earningDeltas.get(key) ?? { rail, provider, mu: 0 };
-      const next = this.safeAddMu(current.mu, providerMu);
+      const current = earningDeltas.get(key) ?? { rail, provider, provider_record: providerRecord, au: ZERO_AU };
+      const next = this.safeAddAu(current.au, providerAu);
       if (next instanceof Error) return next;
-      earningDeltas.set(key, { ...current, mu: next });
+      earningDeltas.set(key, { ...current, au: next });
     }
 
     const earnings = new Map();
-    let earnCumTotal = 0;
+    let earnCumTotal = ZERO_AU;
     for (const delta of earningDeltas.values()) {
-      const { rail, provider, mu: deltaMu } = delta;
+      const { rail, provider, provider_record: providerRecord, au: deltaAu } = delta;
       const current = await this.earningRecord(provider, rail);
       if (current instanceof Error) return current;
       const currentError = this.guardianValidateEarningRecord(current, provider, rail);
       if (currentError) return currentError;
       const probeGate = await this.probeGateForEarning(provider, current, params);
       if (probeGate instanceof Error) return probeGate;
+      const lockedEarningEpochs = this.providerLockedEarningEpochs(providerRecord, params);
+      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
       const refreshed = this.refreshEarningHoldback(
         current,
         this.value.epoch,
-        this.lockedEarningEpochs(params),
+        lockedEarningEpochs,
         probeGate
       );
       if (refreshed instanceof Error) return refreshed;
-      const totalMu = this.safeAddMu(refreshed.total_mu, deltaMu);
-      if (totalMu instanceof Error) return totalMu;
-      const heldMu = this.safeAddMu(refreshed.held_mu, deltaMu);
-      if (heldMu instanceof Error) return heldMu;
-      const holdbacks = this.appendHoldbackBucket(refreshed.holdbacks, this.value.epoch, deltaMu);
+      const totalAu = this.safeAddAu(refreshed.total_au, deltaAu);
+      if (totalAu instanceof Error) return totalAu;
+      const heldAu = this.safeAddAu(refreshed.held_au, deltaAu);
+      if (heldAu instanceof Error) return heldAu;
+      const holdbacks = this.appendHoldbackBucket(
+        refreshed.holdbacks,
+        this.value.epoch,
+        deltaAu,
+        lockedEarningEpochs
+      );
       if (holdbacks instanceof Error) return holdbacks;
       earnings.set(stableJson([rail, provider]), {
         ...refreshed,
         rail,
-        total_mu: totalMu,
-        held_mu: heldMu,
+        total_au: totalAu,
+        held_au: heldAu,
         holdbacks,
         updated_epoch: this.value.epoch,
         updated_at: this.tx,
       });
-      earnCumTotal = this.safeAddMu(earnCumTotal, totalMu);
+      earnCumTotal = this.safeAddAu(earnCumTotal, totalAu);
       if (earnCumTotal instanceof Error) return earnCumTotal;
     }
 
     const feeRecords = new Map();
     const nextFeeRecords = new Map();
-    let nextFeeCumTotal = 0;
+    let nextFeeCumTotal = ZERO_AU;
     const touchedRails = new Set([
-      ...Array.from(debitRailTotals.entries()).filter(([, mu]) => mu > 0).map(([rail]) => rail),
-      ...Array.from(grossRailTotals.entries()).filter(([, mu]) => mu > 0).map(([rail]) => rail),
+      ...Array.from(debitRailTotals.entries()).filter(([, au]) => this.compareAu(au, ZERO_AU) > 0).map(([rail]) => rail),
+      ...Array.from(grossRailTotals.entries()).filter(([, au]) => this.compareAu(au, ZERO_AU) > 0).map(([rail]) => rail),
     ]);
     for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
       const fee = await this.feeCumRecord(rail);
@@ -3016,13 +3400,13 @@ class MayhemContract extends Contract {
       const feeError = this.guardianValidateFeeRecord(fee, rail);
       if (feeError) return feeError;
       feeRecords.set(rail, fee);
-      const feeDeltaMu = feeDeltaByRail.get(rail) ?? 0;
-      const nextFeeCum = this.safeAddMu(fee.cum_mu, feeDeltaMu);
+      const feeDeltaAu = feeDeltaByRail.get(rail) ?? ZERO_AU;
+      const nextFeeCum = this.safeAddAu(fee.cum_au, feeDeltaAu);
       if (nextFeeCum instanceof Error) return nextFeeCum;
       const nextFee = touchedRails.has(rail)
         ? {
             ...fee,
-            cum_mu: nextFeeCum,
+            cum_au: nextFeeCum,
             updated_epoch: this.value.epoch,
             updated_at: this.tx,
             last_apply_hash: applyHash,
@@ -3030,11 +3414,11 @@ class MayhemContract extends Contract {
           }
         : fee;
       nextFeeRecords.set(rail, nextFee);
-      nextFeeCumTotal = this.safeAddMu(nextFeeCumTotal, nextFee.cum_mu);
+      nextFeeCumTotal = this.safeAddAu(nextFeeCumTotal, nextFee.cum_au);
       if (nextFeeCumTotal instanceof Error) return nextFeeCumTotal;
     }
 
-    const providerDeltaTotal = this.safeSubMu(grossTotal, feeDeltaTotalMu);
+    const providerDeltaTotal = this.safeSubAu(grossTotal, feeDeltaTotalAu);
     if (providerDeltaTotal instanceof Error) return providerDeltaTotal;
     const guardian = this.guardianCheckEpochApply({
       epoch: this.value.epoch,
@@ -3074,7 +3458,7 @@ class MayhemContract extends Contract {
         roots,
         totals,
         debitTotal,
-        feeDeltaMu: feeDeltaTotalMu,
+        feeDeltaAu: feeDeltaTotalAu,
         nextFeeCum: nextFeeCumTotal,
         providerCount: grossEarningMap.size,
         earnCumTotal,
@@ -3093,7 +3477,7 @@ class MayhemContract extends Contract {
     for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER.filter((rail) => touchedRails.has(rail))) {
       const feeRecord = {
         ...nextFeeRecords.get(rail),
-        settled_cum_mu: guardian.next_settled_cum_by_rail.get(rail),
+        settled_cum_au: guardian.next_settled_cum_by_rail.get(rail),
       };
       await this.put(this.feeCumKey(rail), feeRecord);
     }
@@ -3112,8 +3496,8 @@ class MayhemContract extends Contract {
         epoch_seconds: params.epoch_seconds,
         roots,
         totals,
-        feeDeltaMu: feeDeltaTotalMu,
-        feeCumMu: nextFeeCumTotal,
+        feeDeltaAu: feeDeltaTotalAu,
+        feeCumAu: nextFeeCumTotal,
         priceDerivations,
       });
     } else if (priceDerivations.length > 0) {
@@ -3136,9 +3520,9 @@ class MayhemContract extends Contract {
       op: 'epochApply',
       epoch: this.value.epoch,
       idempotent: false,
-      debited_mu: debitTotal,
-      earned_mu: providerDeltaTotal,
-      fee_mu: feeDeltaTotalMu,
+      debited_au: debitTotal,
+      earned_au: providerDeltaTotal,
+      fee_au: feeDeltaTotalAu,
       rails: Array.from(touchedRails).sort(
         (left, right) => PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
       ),
@@ -3158,7 +3542,7 @@ class MayhemContract extends Contract {
         utilization_bps: update.utilization_bps,
         ema_utilization_bps: update.ema_utilization_bps,
         active_supply: update.active_supply,
-        active_demand_mu: update.active_demand_mu,
+        active_demand_au: update.active_demand_au,
         frozen: update.frozen,
         derivation_hash: update.derivation_hash,
       }));
@@ -3170,7 +3554,7 @@ class MayhemContract extends Contract {
 
   async epochCommit() {
     const banned = await this.get(`committer/ban/${this.address}`);
-    if (banned) return new Error('Epoch committer is banned.');
+    if (banned?.status === 'banned') return new Error('Epoch committer is banned.');
 
     const roots = this.normalizeEpochRoots(this.value.roots);
     if (roots instanceof Error) return roots;
@@ -3244,8 +3628,8 @@ class MayhemContract extends Contract {
 
     if (this.value.reason === 'over_credit') {
       if (!hasOwn(this.value, 'receipt')) return new Error('Over-credit fraud proof requires a receipt.');
-      if (!hasOwn(this.value, 'claimed_mu_owed_cum')) {
-        return new Error('Over-credit fraud proof requires claimed_mu_owed_cum.');
+      if (!hasOwn(this.value, 'claimed_au_owed_cum')) {
+        return new Error('Over-credit fraud proof requires claimed_au_owed_cum.');
       }
       const receipt = await this.normalizeReceiptEnvelope(this.value.receipt);
       if (receipt instanceof Error) return receipt;
@@ -3257,8 +3641,8 @@ class MayhemContract extends Contract {
         proof_epoch: this.value.proof_epoch,
         reason: this.value.reason,
         receipt,
-        claimed_mu_owed_cum: this.value.claimed_mu_owed_cum,
-        previous_mu_owed_cum: this.value.previous_mu_owed_cum ?? 0,
+        claimed_au_owed_cum: this.value.claimed_au_owed_cum,
+        previous_au_owed_cum: this.value.previous_au_owed_cum ?? ZERO_AU,
       };
       proofHash = await this.fraudProofHash(proofHashPayload);
       const existingProof = await this.get(`ev/fraud/${this.value.epoch}/${proofHash}`);
@@ -3329,8 +3713,8 @@ class MayhemContract extends Contract {
     };
     if (this.value.reason === 'over_credit') {
       record.receipt_hash = proof.receipt_hash;
-      record.actual_mu = proof.actual_mu;
-      record.claimed_mu = proof.claimed_mu;
+      record.actual_au = proof.actual_au;
+      record.claimed_au = proof.claimed_au;
       record.committed_use_root = commit.roots.use;
     } else if (this.value.reason === 'price_derivation') {
       record.price_usage = proof.price_usage;
@@ -3349,7 +3733,8 @@ class MayhemContract extends Contract {
     };
     const banKey = `committer/ban/${commit.submitted_by}`;
     const existingBan = await this.get(banKey);
-    const ban = existingBan ?? {
+    const ban = existingBan?.status === 'banned' ? existingBan : {
+      ...(existingBan ?? {}),
       submitter: commit.submitted_by,
       status: 'banned',
       reason: 'fraud_proof',
@@ -3409,16 +3794,16 @@ class MayhemContract extends Contract {
     if (balance instanceof Error) return balance;
     const balanceError = this.guardianValidateBalanceRecord(balance, this.address, rail);
     if (balanceError) return balanceError;
-    const params = await this.activeParamsAt(this.value.at, ['dispute_deposit_mu']);
-    const depositMu = params.dispute_deposit_mu;
-    if (balance.mu < depositMu) return new Error('Insufficient balance for dispute deposit.');
+    const params = await this.activeParamsAt(this.value.at, ['dispute_deposit_au']);
+    const depositAu = params.dispute_deposit_au;
+    if (this.compareAu(balance.au, depositAu) < 0) return new Error('Insufficient balance for dispute deposit.');
 
-    const nextBalanceMu = this.safeSubMu(balance.mu, depositMu);
-    if (nextBalanceMu instanceof Error) return nextBalanceMu;
+    const nextBalanceAu = this.safeSubAu(balance.au, depositAu);
+    if (nextBalanceAu instanceof Error) return nextBalanceAu;
     const nextBalance = {
       ...balance,
       rail,
-      mu: nextBalanceMu,
+      au: nextBalanceAu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch ?? 0),
       updated_at: this.tx,
     };
@@ -3442,7 +3827,7 @@ class MayhemContract extends Contract {
       at: this.value.at,
       evidence_hash: this.value.evidence_hash ?? null,
       evidence: cloneValue(this.value.evidence ?? null),
-      deposit_mu: depositMu,
+      deposit_au: depositAu,
       deposit_holder: this.address,
       opened_at: this.tx,
       updated_at: this.tx,
@@ -3457,7 +3842,7 @@ class MayhemContract extends Contract {
       ok: true,
       op: 'dispute',
       dispute_id: disputeId,
-      deposit_mu: depositMu,
+      deposit_au: depositAu,
       dispute_hash: record.dispute_hash,
     };
   }
@@ -3491,39 +3876,39 @@ class MayhemContract extends Contract {
       return new Error('Only provider_fault disputes may slash a provider.');
     }
 
-    let depositRefundedMu = 0;
-    let depositForfeitedMu = 0;
+    let depositRefundedAu = ZERO_AU;
+    let depositForfeitedAu = ZERO_AU;
     const rail = this.normalizeLedgerRail(dispute.rail, 'dispute rail');
     if (rail instanceof Error) return rail;
     if (this.value.deposit_action === 'refund') {
-      depositRefundedMu = dispute.deposit_mu;
+      depositRefundedAu = dispute.deposit_au;
       const balance = await this.balanceRecord(dispute.opened_by, rail);
       if (balance instanceof Error) return balance;
       const balanceError = this.guardianValidateBalanceRecord(balance, dispute.opened_by, rail);
       if (balanceError) return balanceError;
-      const nextMu = this.safeAddMu(balance.mu, depositRefundedMu);
-      if (nextMu instanceof Error) return nextMu;
+      const nextAu = this.safeAddAu(balance.au, depositRefundedAu);
+      if (nextAu instanceof Error) return nextAu;
       await this.put(this.balanceKey(dispute.opened_by, rail), {
         ...balance,
         rail,
-        mu: nextMu,
+        au: nextAu,
         updated_epoch: Math.max(balance.updated_epoch, dispute.epoch ?? 0),
         updated_at: this.tx,
       });
     } else {
-      depositForfeitedMu = dispute.deposit_mu;
+      depositForfeitedAu = dispute.deposit_au;
       const fee = await this.feeCumRecord(rail);
       if (fee instanceof Error) return fee;
       const feeError = this.guardianValidateFeeRecord(fee, rail);
       if (feeError) return feeError;
-      const cumMu = this.safeAddMu(fee.cum_mu, depositForfeitedMu);
-      if (cumMu instanceof Error) return cumMu;
-      const settledCumMu = this.safeAddMu(fee.settled_cum_mu ?? fee.cum_mu, depositForfeitedMu);
-      if (settledCumMu instanceof Error) return settledCumMu;
+      const cumAu = this.safeAddAu(fee.cum_au, depositForfeitedAu);
+      if (cumAu instanceof Error) return cumAu;
+      const settledCumAu = this.safeAddAu(fee.settled_cum_au ?? fee.cum_au, depositForfeitedAu);
+      if (settledCumAu instanceof Error) return settledCumAu;
       const updatedFee = {
         ...fee,
-        cum_mu: cumMu,
-        settled_cum_mu: settledCumMu,
+        cum_au: cumAu,
+        settled_cum_au: settledCumAu,
         updated_epoch: Math.max(fee.updated_epoch, dispute.epoch ?? 0),
         updated_at: this.tx,
         last_dispute_forfeit_at: this.tx,
@@ -3542,8 +3927,8 @@ class MayhemContract extends Contract {
         kind: 'dispute_lost',
         epoch: dispute.epoch ?? 0,
         at: this.value.at,
-        paid_mu: null,
-        max_spend_mu: null,
+        paid_au: null,
+        max_spend_au: null,
         evidence_hash: this.value.rationale_hash,
       });
       if (reputationEvent instanceof Error) return reputationEvent;
@@ -3577,8 +3962,8 @@ class MayhemContract extends Contract {
       resolved_by: this.address,
       resolved_at: this.tx,
       resolved_at_seconds: this.value.at,
-      deposit_refunded_mu: depositRefundedMu,
-      deposit_forfeited_mu: depositForfeitedMu,
+      deposit_refunded_au: depositRefundedAu,
+      deposit_forfeited_au: depositForfeitedAu,
       reputation_event: reputationEvent,
       slash,
       updated_at: this.tx,
@@ -3592,8 +3977,8 @@ class MayhemContract extends Contract {
       dispute_id: dispute.dispute_id,
       outcome: resolved.outcome,
       deposit_action: resolved.deposit_action,
-      deposit_refunded_mu: depositRefundedMu,
-      deposit_forfeited_mu: depositForfeitedMu,
+      deposit_refunded_au: depositRefundedAu,
+      deposit_forfeited_au: depositForfeitedAu,
       slash,
       resolution_hash: resolved.resolution_hash,
     };
@@ -3612,8 +3997,8 @@ class MayhemContract extends Contract {
     }
 
     const record = {
-      denom: 'tnk_usd_e6',
-      tnk_usd_e6: this.value.tnk_usd_e6,
+      denom: 'tnk_usd_au',
+      tnk_usd_au: this.normalizeAu(this.value.tnk_usd_au, 'TNK/USD atto-rate', { allowZero: false }),
       source: this.value.source,
       ts: this.value.ts,
       updated_at: this.tx,
@@ -3638,8 +4023,8 @@ class MayhemContract extends Contract {
     }
 
     const record = {
-      denom: 'tap_usd_e6',
-      tap_usd_e6: this.value.tap_usd_e6,
+      denom: 'tap_usd_au',
+      tap_usd_au: this.normalizeAu(this.value.tap_usd_au, 'TAP/USD atto-rate', { allowZero: false }),
       source: this.value.source,
       ts: this.value.ts,
       updated_at: this.tx,
@@ -3654,13 +4039,14 @@ class MayhemContract extends Contract {
   validateRateOracleValue(value) {
     const shapeError = this.validateExactObjectKeys(
       value,
-      ['op', 'tnk_usd_e6', 'source', 'ts'],
+      ['op', 'tnk_usd_au', 'source', 'ts'],
       'rate oracle'
     );
     if (shapeError) return shapeError;
     if (value.op !== 'rate_oracle') return new Error('Invalid rate oracle op.');
-    if (!Number.isSafeInteger(value.tnk_usd_e6) || value.tnk_usd_e6 < 1) {
-      return new Error('Invalid TNK/USD rate.');
+    const rate = this.normalizeAu(value.tnk_usd_au, 'TNK/USD atto-rate', { allowZero: false });
+    if (rate instanceof Error) {
+      return new Error('Invalid TNK/USD atto-rate.');
     }
     if (typeof value.source !== 'string' || value.source.length < 1 || value.source.length > 64) {
       return new Error('Invalid rate source.');
@@ -3674,13 +4060,14 @@ class MayhemContract extends Contract {
   validateTapRateOracleValue(value) {
     const shapeError = this.validateExactObjectKeys(
       value,
-      ['op', 'tap_usd_e6', 'source', 'ts'],
+      ['op', 'tap_usd_au', 'source', 'ts'],
       'TAP rate oracle'
     );
     if (shapeError) return shapeError;
     if (value.op !== 'tap_rate_oracle') return new Error('Invalid TAP rate oracle op.');
-    if (!Number.isSafeInteger(value.tap_usd_e6) || value.tap_usd_e6 < 1) {
-      return new Error('Invalid TAP/USD rate.');
+    const rate = this.normalizeAu(value.tap_usd_au, 'TAP/USD atto-rate', { allowZero: false });
+    if (rate instanceof Error) {
+      return new Error('Invalid TAP/USD atto-rate.');
     }
     if (typeof value.source !== 'string' || value.source.length < 1 || value.source.length > 64) {
       return new Error('Invalid TAP rate source.');
@@ -3698,7 +4085,7 @@ class MayhemContract extends Contract {
     if (shapeError) return shapeError;
     const settlementParams = await this.activeParamsAt(this.value.at, ['max_tnk_settlement_outputs']);
     if (this.value.outputs.length > settlementParams.max_tnk_settlement_outputs) {
-      return new Error('TNK settlement output batch exceeds max_tnk_settlement_outputs.');
+      return new Error('TNK settlement output count exceeds max_tnk_settlement_outputs.');
     }
 
     const outputs = this.normalizeTnkSettlementOutputs(this.value.outputs);
@@ -3706,18 +4093,18 @@ class MayhemContract extends Contract {
     if (stableJson(outputs) !== stableJson(this.value.outputs)) {
       return new Error('TNK settlement outputs must be canonical.');
     }
-    const totals = this.tnkSettlementTotals(outputs, this.value.rate_tnk_usd_e6);
+    const totals = this.tnkSettlementTotals(outputs, this.value.rate_tnk_usd_au);
     if (totals instanceof Error) return totals;
     if (totals.provider_count !== this.value.provider_count) {
       return new Error('TNK settlement provider count does not match outputs.');
     }
-    if (totals.provider_mu !== this.value.provider_mu) {
+    if (this.compareAu(totals.provider_au, this.value.provider_au) !== 0) {
       return new Error('TNK settlement provider amount does not match outputs.');
     }
-    if (totals.operator_fee_mu !== this.value.operator_fee_mu) {
+    if (this.compareAu(totals.operator_fee_au, this.value.operator_fee_au) !== 0) {
       return new Error('TNK settlement operator fee does not match outputs.');
     }
-    if (totals.gross_mu !== this.value.gross_mu) {
+    if (this.compareAu(totals.gross_au, this.value.gross_au) !== 0) {
       return new Error('TNK settlement gross amount does not match outputs.');
     }
     if (totals.tnk_e18 !== this.value.tnk_e18) {
@@ -3740,7 +4127,7 @@ class MayhemContract extends Contract {
           epoch: this.value.epoch,
           rail: 'tnk',
           idempotent: true,
-          msb_tx_hash: this.value.msb_tx_hash,
+          msb_tx_hashes: this.value.msb_tx_hashes,
         };
       }
       return new Error('TNK settlement already exists for epoch.');
@@ -3757,7 +4144,7 @@ class MayhemContract extends Contract {
     const rate = await this.guardianRequireFreshRate(this.value.at);
     if (rate instanceof Error) return rate;
     if (
-      rate.tnk_usd_e6 !== this.value.rate_tnk_usd_e6 ||
+      this.compareAu(rate.tnk_usd_au, this.value.rate_tnk_usd_au) !== 0 ||
       rate.source !== this.value.rate_source ||
       rate.ts !== this.value.rate_ts
     ) {
@@ -3771,7 +4158,8 @@ class MayhemContract extends Contract {
       'canary_probe_release_min_passes',
     ]);
     const earningUpdates = [];
-    for (const output of outputs.filter((entry) => entry.role === 'provider')) {
+    for (const [outputIndex, output] of outputs.entries()) {
+      if (output.role !== 'provider') continue;
       const provider = await this.get(`prov/${output.provider}`);
       if (!provider || provider.status !== 'active') {
         return new Error('TNK settlement provider is not active.');
@@ -3791,30 +4179,32 @@ class MayhemContract extends Contract {
       if (earningError) return earningError;
       const probeGate = await this.probeGateForEarning(output.provider, earning, params);
       if (probeGate instanceof Error) return probeGate;
+      const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
+      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
       const refreshed = this.refreshEarningHoldback(
         earning,
         this.value.epoch,
-        this.lockedEarningEpochs(params),
+        lockedEarningEpochs,
         probeGate
       );
       if (refreshed instanceof Error) return refreshed;
-      const payable = this.safeSubMu(
-        this.safeSubMu(refreshed.total_mu, refreshed.held_mu),
-        refreshed.paid_cum_mu
+      const payable = this.safeSubAu(
+        this.safeSubAu(refreshed.total_au, refreshed.held_au),
+        refreshed.paid_cum_au
       );
       if (payable instanceof Error) return payable;
-      if (payable <= 0) return new Error('TNK settlement provider has no payable earnings.');
-      if (output.mu !== payable) {
+      if (this.isZeroAu(payable)) return new Error('TNK settlement provider has no payable earnings.');
+      if (this.compareAu(output.au, payable) !== 0) {
         return new Error('TNK settlement provider amount does not match payable earnings.');
       }
-      const paidCumMu = this.safeAddMu(refreshed.paid_cum_mu, output.mu);
-      if (paidCumMu instanceof Error) return paidCumMu;
+      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, output.au);
+      if (paidCumAu instanceof Error) return paidCumAu;
       const nextEarning = {
         ...refreshed,
-        paid_cum_mu: paidCumMu,
+        paid_cum_au: paidCumAu,
         updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
         last_settlement_epoch: this.value.epoch,
-        last_settlement_msb_tx_hash: this.value.msb_tx_hash,
+        last_settlement_msb_tx_hash: this.value.msb_tx_hashes[outputIndex],
       };
       const nextError = this.guardianValidateEarningRecord(nextEarning, output.provider, 'tnk');
       if (nextError) return nextError;
@@ -3825,29 +4215,32 @@ class MayhemContract extends Contract {
     if (fee instanceof Error) return fee;
     const feeError = this.guardianValidateFeeRecord(fee, 'tnk');
     if (feeError) return feeError;
-    const payableFee = this.safeSubMu(fee.cum_mu, fee.swept_cum_mu);
+    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
     if (payableFee instanceof Error) return payableFee;
-    if (payableFee !== this.value.operator_fee_mu) {
+    if (this.compareAu(payableFee, this.value.operator_fee_au) !== 0) {
       return new Error('TNK settlement operator fee does not match fee state.');
     }
     const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
-    if (payableFee === 0 && operatorOutputs.length !== 0) {
+    if (this.isZeroAu(payableFee) && operatorOutputs.length !== 0) {
       return new Error('TNK settlement has unexpected operator fee output.');
     }
-    if (payableFee > 0) {
+    if (this.compareAu(payableFee, ZERO_AU) > 0) {
       if (operatorOutputs.length !== 1) return new Error('TNK settlement missing operator fee output.');
       if (operatorOutputs[0].to !== this.value.operator_to) {
         return new Error('TNK settlement operator target mismatch.');
       }
     }
-    const sweptCumMu = this.safeAddMu(fee.swept_cum_mu, this.value.operator_fee_mu);
-    if (sweptCumMu instanceof Error) return sweptCumMu;
+    const operatorOutputIndex = outputs.findIndex((entry) => entry.role === 'operator_fee');
+    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, this.value.operator_fee_au);
+    if (sweptCumAu instanceof Error) return sweptCumAu;
     const nextFee = {
       ...fee,
-      swept_cum_mu: sweptCumMu,
+      swept_cum_au: sweptCumAu,
       updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
       last_settlement_epoch: this.value.epoch,
-      last_settlement_msb_tx_hash: this.value.msb_tx_hash,
+      last_settlement_msb_tx_hash: operatorOutputIndex >= 0
+        ? this.value.msb_tx_hashes[operatorOutputIndex]
+        : (fee.last_settlement_msb_tx_hash ?? null),
     };
     const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
     if (nextFeeError) return nextFeeError;
@@ -3859,10 +4252,10 @@ class MayhemContract extends Contract {
     await this.put(key, record);
     console.log('mayhem tnkSettlement', {
       epoch: this.value.epoch,
-      provider_mu: this.value.provider_mu,
-      operator_fee_mu: this.value.operator_fee_mu,
-      gross_mu: this.value.gross_mu,
-      msb_tx_hash: this.value.msb_tx_hash,
+      provider_au: this.value.provider_au,
+      operator_fee_au: this.value.operator_fee_au,
+      gross_au: this.value.gross_au,
+      msb_tx_hashes: this.value.msb_tx_hashes,
     });
     return {
       ok: true,
@@ -3870,10 +4263,10 @@ class MayhemContract extends Contract {
       epoch: this.value.epoch,
       rail: 'tnk',
       idempotent: false,
-      provider_mu: this.value.provider_mu,
-      operator_fee_mu: this.value.operator_fee_mu,
-      gross_mu: this.value.gross_mu,
-      msb_tx_hash: this.value.msb_tx_hash,
+      provider_au: this.value.provider_au,
+      operator_fee_au: this.value.operator_fee_au,
+      gross_au: this.value.gross_au,
+      msb_tx_hashes: this.value.msb_tx_hashes,
       transfer_root: this.value.transfer_root,
     };
   }
@@ -3890,15 +4283,15 @@ class MayhemContract extends Contract {
         'treasury_from',
         'operator_to',
         'epoch_apply_hash',
-        'rate_tnk_usd_e6',
+        'rate_tnk_usd_au',
         'rate_source',
         'rate_ts',
-        'msb_tx_hash',
+        'msb_tx_hashes',
         'transfer_root',
         'provider_count',
-        'provider_mu',
-        'operator_fee_mu',
-        'gross_mu',
+        'provider_au',
+        'operator_fee_au',
+        'gross_au',
         'tnk_e18',
         'outputs',
       ],
@@ -3913,30 +4306,43 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(value.treasury_from)) return new Error('Invalid TNK treasury address.');
     if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid TNK operator address.');
     if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid TNK settlement apply hash.');
-    if (!this.isHexBytes(value.msb_tx_hash, 32)) {
-      return new Error('TNK settlement requires a real 64-hex MSB tx hash.');
+    if (!Array.isArray(value.msb_tx_hashes) || value.msb_tx_hashes.length === 0) {
+      return new Error('TNK settlement requires one real 64-hex MSB tx hash per output.');
+    }
+    const seenTxHashes = new Set();
+    for (const hash of value.msb_tx_hashes) {
+      if (!this.isHexBytes(hash, 32)) {
+        return new Error('TNK settlement requires one real 64-hex MSB tx hash per output.');
+      }
+      if (seenTxHashes.has(hash)) return new Error('Duplicate TNK settlement MSB tx hash.');
+      seenTxHashes.add(hash);
     }
     if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid TNK settlement transfer root.');
-    if (!Number.isSafeInteger(value.rate_tnk_usd_e6) || value.rate_tnk_usd_e6 < 1) {
+    const rateTnkUsdAu = this.normalizeAu(value.rate_tnk_usd_au, 'TNK settlement rate', { allowZero: false });
+    if (rateTnkUsdAu instanceof Error) {
       return new Error('Invalid TNK settlement rate.');
     }
     if (!RATE_SOURCES.has(value.rate_source)) return new Error('Unsupported TNK settlement rate source.');
     if (!Number.isSafeInteger(value.rate_ts) || value.rate_ts < 0) {
       return new Error('Invalid TNK settlement rate timestamp.');
     }
-    for (const key of ['provider_count', 'provider_mu', 'operator_fee_mu', 'gross_mu']) {
-      if (!Number.isSafeInteger(value[key]) || value[key] < 0) {
-        return new Error('Invalid TNK settlement total.');
-      }
+    if (!Number.isSafeInteger(value.provider_count) || value.provider_count < 0) {
+      return new Error('Invalid TNK settlement total.');
     }
-    if (value.gross_mu <= 0) return new Error('TNK settlement gross amount must be positive.');
-    const gross = this.safeAddMu(value.provider_mu, value.operator_fee_mu);
+    for (const key of ['provider_au', 'operator_fee_au', 'gross_au']) {
+      const amount = this.normalizeAu(value[key], `TNK settlement ${key}`, { allowZero: key !== 'gross_au' });
+      if (amount instanceof Error) return new Error('Invalid TNK settlement total.');
+    }
+    const gross = this.safeAddAu(value.provider_au, value.operator_fee_au);
     if (gross instanceof Error) return gross;
-    if (gross !== value.gross_mu) return new Error('TNK settlement gross amount does not balance.');
+    if (this.compareAu(gross, value.gross_au) !== 0) return new Error('TNK settlement gross amount does not balance.');
     const tnkE18 = this.parseTnkE18(value.tnk_e18);
     if (tnkE18 instanceof Error) return tnkE18;
     if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
       return new Error('TNK settlement outputs are required.');
+    }
+    if (value.msb_tx_hashes.length !== value.outputs.length) {
+      return new Error('TNK settlement MSB tx hash count must match outputs.');
     }
     return null;
   }
@@ -3955,7 +4361,7 @@ class MayhemContract extends Contract {
       if (output.role === 'provider') {
         const shapeError = this.validateExactObjectKeys(
           output,
-          ['role', 'provider', 'to', 'mu', 'tnk_e18'],
+          ['role', 'provider', 'to', 'au', 'tnk_e18'],
           'TNK settlement provider output'
         );
         if (shapeError) return shapeError;
@@ -3970,7 +4376,7 @@ class MayhemContract extends Contract {
       } else if (output.role === 'operator_fee') {
         const shapeError = this.validateExactObjectKeys(
           output,
-          ['role', 'to', 'mu', 'tnk_e18'],
+          ['role', 'to', 'au', 'tnk_e18'],
           'TNK settlement operator output'
         );
         if (shapeError) return shapeError;
@@ -3988,7 +4394,8 @@ class MayhemContract extends Contract {
 
   normalizeTnkSettlementOutput(output) {
     if (!this.isSafeKeyPart(output.to)) return new Error('Invalid TNK settlement output address.');
-    if (!Number.isSafeInteger(output.mu) || output.mu <= 0) {
+    const au = this.normalizeAu(output.au, 'TNK settlement output amount', { allowZero: false });
+    if (au instanceof Error) {
       return new Error('Invalid TNK settlement output amount.');
     }
     const tnkE18 = this.parseTnkE18(output.tnk_e18);
@@ -3998,24 +4405,24 @@ class MayhemContract extends Contract {
           role: 'provider',
           provider: output.provider,
           to: output.to,
-          mu: output.mu,
+          au,
           tnk_e18: output.tnk_e18,
         }
       : {
           role: 'operator_fee',
           to: output.to,
-          mu: output.mu,
+          au,
           tnk_e18: output.tnk_e18,
         };
   }
 
-  tnkSettlementTotals(outputs, rateTnkUsdE6) {
-    let providerMu = 0;
-    let operatorFeeMu = 0;
+  tnkSettlementTotals(outputs, rateTnkUsdAu) {
+    let providerAu = ZERO_AU;
+    let operatorFeeAu = ZERO_AU;
     let tnkE18 = 0n;
     let providerCount = 0;
     for (const output of outputs) {
-      const expectedTnkE18 = this.muToTnkE18Ceil(output.mu, rateTnkUsdE6);
+      const expectedTnkE18 = this.auToTnkE18Ceil(output.au, rateTnkUsdAu);
       if (expectedTnkE18 instanceof Error) return expectedTnkE18;
       if (output.tnk_e18 !== expectedTnkE18.toString()) {
         return new Error('TNK settlement output amount does not match oracle rate.');
@@ -4025,31 +4432,31 @@ class MayhemContract extends Contract {
       tnkE18 += parsed;
       if (output.role === 'provider') {
         providerCount += 1;
-        providerMu = this.safeAddMu(providerMu, output.mu);
-        if (providerMu instanceof Error) return providerMu;
+        providerAu = this.safeAddAu(providerAu, output.au);
+        if (providerAu instanceof Error) return providerAu;
       } else {
-        operatorFeeMu = this.safeAddMu(operatorFeeMu, output.mu);
-        if (operatorFeeMu instanceof Error) return operatorFeeMu;
+        operatorFeeAu = this.safeAddAu(operatorFeeAu, output.au);
+        if (operatorFeeAu instanceof Error) return operatorFeeAu;
       }
     }
-    const grossMu = this.safeAddMu(providerMu, operatorFeeMu);
-    if (grossMu instanceof Error) return grossMu;
+    const grossAu = this.safeAddAu(providerAu, operatorFeeAu);
+    if (grossAu instanceof Error) return grossAu;
     return {
       provider_count: providerCount,
-      provider_mu: providerMu,
-      operator_fee_mu: operatorFeeMu,
-      gross_mu: grossMu,
+      provider_au: providerAu,
+      operator_fee_au: operatorFeeAu,
+      gross_au: grossAu,
       tnk_e18: tnkE18.toString(),
     };
   }
 
-  muToTnkE18Ceil(mu, rateTnkUsdE6) {
-    if (!Number.isSafeInteger(mu) || mu <= 0) return new Error('Invalid TNK settlement amount.');
-    if (!Number.isSafeInteger(rateTnkUsdE6) || rateTnkUsdE6 <= 0) {
-      return new Error('Invalid TNK/USD rate.');
-    }
-    const numerator = BigInt(mu) * TNK_E18;
-    const denominator = BigInt(rateTnkUsdE6);
+  auToTnkE18Ceil(au, rateTnkUsdAu) {
+    const amount = this.parseAu(au, 'TNK settlement amount', { allowZero: false });
+    if (amount instanceof Error) return new Error('Invalid TNK settlement amount.');
+    const rate = this.parseAu(rateTnkUsdAu, 'TNK/USD atto-rate', { allowZero: false });
+    if (rate instanceof Error) return new Error('Invalid TNK/USD atto-rate.');
+    const numerator = amount * TNK_E18;
+    const denominator = rate;
     return (numerator + denominator - 1n) / denominator;
   }
 
@@ -4069,15 +4476,15 @@ class MayhemContract extends Contract {
       treasury_from: this.value.treasury_from,
       operator_to: this.value.operator_to,
       epoch_apply_hash: this.value.epoch_apply_hash,
-      rate_tnk_usd_e6: this.value.rate_tnk_usd_e6,
+      rate_tnk_usd_au: this.value.rate_tnk_usd_au,
       rate_source: this.value.rate_source,
       rate_ts: this.value.rate_ts,
-      msb_tx_hash: this.value.msb_tx_hash,
+      msb_tx_hashes: this.value.msb_tx_hashes,
       transfer_root: this.value.transfer_root,
       provider_count: this.value.provider_count,
-      provider_mu: this.value.provider_mu,
-      operator_fee_mu: this.value.operator_fee_mu,
-      gross_mu: this.value.gross_mu,
+      provider_au: this.value.provider_au,
+      operator_fee_au: this.value.operator_fee_au,
+      gross_au: this.value.gross_au,
       tnk_e18: this.value.tnk_e18,
       outputs,
     };
@@ -4090,6 +4497,10 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(this.value.treasury_address)) return new Error('Invalid TNK treasury address.');
     const tnkE18 = this.parseTnkE18(this.value.tnk_e18);
     if (tnkE18 instanceof Error) return tnkE18;
+    const quotedAu = this.normalizeAu(this.value.quoted_au, 'TNK quoted credit', { allowZero: false });
+    if (quotedAu instanceof Error) return quotedAu;
+    const quotedRate = this.normalizeAu(this.value.rate_tnk_usd_au, 'TNK quoted rate', { allowZero: false });
+    if (quotedRate instanceof Error) return quotedRate;
 
     const key = `dep/pending/${this.value.memo_hash}`;
     if ((await this.get(key)) !== null) return new Error('TNK deposit memo already pending.');
@@ -4101,8 +4512,8 @@ class MayhemContract extends Contract {
       requested_at: this.tx,
       treasury_address: this.value.treasury_address,
       tnk_e18: this.value.tnk_e18,
-      quoted_mu: this.value.quoted_mu,
-      rate_tnk_usd_e6: this.value.rate_tnk_usd_e6,
+      quoted_au: quotedAu,
+      rate_tnk_usd_au: quotedRate,
       rate_source: this.value.rate_source,
     };
     await this.put(key, record);
@@ -4131,32 +4542,36 @@ class MayhemContract extends Contract {
     const pendingTnkE18 = this.parseTnkE18(pending.tnk_e18);
     if (pendingTnkE18 instanceof Error) return pendingTnkE18;
     if (pendingTnkE18 !== tnkE18) return new Error('TNK deposit amount does not match pending intent.');
-    if (pending.rate_tnk_usd_e6 !== rate.tnk_usd_e6) return new Error('TNK deposit rate does not match pending intent.');
-    const mu = this.tnkE18ToMu(tnkE18, rate.tnk_usd_e6);
-    if (mu instanceof Error) return mu;
-    if (mu <= 0) return new Error('TNK deposit converts to zero mu.');
-    if (pending.quoted_mu !== mu) return new Error('TNK deposit credit does not match pending intent.');
+    if (this.compareAu(pending.rate_tnk_usd_au, rate.tnk_usd_au) !== 0) {
+      return new Error('TNK deposit rate does not match pending intent.');
+    }
+    const au = this.tnkE18ToAu(tnkE18, rate.tnk_usd_au);
+    if (au instanceof Error) return au;
+    if (this.isZeroAu(au)) return new Error('TNK deposit converts to zero au.');
+    if (this.compareAu(pending.quoted_au, au) !== 0) {
+      return new Error('TNK deposit credit does not match pending intent.');
+    }
 
     const ledgerRail = 'tnk';
     const balance = await this.balanceRecord(pending.user, ledgerRail);
     if (balance instanceof Error) return balance;
-    const nextMu = this.safeAddMu(balance.mu, mu);
-    if (nextMu instanceof Error) return nextMu;
+    const nextAu = this.safeAddAu(balance.au, au);
+    if (nextAu instanceof Error) return nextAu;
     const leaf = await this.depositLeafHash({
       rail: 'tnk',
       memo_hash: this.value.memo_hash,
       user_hash: await this.opaqueHash('deposit-user', pending.user),
-      mu,
+      au,
       tnk_e18: this.value.tnk_e18,
       msb_tx_hash: this.value.msb_tx_hash,
       rate_ts: rate.ts,
       treasury_address_hash: await this.opaqueHash('deposit-treasury', pending.treasury_address),
-      quoted_mu: pending.quoted_mu,
+      quoted_au: pending.quoted_au,
     });
     const depositRoot = await this.nextDepositRoot({
       epoch: this.value.epoch,
       leaf,
-      mu,
+      au,
       at: this.value.at,
     });
     if (depositRoot instanceof Error) return depositRoot;
@@ -4164,7 +4579,7 @@ class MayhemContract extends Contract {
     const record = {
       ...balance,
       rail: ledgerRail,
-      mu: nextMu,
+      au: nextAu,
       updated_at: this.tx,
       last_deposit_rail: ledgerRail,
       last_deposit_rate_ts: rate.ts,
@@ -4174,7 +4589,7 @@ class MayhemContract extends Contract {
     await this.del(pendingKey);
     console.log('mayhem tnkDeposit', {
       who: pending.user,
-      mu,
+      au,
       tnk_e18: this.value.tnk_e18,
       rate_ts: rate.ts,
       epoch: this.value.epoch,
@@ -4183,7 +4598,7 @@ class MayhemContract extends Contract {
       ok: true,
       op: 'tnkDeposit',
       who: pending.user,
-      mu,
+      au,
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
       rate_ts: rate.ts,
@@ -4200,9 +4615,9 @@ class MayhemContract extends Contract {
     if (tapWei instanceof Error) return tapWei;
     const rate = await this.guardianRequireFreshTapRate(this.value.at);
     if (rate instanceof Error) return rate;
-    const mu = this.tapWeiToMu(tapWei, rate.tap_usd_e6);
-    if (mu instanceof Error) return mu;
-    if (mu <= 0) return new Error('TAP deposit converts to zero mu.');
+    const au = this.tapWeiToAu(tapWei, rate.tap_usd_au);
+    if (au instanceof Error) return au;
+    if (this.isZeroAu(au)) return new Error('TAP deposit converts to zero au.');
 
     const who = this.value.who.toLowerCase();
     const ethTxHash = this.value.eth_tx_hash.toLowerCase();
@@ -4217,8 +4632,8 @@ class MayhemContract extends Contract {
         op: 'tapDeposit',
         duplicate: true,
         who: existing.who,
-        mu: 0,
-        credited_mu: existing.mu ?? null,
+        au: ZERO_AU,
+        credited_au: existing.au ?? null,
         epoch: existing.epoch ?? this.value.epoch,
         deposit_root: (await this.get(`ev/dep/${existing.epoch ?? this.value.epoch}`))?.merkle_root ?? null,
       };
@@ -4229,14 +4644,14 @@ class MayhemContract extends Contract {
     if (balance instanceof Error) return balance;
     const balanceError = this.guardianValidateBalanceRecord(balance, who, ledgerRail);
     if (balanceError) return balanceError;
-    const nextMu = this.safeAddMu(balance.mu, mu);
-    if (nextMu instanceof Error) return nextMu;
+    const nextAu = this.safeAddAu(balance.au, au);
+    if (nextAu instanceof Error) return nextAu;
     const leaf = await this.depositLeafHash({
       rail: 'tap',
       user_hash: await this.opaqueHash('deposit-user', who),
-      mu,
+      au,
       tap_wei: this.value.tap_wei,
-      tap_usd_e6: rate.tap_usd_e6,
+      tap_usd_au: rate.tap_usd_au,
       rate_ts: rate.ts,
       rate_source: rate.source,
       eth_tx_hash: ethTxHash,
@@ -4254,7 +4669,7 @@ class MayhemContract extends Contract {
     const depositRoot = await this.nextDepositRoot({
       epoch: this.value.epoch,
       leaf,
-      mu,
+      au,
       at: this.value.at,
     });
     if (depositRoot instanceof Error) return depositRoot;
@@ -4263,10 +4678,10 @@ class MayhemContract extends Contract {
       rail: 'tap',
       who,
       tap_wei: this.value.tap_wei,
-      tap_usd_e6: rate.tap_usd_e6,
+      tap_usd_au: rate.tap_usd_au,
       rate_ts: rate.ts,
       rate_source: rate.source,
-      mu,
+      au,
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
       block_number: this.value.block_number,
@@ -4288,22 +4703,22 @@ class MayhemContract extends Contract {
       ...balance,
       user: who,
       rail: ledgerRail,
-      mu: nextMu,
+      au: nextAu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
       updated_at: this.tx,
       last_deposit_rail: 'tap',
       last_deposit_rate_ts: rate.ts,
       last_deposit_rate_source: rate.source,
-      last_deposit_tap_usd_e6: rate.tap_usd_e6,
+      last_deposit_tap_usd_au: rate.tap_usd_au,
     };
     await this.put(seenKey, seen);
     await this.put(this.balanceKey(who, ledgerRail), record);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     console.log('mayhem tapDeposit', {
       who,
-      mu,
+      au,
       tap_wei: this.value.tap_wei,
-      tap_usd_e6: rate.tap_usd_e6,
+      tap_usd_au: rate.tap_usd_au,
       rate_ts: rate.ts,
       eth_tx_hash: ethTxHash,
       log_index: this.value.log_index,
@@ -4314,7 +4729,7 @@ class MayhemContract extends Contract {
       op: 'tapDeposit',
       duplicate: false,
       who,
-      mu,
+      au,
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
       eth_tx_hash: ethTxHash,
@@ -4389,26 +4804,45 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(this.value.ext_ref_hash)) return new Error('Invalid external reference hash.');
     const fiat = this.fiatEvidenceFields();
     if (fiat instanceof Error) return fiat;
+    const au = this.normalizeAu(this.value.au, 'fiat deposit amount', { allowZero: false });
+    if (au instanceof Error) return au;
+
+    const seenKey = `dep/fiat/${this.value.ext_ref_hash}`;
+    const existing = await this.get(seenKey);
+    if (existing !== null) {
+      return {
+        ok: true,
+        op: 'fiatDeposit',
+        duplicate: true,
+        rail: existing.rail ?? 'fiat',
+        processor_rail: existing.processor_rail ?? this.value.rail,
+        who: existing.who,
+        au: ZERO_AU,
+        credited_au: existing.au ?? null,
+        epoch: existing.epoch ?? this.value.epoch,
+        deposit_root: (await this.get(`ev/dep/${existing.epoch ?? this.value.epoch}`))?.merkle_root ?? null,
+      };
+    }
 
     const ledgerRail = 'fiat';
     const balance = await this.balanceRecord(this.value.who, ledgerRail);
     if (balance instanceof Error) return balance;
     const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who, ledgerRail);
     if (balanceError) return balanceError;
-    const nextMu = this.safeAddMu(balance.mu, this.value.mu);
-    if (nextMu instanceof Error) return nextMu;
+    const nextAu = this.safeAddAu(balance.au, au);
+    if (nextAu instanceof Error) return nextAu;
     const leaf = await this.depositLeafHash({
       rail: ledgerRail,
       processor_rail: this.value.rail,
       user_hash: await this.opaqueHash('deposit-user', this.value.who),
-      mu: this.value.mu,
+      au,
       ext_ref_hash: this.value.ext_ref_hash,
       ...fiat,
     });
     const depositRoot = await this.nextDepositRoot({
       epoch: this.value.epoch,
       leaf,
-      mu: this.value.mu,
+      au,
       at: this.value.at,
     });
     if (depositRoot instanceof Error) return depositRoot;
@@ -4416,20 +4850,36 @@ class MayhemContract extends Contract {
     const record = {
       ...balance,
       rail: ledgerRail,
-      mu: nextMu,
+      au: nextAu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
       updated_at: this.tx,
       last_deposit_rail: ledgerRail,
       last_deposit_processor_rail: this.value.rail,
       ...(fiat.fiat_currency ? { last_deposit_fiat_currency: fiat.fiat_currency } : {}),
     };
+    const seen = {
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
+      who: this.value.who,
+      au,
+      ext_ref_hash: this.value.ext_ref_hash,
+      ...fiat,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      credited_at: this.tx,
+      credited_by: this.address,
+      credited_by_role: 'admin',
+      chargeback_au_cum: ZERO_AU,
+      network_absorbed_au_cum: ZERO_AU,
+    };
+    await this.put(seenKey, seen);
     await this.put(this.balanceKey(this.value.who, ledgerRail), record);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     console.log('mayhem fiatDeposit', {
       rail: ledgerRail,
       processor_rail: this.value.rail,
       who: this.value.who,
-      mu: this.value.mu,
+      au,
       ...fiat,
       epoch: this.value.epoch,
     });
@@ -4439,7 +4889,8 @@ class MayhemContract extends Contract {
       rail: ledgerRail,
       processor_rail: this.value.rail,
       who: this.value.who,
-      mu: this.value.mu,
+      au,
+      duplicate: false,
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
       ...fiat,
@@ -4455,25 +4906,59 @@ class MayhemContract extends Contract {
     if (!this.isSafeKeyPart(this.value.dispute_ref_hash)) return new Error('Invalid dispute reference hash.');
     const fiat = this.fiatEvidenceFields();
     if (fiat instanceof Error) return fiat;
+    const au = this.normalizeAu(this.value.au, 'fiat chargeback amount', { allowZero: false });
+    if (au instanceof Error) return au;
+
+    const depositSeenKey = `dep/fiat/${this.value.ext_ref_hash}`;
+    const depositSeen = await this.get(depositSeenKey);
+    if (depositSeen === null) return new Error('Fiat deposit reference not found.');
+    if (depositSeen.who !== this.value.who) return new Error('Fiat chargeback recipient mismatch.');
+    if (depositSeen.processor_rail !== this.value.rail) return new Error('Fiat chargeback processor rail mismatch.');
+    const chargebackSeenKey = `${depositSeenKey}/chargeback/${this.value.dispute_ref_hash}`;
+    const existingChargeback = await this.get(chargebackSeenKey);
+    if (existingChargeback !== null) {
+      return {
+        ok: true,
+        op: 'fiatChargeback',
+        duplicate: true,
+        rail: existingChargeback.rail ?? 'fiat',
+        processor_rail: existingChargeback.processor_rail ?? this.value.rail,
+        who: existingChargeback.who,
+        au: ZERO_AU,
+        disputed_au: existingChargeback.au ?? null,
+        clawback_au: ZERO_AU,
+        credited_clawback_au: existingChargeback.clawback_au ?? null,
+        network_absorbed_au: ZERO_AU,
+        frozen: true,
+        epoch: existingChargeback.epoch ?? this.value.epoch,
+        deposit_root: (await this.get(`ev/dep/${existingChargeback.epoch ?? this.value.epoch}`))?.merkle_root ?? null,
+        ...fiat,
+      };
+    }
+    const depositDisputedAuCum = this.safeAddAu(depositSeen.disputed_au_cum ?? ZERO_AU, au);
+    if (depositDisputedAuCum instanceof Error) return depositDisputedAuCum;
+    if (this.compareAu(depositDisputedAuCum, depositSeen.au) > 0) {
+      return new Error('Fiat chargeback exceeds original deposit.');
+    }
 
     const ledgerRail = 'fiat';
     const balance = await this.balanceRecord(this.value.who, ledgerRail);
     if (balance instanceof Error) return balance;
     const balanceError = this.guardianValidateBalanceRecord(balance, this.value.who, ledgerRail);
     if (balanceError) return balanceError;
-    const clawbackMu = Math.min(balance.mu, this.value.mu);
-    const networkAbsorbedMu = this.safeSubMu(this.value.mu, clawbackMu);
-    if (networkAbsorbedMu instanceof Error) return networkAbsorbedMu;
-    const nextMu = this.safeSubMu(balance.mu, clawbackMu);
-    if (nextMu instanceof Error) return nextMu;
+    const clawbackAu = this.compareAu(balance.au, au) < 0 ? balance.au : au;
+    const networkAbsorbedAu = this.safeSubAu(au, clawbackAu);
+    if (networkAbsorbedAu instanceof Error) return networkAbsorbedAu;
+    const nextAu = this.safeSubAu(balance.au, clawbackAu);
+    if (nextAu instanceof Error) return nextAu;
 
     const leaf = await this.depositLeafHash({
       rail: ledgerRail,
       processor_rail: this.value.rail,
       user_hash: await this.opaqueHash('deposit-user', this.value.who),
-      mu: this.value.mu,
-      clawback_mu: clawbackMu,
-      network_absorbed_mu: networkAbsorbedMu,
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
       ext_ref_hash: this.value.ext_ref_hash,
       dispute_ref_hash: this.value.dispute_ref_hash,
       reversed: true,
@@ -4482,20 +4967,20 @@ class MayhemContract extends Contract {
     const depositRoot = await this.nextDepositReversalRoot({
       epoch: this.value.epoch,
       leaf,
-      disputedMu: this.value.mu,
-      clawbackMu,
-      absorbedMu: networkAbsorbedMu,
+      disputedAu: au,
+      clawbackAu,
+      absorbedAu: networkAbsorbedAu,
       at: this.value.at,
     });
     if (depositRoot instanceof Error) return depositRoot;
 
     const frozen = await this.get(`frozen/${this.value.who}`);
-    const disputedMuCum = this.safeAddMu(frozen?.disputed_mu_cum ?? 0, this.value.mu);
-    if (disputedMuCum instanceof Error) return disputedMuCum;
-    const clawbackMuCum = this.safeAddMu(frozen?.clawback_mu_cum ?? 0, clawbackMu);
-    if (clawbackMuCum instanceof Error) return clawbackMuCum;
-    const absorbedMuCum = this.safeAddMu(frozen?.network_absorbed_mu_cum ?? 0, networkAbsorbedMu);
-    if (absorbedMuCum instanceof Error) return absorbedMuCum;
+    const frozenDisputedAuCum = this.safeAddAu(frozen?.disputed_au_cum ?? ZERO_AU, au);
+    if (frozenDisputedAuCum instanceof Error) return frozenDisputedAuCum;
+    const clawbackAuCum = this.safeAddAu(frozen?.clawback_au_cum ?? ZERO_AU, clawbackAu);
+    if (clawbackAuCum instanceof Error) return clawbackAuCum;
+    const absorbedAuCum = this.safeAddAu(frozen?.network_absorbed_au_cum ?? ZERO_AU, networkAbsorbedAu);
+    if (absorbedAuCum instanceof Error) return absorbedAuCum;
     const freezeRecord = {
       user: this.value.who,
       status: 'frozen',
@@ -4508,33 +4993,65 @@ class MayhemContract extends Contract {
       updated_at_seconds: this.value.at,
       updated_epoch: Math.max(frozen?.updated_epoch ?? 0, this.value.epoch),
       dispute_count: (frozen?.dispute_count ?? 0) + 1,
-      disputed_mu_cum: disputedMuCum,
-      clawback_mu_cum: clawbackMuCum,
-      network_absorbed_mu_cum: absorbedMuCum,
+      disputed_au_cum: frozenDisputedAuCum,
+      clawback_au_cum: clawbackAuCum,
+      network_absorbed_au_cum: absorbedAuCum,
       last_ext_ref_hash: this.value.ext_ref_hash,
       last_dispute_ref_hash: this.value.dispute_ref_hash,
       last_fiat_currency: fiat.fiat_currency,
+    };
+    const depositChargebackAuCum = this.safeAddAu(depositSeen.chargeback_au_cum ?? ZERO_AU, clawbackAu);
+    if (depositChargebackAuCum instanceof Error) return depositChargebackAuCum;
+    const depositAbsorbedAuCum = this.safeAddAu(depositSeen.network_absorbed_au_cum ?? ZERO_AU, networkAbsorbedAu);
+    if (depositAbsorbedAuCum instanceof Error) return depositAbsorbedAuCum;
+    const chargebackSeen = {
+      rail: ledgerRail,
+      processor_rail: this.value.rail,
+      who: this.value.who,
+      au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
+      ext_ref_hash: this.value.ext_ref_hash,
+      dispute_ref_hash: this.value.dispute_ref_hash,
+      ...fiat,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      credited_at: this.tx,
+      credited_by: this.address,
+      credited_by_role: 'admin',
     };
 
     await this.put(this.balanceKey(this.value.who, ledgerRail), {
       ...balance,
       rail: ledgerRail,
-      mu: nextMu,
+      au: nextAu,
       updated_epoch: Math.max(balance.updated_epoch, this.value.epoch),
       updated_at: this.tx,
       last_chargeback_rail: ledgerRail,
       last_chargeback_processor_rail: this.value.rail,
       last_chargeback_fiat_currency: fiat.fiat_currency,
     });
+    await this.put(depositSeenKey, {
+      ...depositSeen,
+      disputed_au_cum: depositDisputedAuCum,
+      chargeback_au_cum: depositChargebackAuCum,
+      network_absorbed_au_cum: depositAbsorbedAuCum,
+      last_dispute_ref_hash: this.value.dispute_ref_hash,
+      last_chargeback_at: this.tx,
+      last_chargeback_at_seconds: this.value.at,
+      last_chargeback_epoch: this.value.epoch,
+    });
+    await this.put(chargebackSeenKey, chargebackSeen);
     await this.put(`frozen/${this.value.who}`, freezeRecord);
     await this.put(`ev/dep/${this.value.epoch}`, depositRoot);
     console.log('mayhem fiatChargeback', {
       rail: ledgerRail,
       processor_rail: this.value.rail,
       who: this.value.who,
-      mu: this.value.mu,
-      clawback_mu: clawbackMu,
-      network_absorbed_mu: networkAbsorbedMu,
+      au,
+      duplicate: false,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
       ...fiat,
       epoch: this.value.epoch,
     });
@@ -4544,9 +5061,9 @@ class MayhemContract extends Contract {
       rail: ledgerRail,
       processor_rail: this.value.rail,
       who: this.value.who,
-      mu: this.value.mu,
-      clawback_mu: clawbackMu,
-      network_absorbed_mu: networkAbsorbedMu,
+      au: this.value.au,
+      clawback_au: clawbackAu,
+      network_absorbed_au: networkAbsorbedAu,
       frozen: true,
       epoch: this.value.epoch,
       deposit_root: depositRoot.merkle_root,
@@ -4624,7 +5141,7 @@ class MayhemContract extends Contract {
       return new Error('Current admin price required before provider serving.');
     }
     if (schedule.denom !== PRICE_DENOMINATION || current.denom !== PRICE_DENOMINATION) {
-      return new Error('Provider serving requires a current mu_usd admin price.');
+      return new Error('Provider serving requires a current au_usd admin price.');
     }
     if (current.enclave_id !== enclaveId) {
       return new Error('Provider serving requires a current admin-set enclave price.');
@@ -4844,15 +5361,51 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  async normalizeCtxBracketEvidenceForEnclave(enclaveId, tokens, bracket, tableVer, table, label) {
+    const enclave = await this.get(`enclave/${enclaveId}`);
+    if (!enclave) return new Error(`${label} enclave not found.`);
+    if (!this.enclaveUsesCtxPrice(enclave)) {
+      if (bracket !== undefined && bracket !== null) {
+        return new Error(`${label} context bracket is only valid for text-generation enclaves.`);
+      }
+      if (tableVer !== undefined && tableVer !== null) {
+        return new Error(`${label} context bracket table version is only valid for text-generation enclaves.`);
+      }
+      return {
+        enclave,
+        ctx_bracket: null,
+        ctx_bracket_table_ver: null,
+      };
+    }
+    const ctxError = this.validateCtxBracketEvidence(tokens, bracket, tableVer, table, label);
+    if (ctxError) return ctxError;
+    return {
+      enclave,
+      ctx_bracket: bracket,
+      ctx_bracket_table_ver: tableVer,
+    };
+  }
+
   validateProviderLifecycleIntent(intent) {
     if (!PROVIDER_LIFECYCLE_OPS.has(intent.op)) return new Error('Unsupported provider lifecycle op.');
     const allowed = intent.op === 'register_provider'
       ? ['op', 'provider', 'nonce']
       : intent.op === 'join_room' || intent.op === 'leave_room'
         ? ['op', 'provider', 'enclave_id', 'room_id', 'nonce']
+        : intent.op === 'join_enclave'
+          ? ['op', 'provider', 'enclave_id', 'nonce', 'hardware_fingerprint', 'device_key']
         : ['op', 'provider', 'enclave_id', 'nonce'];
-    const shapeError = this.validateExactObjectKeys(intent, allowed, 'provider lifecycle intent');
-    if (shapeError) return shapeError;
+    const required = intent.op === 'join_enclave'
+      ? ['op', 'provider', 'enclave_id', 'nonce']
+      : allowed;
+    const allowedSet = new Set(allowed);
+    const unknown = Object.keys(intent).filter((key) => !allowedSet.has(key)).sort();
+    if (unknown.length > 0) {
+      return new Error(`provider lifecycle intent does not accept fields: ${unknown.join(', ')}.`);
+    }
+    for (const key of required) {
+      if (!hasOwn(intent, key)) return new Error(`provider lifecycle intent is missing ${key}.`);
+    }
     if (!this.isHexBytes(intent.provider, 32)) return new Error('Invalid provider id.');
     if (!this.isHexBytes(intent.nonce, 32)) return new Error('Invalid lifecycle nonce.');
     if (hasOwn(intent, 'enclave_id') && !this.isSafeKeyPart(intent.enclave_id)) {
@@ -4861,7 +5414,28 @@ class MayhemContract extends Contract {
     if (hasOwn(intent, 'room_id') && !this.isSafeKeyPart(intent.room_id)) {
       return new Error('Invalid room id.');
     }
+    if (hasOwn(intent, 'hardware_fingerprint') && !this.isHexBytes(intent.hardware_fingerprint, 32)) {
+      return new Error('Invalid provider hardware fingerprint.');
+    }
+    if (hasOwn(intent, 'device_key') && !this.isHexBytes(intent.device_key, 32)) {
+      return new Error('Invalid provider device key.');
+    }
     return null;
+  }
+
+  banRecordKey(targetType, target) {
+    switch (targetType) {
+      case 'provider':
+        return `ban/provider/${target}`;
+      case 'device':
+        return `ban/device/${target}`;
+      case 'fingerprint':
+        return `ban/fingerprint/${target}`;
+      case 'committer':
+        return `committer/ban/${target}`;
+      default:
+        return `ban/unknown/${target}`;
+    }
   }
 
   async providerLifecycleFeatureKey(intent) {
@@ -4932,10 +5506,28 @@ class MayhemContract extends Contract {
     for (const key of keys) {
       const value = values[key];
       const def = PARAM_DEFINITIONS[key];
+      if (def.money) {
+        const au = this.normalizeAu(value, `Parameter ${key}`, { allowZero: def.min === ZERO_AU });
+        if (au instanceof Error) return au;
+        if (this.compareAu(au, def.min) < 0) return new Error(`Parameter ${key} is out of range.`);
+        continue;
+      }
       if (!Number.isInteger(value)) return new Error(`Parameter ${key} must be an integer.`);
       if (value < def.min || value > def.max) return new Error(`Parameter ${key} is out of range.`);
     }
     return null;
+  }
+
+  normalizeParamValues(values) {
+    const normalized = {};
+    for (const [key, value] of Object.entries(values)) {
+      const def = PARAM_DEFINITIONS[key];
+      normalized[key] = def.money
+        ? this.normalizeAu(value, `Parameter ${key}`, { allowZero: def.min === ZERO_AU })
+        : value;
+      if (normalized[key] instanceof Error) return normalized[key];
+    }
+    return normalized;
   }
 
   validateParamKeys(keys) {
@@ -5326,8 +5918,8 @@ class MayhemContract extends Contract {
       ...(record.ctx_bracket ? { ctx_bracket: record.ctx_bracket } : {}),
       ...(record.ctx_bracket_table_ver ? { ctx_bracket_table_ver: record.ctx_bracket_table_ver } : {}),
       rate_map: cloneValue(record.seed_rate_map ?? record.rate_map),
-      per_req_mu: record.seed_per_req_mu ?? record.per_req_mu,
-      min_session_mu: record.seed_min_session_mu ?? record.min_session_mu,
+      per_req_au: record.seed_per_req_au ?? record.per_req_au,
+      min_session_au: record.seed_min_session_au ?? record.min_session_au,
       effective_at: record.seed_effective_at ?? record.effective_at,
       effective_from: record.seed_effective_from ?? record.effective_from,
       updated_at: record.seed_updated_at ?? record.updated_at,
@@ -5353,7 +5945,7 @@ class MayhemContract extends Contract {
       'market_gain_bps',
       'market_max_step_bps',
       'market_cold_start_min_providers',
-      'market_provider_epoch_target_mu',
+      'market_provider_epoch_target_au',
       'market_max_utilization_bps',
       'market_below_target_discount_bps',
       'market_above_target_slope_bps',
@@ -5367,27 +5959,35 @@ class MayhemContract extends Contract {
       gain_bps: params.market_gain_bps,
       max_step_bps: params.market_max_step_bps,
       cold_start_min_providers: params.market_cold_start_min_providers,
-      provider_epoch_target_mu: params.market_provider_epoch_target_mu,
+      provider_epoch_target_au: params.market_provider_epoch_target_au,
       max_utilization_bps: params.market_max_utilization_bps,
       below_target_discount_bps: params.market_below_target_discount_bps,
       above_target_slope_bps: params.market_above_target_slope_bps,
     };
   }
 
-  marketUtilizationBps(demandMu, activeSupply, constants) {
-    if (!Number.isSafeInteger(demandMu) || demandMu < 0) {
-      return new Error('Invalid market demand.');
-    }
+  marketUtilizationBps(demandAu, activeSupply, constants) {
+    const demand = this.parseAu(demandAu, 'market demand');
+    if (demand instanceof Error) return new Error('Invalid market demand.');
     if (!Number.isSafeInteger(activeSupply) || activeSupply < 0) {
       return new Error('Invalid market active supply.');
     }
     if (activeSupply === 0) return 0;
-    const capacityMu = activeSupply * constants.provider_epoch_target_mu;
-    if (!Number.isSafeInteger(capacityMu) || capacityMu <= 0) {
+    const providerEpochTarget = this.parseAu(
+      constants.provider_epoch_target_au,
+      'market provider epoch target',
+      { allowZero: false }
+    );
+    if (providerEpochTarget instanceof Error) {
       return new Error('Invalid market supply capacity.');
     }
-    const util = Math.floor((demandMu * 10_000) / capacityMu);
-    return Math.min(util, constants.max_utilization_bps);
+    const capacityAu = BigInt(activeSupply) * providerEpochTarget;
+    if (capacityAu <= 0n) return new Error('Invalid market supply capacity.');
+    const util = (demand * 10_000n) / capacityAu;
+    const capped = util > BigInt(constants.max_utilization_bps)
+      ? BigInt(constants.max_utilization_bps)
+      : util;
+    return Number(capped);
   }
 
   marketEmaUtilizationBps(previousEmaBps, utilizationBps, constants) {
@@ -5416,41 +6016,40 @@ class MayhemContract extends Contract {
   }
 
   scalePriceTerm(term, multiplierBps) {
-    if (!Number.isSafeInteger(term) || term < 0 || !Number.isSafeInteger(multiplierBps) || multiplierBps < 0) {
+    const amount = this.parseAu(term, 'price term');
+    if (amount instanceof Error || !Number.isSafeInteger(multiplierBps) || multiplierBps < 0) {
       return new Error('Invalid price term.');
     }
-    if (term === 0) return 0;
-    const scaled = this.safeNarrowMu(
-      (BigInt(term) * BigInt(multiplierBps) + 5_000n) / 10_000n
-    );
-    if (scaled instanceof Error) return scaled;
-    return Math.max(1, scaled);
+    if (amount === 0n) return ZERO_AU;
+    const scaled = (amount * BigInt(multiplierBps) + 5_000n) / 10_000n;
+    return this.canonicalAu(scaled > 0n ? scaled : 1n);
   }
 
   stepPriceTerm(current, desired, constants) {
-    if (
-      !Number.isSafeInteger(current) ||
-      !Number.isSafeInteger(desired) ||
-      current < 0 ||
-      desired < 0
-    ) {
-      return new Error('Invalid price term.');
-    }
-    if (current === desired) return current;
-    if (current === 0) return desired;
-    const delta = Math.abs(desired - current);
-    const gained = Math.max(1, Math.floor((delta * constants.gain_bps) / 10_000));
-    const maxStep = Math.max(1, Math.floor((current * constants.max_step_bps) / 10_000));
-    const step = Math.min(gained, maxStep);
-    return desired > current ? current + step : Math.max(0, current - step);
+    const currentAu = this.parseAu(current, 'current price term');
+    const desiredAu = this.parseAu(desired, 'desired price term');
+    if (currentAu instanceof Error || desiredAu instanceof Error) return new Error('Invalid price term.');
+    if (currentAu === desiredAu) return this.canonicalAu(currentAu);
+    if (currentAu === 0n) return this.canonicalAu(desiredAu);
+    const delta = currentAu > desiredAu ? currentAu - desiredAu : desiredAu - currentAu;
+    const gainedRaw = (delta * BigInt(constants.gain_bps)) / 10_000n;
+    const maxStepRaw = (currentAu * BigInt(constants.max_step_bps)) / 10_000n;
+    const gained = gainedRaw > 0n ? gainedRaw : 1n;
+    const maxStep = maxStepRaw > 0n ? maxStepRaw : 1n;
+    const step = gained < maxStep ? gained : maxStep;
+    return this.canonicalAu(
+      desiredAu > currentAu
+        ? currentAu + step
+        : (step > currentAu ? 0n : currentAu - step)
+    );
   }
 
   scaleRateMap(rateMap, multiplierBps) {
     const scaled = [];
     for (const entry of rateMap) {
-      const perUnitMu = this.scalePriceTerm(entry.per_unit_mu, multiplierBps);
-      if (perUnitMu instanceof Error) return perUnitMu;
-      scaled.push({ ...entry, per_unit_mu: perUnitMu });
+      const perUnitAu = this.scalePriceTerm(entry.per_unit_au, multiplierBps);
+      if (perUnitAu instanceof Error) return perUnitAu;
+      scaled.push({ ...entry, per_unit_au: perUnitAu });
     }
     return this.normalizeRateMap(scaled);
   }
@@ -5463,9 +6062,9 @@ class MayhemContract extends Contract {
       if (!desired || desired.granularity !== entry.granularity) {
         return new Error('Market price rate_map shape changed.');
       }
-      const perUnitMu = this.stepPriceTerm(entry.per_unit_mu, desired.per_unit_mu, constants);
-      if (perUnitMu instanceof Error) return perUnitMu;
-      stepped.push({ ...entry, per_unit_mu: perUnitMu });
+      const perUnitAu = this.stepPriceTerm(entry.per_unit_au, desired.per_unit_au, constants);
+      if (perUnitAu instanceof Error) return perUnitAu;
+      stepped.push({ ...entry, per_unit_au: perUnitAu });
     }
     return this.normalizeRateMap(stepped);
   }
@@ -5473,8 +6072,8 @@ class MayhemContract extends Contract {
   priceTermsEqual(left, right) {
     return (
       stableJson(left.rate_map) === stableJson(right.rate_map) &&
-      left.per_req_mu === right.per_req_mu &&
-      left.min_session_mu === right.min_session_mu
+      this.compareAu(left.per_req_au, right.per_req_au) === 0 &&
+      this.compareAu(left.min_session_au, right.min_session_au) === 0
     );
   }
 
@@ -5504,11 +6103,11 @@ class MayhemContract extends Contract {
         return new Error('Market price requires an admin seed.');
       }
 
-      const activeSupply = this.enclaveActiveProviders(enclave).length;
+      const activeSupply = usage.provider_count;
       const previousMarket = current.market && typeof current.market === 'object'
         ? current.market
         : {};
-      const utilizationBps = this.marketUtilizationBps(usage.demand_mu, activeSupply, constants);
+      const utilizationBps = this.marketUtilizationBps(usage.demand_au, activeSupply, constants);
       if (utilizationBps instanceof Error) return utilizationBps;
       const frozen = activeSupply < constants.cold_start_min_providers;
       const emaUtilizationBps = frozen
@@ -5519,25 +6118,25 @@ class MayhemContract extends Contract {
         : this.marketCurveMultiplierBps(emaUtilizationBps, constants);
       const desiredRateMap = this.scaleRateMap(seed.rate_map, multiplierBps);
       if (desiredRateMap instanceof Error) return desiredRateMap;
-      const desiredPerReqMu = this.scalePriceTerm(seed.per_req_mu, multiplierBps);
-      if (desiredPerReqMu instanceof Error) return desiredPerReqMu;
-      const desiredMinSessionMu = this.scalePriceTerm(seed.min_session_mu, multiplierBps);
-      if (desiredMinSessionMu instanceof Error) return desiredMinSessionMu;
+      const desiredPerReqAu = this.scalePriceTerm(seed.per_req_au, multiplierBps);
+      if (desiredPerReqAu instanceof Error) return desiredPerReqAu;
+      const desiredMinSessionAu = this.scalePriceTerm(seed.min_session_au, multiplierBps);
+      if (desiredMinSessionAu instanceof Error) return desiredMinSessionAu;
 
       const nextTerms = frozen
         ? {
             rate_map: cloneValue(seed.rate_map),
-            per_req_mu: seed.per_req_mu,
-            min_session_mu: seed.min_session_mu,
+            per_req_au: seed.per_req_au,
+            min_session_au: seed.min_session_au,
           }
         : {
             rate_map: this.stepRateMap(current.rate_map, desiredRateMap, constants),
-            per_req_mu: this.stepPriceTerm(current.per_req_mu, desiredPerReqMu, constants),
-            min_session_mu: this.stepPriceTerm(current.min_session_mu, desiredMinSessionMu, constants),
+            per_req_au: this.stepPriceTerm(current.per_req_au, desiredPerReqAu, constants),
+            min_session_au: this.stepPriceTerm(current.min_session_au, desiredMinSessionAu, constants),
           };
       if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
-      if (nextTerms.per_req_mu instanceof Error) return nextTerms.per_req_mu;
-      if (nextTerms.min_session_mu instanceof Error) return nextTerms.min_session_mu;
+      if (nextTerms.per_req_au instanceof Error) return nextTerms.per_req_au;
+      if (nextTerms.min_session_au instanceof Error) return nextTerms.min_session_au;
       const latest = this.priceLatestEntry(schedule);
       const record = {
         enclave_id: current.enclave_id,
@@ -5545,8 +6144,8 @@ class MayhemContract extends Contract {
         denom: PRICE_DENOMINATION,
         ver: latest ? latest.ver + 1 : 1,
         rate_map: nextTerms.rate_map,
-        per_req_mu: nextTerms.per_req_mu,
-        min_session_mu: nextTerms.min_session_mu,
+        per_req_au: nextTerms.per_req_au,
+        min_session_au: nextTerms.min_session_au,
         effective_at: at,
         effective_from: tx,
         updated_at: tx,
@@ -5564,7 +6163,7 @@ class MayhemContract extends Contract {
           epoch,
           epoch_seconds: epochSeconds,
           active_supply: activeSupply,
-          active_demand_mu: usage.demand_mu,
+          active_demand_au: usage.demand_au,
           session_count: usage.session_count,
           ...(ctxMeta ? {
             ctx_bracket: ctxMeta.ctx_bracket,
@@ -5574,15 +6173,15 @@ class MayhemContract extends Contract {
           ema_utilization_bps: emaUtilizationBps,
           multiplier_bps: multiplierBps,
           desired_rate_map: desiredRateMap,
-          desired_per_req_mu: desiredPerReqMu,
-          desired_min_session_mu: desiredMinSessionMu,
+          desired_per_req_au: desiredPerReqAu,
+          desired_min_session_au: desiredMinSessionAu,
           frozen,
           frozen_reason: frozen ? 'cold_start_min_providers' : null,
           constants,
           previous_price_ver: current.ver,
           previous_rate_map: cloneValue(current.rate_map),
-          previous_per_req_mu: current.per_req_mu,
-          previous_min_session_mu: current.min_session_mu,
+          previous_per_req_au: current.per_req_au,
+          previous_min_session_au: current.min_session_au,
           seed_price_ver: seed.ver,
         },
       };
@@ -5602,7 +6201,7 @@ class MayhemContract extends Contract {
         utilization_bps: utilizationBps,
         ema_utilization_bps: emaUtilizationBps,
         active_supply: activeSupply,
-        active_demand_mu: usage.demand_mu,
+        active_demand_au: usage.demand_au,
         frozen,
         schedule_key: scheduleKey,
         schedule: updatedSchedule,
@@ -5635,6 +6234,32 @@ class MayhemContract extends Contract {
     );
   }
 
+  async currentAppliedEpoch() {
+    const state = await this.get('epoch/apply/state');
+    const epoch = state?.epoch ?? 0;
+    return Number.isSafeInteger(epoch) && epoch >= 0 ? epoch : 0;
+  }
+
+  async enclaveMinTierPolicy(enclave, currentEpoch = null) {
+    const epoch = currentEpoch ?? await this.currentAppliedEpoch();
+    const policy = await this.get(`tierpolicy/enclave/${enclave.enclave_id}`);
+    const baseMinTier = policy?.current_min_att_tier ?? enclave.min_att_tier ?? enclave.att_tier ?? 1;
+    const pending = policy?.pending ?? enclave.pending_min_att_tier ?? null;
+    if (pending && pending.effective_epoch <= epoch) {
+      return {
+        min_att_tier: pending.min_att_tier,
+        pending: null,
+        effective_epoch: pending.effective_epoch,
+        current_epoch: epoch,
+      };
+    }
+    return {
+      min_att_tier: baseMinTier,
+      pending,
+      current_epoch: epoch,
+    };
+  }
+
   validateRateMap(rateMap, modelClass, label, { allowZeroPrice = false } = {}) {
     if (!Array.isArray(rateMap) || rateMap.length === 0 || rateMap.length > RATE_MAP_MAX_ENTRIES) {
       return new Error(`${label} must be a non-empty array with at most ${RATE_MAP_MAX_ENTRIES} entries.`);
@@ -5643,7 +6268,7 @@ class MayhemContract extends Contract {
     if (!validUnits) return new Error(`No rate units configured for model_class ${modelClass}.`);
     const seen = new Set();
     for (const entry of rateMap) {
-      const shapeError = this.validateExactObjectKeys(entry, ['unit', 'per_unit_mu', 'granularity'], `${label} entry`);
+      const shapeError = this.validateExactObjectKeys(entry, ['unit', 'per_unit_au', 'granularity'], `${label} entry`);
       if (shapeError) return shapeError;
       if (typeof entry.unit !== 'string' || entry.unit.length === 0 || entry.unit.length > 64) {
         return new Error(`${label} unit must be a non-empty string.`);
@@ -5651,8 +6276,9 @@ class MayhemContract extends Contract {
       if (!validUnits.has(entry.unit)) return new Error(`${label} unit ${entry.unit} is not allowed for model_class ${modelClass}.`);
       if (seen.has(entry.unit)) return new Error(`${label} has duplicate unit ${entry.unit}.`);
       seen.add(entry.unit);
-      if (!Number.isSafeInteger(entry.per_unit_mu) || entry.per_unit_mu < 0 || (!allowZeroPrice && entry.per_unit_mu === 0)) {
-        return new Error(`${label} per_unit_mu must be ${allowZeroPrice ? 'a non-negative' : 'a positive'} integer.`);
+      const perUnitAu = this.normalizeAu(entry.per_unit_au, `${label} per_unit_au`, { allowZero: allowZeroPrice });
+      if (perUnitAu instanceof Error || (!allowZeroPrice && this.isZeroAu(perUnitAu))) {
+        return new Error(`${label} per_unit_au must be ${allowZeroPrice ? 'a non-negative' : 'a positive'} integer.`);
       }
       if (!Number.isSafeInteger(entry.granularity) || entry.granularity <= 0) {
         return new Error(`${label} granularity must be a positive integer.`);
@@ -5665,7 +6291,7 @@ class MayhemContract extends Contract {
     return rateMap
       .map((entry) => ({
         unit: entry.unit,
-        per_unit_mu: entry.per_unit_mu,
+        per_unit_au: this.normalizeAu(entry.per_unit_au),
         granularity: entry.granularity,
       }))
       .sort((left, right) => compareCodepoint(left.unit, right.unit));
@@ -5678,7 +6304,7 @@ class MayhemContract extends Contract {
     const seen = new Set();
     const normalized = [];
     for (const entry of rateMap) {
-      const shapeError = this.validateExactObjectKeys(entry, ['unit', 'per_unit_mu', 'granularity'], `${label} entry`);
+      const shapeError = this.validateExactObjectKeys(entry, ['unit', 'per_unit_au', 'granularity'], `${label} entry`);
       if (shapeError) return shapeError;
       if (typeof entry.unit !== 'string' || entry.unit.length === 0 || entry.unit.length > 64) {
         return new Error(`${label} unit must be a non-empty string.`);
@@ -5687,15 +6313,16 @@ class MayhemContract extends Contract {
       if (!this.isSafeKeyPart(unit)) return new Error(`${label} unit is invalid.`);
       if (seen.has(unit)) return new Error(`${label} has duplicate unit ${unit}.`);
       seen.add(unit);
-      if (!Number.isSafeInteger(entry.per_unit_mu) || entry.per_unit_mu <= 0) {
-        return new Error(`${label} per_unit_mu must be a positive integer.`);
+      const perUnitAu = this.normalizeAu(entry.per_unit_au, `${label} per_unit_au`, { allowZero: false });
+      if (perUnitAu instanceof Error) {
+        return new Error(`${label} per_unit_au must be a positive integer.`);
       }
       if (!Number.isSafeInteger(entry.granularity) || entry.granularity <= 0) {
         return new Error(`${label} granularity must be a positive integer.`);
       }
       normalized.push({
         unit,
-        per_unit_mu: entry.per_unit_mu,
+        per_unit_au: perUnitAu,
         granularity: entry.granularity,
       });
     }
@@ -5728,20 +6355,20 @@ class MayhemContract extends Contract {
     price_min_bps: PARAM_DEFINITIONS.price_min_bps.default,
     price_max_bps: PARAM_DEFINITIONS.price_max_bps.default,
   }) {
+    const refPerUnit = this.parseAu(ref?.per_unit_au, 'reference rate per_unit_au', { allowZero: false });
+    const pricePerUnit = this.parseAu(price?.per_unit_au, 'price rate per_unit_au');
     if (
-      !Number.isSafeInteger(ref?.per_unit_mu) ||
-      ref.per_unit_mu <= 0 ||
+      refPerUnit instanceof Error ||
       !Number.isSafeInteger(ref?.granularity) ||
       ref.granularity <= 0 ||
-      !Number.isSafeInteger(price?.per_unit_mu) ||
-      price.per_unit_mu < 0 ||
+      pricePerUnit instanceof Error ||
       !Number.isSafeInteger(price?.granularity) ||
       price.granularity <= 0
     ) {
       return false;
     }
-    const priceScaled = BigInt(price.per_unit_mu) * BigInt(ref.granularity) * 10_000n;
-    const refScaled = BigInt(ref.per_unit_mu) * BigInt(price.granularity);
+    const priceScaled = pricePerUnit * BigInt(ref.granularity) * 10_000n;
+    const refScaled = refPerUnit * BigInt(price.granularity);
     return (
       priceScaled >= refScaled * BigInt(params.price_min_bps) &&
       priceScaled <= refScaled * BigInt(params.price_max_bps)
@@ -5753,12 +6380,15 @@ class MayhemContract extends Contract {
     if (!REPUTATION_EVENT_KINDS.has(value.kind)) return new Error('Unsupported reputation event kind.');
     if (
       (value.kind === 'session_ok' || value.kind === 'session_partial') &&
-      !Number.isInteger(value.paid_mu)
+      this.normalizeAu(value.paid_au, 'reputation paid amount') instanceof Error
     ) {
-      return new Error('Reputation event requires paid_mu.');
+      return new Error('Reputation event requires paid_au.');
     }
-    if (value.kind === 'session_fail' && !Number.isInteger(value.max_spend_mu)) {
-      return new Error('Reputation event requires max_spend_mu.');
+    if (
+      value.kind === 'session_fail' &&
+      this.normalizeAu(value.max_spend_au, 'reputation max spend') instanceof Error
+    ) {
+      return new Error('Reputation event requires max_spend_au.');
     }
     return null;
   }
@@ -5828,12 +6458,12 @@ class MayhemContract extends Contract {
         'enclave_id',
         'price_ver',
         'locked_rate_map',
-        'locked_per_req_mu',
-        'locked_min_session_mu',
+        'locked_per_req_au',
+        'locked_min_session_au',
         'served_ctx',
         'ctx_bracket',
         'ctx_bracket_table_ver',
-        'max_spend_mu',
+        'max_spend_au',
         'checkpoint_every',
         'user_sig',
       ],
@@ -5855,26 +6485,32 @@ class MayhemContract extends Contract {
     }
     const lockedRateMap = this.normalizeLockedRateMap(voucher.locked_rate_map, 'spend voucher locked_rate_map');
     if (lockedRateMap instanceof Error) return lockedRateMap;
-    if (!Number.isSafeInteger(voucher.locked_per_req_mu) || voucher.locked_per_req_mu < 0) {
+    const lockedPerReqAu = this.normalizeAu(voucher.locked_per_req_au, 'spend voucher locked per-request price');
+    if (lockedPerReqAu instanceof Error) {
       return new Error('Invalid spend voucher locked per-request price.');
     }
-    if (!Number.isSafeInteger(voucher.locked_min_session_mu) || voucher.locked_min_session_mu < 0) {
+    const lockedMinSessionAu = this.normalizeAu(voucher.locked_min_session_au, 'spend voucher locked minimum session price');
+    if (lockedMinSessionAu instanceof Error) {
       return new Error('Invalid spend voucher locked minimum session price.');
     }
     if (!Number.isSafeInteger(voucher.served_ctx) || voucher.served_ctx < 0) {
       return new Error('Invalid spend voucher served context.');
     }
-    const table = await this.ctxBracketTableByVersion(voucher.ctx_bracket_table_ver);
+    const table = voucher.ctx_bracket_table_ver === null || voucher.ctx_bracket_table_ver === undefined
+      ? null
+      : await this.ctxBracketTableByVersion(voucher.ctx_bracket_table_ver);
     if (table instanceof Error) return table;
-    const ctxError = this.validateCtxBracketEvidence(
+    const ctxMeta = await this.normalizeCtxBracketEvidenceForEnclave(
+      voucher.enclave_id.toLowerCase(),
       voucher.served_ctx,
       voucher.ctx_bracket,
       voucher.ctx_bracket_table_ver,
       table,
       'spend voucher'
     );
-    if (ctxError) return ctxError;
-    if (!Number.isSafeInteger(voucher.max_spend_mu) || voucher.max_spend_mu < 1) {
+    if (ctxMeta instanceof Error) return ctxMeta;
+    const maxSpendAu = this.normalizeAu(voucher.max_spend_au, 'spend voucher max spend', { allowZero: false });
+    if (maxSpendAu instanceof Error) {
       return new Error('Invalid spend voucher max spend.');
     }
     if (!Number.isSafeInteger(voucher.checkpoint_every.tokens) || voucher.checkpoint_every.tokens < 1) {
@@ -5890,12 +6526,12 @@ class MayhemContract extends Contract {
       enclave_id: voucher.enclave_id.toLowerCase(),
       price_ver: voucher.price_ver,
       locked_rate_map: lockedRateMap,
-      locked_per_req_mu: voucher.locked_per_req_mu,
-      locked_min_session_mu: voucher.locked_min_session_mu,
+      locked_per_req_au: lockedPerReqAu,
+      locked_min_session_au: lockedMinSessionAu,
       served_ctx: voucher.served_ctx,
-      ctx_bracket: voucher.ctx_bracket,
-      ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
-      max_spend_mu: voucher.max_spend_mu,
+      ctx_bracket: ctxMeta.ctx_bracket,
+      ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+      max_spend_au: maxSpendAu,
       checkpoint_every: {
         tokens: voucher.checkpoint_every.tokens,
         ms: voucher.checkpoint_every.ms,
@@ -5926,7 +6562,7 @@ class MayhemContract extends Contract {
         'served_ctx',
         'ctx_bracket',
         'ctx_bracket_table_ver',
-        'max_spend_mu',
+        'max_spend_au',
         'voucher',
         'provider_sig',
       ],
@@ -5952,20 +6588,24 @@ class MayhemContract extends Contract {
     if (!Number.isSafeInteger(value.served_ctx) || value.served_ctx < 0) {
       return new Error('Invalid spend reservation served context.');
     }
-    const activeTable = await this.ctxBracketTableAt(value.at);
+    const activeTable = value.ctx_bracket_table_ver === null || value.ctx_bracket_table_ver === undefined
+      ? null
+      : await this.ctxBracketTableAt(value.at);
     if (activeTable instanceof Error) return activeTable;
-    if (value.ctx_bracket_table_ver !== activeTable.ver) {
+    if (activeTable && value.ctx_bracket_table_ver !== activeTable.ver) {
       return new Error('Spend reservation context bracket table is not active.');
     }
-    const ctxError = this.validateCtxBracketEvidence(
+    const ctxMeta = await this.normalizeCtxBracketEvidenceForEnclave(
+      value.enclave_id.toLowerCase(),
       value.served_ctx,
       value.ctx_bracket,
       value.ctx_bracket_table_ver,
       activeTable,
       'spend reservation'
     );
-    if (ctxError) return ctxError;
-    if (!Number.isSafeInteger(value.max_spend_mu) || value.max_spend_mu < 1) {
+    if (ctxMeta instanceof Error) return ctxMeta;
+    const maxSpendAu = this.normalizeAu(value.max_spend_au, 'spend reservation max spend', { allowZero: false });
+    if (maxSpendAu instanceof Error) {
       return new Error('Invalid spend reservation max spend.');
     }
     if (!this.isHexBytes(value.provider_sig, 64)) {
@@ -5992,7 +6632,7 @@ class MayhemContract extends Contract {
     if (voucher.body.ctx_bracket_table_ver !== value.ctx_bracket_table_ver) {
       return new Error('Spend reservation voucher context bracket table version mismatch.');
     }
-    if (voucher.max_spend_mu !== value.max_spend_mu) {
+    if (this.compareAu(voucher.max_spend_au, maxSpendAu) !== 0) {
       return new Error('Spend reservation voucher max spend mismatch.');
     }
     return {
@@ -6007,25 +6647,25 @@ class MayhemContract extends Contract {
       enclave_id: value.enclave_id.toLowerCase(),
       price_ver: value.price_ver,
       locked_rate_map: voucher.body.locked_rate_map,
-      locked_per_req_mu: voucher.body.locked_per_req_mu,
-      locked_min_session_mu: voucher.body.locked_min_session_mu,
+      locked_per_req_au: voucher.body.locked_per_req_au,
+      locked_min_session_au: voucher.body.locked_min_session_au,
       served_ctx: value.served_ctx,
-      ctx_bracket: value.ctx_bracket,
-      ctx_bracket_table_ver: value.ctx_bracket_table_ver,
+      ctx_bracket: ctxMeta.ctx_bracket,
+      ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       rules_ver: value.rules_ver,
-      max_spend_mu: value.max_spend_mu,
+      max_spend_au: maxSpendAu,
       voucher: {
         session_id: voucher.body.session_id,
         rail: voucher.body.rail,
         enclave_id: voucher.body.enclave_id,
         price_ver: voucher.body.price_ver,
         locked_rate_map: voucher.body.locked_rate_map,
-        locked_per_req_mu: voucher.body.locked_per_req_mu,
-        locked_min_session_mu: voucher.body.locked_min_session_mu,
+        locked_per_req_au: voucher.body.locked_per_req_au,
+        locked_min_session_au: voucher.body.locked_min_session_au,
         served_ctx: voucher.body.served_ctx,
         ctx_bracket: voucher.body.ctx_bracket,
         ctx_bracket_table_ver: voucher.body.ctx_bracket_table_ver,
-        max_spend_mu: voucher.body.max_spend_mu,
+        max_spend_au: voucher.body.max_spend_au,
         checkpoint_every: voucher.body.checkpoint_every,
         user_sig: voucher.user_sig,
       },
@@ -6041,8 +6681,8 @@ class MayhemContract extends Contract {
         rail,
         denom: PRICE_DENOMINATION,
         epoch,
-        reserved_mu: 0,
-        balance_mu_at_last_reserve: null,
+        reserved_au: ZERO_AU,
+        balance_au_at_last_reserve: null,
         sessions: [],
         updated_at: null,
       };
@@ -6054,7 +6694,8 @@ class MayhemContract extends Contract {
       return new Error('Spend hold record key mismatch.');
     }
     if (record.denom !== PRICE_DENOMINATION) return new Error('Spend hold denomination mismatch.');
-    if (!Number.isSafeInteger(record.reserved_mu) || record.reserved_mu < 0) {
+    const reservedAu = this.normalizeAu(record.reserved_au, 'spend hold reserved amount');
+    if (reservedAu instanceof Error) {
       return new Error('Invalid spend hold reserved amount.');
     }
     if (!Array.isArray(record.sessions)) return new Error('Spend hold sessions must be an array.');
@@ -6076,33 +6717,45 @@ class MayhemContract extends Contract {
       if (stableJson(lockedRateMap) !== stableJson(session.locked_rate_map)) {
         return new Error('Spend hold locked_rate_map must be canonical.');
       }
-      if (!Number.isSafeInteger(session.locked_per_req_mu) || session.locked_per_req_mu < 0) {
+      const lockedPerReqAu = this.normalizeAu(session.locked_per_req_au, 'spend hold locked per-request price');
+      if (lockedPerReqAu instanceof Error) {
         return new Error('Invalid spend hold locked per-request price.');
       }
-      if (!Number.isSafeInteger(session.locked_min_session_mu) || session.locked_min_session_mu < 0) {
+      const lockedMinSessionAu = this.normalizeAu(session.locked_min_session_au, 'spend hold locked minimum session price');
+      if (lockedMinSessionAu instanceof Error) {
         return new Error('Invalid spend hold locked minimum session price.');
       }
       if (!Number.isSafeInteger(session.served_ctx) || session.served_ctx < 0) {
         return new Error('Invalid spend hold served context.');
       }
-      const table = await this.ctxBracketTableByVersion(session.ctx_bracket_table_ver);
+      const table = session.ctx_bracket_table_ver === null || session.ctx_bracket_table_ver === undefined
+        ? null
+        : await this.ctxBracketTableByVersion(session.ctx_bracket_table_ver);
       if (table instanceof Error) return table;
-      const ctxError = this.validateCtxBracketEvidence(
+      const ctxMeta = await this.normalizeCtxBracketEvidenceForEnclave(
+        session.enclave_id,
         session.served_ctx,
         session.ctx_bracket,
         session.ctx_bracket_table_ver,
         table,
         'spend hold'
       );
-      if (ctxError) return ctxError;
-      if (!Number.isSafeInteger(session.max_spend_mu) || session.max_spend_mu < 1) {
+      if (ctxMeta instanceof Error) return ctxMeta;
+      const maxSpendAu = this.normalizeAu(session.max_spend_au, 'spend hold max spend', { allowZero: false });
+      if (maxSpendAu instanceof Error) {
         return new Error('Invalid spend hold max spend.');
       }
       if (!this.isHexBytes(session.voucher_hash, 32)) return new Error('Invalid spend hold voucher hash.');
     }
     return {
       ...record,
-      sessions: record.sessions.map((session) => ({ ...session })),
+      reserved_au: reservedAu,
+      sessions: record.sessions.map((session) => ({
+        ...session,
+        locked_per_req_au: this.normalizeAu(session.locked_per_req_au, 'spend hold locked per-request price'),
+        locked_min_session_au: this.normalizeAu(session.locked_min_session_au, 'spend hold locked minimum session price'),
+        max_spend_au: this.normalizeAu(session.max_spend_au, 'spend hold max spend', { allowZero: false }),
+      })),
     };
   }
 
@@ -6276,8 +6929,8 @@ class MayhemContract extends Contract {
         'memo_hash',
         'treasury_address',
         'tnk_e18',
-        'quoted_mu',
-        'rate_tnk_usd_e6',
+        'quoted_au',
+        'rate_tnk_usd_au',
         'rate_source',
       ],
       'deposit TNK intent'
@@ -6286,10 +6939,12 @@ class MayhemContract extends Contract {
     if (intent.op !== 'deposit_tnk') return new Error('Invalid deposit TNK intent op.');
     if (!this.isSafeKeyPart(intent.memo_hash)) return new Error('Invalid deposit memo hash.');
     if (!this.isSafeKeyPart(intent.treasury_address)) return new Error('Invalid TNK treasury address.');
-    if (!Number.isSafeInteger(intent.quoted_mu) || intent.quoted_mu < 1) {
+    const quotedAu = this.normalizeAu(intent.quoted_au, 'TNK quoted credit', { allowZero: false });
+    if (quotedAu instanceof Error) {
       return new Error('Invalid TNK quoted credit.');
     }
-    if (!Number.isSafeInteger(intent.rate_tnk_usd_e6) || intent.rate_tnk_usd_e6 < 1) {
+    const rate = this.normalizeAu(intent.rate_tnk_usd_au, 'TNK quoted rate', { allowZero: false });
+    if (rate instanceof Error) {
       return new Error('Invalid TNK quoted rate.');
     }
     if (!this.isSafeKeyPart(intent.rate_source)) return new Error('Invalid TNK rate source.');
@@ -6311,7 +6966,7 @@ class MayhemContract extends Contract {
     if (user !== null && record.user !== user) {
       return new Error('Guardian balance owner invariant failed.');
     }
-    if (!Number.isSafeInteger(record.mu) || record.mu < 0) {
+    if (this.normalizeAu(record.au, 'balance au') instanceof Error) {
       return new Error('Guardian non-negative balance invariant failed.');
     }
     if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
@@ -6333,25 +6988,25 @@ class MayhemContract extends Contract {
     if (provider !== null && record.provider !== provider) {
       return new Error('Guardian earnings owner invariant failed.');
     }
-    for (const key of ['total_mu', 'held_mu', 'paid_cum_mu']) {
-      if (!Number.isSafeInteger(record[key]) || record[key] < 0) {
+    for (const key of ['total_au', 'held_au', 'paid_cum_au']) {
+      if (this.normalizeAu(record[key], `earning ${key}`) instanceof Error) {
         return new Error('Guardian non-negative earnings invariant failed.');
       }
     }
     if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
       return new Error('Guardian earnings epoch invariant failed.');
     }
-    const payableMu = this.safeSubMu(record.total_mu, record.held_mu);
-    if (payableMu instanceof Error) return payableMu;
-    if (record.held_mu > record.total_mu || record.paid_cum_mu > payableMu) {
+    const payableAu = this.safeSubAu(record.total_au, record.held_au);
+    if (payableAu instanceof Error) return payableAu;
+    if (this.compareAu(record.held_au, record.total_au) > 0 || this.compareAu(record.paid_cum_au, payableAu) > 0) {
       return new Error('Guardian earnings conservation invariant failed.');
     }
     if (record.holdbacks !== undefined) {
       const holdbacks = this.normalizeHoldbackBuckets(record);
       if (holdbacks instanceof Error) return holdbacks;
-      const heldMu = this.holdbackBucketTotal(holdbacks);
-      if (heldMu instanceof Error) return heldMu;
-      if (heldMu !== record.held_mu) {
+      const heldAu = this.holdbackBucketTotal(holdbacks);
+      if (heldAu instanceof Error) return heldAu;
+      if (this.compareAu(heldAu, record.held_au) !== 0) {
         return new Error('Guardian earnings conservation invariant failed.');
       }
     }
@@ -6368,19 +7023,22 @@ class MayhemContract extends Contract {
     if (record.denom !== PRICE_DENOMINATION) {
       return new Error('Guardian fee denomination invariant failed.');
     }
-    for (const key of ['cum_mu', 'swept_cum_mu']) {
-      if (!Number.isSafeInteger(record[key]) || record[key] < 0) {
+    for (const key of ['cum_au', 'swept_cum_au']) {
+      if (this.normalizeAu(record[key], `fee ${key}`) instanceof Error) {
         return new Error('Guardian fee conservation invariant failed.');
       }
     }
     if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
-    if (record.swept_cum_mu > record.cum_mu) {
+    if (this.compareAu(record.swept_cum_au, record.cum_au) > 0) {
       return new Error('Guardian fee conservation invariant failed.');
     }
-    const settledCumMu = record.settled_cum_mu ?? record.cum_mu;
-    if (!Number.isSafeInteger(settledCumMu) || settledCumMu < 0 || settledCumMu < record.cum_mu) {
+    const settledCumAu = record.settled_cum_au ?? record.cum_au;
+    if (
+      this.normalizeAu(settledCumAu, 'fee settled cumulative amount') instanceof Error ||
+      this.compareAu(settledCumAu, record.cum_au) < 0
+    ) {
       return new Error('Guardian conservation invariant failed.');
     }
     return null;
@@ -6404,7 +7062,7 @@ class MayhemContract extends Contract {
     if (epoch <= applyState.updated_epoch || epoch !== applyState.updated_epoch + 1) {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
-    let feeDeltaMu = 0;
+    let feeDeltaAu = ZERO_AU;
     for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
       const fee = feeRecords.get(rail);
       const feeError = this.guardianValidateFeeRecord(fee, rail);
@@ -6412,18 +7070,18 @@ class MayhemContract extends Contract {
       const nextFee = nextFeeRecords.get(rail);
       const nextFeeError = this.guardianValidateFeeRecord(nextFee, rail);
       if (nextFeeError) return nextFeeError;
-      const railFeeDelta = feeDeltaByRail.get(rail) ?? 0;
-      feeDeltaMu = this.safeAddMu(feeDeltaMu, railFeeDelta);
-      if (feeDeltaMu instanceof Error) return feeDeltaMu;
-      const expectedFeeCumMu = this.safeAddMu(fee.cum_mu, railFeeDelta);
-      if (expectedFeeCumMu instanceof Error) return expectedFeeCumMu;
-      if (nextFee.cum_mu !== expectedFeeCumMu) {
+      const railFeeDelta = feeDeltaByRail.get(rail) ?? ZERO_AU;
+      feeDeltaAu = this.safeAddAu(feeDeltaAu, railFeeDelta);
+      if (feeDeltaAu instanceof Error) return feeDeltaAu;
+      const expectedFeeCumAu = this.safeAddAu(fee.cum_au, railFeeDelta);
+      if (expectedFeeCumAu instanceof Error) return expectedFeeCumAu;
+      if (this.compareAu(nextFee.cum_au, expectedFeeCumAu) !== 0) {
         return new Error('Guardian fee conservation invariant failed.');
       }
     }
-    const grossDeltaTotal = this.safeAddMu(providerDeltaTotal, feeDeltaMu);
+    const grossDeltaTotal = this.safeAddAu(providerDeltaTotal, feeDeltaAu);
     if (grossDeltaTotal instanceof Error) return grossDeltaTotal;
-    if (grossDeltaTotal !== debitTotal) {
+    if (this.compareAu(grossDeltaTotal, debitTotal) !== 0) {
       return new Error('Guardian conservation invariant failed.');
     }
 
@@ -6440,13 +7098,13 @@ class MayhemContract extends Contract {
     for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
       const fee = feeRecords.get(rail);
       const nextFee = nextFeeRecords.get(rail);
-      const priorSettledCumMu = fee.settled_cum_mu ?? fee.cum_mu;
-      const nextSettledCumMu = this.safeAddMu(priorSettledCumMu, debitRailTotals.get(rail) ?? 0);
-      if (nextSettledCumMu instanceof Error) return nextSettledCumMu;
-      if (nextFee.cum_mu > nextSettledCumMu) {
+      const priorSettledCumAu = fee.settled_cum_au ?? fee.cum_au;
+      const nextSettledCumAu = this.safeAddAu(priorSettledCumAu, debitRailTotals.get(rail) ?? ZERO_AU);
+      if (nextSettledCumAu instanceof Error) return nextSettledCumAu;
+      if (this.compareAu(nextFee.cum_au, nextSettledCumAu) > 0) {
         return new Error('Guardian conservation invariant failed.');
       }
-      nextSettledCumByRail.set(rail, nextSettledCumMu);
+      nextSettledCumByRail.set(rail, nextSettledCumAu);
     }
     return { ok: true, next_settled_cum_by_rail: nextSettledCumByRail };
   }
@@ -6455,10 +7113,33 @@ class MayhemContract extends Contract {
     return Math.max(params.holdback_epochs ?? 0, params.challenge_epochs ?? 0);
   }
 
+  providerLockedEarningEpochs(provider, params) {
+    const normalHoldback = params.holdback_epochs ?? 0;
+    const newProviderHoldback = params.new_provider_holdback_epochs ?? normalHoldback;
+    const threshold = params.probation_successful_sessions ?? 0;
+    const successfulSessions = provider?.probation?.successful_sessions ?? 0;
+    if (
+      !Number.isSafeInteger(normalHoldback) ||
+      !Number.isSafeInteger(newProviderHoldback) ||
+      !Number.isSafeInteger(threshold) ||
+      !Number.isSafeInteger(successfulSessions) ||
+      normalHoldback < 0 ||
+      newProviderHoldback < 0 ||
+      threshold < 0 ||
+      successfulSessions < 0
+    ) {
+      return new Error('Invalid provider holdback probation state.');
+    }
+    const providerHoldback = successfulSessions < threshold
+      ? Math.max(normalHoldback, newProviderHoldback)
+      : normalHoldback;
+    return Math.max(providerHoldback, params.challenge_epochs ?? 0);
+  }
+
   async recordCanaryProbePass(value) {
     const key = `probe/pass/${value.provider}/${value.epoch}`;
     const current = await this.get(key);
-    const passCount = this.safeAddMu(current?.pass_count ?? 0, 1);
+    const passCount = this.safeAddCount(current?.pass_count ?? 0, 1, 'canary pass count');
     if (passCount instanceof Error) return passCount;
     const record = {
       provider: value.provider,
@@ -6500,13 +7181,14 @@ class MayhemContract extends Contract {
 
   normalizeHoldbackBuckets(record) {
     if (!Array.isArray(record.holdbacks)) {
-      if (!Number.isSafeInteger(record.held_mu) || record.held_mu < 0) {
+      const heldAu = this.normalizeAu(record.held_au, 'earning held amount');
+      if (heldAu instanceof Error) {
         return new Error('Guardian non-negative earnings invariant failed.');
       }
-      if (record.held_mu === 0) return [];
+      if (this.isZeroAu(heldAu)) return [];
       return [{
         epoch: Number.isSafeInteger(record.updated_epoch) ? record.updated_epoch : 0,
-        mu: record.held_mu,
+        au: heldAu,
       }];
     }
 
@@ -6518,31 +7200,50 @@ class MayhemContract extends Contract {
       if (!Number.isSafeInteger(bucket.epoch) || bucket.epoch < 0) {
         return new Error('Guardian monotonic epoch invariant failed.');
       }
-      if (!Number.isSafeInteger(bucket.mu) || bucket.mu <= 0) {
+      const bucketAu = this.normalizeAu(bucket.au, 'holdback bucket amount', { allowZero: false });
+      if (bucketAu instanceof Error) {
         return new Error('Guardian non-negative earnings invariant failed.');
       }
-      const key = `${bucket.epoch}:${bucket.probe_gate === true ? 'probe' : 'time'}`;
-      const next = this.safeAddMu(byEpoch.get(key)?.mu ?? 0, bucket.mu);
+      const lockedEpochs = hasOwn(bucket, 'locked_epochs') ? bucket.locked_epochs : null;
+      if (lockedEpochs !== null && (!Number.isSafeInteger(lockedEpochs) || lockedEpochs < 0)) {
+        return new Error('Guardian monotonic epoch invariant failed.');
+      }
+      const key = `${bucket.epoch}:${bucket.probe_gate === true ? 'probe' : 'time'}:${lockedEpochs ?? 'default'}`;
+      const next = this.safeAddAu(byEpoch.get(key)?.au ?? ZERO_AU, bucketAu);
       if (next instanceof Error) return next;
       byEpoch.set(key, {
         epoch: bucket.epoch,
-        mu: next,
+        au: next,
         probe_gate: bucket.probe_gate === true,
+        ...(lockedEpochs !== null ? { locked_epochs: lockedEpochs } : {}),
       });
     }
     return Array.from(byEpoch.values())
-      .sort((a, b) => a.epoch - b.epoch || Number(a.probe_gate) - Number(b.probe_gate))
+      .sort((a, b) => (
+        a.epoch - b.epoch ||
+        (a.locked_epochs ?? -1) - (b.locked_epochs ?? -1) ||
+        Number(a.probe_gate) - Number(b.probe_gate)
+      ))
       .map((bucket) => (
         bucket.probe_gate
-          ? { epoch: bucket.epoch, mu: bucket.mu, probe_gate: true }
-          : { epoch: bucket.epoch, mu: bucket.mu }
+          ? {
+              epoch: bucket.epoch,
+              au: bucket.au,
+              probe_gate: true,
+              ...(hasOwn(bucket, 'locked_epochs') ? { locked_epochs: bucket.locked_epochs } : {}),
+            }
+          : {
+              epoch: bucket.epoch,
+              au: bucket.au,
+              ...(hasOwn(bucket, 'locked_epochs') ? { locked_epochs: bucket.locked_epochs } : {}),
+            }
       ));
   }
 
   holdbackBucketTotal(holdbacks) {
-    let total = 0;
+    let total = ZERO_AU;
     for (const bucket of holdbacks) {
-      const next = this.safeAddMu(total, bucket.mu);
+      const next = this.safeAddAu(total, bucket.au);
       if (next instanceof Error) return next;
       total = next;
     }
@@ -6560,7 +7261,11 @@ class MayhemContract extends Contract {
     if (holdbacks instanceof Error) return holdbacks;
     const kept = [];
     for (const bucket of holdbacks) {
-      if (bucket.epoch + lockedEpochs > currentEpoch) {
+      const bucketLockedEpochs = hasOwn(bucket, 'locked_epochs') ? bucket.locked_epochs : lockedEpochs;
+      if (!Number.isSafeInteger(bucketLockedEpochs) || bucketLockedEpochs < 0) {
+        return new Error('Guardian monotonic epoch invariant failed.');
+      }
+      if (bucket.epoch + bucketLockedEpochs > currentEpoch) {
         kept.push(bucket);
         continue;
       }
@@ -6570,59 +7275,68 @@ class MayhemContract extends Contract {
         kept.push(bucket);
         continue;
       }
-      const gatedMu = this.safeMulDivMu(bucket.mu, probeGate.holdback_bps, 10_000);
-      if (gatedMu instanceof Error) return gatedMu;
-      if (gatedMu > 0) {
-        kept.push({ epoch: bucket.epoch, mu: gatedMu, probe_gate: true });
+      const gatedAu = this.safeMulDivAu(bucket.au, probeGate.holdback_bps, 10_000);
+      if (gatedAu instanceof Error) return gatedAu;
+      if (this.compareAu(gatedAu, ZERO_AU) > 0) {
+        kept.push({
+          epoch: bucket.epoch,
+          au: gatedAu,
+          probe_gate: true,
+          ...(hasOwn(bucket, 'locked_epochs') ? { locked_epochs: bucket.locked_epochs } : {}),
+        });
       }
     }
-    const heldMu = this.holdbackBucketTotal(kept);
-    if (heldMu instanceof Error) return heldMu;
+    const heldAu = this.holdbackBucketTotal(kept);
+    if (heldAu instanceof Error) return heldAu;
     return {
       ...record,
-      held_mu: heldMu,
+      held_au: heldAu,
       holdbacks: kept,
       last_holdback_release_epoch: currentEpoch,
     };
   }
 
-  slashHoldbackBuckets(holdbacks, slashMu) {
-    if (!Number.isSafeInteger(slashMu) || slashMu < 0) {
+  slashHoldbackBuckets(holdbacks, slashAu) {
+    const slashAmountAu = this.normalizeAu(slashAu, 'slash amount');
+    if (slashAmountAu instanceof Error) {
       return new Error('Guardian non-negative earnings invariant failed.');
     }
-    if (slashMu === 0) return holdbacks;
+    if (this.isZeroAu(slashAmountAu)) return holdbacks;
 
-    let remaining = slashMu;
+    let remaining = slashAmountAu;
     const kept = [];
     for (let idx = holdbacks.length - 1; idx >= 0; idx -= 1) {
       const bucket = holdbacks[idx];
-      if (remaining === 0) {
+      if (this.isZeroAu(remaining)) {
         kept.push(bucket);
         continue;
       }
-      if (bucket.mu <= remaining) {
-        remaining -= bucket.mu;
+      if (this.compareAu(bucket.au, remaining) <= 0) {
+        remaining = this.safeSubAu(remaining, bucket.au);
+        if (remaining instanceof Error) return remaining;
         continue;
       }
+      const reducedAu = this.safeSubAu(bucket.au, remaining);
+      if (reducedAu instanceof Error) return reducedAu;
       kept.push({
         ...bucket,
         epoch: bucket.epoch,
-        mu: bucket.mu - remaining,
+        au: reducedAu,
       });
-      remaining = 0;
+      remaining = ZERO_AU;
     }
-    if (remaining !== 0) return new Error('Guardian earnings conservation invariant failed.');
+    if (!this.isZeroAu(remaining)) return new Error('Guardian earnings conservation invariant failed.');
     return kept.reverse();
   }
 
-  slashAmount(heldMu, slashBps) {
-    if (!Number.isSafeInteger(heldMu) || heldMu < 0) {
+  slashAmount(heldAu, slashBps) {
+    if (this.normalizeAu(heldAu, 'held amount') instanceof Error) {
       return new Error('Guardian non-negative earnings invariant failed.');
     }
     if (!Number.isSafeInteger(slashBps) || slashBps < 0 || slashBps > 10_000) {
       return new Error('Invalid slash bps.');
     }
-    return this.safeMulDivMu(heldMu, slashBps, 10_000);
+    return this.safeMulDivAu(heldAu, slashBps, 10_000);
   }
 
   providerActiveEnclaves(provider) {
@@ -6868,11 +7582,11 @@ class MayhemContract extends Contract {
     const beneficiaryBalances = new Map();
     const updatedFees = new Map();
     const railSlashRecords = [];
-    let heldBeforeMu = 0;
-    let heldAfterMu = 0;
-    let forfeitedMu = 0;
-    let reporterMu = 0;
-    let treasuryMu = 0;
+    let heldBeforeAu = ZERO_AU;
+    let heldAfterAu = ZERO_AU;
+    let forfeitedAu = ZERO_AU;
+    let reporterAu = ZERO_AU;
+    let treasuryAu = ZERO_AU;
 
     for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
       const earning = await this.earningRecord(providerId, rail);
@@ -6882,40 +7596,40 @@ class MayhemContract extends Contract {
       const holdbacks = this.normalizeHoldbackBuckets(earning);
       if (holdbacks instanceof Error) return holdbacks;
 
-      const railForfeitedMu = this.slashAmount(earning.held_mu, slashBps);
-      if (railForfeitedMu instanceof Error) return railForfeitedMu;
-      const railReporterMu = beneficiary === null ? 0 : this.safeMulDivMu(railForfeitedMu, 1, 2);
-      if (railReporterMu instanceof Error) return railReporterMu;
-      const railTreasuryMu = this.safeSubMu(railForfeitedMu, railReporterMu);
-      if (railTreasuryMu instanceof Error) return railTreasuryMu;
-      const remainingHoldbacks = this.slashHoldbackBuckets(holdbacks, railForfeitedMu);
+      const railForfeitedAu = this.slashAmount(earning.held_au, slashBps);
+      if (railForfeitedAu instanceof Error) return railForfeitedAu;
+      const railReporterAu = beneficiary === null ? ZERO_AU : this.safeMulDivAu(railForfeitedAu, 1, 2);
+      if (railReporterAu instanceof Error) return railReporterAu;
+      const railTreasuryAu = this.safeSubAu(railForfeitedAu, railReporterAu);
+      if (railTreasuryAu instanceof Error) return railTreasuryAu;
+      const remainingHoldbacks = this.slashHoldbackBuckets(holdbacks, railForfeitedAu);
       if (remainingHoldbacks instanceof Error) return remainingHoldbacks;
-      const railHeldAfterMu = this.safeSubMu(earning.held_mu, railForfeitedMu);
-      if (railHeldAfterMu instanceof Error) return railHeldAfterMu;
-      const railTotalMu = this.safeSubMu(earning.total_mu, railForfeitedMu);
-      if (railTotalMu instanceof Error) return railTotalMu;
-      const slashedCumMu = this.safeAddMu(earning.slashed_cum_mu ?? 0, railForfeitedMu);
-      if (slashedCumMu instanceof Error) return slashedCumMu;
+      const railHeldAfterAu = this.safeSubAu(earning.held_au, railForfeitedAu);
+      if (railHeldAfterAu instanceof Error) return railHeldAfterAu;
+      const railTotalAu = this.safeSubAu(earning.total_au, railForfeitedAu);
+      if (railTotalAu instanceof Error) return railTotalAu;
+      const slashedCumAu = this.safeAddAu(earning.slashed_cum_au ?? ZERO_AU, railForfeitedAu);
+      if (slashedCumAu instanceof Error) return slashedCumAu;
 
-      heldBeforeMu = this.safeAddMu(heldBeforeMu, earning.held_mu);
-      if (heldBeforeMu instanceof Error) return heldBeforeMu;
-      heldAfterMu = this.safeAddMu(heldAfterMu, railHeldAfterMu);
-      if (heldAfterMu instanceof Error) return heldAfterMu;
-      forfeitedMu = this.safeAddMu(forfeitedMu, railForfeitedMu);
-      if (forfeitedMu instanceof Error) return forfeitedMu;
-      reporterMu = this.safeAddMu(reporterMu, railReporterMu);
-      if (reporterMu instanceof Error) return reporterMu;
-      treasuryMu = this.safeAddMu(treasuryMu, railTreasuryMu);
-      if (treasuryMu instanceof Error) return treasuryMu;
+      heldBeforeAu = this.safeAddAu(heldBeforeAu, earning.held_au);
+      if (heldBeforeAu instanceof Error) return heldBeforeAu;
+      heldAfterAu = this.safeAddAu(heldAfterAu, railHeldAfterAu);
+      if (heldAfterAu instanceof Error) return heldAfterAu;
+      forfeitedAu = this.safeAddAu(forfeitedAu, railForfeitedAu);
+      if (forfeitedAu instanceof Error) return forfeitedAu;
+      reporterAu = this.safeAddAu(reporterAu, railReporterAu);
+      if (reporterAu instanceof Error) return reporterAu;
+      treasuryAu = this.safeAddAu(treasuryAu, railTreasuryAu);
+      if (treasuryAu instanceof Error) return treasuryAu;
 
-      if (earning.total_mu > 0 || railForfeitedMu > 0) {
+      if (this.compareAu(earning.total_au, ZERO_AU) > 0 || this.compareAu(railForfeitedAu, ZERO_AU) > 0) {
         const updatedEarning = {
           ...earning,
           rail,
-          total_mu: railTotalMu,
-          held_mu: railHeldAfterMu,
+          total_au: railTotalAu,
+          held_au: railHeldAfterAu,
           holdbacks: remainingHoldbacks,
-          slashed_cum_mu: slashedCumMu,
+          slashed_cum_au: slashedCumAu,
           last_slash_at: this.tx,
           updated_at: this.tx,
         };
@@ -6924,36 +7638,36 @@ class MayhemContract extends Contract {
         updatedEarnings.set(rail, updatedEarning);
       }
 
-      if (railReporterMu > 0) {
+      if (this.compareAu(railReporterAu, ZERO_AU) > 0) {
         const currentBalance = await this.balanceRecord(beneficiary, rail);
         if (currentBalance instanceof Error) return currentBalance;
         const balanceError = this.guardianValidateBalanceRecord(currentBalance, beneficiary, rail);
         if (balanceError) return balanceError;
-        const nextMu = this.safeAddMu(currentBalance.mu, railReporterMu);
-        if (nextMu instanceof Error) return nextMu;
+        const nextAu = this.safeAddAu(currentBalance.au, railReporterAu);
+        if (nextAu instanceof Error) return nextAu;
         beneficiaryBalances.set(rail, {
           ...currentBalance,
           rail,
-          mu: nextMu,
+          au: nextAu,
           updated_epoch: Math.max(currentBalance.updated_epoch, epoch),
           updated_at: this.tx,
         });
       }
 
-      if (railTreasuryMu > 0) {
+      if (this.compareAu(railTreasuryAu, ZERO_AU) > 0) {
         const fee = await this.feeCumRecord(rail);
         if (fee instanceof Error) return fee;
         const feeError = this.guardianValidateFeeRecord(fee, rail);
         if (feeError) return feeError;
-        const cumMu = this.safeAddMu(fee.cum_mu, railTreasuryMu);
-        if (cumMu instanceof Error) return cumMu;
-        const settledCumMu = this.safeAddMu(fee.settled_cum_mu ?? fee.cum_mu, railTreasuryMu);
-        if (settledCumMu instanceof Error) return settledCumMu;
+        const cumAu = this.safeAddAu(fee.cum_au, railTreasuryAu);
+        if (cumAu instanceof Error) return cumAu;
+        const settledCumAu = this.safeAddAu(fee.settled_cum_au ?? fee.cum_au, railTreasuryAu);
+        if (settledCumAu instanceof Error) return settledCumAu;
         const updatedFee = {
           ...fee,
           rail,
-          cum_mu: cumMu,
-          settled_cum_mu: settledCumMu,
+          cum_au: cumAu,
+          settled_cum_au: settledCumAu,
           updated_epoch: Math.max(fee.updated_epoch, epoch),
           updated_at: this.tx,
           last_slash_at: this.tx,
@@ -6963,14 +7677,14 @@ class MayhemContract extends Contract {
         updatedFees.set(rail, updatedFee);
       }
 
-      if (earning.held_mu > 0 || railForfeitedMu > 0) {
+      if (this.compareAu(earning.held_au, ZERO_AU) > 0 || this.compareAu(railForfeitedAu, ZERO_AU) > 0) {
         railSlashRecords.push({
           rail,
-          held_before_mu: earning.held_mu,
-          held_after_mu: railHeldAfterMu,
-          forfeited_mu: railForfeitedMu,
-          beneficiary_mu: railReporterMu,
-          treasury_mu: railTreasuryMu,
+          held_before_au: earning.held_au,
+          held_after_au: railHeldAfterAu,
+          forfeited_au: railForfeitedAu,
+          beneficiary_au: railReporterAu,
+          treasury_au: railTreasuryAu,
         });
       }
     }
@@ -7007,11 +7721,11 @@ class MayhemContract extends Contract {
       probe_id: probeId,
       event_id: eventId,
       slash_bps: slashBps,
-      held_before_mu: heldBeforeMu,
-      held_after_mu: heldAfterMu,
-      forfeited_mu: forfeitedMu,
-      beneficiary_mu: reporterMu,
-      treasury_mu: treasuryMu,
+      held_before_au: heldBeforeAu,
+      held_after_au: heldAfterAu,
+      forfeited_au: forfeitedAu,
+      beneficiary_au: reporterAu,
+      treasury_au: treasuryAu,
       rails: railSlashRecords,
       tombstone,
       ban_tombstones: banTombstones,
@@ -7054,12 +7768,16 @@ class MayhemContract extends Contract {
     return slash;
   }
 
-  appendHoldbackBucket(holdbacks, epoch, mu) {
+  appendHoldbackBucket(holdbacks, epoch, au, lockedEpochs = null) {
     if (!Number.isSafeInteger(epoch) || epoch < 0) {
       return new Error('Guardian monotonic epoch invariant failed.');
     }
-    if (!Number.isSafeInteger(mu) || mu <= 0) {
+    const amount = this.normalizeAu(au, 'holdback amount', { allowZero: false });
+    if (amount instanceof Error) {
       return new Error('Guardian non-negative earnings invariant failed.');
+    }
+    if (lockedEpochs !== null && (!Number.isSafeInteger(lockedEpochs) || lockedEpochs < 0)) {
+      return new Error('Guardian monotonic epoch invariant failed.');
     }
     const normalized = this.normalizeHoldbackBuckets({ holdbacks });
     if (normalized instanceof Error) return normalized;
@@ -7067,17 +7785,34 @@ class MayhemContract extends Contract {
     const byEpoch = new Map(
       normalized
         .filter((bucket) => bucket.probe_gate !== true)
-        .map((bucket) => [bucket.epoch, bucket.mu])
+        .map((bucket) => [
+          `${bucket.epoch}:${hasOwn(bucket, 'locked_epochs') ? bucket.locked_epochs : 'default'}`,
+          bucket,
+        ])
     );
-    const next = this.safeAddMu(byEpoch.get(epoch) ?? 0, mu);
+    const key = `${epoch}:${lockedEpochs ?? 'default'}`;
+    const current = byEpoch.get(key);
+    const next = this.safeAddAu(current?.au ?? ZERO_AU, amount);
     if (next instanceof Error) return next;
-    byEpoch.set(epoch, next);
+    byEpoch.set(key, {
+      epoch,
+      au: next,
+      ...(lockedEpochs !== null ? { locked_epochs: lockedEpochs } : {}),
+    });
     return [
-      ...Array.from(byEpoch.entries())
-        .map(([bucketEpoch, bucketMu]) => ({ epoch: bucketEpoch, mu: bucketMu })),
+      ...Array.from(byEpoch.values())
+        .map((bucket) => ({
+          epoch: bucket.epoch,
+          au: bucket.au,
+          ...(hasOwn(bucket, 'locked_epochs') ? { locked_epochs: bucket.locked_epochs } : {}),
+        })),
       ...gated,
     ]
-      .sort((a, b) => a.epoch - b.epoch || Number(a.probe_gate === true) - Number(b.probe_gate === true));
+      .sort((a, b) => (
+        a.epoch - b.epoch ||
+        (a.locked_epochs ?? -1) - (b.locked_epochs ?? -1) ||
+        Number(a.probe_gate === true) - Number(b.probe_gate === true)
+      ));
   }
 
   normalizeEpochRoots(value) {
@@ -7114,6 +7849,14 @@ class MayhemContract extends Contract {
     const totals = {};
     for (const key of EPOCH_TOTAL_KEYS) {
       const total = value[key];
+      if (EPOCH_TOTAL_MONEY_KEYS.has(key)) {
+        const au = this.normalizeAu(total, `epoch total ${key}`);
+        if (au instanceof Error) {
+          return new Error(`Invalid epoch total ${key}.`);
+        }
+        totals[key] = au;
+        continue;
+      }
       if (!Number.isSafeInteger(total) || total < 0) {
         return new Error(`Invalid epoch total ${key}.`);
       }
@@ -7171,7 +7914,7 @@ class MayhemContract extends Contract {
       if (count === 0) continue;
       const unit = this.canonicalUsageUnit(rawUnit);
       if (!this.isSafeKeyPart(unit)) return new Error('Invalid receipt usage unit.');
-      const next = this.safeAddMu(usage[unit] ?? 0, count);
+      const next = this.safeAddCount(usage[unit] ?? 0, count, 'receipt usage count');
       if (next instanceof Error) return next;
       usage[unit] = next;
     }
@@ -7208,12 +7951,12 @@ class MayhemContract extends Contract {
       locked_rate_map: cloneValue(bodySource.locked_rate_map),
       rules_ver: bodySource.rules_ver,
       usage: cloneValue(bodySource.usage),
-      mu_owed_cum: bodySource.mu_owed_cum,
+      au_owed_cum: bodySource.au_owed_cum,
       prompt_hash: bodySource.prompt_hash,
       ts: bodySource.ts,
     };
-    if (hasOwn(bodySource, 'locked_per_req_mu')) body.locked_per_req_mu = bodySource.locked_per_req_mu;
-    if (hasOwn(bodySource, 'locked_min_session_mu')) body.locked_min_session_mu = bodySource.locked_min_session_mu;
+    if (hasOwn(bodySource, 'locked_per_req_au')) body.locked_per_req_au = bodySource.locked_per_req_au;
+    if (hasOwn(bodySource, 'locked_min_session_au')) body.locked_min_session_au = bodySource.locked_min_session_au;
     if (hasOwn(bodySource, 'served_ctx')) body.served_ctx = bodySource.served_ctx;
     if (hasOwn(bodySource, 'ctx_bracket')) body.ctx_bracket = bodySource.ctx_bracket;
     if (hasOwn(bodySource, 'ctx_bracket_table_ver')) {
@@ -7267,8 +8010,8 @@ class MayhemContract extends Contract {
       } else if (migrated.schema_version === 2) {
         migrated.schema_version = 3;
       } else if (migrated.schema_version === 3) {
-        migrated.locked_per_req_mu ??= 0;
-        migrated.locked_min_session_mu ??= 0;
+        migrated.locked_per_req_au ??= ZERO_AU;
+        migrated.locked_min_session_au ??= ZERO_AU;
         migrated.schema_version = 4;
       } else if (migrated.schema_version === 4) {
         migrated.served_ctx ??= 0;
@@ -7279,11 +8022,19 @@ class MayhemContract extends Contract {
         migrated.schema_version = 6;
       } else if (migrated.schema_version === 6) {
         migrated.schema_version = 7;
+      } else if (migrated.schema_version === 7) {
+        migrated.schema_version = 8;
       } else {
         return new Error(
           `Unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}.`
         );
       }
+    }
+    for (const field of ['locked_per_req_au', 'locked_min_session_au', 'au_owed_cum']) {
+      if (!hasOwn(migrated, field)) continue;
+      const normalizedAu = this.normalizeAu(migrated[field], `receipt ${field}`);
+      if (normalizedAu instanceof Error) return normalizedAu;
+      migrated[field] = normalizedAu;
     }
     return migrated;
   }
@@ -7312,25 +8063,30 @@ class MayhemContract extends Contract {
     if (stableJson(lockedRateMap) !== stableJson(body.locked_rate_map)) {
       return new Error('Receipt locked_rate_map must be canonical.');
     }
-    if (!Number.isSafeInteger(body.locked_per_req_mu) || body.locked_per_req_mu < 0) {
+    const lockedPerReqAu = this.normalizeAu(body.locked_per_req_au, 'receipt locked per-request price');
+    if (lockedPerReqAu instanceof Error) {
       return new Error('Invalid receipt locked per-request price.');
     }
-    if (!Number.isSafeInteger(body.locked_min_session_mu) || body.locked_min_session_mu < 0) {
+    const lockedMinSessionAu = this.normalizeAu(body.locked_min_session_au, 'receipt locked minimum session price');
+    if (lockedMinSessionAu instanceof Error) {
       return new Error('Invalid receipt locked minimum session price.');
     }
     if (!Number.isSafeInteger(body.served_ctx) || body.served_ctx < 0) {
       return new Error('Invalid receipt served context.');
     }
-    const table = await this.ctxBracketTableByVersion(body.ctx_bracket_table_ver);
+    const table = body.ctx_bracket_table_ver === null || body.ctx_bracket_table_ver === undefined
+      ? null
+      : await this.ctxBracketTableByVersion(body.ctx_bracket_table_ver);
     if (table instanceof Error) return table;
-    const ctxError = this.validateCtxBracketEvidence(
+    const ctxMeta = await this.normalizeCtxBracketEvidenceForEnclave(
+      body.enclave_id,
       body.served_ctx,
       body.ctx_bracket,
       body.ctx_bracket_table_ver,
       table,
       'receipt'
     );
-    if (ctxError) return ctxError;
+    if (ctxMeta instanceof Error) return ctxMeta;
     if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
       return new Error('Invalid receipt rules version.');
     }
@@ -7339,17 +8095,18 @@ class MayhemContract extends Contract {
     if (stableJson(usage) !== stableJson(body.usage)) {
       return new Error('Receipt usage must be canonical.');
     }
-    if (!Number.isSafeInteger(body.mu_owed_cum) || body.mu_owed_cum < 0) {
+    const auOwedCum = this.normalizeAu(body.au_owed_cum, 'receipt cumulative amount');
+    if (auOwedCum instanceof Error) {
       return new Error('Invalid receipt cumulative amount.');
     }
-    const lockedMu = this.usageMuForLockedTerms(
+    const lockedAu = this.usageAuForLockedTerms(
       body.locked_rate_map,
-      body.locked_per_req_mu,
-      body.locked_min_session_mu,
+      lockedPerReqAu,
+      lockedMinSessionAu,
       body.usage
     );
-    if (lockedMu instanceof Error) return lockedMu;
-    if (body.mu_owed_cum !== lockedMu) {
+    if (lockedAu instanceof Error) return lockedAu;
+    if (this.compareAu(auOwedCum, lockedAu) !== 0) {
       return new Error('Receipt cumulative amount does not match locked price terms.');
     }
     if (!Number.isSafeInteger(body.ts) || body.ts < 0) return new Error('Invalid receipt timestamp.');
@@ -7398,20 +8155,21 @@ class MayhemContract extends Contract {
       return new Error('Over-credit proof requires a single committed receipt.');
     }
 
-    const previousMu = this.value.previous_mu_owed_cum ?? 0;
-    const claimedCum = this.value.claimed_mu_owed_cum;
-    if (!Number.isSafeInteger(previousMu) || previousMu < 0) {
+    const previousAu = this.normalizeAu(this.value.previous_au_owed_cum ?? ZERO_AU, 'previous receipt amount');
+    if (previousAu instanceof Error) {
       return new Error('Invalid previous receipt amount.');
     }
-    if (previousMu > receipt.body.mu_owed_cum || previousMu > claimedCum) {
+    const claimedCum = this.normalizeAu(this.value.claimed_au_owed_cum, 'claimed receipt amount');
+    if (claimedCum instanceof Error) return new Error('Invalid claimed receipt amount.');
+    if (this.compareAu(previousAu, receipt.body.au_owed_cum) > 0 || this.compareAu(previousAu, claimedCum) > 0) {
       return new Error('Previous receipt amount exceeds cumulative amount.');
     }
-    const actualMu = this.safeSubMu(receipt.body.mu_owed_cum, previousMu);
-    if (actualMu instanceof Error) return actualMu;
-    const claimedMu = this.safeSubMu(claimedCum, previousMu);
-    if (claimedMu instanceof Error) return claimedMu;
-    if (claimedMu <= actualMu) return new Error('Receipt does not contradict committed usage.');
-    if (commit.totals.use_mu !== claimedMu) {
+    const actualAu = this.safeSubAu(receipt.body.au_owed_cum, previousAu);
+    if (actualAu instanceof Error) return actualAu;
+    const claimedAu = this.safeSubAu(claimedCum, previousAu);
+    if (claimedAu instanceof Error) return claimedAu;
+    if (this.compareAu(claimedAu, actualAu) <= 0) return new Error('Receipt does not contradict committed usage.');
+    if (this.compareAu(commit.totals.use_au, claimedAu) !== 0) {
       return new Error('Fraud proof claimed amount does not match committed usage total.');
     }
 
@@ -7419,7 +8177,7 @@ class MayhemContract extends Contract {
       ...receipt,
       body: {
         ...receipt.body,
-        mu_owed_cum: claimedCum,
+        au_owed_cum: claimedCum,
       },
     };
     const claimedUseRoot = await this.usageLeafHash(claimedReceipt);
@@ -7428,8 +8186,8 @@ class MayhemContract extends Contract {
     }
 
     return {
-      actual_mu: actualMu,
-      claimed_mu: claimedMu,
+      actual_au: actualAu,
+      claimed_au: claimedAu,
       receipt_hash: await this.usageLeafHash(receipt),
     };
   }
@@ -7440,8 +8198,8 @@ class MayhemContract extends Contract {
       ...(record.ctx_bracket ? { ctx_bracket: record.ctx_bracket } : {}),
       ...(record.ctx_bracket_table_ver ? { ctx_bracket_table_ver: record.ctx_bracket_table_ver } : {}),
       rate_map: cloneValue(record.rate_map),
-      per_req_mu: record.per_req_mu,
-      min_session_mu: record.min_session_mu,
+      per_req_au: record.per_req_au,
+      min_session_au: record.min_session_au,
     };
   }
 
@@ -7478,7 +8236,7 @@ class MayhemContract extends Contract {
       price_source: record.price_source,
       usage: {
         usage_root: usageRoot,
-        active_demand_mu: market.active_demand_mu,
+        active_demand_au: market.active_demand_au,
         session_count: market.session_count,
         ...(record.ctx_bracket ? {
           ctx_bracket: record.ctx_bracket,
@@ -7499,13 +8257,13 @@ class MayhemContract extends Contract {
       previous_price: {
         ver: market.previous_price_ver,
         rate_map: cloneValue(market.previous_rate_map),
-        per_req_mu: market.previous_per_req_mu,
-        min_session_mu: market.previous_min_session_mu,
+        per_req_au: market.previous_per_req_au,
+        min_session_au: market.previous_min_session_au,
       },
       desired_price: {
         rate_map: cloneValue(market.desired_rate_map),
-        per_req_mu: market.desired_per_req_mu,
-        min_session_mu: market.desired_min_session_mu,
+        per_req_au: market.desired_per_req_au,
+        min_session_au: market.desired_min_session_au,
       },
       result_price: this.priceTermsSnapshot(record),
     };
@@ -7579,7 +8337,7 @@ class MayhemContract extends Contract {
     }
     const priceUsage = this.normalizePriceProofUsage(this.value.price_usage);
     if (priceUsage instanceof Error) return priceUsage;
-    if (commit.totals.use_mu !== priceUsage.demand_mu) {
+    if (this.compareAu(commit.totals.use_au, priceUsage.demand_au) !== 0) {
       return new Error('Price derivation proof usage does not match committed usage total.');
     }
     if (commit.totals.use_count !== priceUsage.session_count) {
@@ -7627,7 +8385,7 @@ class MayhemContract extends Contract {
     roots,
     totals,
     debitTotal,
-    feeDeltaMu,
+    feeDeltaAu,
     nextFeeCum,
     providerCount,
     earnCumTotal,
@@ -7646,12 +8404,12 @@ class MayhemContract extends Contract {
     ) {
       return new Error('Epoch apply roots do not match committed roots.');
     }
-    if (totals.use_mu !== debitTotal) return new Error('Epoch usage total does not match debits.');
-    if (totals.earn_mu !== earnCumTotal) {
+    if (this.compareAu(totals.use_au, debitTotal) !== 0) return new Error('Epoch usage total does not match debits.');
+    if (this.compareAu(totals.earn_au, earnCumTotal) !== 0) {
       return new Error('Epoch earn total does not match cumulative provider earnings.');
     }
-    if (totals.fee_mu !== feeDeltaMu) return new Error('Epoch fee total does not match computed fee.');
-    if (totals.fee_cum_mu !== nextFeeCum) {
+    if (this.compareAu(totals.fee_au, feeDeltaAu) !== 0) return new Error('Epoch fee total does not match computed fee.');
+    if (this.compareAu(totals.fee_cum_au, nextFeeCum) !== 0) {
       return new Error('Epoch cumulative fee total does not match fee state.');
     }
     if (totals.provider_count !== providerCount) {
@@ -7671,7 +8429,7 @@ class MayhemContract extends Contract {
       if (
         depositRoot.merkle_root !== roots.dep ||
         depositRoot.count !== totals.dep_count ||
-        depositRoot.mu_total !== totals.dep_mu
+        this.compareAu(depositRoot.au_total, totals.dep_au) !== 0
       ) {
         return new Error('Committed deposit root does not match deposit evidence.');
       }
@@ -7706,7 +8464,7 @@ class MayhemContract extends Contract {
     }
   }
 
-  async writeEpochEvidenceRoots({ epoch, at, epoch_seconds, roots, totals, feeDeltaMu, feeCumMu, priceDerivations }) {
+  async writeEpochEvidenceRoots({ epoch, at, epoch_seconds, roots, totals, feeDeltaAu, feeCumAu, priceDerivations }) {
     if ((await this.get(`ev/dep/${epoch}`)) === null) {
       await this.put(`ev/dep/${epoch}`, {
         type: 'deposit_root',
@@ -7714,7 +8472,7 @@ class MayhemContract extends Contract {
         epoch_seconds,
         merkle_root: roots.dep,
         count: totals.dep_count,
-        mu_total: totals.dep_mu,
+        au_total: totals.dep_au,
         ts: at,
         updated_at: this.tx,
       });
@@ -7725,7 +8483,7 @@ class MayhemContract extends Contract {
       epoch_seconds,
       merkle_root: roots.use,
       sessions: totals.use_count,
-      mu_total: totals.use_mu,
+      au_total: totals.use_au,
       providers: totals.provider_count,
       ts: at,
       updated_at: this.tx,
@@ -7736,7 +8494,7 @@ class MayhemContract extends Contract {
       epoch_seconds,
       merkle_root: roots.earn,
       provider_count: totals.provider_count,
-      mu_cum_total: totals.earn_mu,
+      au_cum_total: totals.earn_au,
       ts: at,
       updated_at: this.tx,
     });
@@ -7745,8 +8503,8 @@ class MayhemContract extends Contract {
       epoch,
       epoch_seconds,
       merkle_root: roots.fee,
-      mu_fee_epoch: feeDeltaMu,
-      mu_fee_cum: feeCumMu,
+      au_fee_epoch: feeDeltaAu,
+      au_fee_cum: feeCumAu,
       sweep_msb_tx_hash: null,
       ts: at,
       updated_at: this.tx,
@@ -7768,12 +8526,10 @@ class MayhemContract extends Contract {
         return new Error(`Invalid ${label} entry.`);
       }
       const id = entry[idKey];
-      const mu = entry[amountKey];
+      const au = this.normalizeAu(entry[amountKey], `${label} amount`, { allowZero: false });
+      if (au instanceof Error) return new Error(`Invalid ${label} amount.`);
       if (!this.isSafeKeyPart(id)) return new Error(`Invalid ${label} ${idKey}.`);
-      if (!Number.isSafeInteger(mu) || mu <= 0) {
-        return new Error(`Invalid ${label} amount.`);
-      }
-      const next = this.safeAddMu(out.get(id) ?? 0, mu);
+      const next = this.safeAddAu(out.get(id) ?? ZERO_AU, au);
       if (next instanceof Error) return next;
       out.set(id, next);
     }
@@ -7789,14 +8545,12 @@ class MayhemContract extends Contract {
       const rail = this.normalizeLedgerRail(entry.rail, `${label} rail`);
       if (rail instanceof Error) return rail;
       const id = entry[idKey];
-      const mu = entry[amountKey];
+      const au = this.normalizeAu(entry[amountKey], `${label} amount`, { allowZero: false });
+      if (au instanceof Error) return new Error(`Invalid ${label} amount.`);
       if (!this.isSafeKeyPart(id)) return new Error(`Invalid ${label} ${idKey}.`);
-      if (!Number.isSafeInteger(mu) || mu <= 0) {
-        return new Error(`Invalid ${label} amount.`);
-      }
       const key = stableJson([rail, id]);
-      const current = out.get(key) ?? { rail, [idKey]: id, [amountKey]: 0 };
-      const next = this.safeAddMu(current[amountKey], mu);
+      const current = out.get(key) ?? { rail, [idKey]: id, [amountKey]: ZERO_AU };
+      const next = this.safeAddAu(current[amountKey], au);
       if (next instanceof Error) return next;
       out.set(key, { ...current, [amountKey]: next });
     }
@@ -7813,14 +8567,15 @@ class MayhemContract extends Contract {
         'enclave_id',
         'ctx_bracket',
         'ctx_bracket_table_ver',
-        'demand_mu',
+        'demand_au',
         'session_count',
+        'provider_count',
       ]);
       const unknown = Object.keys(entry).filter((key) => !allowed.has(key)).sort();
       if (unknown.length > 0) {
         return new Error(`market usage entry does not accept fields: ${unknown.join(', ')}.`);
       }
-      for (const key of ['enclave_id', 'demand_mu', 'session_count']) {
+      for (const key of ['enclave_id', 'demand_au', 'session_count', 'provider_count']) {
         if (!hasOwn(entry, key)) return new Error(`market usage entry is missing ${key}.`);
       }
       const enclaveId = entry.enclave_id;
@@ -7835,69 +8590,77 @@ class MayhemContract extends Contract {
       ) {
         return new Error('Invalid market usage context bracket table version.');
       }
-      if (!Number.isSafeInteger(entry.demand_mu) || entry.demand_mu <= 0) {
+      const demandEntryAu = this.normalizeAu(entry.demand_au, 'market usage demand', { allowZero: false });
+      if (demandEntryAu instanceof Error) {
         return new Error('Invalid market usage demand.');
       }
       if (!Number.isSafeInteger(entry.session_count) || entry.session_count <= 0) {
         return new Error('Invalid market usage session_count.');
+      }
+      if (!Number.isSafeInteger(entry.provider_count) || entry.provider_count <= 0) {
+        return new Error('Invalid market usage provider_count.');
       }
       const key = this.priceMarketKey(enclaveId, ctxBracket);
       const current = out.get(key) ?? {
         enclave_id: enclaveId,
         ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
         ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
-        demand_mu: 0,
+        demand_au: ZERO_AU,
         session_count: 0,
+        provider_count: 0,
       };
       if ((current.ctx_bracket_table_ver ?? null) !== (entry.ctx_bracket_table_ver ?? current.ctx_bracket_table_ver ?? null)) {
         return new Error('Market usage context bracket table version mismatch.');
       }
-      const demandMu = this.safeAddMu(current.demand_mu, entry.demand_mu);
-      if (demandMu instanceof Error) return demandMu;
-      const sessionCount = this.safeAddMu(current.session_count, entry.session_count);
+      const demandAu = this.safeAddAu(current.demand_au, demandEntryAu);
+      if (demandAu instanceof Error) return demandAu;
+      const sessionCount = this.safeAddCount(current.session_count, entry.session_count, 'market usage session_count');
       if (sessionCount instanceof Error) return sessionCount;
+      const providerCount = this.safeAddCount(current.provider_count, entry.provider_count, 'market usage provider_count');
+      if (providerCount instanceof Error) return providerCount;
       out.set(key, {
         enclave_id: enclaveId,
         ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
         ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
-        demand_mu: demandMu,
+        demand_au: demandAu,
         session_count: sessionCount,
+        provider_count: providerCount,
       });
     }
     return out;
   }
 
-  sumMu(entries) {
-    let sum = 0;
-    for (const [, mu] of entries) {
-      const next = this.safeAddMu(sum, mu);
+  sumAu(entries) {
+    let sum = ZERO_AU;
+    for (const [, au] of entries) {
+      const next = this.safeAddAu(sum, au);
       if (next instanceof Error) return next;
       sum = next;
     }
     return sum;
   }
 
-  sumRailMu(entries, amountKey) {
-    let sum = 0;
+  sumRailAu(entries, amountKey) {
+    let sum = ZERO_AU;
     for (const entry of entries.values()) {
-      const next = this.safeAddMu(sum, entry[amountKey]);
+      const next = this.safeAddAu(sum, entry[amountKey]);
       if (next instanceof Error) return next;
       sum = next;
     }
     return sum;
   }
 
-  sumMarketDemandMu(entries) {
-    let sum = 0;
+  sumMarketDemandAu(entries) {
+    let sum = ZERO_AU;
     for (const entry of entries.values()) {
-      const next = this.safeAddMu(sum, entry.demand_mu);
+      const next = this.safeAddAu(sum, entry.demand_au);
       if (next instanceof Error) return next;
       sum = next;
     }
     return sum;
   }
 
-  usageMuForRateMap(rateMap, usage) {
+  usageAuForRateMap(rateMap, usage) {
     const rates = this.rateMapByUnit(rateMap);
     const priced = [];
     for (const [unit, count] of Object.entries(usage ?? {})) {
@@ -7905,43 +8668,42 @@ class MayhemContract extends Contract {
       if (count === 0) continue;
       const rate = rates.get(unit);
       if (!rate) return new Error(`Receipt locked_rate_map missing usage unit ${unit}.`);
-      if (!Number.isSafeInteger(rate.per_unit_mu) || rate.per_unit_mu <= 0) {
-        return new Error('Invalid locked rate per_unit_mu.');
+      const perUnitAu = this.parseAu(rate.per_unit_au, 'locked rate per_unit_au', { allowZero: false });
+      if (perUnitAu instanceof Error) {
+        return new Error('Invalid locked rate per_unit_au.');
       }
       if (!Number.isSafeInteger(rate.granularity) || rate.granularity <= 0) {
         return new Error('Invalid locked rate granularity.');
       }
       priced.push({
         count: BigInt(count),
-        perUnitMu: BigInt(rate.per_unit_mu),
+        perUnitAu,
         granularity: BigInt(rate.granularity),
       });
     }
-    if (priced.length === 0) return 0;
+    if (priced.length === 0) return ZERO_AU;
     const sameGranularity = priced.every((entry) => entry.granularity === priced[0].granularity);
     if (sameGranularity) {
-      const raw = priced.reduce((sum, entry) => sum + entry.count * entry.perUnitMu, 0n);
-      return this.safeNarrowMu(this.ceilDivBigInt(raw, priced[0].granularity));
+      const raw = priced.reduce((sum, entry) => sum + entry.count * entry.perUnitAu, 0n);
+      return this.canonicalAu(this.ceilDivBigInt(raw, priced[0].granularity));
     }
     let total = 0n;
     for (const entry of priced) {
-      total += this.ceilDivBigInt(entry.count * entry.perUnitMu, entry.granularity);
+      total += this.ceilDivBigInt(entry.count * entry.perUnitAu, entry.granularity);
     }
-    return this.safeNarrowMu(total);
+    return this.canonicalAu(total);
   }
 
-  usageMuForLockedTerms(rateMap, perReqMu, minSessionMu, usage) {
-    if (!Number.isSafeInteger(perReqMu) || perReqMu < 0) {
-      return new Error('Invalid locked per-request price.');
-    }
-    if (!Number.isSafeInteger(minSessionMu) || minSessionMu < 0) {
-      return new Error('Invalid locked minimum session price.');
-    }
-    const usageMu = this.usageMuForRateMap(rateMap, usage);
-    if (usageMu instanceof Error) return usageMu;
-    const subtotal = this.safeAddMu(usageMu, perReqMu);
+  usageAuForLockedTerms(rateMap, perReqAu, minSessionAu, usage) {
+    const normalizedPerReqAu = this.normalizeAu(perReqAu, 'locked per-request price');
+    if (normalizedPerReqAu instanceof Error) return new Error('Invalid locked per-request price.');
+    const normalizedMinSessionAu = this.normalizeAu(minSessionAu, 'locked minimum session price');
+    if (normalizedMinSessionAu instanceof Error) return new Error('Invalid locked minimum session price.');
+    const usageAu = this.usageAuForRateMap(rateMap, usage);
+    if (usageAu instanceof Error) return usageAu;
+    const subtotal = this.safeAddAu(usageAu, normalizedPerReqAu);
     if (subtotal instanceof Error) return subtotal;
-    return Math.max(subtotal, minSessionMu);
+    return this.maxAu(subtotal, normalizedMinSessionAu);
   }
 
   ceilDivBigInt(value, divisor) {
@@ -7950,9 +8712,9 @@ class MayhemContract extends Contract {
   }
 
   railTotals(entries, amountKey) {
-    const out = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, 0]));
+    const out = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, ZERO_AU]));
     for (const entry of entries.values()) {
-      const next = this.safeAddMu(out.get(entry.rail) ?? 0, entry[amountKey]);
+      const next = this.safeAddAu(out.get(entry.rail) ?? ZERO_AU, entry[amountKey]);
       if (next instanceof Error) return next;
       out.set(entry.rail, next);
     }
@@ -7961,49 +8723,91 @@ class MayhemContract extends Contract {
 
   assertMatchingRailTotals(left, right) {
     for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
-      if ((left.get(rail) ?? 0) !== (right.get(rail) ?? 0)) {
+      if (this.compareAu(left.get(rail) ?? ZERO_AU, right.get(rail) ?? ZERO_AU) !== 0) {
         return new Error('Epoch debits must equal gross provider earnings per rail.');
       }
     }
     return null;
   }
 
-  safeAddMu(a, b) {
-    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b)) {
-      return new Error('mu values must be safe integers.');
-    }
-    return this.safeNarrowMu(BigInt(a) + BigInt(b));
+  safeAddAu(a, b) {
+    const left = this.parseAu(a, 'au value');
+    if (left instanceof Error) return left;
+    const right = this.parseAu(b, 'au value');
+    if (right instanceof Error) return right;
+    return this.canonicalAu(left + right);
   }
 
-  safeSubMu(a, b) {
-    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || b < 0) {
-      return new Error('mu values must be safe integers.');
-    }
-    if (b > a) return new Error('mu value underflow.');
-    return this.safeNarrowMu(BigInt(a) - BigInt(b));
+  safeSubAu(a, b) {
+    const left = this.parseAu(a, 'au value');
+    if (left instanceof Error) return left;
+    const right = this.parseAu(b, 'au value');
+    if (right instanceof Error) return right;
+    if (right > left) return new Error('au value underflow.');
+    return this.canonicalAu(left - right);
   }
 
-  safeMulDivMu(a, b, divisor) {
+  safeMulDivAu(a, b, divisor) {
+    const amount = this.parseAu(a, 'au value');
+    if (amount instanceof Error) return amount;
     if (
-      !Number.isSafeInteger(a) ||
       !Number.isSafeInteger(b) ||
       !Number.isSafeInteger(divisor) ||
-      a < 0 ||
       b < 0 ||
       divisor <= 0
     ) {
-      return new Error('mu values must be safe integers.');
+      return new Error('Invalid au multiplier.');
     }
-    return this.safeNarrowMu((BigInt(a) * BigInt(b)) / BigInt(divisor));
+    return this.canonicalAu((amount * BigInt(b)) / BigInt(divisor));
   }
 
-  safeNarrowMu(value) {
-    if (typeof value !== 'bigint' || value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-      return new Error('mu value overflow.');
+  safeAddCount(a, b, label = 'count') {
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a < 0 || b < 0) {
+      return new Error(`Invalid ${label}.`);
     }
-    const narrowed = Number(value);
-    if (!Number.isSafeInteger(narrowed)) return new Error('mu value overflow.');
-    return narrowed;
+    const next = a + b;
+    if (!Number.isSafeInteger(next)) return new Error(`${label} overflow.`);
+    return next;
+  }
+
+  parseAu(value, label = 'au value', { allowZero = true } = {}) {
+    if (typeof value === 'bigint') {
+      if (value < 0n || (!allowZero && value === 0n)) return new Error(`${label} must be positive.`);
+      return value;
+    }
+    if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) {
+      return new Error(`${label} must be a canonical decimal string.`);
+    }
+    const parsed = BigInt(value);
+    if (!allowZero && parsed === 0n) return new Error(`${label} must be positive.`);
+    return parsed;
+  }
+
+  normalizeAu(value, label = 'au value', options = {}) {
+    const parsed = this.parseAu(value, label, options);
+    if (parsed instanceof Error) return parsed;
+    return this.canonicalAu(parsed);
+  }
+
+  canonicalAu(value) {
+    if (typeof value !== 'bigint' || value < 0n) return new Error('Invalid au value.');
+    return value.toString();
+  }
+
+  compareAu(a, b) {
+    const left = this.parseAu(a, 'au value');
+    if (left instanceof Error) return NaN;
+    const right = this.parseAu(b, 'au value');
+    if (right instanceof Error) return NaN;
+    return left === right ? 0 : (left < right ? -1 : 1);
+  }
+
+  maxAu(a, b) {
+    return this.compareAu(a, b) >= 0 ? this.normalizeAu(a) : this.normalizeAu(b);
+  }
+
+  isZeroAu(value) {
+    return this.compareAu(value, ZERO_AU) === 0;
   }
 
   sortedMapEntries(map) {
@@ -8020,9 +8824,9 @@ class MayhemContract extends Contract {
   }
 
   mapEntriesForHash(map, idKey, amountKey) {
-    return this.sortedMapEntries(map).map(([id, mu]) => ({
+    return this.sortedMapEntries(map).map(([id, au]) => ({
       [idKey]: id,
-      [amountKey]: mu,
+      [amountKey]: au,
     }));
   }
 
@@ -8044,8 +8848,9 @@ class MayhemContract extends Contract {
         enclave_id: entry.enclave_id,
         ...(entry.ctx_bracket ? { ctx_bracket: entry.ctx_bracket } : {}),
         ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
-        demand_mu: entry.demand_mu,
+        demand_au: entry.demand_au,
         session_count: entry.session_count,
+        provider_count: entry.provider_count,
       }));
   }
 
@@ -8056,7 +8861,7 @@ class MayhemContract extends Contract {
       user,
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
-      mu: 0,
+      au: ZERO_AU,
       updated_epoch: 0,
       updated_at: null,
     };
@@ -8069,9 +8874,9 @@ class MayhemContract extends Contract {
       provider,
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
-      total_mu: 0,
-      held_mu: 0,
-      paid_cum_mu: 0,
+      total_au: ZERO_AU,
+      held_au: ZERO_AU,
+      paid_cum_au: ZERO_AU,
       updated_epoch: 0,
       updated_at: null,
     };
@@ -8083,8 +8888,8 @@ class MayhemContract extends Contract {
     return (await this.get(this.feeCumKey(normalizedRail))) ?? {
       rail: normalizedRail,
       denom: PRICE_DENOMINATION,
-      cum_mu: 0,
-      swept_cum_mu: 0,
+      cum_au: ZERO_AU,
+      swept_cum_au: ZERO_AU,
       updated_epoch: 0,
       updated_at: null,
       last_apply_hash: null,
@@ -8143,20 +8948,16 @@ class MayhemContract extends Contract {
     };
   }
 
-  tnkE18ToMu(tnkE18, tnkUsdE6) {
-    if (!Number.isSafeInteger(tnkUsdE6) || tnkUsdE6 <= 0) {
-      return new Error('Invalid TNK/USD rate.');
-    }
-    const mu = (tnkE18 * BigInt(tnkUsdE6)) / TNK_E18;
-    return this.safeNarrowMu(mu);
+  tnkE18ToAu(tnkE18, tnkUsdAu) {
+    const rate = this.parseAu(tnkUsdAu, 'TNK/USD atto-rate', { allowZero: false });
+    if (rate instanceof Error) return new Error('Invalid TNK/USD atto-rate.');
+    return this.canonicalAu((tnkE18 * rate) / TNK_E18);
   }
 
-  tapWeiToMu(tapWei, tapUsdE6) {
-    if (!Number.isSafeInteger(tapUsdE6) || tapUsdE6 <= 0) {
-      return new Error('Invalid TAP/USD policy rate.');
-    }
-    const mu = (tapWei * BigInt(tapUsdE6)) / TAP_WEI;
-    return this.safeNarrowMu(mu);
+  tapWeiToAu(tapWei, tapUsdAu) {
+    const rate = this.parseAu(tapUsdAu, 'TAP/USD policy rate', { allowZero: false });
+    if (rate instanceof Error) return new Error('Invalid TAP/USD policy rate.');
+    return this.canonicalAu((tapWei * rate) / TAP_WEI);
   }
 
   async requireFreshRate(at) {
@@ -8216,14 +9017,14 @@ class MayhemContract extends Contract {
     return await this.opaqueHash('mayhem-deposit-leaf-v1', value);
   }
 
-  async nextDepositRoot({ epoch, leaf, mu, at }) {
+  async nextDepositRoot({ epoch, leaf, au, at }) {
     const current = await this.get(`ev/dep/${epoch}`);
     if (current && current.type !== 'deposit_root') {
       return new Error('Invalid deposit evidence root.');
     }
     const count = (current?.count ?? 0) + 1;
-    const muTotal = this.safeAddMu(current?.mu_total ?? 0, mu);
-    if (muTotal instanceof Error) return muTotal;
+    const auTotal = this.safeAddAu(current?.au_total ?? ZERO_AU, au);
+    if (auTotal instanceof Error) return auTotal;
     const merkleRoot = current
       ? await this.opaqueHash('mayhem-deposit-root-v1', {
         previous_root: current.merkle_root,
@@ -8236,24 +9037,24 @@ class MayhemContract extends Contract {
       epoch,
       merkle_root: merkleRoot,
       count,
-      mu_total: muTotal,
+      au_total: auTotal,
       ts: at,
       updated_at: this.tx,
     };
   }
 
-  async nextDepositReversalRoot({ epoch, leaf, disputedMu, clawbackMu, absorbedMu, at }) {
+  async nextDepositReversalRoot({ epoch, leaf, disputedAu, clawbackAu, absorbedAu, at }) {
     const current = await this.get(`ev/dep/${epoch}`);
     if (current && current.type !== 'deposit_root') {
       return new Error('Invalid deposit evidence root.');
     }
     const count = (current?.count ?? 0) + 1;
-    const reversedMuTotal = this.safeAddMu(current?.reversed_mu_total ?? 0, disputedMu);
-    if (reversedMuTotal instanceof Error) return reversedMuTotal;
-    const clawbackMuTotal = this.safeAddMu(current?.clawback_mu_total ?? 0, clawbackMu);
-    if (clawbackMuTotal instanceof Error) return clawbackMuTotal;
-    const networkAbsorbedMuTotal = this.safeAddMu(current?.network_absorbed_mu_total ?? 0, absorbedMu);
-    if (networkAbsorbedMuTotal instanceof Error) return networkAbsorbedMuTotal;
+    const reversedAuTotal = this.safeAddAu(current?.reversed_au_total ?? ZERO_AU, disputedAu);
+    if (reversedAuTotal instanceof Error) return reversedAuTotal;
+    const clawbackAuTotal = this.safeAddAu(current?.clawback_au_total ?? ZERO_AU, clawbackAu);
+    if (clawbackAuTotal instanceof Error) return clawbackAuTotal;
+    const networkAbsorbedAuTotal = this.safeAddAu(current?.network_absorbed_au_total ?? ZERO_AU, absorbedAu);
+    if (networkAbsorbedAuTotal instanceof Error) return networkAbsorbedAuTotal;
     const merkleRoot = current
       ? await this.opaqueHash('mayhem-deposit-root-v1', {
         previous_root: current.merkle_root,
@@ -8265,7 +9066,7 @@ class MayhemContract extends Contract {
       ...(current ?? {
         type: 'deposit_root',
         epoch,
-        mu_total: 0,
+        au_total: ZERO_AU,
       }),
       type: 'deposit_root',
       epoch,
@@ -8273,9 +9074,9 @@ class MayhemContract extends Contract {
       count,
       reversed: true,
       reversal_count: (current?.reversal_count ?? 0) + 1,
-      reversed_mu_total: reversedMuTotal,
-      clawback_mu_total: clawbackMuTotal,
-      network_absorbed_mu_total: networkAbsorbedMuTotal,
+      reversed_au_total: reversedAuTotal,
+      clawback_au_total: clawbackAuTotal,
+      network_absorbed_au_total: networkAbsorbedAuTotal,
       ts: at,
       updated_at: this.tx,
     };
@@ -8327,9 +9128,8 @@ class MayhemContract extends Contract {
       return `dep/tap/${value.eth_tx_hash.toLowerCase()}/${value.log_index}/${digest}`;
     }
     if (value.op === 'fiat_deposit') {
-      if (!this.isSafeKeyPart(value.rail)) return new Error('Invalid fiat deposit rail.');
       if (!this.isSafeKeyPart(value.ext_ref_hash)) return new Error('Invalid external reference hash.');
-      return `dep/fiat/${value.rail}/${value.ext_ref_hash}/${digest}`;
+      return `dep/fiat/${value.ext_ref_hash}`;
     }
     return new Error('Unsupported deposit feature op.');
   }
@@ -8426,8 +9226,12 @@ class MayhemContract extends Contract {
     const currentHead = await this.get(headKey);
     const body = {
       ...event,
-      paid_mu: event.paid_mu ?? null,
-      max_spend_mu: event.max_spend_mu ?? null,
+      paid_au: event.paid_au !== null && event.paid_au !== undefined
+        ? this.normalizeAu(event.paid_au, 'reputation paid amount')
+        : null,
+      max_spend_au: event.max_spend_au !== null && event.max_spend_au !== undefined
+        ? this.normalizeAu(event.max_spend_au, 'reputation max spend')
+        : null,
       evidence_hash: event.evidence_hash ?? null,
       recorded_at: this.tx,
       recorded_by: this.address,
