@@ -8089,7 +8089,8 @@ class MayhemContract extends Contract {
   verifyReceiptEnvelope(envelope) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
-    const signedBody = envelope.signed_body ?? envelope.body;
+    const signedBody = envelope.body;
+    if (!signedBody || typeof signedBody !== 'object' || Array.isArray(signedBody)) return false;
     const enclaveKey = envelope.enclave_pubkey ?? (
       this.isHexBytes(signedBody.enclave_id, 32) ? signedBody.enclave_id : null
     );
