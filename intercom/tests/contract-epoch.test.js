@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import b4a from 'b4a';
-import MayhemContract, { receiptMessage } from '../contract/contract.js';
+import MayhemContract, { SESSION_RECEIPT_SCHEMA_VERSION, receiptMessage } from '../contract/contract.js';
 import { recomputeEpoch } from '../scripts/recompute-epoch-roots.mjs';
 import {
   MemoryStorage,
@@ -38,6 +38,7 @@ const epochEnclaveRegistration = {
   op: 'register_enclave',
   enclave_id: enclaveId,
   model_id: modelId,
+  model_class: 'text-generation',
   backend: 'llama.cpp',
   artifact_root: '5'.repeat(64),
   artifact_root_kind: 'blake3_merkle_v1',
@@ -124,7 +125,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
   deposits: [],
   receipts: [
     {
-      schema_version: 1,
+      schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
       session_id: 'session-epoch-1',
       seq: 1,
       final: true,
@@ -135,8 +136,13 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       model_id: modelId,
       price_ver: 1,
       locked_rate_map: textLockedRateMapFor(2_000),
+      locked_per_req_au: '0',
+      locked_min_session_au: '0',
+      served_ctx: 32768,
+      ctx_bracket: 'le32k',
+      ctx_bracket_table_ver: 1,
       rules_ver: 1,
-      usage: { in: 100, out: 250 },
+      usage: { input_token: 100, output_token: 250 },
       au_owed_cum: '2000',
       prompt_hash: 'a'.repeat(64),
       ts: 3_600,
@@ -148,27 +154,38 @@ const receiptBundle = (user, provider, overrides = {}) => ({
   ...overrides,
 });
 
-test('epoch recompute canonicalizes metered usage maps', async () => {
+test('epoch recompute accepts only current canonical metered usage maps', async () => {
   const { provider, user } = await setupEpochContract();
-  const legacyText = receiptBundle(user, provider);
   const canonicalText = receiptBundle(user, provider, {
     receipts: [
       {
-        ...legacyText.receipts[0],
-        schema_version: 2,
+        ...receiptBundle(user, provider).receipts[0],
         locked_rate_map: textLockedRateMapFor(2_000),
         usage: { input_token: 100, output_token: 250 },
       },
     ],
   });
 
-  assert.deepEqual((await recomputeEpoch(canonicalText)).roots, (await recomputeEpoch(legacyText)).roots);
+  const canonicalRoll = await recomputeEpoch(canonicalText);
+  assert.equal(canonicalRoll.totals.use_count, 1);
+  assert.equal(canonicalRoll.totals.use_au, '2000');
+
+  await assert.rejects(
+    () => recomputeEpoch(receiptBundle(user, provider, {
+      receipts: [
+        {
+          ...canonicalText.receipts[0],
+          usage: { in: 100, out: 250 },
+        },
+      ],
+    })),
+    /receipt usage must be canonical/
+  );
 
   const imageAliasBundle = receiptBundle(user, provider, {
     receipts: [
       {
-        ...legacyText.receipts[0],
-        schema_version: 2,
+        ...canonicalText.receipts[0],
         model_id: 'admin/image-small@fp16',
         locked_rate_map: imageLockedRateMap,
         usage: { images: 2, steps: 60 },
@@ -179,8 +196,7 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
   const imageCanonicalBundle = receiptBundle(user, provider, {
     receipts: [
       {
-        ...legacyText.receipts[0],
-        schema_version: 2,
+        ...canonicalText.receipts[0],
         model_id: 'admin/image-small@fp16',
         locked_rate_map: imageLockedRateMap,
         usage: { image: 2, step: 60 },
@@ -188,17 +204,16 @@ test('epoch recompute canonicalizes metered usage maps', async () => {
       },
     ],
   });
-  const imageAliasRoll = await recomputeEpoch(imageAliasBundle);
   const imageCanonicalRoll = await recomputeEpoch(imageCanonicalBundle);
 
-  assert.deepEqual(imageAliasRoll.roots, imageCanonicalRoll.roots);
-  assert.equal(imageAliasRoll.totals.use_count, 1);
-  assert.equal(imageAliasRoll.totals.use_au, '1120');
+  await assert.rejects(() => recomputeEpoch(imageAliasBundle), /receipt usage must be canonical/);
+  assert.equal(imageCanonicalRoll.totals.use_count, 1);
+  assert.equal(imageCanonicalRoll.totals.use_au, '1120');
 });
 
 const signedReceipt = (user, provider, enclave, overrides = {}) => {
   const body = {
-    schema_version: 1,
+    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: 'session-epoch-1',
     seq: 1,
     final: true,
@@ -209,8 +224,13 @@ const signedReceipt = (user, provider, enclave, overrides = {}) => {
     model_id: modelId,
     price_ver: 1,
     locked_rate_map: textLockedRateMapFor(1_000),
+    locked_per_req_au: '0',
+    locked_min_session_au: '0',
+    served_ctx: 32768,
+    ctx_bracket: 'le32k',
+    ctx_bracket_table_ver: 1,
     rules_ver: 1,
-    usage: { in: 100, out: 250 },
+    usage: { input_token: 100, output_token: 250 },
     au_owed_cum: '1000',
     prompt_hash: 'a'.repeat(64),
     ts: 3_600,

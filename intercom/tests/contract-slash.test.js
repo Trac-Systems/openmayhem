@@ -76,6 +76,7 @@ async function setupProviderServing(ctx) {
       op: 'register_enclave',
       enclave_id: enclaveId,
       model_id: modelId,
+      model_class: 'text-generation',
       backend: 'llama.cpp',
       artifact_root: 'a'.repeat(64),
       artifact_root_kind: 'blake3_merkle_v1',

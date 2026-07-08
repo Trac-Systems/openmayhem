@@ -54,6 +54,7 @@ const enclaveRegistration = {
   op: 'register_enclave',
   enclave_id: enclaveId,
   model_id: 'qwen/qwen2.5-4b-instruct@4bit',
+  model_class: 'text-generation',
   backend: 'llama.cpp',
   artifact_root: artifactRoot,
   artifact_root_kind: 'blake3_merkle_v1',
@@ -94,6 +95,7 @@ const enclaveRetire = {
 const modelRef = {
   op: 'set_model_ref',
   model_id: enclaveRegistration.model_id,
+  model_class: 'text-generation',
   rate_map: textRateMap(20, 60),
 };
 
@@ -294,53 +296,42 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   });
 });
 
-test('MayhemContract model_class defaults old text records and allows new admin classes', async () => {
+test('MayhemContract requires model_class and allows admin model classes', async () => {
   const admin = await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });
   const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
   const contract = new MayhemContract(protocol, {});
-  const legacyEnclaveId = 'b'.repeat(64);
 
-  await storage.put(`enclave/${legacyEnclaveId}`, {
-    enclave_id: legacyEnclaveId,
-    model_id: enclaveRegistration.model_id,
-    backend: 'llama.cpp',
-    artifact_root: artifactRoot,
-    artifact_root_kind: 'blake3_merkle_v1',
-    artifact_source: artifactSource,
-    manifest_hash: manifestHash,
-    att_tier: 1,
-    binary_hash: binaryHash,
-    caps: {
-      chat: true,
-      tools: false,
-      ctx: 32768,
-    },
-    status: 'active',
-    providers: [],
-    created_by: admin.publicKey,
-    created_by_role: 'admin',
-    registered_at: makeTxKey(1),
-    updated_at: makeTxKey(1),
-    retired_at: null,
-  });
-  await storage.put(`modelref/${enclaveRegistration.model_id}`, {
-    model_id: enclaveRegistration.model_id,
-    rate_map: textRateMap(20, 60),
-  });
-
-  const legacyPrice = await execute(
+  const missingEnclaveClass = await execute(
     contract,
     storage,
-    'setPrice',
+    'registerEnclave',
     {
-      ...priceSchedule,
-      enclave_id: legacyEnclaveId,
+      ...enclaveRegistration,
+      enclave_id: 'b'.repeat(64),
+      model_id: 'admin/missing-class@q4',
+      model_class: undefined,
     },
     admin.publicKey,
     2
   );
-  assert.equal(legacyPrice.ok, true, legacyPrice.message);
+  assert.equal(missingEnclaveClass instanceof Error, true);
+  assert.match(missingEnclaveClass.message, /Invalid schema/i);
+
+  const missingModelRefClass = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      op: 'set_model_ref',
+      model_id: 'admin/missing-modelref-class@q4',
+      rate_map: textRateMap(20, 60),
+    },
+    admin.publicKey,
+    3
+  );
+  assert.equal(missingModelRefClass instanceof Error, true);
+  assert.match(missingModelRefClass.message, /Invalid schema/i);
 
   const embeddingRegistration = {
     ...enclaveRegistration,
@@ -361,7 +352,7 @@ test('MayhemContract model_class defaults old text records and allows new admin 
     'registerEnclave',
     embeddingRegistration,
     admin.publicKey,
-    3
+    4
   );
   assert.equal(registered.ok, true, registered.message);
   assert.equal((await storage.get(`enclave/${embeddingRegistration.enclave_id}`)).value.model_class, 'embedding');
@@ -377,7 +368,7 @@ test('MayhemContract model_class defaults old text records and allows new admin 
       rate_map: [{ unit: 'embedding', per_unit_au: '2', granularity: 1 }],
     },
     admin.publicKey,
-    4
+    5
   );
   assert.equal(modelRefResult.ok, true, modelRefResult.message);
   assert.equal((await storage.get(`modelref/${embeddingRegistration.model_id}`)).value.model_class, 'embedding');
@@ -1491,7 +1482,7 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
   assert.equal(updated.value.updated_at, makeTxKey(8));
 });
 
-test('MayhemContract lets providers declare accepted payment rails without legacy migration', async () => {
+test('MayhemContract lets providers declare accepted payment rails without stale rail compatibility', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });

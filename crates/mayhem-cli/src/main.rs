@@ -64,11 +64,11 @@ use mayhem_hwprobe::{
 use mayhem_proto::{
     chunk_json_payload, ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at,
     default_ctx_bracket_schedule, reassemble_json_payload, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, supported_receipt_signing_bytes,
-    supported_spend_voucher_signing_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
-    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk,
-    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    validate_ctx_bracket_schedule, AttestationRuntimeConfig, CatalogEnclaveIdentity,
+    CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk, PayloadChunkManifest, ReceiptAck,
+    ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
     USAGE_STEP,
 };
@@ -15898,20 +15898,22 @@ fn commit_is_challengeable_over_credit(commit: &Value, proof_epoch: u64) -> bool
 fn normalized_receipt_envelope(value: &Value) -> Option<Value> {
     let receipt = value.get("receipt").unwrap_or(value);
     let body_source = receipt.get("body").unwrap_or(receipt);
-    let final_receipt = body_source
-        .get("final")
-        .or_else(|| body_source.get("final_receipt"))?;
     let mut body = Map::new();
     for field in [
         "schema_version",
         "session_id",
         "seq",
+        "final",
         "rail",
         "user",
         "provider",
         "enclave_id",
         "model_id",
         "price_ver",
+        "locked_rate_map",
+        "locked_per_req_au",
+        "locked_min_session_au",
+        "served_ctx",
         "rules_ver",
         "usage",
         "au_owed_cum",
@@ -15920,7 +15922,15 @@ fn normalized_receipt_envelope(value: &Value) -> Option<Value> {
     ] {
         body.insert(field.to_owned(), body_source.get(field)?.clone());
     }
-    body.insert("final".to_owned(), final_receipt.clone());
+    if let Some(ctx_bracket) = body_source.get("ctx_bracket") {
+        body.insert("ctx_bracket".to_owned(), ctx_bracket.clone());
+    }
+    if let Some(ctx_bracket_table_ver) = body_source.get("ctx_bracket_table_ver") {
+        body.insert(
+            "ctx_bracket_table_ver".to_owned(),
+            ctx_bracket_table_ver.clone(),
+        );
+    }
     Some(json!({
         "body": Value::Object(body),
         "enclave_sig": receipt.get("enclave_sig").or_else(|| value.get("enclave_sig"))?.clone(),
@@ -19816,7 +19826,7 @@ fn receipt_history_summary(entry: &Value) -> Value {
         "au_owed_cum": body.get("au_owed_cum").and_then(value_money_au).map(money_au_json),
         "usage": body.get("usage").cloned().unwrap_or(Value::Null),
         "ts": body.get("ts").and_then(Value::as_u64),
-        "final_receipt": body.get("final_receipt").and_then(Value::as_bool),
+        "final": body.get("final").and_then(Value::as_bool),
         "receipt_hash": stable_value_hash(entry),
     })
 }
@@ -28651,41 +28661,16 @@ struct ProviderLifecycleIntentSigningEnvelope<'a> {
 }
 
 fn provider_lifecycle_intent_message(intent: &Value) -> String {
-    provider_lifecycle_intent_message_for_version(intent, CONTRACT_SIGNING_MESSAGE_VERSION)
-}
-
-fn provider_lifecycle_intent_message_for_version(intent: &Value, signing_version: u32) -> String {
-    match signing_version {
-        1 => format!("mayhem-provider-lifecycle-v1{}", stable_json_value(intent)),
-        2 => {
-            let stable_intent = stable_json_value(intent);
-            serde_json::to_string(&ProviderLifecycleIntentSigningEnvelope {
-                domain: "mayhem-provider-lifecycle",
-                signing_version: 2,
-                intent: &stable_intent,
-            })
-            .expect("provider lifecycle signing message serializes")
-        }
-        _ => {
-            let stable_intent = stable_json_value(intent);
-            serde_json::to_string(&ProviderLifecycleIntentSigningEnvelope {
-                domain: "mayhem-provider-lifecycle-unsupported",
-                signing_version,
-                intent: &stable_intent,
-            })
-            .expect("provider lifecycle signing message serializes")
-        }
-    }
+    let stable_intent = stable_json_value(intent);
+    serde_json::to_string(&ProviderLifecycleIntentSigningEnvelope {
+        domain: "mayhem-provider-lifecycle",
+        signing_version: CONTRACT_SIGNING_MESSAGE_VERSION,
+        intent: &stable_intent,
+    })
+    .expect("provider lifecycle signing message serializes")
 }
 
 fn provider_lifecycle_feature_key(intent: &Value) -> Result<String> {
-    provider_lifecycle_feature_key_for_version(intent, CONTRACT_SIGNING_MESSAGE_VERSION)
-}
-
-fn provider_lifecycle_feature_key_for_version(
-    intent: &Value,
-    signing_version: u32,
-) -> Result<String> {
     let provider = intent
         .get("provider")
         .and_then(Value::as_str)
@@ -28694,11 +28679,9 @@ fn provider_lifecycle_feature_key_for_version(
         .get("op")
         .and_then(Value::as_str)
         .context("provider lifecycle intent missing op")?;
-    let digest = blake3::hash(
-        provider_lifecycle_intent_message_for_version(intent, signing_version).as_bytes(),
-    )
-    .to_hex()
-    .to_string();
+    let digest = blake3::hash(provider_lifecycle_intent_message(intent).as_bytes())
+        .to_hex()
+        .to_string();
     Ok(format!("intent/provider/{provider}/{op}/{digest}"))
 }
 
@@ -35143,14 +35126,10 @@ fn verify_provider_session_receipt_ack(
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).context("invalid receipt ack user pubkey")?;
     let signature = Signature::from_bytes(&sig_bytes);
-    let payloads = supported_receipt_signing_bytes(body)?;
-    if payloads
-        .iter()
-        .any(|payload| verifying_key.verify(payload, &signature).is_ok())
-    {
-        return Ok(());
-    }
-    bail!("receipt ack user signature failed")
+    let payload = receipt_signing_bytes(body)?;
+    verifying_key
+        .verify(&payload, &signature)
+        .context("receipt ack user signature failed")
 }
 
 async fn send_provider_session_close(
@@ -36516,7 +36495,7 @@ fn frame_contract_version(frame: &Value) -> Option<u32> {
 fn contract_upgrade_required_reason(expected: u32, actual: Option<u32>) -> String {
     let actual = actual
         .map(|version| version.to_string())
-        .unwrap_or_else(|| "missing/legacy".to_owned());
+        .unwrap_or_else(|| "missing/outdated".to_owned());
     format!(
         "contract upgrade required: expected CONTRACT_VERSION {expected}, got {actual}; update Mayhem on the out-of-sync node before opening sessions"
     )
@@ -36528,14 +36507,10 @@ fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &s
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).context("invalid spend voucher user pubkey")?;
     let signature = Signature::from_bytes(&sig_bytes);
-    let payloads = supported_spend_voucher_signing_bytes(&voucher.body)?;
-    if payloads
-        .iter()
-        .any(|payload| verifying_key.verify(payload, &signature).is_ok())
-    {
-        return Ok(());
-    }
-    bail!("spend voucher user signature failed")
+    let payload = spend_voucher_signing_bytes(&voucher.body)?;
+    verifying_key
+        .verify(&payload, &signature)
+        .context("spend voucher user signature failed")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39625,7 +39600,7 @@ mod tests {
                     "au_owed_cum": "42",
                     "usage": {"output_token": 3},
                     "ts": 7200000,
-                    "final_receipt": true
+                    "final": true
                 }
             }
         }));
@@ -39634,6 +39609,7 @@ mod tests {
         assert_eq!(latest["provider"].as_str(), Some("provider-a"));
         assert_eq!(latest["model_id"].as_str(), Some("model-a"));
         assert_eq!(latest["au_owed_cum"].as_str(), Some("42"));
+        assert_eq!(latest["final"].as_bool(), Some(true));
 
         let previous = receipt_history_summary(&json!({
             "body": {
@@ -39945,6 +39921,11 @@ mod tests {
                         { "unit": "input_token", "per_unit_au": "50", "granularity": 1 },
                         { "unit": "output_token", "per_unit_au": "50", "granularity": 1 }
                     ],
+                    "locked_per_req_au": "0",
+                    "locked_min_session_au": "0",
+                    "served_ctx": 8192,
+                    "ctx_bracket": "le8k",
+                    "ctx_bracket_table_ver": 1,
                     "rules_ver": 1,
                     "usage": { "input_token": 1, "output_token": 1 },
                     "au_owed_cum": "100",
@@ -40011,6 +39992,11 @@ mod tests {
                     "locked_rate_map": [
                         { "unit": "input_token", "per_unit_au": "100", "granularity": 1 }
                     ],
+                    "locked_per_req_au": "0",
+                    "locked_min_session_au": "0",
+                    "served_ctx": 8192,
+                    "ctx_bracket": "le8k",
+                    "ctx_bracket_table_ver": 1,
                     "rules_ver": 1,
                     "usage": { "input_token": 1 },
                     "au_owed_cum": "100",
@@ -41465,7 +41451,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_lifecycle_intents_are_limited_to_opt_in_and_out_ops() {
+    fn provider_lifecycle_intents_are_current_version_and_limited_to_opt_in_and_out_ops() {
         let provider = "11".repeat(32);
         let intent = json!({
             "op": "join_room",
@@ -41476,24 +41462,11 @@ mod tests {
         });
         assert!(provider_lifecycle_intent_message(&intent).contains("\"signing_version\":2"));
         assert_eq!(
-            provider_lifecycle_intent_message_for_version(&intent, 1),
-            format!("mayhem-provider-lifecycle-v1{}", stable_json_value(&intent))
-        );
-        assert_eq!(
             provider_lifecycle_feature_key(&intent).unwrap(),
             format!(
                 "intent/provider/{}/join_room/{}",
                 provider,
                 blake3::hash(provider_lifecycle_intent_message(&intent).as_bytes()).to_hex()
-            )
-        );
-        assert_eq!(
-            provider_lifecycle_feature_key_for_version(&intent, 1).unwrap(),
-            format!(
-                "intent/provider/{}/join_room/{}",
-                provider,
-                blake3::hash(provider_lifecycle_intent_message_for_version(&intent, 1).as_bytes())
-                    .to_hex()
             )
         );
 
@@ -43618,39 +43591,20 @@ mod tests {
                 ..
             }
         ));
-        let mut legacy_voucher = frame.clone();
-        let user_key = SigningKey::from_bytes(&[6_u8; 32]);
-        let voucher_body: mayhem_proto::SpendVoucherBody =
-            serde_json::from_value(legacy_voucher["voucher"].clone()).unwrap();
-        let legacy_sig = hex_encode(
-            &user_key
-                .sign(
-                    &mayhem_proto::spend_voucher_signing_bytes_for_version(&voucher_body, 1)
-                        .unwrap(),
-                )
-                .to_bytes(),
-        );
-        legacy_voucher["voucher"]["user_sig"] = json!(legacy_sig.clone());
-        legacy_voucher["sig"] = json!(legacy_sig);
-        assert_eq!(
-            provider_session_open_decision(&legacy_voucher, &terms),
-            ProviderSessionDecision::Accept
-        );
-
-        let mut legacy_open = frame.clone();
-        legacy_open
+        let mut outdated_open = frame.clone();
+        outdated_open
             .as_object_mut()
             .expect("s.open object")
             .remove("contract_version");
-        legacy_open["voucher"]["user_sig"] = json!("11".repeat(64));
-        legacy_open["sig"] = json!("11".repeat(64));
-        match provider_session_open_decision(&legacy_open, &terms) {
+        outdated_open["voucher"]["user_sig"] = json!("11".repeat(64));
+        outdated_open["sig"] = json!("11".repeat(64));
+        match provider_session_open_decision(&outdated_open, &terms) {
             ProviderSessionDecision::Reject { code, reason } => {
                 assert_eq!(code, "UPGRADE_REQUIRED");
                 assert!(reason.contains("contract upgrade required"));
-                assert!(reason.contains("missing/legacy"));
+                assert!(reason.contains("missing/outdated"));
             }
-            other => panic!("legacy contract version should reject before signatures: {other:?}"),
+            other => panic!("outdated contract version should reject before signatures: {other:?}"),
         }
 
         let mut future_open = frame.clone();

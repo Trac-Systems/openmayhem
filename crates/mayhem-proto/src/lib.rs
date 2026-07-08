@@ -11,7 +11,6 @@ pub const ATTESTATION_ALG: &str = "ed25519";
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 8;
 pub const NEXT_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 8;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
-pub const SUPPORTED_SIGNING_MESSAGE_VERSIONS: &[u32] = &[SIGNING_MESSAGE_VERSION, 1];
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
 pub const CTX_BRACKETS: &[(u32, &str)] = &[
     (8_192, "le8k"),
@@ -291,7 +290,6 @@ pub struct AttestationBody {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AttestationRuntimeConfig {
-    #[serde(default = "default_model_class")]
     pub model_class: String,
     pub backend: String,
     pub ctx: u32,
@@ -596,74 +594,6 @@ pub struct SessionReceipt {
     pub user_sig: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReceiptSchemaMigrationError {
-    Unsupported { from: u32, to: u32 },
-}
-
-impl fmt::Display for ReceiptSchemaMigrationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { from, to } => {
-                write!(f, "unsupported receipt schema migration {from} -> {to}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ReceiptSchemaMigrationError {}
-
-pub fn migrate_receipt_body(
-    body: &ReceiptBody,
-) -> Result<ReceiptBody, ReceiptSchemaMigrationError> {
-    migrate_receipt_body_to_schema(body, SESSION_RECEIPT_SCHEMA_VERSION)
-}
-
-pub fn migrate_receipt_body_to_schema(
-    body: &ReceiptBody,
-    target_schema_version: u32,
-) -> Result<ReceiptBody, ReceiptSchemaMigrationError> {
-    let mut migrated = body.clone();
-    if migrated.schema_version > target_schema_version {
-        return Err(ReceiptSchemaMigrationError::Unsupported {
-            from: migrated.schema_version,
-            to: target_schema_version,
-        });
-    }
-
-    while migrated.schema_version < target_schema_version {
-        match migrated.schema_version {
-            1 => {
-                migrated.usage = ReceiptUsage::new(migrated.usage.units().clone());
-                migrated.schema_version = 2;
-            }
-            2 => migrated.schema_version = 3,
-            3 => migrated.schema_version = 4,
-            4 => migrated.schema_version = 5,
-            5 => {
-                if migrated.ctx_bracket.is_none() {
-                    migrated.ctx_bracket =
-                        Some(ctx_bracket_for_tokens(migrated.served_ctx).to_owned());
-                }
-                if migrated.ctx_bracket_table_ver.is_none() {
-                    migrated.ctx_bracket_table_ver = Some(CTX_BRACKET_TABLE_VERSION);
-                }
-                migrated.schema_version = 6;
-            }
-            6 => migrated.schema_version = 7,
-            7 => migrated.schema_version = 8,
-            from => {
-                return Err(ReceiptSchemaMigrationError::Unsupported {
-                    from,
-                    to: target_schema_version,
-                });
-            }
-        }
-    }
-
-    Ok(migrated)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptAck {
     pub session_id: String,
@@ -672,22 +602,10 @@ pub struct ReceiptAck {
 }
 
 #[derive(Serialize)]
-struct SpendVoucherSigningEnvelopeV1<'a> {
-    domain: &'static str,
-    body: &'a SpendVoucherBody,
-}
-
-#[derive(Serialize)]
 struct SpendVoucherSigningEnvelopeV2<'a> {
     domain: &'static str,
     signing_version: u32,
     body: &'a SpendVoucherBody,
-}
-
-#[derive(Serialize)]
-struct ReceiptSigningEnvelopeV1<'a> {
-    domain: &'static str,
-    body: &'a ReceiptBody,
 }
 
 #[derive(Serialize)]
@@ -780,73 +698,19 @@ struct AttestationHardwareQuoteBinding<'a> {
 }
 
 pub fn spend_voucher_signing_bytes(body: &SpendVoucherBody) -> Result<Vec<u8>, serde_json::Error> {
-    spend_voucher_signing_bytes_for_version(body, SIGNING_MESSAGE_VERSION)
-}
-
-pub fn spend_voucher_signing_bytes_for_version(
-    body: &SpendVoucherBody,
-    signing_version: u32,
-) -> Result<Vec<u8>, serde_json::Error> {
-    match signing_version {
-        1 => serde_json::to_vec(&SpendVoucherSigningEnvelopeV1 {
-            domain: "mayhem-spend-voucher-v1",
-            body,
-        }),
-        2 => serde_json::to_vec(&SpendVoucherSigningEnvelopeV2 {
-            domain: "mayhem-spend-voucher",
-            signing_version: 2,
-            body,
-        }),
-        _ => serde_json::to_vec(&SpendVoucherSigningEnvelopeV2 {
-            domain: "mayhem-spend-voucher-unsupported",
-            signing_version,
-            body,
-        }),
-    }
-}
-
-pub fn supported_spend_voucher_signing_bytes(
-    body: &SpendVoucherBody,
-) -> Result<Vec<Vec<u8>>, serde_json::Error> {
-    SUPPORTED_SIGNING_MESSAGE_VERSIONS
-        .iter()
-        .map(|version| spend_voucher_signing_bytes_for_version(body, *version))
-        .collect()
+    serde_json::to_vec(&SpendVoucherSigningEnvelopeV2 {
+        domain: "mayhem-spend-voucher",
+        signing_version: SIGNING_MESSAGE_VERSION,
+        body,
+    })
 }
 
 pub fn receipt_signing_bytes(body: &ReceiptBody) -> Result<Vec<u8>, serde_json::Error> {
-    receipt_signing_bytes_for_version(body, SIGNING_MESSAGE_VERSION)
-}
-
-pub fn receipt_signing_bytes_for_version(
-    body: &ReceiptBody,
-    signing_version: u32,
-) -> Result<Vec<u8>, serde_json::Error> {
-    match signing_version {
-        1 => serde_json::to_vec(&ReceiptSigningEnvelopeV1 {
-            domain: "mayhem-session-receipt-v1",
-            body,
-        }),
-        2 => serde_json::to_vec(&ReceiptSigningEnvelopeV2 {
-            domain: "mayhem-session-receipt",
-            signing_version: 2,
-            body,
-        }),
-        _ => serde_json::to_vec(&ReceiptSigningEnvelopeV2 {
-            domain: "mayhem-session-receipt-unsupported",
-            signing_version,
-            body,
-        }),
-    }
-}
-
-pub fn supported_receipt_signing_bytes(
-    body: &ReceiptBody,
-) -> Result<Vec<Vec<u8>>, serde_json::Error> {
-    SUPPORTED_SIGNING_MESSAGE_VERSIONS
-        .iter()
-        .map(|version| receipt_signing_bytes_for_version(body, *version))
-        .collect()
+    serde_json::to_vec(&ReceiptSigningEnvelopeV2 {
+        domain: "mayhem-session-receipt",
+        signing_version: SIGNING_MESSAGE_VERSION,
+        body,
+    })
 }
 
 pub fn session_accept_signing_bytes(
@@ -1393,15 +1257,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_defaults_model_class_for_legacy_text_reports() {
-        let config: AttestationRuntimeConfig = serde_json::from_value(json!({
+    fn runtime_config_requires_explicit_model_class() {
+        let missing = serde_json::from_value::<AttestationRuntimeConfig>(json!({
             "backend": "llama.cpp",
             "ctx": 8192,
             "tp_degree": 1
-        }))
-        .unwrap();
+        }));
 
-        assert_eq!(config.model_class, DEFAULT_MODEL_CLASS);
+        assert!(missing.is_err());
     }
 
     #[test]
@@ -1522,12 +1385,12 @@ mod tests {
     }
 
     #[test]
-    fn receipt_schema_migration_accepts_v1_for_v2_nodes() {
-        let legacy_usage: ReceiptUsage =
+    fn receipt_usage_aliases_parse_to_current_canonical_units() {
+        let aliased_usage: ReceiptUsage =
             serde_json::from_value(serde_json::json!({ "in": 3, "out_tokens": 5 })).unwrap();
-        assert_eq!(legacy_usage, ReceiptUsage::text(3, 5));
+        assert_eq!(aliased_usage, ReceiptUsage::text(3, 5));
         assert_eq!(
-            serde_json::to_value(&legacy_usage).unwrap(),
+            serde_json::to_value(&aliased_usage).unwrap(),
             serde_json::json!({ "input_token": 3, "output_token": 5 })
         );
         let cached_usage: ReceiptUsage = serde_json::from_value(serde_json::json!({
@@ -1554,58 +1417,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(mixed_alias_usage, ReceiptUsage::text(5, 12));
-
-        let receipt = ReceiptBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
-            session_id: "sess".to_owned(),
-            seq: 1,
-            final_receipt: false,
-            rail: "fiat".to_owned(),
-            user: "user".to_owned(),
-            provider: "provider".to_owned(),
-            enclave_id: "enclave".to_owned(),
-            model_id: "model".to_owned(),
-            price_ver: 1,
-            locked_rate_map: locked_rate_map(),
-            locked_per_req_au: 0,
-            locked_min_session_au: 0,
-            served_ctx: 8192,
-            ctx_bracket: Some("le8k".to_owned()),
-            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
-            rules_ver: 1,
-            usage: ReceiptUsage::text(3, 5),
-            au_owed_cum: 1,
-            prompt_hash: "hash".to_owned(),
-            ts: 10,
-        };
-
-        assert_eq!(migrate_receipt_body(&receipt).unwrap(), receipt);
-
-        let migrated =
-            migrate_receipt_body_to_schema(&receipt, NEXT_SESSION_RECEIPT_SCHEMA_VERSION).unwrap();
-        assert_eq!(migrated.schema_version, NEXT_SESSION_RECEIPT_SCHEMA_VERSION);
-        assert_eq!(migrated.session_id, receipt.session_id);
-        assert_eq!(migrated.usage, receipt.usage);
-
-        let mut unsupported = receipt.clone();
-        unsupported.schema_version = 99;
-        assert_eq!(
-            migrate_receipt_body_to_schema(&unsupported, NEXT_SESSION_RECEIPT_SCHEMA_VERSION)
-                .unwrap_err(),
-            ReceiptSchemaMigrationError::Unsupported {
-                from: 99,
-                to: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
-            }
-        );
-
-        assert_eq!(
-            migrate_receipt_body_to_schema(&migrated, SESSION_RECEIPT_SCHEMA_VERSION).unwrap(),
-            migrated
-        );
     }
 
     #[test]
-    fn signing_payloads_are_versioned_and_keep_legacy_payloads_supported() {
+    fn signing_payloads_use_current_version_only() {
         let voucher = SpendVoucherBody {
             session_id: "sess".to_owned(),
             rail: "fiat".to_owned(),
@@ -1624,18 +1439,9 @@ mod tests {
             },
         };
         let current_voucher = spend_voucher_signing_bytes(&voucher).unwrap();
-        let legacy_voucher = spend_voucher_signing_bytes_for_version(&voucher, 1).unwrap();
-        assert_ne!(current_voucher, legacy_voucher);
         assert!(String::from_utf8(current_voucher.clone())
             .unwrap()
             .contains("\"signing_version\":2"));
-        assert!(String::from_utf8(legacy_voucher.clone())
-            .unwrap()
-            .contains("mayhem-spend-voucher-v1"));
-        assert_eq!(
-            supported_spend_voucher_signing_bytes(&voucher).unwrap(),
-            vec![current_voucher, legacy_voucher]
-        );
 
         let receipt = ReceiptBody {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
@@ -1661,18 +1467,9 @@ mod tests {
             ts: 10,
         };
         let current_receipt = receipt_signing_bytes(&receipt).unwrap();
-        let legacy_receipt = receipt_signing_bytes_for_version(&receipt, 1).unwrap();
-        assert_ne!(current_receipt, legacy_receipt);
         assert!(String::from_utf8(current_receipt.clone())
             .unwrap()
             .contains("\"signing_version\":2"));
-        assert!(String::from_utf8(legacy_receipt.clone())
-            .unwrap()
-            .contains("mayhem-session-receipt-v1"));
-        assert_eq!(
-            supported_receipt_signing_bytes(&receipt).unwrap(),
-            vec![current_receipt, legacy_receipt]
-        );
     }
 
     #[test]

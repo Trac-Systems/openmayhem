@@ -3,7 +3,6 @@ import test from 'node:test';
 import b4a from 'b4a';
 import MayhemContract, {
   CONTRACT_VERSION,
-  NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
   SESSION_RECEIPT_SCHEMA_VERSION,
   consentMessage,
   providerLifecycleIntentMessage,
@@ -36,91 +35,87 @@ test('contract reports the exported contract version', async () => {
   assert.equal(result.version, CONTRACT_VERSION);
 });
 
-test('contract accepts legacy v1 and current v2 consent signatures', async () => {
-  assert.notEqual(consentMessage(1, rulesHash, 1), consentMessage(1, rulesHash));
+test('contract accepts only the current consent signing version', async () => {
+  assert.throws(() => consentMessage(1, rulesHash, 1), /Unsupported signing message version/);
   assert.match(consentMessage(1, rulesHash), /"signing_version":2/);
 
-  for (const signingVersion of [1, 2]) {
-    const admin = await makeIdentity();
-    const user = await makeIdentity();
-    const storage = new MemoryStorage({ admin: admin.publicKey });
-    const protocol = { peer: { wallet: makeVerifier(user.wallet) } };
-    const contract = new MayhemContract(protocol, {});
+  const admin = await makeIdentity();
+  const user = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(user.wallet) } };
+  const contract = new MayhemContract(protocol, {});
 
-    let result = await execute(
-      contract,
-      storage,
-      'setRules',
-      { op: 'set_rules', ver: 1, hash: rulesHash },
-      admin.publicKey,
-      1
-    );
-    assert.equal(result.ok, true, result.message);
+  let result = await execute(
+    contract,
+    storage,
+    'setRules',
+    { op: 'set_rules', ver: 1, hash: rulesHash },
+    admin.publicKey,
+    1
+  );
+  assert.equal(result.ok, true, result.message);
 
-    result = await execute(
-      contract,
-      storage,
-      'consent',
-      {
-        op: 'consent',
-        ver: 1,
-        hash: rulesHash,
-        sig: signConsent(user.wallet, 1, rulesHash, signingVersion),
-      },
-      user.publicKey,
-      2
-    );
-    assert.equal(result.ok, true, result.message);
-    assert.equal((await storage.get(`consent/${user.publicKey}`)).value.hash, rulesHash);
-  }
+  result = await execute(
+    contract,
+    storage,
+    'consent',
+    {
+      op: 'consent',
+      ver: 1,
+      hash: rulesHash,
+      sig: signConsent(user.wallet, 1, rulesHash),
+    },
+    user.publicKey,
+    2
+  );
+  assert.equal(result.ok, true, result.message);
+  assert.equal((await storage.get(`consent/${user.publicKey}`)).value.hash, rulesHash);
 });
 
-test('provider lifecycle features accept v1 and v2 signing keys during rollout', async () => {
-  for (const signingVersion of [1, 2]) {
-    const admin = await makeIdentity();
-    const provider = await makeIdentity();
-    const storage = new MemoryStorage({
-      admin: admin.publicKey,
-      'rules/current': { ver: 1, hash: rulesHash },
-      [`consent/${provider.publicKey}`]: { ver: 1, hash: rulesHash, at: 'seed' },
-    });
-    const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
-    const contract = new MayhemContract(protocol, {});
-    const intent = {
-      op: 'register_provider',
-      provider: provider.publicKey,
-      nonce: `${signingVersion}`.repeat(64),
-    };
+test('provider lifecycle features accept only the current signing version', async () => {
+  const admin = await makeIdentity();
+  const provider = await makeIdentity();
+  const storage = new MemoryStorage({
+    admin: admin.publicKey,
+    'rules/current': { ver: 1, hash: rulesHash },
+    [`consent/${provider.publicKey}`]: { ver: 1, hash: rulesHash, at: 'seed' },
+  });
+  const protocol = { peer: { wallet: makeVerifier(provider.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const intent = {
+    op: 'register_provider',
+    provider: provider.publicKey,
+    nonce: '2'.repeat(64),
+  };
 
-    assert.notEqual(
-      providerLifecycleIntentMessage(intent, 1),
-      providerLifecycleIntentMessage(intent, 2)
-    );
+  assert.throws(
+    () => providerLifecycleIntentMessage(intent, 1),
+    /Unsupported signing message version/
+  );
 
-    await executeFeature(
-      contract,
-      storage,
-      'mayhem_feature',
-      await providerLifecycleFeatureKey(intent, signingVersion),
-      {
-        op: 'provider_lifecycle',
-        intent,
-        sig: signProviderLifecycleIntent(provider.wallet, intent, signingVersion),
-      },
-      admin.publicKey
-    );
+  await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await providerLifecycleFeatureKey(intent),
+    {
+      op: 'provider_lifecycle',
+      intent,
+      sig: signProviderLifecycleIntent(provider.wallet, intent),
+    },
+    admin.publicKey
+  );
 
-    assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
-  }
+  assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
 });
 
-test('receipt verifier accepts v1 and v2 receipt signing payloads', async () => {
+test('receipt verifier accepts only the current signing payload', async () => {
   const user = await makeIdentity();
   const provider = await makeIdentity();
   const enclave = await makeIdentity();
   const contract = new MayhemContract({ peer: { wallet: makeVerifier(enclave.wallet) } }, {});
   const body = {
-    schema_version: 1,
+    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: 'session-versioning',
     seq: 1,
     final: true,
@@ -131,46 +126,55 @@ test('receipt verifier accepts v1 and v2 receipt signing payloads', async () => 
     model_id: 'model/versioning',
     price_ver: 1,
     locked_rate_map: versioningLockedRateMap,
+    locked_per_req_au: '0',
+    locked_min_session_au: '0',
+    served_ctx: 8192,
+    ctx_bracket: 'le8k',
+    ctx_bracket_table_ver: 1,
     rules_ver: 1,
-    usage: { in: 10, out: 20 },
+    usage: { input_token: 10, output_token: 20 },
     au_owed_cum: '100',
     prompt_hash: 'a'.repeat(64),
     ts: 1_000,
   };
 
-  for (const signingVersion of [1, 2]) {
-    const message = b4a.from(receiptMessage(body, signingVersion));
-    assert.equal(
-      contract.verifyReceiptEnvelope({
-        body,
-        enclave_pubkey: enclave.publicKey,
-        enclave_sig: b4a.toString(enclave.wallet.sign(message), 'hex'),
-        user_sig: b4a.toString(user.wallet.sign(message), 'hex'),
-      }),
-      true
-    );
-  }
+  assert.throws(() => receiptMessage(body, 1), /Unsupported signing message version/);
+  const message = b4a.from(receiptMessage(body));
+  assert.equal(
+    contract.verifyReceiptEnvelope({
+      body,
+      enclave_pubkey: enclave.publicKey,
+      enclave_sig: b4a.toString(enclave.wallet.sign(message), 'hex'),
+      user_sig: b4a.toString(user.wallet.sign(message), 'hex'),
+    }),
+    true
+  );
 });
 
-test('receipt schema migration normalizes legacy usage maps', async () => {
+test('receipt normalization rejects old schemas and non-canonical usage', async () => {
   const user = await makeIdentity();
   const provider = await makeIdentity();
   const enclave = await makeIdentity();
   const contract = new MayhemContract({ peer: { wallet: makeVerifier(enclave.wallet) } }, {});
   const body = {
-    schema_version: 1,
-    session_id: 'session-schema-migration',
+    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+    session_id: 'session-schema-current',
     seq: 1,
     final: true,
     rail: 'fiat',
     user: user.publicKey,
     provider: provider.publicKey,
-    enclave_id: 'enclave-schema-migration',
-    model_id: 'model/schema-migration',
+    enclave_id: 'enclave-schema-current',
+    model_id: 'model/schema-current',
     price_ver: 1,
     locked_rate_map: versioningLockedRateMap,
+    locked_per_req_au: '0',
+    locked_min_session_au: '0',
+    served_ctx: 8192,
+    ctx_bracket: 'le8k',
+    ctx_bracket_table_ver: 1,
     rules_ver: 1,
-    usage: { in: 10, out_tokens: 20 },
+    usage: { input_token: 10, output_token: 20 },
     au_owed_cum: '100',
     prompt_hash: 'a'.repeat(64),
     ts: 1_000,
@@ -191,19 +195,23 @@ test('receipt schema migration normalizes legacy usage maps', async () => {
     },
   });
 
-  const migrated = await contract.normalizeReceiptEnvelope(envelope, {
-    targetSchemaVersion: NEXT_SESSION_RECEIPT_SCHEMA_VERSION,
-  });
-  assert.equal(migrated instanceof Error, false, migrated.message);
-  assert.equal(migrated.body.schema_version, NEXT_SESSION_RECEIPT_SCHEMA_VERSION);
-  assert.deepEqual(migrated.body.usage, { input_token: 10, output_token: 20 });
-  assert.deepEqual(migrated.signed_body, body);
-  assert.equal(contract.verifyReceiptEnvelope(migrated), true);
+  const normalized = await contract.normalizeReceiptEnvelope(envelope);
+  assert.equal(normalized instanceof Error, false, normalized.message);
+  assert.equal(normalized.body.schema_version, SESSION_RECEIPT_SCHEMA_VERSION);
+  assert.equal(Object.hasOwn(normalized, 'signed_body'), false);
+  assert.equal(contract.verifyReceiptEnvelope(normalized), true);
 
-  const unsupported = await contract.normalizeReceiptEnvelope(
-    { ...envelope, body: { ...body, schema_version: 99 } },
-    { targetSchemaVersion: NEXT_SESSION_RECEIPT_SCHEMA_VERSION }
-  );
-  assert.equal(unsupported instanceof Error, true);
-  assert.match(unsupported.message, /Unsupported receipt schema migration/);
+  const oldSchema = await contract.normalizeReceiptEnvelope({
+    ...envelope,
+    body: { ...body, schema_version: SESSION_RECEIPT_SCHEMA_VERSION - 1 },
+  });
+  assert.equal(oldSchema instanceof Error, true);
+  assert.match(oldSchema.message, /Unsupported receipt schema version/);
+
+  const aliasUsage = await contract.normalizeReceiptEnvelope({
+    ...envelope,
+    body: { ...body, usage: { in: 10, out_tokens: 20 } },
+  });
+  assert.equal(aliasUsage instanceof Error, true);
+  assert.match(aliasUsage.message, /Receipt usage must be canonical/);
 });

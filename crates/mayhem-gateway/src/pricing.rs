@@ -9,7 +9,10 @@ pub const CACHED_INPUT_TOKEN_UNIT: &str = USAGE_CACHED_INPUT_TOKEN;
 pub const OUTPUT_TOKEN_UNIT: &str = USAGE_OUTPUT_TOKEN;
 pub const CACHED_INPUT_TOKEN_RATE_BPS: u64 = 2_500;
 
-pub fn text_generation_rate_map(in_per_1k_au: MoneyAu, out_per_1k_au: MoneyAu) -> Vec<RateMapEntry> {
+pub fn text_generation_rate_map(
+    in_per_1k_au: MoneyAu,
+    out_per_1k_au: MoneyAu,
+) -> Vec<RateMapEntry> {
     vec![
         RateMapEntry {
             unit: INPUT_TOKEN_UNIT.to_owned(),
@@ -106,11 +109,7 @@ pub fn usage_units_au(rate_map: &[RateMapEntry], counts: &[(&str, u64)]) -> Mone
             if *count == 0 || rate.per_unit_au == 0 || rate.granularity == 0 {
                 return None;
             }
-            Some((
-                u128::from(*count),
-                rate.per_unit_au,
-                rate.granularity,
-            ))
+            Some((u128::from(*count), rate.per_unit_au, rate.granularity))
         })
         .collect::<Vec<_>>();
 
@@ -141,18 +140,16 @@ pub fn usage_units_au(rate_map: &[RateMapEntry], counts: &[(&str, u64)]) -> Mone
 }
 
 pub fn rate_map_cost_basis_per_1k(rate_map: &[RateMapEntry]) -> MoneyAu {
-    rate_map
-        .iter()
-        .fold(0u128, |acc, entry| {
-            if entry.granularity == 0 {
-                acc
-            } else {
-                acc.saturating_add(ceil_div_u128(
-                    entry.per_unit_au.saturating_mul(1_000),
-                    u128::from(entry.granularity),
-                ))
-            }
-        })
+    rate_map.iter().fold(0u128, |acc, entry| {
+        if entry.granularity == 0 {
+            acc
+        } else {
+            acc.saturating_add(ceil_div_u128(
+                entry.per_unit_au.saturating_mul(1_000),
+                u128::from(entry.granularity),
+            ))
+        }
+    })
 }
 
 fn ceil_div_u128(value: u128, divisor: u128) -> u128 {
@@ -245,5 +242,23 @@ mod tests {
             serde_json::json!({ "audio_second": 3, "input_character": 12 })
         );
         assert_eq!(usage_map_au(&rate_map, &usage), 312);
+    }
+
+    #[test]
+    fn embedding_per_token_atto_price_stays_nonzero() {
+        let rate_map = vec![RateMapEntry {
+            unit: USAGE_INPUT_TOKEN.to_owned(),
+            per_unit_au: 10_000_000,
+            granularity: 1,
+        }];
+
+        assert_eq!(
+            usage_units_au(&rate_map, &[(USAGE_INPUT_TOKEN, 1)]),
+            10_000_000
+        );
+        assert_eq!(
+            usage_map_au(&rate_map, &ReceiptUsage::text(3, 0)),
+            30_000_000
+        );
     }
 }

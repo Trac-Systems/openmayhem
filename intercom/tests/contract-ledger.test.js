@@ -1125,7 +1125,7 @@ test('MayhemContract epochApply replays codepoint-sorted varied keys determinist
 
 test('MayhemContract epochApply computes large fee bps with exact BigInt math', async () => {
   const { admin, provider, user, storage, contract } = await setupLedgerContract();
-  const grossAu = '2000000000001';
+  const grossAu = '2000000000000000000000000';
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, grossAu));
 
   const result = await executeEpochApplyFeature(

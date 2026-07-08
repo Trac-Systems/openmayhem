@@ -61,14 +61,14 @@ use futures_util::{stream, Stream};
 use mayhem_bridge::{BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
     chunk_json_payload, ctx_bracket_for_tokens_in_schedule, default_ctx_bracket_schedule,
-    default_model_class, migrate_receipt_body, reassemble_json_payload, receipt_signing_bytes,
+    default_model_class, reassemble_json_payload, receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    supported_receipt_signing_bytes, AttestationReport, CheckpointPolicy, CtxBracketSchedule,
-    MoneyAu, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
+    AttestationReport, CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk,
+    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    SpendVoucherBody, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3626,12 +3626,18 @@ fn dashboard_provider_earning_totals(
         if !provider.is_empty() && !dashboard_provider_in_scope(scope, provider) {
             continue;
         }
-        totals.total_au = totals
-            .total_au
-            .saturating_add(entry.get("total_au").and_then(value_as_money_au).unwrap_or(0));
-        totals.held_au = totals
-            .held_au
-            .saturating_add(entry.get("held_au").and_then(value_as_money_au).unwrap_or(0));
+        totals.total_au = totals.total_au.saturating_add(
+            entry
+                .get("total_au")
+                .and_then(value_as_money_au)
+                .unwrap_or(0),
+        );
+        totals.held_au = totals.held_au.saturating_add(
+            entry
+                .get("held_au")
+                .and_then(value_as_money_au)
+                .unwrap_or(0),
+        );
         totals.paid_au = totals.paid_au.saturating_add(
             entry
                 .get("paid_cum_au")
@@ -4689,9 +4695,7 @@ fn dashboard_derivation_price_basis_au(derivation: &Value) -> Option<MoneyAu> {
         let output = derivation_value(derivation, &["result_price", "out_per_1k"])
             .and_then(value_as_money_au)
             .unwrap_or(0);
-        return Some(
-            rate_map_cost_basis_per_1k(&text_generation_rate_map(input, output)).max(1),
-        );
+        return Some(rate_map_cost_basis_per_1k(&text_generation_rate_map(input, output)).max(1));
     }
     for path in [
         &["result_price", "price_basis_au"][..],
@@ -7595,13 +7599,10 @@ fn verify_provider_receipt_signature(
     let verifying_key = VerifyingKey::from_bytes(&enclave_key)
         .map_err(|err| GatewaySessionError::new(format!("invalid enclave pubkey: {err}")))?;
     let signature = Signature::from_bytes(&signature);
-    let payloads = supported_receipt_signing_bytes(&receipt.body).map_err(|err| {
+    let payload = receipt_signing_bytes(&receipt.body).map_err(|err| {
         GatewaySessionError::new(format!("provider receipt signing payload failed: {err}"))
     })?;
-    if payloads
-        .iter()
-        .any(|payload| verifying_key.verify(payload, &signature).is_ok())
-    {
+    if verifying_key.verify(&payload, &signature).is_ok() {
         return Ok(());
     }
     Err(GatewaySessionError::new(
@@ -9697,11 +9698,12 @@ fn validate_provider_receipt(
     provider_receipt: &ProviderSignedReceipt,
     expected: ExpectedProviderReceipt<'_>,
 ) -> Result<(), GatewaySessionError> {
-    let body = migrate_receipt_body(&provider_receipt.body).map_err(|err| {
-        GatewaySessionError::new(format!(
-            "provider receipt schema_version is not supported: {err}"
-        ))
-    })?;
+    if provider_receipt.body.schema_version != SESSION_RECEIPT_SCHEMA_VERSION {
+        return Err(GatewaySessionError::new(format!(
+            "provider receipt schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
+        )));
+    }
+    let body = provider_receipt.body.clone();
     let checks = [
         (
             body.session_id == invocation.session_id,
@@ -10382,7 +10384,10 @@ fn no_price_band_route_error() -> ApiError {
     )
 }
 
-fn ensure_max_price_allows(quote_au: MoneyAu, max_price_au: Option<MoneyAu>) -> Result<(), ApiError> {
+fn ensure_max_price_allows(
+    quote_au: MoneyAu,
+    max_price_au: Option<MoneyAu>,
+) -> Result<(), ApiError> {
     if max_price_au.is_some_and(|max_price_au| quote_au > max_price_au) {
         return Err(no_price_band_route_error());
     }
@@ -13274,7 +13279,7 @@ fn build_completion(
 ) -> Result<ChatResponse, ApiError> {
     if !state.dev_session_shim {
         return Err(ApiError::service_unavailable(
-            "no provider available: legacy completions cannot use the local dev shim in production mode",
+            "no provider available: text completions cannot use the local dev shim in production mode",
             Some("model"),
         ));
     }
@@ -15357,7 +15362,7 @@ fn frame_contract_version(frame: &Value) -> Option<u32> {
 fn contract_upgrade_required_reason(expected: u32, actual: Option<u32>) -> String {
     let actual = actual
         .map(|version| version.to_string())
-        .unwrap_or_else(|| "missing/legacy".to_owned());
+        .unwrap_or_else(|| "missing/outdated".to_owned());
     format!(
         "contract upgrade required: expected CONTRACT_VERSION {expected}, got {actual}; update Mayhem on the out-of-sync node before opening sessions"
     )
@@ -16123,7 +16128,10 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
                     .and_then(Value::as_u64)
                     .unwrap_or(1),
                 rate_map,
-                per_req_au: price.get("per_req_au").and_then(value_as_money_au).unwrap_or(0),
+                per_req_au: price
+                    .get("per_req_au")
+                    .and_then(value_as_money_au)
+                    .unwrap_or(0),
                 min_session_au: price
                     .get("min_session_au")
                     .and_then(value_as_money_au)
@@ -16469,7 +16477,10 @@ fn session_locked_rate_map(price: &PriceRefAu) -> Vec<RateMapEntry> {
     normalize_rate_map(price.rate_map.clone())
 }
 
-fn calculate_locked_au_owed(invocation: &GatewaySessionInvocation, usage: &ReceiptUsage) -> MoneyAu {
+fn calculate_locked_au_owed(
+    invocation: &GatewaySessionInvocation,
+    usage: &ReceiptUsage,
+) -> MoneyAu {
     priced_usage_au(
         &invocation.spend_voucher.body.locked_rate_map,
         invocation.spend_voucher.body.locked_per_req_au,
@@ -17267,7 +17278,7 @@ mod tests {
     use super::*;
     use mayhem_proto::{
         attestation_signing_bytes, ctx_bracket_for_tokens, reassemble_json_payload,
-        receipt_signing_bytes_for_version, AttestationSigner, CTX_BRACKET_TABLE_VERSION,
+        AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
 
     #[test]
@@ -18108,13 +18119,13 @@ mod tests {
         wrong_session["session_id"] = json!("bb".repeat(32));
         assert_accept_err(&wrong_session, &invocation, "session_id");
 
-        let mut legacy_contract = frame.clone();
-        legacy_contract
+        let mut outdated_contract = frame.clone();
+        outdated_contract
             .as_object_mut()
             .expect("s.accept object")
             .remove("contract_version");
-        legacy_contract["sig"] = json!("ee".repeat(64));
-        assert_accept_err(&legacy_contract, &invocation, "contract upgrade required");
+        outdated_contract["sig"] = json!("ee".repeat(64));
+        assert_accept_err(&outdated_contract, &invocation, "contract upgrade required");
 
         let mut future_contract = frame.clone();
         future_contract["contract_version"] = json!(invocation.contract_version + 1);
@@ -18181,14 +18192,6 @@ mod tests {
         assert_eq!(stored.receipt.enclave_sig, provider_receipt.enclave_sig);
         assert_eq!(stored.receipt.body, provider_receipt.body);
         assert_eq!(stored.receipt_ack.user_sig, stored.receipt.user_sig);
-
-        let mut legacy_signed = provider_receipt.clone();
-        legacy_signed.enclave_sig = sign_hex(
-            &test_enclave_seed(),
-            &receipt_signing_bytes_for_version(&legacy_signed.body, 1).unwrap(),
-        );
-        verify_provider_receipt_signature(&legacy_signed)
-            .expect("legacy v1 provider receipt signature remains accepted");
 
         let live_ack = direct_session_receipt_ack(
             &request,

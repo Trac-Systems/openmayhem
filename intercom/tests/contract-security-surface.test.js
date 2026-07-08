@@ -25,6 +25,7 @@ const enclaveRegistration = {
   op: 'register_enclave',
   enclave_id: enclaveId,
   model_id: modelId,
+  model_class: 'text-generation',
   backend: 'llama.cpp',
   artifact_root: '3'.repeat(64),
   artifact_root_kind: 'blake3_merkle_v1',
@@ -48,6 +49,7 @@ async function setupSecuritySurface() {
 
   await storage.put(`modelref/${modelId}`, {
     model_id: modelId,
+    model_class: 'text-generation',
     rate_map: textRateMap(20, 60),
   });
 
@@ -147,6 +149,7 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     {
       op: 'set_model_ref',
       model_id: 'provider/arbitrary-model@q4',
+      model_class: 'text-generation',
       rate_map: textRateMap(1, 1),
     },
   ],

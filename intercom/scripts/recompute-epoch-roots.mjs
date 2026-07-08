@@ -8,18 +8,6 @@ const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 5_000;
 const SESSION_RECEIPT_SCHEMA_VERSION = 8;
-const CTX_BRACKET_TABLE_VERSION = 1;
-
-function ctxBracketForTokens(tokens) {
-  if (!Number.isSafeInteger(tokens) || tokens < 0) {
-    throw new Error('receipt served_ctx is invalid');
-  }
-  if (tokens <= 8_192) return 'le8k';
-  if (tokens <= 32_768) return 'le32k';
-  if (tokens <= 131_072) return 'le128k';
-  if (tokens <= 262_144) return 'le256k';
-  return 'gt256k';
-}
 
 export const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
@@ -225,47 +213,21 @@ function normalizeReceiptUsage(usageSource) {
   return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
 }
 
-function migrateReceiptBody(body, targetSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
-  if (!Number.isSafeInteger(body.schema_version) || body.schema_version < 1) {
-    throw new Error('receipt schema_version is unsupported');
+function normalizeCurrentReceiptBody(body) {
+  if (body.schema_version !== SESSION_RECEIPT_SCHEMA_VERSION) {
+    throw new Error(`receipt schema_version must be ${SESSION_RECEIPT_SCHEMA_VERSION}`);
   }
-  if (body.schema_version > targetSchemaVersion) {
-    throw new Error(`unsupported receipt schema migration ${body.schema_version} -> ${targetSchemaVersion}`);
-  }
-  const migrated = {
+  const current = {
     ...body,
     usage: normalizeReceiptUsage(body.usage),
   };
-  while (migrated.schema_version < targetSchemaVersion) {
-    if (migrated.schema_version === 1) {
-      migrated.schema_version = 2;
-    } else if (migrated.schema_version === 2) {
-      migrated.schema_version = 3;
-    } else if (migrated.schema_version === 3) {
-      migrated.locked_per_req_au ??= '0';
-      migrated.locked_min_session_au ??= '0';
-      migrated.schema_version = 4;
-    } else if (migrated.schema_version === 4) {
-      migrated.served_ctx ??= 0;
-      migrated.schema_version = 5;
-    } else if (migrated.schema_version === 5) {
-      migrated.ctx_bracket ??= ctxBracketForTokens(migrated.served_ctx ?? 0);
-      migrated.ctx_bracket_table_ver ??= CTX_BRACKET_TABLE_VERSION;
-      migrated.schema_version = 6;
-    } else if (migrated.schema_version === 6) {
-      migrated.schema_version = 7;
-    } else if (migrated.schema_version === 7) {
-      migrated.schema_version = 8;
-    } else {
-      throw new Error(`unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}`);
-    }
+  if (stableJson(current.usage) !== stableJson(body.usage)) {
+    throw new Error('receipt usage must be canonical');
   }
   for (const field of ['locked_per_req_au', 'locked_min_session_au', 'au_owed_cum']) {
-    if (Object.prototype.hasOwnProperty.call(migrated, field)) {
-      migrated[field] = canonicalAu(safeAu(migrated[field], `receipt ${field}`, { allowZero: true }));
-    }
+    current[field] = canonicalAu(safeAu(current[field], `receipt ${field}`, { allowZero: true }));
   }
-  return migrated;
+  return current;
 }
 
 function receiptEnvelope(entry) {
@@ -278,13 +240,12 @@ function receiptEnvelope(entry) {
     voucher: _voucher,
     ...body
   } = bodySource;
-  const migratedBody = migrateReceiptBody(body);
+  const currentBody = normalizeCurrentReceiptBody(body);
   const envelope = {
-    body: migratedBody,
+    body: currentBody,
     enclave_sig: receipt.enclave_sig ?? entry.enclave_sig ?? null,
     user_sig: receipt.user_sig ?? entry.user_sig ?? null,
   };
-  if (stableJson(body) !== stableJson(migratedBody)) envelope.signed_body = stableValue(body);
   return envelope;
 }
 

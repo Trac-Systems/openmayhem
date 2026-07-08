@@ -29,6 +29,7 @@ const cleanExitEnclave = {
   op: 'register_enclave',
   enclave_id: cleanExitEnclaveId,
   model_id: 'mayhem/clean-exit-tnk@q4',
+  model_class: 'text-generation',
   backend: 'llama.cpp',
   artifact_root: '4'.repeat(64),
   artifact_root_kind: 'blake3_merkle_v1',
@@ -52,6 +53,7 @@ const cleanExitEnclave = {
 const cleanExitModelRef = {
   op: 'set_model_ref',
   model_id: cleanExitEnclave.model_id,
+  model_class: 'text-generation',
   rate_map: textRateMap(20, 60),
 };
 const cleanExitPrice = {

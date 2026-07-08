@@ -43,6 +43,7 @@ const enclaveRegistration = {
   op: 'register_enclave',
   enclave_id: enclaveId,
   model_id: modelId,
+  model_class: 'text-generation',
   backend: 'llama.cpp',
   artifact_root: 'a'.repeat(64),
   artifact_root_kind: 'blake3_merkle_v1',
@@ -92,6 +93,7 @@ async function setupRegisteredEnclave() {
 
   await storage.put(`modelref/${modelId}`, {
     model_id: modelId,
+    model_class: 'text-generation',
     rate_map: textRateMap(20, 60),
   });
   await storage.put('params/market_provider_epoch_target_au', {
@@ -512,6 +514,19 @@ test('MayhemContract epochApply floats market price from settled usage with clam
   );
   assert.equal(reseed.ok, true, reseed.message);
   assert.equal(reseed.ver, 4);
+});
+
+test('MayhemContract market price math supports sub-micro atto price steps', async () => {
+  const { contract } = await setupRegisteredEnclave();
+  const qwenEmbeddingPerTokenAu = '10000000';
+  const next = contract.stepPriceTerm(qwenEmbeddingPerTokenAu, '10001000', {
+    gain_bps: 5_000,
+    max_step_bps: 1,
+  });
+
+  assert.equal(next, '10000500');
+  assert.ok(BigInt(next) > BigInt(qwenEmbeddingPerTokenAu));
+  assert.ok(BigInt(next) - BigInt(qwenEmbeddingPerTokenAu) < BigInt(qwenEmbeddingPerTokenAu) / 10_000n);
 });
 
 test('MayhemContract keeps context brackets as independent price markets', async () => {
@@ -960,6 +975,7 @@ test('MayhemContract setModelRef is admin-only and forward-facing', async () => 
   const modelRef = {
     op: 'set_model_ref',
     model_id: modelId,
+    model_class: 'text-generation',
     rate_map: textRateMap(20, 60),
     source_hash: 'd'.repeat(64),
   };

@@ -4,7 +4,6 @@ import { Contract } from 'trac-peer';
 
 export const CONTRACT_VERSION = 4;
 const SIGNING_MESSAGE_VERSION = 2;
-const SUPPORTED_SIGNING_MESSAGE_VERSIONS = Object.freeze([2, 1]);
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const PROVIDER_ACCEPTED_RAIL_ORDER = Object.freeze(['fiat', 'tap', 'tnk']);
@@ -290,63 +289,94 @@ const ROOM_POLICY_FIELDS = new Set([
   'max_price_mult',
 ]);
 
-export const signingMessageVersions = () => [...SUPPORTED_SIGNING_MESSAGE_VERSIONS];
+export const signingMessageVersions = () => [SIGNING_MESSAGE_VERSION];
 export const consentMessage = (ver, hash, signingVersion = SIGNING_MESSAGE_VERSION) => {
-  if (signingVersion === 1) return `mayhem-consent${ver}${hash}`;
-  if (signingVersion === 2) {
-    return JSON.stringify({
-      domain: 'mayhem-consent',
-      signing_version: 2,
-      rules_ver: ver,
-      rules_hash: hash,
-    });
+  if (signingVersion !== SIGNING_MESSAGE_VERSION) {
+    throw new Error(`Unsupported signing message version: ${signingVersion}`);
   }
-  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+  return JSON.stringify({
+    domain: 'mayhem-consent',
+    signing_version: SIGNING_MESSAGE_VERSION,
+    rules_ver: ver,
+    rules_hash: hash,
+  });
 };
 export const providerLifecycleIntentMessage = (intent, signingVersion = SIGNING_MESSAGE_VERSION) => {
-  if (signingVersion === 1) return `mayhem-provider-lifecycle-v1${stableJson(intent)}`;
-  if (signingVersion === 2) {
-    return JSON.stringify({
-      domain: 'mayhem-provider-lifecycle',
-      signing_version: 2,
-      intent: stableValue(intent),
-    });
+  if (signingVersion !== SIGNING_MESSAGE_VERSION) {
+    throw new Error(`Unsupported signing message version: ${signingVersion}`);
   }
-  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+  return JSON.stringify({
+    domain: 'mayhem-provider-lifecycle',
+    signing_version: SIGNING_MESSAGE_VERSION,
+    intent: stableValue(intent),
+  });
 };
 export const depositTnkIntentMessage = (intent) =>
   `mayhem-deposit-tnk-intent-v1${stableJson(intent)}`;
+const canonicalSpendVoucherBody = (body) => {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const canonical = {
+    session_id: body.session_id,
+    rail: body.rail,
+    enclave_id: body.enclave_id,
+    price_ver: body.price_ver,
+    locked_rate_map: body.locked_rate_map,
+    locked_per_req_au: body.locked_per_req_au,
+    locked_min_session_au: body.locked_min_session_au,
+    served_ctx: body.served_ctx,
+  };
+  if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
+  if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
+  canonical.max_spend_au = body.max_spend_au;
+  canonical.checkpoint_every = body.checkpoint_every;
+  return canonical;
+};
+const canonicalReceiptBody = (body) => {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const canonical = {
+    schema_version: body.schema_version,
+    session_id: body.session_id,
+    seq: body.seq,
+    final: body.final,
+    rail: body.rail,
+    user: body.user,
+    provider: body.provider,
+    enclave_id: body.enclave_id,
+    model_id: body.model_id,
+    price_ver: body.price_ver,
+    locked_rate_map: body.locked_rate_map,
+    locked_per_req_au: body.locked_per_req_au,
+    locked_min_session_au: body.locked_min_session_au,
+    served_ctx: body.served_ctx,
+  };
+  if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
+  if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
+  canonical.rules_ver = body.rules_ver;
+  canonical.usage = body.usage;
+  canonical.au_owed_cum = body.au_owed_cum;
+  canonical.prompt_hash = body.prompt_hash;
+  canonical.ts = body.ts;
+  return canonical;
+};
 export const receiptMessage = (body, signingVersion = SIGNING_MESSAGE_VERSION) => {
-  if (signingVersion === 1) {
-    return JSON.stringify({
-      domain: 'mayhem-session-receipt-v1',
-      body,
-    });
+  if (signingVersion !== SIGNING_MESSAGE_VERSION) {
+    throw new Error(`Unsupported signing message version: ${signingVersion}`);
   }
-  if (signingVersion === 2) {
-    return JSON.stringify({
-      domain: 'mayhem-session-receipt',
-      signing_version: 2,
-      body,
-    });
-  }
-  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+  return JSON.stringify({
+    domain: 'mayhem-session-receipt',
+    signing_version: SIGNING_MESSAGE_VERSION,
+    body: canonicalReceiptBody(body),
+  });
 };
 export const spendVoucherMessage = (body, signingVersion = SIGNING_MESSAGE_VERSION) => {
-  if (signingVersion === 1) {
-    return JSON.stringify({
-      domain: 'mayhem-spend-voucher-v1',
-      body,
-    });
+  if (signingVersion !== SIGNING_MESSAGE_VERSION) {
+    throw new Error(`Unsupported signing message version: ${signingVersion}`);
   }
-  if (signingVersion === 2) {
-    return JSON.stringify({
-      domain: 'mayhem-spend-voucher',
-      signing_version: 2,
-      body,
-    });
-  }
-  throw new Error(`Unsupported signing message version: ${signingVersion}`);
+  return JSON.stringify({
+    domain: 'mayhem-spend-voucher',
+    signing_version: SIGNING_MESSAGE_VERSION,
+    body: canonicalSpendVoucherBody(body),
+  });
 };
 export const spendReservationEvidence = (value) => ({
   contract_version: value.contract_version,
@@ -636,7 +666,7 @@ class MayhemContract extends Contract {
         $$type: 'object',
         op: { type: 'string', min: 1, max: 64 },
         model_id: { type: 'string', min: 1, max: 256 },
-        model_class: { type: 'string', min: 1, max: 64, optional: true },
+        model_class: { type: 'string', min: 1, max: 64 },
         rate_map: { type: 'array', min: 1, max: RATE_MAP_MAX_ENTRIES, items: { type: 'any' } },
         source_hash: { type: 'string', min: 1, max: 128, optional: true },
       },
@@ -668,7 +698,7 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         enclave_id: { type: 'string', min: 1, max: 128 },
         model_id: { type: 'string', min: 1, max: 256 },
-        model_class: { type: 'string', min: 1, max: 64, optional: true },
+        model_class: { type: 'string', min: 1, max: 64 },
         backend: { type: 'string', min: 1, max: 64 },
         artifact_root: { type: 'string', min: 1, max: 256 },
         artifact_root_kind: { type: 'string', min: 1, max: 64 },
@@ -2753,11 +2783,17 @@ class MayhemContract extends Contract {
 
     const modelRef = await this.get(`modelref/${enclave.model_id}`);
     if (!modelRef) return new Error('Model reference not found.');
-    if (this.modelClassFor(modelRef) !== this.modelClassFor(enclave)) {
+    const enclaveClass = this.modelClassFor(enclave);
+    const enclaveClassError = this.validateModelClass(enclaveClass, 'Enclave model_class');
+    if (enclaveClassError) return enclaveClassError;
+    const modelRefClass = this.modelClassFor(modelRef);
+    const modelRefClassError = this.validateModelClass(modelRefClass, 'Model reference model_class');
+    if (modelRefClassError) return modelRefClassError;
+    if (modelRefClass !== enclaveClass) {
       return new Error('Model reference model_class must match enclave model_class.');
     }
 
-    const rateError = this.validateRateMap(this.value.rate_map, this.modelClassFor(enclave), 'Enclave price rate_map', {
+    const rateError = this.validateRateMap(this.value.rate_map, enclaveClass, 'Enclave price rate_map', {
       allowZeroPrice: true,
     });
     if (rateError) return rateError;
@@ -5444,12 +5480,7 @@ class MayhemContract extends Contract {
   }
 
   async providerLifecycleFeatureKeys(intent) {
-    const keys = [];
-    for (const signingVersion of SUPPORTED_SIGNING_MESSAGE_VERSIONS) {
-      const digest = await blake3(b4a.from(providerLifecycleIntentMessage(intent, signingVersion)));
-      keys.push(`intent/provider/${intent.provider}/${intent.op}/${b4a.toString(digest, 'hex')}`);
-    }
-    return keys;
+    return [await this.providerLifecycleFeatureKey(intent)];
   }
 
   async spendReservationFeatureKey(value) {
@@ -6214,7 +6245,7 @@ class MayhemContract extends Contract {
 
   modelClassFor(value) {
     if (!value || !hasOwn(value, 'model_class') || value.model_class === null || value.model_class === undefined) {
-      return DEFAULT_MODEL_CLASS;
+      return undefined;
     }
     return value.model_class;
   }
@@ -7934,14 +7965,11 @@ class MayhemContract extends Contract {
     if (!bodySource || typeof bodySource !== 'object' || Array.isArray(bodySource)) {
       return new Error('Fraud proof receipt body must be an object.');
     }
-    const finalReceipt = hasOwn(bodySource, 'final')
-      ? bodySource.final
-      : bodySource.final_receipt;
     const body = {
       schema_version: bodySource.schema_version,
       session_id: bodySource.session_id,
       seq: bodySource.seq,
-      final: finalReceipt,
+      final: bodySource.final,
       rail: bodySource.rail,
       user: bodySource.user,
       provider: bodySource.provider,
@@ -7963,80 +7991,25 @@ class MayhemContract extends Contract {
       body.ctx_bracket_table_ver = bodySource.ctx_bracket_table_ver;
     }
 
-    const migratedBody = this.migrateReceiptBody(body, targetSchemaVersion);
-    if (migratedBody instanceof Error) return migratedBody;
+    if (body.schema_version !== targetSchemaVersion) {
+      return new Error('Unsupported receipt schema version.');
+    }
 
-    const bodyError = await this.validateReceiptBody(migratedBody, targetSchemaVersion);
+    const bodyError = await this.validateReceiptBody(body, targetSchemaVersion);
     if (bodyError) return bodyError;
 
     const envelope = {
-      body: migratedBody,
+      body,
       enclave_sig: receipt.enclave_sig ?? value.enclave_sig,
       user_sig: receipt.user_sig ?? value.user_sig,
       enclave_pubkey: receipt.enclave_pubkey ?? value.enclave_pubkey ?? bodySource.enclave_pubkey ?? null,
     };
-    if (stableJson(body) !== stableJson(migratedBody)) envelope.signed_body = body;
     if (!this.isHexBytes(envelope.enclave_sig, 64)) return new Error('Invalid enclave receipt signature.');
     if (!this.isHexBytes(envelope.user_sig, 64)) return new Error('Invalid user receipt signature.');
     if (envelope.enclave_pubkey !== null && !this.isHexBytes(envelope.enclave_pubkey, 32)) {
       return new Error('Invalid enclave receipt public key.');
     }
     return envelope;
-  }
-
-  migrateReceiptBody(body, targetSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
-    if (!Number.isSafeInteger(targetSchemaVersion) || targetSchemaVersion < 1) {
-      return new Error('Invalid target receipt schema version.');
-    }
-    if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      return new Error('Invalid receipt body.');
-    }
-    if (!Number.isSafeInteger(body.schema_version) || body.schema_version < 1) {
-      return new Error('Unsupported receipt schema version.');
-    }
-    if (body.schema_version > targetSchemaVersion) {
-      return new Error(
-        `Unsupported receipt schema migration ${body.schema_version} -> ${targetSchemaVersion}.`
-      );
-    }
-
-    const migrated = cloneValue(body);
-    const usage = this.normalizeReceiptUsage(migrated.usage);
-    if (usage instanceof Error) return usage;
-    migrated.usage = usage;
-    while (migrated.schema_version < targetSchemaVersion) {
-      if (migrated.schema_version === 1) {
-        migrated.schema_version = 2;
-      } else if (migrated.schema_version === 2) {
-        migrated.schema_version = 3;
-      } else if (migrated.schema_version === 3) {
-        migrated.locked_per_req_au ??= ZERO_AU;
-        migrated.locked_min_session_au ??= ZERO_AU;
-        migrated.schema_version = 4;
-      } else if (migrated.schema_version === 4) {
-        migrated.served_ctx ??= 0;
-        migrated.schema_version = 5;
-      } else if (migrated.schema_version === 5) {
-        migrated.ctx_bracket ??= ctxBracketForTokens(migrated.served_ctx ?? 0);
-        migrated.ctx_bracket_table_ver ??= CTX_BRACKET_TABLE_VERSION;
-        migrated.schema_version = 6;
-      } else if (migrated.schema_version === 6) {
-        migrated.schema_version = 7;
-      } else if (migrated.schema_version === 7) {
-        migrated.schema_version = 8;
-      } else {
-        return new Error(
-          `Unsupported receipt schema migration ${migrated.schema_version} -> ${targetSchemaVersion}.`
-        );
-      }
-    }
-    for (const field of ['locked_per_req_au', 'locked_min_session_au', 'au_owed_cum']) {
-      if (!hasOwn(migrated, field)) continue;
-      const normalizedAu = this.normalizeAu(migrated[field], `receipt ${field}`);
-      if (normalizedAu instanceof Error) return normalizedAu;
-      migrated[field] = normalizedAu;
-    }
-    return migrated;
   }
 
   async validateReceiptBody(body, expectedSchemaVersion = SESSION_RECEIPT_SCHEMA_VERSION) {
@@ -8121,13 +8094,11 @@ class MayhemContract extends Contract {
       this.isHexBytes(signedBody.enclave_id, 32) ? signedBody.enclave_id : null
     );
     if (!enclaveKey) return false;
-    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) => {
-      const message = receiptMessage(signedBody, signingVersion);
-      return (
-        verify.call(this.protocol.peer.wallet, envelope.enclave_sig, message, enclaveKey) === true &&
-        verify.call(this.protocol.peer.wallet, envelope.user_sig, message, signedBody.user) === true
-      );
-    });
+    const message = receiptMessage(signedBody);
+    return (
+      verify.call(this.protocol.peer.wallet, envelope.enclave_sig, message, enclaveKey) === true &&
+      verify.call(this.protocol.peer.wallet, envelope.user_sig, message, signedBody.user) === true
+    );
   }
 
   receiptLeafEnvelope(envelope) {
@@ -9383,17 +9354,13 @@ class MayhemContract extends Contract {
   verifyConsentSignature(sender, ver, hash, sig) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
-    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) =>
-      verify.call(this.protocol.peer.wallet, sig, consentMessage(ver, hash, signingVersion), sender) === true
-    );
+    return verify.call(this.protocol.peer.wallet, sig, consentMessage(ver, hash), sender) === true;
   }
 
   verifyProviderLifecycleSignature(provider, intent, sig) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
-    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) =>
-      verify.call(this.protocol.peer.wallet, sig, providerLifecycleIntentMessage(intent, signingVersion), provider) === true
-    );
+    return verify.call(this.protocol.peer.wallet, sig, providerLifecycleIntentMessage(intent), provider) === true;
   }
 
   verifyDepositTnkSignature(sender, intent, sig) {
@@ -9405,9 +9372,7 @@ class MayhemContract extends Contract {
   verifySpendVoucherSignature(user, body, sig) {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
-    return SUPPORTED_SIGNING_MESSAGE_VERSIONS.some((signingVersion) =>
-      verify.call(this.protocol.peer.wallet, sig, spendVoucherMessage(body, signingVersion), user) === true
-    );
+    return verify.call(this.protocol.peer.wallet, sig, spendVoucherMessage(body), user) === true;
   }
 
   verifySpendReservationSignature(provider, value) {
