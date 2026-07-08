@@ -22,9 +22,8 @@ use jsonwebtoken::{
 };
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
-    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind,
+    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind, MoneyAu,
     ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    MoneyAu,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -165,7 +164,6 @@ pub struct VerifiedAttestation {
 pub struct ProviderHeartbeat {
     pub t: String,
     pub v: u32,
-    #[serde(default)]
     pub contract_version: u32,
     pub provider: String,
     pub enclave_id: String,
@@ -182,17 +180,12 @@ pub struct ProviderHeartbeat {
     pub transport_peer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_anchor: Option<String>,
-    #[serde(default = "default_heartbeat_accepting_new")]
     pub accepting_new: bool,
     pub caps: HeartbeatCaps,
     pub att: HeartbeatAttestation,
     pub ts: u64,
     pub nonce: String,
     pub sig: String,
-}
-
-fn default_heartbeat_accepting_new() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1724,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_heartbeat_without_contract_version_requires_upgrade_before_signature_check() {
+    fn heartbeat_without_contract_version_is_rejected_before_signature_check() {
         let signing_key = SigningKey::from_bytes(&[10_u8; 32]);
         let provider = hex::encode(signing_key.verifying_key().to_bytes());
         let now = 1_800_000_000_000;
@@ -1742,8 +1735,33 @@ mod tests {
             max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
             max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
         })
-        .expect_err("legacy heartbeat must require upgrade");
-        assert!(matches!(err, GatewayError::ContractUpgradeRequired { .. }));
+        .expect_err("heartbeat without current contract version must fail");
+        assert!(matches!(err, GatewayError::HeartbeatJson(_)));
+        assert!(err.to_string().contains("contract_version"));
+    }
+
+    #[test]
+    fn heartbeat_without_accepting_new_is_rejected_before_signature_check() {
+        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&signing_key, &provider, now, "ae");
+        heartbeat
+            .as_object_mut()
+            .expect("heartbeat object")
+            .remove("accepting_new");
+        heartbeat["sig"] = json!("00".repeat(64));
+
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("heartbeat without accepting_new must fail");
+        assert!(matches!(err, GatewayError::HeartbeatJson(_)));
+        assert!(err.to_string().contains("accepting_new"));
     }
 
     #[test]
@@ -1786,6 +1804,7 @@ mod tests {
             "perf": { "tok_s": 42.0, "ttft_ms": 120 },
             "price_ver": 3,
             "min_ask_au": "0",
+            "accepting_new": true,
             "caps": { "tools": true, "json": true, "ctx": 8192, "vision": false },
             "att": { "epoch": 81, "head": "44".repeat(32) },
             "ts": now_millis,

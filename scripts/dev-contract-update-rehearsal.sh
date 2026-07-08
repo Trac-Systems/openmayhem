@@ -22,7 +22,7 @@ usage() {
 Usage: scripts/dev-contract-update-rehearsal.sh
 
 Runs the local contract-update rehearsal gate:
-  - JS contract tests for versioned signing, receipt migration, and param delay;
+  - JS contract tests for versioned signing, current receipt schema, and param delay;
   - Rust handshake tests for explicit upgrade-required failures;
   - a fresh Pear dev-net where simulated noop reports the current contract version.
 
@@ -77,7 +77,7 @@ if [[ "$SKIP_CARGO" != "1" ]]; then
   (
     cd "$ROOT_DIR"
     cargo test -p mayhem-cli provider_session_open_enforces_admin_terms -- --nocapture
-    cargo test -p mayhem-gateway legacy_heartbeat_without_contract_version_requires_upgrade_before_signature_check -- --nocapture
+    cargo test -p mayhem-gateway heartbeat_without_contract_version_is_rejected_before_signature_check -- --nocapture
     cargo test -p mayhem-gateway direct_session_accept_pins_session_enclave_provider_and_signature -- --nocapture
   )
 else
