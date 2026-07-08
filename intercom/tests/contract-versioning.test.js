@@ -7,6 +7,7 @@ import MayhemContract, {
   consentMessage,
   providerLifecycleIntentMessage,
   receiptMessage,
+  spendVoucherMessage,
 } from '../contract/contract.js';
 import {
   MemoryStorage,
@@ -149,6 +150,82 @@ test('receipt verifier accepts only the current signing payload', async () => {
     }),
     true
   );
+});
+
+test('Rust atto money signing fixture matches JS canonical messages', () => {
+  const lockedRateMap = [
+    { unit: 'input_token', per_unit_au: '10000000', granularity: 1 },
+    { unit: 'output_token', per_unit_au: '2500000000000000', granularity: 1000 },
+  ];
+  const voucher = {
+    session_id: 'sess-au-roundtrip',
+    rail: 'fiat',
+    enclave_id: 'enclave-au-roundtrip',
+    price_ver: 9,
+    locked_rate_map: lockedRateMap,
+    locked_per_req_au: '1',
+    locked_min_session_au: '2000000000000000000000000',
+    served_ctx: 131072,
+    ctx_bracket: 'le128k',
+    ctx_bracket_table_ver: 1,
+    max_spend_au: '2000000000000000000000001',
+    checkpoint_every: { tokens: 4096, ms: 30000 },
+  };
+  const expectedVoucher = [
+    '{"domain":"mayhem-spend-voucher","signing_version":2,"body":{',
+    '"session_id":"sess-au-roundtrip","rail":"fiat","enclave_id":"enclave-au-roundtrip",',
+    '"price_ver":9,"locked_rate_map":[',
+    '{"unit":"input_token","per_unit_au":"10000000","granularity":1},',
+    '{"unit":"output_token","per_unit_au":"2500000000000000","granularity":1000}',
+    '],"locked_per_req_au":"1","locked_min_session_au":"2000000000000000000000000",',
+    '"served_ctx":131072,"ctx_bracket":"le128k","ctx_bracket_table_ver":1,',
+    '"max_spend_au":"2000000000000000000000001",',
+    '"checkpoint_every":{"tokens":4096,"ms":30000}}}',
+  ].join('');
+  assert.equal(spendVoucherMessage(voucher), expectedVoucher);
+
+  const receipt = {
+    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+    session_id: 'sess-au-roundtrip',
+    seq: 2,
+    final: true,
+    rail: 'fiat',
+    user: '11'.repeat(32),
+    provider: '22'.repeat(32),
+    enclave_id: 'enclave-au-roundtrip',
+    model_id: 'model/atto-roundtrip',
+    price_ver: 9,
+    locked_rate_map: lockedRateMap,
+    locked_per_req_au: '1',
+    locked_min_session_au: '2000000000000000000000000',
+    served_ctx: 131072,
+    ctx_bracket: 'le128k',
+    ctx_bracket_table_ver: 1,
+    rules_ver: 7,
+    usage: { input_token: 3, output_token: 5 },
+    au_owed_cum: '2000000000000000000000001',
+    prompt_hash: '33'.repeat(32),
+    ts: 1783517300,
+  };
+  const expectedReceipt = [
+    '{"domain":"mayhem-session-receipt","signing_version":2,"body":{',
+    '"schema_version":8,"session_id":"sess-au-roundtrip","seq":2,"final":true,',
+    '"rail":"fiat","user":"',
+    '11'.repeat(32),
+    '","provider":"',
+    '22'.repeat(32),
+    '","enclave_id":"enclave-au-roundtrip","model_id":"model/atto-roundtrip",',
+    '"price_ver":9,"locked_rate_map":[',
+    '{"unit":"input_token","per_unit_au":"10000000","granularity":1},',
+    '{"unit":"output_token","per_unit_au":"2500000000000000","granularity":1000}',
+    '],"locked_per_req_au":"1","locked_min_session_au":"2000000000000000000000000",',
+    '"served_ctx":131072,"ctx_bracket":"le128k","ctx_bracket_table_ver":1,',
+    '"rules_ver":7,"usage":{"input_token":3,"output_token":5},',
+    '"au_owed_cum":"2000000000000000000000001","prompt_hash":"',
+    '33'.repeat(32),
+    '","ts":1783517300}}',
+  ].join('');
+  assert.equal(receiptMessage(receipt), expectedReceipt);
 });
 
 test('receipt normalization rejects old schemas and non-canonical usage', async () => {

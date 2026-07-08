@@ -44325,6 +44325,58 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_receipt_serializes_large_atto_money_as_strings() {
+        let mut terms = test_provider_session_terms();
+        let large_au: MoneyAu = 20_000_000_000_000_000_000;
+        terms.min_session_au = large_au;
+        let active = ActiveProviderSession {
+            remote: "peer-a".to_owned(),
+            user_pubkey: "66".repeat(32),
+            session_id: "aa".repeat(32),
+            rail: "fiat".to_owned(),
+            price_ver: terms.price_ver,
+            locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
+            locked_per_req_au: terms.per_req_au,
+            locked_min_session_au: terms.min_session_au,
+            served_ctx: u32::try_from(terms.ctx).unwrap(),
+            ctx_bracket: terms.ctx_bracket.clone(),
+            ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
+            checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "large atto receipt" }],
+            "stream": false
+        });
+        let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
+        let receipt = provider_session_receipt_for_usage(
+            &terms,
+            &active,
+            &body,
+            ReceiptUsage::text(1, 1),
+            1,
+            true,
+            &runtime_keypair,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.body.au_owed_cum, large_au);
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["locked_min_session_au"], json!(large_au.to_string()));
+        assert_eq!(value["au_owed_cum"], json!(large_au.to_string()));
+        assert!(value["au_owed_cum"].is_string());
+
+        let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
+            .try_into()
+            .unwrap();
+        let sig_bytes: [u8; 64] = test_hex_decode(&receipt.enclave_sig).try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes).unwrap();
+        let signature = Signature::from_bytes(&sig_bytes);
+        verifying_key
+            .verify(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
+            .unwrap();
+    }
+
+    #[test]
     fn provider_session_checkpoint_receipt_is_cumulative_non_final_and_sequenced() {
         let terms = test_provider_session_terms();
         let active = ActiveProviderSession {

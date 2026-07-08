@@ -1472,6 +1472,98 @@ mod tests {
     }
 
     #[test]
+    fn js_contract_atto_money_signing_fixture_matches_rust() {
+        let locked_rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 10_000_000,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_OUTPUT_TOKEN.to_owned(),
+                per_unit_au: 2_500_000_000_000_000,
+                granularity: 1_000,
+            },
+        ];
+        let voucher = SpendVoucherBody {
+            session_id: "sess-au-roundtrip".to_owned(),
+            rail: "fiat".to_owned(),
+            enclave_id: "enclave-au-roundtrip".to_owned(),
+            price_ver: 9,
+            locked_rate_map: locked_rate_map.clone(),
+            locked_per_req_au: 1,
+            locked_min_session_au: 2_000_000_000_000_000_000_000_000,
+            served_ctx: 131_072,
+            ctx_bracket: Some("le128k".to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+            max_spend_au: 2_000_000_000_000_000_000_000_001,
+            checkpoint_every: CheckpointPolicy {
+                tokens: 4096,
+                ms: 30000,
+            },
+        };
+        let expected_voucher = concat!(
+            "{\"domain\":\"mayhem-spend-voucher\",\"signing_version\":2,\"body\":{",
+            "\"session_id\":\"sess-au-roundtrip\",\"rail\":\"fiat\",\"enclave_id\":\"enclave-au-roundtrip\",",
+            "\"price_ver\":9,\"locked_rate_map\":[",
+            "{\"unit\":\"input_token\",\"per_unit_au\":\"10000000\",\"granularity\":1},",
+            "{\"unit\":\"output_token\",\"per_unit_au\":\"2500000000000000\",\"granularity\":1000}",
+            "],\"locked_per_req_au\":\"1\",\"locked_min_session_au\":\"2000000000000000000000000\",",
+            "\"served_ctx\":131072,\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
+            "\"max_spend_au\":\"2000000000000000000000001\",",
+            "\"checkpoint_every\":{\"tokens\":4096,\"ms\":30000}}}"
+        );
+        assert_eq!(
+            String::from_utf8(spend_voucher_signing_bytes(&voucher).unwrap()).unwrap(),
+            expected_voucher
+        );
+
+        let receipt = ReceiptBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            session_id: "sess-au-roundtrip".to_owned(),
+            seq: 2,
+            final_receipt: true,
+            rail: "fiat".to_owned(),
+            user: "11".repeat(32),
+            provider: "22".repeat(32),
+            enclave_id: "enclave-au-roundtrip".to_owned(),
+            model_id: "model/atto-roundtrip".to_owned(),
+            price_ver: 9,
+            locked_rate_map,
+            locked_per_req_au: voucher.locked_per_req_au,
+            locked_min_session_au: voucher.locked_min_session_au,
+            served_ctx: voucher.served_ctx,
+            ctx_bracket: voucher.ctx_bracket,
+            ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
+            rules_ver: 7,
+            usage: ReceiptUsage::text(3, 5),
+            au_owed_cum: voucher.max_spend_au,
+            prompt_hash: "33".repeat(32),
+            ts: 1_783_517_300,
+        };
+        let expected_receipt = concat!(
+            "{\"domain\":\"mayhem-session-receipt\",\"signing_version\":2,\"body\":{",
+            "\"schema_version\":8,\"session_id\":\"sess-au-roundtrip\",\"seq\":2,\"final\":true,",
+            "\"rail\":\"fiat\",\"user\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+            "\"provider\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+            "\"enclave_id\":\"enclave-au-roundtrip\",\"model_id\":\"model/atto-roundtrip\",",
+            "\"price_ver\":9,\"locked_rate_map\":[",
+            "{\"unit\":\"input_token\",\"per_unit_au\":\"10000000\",\"granularity\":1},",
+            "{\"unit\":\"output_token\",\"per_unit_au\":\"2500000000000000\",\"granularity\":1000}",
+            "],\"locked_per_req_au\":\"1\",\"locked_min_session_au\":\"2000000000000000000000000\",",
+            "\"served_ctx\":131072,\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
+            "\"rules_ver\":7,\"usage\":{\"input_token\":3,\"output_token\":5},",
+            "\"au_owed_cum\":\"2000000000000000000000001\",",
+            "\"prompt_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
+            "\"ts\":1783517300}}"
+        );
+        assert_eq!(
+            String::from_utf8(receipt_signing_bytes(&receipt).unwrap()).unwrap(),
+            expected_receipt
+        );
+    }
+
+    #[test]
     fn session_accept_signing_payload_is_stable_bound_and_sig_excluded() {
         let mut frame = json!({
             "t": "s.accept",
