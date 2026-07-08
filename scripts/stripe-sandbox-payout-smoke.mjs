@@ -5,8 +5,9 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const DEFAULT_STRIPE_ENV_FILE = '/Applications/MAMP/htdocs/gpd/stripe.txt';
-const DEFAULT_MU = 1_000_000;
+const DEFAULT_STRIPE_ENV_FILE = path.resolve('.mayhem-local', 'secrets', 'stripe.txt');
+const AU_PER_USD_CENT = 10_000_000_000_000_000n;
+const DEFAULT_AU = '1000000000000000000';
 const DEFAULT_STRIPE_AMOUNT_MINOR = 100;
 const DEFAULT_FEE_BPS = 1500;
 const DEFAULT_BUSINESS_URL = 'https://trac.network';
@@ -26,8 +27,8 @@ settlement reports instead of per-payout Trac writes.
 Options:
   --stripe-env-file <path>   File with STRIPE_SECRET_KEY
                              (default: ${DEFAULT_STRIPE_ENV_FILE})
-  --mu <mu_usd>              Contract payout amount in integer micro-USD
-                             (default: ${DEFAULT_MU})
+  --au <au_usd>              Contract payout amount in canonical atto-USD
+                             (default: ${DEFAULT_AU})
   --currency <usd|eur>       Stripe payout evidence currency (default: usd)
   --amount-cents <cents>     Test charge/transfer amount in minor units
                              (default: ${DEFAULT_STRIPE_AMOUNT_MINOR})
@@ -40,10 +41,21 @@ Options:
   --help                     Show this help
 `;
 
+function parseAu(value) {
+  const raw = String(value ?? '').trim();
+  if (!/^(0|[1-9]\d*)$/.test(raw)) {
+    throw new Error('--au must be a canonical positive atto-USD integer');
+  }
+  const au = BigInt(raw);
+  if (au <= 0n) throw new Error('--au must be positive');
+  if (au % AU_PER_USD_CENT !== 0n) throw new Error('--au must be whole-cent aligned');
+  return au;
+}
+
 function parseArgs(argv) {
   const args = {
     stripeEnvFile: DEFAULT_STRIPE_ENV_FILE,
-    mu: DEFAULT_MU,
+    au: DEFAULT_AU,
     currency: 'usd',
     amountCents: DEFAULT_STRIPE_AMOUNT_MINOR,
     feeBps: DEFAULT_FEE_BPS,
@@ -59,7 +71,7 @@ function parseArgs(argv) {
       return argv[i];
     };
     if (arg === '--stripe-env-file') args.stripeEnvFile = next();
-    else if (arg === '--mu') args.mu = Number.parseInt(next(), 10);
+    else if (arg === '--au') args.au = next();
     else if (arg === '--currency') args.currency = next().trim().toLowerCase();
     else if (arg === '--amount-cents') args.amountCents = Number.parseInt(next(), 10);
     else if (arg === '--fee-bps') args.feeBps = Number.parseInt(next(), 10);
@@ -73,7 +85,7 @@ function parseArgs(argv) {
       throw new Error(`unknown argument: ${arg}`);
     }
   }
-  if (!Number.isSafeInteger(args.mu) || args.mu <= 0) throw new Error('--mu must be a positive integer');
+  args.au = parseAu(args.au).toString();
   if (!['usd', 'eur'].includes(args.currency)) throw new Error('--currency must be usd or eur');
   if (!Number.isSafeInteger(args.amountCents) || args.amountCents <= 0) {
     throw new Error('--amount-cents must be a positive integer');
@@ -257,7 +269,7 @@ async function waitConnectedAccountReady(secretKey, accountId) {
   return full;
 }
 
-async function createDestinationCharge(secretKey, accountId, tag, currency, amountCents, feeBps, mu) {
+async function createDestinationCharge(secretKey, accountId, tag, currency, amountCents, feeBps, au) {
   const feeCents = Math.floor((amountCents * feeBps) / 10_000);
   const providerNetCents = amountCents - feeCents;
   if (providerNetCents <= 0) {
@@ -272,8 +284,8 @@ async function createDestinationCharge(secretKey, accountId, tag, currency, amou
     on_behalf_of: accountId,
     'transfer_data[destination]': accountId,
     'metadata[mayhem_smoke]': tag,
-    'metadata[mayhem_denom]': 'mu_usd',
-    'metadata[mayhem_mu]': String(mu),
+    'metadata[mayhem_denom]': 'au_usd',
+    'metadata[mayhem_au]': String(au),
     'metadata[mayhem_fiat_currency]': currency,
     'metadata[mayhem_fiat_amount_minor]': String(amountCents),
     'metadata[mayhem_fee_bps]': String(feeBps),
@@ -356,7 +368,7 @@ async function main() {
       args.currency,
       args.amountCents,
       args.feeBps,
-      args.mu
+      args.au
     );
     const report = {
       ok: true,
@@ -386,7 +398,7 @@ async function main() {
       ledger: {
         payout_confirm_retired: true,
         evidence_model: 'epoch_settlement_report',
-        mu_usd: args.mu,
+        au_usd: args.au,
         fiat_currency: args.currency,
         gross_amount_minor: args.amountCents,
         fee_bps: args.feeBps,

@@ -13,7 +13,7 @@ use serde_json::json;
 
 const RUN_ENV: &str = "MAYHEM_RUN_LLAMACPP_TESTS";
 const HF_TOKEN_FILE_ENV: &str = "HF_TOKEN_FILE";
-const DEFAULT_HF_TOKEN_FILE: &str = "/Applications/MAMP/htdocs/gpd/hf.txt";
+const DEFAULT_HF_TOKEN_FILE: &str = ".mayhem-local/secrets/hf.txt";
 const REPO: &str = "lmstudio-community/Qwen3.5-4B-GGUF";
 const REVISION: &str = "f9f88ac3e234be915e23811a6d28ea287bdb927e";
 const FILE_NAME: &str = "Qwen3.5-4B-Q4_K_M.gguf";

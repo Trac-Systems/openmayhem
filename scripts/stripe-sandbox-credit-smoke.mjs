@@ -10,8 +10,9 @@ import { fileURLToPath } from 'node:url';
 import MayhemContract from '../intercom/contract/contract.js';
 import { createHash, jsonStringify } from '../intercom/trac/trac-peer/src/utils/types.js';
 
-const DEFAULT_STRIPE_ENV_FILE = '/Applications/MAMP/htdocs/gpd/stripe.txt';
-const DEFAULT_MU = 1_000_000;
+const DEFAULT_STRIPE_ENV_FILE = path.resolve('.mayhem-local', 'secrets', 'stripe.txt');
+const AU_PER_USD_CENT = 10_000_000_000_000_000n;
+const DEFAULT_AU = '1000000000000000000';
 const DEFAULT_CONTRACT_EPOCH_SECONDS = 3_600;
 const DEFAULT_SMOKE_ADMIN_EPOCH_SECONDS = 7_200;
 const ZERO_HEX = '0'.repeat(64);
@@ -46,7 +47,7 @@ Mayhem contract state credits bal/<user> exactly once and writes ev/dep/<epoch>.
 Options:
   --stripe-env-file <path>   File with STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET
                              (default: ${DEFAULT_STRIPE_ENV_FILE})
-  --mu <mu_usd>              Whole-cent mu_usd amount (default: ${DEFAULT_MU})
+  --au <au_usd>              Whole-cent au_usd amount (default: ${DEFAULT_AU})
   --currency <usd|eur>       Stripe checkout currency (default: usd)
   --who <hex-pubkey>         64-hex test user id (default: random)
   --paygate-port <port>      Local paygate port (default: auto)
@@ -60,10 +61,29 @@ Options:
   --help                     Show this help
 `;
 
+function parseAu(value) {
+  const raw = String(value ?? '').trim();
+  if (!/^(0|[1-9]\d*)$/.test(raw)) {
+    throw new Error('--au must be a canonical positive atto-USD integer');
+  }
+  const au = BigInt(raw);
+  if (au <= 0n) throw new Error('--au must be positive');
+  if (au % AU_PER_USD_CENT !== 0n) throw new Error('--au must be whole-cent aligned');
+  return au;
+}
+
+function auToStripeMinor(au, label = '--au') {
+  const minor = au / AU_PER_USD_CENT;
+  if (minor > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`${label} exceeds Stripe minor-unit safe integer range`);
+  }
+  return Number(minor);
+}
+
 function parseArgs(argv) {
   const args = {
     stripeEnvFile: DEFAULT_STRIPE_ENV_FILE,
-    mu: DEFAULT_MU,
+    au: DEFAULT_AU,
     currency: 'usd',
     who: randomBytes(32).toString('hex'),
     paygatePort: null,
@@ -81,7 +101,7 @@ function parseArgs(argv) {
       return argv[i];
     };
     if (arg === '--stripe-env-file') args.stripeEnvFile = next();
-    else if (arg === '--mu') args.mu = Number.parseInt(next(), 10);
+    else if (arg === '--au') args.au = next();
     else if (arg === '--currency') args.currency = next().trim().toLowerCase();
     else if (arg === '--who') args.who = next();
     else if (arg === '--paygate-port') args.paygatePort = Number.parseInt(next(), 10);
@@ -97,8 +117,9 @@ function parseArgs(argv) {
       throw new Error(`unknown argument: ${arg}`);
     }
   }
-  if (!Number.isSafeInteger(args.mu) || args.mu <= 0) throw new Error('--mu must be a positive integer');
-  if (args.mu % 10_000 !== 0) throw new Error('--mu must be whole-cent aligned');
+  const au = parseAu(args.au);
+  args.au = au.toString();
+  args.stripeAmountMinor = auToStripeMinor(au);
   if (!['usd', 'eur'].includes(args.currency)) throw new Error('--currency must be usd or eur');
   if (!/^[0-9a-f]{64}$/i.test(args.who)) throw new Error('--who must be 64 hex characters');
   if (!Number.isSafeInteger(args.epochSeconds) || args.epochSeconds < 60) {
@@ -458,7 +479,7 @@ async function main() {
     const idempotencyKey = `mayhem-stripe-smoke-${Date.now()}`;
     const created = await postJson(`${paygateBase}/v1/stripe/payment-intents`, {
       who: args.who,
-      mu: args.mu,
+      au: args.au,
       currency: args.currency,
       idempotency_key: idempotencyKey,
     });
@@ -485,8 +506,8 @@ async function main() {
           currency: intent.currency,
           metadata: {
             mayhem_who: args.who,
-            mayhem_mu: String(args.mu),
-            mayhem_denom: 'mu_usd',
+            mayhem_au: String(args.au),
+            mayhem_denom: 'au_usd',
             mayhem_fiat_currency: intent.currency,
             mayhem_fiat_amount_minor: String(intent.amount),
           },
@@ -504,7 +525,7 @@ async function main() {
     const depositRoot = await getJson(`${contractBase}/state?key=${encodeURIComponent(`ev/dep/${epoch}`)}`);
     const eventLog = existsSync(eventStore) ? await readFile(eventStore, 'utf8') : '';
     const eventLogLines = eventLog.trim() ? eventLog.trim().split(/\r?\n/).length : 0;
-    const balanceMu = balance.value?.mu ?? 0;
+    const balanceAu = String(balance.value?.au ?? '0');
     const dep = depositRoot.value;
     const contractPostsAfterCredit = contract.submitted.length;
     let dispute = null;
@@ -520,7 +541,7 @@ async function main() {
           object: {
             id: `dp_${disputeEventId.slice(-8)}`,
             object: 'dispute',
-            amount: args.mu / 10_000,
+            amount: args.stripeAmountMinor,
             currency: intent.currency,
             charge: chargeId,
             payment_intent: intent.id,
@@ -544,15 +565,15 @@ async function main() {
         event_id: disputeEventId,
         first_clawed_back: disputeFirst.clawed_back === true,
         replay_duplicate: disputeReplay.duplicate === true,
-        balance_after_chargeback_mu: balanceAfter.value?.mu ?? null,
+        balance_after_chargeback_au: balanceAfter.value?.au == null ? null : String(balanceAfter.value.au),
         frozen_status: frozen.value?.status ?? null,
-        disputed_mu_cum: frozen.value?.disputed_mu_cum ?? null,
+        disputed_au_cum: frozen.value?.disputed_au_cum == null ? null : String(frozen.value.disputed_au_cum),
         event_log_lines: updatedEventLog.trim() ? updatedEventLog.trim().split(/\r?\n/).length : 0,
         deposit_count_after_reversal: reversalRoot.value?.count ?? null,
-        deposit_mu_total_after_reversal: reversalRoot.value?.mu_total ?? null,
-        reversed_mu_total: reversalRoot.value?.reversed_mu_total ?? null,
-        clawback_mu_total: reversalRoot.value?.clawback_mu_total ?? null,
-        network_absorbed_mu_total: reversalRoot.value?.network_absorbed_mu_total ?? null,
+        deposit_au_total_after_reversal: reversalRoot.value?.au_total == null ? null : String(reversalRoot.value.au_total),
+        reversed_au_total: reversalRoot.value?.reversed_au_total == null ? null : String(reversalRoot.value.reversed_au_total),
+        clawback_au_total: reversalRoot.value?.clawback_au_total == null ? null : String(reversalRoot.value.clawback_au_total),
+        network_absorbed_au_total: reversalRoot.value?.network_absorbed_au_total == null ? null : String(reversalRoot.value.network_absorbed_au_total),
       };
     }
     const creditOk =
@@ -562,22 +583,22 @@ async function main() {
       && first.duplicate === false
       && replay.ok === true
       && replay.duplicate === true
-      && balanceMu === args.mu
+      && balanceAu === args.au
       && dep?.type === 'deposit_root'
       && dep.count === 1
-      && dep.mu_total === args.mu
+      && String(dep.au_total ?? '0') === args.au
       && eventLogLines === 1
       && contractPostsAfterCredit === 1;
     const disputeOk = !args.includeDispute
       || (
         dispute?.first_clawed_back === true
         && dispute?.replay_duplicate === true
-        && dispute?.balance_after_chargeback_mu === 0
+        && dispute?.balance_after_chargeback_au === '0'
         && dispute?.frozen_status === 'frozen'
-        && dispute?.disputed_mu_cum === args.mu
+        && dispute?.disputed_au_cum === args.au
         && dispute?.event_log_lines === 2
-        && dispute?.reversed_mu_total === args.mu
-        && dispute?.clawback_mu_total === args.mu
+        && dispute?.reversed_au_total === args.au
+        && dispute?.clawback_au_total === args.au
         && contract.submitted.length === 2
       );
     const ok = creditOk && disputeOk;
@@ -598,9 +619,9 @@ async function main() {
         who: args.who,
         epoch_seconds: args.epochSeconds,
         epoch,
-        balance_mu: balanceMu,
+        balance_au: balanceAu,
         deposit_count: dep?.count ?? null,
-        deposit_mu_total: dep?.mu_total ?? null,
+        deposit_au_total: dep?.au_total ?? null,
         deposit_root: dep?.merkle_root ?? null,
         submitted_contract_posts: contract.submitted.length,
       },

@@ -70,8 +70,8 @@ to publish private session content.
 
 ## 5. Pricing And Economy
 
-All canonical prices are denominated in `mu_usd`, integer micro-USD. TNK,
-Stripe, Coinbase, and future rails are payment or payout rails around this
+All canonical prices are denominated in `au_usd`, canonical atto-USD. TNK,
+Stripe, TAP, and future rails are payment or payout rails around this
 shared credit unit; they do not create separate provider-defined prices.
 
 Only the admin may set prices, price bounds, rate windows, fees, holdbacks,

@@ -3,7 +3,7 @@
   "launch_id": "mayhem-testnet-beta-v1",
   "network": {
     "name": "testnet1",
-    "denom": "mu_usd",
+    "denom": "au_usd",
     "msb": {
       "address_prefix": "testtrac",
       "network_id": 919,
@@ -129,12 +129,12 @@
         "bundle_bytes": "<enclave-download-bundle-size-bytes>",
         "admin_signature": "<admin-ed25519-signature-over-enclave-download-manifest-128-hex>"
       },
-      "model_ref_mu": {
+      "model_ref_au": {
         "in_per_1k": 18,
         "out_per_1k": 55
       },
-      "price_mu": {
-        "denom": "mu_usd",
+      "price_au": {
+        "denom": "au_usd",
         "in_per_1k": 18,
         "out_per_1k": 55,
         "per_req": 0,

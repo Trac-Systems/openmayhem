@@ -5,6 +5,7 @@
 !.env.example
 .mayhem-local/
 intercom/config.toml
+intercom/rules/
 stripe.txt
 **/stripe.txt
 *.local.toml

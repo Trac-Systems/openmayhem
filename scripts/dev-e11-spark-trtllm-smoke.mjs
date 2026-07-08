@@ -67,12 +67,12 @@ Environment:
   MAYHEM_E11_CLUSTER_FILE          Spark credential file (default: ../gpd/cluster.txt)
   MAYHEM_E11_TAG                   Reuse a named run directory/tag instead of generating one
   MAYHEM_E11_DEVNET_CLEANUP        Remove dev-net stores before starting (default: 1)
-  MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: /home/trac/ai/mayhem/i3-e11-operationmayhem)
-  MAYHEM_E11_REMOTE_DOWNLOADS      Spark provider download cache (default: /home/trac/ai/mayhem/e11-provider-downloads)
+  MAYHEM_E11_REMOTE_ROOT           Spark checkout/staging root (default: $HOME/mayhem/i3-e11-operationmayhem)
+  MAYHEM_E11_REMOTE_DOWNLOADS      Spark provider download cache (default: $HOME/mayhem/e11-provider-downloads)
   MAYHEM_E11_REMOTE_PROVIDER_CACHE Spark provider sealed-store cache root (default: <remote root>/.mayhem-local/i3-e11-spark-provider-cache)
   MAYHEM_E11_ACCEL_ARTIFACT        Accelerated catalog artifact to prove (default: ${DEFAULT_ACCEL_ARTIFACT}; E14 uses vllm-fp16)
-  MAYHEM_E11_TRTLLM_PYTHON         Spark TensorRT-LLM Python wrapper (default: /home/trac/ai/mayhem/bin/trtllm-python)
-  MAYHEM_E11_VLLM_PYTHON           Spark vLLM Python wrapper (default: /home/trac/ai/mayhem/bin/vllm-python-e14)
+  MAYHEM_E11_TRTLLM_PYTHON         Spark TensorRT-LLM Python wrapper (default: $HOME/mayhem/bin/trtllm-python)
+  MAYHEM_E11_VLLM_PYTHON           Spark vLLM Python wrapper (default: $HOME/mayhem/bin/vllm-python-e14)
   MAYHEM_E11_HF_TOKEN_FILE         HF token file copied temporarily to Spark if present (default: ../gpd/hf.txt)
   MAYHEM_E11_CATALOG_RELEASE_REPO  HF repo for the signed catalog release (default: ${DEFAULT_CATALOG_RELEASE_REPO})
   MAYHEM_E11_CATALOG_RELEASE_REVISION  40-hex signed catalog release revision (default: ${DEFAULT_CATALOG_RELEASE_REVISION})
@@ -437,8 +437,8 @@ function artifactSidecarRoots(artifact) {
 
 function textRateMapJson(model) {
   return JSON.stringify([
-    { unit: 'input_token', per_unit_mu: Number(model.price_ref_mu?.in_per_1k || 18), granularity: 1000 },
-    { unit: 'output_token', per_unit_mu: Number(model.price_ref_mu?.out_per_1k || 55), granularity: 1000 },
+    { unit: 'input_token', per_unit_au: String(model.price_ref_au?.in_per_1k ?? '18'), granularity: 1000 },
+    { unit: 'output_token', per_unit_au: String(model.price_ref_au?.out_per_1k ?? '55'), granularity: 1000 },
   ]);
 }
 
@@ -1118,10 +1118,25 @@ async function waitForCanonicalEnclaveReady(rpcUrl, { enclaveId, modelId, backen
   fail(`timed out waiting for canonical ${backend} enclave readiness: ${JSON.stringify(last)}`);
 }
 
-function safeMu(value, label) {
+function safeCount(value, label) {
   const number = Number(value ?? 0);
   if (!Number.isSafeInteger(number) || number < 0) fail(`${label} is not a non-negative safe integer: ${value}`);
   return number;
+}
+
+function parseAu(value, label) {
+  const raw = String(value ?? '0');
+  if (!/^(0|[1-9]\d*)$/.test(raw)) fail(`${label} is not a canonical non-negative atto-USD integer: ${value}`);
+  return BigInt(raw);
+}
+
+function auString(value, label) {
+  return parseAu(value, label).toString();
+}
+
+function auDelta(left, right, label) {
+  const delta = parseAu(left, `${label} left`) - parseAu(right, `${label} right`);
+  return delta.toString();
 }
 
 async function readDepositRootSnapshot(rpcUrl, epoch) {
@@ -1130,8 +1145,8 @@ async function readDepositRootSnapshot(rpcUrl, epoch) {
   if (value.type !== 'deposit_root') fail(`ev/dep/${epoch} is not a deposit root`);
   return {
     merkle_root: value.merkle_root,
-    count: safeMu(value.count, `ev/dep/${epoch} count`),
-    mu_total: safeMu(value.mu_total, `ev/dep/${epoch} mu_total`),
+    count: safeCount(value.count, `ev/dep/${epoch} count`),
+    au_total: auString(value.au_total, `ev/dep/${epoch} au_total`),
     source: `ev/dep/${epoch}`,
   };
 }
@@ -1149,9 +1164,9 @@ async function readLedgerSnapshot(rpcUrl, user, provider) {
     balance,
     earning,
     fee,
-    balance_mu: safeMu(balance?.mu, 'fiat balance mu'),
-    provider_total_mu: safeMu(earning?.total_mu, 'fiat provider total_mu'),
-    fee_cum_mu: safeMu(fee?.cum_mu, 'fiat fee cum_mu'),
+    balance_au: auString(balance?.au, 'fiat balance au'),
+    provider_total_au: auString(earning?.total_au, 'fiat provider total_au'),
+    fee_cum_au: auString(fee?.cum_au, 'fiat fee cum_au'),
   };
 }
 
@@ -1161,14 +1176,14 @@ async function waitForLedgerMovement(rpcUrl, user, provider, before, expected, t
   while (Date.now() < deadline) {
     latest = await readLedgerSnapshot(rpcUrl, user, provider);
     const actual = {
-      debit_mu: before.balance_mu - latest.balance_mu,
-      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
-      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+      debit_au: auDelta(before.balance_au, latest.balance_au, 'fiat debit au'),
+      provider_net_au: auDelta(latest.provider_total_au, before.provider_total_au, 'fiat provider net au'),
+      fee_au: auDelta(latest.fee_cum_au, before.fee_cum_au, 'fiat fee au'),
     };
     if (
-      actual.debit_mu === expected.debit_mu &&
-      actual.provider_net_mu === expected.provider_net_mu &&
-      actual.fee_mu === expected.fee_mu
+      actual.debit_au === expected.debit_au &&
+      actual.provider_net_au === expected.provider_net_au &&
+      actual.fee_au === expected.fee_au
     ) {
       return { after: latest, actual };
     }
@@ -1178,9 +1193,9 @@ async function waitForLedgerMovement(rpcUrl, user, provider, before, expected, t
   return {
     after: latest,
     actual: {
-      debit_mu: before.balance_mu - latest.balance_mu,
-      provider_net_mu: latest.provider_total_mu - before.provider_total_mu,
-      fee_mu: latest.fee_cum_mu - before.fee_cum_mu,
+      debit_au: auDelta(before.balance_au, latest.balance_au, 'fiat debit au'),
+      provider_net_au: auDelta(latest.provider_total_au, before.provider_total_au, 'fiat provider net au'),
+      fee_au: auDelta(latest.fee_cum_au, before.fee_cum_au, 'fiat fee au'),
     },
   };
 }
@@ -1220,13 +1235,15 @@ async function settleGatewayReceiptEpoch({ mayhemBin, adminHome, adminRpcUrl, re
   const recomputedStdout = runSync('node', [path.join(ROOT, 'intercom/scripts/recompute-epoch-roots.mjs'), bundlePath]);
   fs.writeFileSync(recomputedPath, recomputedStdout);
   const recomputed = readJson(recomputedPath);
-  if (safeMu(recomputed?.totals?.use_mu, 'recomputed use_mu') <= 0) fail('epoch recompute produced zero usage');
+  if (parseAu(recomputed?.totals?.use_au, 'recomputed use_au') <= 0n) fail('epoch recompute produced zero usage');
   const providerEarning = (recomputed.earnings || []).find((entry) => entry.rail === 'fiat' && entry.provider === provider);
   if (!providerEarning) fail(`epoch recompute did not include fiat earnings for provider ${provider}`);
-  const expectedDebitMu = safeMu(recomputed.totals.use_mu, 'expected debit mu');
-  const providerGrossMu = safeMu(providerEarning.gross_mu, 'provider gross_mu');
-  const expectedProviderNetMu = providerGrossMu - Math.floor((providerGrossMu * feeBps) / 10_000);
-  const expectedFeeMu = safeMu(recomputed.totals.fee_mu, 'expected fee_mu');
+  const expectedDebitAu = auString(recomputed.totals.use_au, 'expected debit au');
+  const providerGrossAu = parseAu(providerEarning.gross_au, 'provider gross_au');
+  const expectedProviderNetAu = (
+    providerGrossAu - ((providerGrossAu * BigInt(feeBps)) / 10_000n)
+  ).toString();
+  const expectedFeeAu = auString(recomputed.totals.fee_au, 'expected fee_au');
 
   const adminEpochCommon = [
     '--home', adminHome,
@@ -1242,11 +1259,11 @@ async function settleGatewayReceiptEpoch({ mayhemBin, adminHome, adminRpcUrl, re
   const applySim = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-apply', ...adminEpochCommon, '--sim'], applySimPath);
   const apply = runJsonCommandToFile(mayhemBin, ['admin', 'epoch-apply', ...adminEpochCommon], applyPath);
 
-  const expected = { debit_mu: expectedDebitMu, provider_net_mu: expectedProviderNetMu, fee_mu: expectedFeeMu };
+  const expected = { debit_au: expectedDebitAu, provider_net_au: expectedProviderNetAu, fee_au: expectedFeeAu };
   const { after, actual } = await waitForLedgerMovement(adminRpcUrl, user, provider, before, expected);
-  if (actual.debit_mu !== expected.debit_mu) fail(`fiat balance debit mismatch; expected ${expected.debit_mu}, got ${actual.debit_mu}`);
-  if (actual.provider_net_mu !== expected.provider_net_mu) fail(`fiat provider earning mismatch; expected ${expected.provider_net_mu}, got ${actual.provider_net_mu}`);
-  if (actual.fee_mu !== expected.fee_mu) fail(`fiat fee movement mismatch; expected ${expected.fee_mu}, got ${actual.fee_mu}`);
+  if (actual.debit_au !== expected.debit_au) fail(`fiat balance debit mismatch; expected ${expected.debit_au}, got ${actual.debit_au}`);
+  if (actual.provider_net_au !== expected.provider_net_au) fail(`fiat provider earning mismatch; expected ${expected.provider_net_au}, got ${actual.provider_net_au}`);
+  if (actual.fee_au !== expected.fee_au) fail(`fiat fee movement mismatch; expected ${expected.fee_au}, got ${actual.fee_au}`);
 
   return {
     ok: true,
@@ -1343,10 +1360,10 @@ async function main() {
   const localBinaryHash = runSync(enclaveBin, ['measure-binary', '--binary', mayhemBin]).trim().replace(/^binary_hash=/, '');
 
   const remoteHome = (await ssh(remote, passFile, 'printf "%s\\n" "$HOME"')).stdout.trim();
-  const remoteRoot = (process.env.MAYHEM_E11_REMOTE_ROOT || '/home/trac/ai/mayhem/i3-e11-operationmayhem')
+  const remoteRoot = (process.env.MAYHEM_E11_REMOTE_ROOT || '$HOME/mayhem/i3-e11-operationmayhem')
     .replace(/^~(?=\/|$)/, remoteHome)
     .replace('$HOME', remoteHome);
-  const remoteDownloads = (process.env.MAYHEM_E11_REMOTE_DOWNLOADS || '/home/trac/ai/mayhem/e11-provider-downloads')
+  const remoteDownloads = (process.env.MAYHEM_E11_REMOTE_DOWNLOADS || '$HOME/mayhem/e11-provider-downloads')
     .replace(/^~(?=\/|$)/, remoteHome)
     .replace('$HOME', remoteHome);
   const remoteProviderCacheRoot = (process.env.MAYHEM_E11_REMOTE_PROVIDER_CACHE || path.posix.join(remoteRoot, '.mayhem-local/i3-e11-spark-provider-cache'))
@@ -1363,8 +1380,12 @@ async function main() {
   const remoteEnclave = path.posix.join(remoteRoot, 'target/debug/mayhem-enclave');
   const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
   const remoteNode = (await ssh(remote, passFile, 'command -v node || true')).stdout.trim() || '/usr/bin/node';
-  const remoteTrtPython = process.env.MAYHEM_E11_TRTLLM_PYTHON || '/home/trac/ai/mayhem/bin/trtllm-python';
-  const remoteVllmPython = process.env.MAYHEM_E11_VLLM_PYTHON || '/home/trac/ai/mayhem/bin/vllm-python-e14';
+  const remoteTrtPython = (process.env.MAYHEM_E11_TRTLLM_PYTHON || '$HOME/mayhem/bin/trtllm-python')
+    .replace(/^~(?=\/|$)/, remoteHome)
+    .replace('$HOME', remoteHome);
+  const remoteVllmPython = (process.env.MAYHEM_E11_VLLM_PYTHON || '$HOME/mayhem/bin/vllm-python-e14')
+    .replace(/^~(?=\/|$)/, remoteHome)
+    .replace('$HOME', remoteHome);
 
   log('syncing current source tree to Spark');
   await ssh(remote, passFile, `mkdir -p ${sh(remoteRoot)} ${sh(remoteLogs)} ${sh(remoteDownloads)} ${sh(remoteProviderHome)}`);
@@ -1481,7 +1502,7 @@ async function main() {
     'set-params',
     '--submitted-at', '0',
     '--effective-at', '86400',
-    '--values-json', '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_mu":0,"rate_staleness_seconds":86400,"canary_match_min_bps":9000,"probe_reward_mu":5000}',
+    '--values-json', '{"fee_bps":1500,"holdback_epochs":0,"challenge_epochs":0,"payout_min_au":0,"rate_staleness_seconds":86400,"canary_match_min_bps":9000,"probe_reward_au":5000}',
   ]);
   adminRun('admin-publish-catalog', [
     'publish-catalog',
@@ -1551,7 +1572,7 @@ async function main() {
     'fiat-deposit',
     '--rail', 'stripe',
     '--who', userPubkey,
-    '--mu', '10000000',
+    '--au', '10000000',
     '--ext-ref-hash', fiatDepositRef,
     '--fiat-currency', 'usd',
     '--fiat-amount-minor', '1000',

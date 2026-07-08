@@ -18,7 +18,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(target_os = "windows")]
 use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -49,13 +48,13 @@ use mayhem_gateway::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
         GatewayLocalRunBadge, GatewayModel, GatewayRouteCandidate, GatewayState,
-        GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, MayhemModelInfo,
-        ModelCaps, PriceRefMu, ProviderKybInfo, ScBridgeGatewaySessionBackend,
+        GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, GatewayUpdateModelNotice,
+        MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo, ScBridgeGatewaySessionBackend,
         ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_ROUTE_MAX_WAIT_MS,
     },
-    priced_usage_mu, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_mu,
-    ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry, ReputationEvent,
-    ReputationEventKind, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT,
+    priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
+    HeartbeatReceiver, ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry,
+    ReputationEvent, ReputationEventKind, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT,
     OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
@@ -67,14 +66,14 @@ use mayhem_proto::{
     default_ctx_bracket_schedule, reassemble_json_payload, receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, supported_receipt_signing_bytes,
     supported_spend_voucher_signing_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
-    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, PayloadChunk,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk,
     PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION,
     DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
     USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -85,7 +84,9 @@ const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
 const DEFAULT_HOLDBACK_EPOCHS: u64 = 24;
+const DEFAULT_NEW_PROVIDER_HOLDBACK_EPOCHS: u64 = 168;
 const DEFAULT_CHALLENGE_EPOCHS: u64 = 6;
+const DEFAULT_PROBATION_SUCCESSFUL_SESSIONS: u64 = 50;
 const DEFAULT_CANARY_PROBE_HOLDBACK_BPS: u64 = 0;
 const DEFAULT_CANARY_PROBE_RELEASE_MIN_PASSES: u64 = 1;
 const DEFAULT_RATE_STALENESS_SECONDS: u64 = 45 * 60;
@@ -274,6 +275,11 @@ enum ProviderCommands {
     Earnings(ProviderEarningsArgs),
     /// Pick an admin-created enclave, seal its artifact, join canonical rooms, and send heartbeats.
     Start(Box<ProviderStartArgs>),
+    /// Plan supervised serving sets from admin-created enclaves.
+    Serve {
+        #[command(subcommand)]
+        command: ProviderServeCommands,
+    },
     /// Register if needed, then join an existing admin-created enclave and canonical rooms.
     Join(ProviderJoinArgs),
     /// Leave canonical rooms, then leave an existing admin-created enclave.
@@ -293,6 +299,16 @@ enum ProviderRoomsCommands {
     Join(ProviderRoomJoinArgs),
     /// Leave one canonical room.
     Leave(ProviderRoomLeaveArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderServeCommands {
+    /// Compute the price-aware auto-fit enclave set for this machine.
+    Plan(ProviderServePlanArgs),
+    /// Add one admin-created enclave worker to the running local supervisor.
+    Add(ProviderServeAddArgs),
+    /// Remove one enclave worker from the running local supervisor.
+    Remove(ProviderServeRemoveArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -349,6 +365,10 @@ enum AdminCommands {
     PublishCatalog(AdminPublishCatalogArgs),
     /// Register an admin-created and attested canonical enclave.
     RegisterEnclave(AdminRegisterEnclaveArgs),
+    /// Update admin-owned metadata for a canonical enclave.
+    UpdateEnclave(AdminUpdateEnclaveArgs),
+    /// Schedule an enclave minimum attestation tier with an owner-controlled notice window.
+    SetEnclaveMinTier(AdminSetEnclaveMinTierArgs),
     /// Retire an admin-created enclave.
     RetireEnclave(AdminRetireEnclaveArgs),
     /// Open a canonical admin room for a model.
@@ -367,6 +387,11 @@ enum AdminCommands {
         #[command(subcommand)]
         command: AdminFeeCommands,
     },
+    /// Admin dispute listing, resolution, and operator alerts.
+    Disputes {
+        #[command(subcommand)]
+        command: AdminDisputeCommands,
+    },
     /// Set an admin-approved provider payout target.
     SetProviderPayout(AdminSetProviderPayoutArgs),
     /// Verify a provider business identity for Tier 4 accountability.
@@ -375,6 +400,18 @@ enum AdminCommands {
     RevokeProviderKyb(AdminRevokeProviderKybArgs),
     /// Ban a provider and tombstone its active serving rows.
     BanProvider(AdminBanProviderArgs),
+    /// Inspect admin ban records.
+    Ban {
+        #[command(subcommand)]
+        command: AdminBanCommands,
+    },
+    /// Reverse a provider, device, fingerprint, or committer ban going forward.
+    Unban(AdminUnbanArgs),
+    /// Admin device-key operations.
+    Device {
+        #[command(subcommand)]
+        command: AdminDeviceCommands,
+    },
     /// Accredit an auditor key for probe submission.
     AuditorRegister(AdminAuditorRegisterArgs),
     /// Fold real reputation events and anchor rep/<provider> snapshots.
@@ -383,9 +420,9 @@ enum AdminCommands {
     RateOracle(AdminRateOracleArgs),
     /// Post a fresh TAP/USD policy rate for TAP deposit conversion.
     TapRateOracle(AdminTapRateOracleArgs),
-    /// Record one real treasury-signed MSB batch settlement for TNK earnings.
+    /// Record one epoch TNK settlement backed by real treasury-signed MSB transfers.
     TnkSettlement(AdminTnkSettlementArgs),
-    /// Confirm a memo-bound TNK deposit into the canonical credit ledger.
+    /// Confirm a TNK deposit intent into the canonical credit ledger.
     TnkDeposit(AdminTnkDepositArgs),
     /// Confirm a finalized TAP escrow Deposit event into the canonical credit ledger.
     TapDeposit(AdminTapDepositArgs),
@@ -414,6 +451,30 @@ enum AdminFeeCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum AdminDisputeCommands {
+    /// List dispute records from the replicated contract ledger.
+    List(AdminDisputesListArgs),
+    /// Show one dispute record from the replicated contract ledger.
+    Show(AdminDisputesShowArgs),
+    /// Resolve an open dispute with the existing admin-gated contract op.
+    Resolve(AdminDisputesResolveArgs),
+    /// Poll open disputes and print operator alerts for new/aging records.
+    Watch(AdminDisputesWatchArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminBanCommands {
+    /// List active and historical admin ban records.
+    List(AdminBanListArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminDeviceCommands {
+    /// Rebind a healthy device key to a replacement provider wallet.
+    Rebind(AdminDeviceRebindArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum PriceCommands {
     /// Show the current live market price for a model/enclave.
     Show(PriceShowArgs),
@@ -421,7 +482,7 @@ enum PriceCommands {
 
 #[derive(Debug, Subcommand)]
 enum PayCommands {
-    /// Prepare a memo-bound TNK treasury deposit.
+    /// Prepare a TNK treasury deposit intent.
     Tnk(PayTnkArgs),
     /// Buy credits via Stripe hosted checkout.
     Stripe(PayRailArgs),
@@ -429,11 +490,11 @@ enum PayCommands {
 
 #[derive(Debug, Subcommand)]
 enum DepositCommands {
-    /// Prepare a memo-bound TNK treasury deposit.
+    /// Prepare a TNK treasury deposit intent.
     Tnk(PayTnkArgs),
     /// Buy credits via Stripe hosted checkout.
     Stripe(PayRailArgs),
-    /// Build unsigned TAP approve+deposit calldata for an external wallet.
+    /// Prepare a TAP approve+deposit transaction plan.
     Tap(DepositTapArgs),
     /// Show pending/confirmed deposit state from the contract ledger.
     Status(DepositStatusArgs),
@@ -441,14 +502,14 @@ enum DepositCommands {
 
 #[derive(Debug, Subcommand)]
 enum WalletCommands {
-    /// Show the local wallet public key, Trac address, and keypair path.
+    /// Show the local wallet public key plus Trac and Ethereum addresses.
     Show(WalletShowArgs),
     /// Reveal the restorable mnemonic after explicit confirmation.
     Backup(WalletBackupArgs),
     /// Reveal the restorable mnemonic after explicit confirmation.
     #[command(name = "export-mnemonic", alias = "export")]
     ExportMnemonic(WalletBackupArgs),
-    /// Import a wallet from a BIP-39 mnemonic.
+    /// Import a wallet from a BIP-39 mnemonic and optional Ethereum key.
     Import(WalletImportArgs),
     /// Re-encrypt the wallet with a new password.
     Passwd(WalletPasswdArgs),
@@ -505,6 +566,14 @@ struct WalletImportArgs {
     /// BIP-39 mnemonic to import.
     #[arg(long)]
     mnemonic: String,
+
+    /// Existing Ethereum private key to store with the local wallet.
+    #[arg(long, conflicts_with = "ethereum_mnemonic")]
+    ethereum_private_key: Option<String>,
+
+    /// Existing Ethereum mnemonic to derive and store with the local wallet.
+    #[arg(long, conflicts_with = "ethereum_private_key")]
+    ethereum_mnemonic: Option<String>,
 
     /// Overwrite an existing keypair.json.
     #[arg(long)]
@@ -811,8 +880,8 @@ struct ConfigMaxPriceArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Persistent default max-bid in integer micro-USD. Omit to inspect.
-    mu: Option<u64>,
+    /// Persistent default max-bid in integer atto-USD. Omit to inspect.
+    au: Option<MoneyAu>,
 
     /// Remove the persistent max-price ceiling.
     #[arg(long)]
@@ -894,6 +963,22 @@ struct UpArgs {
     /// Also start provider serving for the first feasible admin-created enclave.
     #[arg(long)]
     provider: bool,
+
+    /// Admin-created enclave id, or model id, for the supervised provider to serve.
+    #[arg(long)]
+    provider_enclave: Option<String>,
+
+    /// Comma-separated admin-created enclave ids/model ids for supervised multi-model serving.
+    #[arg(long, value_name = "A,B,C")]
+    enclaves: Option<String>,
+
+    /// Compute the best fitting/priced admin enclave set after the peer is live, then add workers.
+    #[arg(long)]
+    auto_fit: bool,
+
+    /// Override llama.cpp GPU layer count for the supervised provider. 0 forces CPU/no-GPU.
+    #[arg(long)]
+    provider_gpu_layers: Option<u32>,
 
     /// Intercom/Pear network: mainnet, testnet1, local, or development. Defaults to config, env, or mainnet.
     #[arg(long)]
@@ -1018,9 +1103,9 @@ struct UseArgs {
     #[arg(long)]
     min_tok_s: Option<f64>,
 
-    /// Gateway-default user max-bid ceiling in µUSD. Overrides config for this gateway process.
+    /// Gateway-default user max-bid ceiling in canonical atto-USD. Overrides config for this gateway process.
     #[arg(long)]
-    max_price_mu: Option<u64>,
+    max_price_au: Option<MoneyAu>,
 
     /// Gateway-default maximum route wait in seconds. 0 keeps instant-fail behavior.
     #[arg(long)]
@@ -1381,7 +1466,7 @@ struct ReceiptsExportArgs {
 
     /// Prior cumulative operator fee before this epoch.
     #[arg(long, default_value_t = 0)]
-    prior_fee_cum_mu: u64,
+    prior_fee_cum_au: MoneyAu,
 
     /// Path to intercom/scripts/recompute-epoch-roots.mjs.
     #[arg(long, value_name = "PATH")]
@@ -1559,11 +1644,11 @@ struct PayTnkArgs {
     #[arg(long)]
     treasury_address: Option<String>,
 
-    /// Override TNK/USD rate in integer micro-USD per 1 TNK. Defaults to contract rate/latest.
+    /// Override TNK/USD rate in integer atto-USD per 1 TNK. Defaults to contract rate/latest.
     #[arg(long)]
-    tnk_usd_e6: Option<u64>,
+    tnk_usd_au: Option<MoneyAu>,
 
-    /// 32-byte hex nonce used with the wallet public key to derive the memo hash.
+    /// 32-byte hex nonce used with the wallet public key to derive the deposit binding.
     #[arg(long)]
     nonce: Option<String>,
 
@@ -1574,6 +1659,10 @@ struct PayTnkArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
+
+    /// Exact keypair.json path for the local Trac wallet. Overrides config.toml and --peer-store-name.
+    #[arg(long, value_name = "PATH")]
+    keypair: Option<PathBuf>,
 
     /// Intercom peer store name under <home>/stores when config.toml has no identity store.
     #[arg(long, default_value = "main")]
@@ -1622,12 +1711,11 @@ struct PayTnkArgs {
 
 #[derive(Debug, Parser)]
 struct DepositTapArgs {
-    /// External Ethereum wallet address that will send approve+deposit.
-    #[arg(long)]
-    from: String,
+    #[command(flatten)]
+    wallet: WalletLocatorArgs,
 
     /// TAP amount to deposit, for example 10 or 10.25.
-    #[arg(long)]
+    #[arg(long, alias = "amount")]
     amount_tap: Option<String>,
 
     /// TAP amount as a raw 18-decimal integer wei string.
@@ -1638,7 +1726,7 @@ struct DepositTapArgs {
     #[arg(long)]
     token: Option<String>,
 
-    /// TAP KnowledgePool contract address. Defaults to env/local addresses file.
+    /// TAP MayhemInferencePool contract address. Defaults to env/local addresses file.
     #[arg(long)]
     pool: Option<String>,
 
@@ -1650,7 +1738,15 @@ struct DepositTapArgs {
     #[arg(long, value_name = "PATH")]
     addresses: Option<PathBuf>,
 
-    /// Print machine-readable calldata.
+    /// Ethereum JSON-RPC URL for TAP balance checks, simulation, and broadcast.
+    #[arg(long = "rpc-url", alias = "eth-rpc")]
+    rpc_url: Option<String>,
+
+    /// Broadcast after the gas precheck and simulation pass. Without this, only dry-run.
+    #[arg(long)]
+    confirm: bool,
+
+    /// Print a machine-readable local signing report.
     #[arg(long)]
     json: bool,
 }
@@ -1677,12 +1773,12 @@ struct DepositStatusArgs {
     #[arg(long)]
     who: Option<String>,
 
-    /// Ledger rail to inspect. Defaults to tnk for --memo-hash, tap for --eth-tx-hash, otherwise fiat.
+    /// Ledger rail to inspect. Defaults to tnk for --deposit-binding, tap for --eth-tx-hash, otherwise fiat.
     #[arg(long, value_enum)]
     rail: Option<GatewayLedgerRail>,
 
-    /// TNK deposit memo hash to check for a pending intent.
-    #[arg(long)]
+    /// TNK deposit binding hash to check for a pending intent.
+    #[arg(long = "deposit-binding", alias = "memo-hash")]
     memo_hash: Option<String>,
 
     /// TAP escrow transaction hash to check for admin-oracle confirmation.
@@ -1693,15 +1789,15 @@ struct DepositStatusArgs {
     #[arg(long)]
     log_index: Option<u64>,
 
-    /// Balance threshold in mu_usd that counts as confirmed.
+    /// Balance threshold in au_usd that counts as confirmed.
     #[arg(long)]
-    target_mu: Option<u64>,
+    target_au: Option<MoneyAu>,
 
-    /// Wait until --target-mu is reached.
+    /// Wait until --target-au is reached.
     #[arg(long)]
     wait: bool,
 
-    /// Maximum seconds to wait for --target-mu.
+    /// Maximum seconds to wait for --target-au.
     #[arg(long, default_value_t = 900)]
     timeout_seconds: u64,
 
@@ -1740,7 +1836,7 @@ struct WithdrawArgs {
     #[arg(long)]
     eth_rpc: Option<String>,
 
-    /// TAP KnowledgePool contract address. Defaults to env/local addresses file.
+    /// TAP MayhemInferencePool contract address. Defaults to env/local addresses file.
     #[arg(long)]
     pool: Option<String>,
 
@@ -1809,6 +1905,10 @@ struct DisputeArgs {
     #[arg(long)]
     reason: String,
 
+    /// Ledger rail whose balance supplied the dispute bond.
+    #[arg(long, value_enum, default_value_t = GatewayLedgerRail::Fiat)]
+    rail: GatewayLedgerRail,
+
     /// Provider public key, when this dispute names a provider.
     #[arg(long)]
     provider: Option<String>,
@@ -1873,11 +1973,11 @@ struct FraudProofSubmitArgs {
 
     /// Amount claimed in the epoch commit for this receipt.
     #[arg(long)]
-    claimed_mu_owed_cum: u64,
+    claimed_au_owed_cum: MoneyAu,
 
     /// Previous cumulative owed amount for the session, if any.
     #[arg(long)]
-    previous_mu_owed_cum: Option<u64>,
+    previous_au_owed_cum: Option<MoneyAu>,
 }
 
 #[derive(Debug, Parser)]
@@ -1920,6 +2020,14 @@ struct FraudProofChallengeArgs {
     /// Stop after this many matching challenges in one scan.
     #[arg(long)]
     max_challenges: Option<usize>,
+
+    /// Age threshold for unresolved dispute alerts emitted by the watcher.
+    #[arg(long, default_value_t = 3 * 24 * 60 * 60)]
+    dispute_aging_seconds: u64,
+
+    /// Optional webhook URL for dispute alerts emitted by the watcher.
+    #[arg(long)]
+    dispute_alert_webhook_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -2186,6 +2294,10 @@ struct RulesReviewArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
+
+    /// Exact keypair.json path for the local Trac wallet. Overrides config.toml and --peer-store-name.
+    #[arg(long, value_name = "PATH")]
+    keypair: Option<PathBuf>,
 
     /// Intercom peer store name under <home>/stores when config.toml is absent.
     #[arg(long, default_value = "main")]
@@ -2844,6 +2956,25 @@ enum AdminPayoutConfirmKind {
     FeeSweep,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum AdminBanTargetType {
+    Provider,
+    Device,
+    Fingerprint,
+    Committer,
+}
+
+impl AdminBanTargetType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Device => "device",
+            Self::Fingerprint => "fingerprint",
+            Self::Committer => "committer",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 struct AdminTxArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
@@ -2857,6 +2988,10 @@ struct AdminTxArgs {
     /// Intercom peer store name under <home>/stores when config.toml has no identity store.
     #[arg(long, default_value = "main")]
     peer_store_name: String,
+
+    /// Exact admin keypair.json path. Overrides config.toml and --peer-store-name for signing.
+    #[arg(long, value_name = "PATH")]
+    keypair: Option<PathBuf>,
 
     /// Password for the encrypted admin keypair.json. Empty by default.
     #[arg(long)]
@@ -2873,6 +3008,150 @@ struct AdminTxArgs {
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Clone, Parser)]
+struct AdminReadArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AdminDisputesListArgs {
+    #[command(flatten)]
+    read: AdminReadArgs,
+
+    /// Only show unresolved disputes.
+    #[arg(long)]
+    open: bool,
+
+    /// Override current Unix seconds for deterministic age display.
+    #[arg(long)]
+    now: Option<u64>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminBanListArgs {
+    #[command(flatten)]
+    read: AdminReadArgs,
+
+    /// Restrict to one ban record type.
+    #[arg(long = "type", value_enum)]
+    target_type: Option<AdminBanTargetType>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminDisputesShowArgs {
+    #[command(flatten)]
+    read: AdminReadArgs,
+
+    /// Dispute id to inspect.
+    #[arg(value_name = "ID")]
+    dispute_id: u64,
+
+    /// Override current Unix seconds for deterministic age display.
+    #[arg(long)]
+    now: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum AdminDisputeOutcome {
+    /// The opener's dispute is upheld: refund the opener bond and mark provider fault.
+    Upheld,
+    /// The opener's dispute is rejected: forfeit the opener bond.
+    Rejected,
+    /// Neither side is at fault: refund the opener bond without provider-fault reputation.
+    NoFault,
+}
+
+impl AdminDisputeOutcome {
+    fn contract_outcome(self) -> &'static str {
+        match self {
+            Self::Upheld => "provider_fault",
+            Self::Rejected => "opener_fault",
+            Self::NoFault => "no_fault",
+        }
+    }
+
+    fn deposit_action(self) -> &'static str {
+        match self {
+            Self::Rejected => "forfeit",
+            Self::Upheld | Self::NoFault => "refund",
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+struct AdminDisputesResolveArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Dispute id to resolve.
+    #[arg(value_name = "ID")]
+    dispute_id: u64,
+
+    /// Human adjudication outcome.
+    #[arg(long, value_enum)]
+    outcome: AdminDisputeOutcome,
+
+    /// Human-readable rationale. Stored as a BLAKE3 rationale hash.
+    #[arg(long)]
+    reason: Option<String>,
+
+    /// Precomputed BLAKE3 rationale hash.
+    #[arg(long)]
+    rationale_hash: Option<String>,
+
+    /// Contract timestamp/slot. Defaults to current Unix seconds.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// Do not slash provider held earnings when --outcome upheld.
+    #[arg(long)]
+    no_slash: bool,
+
+    /// Slash beneficiary. Defaults to the dispute opener when the contract slashes.
+    #[arg(long)]
+    beneficiary: Option<String>,
+
+    /// Required for the real submit after reviewing --submit --sim output.
+    #[arg(long)]
+    sim_reviewed: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AdminDisputesWatchArgs {
+    #[command(flatten)]
+    read: AdminReadArgs,
+
+    /// Keep polling for new/aging disputes.
+    #[arg(long)]
+    watch: bool,
+
+    /// Poll interval while --watch is active.
+    #[arg(long, default_value_t = 60)]
+    poll_interval_seconds: u64,
+
+    /// Age threshold for an unresolved dispute alert.
+    #[arg(long, default_value_t = 3 * 24 * 60 * 60)]
+    aging_seconds: u64,
+
+    /// Override current Unix seconds for deterministic one-shot output.
+    #[arg(long)]
+    now: Option<u64>,
+
+    /// Optional webhook URL that receives the same dispute alert bundle as JSON.
+    #[arg(long)]
+    webhook_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -2920,11 +3199,15 @@ struct AdminSetModelRefArgs {
     #[arg(long)]
     model: String,
 
-    /// JSON array of {unit,per_unit_mu,granularity} reference rates.
+    /// Model class for the reference price, e.g. text-generation, embedding, stt, tts, or image-generation.
+    #[arg(long, default_value = "text-generation")]
+    model_class: String,
+
+    /// JSON array of {unit,per_unit_au,granularity} reference rates.
     #[arg(long)]
     rate_map_json: Option<String>,
 
-    /// Path to a JSON array of {unit,per_unit_mu,granularity} reference rates.
+    /// Path to a JSON array of {unit,per_unit_au,granularity} reference rates.
     #[arg(long, value_name = "PATH")]
     rate_map_file: Option<PathBuf>,
 
@@ -3050,6 +3333,100 @@ struct AdminRegisterEnclaveArgs {
 }
 
 #[derive(Debug, Parser)]
+struct AdminUpdateEnclaveArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    enclave_id: String,
+
+    #[arg(long)]
+    model_class: Option<String>,
+
+    #[arg(long)]
+    backend: Option<String>,
+
+    #[arg(long)]
+    artifact_root: Option<String>,
+
+    #[arg(long)]
+    artifact_root_kind: Option<String>,
+
+    /// Hugging Face artifact repo in namespace/name form.
+    #[arg(long)]
+    artifact_repo: Option<String>,
+
+    /// Hugging Face artifact git commit revision.
+    #[arg(long)]
+    artifact_revision: Option<String>,
+
+    /// Hugging Face artifact path inside the repo.
+    #[arg(long)]
+    artifact_path: Option<String>,
+
+    /// Optional JSON object for artifact sidecars.
+    #[arg(long)]
+    artifact_sidecars_json: Option<String>,
+
+    /// Path to a JSON object containing artifact sidecars.
+    #[arg(long, value_name = "PATH")]
+    artifact_sidecars_file: Option<PathBuf>,
+
+    #[arg(long)]
+    source_sha256: Option<String>,
+
+    #[arg(long)]
+    manifest_hash: Option<String>,
+
+    #[arg(long)]
+    att_tier: Option<u8>,
+
+    #[arg(long)]
+    quant: Option<String>,
+
+    #[arg(long)]
+    binary_hash: Option<String>,
+
+    /// JSON object for enclave caps, e.g. '{"tools":true,"json":true,"ctx":8192}'.
+    #[arg(long)]
+    caps_json: Option<String>,
+
+    /// Path to a JSON file containing enclave caps.
+    #[arg(long, value_name = "PATH")]
+    caps_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminSetEnclaveMinTierArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    enclave_id: String,
+
+    #[arg(long)]
+    min_att_tier: u8,
+
+    #[arg(long)]
+    submitted_epoch: u64,
+
+    #[arg(long)]
+    effective_epoch: u64,
+
+    /// Wall-clock seconds used to select the active notice-window parameter.
+    #[arg(long)]
+    submitted_at: u64,
+
+    /// Precomputed BLAKE3 reason hash.
+    #[arg(long)]
+    reason_hash: Option<String>,
+
+    /// Plaintext reason to hash locally with BLAKE3.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Parser)]
 struct AdminRetireEnclaveArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -3103,21 +3480,21 @@ struct AdminSetPriceArgs {
     #[arg(long)]
     enclave_id: String,
 
-    /// JSON array of {unit,per_unit_mu,granularity} rates.
+    /// JSON array of {unit,per_unit_au,granularity} rates.
     #[arg(long)]
     rate_map_json: Option<String>,
 
-    /// Path to a JSON array of {unit,per_unit_mu,granularity} rates.
+    /// Path to a JSON array of {unit,per_unit_au,granularity} rates.
     #[arg(long, value_name = "PATH")]
     rate_map_file: Option<PathBuf>,
 
-    /// Fixed per-request price in integer micro-USD.
+    /// Fixed per-request price in integer atto-USD.
     #[arg(long, default_value_t = 0)]
-    per_req_mu: u64,
+    per_req_au: MoneyAu,
 
-    /// Minimum session price in integer micro-USD.
+    /// Minimum session price in integer atto-USD.
     #[arg(long, default_value_t = 0)]
-    min_session_mu: u64,
+    min_session_au: MoneyAu,
 
     /// Contract timestamp/slot at which the new price becomes active.
     #[arg(long)]
@@ -3136,16 +3513,16 @@ struct AdminPriceSeedArgs {
     /// Admin-created enclave id to seed.
     enclave_id: String,
 
-    /// Seed P0 in integer micro-USD per 1K input and output tokens.
-    p0_mu: u64,
+    /// Seed P0 in integer atto-USD per 1K input and output tokens.
+    p0_au: MoneyAu,
 
-    /// Fixed per-request price in integer micro-USD.
+    /// Fixed per-request price in integer atto-USD.
     #[arg(long, default_value_t = 0)]
-    per_req_mu: u64,
+    per_req_au: MoneyAu,
 
-    /// Minimum session price in integer micro-USD.
+    /// Minimum session price in integer atto-USD.
     #[arg(long, default_value_t = 0)]
-    min_session_mu: u64,
+    min_session_au: MoneyAu,
 
     /// Contract timestamp/slot at which the seed becomes active. Defaults to now.
     #[arg(long)]
@@ -3254,7 +3631,57 @@ struct AdminBanProviderArgs {
     #[arg(long)]
     provider: String,
 
+    /// Optional Tier-2+ platform device key to burn with the provider wallet.
+    #[arg(long)]
+    device_key: Option<String>,
+
+    /// Optional Tier-1 hardware fingerprint to flag on future rejoins.
+    #[arg(long)]
+    hardware_fingerprint: Option<String>,
+
     /// Precomputed reason hash.
+    #[arg(long)]
+    reason_hash: Option<String>,
+
+    /// Plaintext reason to hash locally with BLAKE3.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminUnbanArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Ban target to clear going forward.
+    target: String,
+
+    /// Ban record type.
+    #[arg(long = "type", value_enum)]
+    target_type: AdminBanTargetType,
+
+    /// Precomputed BLAKE3 reason hash.
+    #[arg(long)]
+    reason_hash: Option<String>,
+
+    /// Plaintext reason to hash locally with BLAKE3.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminDeviceRebindArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Platform secure-element device key.
+    device_key: String,
+
+    /// Replacement provider wallet.
+    #[arg(long = "to")]
+    provider: String,
+
+    /// Precomputed BLAKE3 reason hash.
     #[arg(long)]
     reason_hash: Option<String>,
 
@@ -3312,9 +3739,9 @@ struct AdminRateOracleArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    /// TNK/USD rate in integer micro-USD per 1 TNK.
+    /// TNK/USD rate in integer atto-USD per 1 TNK.
     #[arg(long)]
-    tnk_usd_e6: u64,
+    tnk_usd_au: MoneyAu,
 
     /// Oracle source label accepted by the contract.
     #[arg(long, value_enum)]
@@ -3330,9 +3757,9 @@ struct AdminTapRateOracleArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    /// TAP/USD policy rate in integer micro-USD per 1 TAP.
+    /// TAP/USD policy rate in integer atto-USD per 1 TAP.
     #[arg(long)]
-    tap_usd_e6: u64,
+    tap_usd_au: MoneyAu,
 
     /// Oracle source label accepted by the contract.
     #[arg(long, value_enum)]
@@ -3364,7 +3791,7 @@ struct AdminTnkSettlementArgs {
     #[arg(long)]
     at: Option<u64>,
 
-    /// Treasury MSB address that will author the batch transfer.
+    /// Treasury MSB address that will author the settlement transfers.
     #[arg(long)]
     treasury_address: Option<String>,
 
@@ -3372,17 +3799,17 @@ struct AdminTnkSettlementArgs {
     #[arg(long)]
     operator_tnk_address: Option<String>,
 
-    /// MSB network for the treasury batch. Defaults from the treasury address.
+    /// MSB network for the treasury transfers. Defaults from the treasury address.
     #[arg(long)]
     msb_network: Option<String>,
 
-    /// Broadcast the planned MSB batch through the local Pear MSB app. Requires --submit.
+    /// Broadcast the planned MSB transfers through the local Pear MSB app. Requires --submit.
     #[arg(long)]
     submit_transfer: bool,
 
-    /// Use an already-broadcast 64-hex MSB batch transaction hash for evidence.
-    #[arg(long)]
-    msb_tx_hash: Option<String>,
+    /// Use already-broadcast 64-hex MSB transfer hashes for evidence, in output order.
+    #[arg(long = "msb-tx-hash", value_delimiter = ',')]
+    msb_tx_hashes: Vec<String>,
 
     /// Maximum seconds to wait for MSB account sync and validator connection.
     #[arg(long, default_value_t = 180)]
@@ -3392,7 +3819,7 @@ struct AdminTnkSettlementArgs {
     #[arg(long, default_value_t = 3)]
     msb_transfer_max_retries: u64,
 
-    /// Refuse transfer retry unless the treasury balance before broadcast matches this decimal TNK value.
+    /// Refuse transfer retry unless the treasury balance before the first broadcast matches this decimal TNK value.
     #[arg(long)]
     expected_treasury_balance_before: Option<String>,
 }
@@ -3402,7 +3829,8 @@ struct AdminTnkDepositArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    #[arg(long)]
+    /// TNK deposit binding hash produced by the signed user intent.
+    #[arg(long = "deposit-binding", alias = "memo-hash")]
     memo_hash: String,
 
     /// Deposited TNK amount as 18-decimal integer string.
@@ -3484,9 +3912,9 @@ struct AdminFiatDepositArgs {
     #[arg(long)]
     who: String,
 
-    /// Credited amount in integer micro-USD.
+    /// Credited amount in integer atto-USD.
     #[arg(long)]
-    mu: u64,
+    au: MoneyAu,
 
     /// Hash of the external checkout/payment reference.
     #[arg(long)]
@@ -3519,9 +3947,9 @@ struct AdminFiatChargebackArgs {
     #[arg(long)]
     who: String,
 
-    /// Disputed amount in integer micro-USD.
+    /// Disputed amount in integer atto-USD.
     #[arg(long)]
-    mu: u64,
+    au: MoneyAu,
 
     /// Hash of the original external checkout/payment reference.
     #[arg(long)]
@@ -3566,9 +3994,9 @@ struct AdminPayoutConfirmArgs {
     #[arg(long)]
     who: String,
 
-    /// Confirmed amount in integer micro-USD.
+    /// Confirmed amount in canonical atto-USD.
     #[arg(long)]
-    mu: u64,
+    au: MoneyAu,
 
     /// TNK payout amount as 18-decimal integer string. Required for TNK payouts.
     #[arg(long)]
@@ -3651,27 +4079,27 @@ struct AdminEpochApplyArgs {
     #[arg(long, value_name = "PATH")]
     recomputed_file: Option<PathBuf>,
 
-    /// JSON array of {user,mu} debits.
+    /// JSON array of {user,au} debits.
     #[arg(long)]
     debits_json: Option<String>,
 
-    /// Path to a JSON array of {user,mu} debits.
+    /// Path to a JSON array of {user,au} debits.
     #[arg(long, value_name = "PATH")]
     debits_file: Option<PathBuf>,
 
-    /// JSON array of {provider,gross_mu} earnings.
+    /// JSON array of {provider,gross_au} earnings.
     #[arg(long)]
     earnings_json: Option<String>,
 
-    /// Path to a JSON array of {provider,gross_mu} earnings.
+    /// Path to a JSON array of {provider,gross_au} earnings.
     #[arg(long, value_name = "PATH")]
     earnings_file: Option<PathBuf>,
 
-    /// JSON array of {enclave_id,demand_mu,session_count} market usage.
+    /// JSON array of {enclave_id,demand_au,session_count} market usage.
     #[arg(long)]
     market_usage_json: Option<String>,
 
-    /// Path to a JSON array of {enclave_id,demand_mu,session_count} market usage.
+    /// Path to a JSON array of {enclave_id,demand_au,session_count} market usage.
     #[arg(long, value_name = "PATH")]
     market_usage_file: Option<PathBuf>,
 
@@ -3836,8 +4264,8 @@ struct ProviderMinAskSetArgs {
     /// Market target: default, enclave id, model id, or model:T<tier>.
     target: String,
 
-    /// Local provider floor in integer micro-USD. 0 accepts the admin market price.
-    mu: u64,
+    /// Local provider floor in integer atto-USD. 0 accepts the admin market price.
+    au: MoneyAu,
 
     /// Print a machine-readable report.
     #[arg(long)]
@@ -3850,6 +4278,10 @@ struct ProviderLimitsGetArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
+    /// Read limits for one admin enclave/model worker instead of the global defaults.
+    #[arg(long)]
+    enclave: Option<String>,
+
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
@@ -3860,6 +4292,10 @@ struct ProviderLimitsSetArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
+
+    /// Restrict these local protection limits to one admin enclave/model worker.
+    #[arg(long)]
+    enclave: Option<String>,
 
     /// Local hard cap for concurrently accepted direct sessions.
     #[arg(long)]
@@ -4003,6 +4439,101 @@ struct ProviderRoomLeaveArgs {
 }
 
 #[derive(Clone, Debug, Parser)]
+struct ProviderServePlanArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Path to catalog/models.json. Defaults to the admin catalog anchored on the ledger.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Path to the detached catalog signature JSON.
+    #[arg(long, value_name = "PATH")]
+    signature_path: Option<PathBuf>,
+
+    /// Directory containing catalog maintainer public keys.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, whisper.cpp, or piper.
+    #[arg(long, default_value = "auto")]
+    engine_backend: String,
+
+    /// Override llama.cpp GPU layer count. 0 forces CPU/no-GPU.
+    #[arg(long)]
+    gpu_layers: Option<u32>,
+
+    /// Run hwprobe against a deterministic reference profile.
+    #[arg(long)]
+    fixture: Option<String>,
+
+    /// Path used for disk free-space and write-throughput probes.
+    #[arg(long, value_name = "PATH")]
+    disk_path: Option<PathBuf>,
+
+    /// Skip the disk write-throughput benchmark.
+    #[arg(long)]
+    skip_disk_bench: bool,
+
+    /// Maximum context tokens this provider commits to serve for text-generation enclaves.
+    #[arg(long)]
+    ctx: Option<u64>,
+
+    /// Memory reserve kept free before model/KV feasibility math, e.g. 4GB or 15%.
+    #[arg(long, value_name = "GB|%")]
+    memory_reserve: Option<String>,
+
+    /// Print a machine-readable auto-fit report.
+    #[arg(long)]
+    json: bool,
+
+    /// Development-only: load a local catalog fixture without verifying its detached signature.
+    #[arg(long, hide = true)]
+    dev_skip_catalog_verify: bool,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct ProviderServeAddArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Admin-created enclave id, or model id, for the live worker to serve.
+    enclave: String,
+
+    /// Override llama.cpp GPU layer count. Defaults to provider.gpu_layers config if set.
+    #[arg(long)]
+    gpu_layers: Option<u32>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct ProviderServeRemoveArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Enclave/model id, or supervisor child name, to remove.
+    target: String,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Debug, Parser)]
 struct ProviderStartArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -4070,6 +4601,10 @@ struct ProviderStartArgs {
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
+    /// Override llama.cpp GPU layer count. 0 forces CPU/no-GPU.
+    #[arg(long)]
+    gpu_layers: Option<u32>,
+
     /// Run hwprobe against a deterministic reference profile.
     #[arg(long)]
     fixture: Option<String>,
@@ -4102,9 +4637,9 @@ struct ProviderStartArgs {
     #[arg(long, default_value_t = 1)]
     heartbeat_count: u32,
 
-    /// Provider floor for accepted sessions in µUSD. 0 accepts the current market price.
+    /// Provider floor for accepted sessions in atto-USD. 0 accepts the current market price.
     #[arg(long, default_value_t = 0)]
-    min_ask_mu: u64,
+    min_ask_au: MoneyAu,
 
     /// Maximum context tokens this provider commits to serve for this enclave.
     #[arg(long)]
@@ -4126,9 +4661,9 @@ struct ProviderStartArgs {
     #[arg(long, default_value_t = 0)]
     accept_rate_per_minute: u32,
 
-    /// Local serving budget per period in µUSD owed. 0 means unlimited.
+    /// Local serving budget per period in atto-USD owed. 0 means unlimited.
     #[arg(long, default_value_t = 0)]
-    serve_budget_mu: u64,
+    serve_budget_au: MoneyAu,
 
     /// Local serving budget per period in total receipt usage units. 0 means unlimited.
     #[arg(long, default_value_t = 0)]
@@ -4234,6 +4769,10 @@ struct WalletInfo {
     public_key: String,
     address: Option<String>,
     derivation_path: Option<String>,
+    ethereum_address: Option<String>,
+    ethereum_derivation_path: Option<String>,
+    ethereum_source: Option<String>,
+    ethereum_private_key: Option<String>,
     mnemonic: Option<String>,
 }
 
@@ -4241,6 +4780,12 @@ struct WalletInfo {
 struct WalletSeedOutput {
     public_key: String,
     signing_seed_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EthereumKeyOutput {
+    address: String,
+    private_key: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -4255,19 +4800,8 @@ struct MsbTransferOutput {
     validator_connections: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct MsbBatchTransferOutput {
-    ok: bool,
-    network: String,
-    from: String,
-    outputs: Vec<MsbBatchTransferOutputEntry>,
-    tx_hash: String,
-    before_balance: String,
-    validator_connections: u64,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct MsbBatchTransferOutputEntry {
+struct MsbSettlementTransferOutput {
     to: String,
     amount: String,
 }
@@ -4332,15 +4866,19 @@ struct ConfigNetwork {
 #[derive(Debug, Deserialize)]
 struct ConfigProvider {
     engine_backend: Option<String>,
-    min_ask: Option<BTreeMap<String, u64>>,
+    gpu_layers: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_money_au_map")]
+    min_ask: Option<BTreeMap<String, MoneyAu>>,
     limits: Option<ConfigProviderLimits>,
+    enclave_limits: Option<BTreeMap<String, ConfigProviderLimits>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ConfigProviderLimits {
     max_sessions: Option<u32>,
     accept_rate_per_minute: Option<u32>,
-    serve_budget_mu: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_money_au")]
+    serve_budget_au: Option<MoneyAu>,
     serve_budget_units: Option<u64>,
     serve_budget_period_seconds: Option<u64>,
     memory_reserve: Option<String>,
@@ -4349,7 +4887,8 @@ struct ConfigProviderLimits {
 
 #[derive(Debug, Deserialize)]
 struct ConfigUser {
-    max_price_mu: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_money_au")]
+    max_price_au: Option<MoneyAu>,
     max_wait_seconds: Option<u64>,
     min_ctx: Option<u64>,
 }
@@ -4357,6 +4896,40 @@ struct ConfigUser {
 #[derive(Debug, Deserialize)]
 struct ConfigRole {
     mode: Option<String>,
+}
+
+fn deserialize_optional_money_au<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<MoneyAu>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .as_deref()
+        .map(parse_decimal_money_au)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_money_au_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BTreeMap<String, MoneyAu>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<BTreeMap<String, String>>::deserialize(deserializer)?;
+    value
+        .map(|map| {
+            map.into_iter()
+                .map(|(key, value)| {
+                    parse_decimal_money_au(&value)
+                        .map(|au| (key, au))
+                        .map_err(serde::de::Error::custom)
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -4484,6 +5057,11 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
         ProviderCommands::Drain(args) => provider_drain(args).await,
         ProviderCommands::Earnings(args) => provider_earnings(args).await,
         ProviderCommands::Start(args) => provider_start(*args).await,
+        ProviderCommands::Serve { command } => match command {
+            ProviderServeCommands::Plan(args) => provider_serve_plan(args).await,
+            ProviderServeCommands::Add(args) => provider_serve_add(args).await,
+            ProviderServeCommands::Remove(args) => provider_serve_remove(args).await,
+        },
         ProviderCommands::Join(args) => provider_join(args).await,
         ProviderCommands::Leave(args) => provider_leave(args).await,
         ProviderCommands::Stop(args) => provider_stop(args).await,
@@ -4545,6 +5123,11 @@ fn provider_friendly_error(error: &anyhow::Error) -> String {
             "Mayhem could not unlock the provider credentials; check the wallet password, keypair path, and local bridge token.",
         );
     }
+    if lower.contains("binary hash") || lower.contains("measured enclave binary") {
+        return detail(
+            "This Mayhem binary does not match the admin-signed enclave; update or rebuild Mayhem, then retry.",
+        );
+    }
     if lower.contains("hash")
         && (lower.contains("does not match")
             || lower.contains("mismatch")
@@ -4594,11 +5177,6 @@ fn provider_friendly_error(error: &anyhow::Error) -> String {
     if lower.contains("no open admin-created canonical rooms") {
         return detail(
             "No canonical room is open for this admin enclave; ask the admin to open a room before serving.",
-        );
-    }
-    if lower.contains("binary hash") || lower.contains("measured enclave binary") {
-        return detail(
-            "This Mayhem binary does not match the admin-signed enclave; update or rebuild Mayhem, then retry.",
         );
     }
     detail("Provider setup could not complete.")
@@ -4758,9 +5336,16 @@ async fn wallet_import(args: WalletImportArgs) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let password = args.wallet.wallet_password.clone().unwrap_or_default();
-    let wallet = create_wallet(&keypair_path, &password, Some(&args.mnemonic), true)
-        .await
-        .with_context(|| format!("importing wallet {}", keypair_path.display()))?;
+    let wallet = create_wallet(
+        &keypair_path,
+        &password,
+        Some(&args.mnemonic),
+        true,
+        args.ethereum_private_key.as_deref(),
+        args.ethereum_mnemonic.as_deref(),
+    )
+    .await
+    .with_context(|| format!("importing wallet {}", keypair_path.display()))?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&wallet)?);
@@ -4842,10 +5427,19 @@ fn confirm_wallet_backup_reveal(yes: bool) -> Result<()> {
 fn print_wallet_show(wallet: &WalletInfo) {
     println!("Public key: {}", wallet.public_key);
     if let Some(address) = wallet.address.as_deref() {
-        println!("Address: {address}");
+        println!("Trac address: {address}");
+    }
+    if let Some(address) = wallet.ethereum_address.as_deref() {
+        println!("Ethereum address: {address}");
     }
     if let Some(derivation_path) = wallet.derivation_path.as_deref() {
-        println!("Derivation path: {derivation_path}");
+        println!("Trac derivation path: {derivation_path}");
+    }
+    if let Some(derivation_path) = wallet.ethereum_derivation_path.as_deref() {
+        println!("Ethereum derivation path: {derivation_path}");
+    }
+    if let Some(source) = wallet.ethereum_source.as_deref() {
+        println!("Ethereum key source: {source}");
     }
     println!("Keypair: {}", wallet.keypair_path);
 }
@@ -4856,6 +5450,13 @@ fn print_wallet_backup(wallet: &WalletInfo) {
         println!("Mnemonic: {mnemonic}");
         println!(
             "Restore command: mayhem wallet import --keypair {} --mnemonic '<mnemonic>'",
+            wallet.keypair_path
+        );
+    }
+    if let Some(private_key) = wallet.ethereum_private_key.as_deref() {
+        println!("Ethereum private key: {private_key}");
+        println!(
+            "Restore Ethereum key with: mayhem wallet import --keypair {} --mnemonic '<mnemonic>' --ethereum-private-key '<0x-private-key>'",
             wallet.keypair_path
         );
     }
@@ -4897,17 +5498,21 @@ async fn rules_review(args: RulesReviewArgs) -> Result<()> {
         .and_then(|config| config.identity.as_ref())
         .and_then(|identity| identity.store_name.clone())
         .unwrap_or_else(|| args.peer_store_name.clone());
-    let keypair_path = config
-        .as_ref()
-        .and_then(|config| config.identity.as_ref())
-        .and_then(|identity| identity.keypair_path.as_ref())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home.join("stores")
-                .join(&store_name)
-                .join("db")
-                .join("keypair.json")
-        });
+    let keypair_path = if let Some(path) = args.keypair.clone() {
+        absolutize(path)?
+    } else {
+        config
+            .as_ref()
+            .and_then(|config| config.identity.as_ref())
+            .and_then(|identity| identity.keypair_path.as_ref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                home.join("stores")
+                    .join(&store_name)
+                    .join("db")
+                    .join("keypair.json")
+            })
+    };
     let password = args.wallet_password.clone().unwrap_or_default();
     let wallet = inspect_wallet(&keypair_path, &password).await?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
@@ -5051,7 +5656,7 @@ struct CatalogListModel {
     tier: String,
     min_app_version: Option<String>,
     license: String,
-    price_ref_mu: CatalogListPrice,
+    price_ref_au: CatalogListPrice,
     caps: CatalogListCaps,
     requirements: CatalogListRequirements,
     adapter: catalog::CatalogAdapter,
@@ -5334,11 +5939,11 @@ fn catalog_list_model(
         tier: model.tier.clone(),
         min_app_version: model.min_app_version.clone(),
         license: model.provenance.license.clone(),
-        price_ref_mu: CatalogListPrice {
-            denom: model.price_ref_mu.denom.clone(),
+        price_ref_au: CatalogListPrice {
+            denom: model.price_ref_au.denom.clone(),
             rate_map: text_generation_rate_map(
-                model.price_ref_mu.in_per_1k,
-                model.price_ref_mu.out_per_1k,
+                model.price_ref_au.in_per_1k,
+                model.price_ref_au.out_per_1k,
             ),
         },
         caps: CatalogListCaps {
@@ -5621,6 +6226,7 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         downloads_dir: None,
         hf_token_file: None,
         engine_backend: "auto".to_owned(),
+        gpu_layers: None,
         fixture: None,
         disk_path: None,
         skip_disk_bench: true,
@@ -5629,13 +6235,13 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         sim: false,
         no_heartbeat: true,
         heartbeat_count: 1,
-        min_ask_mu: 0,
+        min_ask_au: 0,
         ctx: None,
         memory_reserve: None,
         disk_reserve: None,
         max_sessions: None,
         accept_rate_per_minute: 0,
-        serve_budget_mu: 0,
+        serve_budget_au: 0,
         serve_budget_units: 0,
         serve_budget_period_seconds: 86_400,
         serve_sessions: false,
@@ -6005,8 +6611,8 @@ fn print_catalog_list_report(report: &CatalogListReport) {
         );
         println!(
             "  price ref: {} {}",
-            model.price_ref_mu.denom,
-            format_rate_map(&model.price_ref_mu.rate_map)
+            model.price_ref_au.denom,
+            format_rate_map(&model.price_ref_au.rate_map)
         );
         if let Some(min_app_version) = model.min_app_version.as_deref() {
             println!("  min app version: Mayhem >= {min_app_version}");
@@ -6132,8 +6738,8 @@ fn format_rate_map(rate_map: &[RateMapEntry]) -> String {
         .into_iter()
         .map(|entry| {
             format!(
-                "{}={}/{}mu",
-                entry.unit, entry.per_unit_mu, entry.granularity
+                "{}={}/{}au",
+                entry.unit, entry.per_unit_au, entry.granularity
             )
         })
         .collect::<Vec<_>>()
@@ -11499,6 +12105,8 @@ fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> St
 
 async fn admin(command: AdminCommands) -> Result<()> {
     match &command {
+        AdminCommands::Disputes { command } => return admin_disputes(command).await,
+        AdminCommands::Ban { command } => return admin_ban(command).await,
         AdminCommands::EpochApply(args) => return run_admin_epoch_apply_feature(args).await,
         AdminCommands::TnkDeposit(args) => {
             return run_admin_deposit_feature(
@@ -11544,7 +12152,7 @@ async fn admin(command: AdminCommands) -> Result<()> {
         }
         AdminCommands::PayoutConfirm(_) => {
             bail!(
-                "payout-confirm is retired; use TNK tnk-settlement batch evidence, TAP claim-proof tools, or fiat paygate settlement"
+                "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or fiat paygate settlement"
             );
         }
         _ => {}
@@ -11564,6 +12172,519 @@ async fn admin(command: AdminCommands) -> Result<()> {
     };
     ensure_admin_command_signatures(tx_args, &mut value).await?;
     run_admin_command(tx_args, tx_type, value, schedule_meta).await
+}
+
+async fn admin_disputes(command: &AdminDisputeCommands) -> Result<()> {
+    match command {
+        AdminDisputeCommands::List(args) => admin_disputes_list(args).await,
+        AdminDisputeCommands::Show(args) => admin_disputes_show(args).await,
+        AdminDisputeCommands::Resolve(args) => admin_disputes_resolve(args).await,
+        AdminDisputeCommands::Watch(args) => admin_disputes_watch(args).await,
+    }
+}
+
+async fn admin_ban(command: &AdminBanCommands) -> Result<()> {
+    match command {
+        AdminBanCommands::List(args) => admin_ban_list(args).await,
+    }
+}
+
+async fn admin_read_rpc(args: &AdminReadArgs) -> Result<(String, PeerRpcClient)> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    Ok((rpc_url.clone(), PeerRpcClient::new(&rpc_url)?))
+}
+
+async fn admin_ban_list(args: &AdminBanListArgs) -> Result<()> {
+    let (rpc_url, rpc) = admin_read_rpc(&args.read).await?;
+    let wanted = args.target_type.map(AdminBanTargetType::as_str);
+    let mut records = Vec::new();
+    let prefixes = [
+        ("provider", "ban/provider/"),
+        ("device", "ban/device/"),
+        ("fingerprint", "ban/fingerprint/"),
+        ("committer", "committer/ban/"),
+    ];
+    for (target_type, prefix) in prefixes {
+        if wanted.is_some_and(|wanted| wanted != target_type) {
+            continue;
+        }
+        for entry in read_prefix_entries(&rpc, prefix).await? {
+            let target = entry
+                .key
+                .strip_prefix(prefix)
+                .unwrap_or(entry.key.as_str())
+                .to_owned();
+            records.push(json!({
+                "type": target_type,
+                "target": target,
+                "key": entry.key,
+                "record": entry.value,
+            }));
+        }
+    }
+    records.sort_by(|left, right| {
+        let left_key = left.get("key").and_then(Value::as_str).unwrap_or("");
+        let right_key = right.get("key").and_then(Value::as_str).unwrap_or("");
+        left_key.cmp(right_key)
+    });
+    let count = records.len();
+    let report = json!({
+        "ok": true,
+        "action": "admin.ban.list",
+        "rpc_url": rpc_url,
+        "type": wanted,
+        "count": count,
+        "records": records,
+    });
+    if args.read.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if count == 0 {
+        println!("No ban records found.");
+    } else {
+        println!("Ban records:");
+        for record in report["records"].as_array().into_iter().flatten() {
+            let status = record["record"]
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            println!(
+                "- {} {} {}",
+                record["type"].as_str().unwrap_or("unknown"),
+                short_hash(record["target"].as_str().unwrap_or("")),
+                status
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn admin_disputes_list(args: &AdminDisputesListArgs) -> Result<()> {
+    let (rpc_url, rpc) = admin_read_rpc(&args.read).await?;
+    let now = args.now.unwrap_or(unix_epoch_seconds()?);
+    let disputes = read_dispute_records(&rpc).await?;
+    let records = disputes
+        .iter()
+        .filter(|record| !args.open || record.get("status").and_then(Value::as_str) == Some("open"))
+        .map(|record| dispute_summary(record, now))
+        .collect::<Vec<_>>();
+    let report = json!({
+        "ok": true,
+        "rpc_url": rpc_url,
+        "open_only": args.open,
+        "now": now,
+        "count": records.len(),
+        "disputes": records,
+    });
+    if args.read.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_dispute_list_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn admin_disputes_show(args: &AdminDisputesShowArgs) -> Result<()> {
+    if args.dispute_id == 0 {
+        bail!("dispute id must be positive");
+    }
+    let (rpc_url, rpc) = admin_read_rpc(&args.read).await?;
+    let key = format!("disp/{}", args.dispute_id);
+    let record = read_state_value(&rpc, &key)
+        .await?
+        .with_context(|| format!("dispute #{} not found", args.dispute_id))?;
+    let now = args.now.unwrap_or(unix_epoch_seconds()?);
+    let report = json!({
+        "ok": true,
+        "rpc_url": rpc_url,
+        "key": key,
+        "summary": dispute_summary(&record, now),
+        "dispute": record,
+    });
+    if args.read.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_dispute_show_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn admin_disputes_resolve(args: &AdminDisputesResolveArgs) -> Result<()> {
+    if args.tx.submit && !args.tx.sim && !args.sim_reviewed {
+        bail!(
+            "real dispute resolution requires reviewing `mayhem admin disputes resolve ... --submit --sim` first, then rerun with --sim-reviewed"
+        );
+    }
+    let value = admin_dispute_resolve_payload(args)?;
+    let compact_command = serde_json::to_string(&value)?;
+    let copy_paste = format!(
+        "/tx --command {} --sim 1",
+        shell_single_quote(&compact_command)
+    );
+    let mut report = json!({
+        "ok": true,
+        "submitted": false,
+        "tx_type": "disputeResolve",
+        "dispute_id": args.dispute_id,
+        "outcome": format!("{:?}", args.outcome).to_ascii_lowercase(),
+        "command": value,
+        "copy_paste": {
+            "intercom_sim": copy_paste,
+        },
+    });
+
+    if args.tx.submit {
+        let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        let config = read_mayhem_config(&home)?;
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+        let wallet_password = args.tx.wallet_password.as_deref().unwrap_or("");
+        let wallet = resolve_cli_wallet_with_keypair(
+            &home,
+            config.as_ref(),
+            args.tx.keypair.as_deref(),
+            &args.tx.peer_store_name,
+            wallet_password,
+        )
+        .await?;
+        let keypair_path = PathBuf::from(&wallet.keypair_path);
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let before = read_state_value(&rpc, &format!("disp/{}", args.dispute_id)).await?;
+        let submitted = submit_contract_command(
+            &rpc,
+            &keypair_path,
+            wallet_password,
+            &wallet,
+            "disputeResolve",
+            report["command"].clone(),
+            args.tx.sim,
+        )
+        .await?;
+        report["submitted"] = json!(true);
+        report["sim"] = json!(args.tx.sim);
+        report["rpc_url"] = json!(rpc_url);
+        report["wallet"] = json!({
+            "public_key": wallet.public_key,
+            "keypair_path": wallet.keypair_path,
+        });
+        report["before"] = before.unwrap_or(Value::Null);
+        report["tx"] = submitted;
+        if !args.tx.sim {
+            let key = format!("disp/{}", args.dispute_id);
+            report["resolved_state"] = wait_for_state(&rpc, &key, |value| {
+                value.get("status").and_then(Value::as_str) == Some("resolved")
+                    && value
+                        .get("resolution_hash")
+                        .and_then(Value::as_str)
+                        .is_some_and(|hash| is_hex_len(hash, 64))
+            })
+            .await?;
+        }
+    }
+
+    if args.tx.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_dispute_resolve_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn admin_disputes_watch(args: &AdminDisputesWatchArgs) -> Result<()> {
+    if args.watch && args.poll_interval_seconds == 0 {
+        bail!("--poll-interval-seconds must be positive when --watch is set");
+    }
+    let (rpc_url, rpc) = admin_read_rpc(&args.read).await?;
+    let client = reqwest::Client::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        let now = args.now.unwrap_or(unix_epoch_seconds()?);
+        let alerts = scan_dispute_alerts(&rpc, now, args.aging_seconds, &mut seen).await?;
+        let webhook = if let Some(url) = args.webhook_url.as_deref() {
+            Some(send_dispute_alert_webhook(&client, url, &alerts).await?)
+        } else {
+            None
+        };
+        let report = json!({
+            "ok": true,
+            "rpc_url": rpc_url,
+            "now": now,
+            "aging_seconds": args.aging_seconds,
+            "alert_count": alerts.len(),
+            "alerts": alerts,
+            "webhook": webhook,
+        });
+        if args.read.json {
+            if args.watch {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        } else {
+            print_dispute_alert_report(&report)?;
+        }
+        if !args.watch {
+            break;
+        }
+        sleep(Duration::from_secs(args.poll_interval_seconds)).await;
+    }
+    Ok(())
+}
+
+async fn read_dispute_records(rpc: &PeerRpcClient) -> Result<Vec<Value>> {
+    let mut records = Vec::new();
+    if let Some(next) = read_state_value(rpc, "disp/next")
+        .await?
+        .and_then(|value| value.get("next").and_then(Value::as_u64))
+    {
+        for id in 1..next {
+            if let Some(record) = read_state_value(rpc, &format!("disp/{id}")).await? {
+                if record.get("type").and_then(Value::as_str) == Some("dispute") {
+                    records.push(record);
+                }
+            }
+        }
+    } else {
+        records = read_prefix_entries(rpc, "disp/")
+            .await?
+            .into_iter()
+            .filter(|entry| entry.key != "disp/next")
+            .filter_map(|entry| {
+                (entry.value.get("type").and_then(Value::as_str) == Some("dispute"))
+                    .then_some(entry.value)
+            })
+            .collect();
+    }
+    records.sort_by_key(|record| dispute_record_id(record).unwrap_or(u64::MAX));
+    Ok(records)
+}
+
+fn dispute_record_id(record: &Value) -> Option<u64> {
+    record.get("dispute_id").and_then(Value::as_u64)
+}
+
+fn dispute_record_age_seconds(record: &Value, now: u64) -> Option<u64> {
+    record
+        .get("at")
+        .and_then(Value::as_u64)
+        .map(|at| now.saturating_sub(at))
+}
+
+fn dispute_summary(record: &Value, now: u64) -> Value {
+    json!({
+        "dispute_id": dispute_record_id(record),
+        "status": record.get("status").and_then(Value::as_str),
+        "age_seconds": dispute_record_age_seconds(record, now),
+        "rail": record.get("rail").and_then(Value::as_str),
+        "opened_by": record.get("opened_by").and_then(Value::as_str),
+        "provider": record.get("provider").and_then(Value::as_str),
+        "counterparty": record.get("counterparty").and_then(Value::as_str),
+        "enclave_id": record.get("enclave_id").and_then(Value::as_str),
+        "epoch": record.get("epoch").and_then(Value::as_u64),
+        "session_id": record.get("session_id").and_then(Value::as_str),
+        "reason": record.get("reason").and_then(Value::as_str),
+        "deposit_au": record.get("deposit_au").and_then(Value::as_u64),
+        "evidence_hash": record.get("evidence_hash").and_then(Value::as_str),
+        "dispute_hash": record.get("dispute_hash").and_then(Value::as_str),
+        "resolution_hash": record.get("resolution_hash").and_then(Value::as_str),
+    })
+}
+
+fn admin_dispute_resolve_payload(args: &AdminDisputesResolveArgs) -> Result<Value> {
+    if args.dispute_id == 0 {
+        bail!("dispute id must be positive");
+    }
+    if args.reason.is_some() && args.rationale_hash.is_some() {
+        bail!("pass only one of --reason or --rationale-hash");
+    }
+    let rationale_hash = args
+        .rationale_hash
+        .clone()
+        .or_else(|| {
+            args.reason
+                .as_ref()
+                .map(|reason| blake3::hash(reason.as_bytes()).to_hex().to_string())
+        })
+        .context("--reason or --rationale-hash is required")?;
+    if !is_hex_len(&rationale_hash, 64) {
+        bail!("--rationale-hash must be a 32-byte BLAKE3 hex digest");
+    }
+    let mut payload = json!({
+        "op": "dispute_resolve",
+        "dispute_id": args.dispute_id,
+        "outcome": args.outcome.contract_outcome(),
+        "deposit_action": args.outcome.deposit_action(),
+        "rationale_hash": rationale_hash.to_ascii_lowercase(),
+        "at": args.at.unwrap_or(unix_epoch_seconds()?),
+    });
+    if args.outcome == AdminDisputeOutcome::Upheld && !args.no_slash {
+        payload["slash"] = json!(true);
+    }
+    if let Some(beneficiary) = args.beneficiary.as_deref() {
+        payload["beneficiary"] = json!(beneficiary);
+    }
+    Ok(payload)
+}
+
+async fn scan_dispute_alerts(
+    rpc: &PeerRpcClient,
+    now: u64,
+    aging_seconds: u64,
+    seen: &mut BTreeSet<u64>,
+) -> Result<Vec<Value>> {
+    let records = read_dispute_records(rpc).await?;
+    let mut alerts = Vec::new();
+    for record in records {
+        if record.get("status").and_then(Value::as_str) != Some("open") {
+            continue;
+        }
+        let id = dispute_record_id(&record).unwrap_or(0);
+        let summary = dispute_summary(&record, now);
+        if id != 0 && seen.insert(id) {
+            alerts.push(json!({
+                "kind": "new_dispute",
+                "level": "warning",
+                "message": format!("new Mayhem dispute #{id} is open"),
+                "dispute": summary,
+            }));
+        }
+        if aging_seconds > 0
+            && summary
+                .get("age_seconds")
+                .and_then(Value::as_u64)
+                .is_some_and(|age| age >= aging_seconds)
+        {
+            alerts.push(json!({
+                "kind": "aging_dispute",
+                "level": "critical",
+                "message": format!("Mayhem dispute #{id} has been open for at least {aging_seconds} seconds"),
+                "dispute": summary,
+            }));
+        }
+    }
+    Ok(alerts)
+}
+
+async fn send_dispute_alert_webhook(
+    client: &reqwest::Client,
+    url: &str,
+    alerts: &[Value],
+) -> Result<Value> {
+    if alerts.is_empty() {
+        return Ok(json!({ "sent": false, "reason": "no_alerts" }));
+    }
+    let response = client
+        .post(url)
+        .json(&json!({
+            "type": "mayhem_dispute_alerts",
+            "alerts": alerts,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("posting dispute alerts to {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("dispute alert webhook {url} returned HTTP {status}");
+    }
+    Ok(json!({
+        "sent": true,
+        "url": url,
+        "status": status.as_u16(),
+    }))
+}
+
+fn print_dispute_list_report(report: &Value) -> Result<()> {
+    println!("Mayhem disputes.");
+    println!("RPC: {}", report["rpc_url"].as_str().unwrap_or(""));
+    println!("Count: {}", report["count"].as_u64().unwrap_or(0));
+    println!("ID  STATUS    AGE(s)  RAIL  EPOCH  PROVIDER       ENCLAVE        REASON");
+    for item in report["disputes"].as_array().into_iter().flatten() {
+        println!(
+            "{:<3} {:<9} {:<7} {:<5} {:<6} {:<14} {:<14} {}",
+            item["dispute_id"].as_u64().unwrap_or(0),
+            item["status"].as_str().unwrap_or(""),
+            item["age_seconds"].as_u64().unwrap_or(0),
+            item["rail"].as_str().unwrap_or(""),
+            item["epoch"].as_u64().unwrap_or(0),
+            short_hash(item["provider"].as_str().unwrap_or("")),
+            short_hash(item["enclave_id"].as_str().unwrap_or("")),
+            item["reason"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+fn print_dispute_show_report(report: &Value) -> Result<()> {
+    let summary = &report["summary"];
+    println!(
+        "Dispute #{} ({})",
+        summary["dispute_id"].as_u64().unwrap_or(0),
+        summary["status"].as_str().unwrap_or("")
+    );
+    println!("RPC: {}", report["rpc_url"].as_str().unwrap_or(""));
+    println!(
+        "Age seconds: {}",
+        summary["age_seconds"].as_u64().unwrap_or(0)
+    );
+    println!("Opened by: {}", summary["opened_by"].as_str().unwrap_or(""));
+    println!("Provider: {}", summary["provider"].as_str().unwrap_or(""));
+    println!("Enclave: {}", summary["enclave_id"].as_str().unwrap_or(""));
+    println!(
+        "Evidence hash: {}",
+        summary["evidence_hash"].as_str().unwrap_or("")
+    );
+    println!("Full record:");
+    println!("{}", serde_json::to_string_pretty(&report["dispute"])?);
+    Ok(())
+}
+
+fn print_dispute_resolve_report(report: &Value) -> Result<()> {
+    println!("Admin dispute resolution ready.");
+    println!("Dispute: #{}", report["dispute_id"].as_u64().unwrap_or(0));
+    println!("Outcome: {}", report["outcome"].as_str().unwrap_or(""));
+    println!("Command JSON:");
+    println!("{}", serde_json::to_string_pretty(&report["command"])?);
+    println!("Copy/paste Intercom sim command:");
+    println!(
+        "{}",
+        report["copy_paste"]["intercom_sim"].as_str().unwrap_or("")
+    );
+    if report["submitted"].as_bool() == Some(true) {
+        if report["sim"].as_bool() == Some(true) {
+            println!("Submitted: false (--sim dry-run)");
+            println!("Simulated outcome:");
+        } else {
+            println!("Submitted: true");
+            println!("Resolved state:");
+        }
+        if let Some(tx) = report["tx"]["tx"].as_str() {
+            println!("Tx: {tx}");
+        }
+        if let Some(result) = report["tx"].get("result") {
+            println!("{}", serde_json::to_string_pretty(result)?);
+        }
+        if let Some(state) = report.get("resolved_state") {
+            println!("{}", serde_json::to_string_pretty(state)?);
+        }
+    } else {
+        println!("Submitted: false (run with --submit --sim first, then --submit --sim-reviewed)");
+    }
+    Ok(())
+}
+
+fn print_dispute_alert_report(report: &Value) -> Result<()> {
+    println!("Mayhem dispute alert scan.");
+    println!("RPC: {}", report["rpc_url"].as_str().unwrap_or(""));
+    println!("Alerts: {}", report["alert_count"].as_u64().unwrap_or(0));
+    for alert in report["alerts"].as_array().into_iter().flatten() {
+        println!(
+            "[{}] {}",
+            alert["level"].as_str().unwrap_or("info"),
+            alert["message"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
 }
 
 async fn run_admin_epoch_apply_feature(args: &AdminEpochApplyArgs) -> Result<()> {
@@ -11893,22 +13014,22 @@ fn contract_reputation_event_to_fold_event(entry: &PrefixStateEntry) -> Result<R
         .with_context(|| format!("{} missing kind", entry.key))?
     {
         "session_ok" => ReputationEventKind::SessionOk {
-            paid_mu: value
-                .get("paid_mu")
+            paid_au: value
+                .get("paid_au")
                 .and_then(Value::as_u64)
-                .with_context(|| format!("{} session_ok missing paid_mu", entry.key))?,
+                .with_context(|| format!("{} session_ok missing paid_au", entry.key))?,
         },
         "session_partial" => ReputationEventKind::SessionPartial {
-            paid_mu: value
-                .get("paid_mu")
+            paid_au: value
+                .get("paid_au")
                 .and_then(Value::as_u64)
-                .with_context(|| format!("{} session_partial missing paid_mu", entry.key))?,
+                .with_context(|| format!("{} session_partial missing paid_au", entry.key))?,
         },
         "session_fail" => ReputationEventKind::SessionFail {
-            max_spend_mu: value
-                .get("max_spend_mu")
+            max_spend_au: value
+                .get("max_spend_au")
                 .and_then(Value::as_u64)
-                .with_context(|| format!("{} session_fail missing max_spend_mu", entry.key))?,
+                .with_context(|| format!("{} session_fail missing max_spend_au", entry.key))?,
         },
         "probe_ok" => ReputationEventKind::ProbeOk,
         "probe_fail" => ReputationEventKind::ProbeFail,
@@ -12004,6 +13125,8 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::SetModelRef(args) => &args.tx,
         AdminCommands::PublishCatalog(args) => &args.tx,
         AdminCommands::RegisterEnclave(args) => &args.tx,
+        AdminCommands::UpdateEnclave(args) => &args.tx,
+        AdminCommands::SetEnclaveMinTier(args) => &args.tx,
         AdminCommands::RetireEnclave(args) => &args.tx,
         AdminCommands::OpenRoom(args) => &args.tx,
         AdminCommands::CloseRoom(args) => &args.tx,
@@ -12014,10 +13137,20 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::Fee { command } => match command {
             AdminFeeCommands::Set(args) => &args.tx,
         },
+        AdminCommands::Disputes { .. } => {
+            unreachable!("admin disputes are handled before admin_tx_args")
+        }
         AdminCommands::SetProviderPayout(args) => &args.tx,
         AdminCommands::SetProviderKyb(args) => &args.tx,
         AdminCommands::RevokeProviderKyb(args) => &args.tx,
         AdminCommands::BanProvider(args) => &args.tx,
+        AdminCommands::Ban { .. } => {
+            unreachable!("admin ban list is handled before admin_tx_args")
+        }
+        AdminCommands::Unban(args) => &args.tx,
+        AdminCommands::Device { command } => match command {
+            AdminDeviceCommands::Rebind(args) => &args.tx,
+        },
         AdminCommands::AuditorRegister(args) => &args.tx,
         AdminCommands::ReputationAnchor(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
@@ -12044,6 +13177,13 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::RegisterEnclave(args) => {
             Ok(("registerEnclave", admin_register_enclave_payload(args)?))
         }
+        AdminCommands::UpdateEnclave(args) => {
+            Ok(("updateEnclave", admin_update_enclave_payload(args)?))
+        }
+        AdminCommands::SetEnclaveMinTier(args) => Ok((
+            "setEnclaveMinTier",
+            admin_set_enclave_min_tier_payload(args)?,
+        )),
         AdminCommands::RetireEnclave(args) => Ok((
             "retireEnclave",
             json!({
@@ -12066,6 +13206,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::Fee { command } => match command {
             AdminFeeCommands::Set(args) => Ok(("setParams", admin_fee_set_payload(args)?)),
         },
+        AdminCommands::Disputes { .. } => {
+            bail!("admin disputes are handled outside generic paid admin commands")
+        }
         AdminCommands::SetProviderPayout(args) => Ok((
             "setProviderPayout",
             admin_set_provider_payout_payload(args)?,
@@ -12078,6 +13221,15 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             admin_revoke_provider_kyb_payload(args)?,
         )),
         AdminCommands::BanProvider(args) => Ok(("banProvider", admin_ban_provider_payload(args)?)),
+        AdminCommands::Ban { .. } => {
+            bail!("admin ban list is read-only and handled outside generic paid admin commands")
+        }
+        AdminCommands::Unban(args) => Ok(("unban", admin_unban_payload(args)?)),
+        AdminCommands::Device { command } => match command {
+            AdminDeviceCommands::Rebind(args) => {
+                Ok(("deviceRebind", admin_device_rebind_payload(args)?))
+            }
+        },
         AdminCommands::AuditorRegister(args) => {
             Ok(("auditorRegister", admin_auditor_register_payload(args)))
         }
@@ -12114,9 +13266,10 @@ async fn ensure_admin_command_signatures(args: &AdminTxArgs, value: &mut Value) 
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
     let wallet_password = args.wallet_password.as_deref().unwrap_or("");
-    let wallet = resolve_cli_wallet(
+    let wallet = resolve_cli_wallet_with_keypair(
         &home,
         config.as_ref(),
+        args.keypair.as_deref(),
         &args.peer_store_name,
         wallet_password,
     )
@@ -12162,6 +13315,7 @@ fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Result<Value> {
     let mut payload = json!({
         "op": "set_model_ref",
         "model_id": &args.model,
+        "model_class": &args.model_class,
         "rate_map": rate_map,
     });
     if let Some(source_hash) = &args.source_hash {
@@ -12289,6 +13443,130 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         payload["artifact_sidecars"] = json!(binding.artifact_sidecars);
     }
     Ok(payload)
+}
+
+fn admin_update_enclave_payload(args: &AdminUpdateEnclaveArgs) -> Result<Value> {
+    if let Some(att_tier) = args.att_tier {
+        validate_launch_enclave_attestation_tier(att_tier)?;
+    }
+
+    let mut payload = json!({
+        "op": "update_enclave",
+        "enclave_id": &args.enclave_id,
+    });
+    let mut changed = false;
+
+    changed |=
+        insert_optional_payload_string(&mut payload, "model_class", &args.model_class, false);
+    changed |= insert_optional_payload_string(&mut payload, "backend", &args.backend, false);
+    changed |=
+        insert_optional_payload_string(&mut payload, "artifact_root", &args.artifact_root, true);
+    changed |= insert_optional_payload_string(
+        &mut payload,
+        "artifact_root_kind",
+        &args.artifact_root_kind,
+        false,
+    );
+    changed |=
+        insert_optional_payload_string(&mut payload, "source_sha256", &args.source_sha256, true);
+    changed |=
+        insert_optional_payload_string(&mut payload, "manifest_hash", &args.manifest_hash, true);
+    changed |= insert_optional_payload_string(&mut payload, "quant", &args.quant, false);
+    changed |= insert_optional_payload_string(&mut payload, "binary_hash", &args.binary_hash, true);
+
+    if let Some(att_tier) = args.att_tier {
+        payload["att_tier"] = json!(att_tier);
+        changed = true;
+    }
+
+    match (
+        args.artifact_repo.as_ref(),
+        args.artifact_revision.as_ref(),
+        args.artifact_path.as_ref(),
+    ) {
+        (None, None, None) => {}
+        (Some(repo), Some(revision), Some(path)) => {
+            payload["artifact_source"] = json!({
+                "kind": "huggingface",
+                "repo": repo,
+                "revision": revision.to_ascii_lowercase(),
+                "path": path,
+            });
+            changed = true;
+        }
+        _ => bail!(
+            "pass all of --artifact-repo, --artifact-revision, and --artifact-path when updating artifact_source"
+        ),
+    }
+
+    if let Some(sidecars) = optional_json_arg_or_file(
+        args.artifact_sidecars_json.as_deref(),
+        args.artifact_sidecars_file.as_ref(),
+        "artifact sidecars",
+    )? {
+        if !sidecars.is_object() {
+            bail!("artifact sidecars JSON must be an object");
+        }
+        payload["artifact_sidecars"] = sidecars;
+        changed = true;
+    }
+
+    if let Some(mut caps) = optional_json_arg_or_file(
+        args.caps_json.as_deref(),
+        args.caps_file.as_ref(),
+        "enclave caps",
+    )? {
+        if !caps.is_object() {
+            bail!("enclave caps JSON must be an object");
+        }
+        if let Some(backend) = args.backend.as_deref() {
+            enforce_backend_caps(backend, &mut caps)?;
+        }
+        payload["caps"] = caps;
+        changed = true;
+    }
+
+    if !changed {
+        bail!("pass at least one enclave field to update");
+    }
+
+    Ok(payload)
+}
+
+fn admin_set_enclave_min_tier_payload(args: &AdminSetEnclaveMinTierArgs) -> Result<Value> {
+    validate_launch_enclave_attestation_tier(args.min_att_tier)?;
+    if args.effective_epoch <= args.submitted_epoch {
+        bail!("--effective-epoch must be after --submitted-epoch");
+    }
+    let reason_hash =
+        admin_required_reason_hash(args.reason_hash.as_deref(), args.reason.as_deref())?;
+    Ok(json!({
+        "op": "set_enclave_min_tier",
+        "enclave_id": &args.enclave_id,
+        "min_att_tier": args.min_att_tier,
+        "submitted_epoch": args.submitted_epoch,
+        "effective_epoch": args.effective_epoch,
+        "submitted_at": args.submitted_at,
+        "reason_hash": reason_hash,
+    }))
+}
+
+fn insert_optional_payload_string(
+    payload: &mut Value,
+    key: &str,
+    value: &Option<String>,
+    lowercase: bool,
+) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let stored = if lowercase {
+        value.to_ascii_lowercase()
+    } else {
+        value.clone()
+    };
+    payload[key] = json!(stored);
+    true
 }
 
 fn validate_launch_enclave_attestation_tier(att_tier: u8) -> Result<()> {
@@ -12593,8 +13871,8 @@ fn admin_set_price_payload(args: &AdminSetPriceArgs) -> Result<Value> {
         "op": "set_price",
         "enclave_id": &args.enclave_id,
         "rate_map": rate_map,
-        "per_req_mu": args.per_req_mu,
-        "min_session_mu": args.min_session_mu,
+        "per_req_au": money_au_json(args.per_req_au),
+        "min_session_au": money_au_json(args.min_session_au),
         "effective_at": args.effective_at,
     });
     if let Some(ctx_bracket) = &args.ctx_bracket {
@@ -12608,9 +13886,9 @@ fn admin_price_seed_payload(args: &AdminPriceSeedArgs) -> Result<Value> {
     let mut payload = json!({
         "op": "set_price",
         "enclave_id": &args.enclave_id,
-        "rate_map": text_generation_rate_map(args.p0_mu, args.p0_mu),
-        "per_req_mu": args.per_req_mu,
-        "min_session_mu": args.min_session_mu,
+        "rate_map": text_generation_rate_map(args.p0_au, args.p0_au),
+        "per_req_au": money_au_json(args.per_req_au),
+        "min_session_au": money_au_json(args.min_session_au),
         "effective_at": effective_at,
     });
     if let Some(ctx_bracket) = &args.ctx_bracket {
@@ -12728,8 +14006,8 @@ fn validate_rate_map_entries(
         if entry.granularity == 0 {
             bail!("{label} granularity must be positive");
         }
-        if !allow_zero_per_unit && entry.per_unit_mu == 0 {
-            bail!("{label} per_unit_mu must be positive");
+        if !allow_zero_per_unit && entry.per_unit_au == 0 {
+            bail!("{label} per_unit_au must be positive");
         }
     }
     Ok(())
@@ -12838,6 +14116,20 @@ fn admin_revoke_provider_kyb_payload(args: &AdminRevokeProviderKybArgs) -> Resul
     Ok(payload)
 }
 
+fn admin_required_reason_hash(reason_hash: Option<&str>, reason: Option<&str>) -> Result<String> {
+    if reason_hash.is_some() && reason.is_some() {
+        bail!("pass only one of --reason-hash or --reason");
+    }
+    let hash = reason_hash
+        .map(str::to_owned)
+        .or_else(|| reason.map(|reason| blake3::hash(reason.as_bytes()).to_hex().to_string()))
+        .context("pass --reason or --reason-hash so the admin action has an audit reason")?;
+    if !is_hex_len(&hash, 64) {
+        bail!("reason hash must be a 32-byte BLAKE3 hex digest");
+    }
+    Ok(hash.to_ascii_lowercase())
+}
+
 fn provider_kyb_message(value: &Value) -> String {
     let evidence = json!({
         "provider": value.get("provider").cloned().unwrap_or(Value::Null),
@@ -12864,10 +14156,53 @@ fn admin_ban_provider_payload(args: &AdminBanProviderArgs) -> Result<Value> {
         "op": "ban_provider",
         "provider": &args.provider,
     });
+    if let Some(device_key) = &args.device_key {
+        if !is_hex_len(device_key, 64) {
+            bail!("--device-key must be a 32-byte hex digest");
+        }
+        payload["device_key"] = json!(device_key.to_ascii_lowercase());
+    }
+    if let Some(fingerprint) = &args.hardware_fingerprint {
+        if !is_hex_len(fingerprint, 64) {
+            bail!("--hardware-fingerprint must be a 32-byte hex digest");
+        }
+        payload["hardware_fingerprint"] = json!(fingerprint.to_ascii_lowercase());
+    }
     if let Some(reason_hash) = reason_hash {
         payload["reason_hash"] = json!(reason_hash);
     }
     Ok(payload)
+}
+
+fn admin_unban_payload(args: &AdminUnbanArgs) -> Result<Value> {
+    if !is_hex_len(&args.target, 64) {
+        bail!("unban target must be a 32-byte hex digest/public key");
+    }
+    let reason_hash =
+        admin_required_reason_hash(args.reason_hash.as_deref(), args.reason.as_deref())?;
+    Ok(json!({
+        "op": "unban",
+        "target_type": args.target_type.as_str(),
+        "target": args.target.to_ascii_lowercase(),
+        "reason_hash": reason_hash,
+    }))
+}
+
+fn admin_device_rebind_payload(args: &AdminDeviceRebindArgs) -> Result<Value> {
+    if !is_hex_len(&args.device_key, 64) {
+        bail!("device key must be a 32-byte hex digest");
+    }
+    if !is_hex_len(&args.provider, 64) {
+        bail!("--to provider must be a 32-byte hex public key");
+    }
+    let reason_hash =
+        admin_required_reason_hash(args.reason_hash.as_deref(), args.reason.as_deref())?;
+    Ok(json!({
+        "op": "device_rebind",
+        "device_key": args.device_key.to_ascii_lowercase(),
+        "provider": args.provider.to_ascii_lowercase(),
+        "reason_hash": reason_hash,
+    }))
 }
 
 fn admin_auditor_register_payload(args: &AdminAuditorRegisterArgs) -> Value {
@@ -12881,7 +14216,7 @@ fn admin_auditor_register_payload(args: &AdminAuditorRegisterArgs) -> Value {
 fn admin_rate_oracle_payload(args: &AdminRateOracleArgs) -> Value {
     json!({
         "op": "rate_oracle",
-        "tnk_usd_e6": args.tnk_usd_e6,
+        "tnk_usd_au": money_au_json(args.tnk_usd_au),
         "source": args.source.as_str(),
         "ts": args.ts,
     })
@@ -12890,7 +14225,7 @@ fn admin_rate_oracle_payload(args: &AdminRateOracleArgs) -> Value {
 fn admin_tap_rate_oracle_payload(args: &AdminTapRateOracleArgs) -> Value {
     json!({
         "op": "tap_rate_oracle",
-        "tap_usd_e6": args.tap_usd_e6,
+        "tap_usd_au": money_au_json(args.tap_usd_au),
         "source": args.source.as_str(),
         "ts": args.ts,
     })
@@ -12910,14 +14245,14 @@ fn admin_tnk_settlement_payload(args: &AdminTnkSettlementArgs) -> Result<Value> 
 }
 
 async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Result<()> {
-    if args.submit_transfer && args.msb_tx_hash.is_some() {
+    if args.submit_transfer && !args.msb_tx_hashes.is_empty() {
         bail!("pass only one of --submit-transfer or --msb-tx-hash");
     }
     if args.submit_transfer && args.tx.sim {
         bail!("--submit-transfer cannot be combined with --sim");
     }
     if args.submit_transfer && !args.tx.submit {
-        bail!("--submit-transfer requires --submit so the MSB batch and contract evidence are submitted together");
+        bail!("--submit-transfer requires --submit so the MSB transfers and contract evidence are submitted together");
     }
     if args.msb_transfer_timeout_seconds == 0 {
         bail!("--msb-transfer-timeout-seconds must be positive");
@@ -12939,11 +14274,11 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
     let operator_tnk_address = resolve_tnk_operator_address(args.operator_tnk_address.as_deref())?;
     let network = resolve_tnk_msb_network(args.msb_network.as_deref(), &treasury_address)?;
-    let provided_msb_tx_hash = args
-        .msb_tx_hash
-        .as_deref()
-        .map(validate_msb_tx_hash)
-        .transpose()?;
+    let provided_msb_tx_hashes = args
+        .msb_tx_hashes
+        .iter()
+        .map(|hash| validate_msb_tx_hash(hash))
+        .collect::<Result<Vec<_>>>()?;
 
     let mut plan = build_tnk_settlement_plan(
         &rpc,
@@ -12952,29 +14287,39 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         &network,
         &treasury_address,
         &operator_tnk_address,
-        provided_msb_tx_hash.as_deref(),
+        if provided_msb_tx_hashes.is_empty() {
+            None
+        } else {
+            Some(provided_msb_tx_hashes.as_slice())
+        },
     )
     .await?;
 
     if plan.already_settled.is_none()
         && plan
             .payload
-            .get("msb_tx_hash")
-            .and_then(Value::as_str)
-            .is_none()
+            .get("msb_tx_hashes")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
         && args.tx.submit
         && !args.submit_transfer
     {
-        bail!("--submit requires --msb-tx-hash or --submit-transfer for TNK settlement evidence");
+        bail!("--submit requires one --msb-tx-hash per output or --submit-transfer for TNK settlement evidence");
     }
 
-    let mut msb_transfer = None;
+    let mut msb_transfers = Vec::new();
     if plan.already_settled.is_none() && args.submit_transfer {
         let wallet = resolve_cli_wallet(
             &home,
             config.as_ref(),
             &args.tx.peer_store_name,
             args.tx.wallet_password.as_deref().unwrap_or(""),
+        )
+        .await?;
+        let wallet = inspect_wallet_for_network_prefix(
+            Path::new(&wallet.keypair_path),
+            args.tx.wallet_password.as_deref().unwrap_or(""),
+            msb_network_address_prefix(&network)?,
         )
         .await?;
         if wallet.address.as_deref() != Some(&treasury_address) {
@@ -12985,34 +14330,58 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         }
         let keypair_path = PathBuf::from(wallet.keypair_path.clone());
         let (stores_directory, store_name) = msb_store_from_keypair_path(&keypair_path)?;
-        let transfer = submit_msb_batch_transfer(
-            &network,
-            &stores_directory,
-            &store_name,
-            &plan.msb_outputs,
-            args.msb_transfer_timeout_seconds,
-            args.msb_transfer_max_retries,
-            args.expected_treasury_balance_before.as_deref(),
-        )
-        .await?;
-        if transfer.from != treasury_address {
-            bail!(
-                "MSB batch was authored by {}, expected treasury {}",
-                transfer.from,
-                treasury_address
-            );
+        let mut hashes = Vec::with_capacity(plan.msb_outputs.len());
+        for (index, output) in plan.msb_outputs.iter().enumerate() {
+            let transfer = submit_msb_transfer(
+                &network,
+                &stores_directory,
+                &store_name,
+                &output.to,
+                &output.amount,
+                args.msb_transfer_timeout_seconds,
+                args.msb_transfer_max_retries,
+                (index == 0)
+                    .then(|| args.expected_treasury_balance_before.as_deref())
+                    .flatten(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "submitting MSB settlement transfer {} of {} to {}",
+                    index + 1,
+                    plan.msb_outputs.len(),
+                    output.to
+                )
+            })?;
+            if transfer.from != treasury_address {
+                bail!(
+                    "MSB transfer was authored by {}, expected treasury {}",
+                    transfer.from,
+                    treasury_address
+                );
+            }
+            if transfer.to != output.to || transfer.amount != output.amount {
+                bail!(
+                    "MSB transfer result does not match planned output {}",
+                    index + 1
+                );
+            }
+            hashes.push(transfer.tx_hash.clone());
+            msb_transfers.push(json!({
+                "output_index": index,
+                "transfer": transfer,
+            }));
         }
-        plan.payload["msb_tx_hash"] = json!(transfer.tx_hash.clone());
-        msb_transfer = Some(transfer);
+        plan.payload["msb_tx_hashes"] = json!(hashes);
     }
 
     let settlement_report = plan.payload.clone();
     let feature = if plan.already_settled.is_none()
         && plan
             .payload
-            .get("msb_tx_hash")
-            .and_then(Value::as_str)
-            .is_some()
+            .get("msb_tx_hashes")
+            .and_then(Value::as_array)
+            .is_some_and(|hashes| hashes.len() == plan.msb_outputs.len() && !hashes.is_empty())
     {
         Some(json!({
             "feature": "mayhem",
@@ -13078,15 +14447,22 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             shell_single_quote(&feature_json)
         )
     });
-    let msb_outputs_json = serde_json::to_string(&plan.msb_outputs)?;
-    let msb_transfer_command = format!(
-        "pear run --no-ask {} --transfer-helper batch-transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --outputs-json {} --timeout-seconds {} --max-retries {}",
-        shell_single_quote(&repo_path("intercom/trac/msb")?.display().to_string()),
-        shell_single_quote(&network),
-        shell_single_quote(&msb_outputs_json),
-        args.msb_transfer_timeout_seconds,
-        args.msb_transfer_max_retries
-    );
+    let msb_app_path = repo_path("intercom/trac/msb")?;
+    let msb_transfer_commands = plan
+        .msb_outputs
+        .iter()
+        .map(|output| {
+            format!(
+                "pear-runtime run {} --transfer-helper transfer --network {} --stores-directory <stores-dir> --store-name <store-name> --to {} --amount {} --timeout-seconds {} --max-retries {}",
+                shell_single_quote(&msb_app_path.display().to_string()),
+                shell_single_quote(&network),
+                shell_single_quote(&output.to),
+                shell_single_quote(&output.amount),
+                args.msb_transfer_timeout_seconds,
+                args.msb_transfer_max_retries
+            )
+        })
+        .collect::<Vec<_>>();
 
     let report = json!({
         "ok": true,
@@ -13102,12 +14478,12 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         "settlement": settlement_report,
         "feature": feature,
         "feature_result": feature_result,
-        "msb_transfer": msb_transfer,
+        "msb_transfers": msb_transfers,
         "msb_outputs": plan.msb_outputs,
         "skipped_providers": plan.skipped_providers,
         "copy_paste": {
             "submit_settlement": copy_paste_submit,
-            "msb_transfer_helper": msb_transfer_command,
+            "msb_transfer_helpers": msb_transfer_commands,
             "feature_rpc": feature_rpc_command,
         },
     });
@@ -13160,7 +14536,7 @@ fn admin_fiat_deposit_payload(args: &AdminFiatDepositArgs) -> Result<Value> {
         "op": "fiat_deposit",
         "rail": args.rail.as_str(),
         "who": &args.who,
-        "mu": args.mu,
+        "au": money_au_json(args.au),
         "ext_ref_hash": &args.ext_ref_hash,
         "fiat_currency": normalize_admin_fiat_currency(&args.fiat_currency)?,
         "fiat_amount_minor": args.fiat_amount_minor,
@@ -13177,7 +14553,7 @@ fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Result<Value
         "op": "fiat_chargeback",
         "rail": args.rail.as_str(),
         "who": &args.who,
-        "mu": args.mu,
+        "au": money_au_json(args.au),
         "ext_ref_hash": &args.ext_ref_hash,
         "dispute_ref_hash": &args.dispute_ref_hash,
         "fiat_currency": normalize_admin_fiat_currency(&args.fiat_currency)?,
@@ -13189,7 +14565,7 @@ fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Result<Value
 
 fn admin_payout_confirm_payload(_args: &AdminPayoutConfirmArgs) -> Result<Value> {
     bail!(
-        "payout-confirm is retired; use TNK tnk-settlement batch evidence, TAP claim-proof tools, or fiat paygate settlement"
+        "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or fiat paygate settlement"
     )
 }
 
@@ -13332,15 +14708,11 @@ fn deposit_feature_key(value: &Value) -> Result<String> {
             Ok(format!("dep/tap/{eth_tx_hash}/{log_index}/{digest}"))
         }
         "fiat_deposit" => {
-            let rail = value
-                .get("rail")
-                .and_then(Value::as_str)
-                .context("fiat_deposit feature missing rail")?;
             let ext_ref_hash = value
                 .get("ext_ref_hash")
                 .and_then(Value::as_str)
                 .context("fiat_deposit feature missing ext_ref_hash")?;
-            Ok(format!("dep/fiat/{rail}/{ext_ref_hash}/{digest}"))
+            Ok(format!("dep/fiat/{ext_ref_hash}"))
         }
         _ => bail!("unsupported deposit feature op {op}"),
     }
@@ -13499,9 +14871,10 @@ async fn run_admin_command(
         let config = read_mayhem_config(&home)?;
         let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
         let wallet_password = args.wallet_password.as_deref().unwrap_or("");
-        let wallet = resolve_cli_wallet(
+        let wallet = resolve_cli_wallet_with_keypair(
             &home,
             config.as_ref(),
+            args.keypair.as_deref(),
             &args.peer_store_name,
             wallet_password,
         )
@@ -13779,32 +15152,45 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
     println!("Operator: {}", report["operator_to"].as_str().unwrap_or(""));
     if !report["already_settled"].is_null() {
         println!("Already settled: true");
-        if let Some(hash) = report["already_settled"]["msb_tx_hash"].as_str() {
-            println!("MSB tx: {hash}");
+        let hashes = report["already_settled"]["msb_tx_hashes"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        if hashes > 0 {
+            println!("MSB tx hashes: {hashes}");
         }
         return Ok(());
     }
     println!("Already settled: false");
     if let Some(settlement) = report.get("settlement").filter(|value| !value.is_null()) {
         println!(
-            "Gross: {} mu_usd",
-            settlement["gross_mu"].as_u64().unwrap_or(0)
+            "Gross: {} au_usd",
+            settlement["gross_au"].as_str().unwrap_or("0")
         );
         println!(
-            "Providers: {} / provider_mu: {} / operator_fee_mu: {}",
+            "Providers: {} / provider_au: {} / operator_fee_au: {}",
             settlement["provider_count"].as_u64().unwrap_or(0),
-            settlement["provider_mu"].as_u64().unwrap_or(0),
-            settlement["operator_fee_mu"].as_u64().unwrap_or(0)
+            settlement["provider_au"].as_str().unwrap_or("0"),
+            settlement["operator_fee_au"].as_str().unwrap_or("0")
         );
         println!("TNK e18: {}", settlement["tnk_e18"].as_str().unwrap_or(""));
         println!(
             "Transfer root: {}",
             settlement["transfer_root"].as_str().unwrap_or("")
         );
-        if let Some(hash) = settlement["msb_tx_hash"].as_str() {
-            println!("MSB tx: {hash}");
+        if let Some(hashes) = settlement["msb_tx_hashes"].as_array() {
+            if hashes.is_empty() {
+                println!("MSB tx hashes: pending (dry plan only)");
+            } else {
+                println!("MSB tx hashes: {}", hashes.len());
+                for (index, hash) in hashes.iter().enumerate() {
+                    if let Some(hash) = hash.as_str() {
+                        println!("  {}: {}", index + 1, hash);
+                    }
+                }
+            }
         } else {
-            println!("MSB tx: pending (dry plan only)");
+            println!("MSB tx hashes: pending (dry plan only)");
         }
     }
     println!(
@@ -13831,13 +15217,15 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
             .as_str()
             .unwrap_or("")
     );
-    println!("Copy/paste Pear MSB batch helper command:");
-    println!(
-        "{}",
-        report["copy_paste"]["msb_transfer_helper"]
-            .as_str()
-            .unwrap_or("")
-    );
+    println!("Copy/paste Pear MSB transfer helper commands:");
+    for command in report["copy_paste"]["msb_transfer_helpers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        println!("{command}");
+    }
     if let Some(command) = report["copy_paste"]["feature_rpc"].as_str() {
         println!("Copy/paste feature RPC command:");
         println!("{command}");
@@ -13851,7 +15239,7 @@ fn shell_single_quote(value: &str) -> String {
 
 #[derive(Debug, Clone)]
 struct PayTnkRate {
-    tnk_usd_e6: u64,
+    tnk_usd_au: MoneyAu,
     source: String,
     ts: Option<u64>,
 }
@@ -13872,10 +15260,30 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         _ => {}
     }
 
+    let keypair_path = resolve_wallet_keypair_path(&args.wallet)?;
+    let password = args.wallet.wallet_password.clone().unwrap_or_default();
+    let wallet = inspect_wallet(&keypair_path, &password)
+        .await
+        .with_context(|| format!("reading wallet {}", keypair_path.display()))?;
+    let eth_key = ethereum_wallet_key(&keypair_path, &password)
+        .await
+        .with_context(|| {
+            format!(
+                "reading Ethereum account from wallet {}",
+                keypair_path.display()
+            )
+        })?;
+    if wallet.ethereum_address.as_deref() != Some(eth_key.address.as_str()) {
+        bail!(
+            "wallet Ethereum address {} does not match signing key {}",
+            wallet.ethereum_address.as_deref().unwrap_or("<missing>"),
+            eth_key.address
+        );
+    }
+
     let mut script_args = vec![
         "deposit".to_owned(),
-        "--from".to_owned(),
-        args.from.clone(),
+        "--local-wallet".to_owned(),
         "--json".to_owned(),
     ];
     if let Some(amount_tap) = &args.amount_tap {
@@ -13891,10 +15299,22 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         args.chain_id,
         args.addresses.as_deref(),
     );
+    if let Some(rpc_url) = &args.rpc_url {
+        script_args.extend(["--eth-rpc".to_owned(), rpc_url.clone()]);
+    }
+    if args.confirm {
+        script_args.push("--confirm".to_owned());
+    }
 
-    let report =
-        run_contracts_script_json("contracts/scripts/tap-calldata-builder.mjs", script_args)
-            .await?;
+    let report = run_contracts_script_json_with_env(
+        "contracts/scripts/tap-calldata-builder.mjs",
+        script_args,
+        [(
+            "MAYHEM_TAP_WALLET_PRIVATE_KEY".to_owned(),
+            eth_key.private_key,
+        )],
+    )
+    .await?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -13908,8 +15328,8 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     if args.poll_interval_ms == 0 {
         bail!("--poll-interval-ms must be positive");
     }
-    if args.wait && args.target_mu.is_none() {
-        bail!("--wait requires --target-mu");
+    if args.wait && args.target_au.is_none() {
+        bail!("--wait requires --target-au");
     }
 
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
@@ -13932,10 +15352,10 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
     let rail = deposit_status_rail(&args);
     let rail_name = rail.as_str();
     let before_balance = read_balance_record(&rpc, &who, rail_name).await?;
-    let before_mu = before_balance
-        .get("mu")
-        .and_then(Value::as_u64)
-        .context("normalized balance record missing mu")?;
+    let before_au = before_balance
+        .get("au")
+        .and_then(value_money_au)
+        .context("normalized balance record missing au")?;
 
     let credit_wait = if args.wait {
         Some(
@@ -13943,8 +15363,8 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
                 &rpc,
                 &who,
                 rail_name,
-                before_mu,
-                args.target_mu.expect("--wait checked target_mu"),
+                before_au,
+                args.target_au.expect("--wait checked target_au"),
                 Duration::from_secs(args.timeout_seconds),
                 Duration::from_millis(args.poll_interval_ms),
             )
@@ -13954,10 +15374,10 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         None
     };
     let balance = read_balance_record(&rpc, &who, rail_name).await?;
-    let current_mu = balance
-        .get("mu")
-        .and_then(Value::as_u64)
-        .context("normalized balance record missing mu")?;
+    let current_au = balance
+        .get("au")
+        .and_then(value_money_au)
+        .context("normalized balance record missing au")?;
     let pending_tnk = match args.memo_hash.as_deref() {
         Some(memo_hash) => read_state_value(&rpc, &format!("dep/pending/{memo_hash}")).await?,
         None => None,
@@ -13970,8 +15390,8 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         None => None,
     };
     let status = classify_deposit_status(
-        current_mu,
-        args.target_mu,
+        current_au,
+        args.target_au,
         pending_tnk.as_ref(),
         tap_seen.as_ref(),
     );
@@ -13981,13 +15401,13 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
         "rpc_url": rpc_url,
         "who": who,
         "rail": rail_name,
-        "target_mu": args.target_mu,
+        "target_au": args.target_au.map(money_au_json),
         "balance": balance,
         "credit": credit_wait.as_ref().map(|status| json!({
             "credited": status.credited,
-            "before_mu": status.before_mu,
-            "current_mu": status.current_mu,
-            "target_mu": status.target_mu,
+            "before_au": money_au_json(status.before_au),
+            "current_au": money_au_json(status.current_au),
+            "target_au": money_au_json(status.target_au),
             "waited_ms": status.waited_ms,
         })),
         "tnk": {
@@ -14009,9 +15429,9 @@ async fn deposit_status(args: DepositStatusArgs) -> Result<()> {
 
     if let Some(wait) = credit_wait.as_ref().filter(|status| !status.credited) {
         bail!(
-            "timed out waiting for target balance {} mu_usd; current balance {} mu_usd",
-            wait.target_mu,
-            wait.current_mu
+            "timed out waiting for target balance {} au_usd; current balance {} au_usd",
+            wait.target_au,
+            wait.current_au
         );
     }
     Ok(())
@@ -14115,10 +15535,10 @@ struct FraudProofChallengeCandidate {
     receipt_id: String,
     session_id: Option<String>,
     provider: Option<String>,
-    actual_mu: u64,
-    claimed_mu: u64,
-    claimed_mu_owed_cum: u64,
-    previous_mu_owed_cum: u64,
+    actual_au: MoneyAu,
+    claimed_au: MoneyAu,
+    claimed_au_owed_cum: MoneyAu,
+    previous_au_owed_cum: MoneyAu,
     committed_use_root: String,
     proof_hash: String,
     proof_bytes: usize,
@@ -14147,6 +15567,7 @@ async fn fraud_proof_challenge(args: FraudProofChallengeArgs) -> Result<()> {
         .timeout(Duration::from_secs(args.timeout_seconds))
         .build()?;
     let mut seen_submitted = BTreeSet::new();
+    let mut seen_dispute_alerts = BTreeSet::new();
     let mut scans = Vec::new();
 
     loop {
@@ -14164,6 +15585,18 @@ async fn fraud_proof_challenge(args: FraudProofChallengeArgs) -> Result<()> {
             candidates.retain(|candidate| seen_submitted.insert(candidate.proof_hash.clone()));
         }
         let submissions = submit_fraud_proof_candidates(&args.tx, &rpc_url, &candidates).await?;
+        let dispute_alerts = scan_dispute_alerts(
+            &rpc,
+            at,
+            args.dispute_aging_seconds,
+            &mut seen_dispute_alerts,
+        )
+        .await?;
+        let dispute_alert_webhook = if let Some(url) = args.dispute_alert_webhook_url.as_deref() {
+            Some(send_dispute_alert_webhook(&client, url, &dispute_alerts).await?)
+        } else {
+            None
+        };
         let scan = json!({
             "rpc_url": rpc_url.clone(),
             "gateway_url": if args.receipts_file.is_none() { Some(gateway_root.clone()) } else { None },
@@ -14177,6 +15610,8 @@ async fn fraud_proof_challenge(args: FraudProofChallengeArgs) -> Result<()> {
             "receipts_scanned": receipts.len(),
             "candidates": candidates,
             "submitted": submissions,
+            "dispute_alerts": dispute_alerts,
+            "dispute_alert_webhook": dispute_alert_webhook,
         });
         let should_stop = !args.watch
             || scan
@@ -14187,6 +15622,11 @@ async fn fraud_proof_challenge(args: FraudProofChallengeArgs) -> Result<()> {
                         .is_some_and(|max| candidates.len() >= max)
                 });
         scans.push(scan);
+        if args.watch && !args.tx.json {
+            if let Some(last) = scans.last() {
+                print_dispute_alerts_inline(last)?;
+            }
+        }
         if should_stop {
             break;
         }
@@ -14224,6 +15664,7 @@ fn dispute_payload(args: &DisputeArgs) -> Result<Value> {
     let mut payload = json!({
         "op": "dispute",
         "session_id": &args.session_id,
+        "rail": args.rail.as_str(),
         "reason": &args.reason,
         "at": args.at.unwrap_or(unix_epoch_seconds()?),
     });
@@ -14271,10 +15712,10 @@ fn fraud_proof_payload(args: &FraudProofSubmitArgs) -> Result<Value> {
         "at": args.at.unwrap_or(unix_epoch_seconds()?),
         "reason": &args.reason,
         "receipt": receipt,
-        "claimed_mu_owed_cum": args.claimed_mu_owed_cum,
+        "claimed_au_owed_cum": money_au_json(args.claimed_au_owed_cum),
     });
-    if let Some(previous) = args.previous_mu_owed_cum {
-        payload["previous_mu_owed_cum"] = json!(previous);
+    if let Some(previous) = args.previous_au_owed_cum {
+        payload["previous_au_owed_cum"] = money_au_json(previous);
     }
     Ok(payload)
 }
@@ -14337,10 +15778,10 @@ fn fraud_proof_candidates_from_values(
         if !commit_is_challengeable_over_credit(commit, effective_proof_epoch) {
             continue;
         }
-        let Some(claimed_mu) = commit
+        let Some(claimed_au) = commit
             .get("totals")
-            .and_then(|totals| totals.get("use_mu"))
-            .and_then(Value::as_u64)
+            .and_then(|totals| totals.get("use_au"))
+            .and_then(value_money_au)
         else {
             continue;
         };
@@ -14360,17 +15801,20 @@ fn fraud_proof_candidates_from_values(
             let Some(body) = envelope.get("body").and_then(Value::as_object) else {
                 continue;
             };
-            let actual_cum = body.get("mu_owed_cum").and_then(Value::as_u64).unwrap_or(0);
-            for previous_mu in previous_receipt_amounts(receipts, receipt) {
-                if previous_mu > actual_cum {
+            let actual_cum = body
+                .get("au_owed_cum")
+                .and_then(value_money_au)
+                .unwrap_or(0);
+            for previous_au in previous_receipt_amounts(receipts, receipt) {
+                if previous_au > actual_cum {
                     continue;
                 }
-                let claimed_mu_owed_cum = previous_mu.saturating_add(claimed_mu);
-                if claimed_mu_owed_cum <= actual_cum {
+                let claimed_au_owed_cum = previous_au.saturating_add(claimed_au);
+                if claimed_au_owed_cum <= actual_cum {
                     continue;
                 }
                 let claimed_envelope =
-                    receipt_envelope_with_mu_owed_cum(&envelope, claimed_mu_owed_cum);
+                    receipt_envelope_with_au_owed_cum(&envelope, claimed_au_owed_cum);
                 if usage_leaf_hash_from_envelope(&claimed_envelope)? != committed_use_root {
                     continue;
                 }
@@ -14381,8 +15825,8 @@ fn fraud_proof_candidates_from_values(
                     "at": at,
                     "reason": "over_credit",
                     "receipt": envelope.clone(),
-                    "claimed_mu_owed_cum": claimed_mu_owed_cum,
-                    "previous_mu_owed_cum": previous_mu,
+                    "claimed_au_owed_cum": money_au_json(claimed_au_owed_cum),
+                    "previous_au_owed_cum": money_au_json(previous_au),
                 });
                 let proof_hash = fraud_proof_hash_from_command(&command)?;
                 let proof_bytes = stable_json_len(&command)?;
@@ -14407,10 +15851,10 @@ fn fraud_proof_candidates_from_values(
                         .get("provider")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    actual_mu: actual_cum - previous_mu,
-                    claimed_mu,
-                    claimed_mu_owed_cum,
-                    previous_mu_owed_cum: previous_mu,
+                    actual_au: actual_cum - previous_au,
+                    claimed_au,
+                    claimed_au_owed_cum,
+                    previous_au_owed_cum: previous_au,
                     committed_use_root: committed_use_root.clone(),
                     proof_hash,
                     proof_bytes,
@@ -14442,9 +15886,9 @@ fn commit_is_challengeable_over_credit(commit: &Value, proof_epoch: u64) -> bool
             == Some(1)
         && commit
             .get("totals")
-            .and_then(|totals| totals.get("use_mu"))
-            .and_then(Value::as_u64)
-            .is_some_and(|mu| mu > 0)
+            .and_then(|totals| totals.get("use_au"))
+            .and_then(value_money_au)
+            .is_some_and(|au| au > 0)
         && commit
             .get("provisional_until_epoch")
             .and_then(Value::as_u64)
@@ -14470,7 +15914,7 @@ fn normalized_receipt_envelope(value: &Value) -> Option<Value> {
         "price_ver",
         "rules_ver",
         "usage",
-        "mu_owed_cum",
+        "au_owed_cum",
         "prompt_hash",
         "ts",
     ] {
@@ -14490,7 +15934,7 @@ fn normalized_receipt_envelope(value: &Value) -> Option<Value> {
     }))
 }
 
-fn previous_receipt_amounts(receipts: &[Value], receipt: &Value) -> BTreeSet<u64> {
+fn previous_receipt_amounts(receipts: &[Value], receipt: &Value) -> BTreeSet<MoneyAu> {
     let mut amounts = BTreeSet::from([0]);
     let Some(body) = receipt_body(receipt) else {
         return amounts;
@@ -14498,7 +15942,10 @@ fn previous_receipt_amounts(receipts: &[Value], receipt: &Value) -> BTreeSet<u64
     let Some(session_id) = body.get("session_id").and_then(Value::as_str) else {
         return amounts;
     };
-    let actual_cum = body.get("mu_owed_cum").and_then(Value::as_u64).unwrap_or(0);
+    let actual_cum = body
+        .get("au_owed_cum")
+        .and_then(value_money_au)
+        .unwrap_or(0);
     for other in receipts {
         let Some(other_body) = receipt_body(other) else {
             continue;
@@ -14506,19 +15953,19 @@ fn previous_receipt_amounts(receipts: &[Value], receipt: &Value) -> BTreeSet<u64
         if other_body.get("session_id").and_then(Value::as_str) != Some(session_id) {
             continue;
         }
-        if let Some(mu) = other_body.get("mu_owed_cum").and_then(Value::as_u64) {
-            if mu < actual_cum {
-                amounts.insert(mu);
+        if let Some(au) = other_body.get("au_owed_cum").and_then(value_money_au) {
+            if au < actual_cum {
+                amounts.insert(au);
             }
         }
     }
     amounts
 }
 
-fn receipt_envelope_with_mu_owed_cum(envelope: &Value, mu_owed_cum: u64) -> Value {
+fn receipt_envelope_with_au_owed_cum(envelope: &Value, au_owed_cum: MoneyAu) -> Value {
     let mut claimed = envelope.clone();
     if let Some(body) = claimed.get_mut("body").and_then(Value::as_object_mut) {
-        body.insert("mu_owed_cum".to_owned(), json!(mu_owed_cum));
+        body.insert("au_owed_cum".to_owned(), money_au_json(au_owed_cum));
     }
     claimed
 }
@@ -14553,14 +16000,14 @@ fn fraud_proof_hash_from_command(command: &Value) -> Result<String> {
             .get("receipt")
             .cloned()
             .context("fraud command missing receipt")?,
-        "claimed_mu_owed_cum": command
-            .get("claimed_mu_owed_cum")
+        "claimed_au_owed_cum": command
+            .get("claimed_au_owed_cum")
             .cloned()
-            .context("fraud command missing claimed_mu_owed_cum")?,
-        "previous_mu_owed_cum": command
-            .get("previous_mu_owed_cum")
+            .context("fraud command missing claimed_au_owed_cum")?,
+        "previous_au_owed_cum": command
+            .get("previous_au_owed_cum")
             .cloned()
-            .unwrap_or_else(|| json!(0)),
+            .unwrap_or_else(|| money_au_json(0)),
     });
     Ok(opaque_hash("mayhem-fraud-proof-v1", &value))
 }
@@ -14706,6 +16153,27 @@ fn print_fraud_proof_challenge_report(report: &Value) -> Result<()> {
             .map(Vec::len)
             .unwrap_or(0);
         println!("Submitted proofs: {submissions}");
+        print_dispute_alerts_inline(scan)?;
+    }
+    Ok(())
+}
+
+fn print_dispute_alerts_inline(scan: &Value) -> Result<()> {
+    let alerts = scan
+        .get("dispute_alerts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if alerts.is_empty() {
+        return Ok(());
+    }
+    println!("Dispute alerts: {}", alerts.len());
+    for alert in alerts {
+        println!(
+            "[{}] {}",
+            alert.get("level").and_then(Value::as_str).unwrap_or("info"),
+            alert.get("message").and_then(Value::as_str).unwrap_or("")
+        );
     }
     Ok(())
 }
@@ -14859,20 +16327,36 @@ fn push_tap_contract_args(
 }
 
 async fn run_contracts_script_json(relative_script: &str, args: Vec<String>) -> Result<Value> {
+    run_contracts_script_json_with_env(
+        relative_script,
+        args,
+        std::iter::empty::<(String, String)>(),
+    )
+    .await
+}
+
+async fn run_contracts_script_json_with_env<I>(
+    relative_script: &str,
+    args: Vec<String>,
+    envs: I,
+) -> Result<Value>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     let script = repo_path(relative_script)?;
     let node = env::var_os("MAYHEM_NODE_BIN").unwrap_or_else(|| "node".into());
-    let output = Command::new(&node)
-        .arg(&script)
-        .args(args)
-        .output()
-        .await
-        .with_context(|| {
-            format!(
-                "running {} with {}",
-                script.display(),
-                PathBuf::from(&node).display()
-            )
-        })?;
+    let mut command = Command::new(&node);
+    command.arg(&script).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().await.with_context(|| {
+        format!(
+            "running {} with {}",
+            script.display(),
+            PathBuf::from(&node).display()
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -14905,14 +16389,14 @@ fn tap_deposit_seen_key(eth_tx_hash: &str, log_index: u64) -> String {
 }
 
 fn classify_deposit_status(
-    balance_mu: u64,
-    target_mu: Option<u64>,
+    balance_au: MoneyAu,
+    target_au: Option<MoneyAu>,
     pending_tnk: Option<&Value>,
     tap_seen: Option<&Value>,
 ) -> &'static str {
-    if target_mu.is_some_and(|target| balance_mu >= target) || tap_seen.is_some() {
+    if target_au.is_some_and(|target| balance_au >= target) || tap_seen.is_some() {
         "confirmed"
-    } else if pending_tnk.is_some() || target_mu.is_some() {
+    } else if pending_tnk.is_some() || target_au.is_some() {
         "pending"
     } else {
         "unknown"
@@ -14920,7 +16404,11 @@ fn classify_deposit_status(
 }
 
 fn print_tap_deposit_report(report: &Value) -> Result<()> {
-    println!("TAP deposit calldata ready.");
+    if report["submitted"].as_bool() == Some(true) {
+        println!("TAP deposit submitted.");
+    } else {
+        println!("TAP deposit dry-run complete.");
+    }
     println!("From: {}", report["from"].as_str().unwrap_or(""));
     println!("TAP token: {}", report["token"].as_str().unwrap_or(""));
     println!("Deposit address: {}", report["pool"].as_str().unwrap_or(""));
@@ -14928,23 +16416,43 @@ fn print_tap_deposit_report(report: &Value) -> Result<()> {
         "Amount wei: {}",
         report["amount_wei"].as_str().unwrap_or("")
     );
-    println!("Copy/paste approve tx JSON:");
-    println!(
-        "{}",
-        report["copy_paste"]["approve_tx_json"]
-            .as_str()
-            .unwrap_or("")
-    );
-    println!("Copy/paste deposit tx JSON:");
-    println!(
-        "{}",
-        report["copy_paste"]["deposit_tx_json"]
-            .as_str()
-            .unwrap_or("")
-    );
-    if let Some(command) = report["copy_paste_replay_command"].as_str() {
-        println!("Copy/paste replay command:");
-        println!("{command}");
+    if let Some(precheck) = report["gas_precheck"].as_object() {
+        println!(
+            "Gas precheck: {} (estimated max {} ETH)",
+            if precheck.get("ok").and_then(Value::as_bool) == Some(true) {
+                "ok"
+            } else {
+                "failed"
+            },
+            precheck
+                .get("estimated_max_cost_eth")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        );
+    }
+    if let Some(gas) = report["simulation"]["approve"]["gas_estimate"].as_str() {
+        println!("Approve simulation gas: {gas}");
+    }
+    if let Some(gas) = report["simulation"]["deposit"]["gas_estimate"].as_str() {
+        println!("Deposit simulation gas: {gas}");
+    } else if report["simulation"]["deposit"]["deferred_until_after_approval"].as_bool()
+        == Some(true)
+    {
+        println!("Deposit simulation: deferred until approve confirms, before value moves");
+    }
+    if let Some(transactions) = report["transactions"].as_array() {
+        for tx in transactions {
+            println!(
+                "{} tx: {}",
+                tx["step"].as_str().unwrap_or("tap"),
+                tx["tx_hash"].as_str().unwrap_or("")
+            );
+        }
+    }
+    if report["submitted"].as_bool() != Some(true) {
+        println!(
+            "Dry run only. Re-run with --confirm to broadcast after reviewing the simulation."
+        );
     }
     println!(
         "After the deposit transaction finalizes, check credit with: mayhem deposit status --who {} --eth-tx-hash <tx-hash> --log-index <log-index>",
@@ -14961,12 +16469,12 @@ fn print_deposit_status_report(report: &Value) -> Result<()> {
     println!("Account: {}", report["who"].as_str().unwrap_or(""));
     println!("Rail: {}", report["rail"].as_str().unwrap_or(""));
     println!(
-        "Balance: {} mu_usd ({})",
-        report["balance"]["mu"].as_u64().unwrap_or(0),
-        mu_to_usd_amount(report["balance"]["mu"].as_u64().unwrap_or(0))
+        "Balance: {} au_usd ({})",
+        report["balance"]["au"].as_str().unwrap_or("0"),
+        au_to_usd_amount(value_money_au(&report["balance"]["au"]).unwrap_or(0))
     );
-    if let Some(target) = report["target_mu"].as_u64() {
-        println!("Target: {target} mu_usd");
+    if let Some(target) = report["target_au"].as_str() {
+        println!("Target: {target} au_usd");
     }
     if !report["tnk"]["pending"].is_null() {
         println!("TNK intent: pending");
@@ -15013,7 +16521,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         bail!("--poll-interval-ms must be positive");
     }
     if args.submit_transfer && !args.submit_intent {
-        bail!("--submit-transfer requires --submit-intent so the memo-bound contract intent exists before TNK moves");
+        bail!("--submit-transfer requires --submit-intent so the contract deposit intent exists before TNK moves");
     }
     if args.submit_transfer && args.sim {
         bail!("--submit-transfer cannot be combined with --sim");
@@ -15024,17 +16532,18 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let config = read_mayhem_config(&home)?;
-    let wallet = resolve_cli_wallet(
+    let wallet = resolve_cli_wallet_with_keypair(
         &home,
         config.as_ref(),
+        args.keypair.as_deref(),
         &args.peer_store_name,
         args.wallet_password.as_deref().unwrap_or(""),
     )
     .await?;
-    let amount_mu = parse_usd_amount_to_mu(&args.amount)?;
+    let amount_au = parse_usd_amount_to_au(&args.amount)?;
     let treasury_address =
         resolve_cli_tnk_treasury_address(config.as_ref(), args.treasury_address.as_deref())?;
-    let needs_rpc = args.tnk_usd_e6.is_none() || args.submit_intent || args.wait;
+    let needs_rpc = args.tnk_usd_au.is_none() || args.submit_intent || args.wait;
     let rpc_url = if needs_rpc {
         Some(resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?)
     } else {
@@ -15044,23 +16553,23 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         Some(url) if needs_rpc => Some(PeerRpcClient::new(url)?),
         _ => None,
     };
-    let rate = resolve_tnk_rate(rpc.as_ref(), args.tnk_usd_e6).await?;
+    let rate = resolve_tnk_rate(rpc.as_ref(), args.tnk_usd_au).await?;
     let nonce = resolve_tnk_nonce(
         &wallet.public_key,
-        amount_mu,
+        amount_au,
         &treasury_address,
         &rate,
         &args,
     )?;
     let memo_hash = derive_tnk_memo_hash(&wallet.public_key, &nonce)?;
-    let tnk_e18 = mu_to_tnk_e18_ceil_u128(amount_mu, rate.tnk_usd_e6)?;
+    let tnk_e18 = au_to_tnk_e18_ceil_u128(amount_au, rate.tnk_usd_au)?;
     let tnk_decimal = tnk_e18_to_decimal(tnk_e18);
-    let quoted_credit_mu = tnk_e18_to_mu_floor(tnk_e18, rate.tnk_usd_e6)?;
+    let quoted_credit_au = tnk_e18_to_au_floor(tnk_e18, rate.tnk_usd_au)?;
     let intent_payload = pay_tnk_deposit_intent_payload(
         &memo_hash,
         &treasury_address,
         tnk_e18,
-        quoted_credit_mu,
+        quoted_credit_au,
         &rate,
     );
     let msb_transfer_command = format!("/transfer {} {}", treasury_address, tnk_decimal);
@@ -15068,7 +16577,8 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         &args.amount,
         &treasury_address,
         &nonce,
-        rate.tnk_usd_e6,
+        rate.tnk_usd_au,
+        args.keypair.as_deref(),
         rpc_url.as_deref(),
     );
     let keypair_path = PathBuf::from(wallet.keypair_path.clone());
@@ -15098,22 +16608,22 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         )
     });
     let admin_confirm_command = format!(
-        "mayhem admin tnk-deposit --memo-hash {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --epoch <epoch> --at <unix-seconds>",
+        "mayhem admin tnk-deposit --deposit-binding {} --tnk-e18 {} --msb-tx-hash <msb-tx-hash> --epoch <epoch> --at <unix-seconds>",
         shell_single_quote(&memo_hash),
         tnk_e18
     );
 
     emit_tnk_handoff(
         args.json,
-        amount_mu,
+        amount_au,
         &msb_transfer_command,
         &memo_hash,
         &deposit_intent_command,
     )?;
 
-    let before_mu = if args.wait {
+    let before_au = if args.wait {
         let rpc = rpc.as_ref().context("--wait requires peer RPC")?;
-        Some(read_user_balance_mu(rpc, &wallet.public_key, "tnk").await?)
+        Some(read_user_balance_au(rpc, &wallet.public_key, "tnk").await?)
     } else {
         None
     };
@@ -15148,6 +16658,8 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
                 &treasury_address,
                 &tnk_decimal,
                 args.msb_transfer_timeout_seconds,
+                3,
+                None,
             )
             .await?,
         )
@@ -15157,16 +16669,16 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
 
     let credit = if args.wait {
         let rpc = rpc.as_ref().context("--wait requires peer RPC")?;
-        let before_mu = before_mu.context("--wait balance snapshot missing")?;
-        let target_mu = before_mu
-            .checked_add(amount_mu)
+        let before_au = before_au.context("--wait balance snapshot missing")?;
+        let target_au = before_au
+            .checked_add(amount_au)
             .context("target balance overflowed")?;
         let status = wait_for_credit(
             rpc,
             &wallet.public_key,
             "tnk",
-            before_mu,
-            target_mu,
+            before_au,
+            target_au,
             Duration::from_secs(args.timeout_seconds),
             Duration::from_millis(args.poll_interval_ms),
         )
@@ -15179,16 +16691,16 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
     let report = json!({
         "ok": (submitted.is_some() || !args.submit_intent) && (msb_transfer.is_some() || !args.submit_transfer),
         "rail": "tnk",
-        "denom": "mu_usd",
-        "amount_mu": amount_mu,
-        "amount_usd": mu_to_usd_amount(amount_mu),
-        "quoted_credit_mu": quoted_credit_mu,
+        "denom": "au_usd",
+        "amount_au": money_au_json(amount_au),
+        "amount_usd": au_to_usd_amount(amount_au),
+        "quoted_credit_au": money_au_json(quoted_credit_au),
         "who": wallet.public_key,
         "rpc_url": rpc_url,
         "treasury_address": treasury_address,
         "rate": {
-            "denom": "tnk_usd_e6",
-            "tnk_usd_e6": rate.tnk_usd_e6,
+            "denom": "tnk_usd_au",
+            "tnk_usd_au": money_au_json(rate.tnk_usd_au),
             "source": rate.source,
             "ts": rate.ts,
         },
@@ -15207,16 +16719,16 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         "nonce": nonce,
         "copy_paste": {
             "msb_transfer_command": msb_transfer_command,
-            "transfer_memo_reference": memo_hash,
+            "deposit_binding": memo_hash,
             "deposit_intent_command": deposit_intent_command,
             "deposit_intent_rpc_command": intent_feature_rpc_command,
             "admin_confirm_command": admin_confirm_command,
         },
         "credit": credit.as_ref().map(|status| json!({
             "credited": status.credited,
-            "before_mu": status.before_mu,
-            "current_mu": status.current_mu,
-            "target_mu": status.target_mu,
+            "before_au": money_au_json(status.before_au),
+            "current_au": money_au_json(status.current_au),
+            "target_au": money_au_json(status.target_au),
             "waited_ms": status.waited_ms,
         })),
     });
@@ -15225,16 +16737,16 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         if let Some(status) = credit.as_ref().filter(|status| !status.credited) {
             bail!(
-                "timed out waiting for {} mu_usd credit; current balance {} mu_usd, target {} mu_usd",
-                amount_mu,
-                status.current_mu,
-                status.target_mu
+                "timed out waiting for {} au_usd credit; current balance {} au_usd, target {} au_usd",
+                amount_au,
+                status.current_au,
+                status.target_au
             );
         }
     } else {
         println!("TNK amount: {tnk_decimal} ({tnk_e18} e18)");
         println!("Treasury address: {treasury_address}");
-        println!("Rate: {} tnk_usd_e6 ({})", rate.tnk_usd_e6, rate.source);
+        println!("Rate: {} tnk_usd_au ({})", rate.tnk_usd_au, rate.source);
         if let Some(ts) = rate.ts {
             println!("Rate timestamp: {ts}");
         }
@@ -15274,15 +16786,15 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         if let Some(status) = credit {
             if status.credited {
                 println!(
-                    "Credited: balance {} -> {} mu_usd.",
-                    status.before_mu, status.current_mu
+                    "Credited: balance {} -> {} au_usd.",
+                    status.before_au, status.current_au
                 );
             } else {
                 bail!(
-                    "timed out waiting for {} mu_usd credit; current balance {} mu_usd, target {} mu_usd",
-                    amount_mu,
-                    status.current_mu,
-                    status.target_mu
+                    "timed out waiting for {} au_usd credit; current balance {} au_usd, target {} au_usd",
+                    amount_au,
+                    status.current_au,
+                    status.target_au
                 );
             }
         }
@@ -15308,13 +16820,13 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let paygate_url = resolve_cli_paygate_url(config.as_ref(), args.paygate_url.as_deref());
-    let amount_mu = parse_usd_amount_to_mu(&args.amount)?;
-    let before_mu = read_user_balance_mu(&rpc, &wallet.public_key, rail.balance_rail()).await?;
+    let amount_au = parse_usd_amount_to_au(&args.amount)?;
+    let before_au = read_user_balance_au(&rpc, &wallet.public_key, rail.balance_rail()).await?;
     let checkout = create_pay_checkout(PayCheckoutRequest {
         rail,
         paygate_url: &paygate_url,
         who: &wallet.public_key,
-        amount_mu,
+        amount_au,
         currency: &args.currency,
         locale: &args.locale,
         idempotency_key: args.idempotency_key.as_deref(),
@@ -15322,17 +16834,17 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         cancel_url: args.cancel_url.as_deref(),
     })
     .await?;
-    emit_checkout_handoff(args.json, rail, amount_mu, &args.currency, &checkout.url)?;
+    emit_checkout_handoff(args.json, rail, amount_au, &args.currency, &checkout.url)?;
     let opened = open_checkout_url(&checkout.url, args.no_open).await;
-    let target_mu = before_mu
-        .checked_add(amount_mu)
+    let target_au = before_au
+        .checked_add(amount_au)
         .context("target balance overflowed")?;
     let status = if args.no_wait {
         PayCreditStatus {
             credited: false,
-            before_mu,
-            current_mu: before_mu,
-            target_mu,
+            before_au,
+            current_au: before_au,
+            target_au,
             waited_ms: 0,
         }
     } else {
@@ -15340,8 +16852,8 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
             &rpc,
             &wallet.public_key,
             rail.balance_rail(),
-            before_mu,
-            target_mu,
+            before_au,
+            target_au,
             Duration::from_secs(args.timeout_seconds),
             Duration::from_millis(args.poll_interval_ms),
         )
@@ -15351,9 +16863,9 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     let report = json!({
         "ok": status.credited || args.no_wait,
         "rail": rail.as_str(),
-        "denom": "mu_usd",
-        "amount_mu": amount_mu,
-        "amount_usd": mu_to_usd_amount(amount_mu),
+        "denom": "au_usd",
+        "amount_au": money_au_json(amount_au),
+        "amount_usd": au_to_usd_amount(amount_au),
         "currency": args.currency.to_ascii_lowercase(),
         "who": wallet.public_key,
         "paygate_url": paygate_url,
@@ -15367,9 +16879,9 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         "opened": opened,
         "credit": {
             "credited": status.credited,
-            "before_mu": status.before_mu,
-            "current_mu": status.current_mu,
-            "target_mu": status.target_mu,
+            "before_au": money_au_json(status.before_au),
+            "current_au": money_au_json(status.current_au),
+            "target_au": money_au_json(status.target_au),
             "waited_ms": status.waited_ms,
         },
     });
@@ -15386,22 +16898,28 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
             println!("Not waiting for ledger credit (--no-wait).");
         } else if status.credited {
             println!(
-                "Credited: balance {} -> {} mu_usd.",
-                status.before_mu, status.current_mu
+                "Credited: balance {} -> {} au_usd.",
+                status.before_au, status.current_au
             );
         }
     }
 
     if !args.no_wait && !status.credited {
         bail!(
-            "timed out waiting for {} mu_usd credit; current balance {} mu_usd, target {} mu_usd",
-            amount_mu,
-            status.current_mu,
-            status.target_mu
+            "timed out waiting for {} au_usd credit; current balance {} au_usd, target {} au_usd",
+            amount_au,
+            status.current_au,
+            status.target_au
         );
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct UpProviderWorker {
+    name: String,
+    enclave: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -15436,6 +16954,9 @@ struct UpPlan {
     gateway_active_token_count: usize,
     timeout: Duration,
     dev_embedded_catalog: bool,
+    provider_workers: Vec<UpProviderWorker>,
+    provider_auto_fit: bool,
+    provider_gpu_layers: Option<u32>,
 }
 
 async fn up(args: UpArgs) -> Result<()> {
@@ -15497,9 +17018,30 @@ async fn up(args: UpArgs) -> Result<()> {
         }
     })
     .await?;
+    let provider_auto_fit_report = if plan.provider_auto_fit {
+        Some(up_auto_fit_add_provider_workers(&plan, &client).await?)
+    } else {
+        None
+    };
+    let provider_explicit_launch_report =
+        if !plan.provider_auto_fit && up_provider_workers_deferred(&plan) {
+            Some(up_explicit_add_provider_workers(&plan, &client).await?)
+        } else {
+            None
+        };
     let dashboard_url =
         read_up_logged_dashboard_url(&plan.home).unwrap_or_else(|| plan.dashboard_url.clone());
     let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
+    let provider_worker_report = plan
+        .provider_workers
+        .iter()
+        .map(|worker| {
+            json!({
+                "name": &worker.name,
+                "enclave": &worker.enclave,
+            })
+        })
+        .collect::<Vec<_>>();
 
     let report = json!({
         "ok": true,
@@ -15532,6 +17074,9 @@ async fn up(args: UpArgs) -> Result<()> {
             },
         },
         "provider": plan.provider,
+        "provider_workers": provider_worker_report,
+        "provider_auto_fit": &provider_auto_fit_report,
+        "provider_explicit_launch": &provider_explicit_launch_report,
         "role": plan.role.as_str(),
         "network": {
             "name": &plan.network,
@@ -15576,13 +17121,320 @@ async fn up(args: UpArgs) -> Result<()> {
             );
         }
         if plan.provider {
-            println!("Provider serving was requested and is supervised by mayhemd.");
+            let deferred_report = provider_auto_fit_report
+                .as_ref()
+                .or(provider_explicit_launch_report.as_ref());
+            let worker_count = if up_provider_workers_deferred(&plan) {
+                deferred_report
+                    .and_then(|report| report.get("added"))
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            } else {
+                plan.provider_workers.len()
+            };
+            println!(
+                "Provider serving was requested with {} worker(s) and is supervised by mayhemd.",
+                worker_count
+            );
+            if !up_provider_workers_deferred(&plan) {
+                for worker in &plan.provider_workers {
+                    if let Some(enclave) = worker.enclave.as_deref() {
+                        println!("Provider worker {}: {}", worker.name, enclave);
+                    }
+                }
+            }
+            if let Some(report) = provider_auto_fit_report.as_ref() {
+                println!(
+                    "Auto-fit provider plan: {}",
+                    report["rationale"].as_str().unwrap_or("selected")
+                );
+                for item in report["added"].as_array().into_iter().flatten() {
+                    println!(
+                        "Provider worker {}: {}",
+                        item["name"].as_str().unwrap_or("provider"),
+                        item["enclave_id"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            if let Some(report) = provider_explicit_launch_report.as_ref() {
+                println!(
+                    "Explicit provider plan: {}",
+                    report["rationale"].as_str().unwrap_or("selected")
+                );
+                for item in report["added"].as_array().into_iter().flatten() {
+                    println!(
+                        "Provider worker {}: {}",
+                        item["name"].as_str().unwrap_or("provider"),
+                        item["enclave_id"].as_str().unwrap_or("")
+                    );
+                }
+            }
         }
     }
     Ok(())
 }
 
+fn up_provider_workers_deferred(plan: &UpPlan) -> bool {
+    plan.provider_auto_fit || plan.provider_workers.len() > 1
+}
+
+fn up_provider_serve_plan_args(plan: &UpPlan) -> ProviderServePlanArgs {
+    ProviderServePlanArgs {
+        home: Some(plan.home.clone()),
+        rpc_url: Some(plan.rpc_url.clone()),
+        catalog_path: None,
+        signature_path: None,
+        keys_dir: None,
+        canaries_dir: None,
+        engine_backend: "auto".to_owned(),
+        gpu_layers: plan.provider_gpu_layers,
+        fixture: None,
+        disk_path: None,
+        skip_disk_bench: false,
+        ctx: None,
+        memory_reserve: None,
+        json: true,
+        dev_skip_catalog_verify: false,
+    }
+}
+
+async fn up_auto_fit_add_provider_workers(
+    plan: &UpPlan,
+    client: &reqwest::Client,
+) -> Result<Value> {
+    let serve_plan_args = up_provider_serve_plan_args(plan);
+    let computed = compute_provider_serve_plan(&plan.home, &serve_plan_args).await?;
+    let added = up_add_selected_provider_workers(plan, client, &computed.selection, None).await?;
+    Ok(json!({
+        "ok": true,
+        "selected_count": computed.selection.candidates.len(),
+        "candidate_count": computed.candidates.len(),
+        "rationale": computed.selection.rationale,
+        "total_required_bytes": computed.selection.total_required_bytes,
+        "total_required_human": human_bytes(computed.selection.total_required_bytes),
+        "total_budget_bytes": computed.selection.total_budget_bytes,
+        "total_budget_human": human_bytes(computed.selection.total_budget_bytes),
+        "modalities": computed.selection.modalities,
+        "added": added,
+    }))
+}
+
+async fn up_explicit_add_provider_workers(
+    plan: &UpPlan,
+    client: &reqwest::Client,
+) -> Result<Value> {
+    let requested = plan
+        .provider_workers
+        .iter()
+        .map(|worker| {
+            worker.enclave.clone().with_context(|| {
+                format!(
+                    "deferred provider worker {} is missing an explicit admin enclave/model id",
+                    worker.name
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let serve_plan_args = up_provider_serve_plan_args(plan);
+    let computed =
+        compute_provider_explicit_serve_plan(&plan.home, &serve_plan_args, &requested).await?;
+    let worker_names = plan
+        .provider_workers
+        .iter()
+        .map(|worker| worker.name.clone())
+        .collect::<Vec<_>>();
+    let added =
+        up_add_selected_provider_workers(plan, client, &computed.selection, Some(&worker_names))
+            .await?;
+    Ok(json!({
+        "ok": true,
+        "selected_count": computed.selection.candidates.len(),
+        "candidate_count": computed.candidates.len(),
+        "rationale": computed.selection.rationale,
+        "total_required_bytes": computed.selection.total_required_bytes,
+        "total_required_human": human_bytes(computed.selection.total_required_bytes),
+        "total_budget_bytes": computed.selection.total_budget_bytes,
+        "total_budget_human": human_bytes(computed.selection.total_budget_bytes),
+        "modalities": computed.selection.modalities,
+        "added": added,
+    }))
+}
+
+async fn up_add_selected_provider_workers(
+    plan: &UpPlan,
+    client: &reqwest::Client,
+    selection: &ProviderAutoFitSelection,
+    worker_names: Option<&[String]>,
+) -> Result<Vec<Value>> {
+    let mut added = Vec::new();
+    for (index, candidate) in selection.candidates.iter().enumerate() {
+        let worker_name = worker_names.and_then(|names| names.get(index)).cloned();
+        let child = provider_serve_child_config(
+            &plan.home,
+            &candidate.enclave.enclave_id,
+            plan.provider_gpu_layers,
+            Some(candidate.served_ctx),
+            worker_name,
+        )?;
+        let response = post_gateway_json(
+            client,
+            &format!("{}/children/add", plan.supervisor_url),
+            &child,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "adding auto-fit provider worker for {}",
+                candidate.enclave.model_id
+            )
+        })?;
+        added.push(json!({
+            "name": response.get("name").cloned().unwrap_or(Value::Null),
+            "enclave_id": &candidate.enclave.enclave_id,
+            "model_id": &candidate.enclave.model_id,
+            "backend": &candidate.enclave.backend,
+            "required_bytes": candidate.feasibility.estimated_required_bytes,
+            "response": response,
+        }));
+    }
+    Ok(added)
+}
+
+fn parse_up_enclaves(value: Option<&str>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        bail!("--enclaves requires at least one admin enclave/model id");
+    }
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, part) in value.split(',').enumerate() {
+        let enclave = part.trim();
+        if enclave.is_empty() {
+            bail!(
+                "--enclaves contains an empty entry at position {}; use comma-separated admin enclave/model ids",
+                index + 1
+            );
+        }
+        if !seen.insert(enclave.to_owned()) {
+            bail!("--enclaves contains duplicate enclave/model id `{enclave}`");
+        }
+        out.push(enclave.to_owned());
+    }
+    Ok(out)
+}
+
+fn resolve_up_provider_workers(args: &UpArgs) -> Result<Vec<UpProviderWorker>> {
+    let provider_enclave = args
+        .provider_enclave
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if args
+        .provider_enclave
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("--provider-enclave requires a non-empty admin enclave/model id");
+    }
+    let enclaves = parse_up_enclaves(args.enclaves.as_deref())?;
+    if !args.provider {
+        if provider_enclave.is_some() {
+            bail!("--provider-enclave requires --provider");
+        }
+        if !enclaves.is_empty() {
+            bail!("--enclaves requires --provider");
+        }
+        if args.auto_fit {
+            bail!("--auto-fit requires --provider");
+        }
+        if args.provider_gpu_layers.is_some() {
+            bail!("--provider-gpu-layers requires --provider");
+        }
+        return Ok(Vec::new());
+    }
+    if args.auto_fit && (provider_enclave.is_some() || !enclaves.is_empty()) {
+        bail!("use --auto-fit by itself, or pass explicit --enclaves/--provider-enclave");
+    }
+    if args.auto_fit {
+        return Ok(Vec::new());
+    }
+    if provider_enclave.is_some() && !enclaves.is_empty() {
+        bail!(
+            "use --enclaves for multi-model serving or --provider-enclave for one model, not both"
+        );
+    }
+
+    let requested = if !enclaves.is_empty() {
+        enclaves.into_iter().map(Some).collect::<Vec<_>>()
+    } else if let Some(enclave) = provider_enclave {
+        vec![Some(enclave)]
+    } else {
+        vec![None]
+    };
+    let total = requested.len();
+    Ok(requested
+        .into_iter()
+        .enumerate()
+        .map(|(index, enclave)| UpProviderWorker {
+            name: up_provider_worker_name(enclave.as_deref(), index, total),
+            enclave,
+        })
+        .collect())
+}
+
+fn up_provider_worker_name(enclave: Option<&str>, index: usize, total: usize) -> String {
+    if total == 1 {
+        return "provider".to_owned();
+    }
+    let slug = enclave
+        .map(up_provider_worker_slug)
+        .unwrap_or_else(|| "auto".to_owned());
+    format!("provider-{:02}-{slug}", index + 1)
+}
+
+fn up_provider_worker_slug(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if out.len() >= 24 {
+            break;
+        }
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if matches!(ch, '-' | '_') {
+            Some(ch)
+        } else {
+            Some('-')
+        };
+        let Some(mapped) = mapped else {
+            continue;
+        };
+        if mapped == '-' {
+            if !out.is_empty() && !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        } else {
+            out.push(mapped);
+            last_dash = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "enclave".to_owned()
+    } else {
+        out
+    }
+}
+
 async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
+    let provider_workers = resolve_up_provider_workers(args)?;
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -15715,6 +17567,9 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         gateway_active_token_count,
         timeout: Duration::from_secs(args.timeout_seconds),
         dev_embedded_catalog: args.dev_embedded_catalog,
+        provider_workers,
+        provider_auto_fit: args.auto_fit,
+        provider_gpu_layers: args.provider_gpu_layers,
     })
 }
 
@@ -16023,27 +17878,35 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     }
     write_supervisor_child(&mut out, "gateway", &plan.mayhem_path, &gateway_args, None)?;
 
-    if plan.provider {
-        let provider_args = vec![
-            "provider".to_owned(),
-            "start".to_owned(),
-            "--home".to_owned(),
-            plan.home.display().to_string(),
-            "--rpc-url".to_owned(),
-            plan.rpc_url.clone(),
-            "--sc-bridge-url".to_owned(),
-            plan.sc_bridge_url.clone(),
-            "--sc-bridge-token".to_owned(),
-            plan.sc_bridge_token.clone(),
-            "--serve-sessions".to_owned(),
-        ];
-        write_supervisor_child(
-            &mut out,
-            "provider",
-            &plan.mayhem_path,
-            &provider_args,
-            None,
-        )?;
+    if plan.provider && !up_provider_workers_deferred(plan) {
+        for worker in &plan.provider_workers {
+            let mut provider_args = vec![
+                "provider".to_owned(),
+                "start".to_owned(),
+                "--home".to_owned(),
+                plan.home.display().to_string(),
+                "--rpc-url".to_owned(),
+                plan.rpc_url.clone(),
+                "--sc-bridge-url".to_owned(),
+                plan.sc_bridge_url.clone(),
+                "--sc-bridge-token".to_owned(),
+                plan.sc_bridge_token.clone(),
+                "--serve-sessions".to_owned(),
+            ];
+            if let Some(enclave) = &worker.enclave {
+                provider_args.extend(["--enclave".to_owned(), enclave.clone()]);
+            }
+            if let Some(gpu_layers) = plan.provider_gpu_layers {
+                provider_args.extend(["--gpu-layers".to_owned(), gpu_layers.to_string()]);
+            }
+            write_supervisor_child(
+                &mut out,
+                &worker.name,
+                &plan.mayhem_path,
+                &provider_args,
+                None,
+            )?;
+        }
     }
     Ok(out)
 }
@@ -16515,7 +18378,7 @@ fn resolve_pear_runtime_path() -> Result<PathBuf> {
             }
         }
     }
-    command_from_path("pear-runtime").or_else(|| command_from_path("pear")).context(
+    command_from_path("pear-runtime").context(
         "pear-runtime was not found; install Pear or set MAYHEM_PEAR_RUNTIME to the pear-runtime binary",
     )
 }
@@ -16607,7 +18470,7 @@ fn tokens_create(args: TokenCreateArgs) -> Result<()> {
     if args.max_rate == Some(0) {
         bail!("--max-rate must be greater than zero");
     }
-    let (budget_mu, budget_period) = parse_token_budget(args.budget.as_deref())?;
+    let (budget_au, budget_period) = parse_token_budget(args.budget.as_deref())?;
     let expires_at = parse_token_expires(args.expires.as_deref())?;
     let models = parse_token_models(args.models.as_deref())?;
     let token = new_gateway_token()?;
@@ -16620,10 +18483,10 @@ fn tokens_create(args: TokenCreateArgs) -> Result<()> {
         token_id: token_id.clone(),
         created_at,
         expires_at,
-        budget_mu,
+        budget_au,
         budget_period,
-        spent_total_mu: 0,
-        spent_period_mu: 0,
+        spent_total_au: 0,
+        spent_period_au: 0,
         period_started_at: Some(created_at),
         max_rate_per_minute: args.max_rate,
         models,
@@ -16638,7 +18501,7 @@ fn tokens_create(args: TokenCreateArgs) -> Result<()> {
         "token_id": token_id,
         "token": token.clone(),
         "expires_at": expires_at,
-        "budget_mu": budget_mu,
+        "budget_au": budget_au.map(money_au_json),
         "budget_period": budget_period,
         "max_rate_per_minute": args.max_rate,
     });
@@ -16695,7 +18558,7 @@ fn tokens_list(args: TokenListArgs) -> Result<()> {
                     token.name,
                     token.token_id,
                     active,
-                    mu_to_usd_amount(token.spent_total_mu),
+                    au_to_usd_amount(token.spent_total_au),
                     last_used,
                     budget,
                 );
@@ -16764,14 +18627,14 @@ fn parse_token_name(value: &str) -> Result<String> {
 
 fn parse_token_budget(
     value: Option<&str>,
-) -> Result<(Option<u64>, Option<GatewayTokenBudgetPeriod>)> {
+) -> Result<(Option<MoneyAu>, Option<GatewayTokenBudgetPeriod>)> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok((None, None));
     };
     let Some((amount, period)) = value.split_once('/') else {
         bail!("--budget must be formatted as USD/day, USD/month, or USD/total");
     };
-    let amount_mu = parse_usd_amount_to_mu(amount)
+    let amount_au = parse_usd_amount_to_au(amount)
         .with_context(|| format!("parsing --budget amount {amount:?}"))?;
     let period = match period.trim().to_ascii_lowercase().as_str() {
         "day" => GatewayTokenBudgetPeriod::Day,
@@ -16779,7 +18642,7 @@ fn parse_token_budget(
         "total" => GatewayTokenBudgetPeriod::Total,
         _ => bail!("--budget period must be day, month, or total"),
     };
-    Ok((Some(amount_mu), Some(period)))
+    Ok((Some(amount_au), Some(period)))
 }
 
 fn parse_token_expires(value: Option<&str>) -> Result<Option<u64>> {
@@ -16865,11 +18728,11 @@ fn gateway_token_public_value(token: &GatewayTokenRecord) -> Value {
         "active": token.is_active(unix_epoch_seconds().unwrap_or(0)),
         "created_at": token.created_at,
         "expires_at": token.expires_at,
-        "budget_mu": token.budget_mu,
+        "budget_au": token.budget_au.map(money_au_json),
         "budget_period": token.budget_period,
-        "spent_total_mu": token.spent_total_mu,
-        "spent_total_usd": mu_to_usd_amount(token.spent_total_mu),
-        "spent_period_mu": token.spent_period_mu,
+        "spent_total_au": money_au_json(token.spent_total_au),
+        "spent_total_usd": au_to_usd_amount(token.spent_total_au),
+        "spent_period_au": money_au_json(token.spent_period_au),
         "last_used_at": token.last_used_at,
         "revoked_at": token.revoked_at,
         "max_rate_per_minute": token.max_rate_per_minute,
@@ -16878,16 +18741,100 @@ fn gateway_token_public_value(token: &GatewayTokenRecord) -> Value {
 }
 
 fn token_budget_label(token: &GatewayTokenRecord) -> String {
-    match (token.budget_mu, token.budget_period) {
-        (Some(mu), Some(period)) => {
+    match (token.budget_au, token.budget_period) {
+        (Some(au), Some(period)) => {
             let period = match period {
                 GatewayTokenBudgetPeriod::Total => "total",
                 GatewayTokenBudgetPeriod::Day => "day",
                 GatewayTokenBudgetPeriod::Month => "month",
             };
-            format!("budget=${}/{period}", mu_to_usd_amount(mu))
+            format!("budget=${}/{period}", au_to_usd_amount(au))
         }
         _ => "budget=unlimited".to_owned(),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GatewayProviderHeartbeatWatcherConfig {
+    sc_bridge_url: String,
+    sc_bridge_token: String,
+    channels: Vec<String>,
+}
+
+fn gateway_provider_heartbeat_channels(models: &[GatewayModel]) -> Vec<String> {
+    models
+        .iter()
+        .flat_map(|model| model.mayhem.route_candidates.iter())
+        .filter_map(|candidate| {
+            is_hex_len(&candidate.room_id, 32).then(|| format!("mx/room/{}", candidate.room_id))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn spawn_gateway_provider_heartbeat_watcher(
+    state: GatewayState,
+    config: GatewayProviderHeartbeatWatcherConfig,
+) {
+    if config.channels.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = run_gateway_provider_heartbeat_watcher(&state, &config).await {
+                eprintln!("Gateway provider heartbeat watcher reconnecting: {err:#}");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
+}
+
+async fn run_gateway_provider_heartbeat_watcher(
+    state: &GatewayState,
+    config: &GatewayProviderHeartbeatWatcherConfig,
+) -> Result<()> {
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+        &config.sc_bridge_url,
+        config.sc_bridge_token.clone(),
+    )?)
+    .await
+    .context("connecting to SC-Bridge for gateway provider heartbeat watcher")?;
+    bridge
+        .subscribe(config.channels.iter().map(String::as_str))
+        .await
+        .context("subscribing to provider heartbeat sidechannels")?;
+    for channel in &config.channels {
+        bridge
+            .join(channel)
+            .await
+            .with_context(|| format!("joining provider heartbeat sidechannel {channel}"))?;
+    }
+
+    let mut receiver = HeartbeatReceiver::new();
+    loop {
+        match bridge
+            .next_sidechannel_message(Duration::from_secs(86_400))
+            .await
+        {
+            Ok(event) => {
+                let raw = event.get("message").cloned().unwrap_or(event);
+                if raw.get("t").and_then(Value::as_str) != Some("hb") {
+                    continue;
+                }
+                let now = unix_epoch_millis()?;
+                if let Some(heartbeat) = receiver.receive(&raw, now) {
+                    state.ingest_provider_heartbeat(heartbeat, now);
+                } else if let Some(drop) = receiver.drops().last() {
+                    eprintln!(
+                        "Gateway provider heartbeat dropped for provider {:?} room {:?}: {}",
+                        drop.provider, drop.room_id, drop.reason
+                    );
+                }
+            }
+            Err(BridgeError::Timeout) => continue,
+            Err(err) => return Err(err).context("reading provider heartbeat sidechannel"),
+        }
     }
 }
 
@@ -16922,8 +18869,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             .receipt_checkpoint_ms
             .unwrap_or(DEFAULT_RECEIPT_CHECKPOINT_MS),
     };
-    if args.max_price_mu == Some(0) {
-        bail!("--max-price-mu must be greater than zero");
+    if args.max_price_au == Some(0) {
+        bail!("--max-price-au must be greater than zero");
     }
     if args
         .max_wait
@@ -16937,11 +18884,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     if args.min_ctx == Some(0) {
         bail!("--min-ctx must be greater than zero");
     }
-    let default_max_price_mu = args.max_price_mu.or_else(|| {
+    let default_max_price_au = args.max_price_au.or_else(|| {
         config
             .as_ref()
             .and_then(|config| config.user.as_ref())
-            .and_then(|user| user.max_price_mu)
+            .and_then(|user| user.max_price_au)
     });
     let default_max_wait_seconds = args.max_wait.or_else(|| {
         config
@@ -17036,218 +18983,234 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         None => None,
     };
-    let (state, source, model_count, backend, wallet_public_key, balance_mu, blocked_version_gates) =
-        if args.dev_embedded_catalog {
-            let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
+    let (
+        state,
+        source,
+        model_count,
+        backend,
+        wallet_public_key,
+        balance_au,
+        blocked_version_gates,
+        heartbeat_watcher,
+    ) = if args.dev_embedded_catalog {
+        let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
+        (
+            state,
+            "dev-embedded-catalog".to_owned(),
+            None,
+            "local-openai-shape".to_owned(),
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
+    } else {
+        let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+        let rpc = PeerRpcClient::new(&rpc_url)?;
+        let contract_param_at = unix_epoch_seconds()?;
+        let gateway_epoch_seconds = read_param_u64_at(
+            &rpc,
+            "epoch_seconds",
+            DEFAULT_EPOCH_SECONDS,
+            contract_param_at,
+        )
+        .await?;
+        let (catalog_doc, catalog_json, catalog_source) = if let Some(dev_catalog_path) =
+            args.dev_catalog_path.clone()
+        {
+            let catalog_path = absolutize(dev_catalog_path)?;
+            let catalog_hash = if args.dev_skip_catalog_verify {
+                blake3_file_hex(&catalog_path)?
+            } else {
+                let signature_path = args
+                    .dev_signature_path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| repo_path("catalog/signatures/models.json.sig"))?;
+                let signature_path = absolutize(signature_path)?;
+                let keys_dir = args
+                    .dev_keys_dir
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| repo_path("catalog/keys"))?;
+                let keys_dir = absolutize(keys_dir)?;
+                let canaries_dir = args
+                    .dev_canaries_dir
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+                let canaries_dir = absolutize(canaries_dir)?;
+                let report = catalog::verify(catalog::VerifyOptions {
+                    catalog_path: catalog_path.clone(),
+                    signature_path,
+                    keys_dir,
+                    canaries_dir,
+                    check_dev_downloads: false,
+                    check_launch_sources: false,
+                    hf_token_file: None,
+                })?;
+                if !report.ok {
+                    bail!("local dev catalog verification failed");
+                }
+                report.catalog_hash
+            };
+            let catalog_doc = catalog::load_document(&catalog_path)
+                .with_context(|| format!("loading local dev catalog {}", catalog_path.display()))?;
+            let catalog_json = fs::read_to_string(&catalog_path)
+                .with_context(|| format!("reading local dev catalog {}", catalog_path.display()))?;
+            let trust = if args.dev_skip_catalog_verify {
+                "dev-local-unverified"
+            } else {
+                "dev-local-signed"
+            };
             (
-                state,
-                "dev-embedded-catalog".to_owned(),
-                None,
-                "local-openai-shape".to_owned(),
-                None,
-                None,
-                Vec::new(),
+                catalog_doc,
+                catalog_json,
+                format!("contract:{rpc_url}; catalog:{trust}:{catalog_hash}"),
             )
         } else {
-            let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
-            let rpc = PeerRpcClient::new(&rpc_url)?;
-            let contract_param_at = unix_epoch_seconds()?;
-            let gateway_epoch_seconds = read_param_u64_at(
-                &rpc,
-                "epoch_seconds",
-                DEFAULT_EPOCH_SECONDS,
-                contract_param_at,
-            )
-            .await?;
-            let (catalog_doc, catalog_json, catalog_source) =
-                if let Some(dev_catalog_path) = args.dev_catalog_path.clone() {
-                    let catalog_path = absolutize(dev_catalog_path)?;
-                    let catalog_hash = if args.dev_skip_catalog_verify {
-                        blake3_file_hex(&catalog_path)?
-                    } else {
-                        let signature_path =
-                            args.dev_signature_path.clone().map(Ok).unwrap_or_else(|| {
-                                repo_path("catalog/signatures/models.json.sig")
-                            })?;
-                        let signature_path = absolutize(signature_path)?;
-                        let keys_dir = args
-                            .dev_keys_dir
-                            .clone()
-                            .map(Ok)
-                            .unwrap_or_else(|| repo_path("catalog/keys"))?;
-                        let keys_dir = absolutize(keys_dir)?;
-                        let canaries_dir = args
-                            .dev_canaries_dir
-                            .clone()
-                            .map(Ok)
-                            .unwrap_or_else(|| repo_path("catalog/canaries"))?;
-                        let canaries_dir = absolutize(canaries_dir)?;
-                        let report = catalog::verify(catalog::VerifyOptions {
-                            catalog_path: catalog_path.clone(),
-                            signature_path,
-                            keys_dir,
-                            canaries_dir,
-                            check_dev_downloads: false,
-                            check_launch_sources: false,
-                            hf_token_file: None,
-                        })?;
-                        if !report.ok {
-                            bail!("local dev catalog verification failed");
-                        }
-                        report.catalog_hash
-                    };
-                    let catalog_doc = catalog::load_document(&catalog_path).with_context(|| {
-                        format!("loading local dev catalog {}", catalog_path.display())
-                    })?;
-                    let catalog_json = fs::read_to_string(&catalog_path).with_context(|| {
-                        format!("reading local dev catalog {}", catalog_path.display())
-                    })?;
-                    let trust = if args.dev_skip_catalog_verify {
-                        "dev-local-unverified"
-                    } else {
-                        "dev-local-signed"
-                    };
-                    (
-                        catalog_doc,
-                        catalog_json,
-                        format!("contract:{rpc_url}; catalog:{trust}:{catalog_hash}"),
+            let catalog_client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .context("building catalog release HTTP client")?;
+            let release = read_catalog_release_anchor(&rpc).await?;
+            let catalog_files =
+                fetch_catalog_release_files(&catalog_client, &home, &release).await?;
+            let catalog_doc =
+                catalog::load_document(&catalog_files.catalog_path).with_context(|| {
+                    format!(
+                        "loading verified ledger catalog {}",
+                        catalog_files.catalog_path.display()
                     )
-                } else {
-                    let catalog_client = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(30))
-                        .build()
-                        .context("building catalog release HTTP client")?;
-                    let release = read_catalog_release_anchor(&rpc).await?;
-                    let catalog_files =
-                        fetch_catalog_release_files(&catalog_client, &home, &release).await?;
-                    let catalog_doc = catalog::load_document(&catalog_files.catalog_path)
-                        .with_context(|| {
-                            format!(
-                                "loading verified ledger catalog {}",
-                                catalog_files.catalog_path.display()
-                            )
-                        })?;
-                    let catalog_json = fs::read_to_string(&catalog_files.catalog_path)
-                        .with_context(|| {
-                            format!(
-                                "reading verified ledger catalog {}",
-                                catalog_files.catalog_path.display()
-                            )
-                        })?;
-                    (
-                        catalog_doc,
-                        catalog_json,
-                        format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
+                })?;
+            let catalog_json =
+                fs::read_to_string(&catalog_files.catalog_path).with_context(|| {
+                    format!(
+                        "reading verified ledger catalog {}",
+                        catalog_files.catalog_path.display()
                     )
-                };
-            let canary_registry = GatewayState::canary_registry_from_catalog_json(&catalog_json)
-                .context("loading canary registry from gateway catalog")?;
-            let wallet_password = args.wallet_password.clone().unwrap_or_default();
-            let wallet = resolve_cli_wallet_with_keypair(
-                &home,
-                config.as_ref(),
-                args.keypair.as_deref(),
-                &args.peer_store_name,
-                &wallet_password,
-            )
-            .await?;
-            let keypair_path = PathBuf::from(&wallet.keypair_path);
-            let user_seed =
-                wallet_signing_seed(&keypair_path, &wallet_password, &wallet.public_key)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "loading spend-voucher signing seed for wallet {}",
-                            wallet.public_key
-                        )
-                    })?;
-            let balance_mu =
-                read_user_balance_mu(&rpc, &wallet.public_key, args.rail.as_str()).await?;
-            let contract = read_contract_catalog(&rpc).await?;
-            let models = gateway_models_from_contract(&contract)?;
-            let (models, blocked_version_gates) =
-                filter_gateway_models_by_app_version(models, &catalog_doc)?;
-            let hardware = probe(ProbeOptions {
-                disk_path: home.clone(),
-                run_disk_bench: false,
-                disk_bench_mib: 1,
-                fixture: None,
-            });
-            let models = annotate_gateway_models_with_local_runs(
-                models,
-                &contract,
-                &catalog_doc,
-                &hardware,
-                &home,
-            );
-            let model_count = models.len();
-            let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
-                .await?
-                .into_iter()
-                .map(earning_view)
-                .map(|view| {
-                    view.and_then(|view| {
-                        serde_json::to_value(view).context("serializing provider earning view")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
-                Some(&home),
-                args.sc_bridge_url.as_deref(),
-                args.sc_bridge_token.as_deref(),
-            )?;
-            if args.session_open_timeout_seconds == Some(0) {
-                bail!("--session-open-timeout-seconds must be positive");
-            }
-            if args.session_frame_timeout_seconds == Some(0) {
-                bail!("--session-frame-timeout-seconds must be positive");
-            }
-            if args.session_ttft_timeout_seconds == Some(0) {
-                bail!("--session-ttft-timeout-seconds must be positive");
-            }
-            if args
-                .min_tok_s
-                .is_some_and(|value| !value.is_finite() || value <= 0.0)
-            {
-                bail!("--min-tok-s must be a positive finite number");
-            }
-            let mut session_config =
-                ScBridgeGatewaySessionConfig::new(sc_bridge_url.clone(), sc_bridge_token);
-            if let Some(seconds) = args.session_open_timeout_seconds {
-                session_config.open_timeout = Duration::from_secs(seconds);
-            }
-            if let Some(seconds) = args.session_ttft_timeout_seconds {
-                session_config.ttft_timeout = Duration::from_secs(seconds);
-            }
-            if let Some(seconds) = args.session_frame_timeout_seconds {
-                session_config.frame_timeout = Duration::from_secs(seconds);
-            }
-            session_config.min_tok_s = args.min_tok_s;
-            let failover_policy = mayhem_gateway::openai::GatewayFailoverPolicyConfig {
-                open_timeout_ms: Some(duration_millis_u64(session_config.open_timeout)),
-                ttft_timeout_ms: Some(duration_millis_u64(session_config.ttft_timeout)),
-                stall_timeout_ms: Some(duration_millis_u64(session_config.frame_timeout)),
-                min_tok_s: session_config.min_tok_s,
-            };
-            let backend = ScBridgeGatewaySessionBackend::new(session_config);
+                })?;
             (
-                GatewayState::from_models(models)
-                    .with_canary_registry(canary_registry)
-                    .with_provider_earnings(provider_earnings)
-                    .with_failover_policy(failover_policy)
-                    .with_epoch_seconds(gateway_epoch_seconds)
-                    .with_ctx_bracket_schedule(contract.ctx_bracket_schedule.clone())
-                    .with_receipt_user_seed(user_seed)
-                    .with_receipt_balance_mu(balance_mu)
-                    .with_session_backend(Arc::new(backend)),
-                catalog_source,
-                Some(model_count),
-                format!("sc-bridge-direct-session:{sc_bridge_url}"),
-                Some(wallet.public_key),
-                Some(balance_mu),
-                blocked_version_gates,
+                catalog_doc,
+                catalog_json,
+                format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
             )
         };
+        let canary_registry = GatewayState::canary_registry_from_catalog_json(&catalog_json)
+            .context("loading canary registry from gateway catalog")?;
+        let wallet_password = args.wallet_password.clone().unwrap_or_default();
+        let wallet = resolve_cli_wallet_with_keypair(
+            &home,
+            config.as_ref(),
+            args.keypair.as_deref(),
+            &args.peer_store_name,
+            &wallet_password,
+        )
+        .await?;
+        let keypair_path = PathBuf::from(&wallet.keypair_path);
+        let user_seed = wallet_signing_seed(&keypair_path, &wallet_password, &wallet.public_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "loading spend-voucher signing seed for wallet {}",
+                    wallet.public_key
+                )
+            })?;
+        let balance_au = read_user_balance_au(&rpc, &wallet.public_key, args.rail.as_str()).await?;
+        let contract = read_contract_catalog(&rpc).await?;
+        let models = gateway_models_from_contract(&contract)?;
+        let (models, blocked_version_gates) =
+            filter_gateway_models_by_app_version(models, &catalog_doc)?;
+        let hidden_update_models = gateway_update_models_from_version_gates(&blocked_version_gates);
+        let hardware = probe(ProbeOptions {
+            disk_path: home.clone(),
+            run_disk_bench: false,
+            disk_bench_mib: 1,
+            fixture: None,
+        });
+        let models = annotate_gateway_models_with_local_runs(
+            models,
+            &contract,
+            &catalog_doc,
+            &hardware,
+            &home,
+        );
+        let heartbeat_channels = gateway_provider_heartbeat_channels(&models);
+        let model_count = models.len();
+        let provider_earnings = read_prefix_values::<LedgerEarningRecord>(&rpc, "earn/")
+            .await?
+            .into_iter()
+            .map(earning_view)
+            .map(|view| {
+                view.and_then(|view| {
+                    serde_json::to_value(view).context("serializing provider earning view")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
+            Some(&home),
+            args.sc_bridge_url.as_deref(),
+            args.sc_bridge_token.as_deref(),
+        )?;
+        let heartbeat_watcher = Some(GatewayProviderHeartbeatWatcherConfig {
+            sc_bridge_url: sc_bridge_url.clone(),
+            sc_bridge_token: sc_bridge_token.clone(),
+            channels: heartbeat_channels,
+        });
+        if args.session_open_timeout_seconds == Some(0) {
+            bail!("--session-open-timeout-seconds must be positive");
+        }
+        if args.session_frame_timeout_seconds == Some(0) {
+            bail!("--session-frame-timeout-seconds must be positive");
+        }
+        if args.session_ttft_timeout_seconds == Some(0) {
+            bail!("--session-ttft-timeout-seconds must be positive");
+        }
+        if args
+            .min_tok_s
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            bail!("--min-tok-s must be a positive finite number");
+        }
+        let mut session_config =
+            ScBridgeGatewaySessionConfig::new(sc_bridge_url.clone(), sc_bridge_token);
+        if let Some(seconds) = args.session_open_timeout_seconds {
+            session_config.open_timeout = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = args.session_ttft_timeout_seconds {
+            session_config.ttft_timeout = Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = args.session_frame_timeout_seconds {
+            session_config.frame_timeout = Duration::from_secs(seconds);
+        }
+        session_config.min_tok_s = args.min_tok_s;
+        let failover_policy = mayhem_gateway::openai::GatewayFailoverPolicyConfig {
+            open_timeout_ms: Some(duration_millis_u64(session_config.open_timeout)),
+            ttft_timeout_ms: Some(duration_millis_u64(session_config.ttft_timeout)),
+            stall_timeout_ms: Some(duration_millis_u64(session_config.frame_timeout)),
+            min_tok_s: session_config.min_tok_s,
+        };
+        let backend = ScBridgeGatewaySessionBackend::new(session_config);
+        (
+            GatewayState::from_models(models)
+                .with_canary_registry(canary_registry)
+                .with_provider_earnings(provider_earnings)
+                .with_hidden_update_models(hidden_update_models)
+                .with_failover_policy(failover_policy)
+                .with_epoch_seconds(gateway_epoch_seconds)
+                .with_ctx_bracket_schedule(contract.ctx_bracket_schedule.clone())
+                .with_receipt_user_seed(user_seed)
+                .with_receipt_balance_au(balance_au)
+                .with_session_backend(Arc::new(backend)),
+            catalog_source,
+            Some(model_count),
+            format!("sc-bridge-direct-session:{sc_bridge_url}"),
+            Some(wallet.public_key),
+            Some(balance_au),
+            blocked_version_gates,
+            heartbeat_watcher,
+        )
+    };
     let state = match apple_app_attest_jwks {
         Some(jwks) => state.with_apple_app_attest_jwks(jwks),
         None => state,
@@ -17267,12 +19230,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let state = state.with_receipt_checkpoint_every(receipt_checkpoint_every.clone());
     let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state
-        .with_default_max_price_mu(default_max_price_mu)
+        .with_default_max_price_au(default_max_price_au)
         .with_default_max_wait_ms(default_max_wait_ms)
         .with_default_min_ctx(default_min_ctx)
         .with_receipt_rail(args.rail.as_str())
         .with_provider_load_progress_dir(home.join("provider-load-progress"))
         .with_access_control(access_control);
+    if let Some(config) = heartbeat_watcher {
+        spawn_gateway_provider_heartbeat_watcher(state.clone(), config);
+    }
     let dashboard_url = state.dashboard_url(&gateway_url);
     let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
     let dashboard_session_expires_in_seconds = state.dashboard_session_expires_in().as_secs();
@@ -17291,14 +19257,14 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "rail": args.rail.as_str(),
         "wallet": wallet_public_key.as_ref().map(|public_key| json!({
             "public_key": public_key,
-            "balance_mu": balance_mu.unwrap_or(0),
+            "balance_au": balance_au.unwrap_or(0),
             "balance_source": format!("bal/{}/{}", public_key, args.rail.as_str()),
         })),
         "receipt_checkpoint_every": {
             "tokens": receipt_checkpoint_every.tokens,
             "ms": receipt_checkpoint_every.ms,
         },
-        "default_max_price_mu": default_max_price_mu,
+        "default_max_price_au": default_max_price_au,
         "default_max_wait_ms": default_max_wait_ms.unwrap_or(DEFAULT_ROUTE_MAX_WAIT_MS),
         "default_min_ctx": default_min_ctx,
         "access": {
@@ -17358,14 +19324,14 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             if let Some(public_key) = wallet_public_key.as_deref() {
                 println!("Wallet: {public_key}");
                 println!(
-                    "Balance snapshot: {} mu_usd from bal/{}/{}",
-                    balance_mu.unwrap_or(0),
+                    "Balance snapshot: {} au_usd from bal/{}/{}",
+                    balance_au.unwrap_or(0),
                     public_key,
                     args.rail.as_str()
                 );
             }
-            if let Some(mu) = default_max_price_mu {
-                println!("Default max-price ceiling: {mu} mu_usd.");
+            if let Some(au) = default_max_price_au {
+                println!("Default max-price ceiling: {au} au_usd.");
             }
             println!(
                 "Default max-wait: {}s.",
@@ -17556,10 +19522,10 @@ async fn balance(args: BalanceArgs) -> Result<()> {
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let rail = args.rail.as_str();
     let balance_record = read_balance_record(&rpc, &who, rail).await?;
-    let mu = balance_record
-        .get("mu")
-        .and_then(Value::as_u64)
-        .context("normalized balance record missing mu")?;
+    let au = balance_record
+        .get("au")
+        .and_then(value_money_au)
+        .context("normalized balance record missing au")?;
     let frozen = read_state_value(&rpc, &format!("frozen/{who}")).await?;
     let report = json!({
         "ok": true,
@@ -17567,10 +19533,10 @@ async fn balance(args: BalanceArgs) -> Result<()> {
         "who": who,
         "rail": rail,
         "balance": balance_record,
-        "credit": {
-            "denom": "mu_usd",
-            "mu": mu,
-            "usd": mu_to_usd_amount(mu),
+            "credit": {
+            "denom": "au_usd",
+            "au": money_au_json(au),
+            "usd": au_to_usd_amount(au),
         },
         "frozen": frozen,
     });
@@ -17797,10 +19763,10 @@ async fn reputation(args: ReputationArgs) -> Result<()> {
         None => LedgerEarningRecord {
             provider: provider.clone(),
             rail: "fiat".to_owned(),
-            denom: "mu_usd".to_owned(),
-            total_mu: 0,
-            held_mu: 0,
-            paid_cum_mu: 0,
+            denom: "au_usd".to_owned(),
+            total_au: 0,
+            held_au: 0,
+            paid_cum_au: 0,
             holdbacks: Vec::new(),
             updated_epoch: 0,
             updated_at: None,
@@ -17847,7 +19813,7 @@ fn receipt_history_summary(entry: &Value) -> Value {
         "provider": body.get("provider").and_then(Value::as_str),
         "user": body.get("user").and_then(Value::as_str),
         "enclave_id": body.get("enclave_id").and_then(Value::as_str),
-        "mu_owed_cum": body.get("mu_owed_cum").and_then(Value::as_u64),
+        "au_owed_cum": body.get("au_owed_cum").and_then(value_money_au).map(money_au_json),
         "usage": body.get("usage").cloned().unwrap_or(Value::Null),
         "ts": body.get("ts").and_then(Value::as_u64),
         "final_receipt": body.get("final_receipt").and_then(Value::as_bool),
@@ -17967,6 +19933,13 @@ fn print_status_report(report: &Value) {
     );
     let status = &report["gateway"]["status"];
     if status["ok"].as_bool() == Some(true) {
+        if let Some(message) = status
+            .get("update_notice")
+            .and_then(|notice| notice.get("message"))
+            .and_then(Value::as_str)
+        {
+            println!("{message}");
+        }
         println!(
             "Sessions: active={} paused={} receipts={}",
             status["sessions_active"].as_u64().unwrap_or(0),
@@ -18005,9 +19978,9 @@ fn print_status_report(report: &Value) {
                     .and_then(Value::as_str)
                     .unwrap_or("tok_unknown");
                 let spent = token
-                    .get("spent_total_mu")
-                    .and_then(Value::as_u64)
-                    .map(mu_to_usd_amount)
+                    .get("spent_total_au")
+                    .and_then(value_money_au)
+                    .map(au_to_usd_amount)
                     .unwrap_or_else(|| "0.00".to_owned());
                 let last_used = token
                     .get("last_used_at")
@@ -18026,24 +19999,24 @@ fn print_session_history_report(report: &Value) -> Result<()> {
         for entry in report["sessions"].as_array().into_iter().flatten() {
             let latest = &entry["latest"];
             println!(
-                "{} receipts={} provider={} model={} mu={}",
+                "{} receipts={} provider={} model={} au={}",
                 entry["session_id"].as_str().unwrap_or(""),
                 entry["receipts"].as_u64().unwrap_or(0),
                 latest["provider"].as_str().unwrap_or(""),
                 latest["model_id"].as_str().unwrap_or(""),
-                latest["mu_owed_cum"].as_u64().unwrap_or(0),
+                latest["au_owed_cum"].as_u64().unwrap_or(0),
             );
         }
     } else {
         println!("Recent receipts");
         for entry in report["receipts"].as_array().into_iter().flatten() {
             println!(
-                "{} seq={} provider={} model={} mu={}",
+                "{} seq={} provider={} model={} au={}",
                 entry["session_id"].as_str().unwrap_or(""),
                 entry["seq"].as_u64().unwrap_or(0),
                 entry["provider"].as_str().unwrap_or(""),
                 entry["model_id"].as_str().unwrap_or(""),
-                entry["mu_owed_cum"].as_u64().unwrap_or(0),
+                entry["au_owed_cum"].as_u64().unwrap_or(0),
             );
         }
     }
@@ -18075,11 +20048,11 @@ fn print_reputation_report(report: &Value) {
         );
     }
     println!(
-        "Earnings: total={} held={} paid={} claimable={} mu_usd",
-        report["earnings"]["total_mu"].as_u64().unwrap_or(0),
-        report["earnings"]["held_mu"].as_u64().unwrap_or(0),
-        report["earnings"]["paid_cum_mu"].as_u64().unwrap_or(0),
-        report["earnings"]["claimable_mu"].as_u64().unwrap_or(0),
+        "Earnings: total={} held={} paid={} claimable={} au_usd",
+        report["earnings"]["total_au"].as_u64().unwrap_or(0),
+        report["earnings"]["held_au"].as_u64().unwrap_or(0),
+        report["earnings"]["paid_cum_au"].as_u64().unwrap_or(0),
+        report["earnings"]["claimable_au"].as_u64().unwrap_or(0),
     );
 }
 
@@ -18117,16 +20090,23 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
     let path = config_path_for_home(&home);
     let key = canonical_config_key(&args.key)?;
     let mut config = read_config_toml_value(&path)?;
-    if matches!(
-        key,
-        "user.max_price_mu" | "user.min_ctx" | "user.max_wait_seconds"
-    ) {
+    if key == "user.max_price_au" {
+        let value = args
+            .value
+            .trim()
+            .parse::<MoneyAu>()
+            .with_context(|| format!("{key} must be an integer value"))?;
+        if value == 0 {
+            bail!("{key} must be greater than zero");
+        }
+        toml_set_money_au(&mut config, key, value)?;
+    } else if matches!(key, "user.min_ctx" | "user.max_wait_seconds") {
         let value = args
             .value
             .trim()
             .parse::<u64>()
             .with_context(|| format!("{key} must be an integer value"))?;
-        if matches!(key, "user.max_price_mu" | "user.min_ctx") && value == 0 {
+        if key == "user.min_ctx" && value == 0 {
             bail!("{key} must be greater than zero");
         }
         if key == "user.max_wait_seconds" && value > MAX_ROUTE_MAX_WAIT_MS / 1_000 {
@@ -18163,33 +20143,31 @@ fn config_set(args: ConfigSetArgs) -> Result<()> {
 }
 
 fn config_max_price(args: ConfigMaxPriceArgs) -> Result<()> {
-    if args.clear && args.mu.is_some() {
+    if args.clear && args.au.is_some() {
         bail!("pass either a max-price value or --clear, not both");
     }
-    if args.mu == Some(0) {
+    if args.au == Some(0) {
         bail!("max-price must be greater than 0; use --clear to remove the ceiling");
     }
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let path = config_path_for_home(&home);
     let mut config = read_config_toml_value(&path)?;
-    let changed = args.clear || args.mu.is_some();
+    let changed = args.clear || args.au.is_some();
     if args.clear {
-        toml_remove_path(&mut config, "user.max_price_mu")?;
-    } else if let Some(mu) = args.mu {
-        toml_set_u64(&mut config, "user.max_price_mu", mu)?;
+        toml_remove_path(&mut config, "user.max_price_au")?;
+    } else if let Some(au) = args.au {
+        toml_set_money_au(&mut config, "user.max_price_au", au)?;
     }
     if changed {
         write_config_toml_value(&path, &config)?;
     }
-    let value = toml_get_path(&config, "user.max_price_mu")
-        .and_then(toml::Value::as_integer)
-        .and_then(|value| u64::try_from(value).ok());
+    let value = toml_get_path(&config, "user.max_price_au").and_then(toml_value_money_au);
     let report = json!({
         "ok": true,
         "home": home,
         "path": path,
-        "max_price_mu": value,
+        "max_price_au": value.map(money_au_json),
         "cleared": args.clear,
         "changed": changed,
         "config": serde_json::to_value(&config)?,
@@ -18197,12 +20175,12 @@ fn config_max_price(args: ConfigMaxPriceArgs) -> Result<()> {
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if let Some(mu) = value {
+    } else if let Some(au) = value {
         println!(
-            "User max-price default: {mu} mu_usd in {}",
+            "User max-price default: {au} au_usd in {}",
             report["path"].as_str().unwrap_or("")
         );
-        println!("Per-request override header: X-Mayhem-Max-Price-Mu");
+        println!("Per-request override header: X-Mayhem-Max-Price-Au");
     } else {
         println!(
             "User max-price default: off in {}",
@@ -19516,8 +21494,8 @@ fn price_show_markets_from_gateway_models(
                 continue;
             }
             let price = route
-                .get("price_ref_mu")
-                .or_else(|| mayhem.get("price_ref_mu"))
+                .get("price_ref_au")
+                .or_else(|| mayhem.get("price_ref_au"))
                 .cloned()
                 .unwrap_or(Value::Null);
             if price.is_null() {
@@ -19539,7 +21517,7 @@ fn price_show_markets_from_gateway_models(
                         .get("quant")
                         .and_then(Value::as_str)
                         .unwrap_or(DEFAULT_QUANT_BUCKET),
-                    "price_ref_mu": price,
+                    "price_ref_au": price,
                 })
             });
         }
@@ -19550,7 +21528,7 @@ fn price_show_markets_from_gateway_models(
             && target == model_id
             && tier.is_none()
         {
-            let price = mayhem.get("price_ref_mu").cloned().unwrap_or(Value::Null);
+            let price = mayhem.get("price_ref_au").cloned().unwrap_or(Value::Null);
             if !price.is_null() {
                 markets.entry(model_id.to_owned()).or_insert_with(|| {
                     json!({
@@ -19560,7 +21538,7 @@ fn price_show_markets_from_gateway_models(
                         "provider": Value::Null,
                         "att_tier": Value::Null,
                         "quant": DEFAULT_QUANT_BUCKET,
-                        "price_ref_mu": price,
+                        "price_ref_au": price,
                     })
                 });
             }
@@ -19619,7 +21597,7 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         .filter(|id| !id.is_empty())
         .context("gateway model missing id")?;
     let mayhem = model.get("mayhem").unwrap_or(&Value::Null);
-    let price = mayhem.get("price_ref_mu").unwrap_or(&Value::Null);
+    let price = mayhem.get("price_ref_au").unwrap_or(&Value::Null);
     let caps = mayhem.get("caps").unwrap_or(&Value::Null);
     let attestation_tiers = mayhem
         .get("attestation_tiers")
@@ -19668,7 +21646,7 @@ fn gateway_model_summary(model: &Value) -> Result<ModelSummary> {
         denom: price
             .get("denom")
             .and_then(Value::as_str)
-            .unwrap_or("mu_usd")
+            .unwrap_or("au_usd")
             .to_owned(),
         rate_map: gateway_price_rate_map(price),
         tools: caps.get("tools").and_then(Value::as_bool).unwrap_or(false),
@@ -19703,8 +21681,11 @@ fn gateway_price_rate_map(price: &Value) -> Vec<RateMapEntry> {
         }
     }
     text_generation_rate_map(
-        price.get("in_per_1k").and_then(Value::as_u64).unwrap_or(0),
-        price.get("out_per_1k").and_then(Value::as_u64).unwrap_or(0),
+        price.get("in_per_1k").and_then(value_money_au).unwrap_or(0),
+        price
+            .get("out_per_1k")
+            .and_then(value_money_au)
+            .unwrap_or(0),
     )
 }
 
@@ -20463,7 +22444,7 @@ fn print_price_show_report(report: &Value) -> Result<()> {
         .as_array()
         .context("price report missing markets[]")?
     {
-        let price = market.get("price_ref_mu").unwrap_or(&Value::Null);
+        let price = market.get("price_ref_au").unwrap_or(&Value::Null);
         let rate_map = gateway_price_rate_map(price);
         println!(
             "{}  {}  T{}  quant={}  ver={}",
@@ -20475,16 +22456,19 @@ fn print_price_show_report(report: &Value) -> Result<()> {
         );
         println!("  price: {}", format_rate_map(&rate_map));
         println!(
-            "  per_req_mu={} min_session_mu={} denom={}",
-            price.get("per_req_mu").and_then(Value::as_u64).unwrap_or(0),
+            "  per_req_au={} min_session_au={} denom={}",
             price
-                .get("min_session_mu")
-                .and_then(Value::as_u64)
+                .get("per_req_au")
+                .and_then(value_money_au)
+                .unwrap_or(0),
+            price
+                .get("min_session_au")
+                .and_then(value_money_au)
                 .unwrap_or(0),
             price
                 .get("denom")
                 .and_then(Value::as_str)
-                .unwrap_or("mu_usd")
+                .unwrap_or("au_usd")
         );
         match price.get("derivation").filter(|value| !value.is_null()) {
             Some(derivation) => {
@@ -20520,10 +22504,10 @@ fn print_provider_limits_report(report: &Value) {
             .unwrap_or(0)
     );
     println!(
-        "budget_mu: {}",
+        "budget_au: {}",
         limits
-            .get("serve_budget_mu")
-            .and_then(Value::as_u64)
+            .get("serve_budget_au")
+            .and_then(value_money_au)
             .unwrap_or(0)
     );
     println!(
@@ -20608,14 +22592,14 @@ fn attestation_summary_for_model(model: &Value) -> String {
 
 fn print_balance_report(report: &Value) {
     let balance = &report["balance"];
-    let mu = report["credit"]["mu"].as_u64().unwrap_or(0);
+    let au = report["credit"]["au"].as_u64().unwrap_or(0);
     println!("Mayhem balance");
     println!("Public key: {}", report["who"].as_str().unwrap_or(""));
     println!("Rail: {}", report["rail"].as_str().unwrap_or(""));
     println!(
-        "Credit: {} USD ({} mu_usd)",
+        "Credit: {} USD ({} au_usd)",
         report["credit"]["usd"].as_str().unwrap_or("0.00"),
-        mu
+        au
     );
     println!(
         "Updated epoch: {}",
@@ -20772,7 +22756,7 @@ async fn receipts_export(args: ReceiptsExportArgs) -> Result<()> {
         receipts,
         payouts,
         prior_earnings,
-        prior_fee_cum_mu: args.prior_fee_cum_mu,
+        prior_fee_cum_au: args.prior_fee_cum_au,
     };
 
     let output_path = args
@@ -21368,6 +23352,14 @@ fn resolve_tnk_msb_network(
     }
 }
 
+fn msb_network_address_prefix(network: &str) -> Result<&'static str> {
+    match network.to_ascii_lowercase().as_str() {
+        "mainnet" => Ok("trac"),
+        "testnet" | "testnet1" => Ok("testtrac"),
+        _ => bail!("MSB network must be mainnet or testnet1"),
+    }
+}
+
 fn msb_store_from_keypair_path(keypair_path: &Path) -> Result<(PathBuf, String)> {
     let keypair_file = keypair_path
         .file_name()
@@ -21444,7 +23436,7 @@ fn pay_tnk_deposit_intent_payload(
     memo_hash: &str,
     treasury_address: &str,
     tnk_e18: u128,
-    quoted_mu: u64,
+    quoted_au: MoneyAu,
     rate: &PayTnkRate,
 ) -> Value {
     json!({
@@ -21452,8 +23444,8 @@ fn pay_tnk_deposit_intent_payload(
         "memo_hash": memo_hash,
         "treasury_address": treasury_address,
         "tnk_e18": tnk_e18.to_string(),
-        "quoted_mu": quoted_mu,
-        "rate_tnk_usd_e6": rate.tnk_usd_e6,
+        "quoted_au": money_au_json(quoted_au),
+        "rate_tnk_usd_au": money_au_json(rate.tnk_usd_au),
         "rate_source": rate.source,
     })
 }
@@ -21464,36 +23456,36 @@ fn deposit_tnk_intent_message(intent: &Value) -> String {
 
 async fn resolve_tnk_rate(
     rpc: Option<&PeerRpcClient>,
-    override_rate: Option<u64>,
+    override_rate: Option<MoneyAu>,
 ) -> Result<PayTnkRate> {
-    if let Some(tnk_usd_e6) = override_rate {
-        if tnk_usd_e6 == 0 {
-            bail!("--tnk-usd-e6 must be positive");
+    if let Some(tnk_usd_au) = override_rate {
+        if tnk_usd_au == 0 {
+            bail!("--tnk-usd-au must be positive");
         }
         return Ok(PayTnkRate {
-            tnk_usd_e6,
+            tnk_usd_au,
             source: "cli-override".to_owned(),
             ts: None,
         });
     }
 
     let rpc = rpc.context(
-        "contract rate/latest requires peer RPC; pass --tnk-usd-e6 for offline preparation",
+        "contract rate/latest requires peer RPC; pass --tnk-usd-au for offline preparation",
     )?;
     let value = read_state_value(rpc, "rate/latest").await?.context(
-        "contract rate/latest not found; run mayhem admin rate-oracle or pass --tnk-usd-e6",
+        "contract rate/latest not found; run mayhem admin rate-oracle or pass --tnk-usd-au",
     )?;
     parse_tnk_rate(&value)
 }
 
 fn parse_tnk_rate(value: &Value) -> Result<PayTnkRate> {
-    let tnk_usd_e6 = value
-        .get("tnk_usd_e6")
-        .and_then(Value::as_u64)
+    let tnk_usd_au = value
+        .get("tnk_usd_au")
+        .and_then(value_money_au)
         .filter(|rate| *rate > 0)
-        .context("rate/latest missing positive tnk_usd_e6")?;
+        .context("rate/latest missing positive tnk_usd_au")?;
     Ok(PayTnkRate {
-        tnk_usd_e6,
+        tnk_usd_au,
         source: value
             .get("source")
             .and_then(Value::as_str)
@@ -21545,7 +23537,7 @@ async fn build_tnk_settlement_plan(
     network: &str,
     treasury_address: &str,
     operator_tnk_address: &str,
-    msb_tx_hash: Option<&str>,
+    msb_tx_hashes: Option<&[String]>,
 ) -> Result<TnkSettlementPlan> {
     for (label, value) in [
         ("MSB network", network),
@@ -21635,45 +23627,45 @@ async fn build_tnk_settlement_plan(
         if earning.rail != "tnk" {
             continue;
         }
-        let payable_mu = tnk_payable_earning_mu(rpc, &earning, epoch, &params).await?;
-        if payable_mu == 0 {
-            continue;
-        }
         let Some(provider) = providers.get(&earning.provider) else {
             skipped_providers.push(json!({
                 "provider": earning.provider,
-                "mu": payable_mu,
+                "au": money_au_json(0),
                 "reason": "provider record missing",
             }));
             continue;
         };
+        let payable_au = tnk_payable_earning_au(rpc, &earning, provider, epoch, &params).await?;
+        if payable_au == 0 {
+            continue;
+        }
         match tnk_provider_payout_target(provider, &earning.provider, &admin) {
             Ok(to) => outputs.push(json!({
                 "role": "provider",
                 "provider": earning.provider,
                 "to": to,
-                "mu": payable_mu,
-                "tnk_e18": mu_to_tnk_e18_ceil_u128(payable_mu, rate.tnk_usd_e6)?.to_string(),
+                "au": money_au_json(payable_au),
+                "tnk_e18": au_to_tnk_e18_ceil_u128(payable_au, rate.tnk_usd_au)?.to_string(),
             })),
             Err(error) => skipped_providers.push(json!({
                 "provider": earning.provider,
-                "mu": payable_mu,
+                "au": money_au_json(payable_au),
                 "reason": error.to_string(),
             })),
         }
     }
 
     let fee = read_tnk_fee_record(rpc).await?;
-    let operator_fee_mu = fee
-        .cum_mu
-        .checked_sub(fee.swept_cum_mu)
+    let operator_fee_au = fee
+        .cum_au
+        .checked_sub(fee.swept_cum_au)
         .context("fee/tnk/cum swept amount exceeds cumulative fee")?;
-    if operator_fee_mu > 0 {
+    if operator_fee_au > 0 {
         outputs.push(json!({
             "role": "operator_fee",
             "to": operator_tnk_address,
-            "mu": operator_fee_mu,
-            "tnk_e18": mu_to_tnk_e18_ceil_u128(operator_fee_mu, rate.tnk_usd_e6)?.to_string(),
+            "au": money_au_json(operator_fee_au),
+            "tnk_e18": au_to_tnk_e18_ceil_u128(operator_fee_au, rate.tnk_usd_au)?.to_string(),
         }));
     }
     if outputs.is_empty() {
@@ -21683,6 +23675,16 @@ async fn build_tnk_settlement_plan(
     }
 
     let totals = tnk_settlement_output_totals(&outputs)?;
+    let provided_msb_tx_hashes = msb_tx_hashes
+        .map(|hashes| hashes.to_vec())
+        .unwrap_or_default();
+    if !provided_msb_tx_hashes.is_empty() && provided_msb_tx_hashes.len() != outputs.len() {
+        bail!(
+            "TNK settlement requires one --msb-tx-hash per output: got {}, expected {}",
+            provided_msb_tx_hashes.len(),
+            outputs.len()
+        );
+    }
     let transfer_root = stable_value_hash(&json!({
         "domain": "mayhem-tnk-settlement-transfer-root-v1",
         "value": outputs,
@@ -21696,15 +23698,15 @@ async fn build_tnk_settlement_plan(
         "treasury_from": treasury_address,
         "operator_to": operator_tnk_address,
         "epoch_apply_hash": epoch_apply_hash,
-        "rate_tnk_usd_e6": rate.tnk_usd_e6,
+        "rate_tnk_usd_au": money_au_json(rate.tnk_usd_au),
         "rate_source": rate.source,
         "rate_ts": rate_ts,
-        "msb_tx_hash": msb_tx_hash,
+        "msb_tx_hashes": provided_msb_tx_hashes,
         "transfer_root": transfer_root,
         "provider_count": totals.provider_count,
-        "provider_mu": totals.provider_mu,
-        "operator_fee_mu": totals.operator_fee_mu,
-        "gross_mu": totals.gross_mu,
+        "provider_au": money_au_json(totals.provider_au),
+        "operator_fee_au": money_au_json(totals.operator_fee_au),
+        "gross_au": money_au_json(totals.gross_au),
         "tnk_e18": totals.tnk_e18,
         "outputs": outputs,
     });
@@ -21719,7 +23721,7 @@ async fn build_tnk_settlement_plan(
                 .context("settlement output missing tnk_e18")?
                 .parse::<u128>()
                 .context("parsing settlement tnk_e18")?;
-            Ok(MsbBatchTransferOutputEntry {
+            Ok(MsbSettlementTransferOutput {
                 to: output
                     .get("to")
                     .and_then(Value::as_str)
@@ -21741,26 +23743,26 @@ async fn build_tnk_settlement_plan(
 #[derive(Debug)]
 struct TnkSettlementTotals {
     provider_count: u64,
-    provider_mu: u64,
-    operator_fee_mu: u64,
-    gross_mu: u64,
+    provider_au: MoneyAu,
+    operator_fee_au: MoneyAu,
+    gross_au: MoneyAu,
     tnk_e18: String,
 }
 
 fn tnk_settlement_output_totals(outputs: &[Value]) -> Result<TnkSettlementTotals> {
     let mut provider_count = 0_u64;
-    let mut provider_mu = 0_u64;
-    let mut operator_fee_mu = 0_u64;
+    let mut provider_au = 0_u128;
+    let mut operator_fee_au = 0_u128;
     let mut tnk_e18 = 0_u128;
     for output in outputs {
         let role = output
             .get("role")
             .and_then(Value::as_str)
             .context("TNK settlement output missing role")?;
-        let mu = output
-            .get("mu")
-            .and_then(Value::as_u64)
-            .context("TNK settlement output missing mu")?;
+        let au = output
+            .get("au")
+            .and_then(value_money_au)
+            .context("TNK settlement output missing au")?;
         let amount = output
             .get("tnk_e18")
             .and_then(Value::as_str)
@@ -21775,26 +23777,26 @@ fn tnk_settlement_output_totals(outputs: &[Value]) -> Result<TnkSettlementTotals
                 provider_count = provider_count
                     .checked_add(1)
                     .context("TNK settlement provider count overflow")?;
-                provider_mu = provider_mu
-                    .checked_add(mu)
+                provider_au = provider_au
+                    .checked_add(au)
                     .context("TNK settlement provider amount overflow")?;
             }
             "operator_fee" => {
-                operator_fee_mu = operator_fee_mu
-                    .checked_add(mu)
+                operator_fee_au = operator_fee_au
+                    .checked_add(au)
                     .context("TNK settlement operator amount overflow")?;
             }
             _ => bail!("invalid TNK settlement output role {role}"),
         }
     }
-    let gross_mu = provider_mu
-        .checked_add(operator_fee_mu)
+    let gross_au = provider_au
+        .checked_add(operator_fee_au)
         .context("TNK settlement gross amount overflow")?;
     Ok(TnkSettlementTotals {
         provider_count,
-        provider_mu,
-        operator_fee_mu,
-        gross_mu,
+        provider_au,
+        operator_fee_au,
+        gross_au,
         tnk_e18: tnk_e18.to_string(),
     })
 }
@@ -21803,8 +23805,22 @@ async fn read_tnk_settlement_params(rpc: &PeerRpcClient, at: u64) -> Result<TnkS
     Ok(TnkSettlementParams {
         holdback_epochs: read_param_u64_at(rpc, "holdback_epochs", DEFAULT_HOLDBACK_EPOCHS, at)
             .await?,
+        new_provider_holdback_epochs: read_param_u64_at(
+            rpc,
+            "new_provider_holdback_epochs",
+            DEFAULT_NEW_PROVIDER_HOLDBACK_EPOCHS,
+            at,
+        )
+        .await?,
         challenge_epochs: read_param_u64_at(rpc, "challenge_epochs", DEFAULT_CHALLENGE_EPOCHS, at)
             .await?,
+        probation_successful_sessions: read_param_u64_at(
+            rpc,
+            "probation_successful_sessions",
+            DEFAULT_PROBATION_SUCCESSFUL_SESSIONS,
+            at,
+        )
+        .await?,
         canary_probe_holdback_bps: read_param_u64_at(
             rpc,
             "canary_probe_holdback_bps",
@@ -21858,9 +23874,9 @@ async fn read_tnk_fee_record(rpc: &PeerRpcClient) -> Result<LedgerFeeRecord> {
         Some(value) => serde_json::from_value(value).context("parsing fee/tnk/cum contract state"),
         None => Ok(LedgerFeeRecord {
             rail: "tnk".to_owned(),
-            denom: "mu_usd".to_owned(),
-            cum_mu: 0,
-            swept_cum_mu: 0,
+            denom: "au_usd".to_owned(),
+            cum_au: 0,
+            swept_cum_au: 0,
             updated_epoch: 0,
             updated_at: None,
             last_apply_hash: None,
@@ -21871,25 +23887,42 @@ async fn read_tnk_fee_record(rpc: &PeerRpcClient) -> Result<LedgerFeeRecord> {
     }
 }
 
-async fn tnk_payable_earning_mu(
+async fn tnk_payable_earning_au(
     rpc: &PeerRpcClient,
     earning: &LedgerEarningRecord,
+    provider: &Value,
     epoch: u64,
     params: &TnkSettlementParams,
-) -> Result<u64> {
-    let locked_epochs = params.holdback_epochs.max(params.challenge_epochs);
+) -> Result<MoneyAu> {
+    let locked_epochs = provider_tnk_locked_epochs(provider, params)?;
     let kept = refresh_tnk_holdbacks(rpc, earning, epoch, locked_epochs, params).await?;
-    let held_mu = kept
+    let held_au = kept
         .iter()
-        .try_fold(0_u64, |sum, bucket| sum.checked_add(bucket.mu))
+        .try_fold(0_u128, |sum, bucket| sum.checked_add(bucket.au))
         .context("TNK held amount overflow")?;
-    let released_mu = earning
-        .total_mu
-        .checked_sub(held_mu)
+    let released_au = earning
+        .total_au
+        .checked_sub(held_au)
         .context("TNK held amount exceeds total earnings")?;
-    released_mu
-        .checked_sub(earning.paid_cum_mu)
+    released_au
+        .checked_sub(earning.paid_cum_au)
         .context("TNK paid amount exceeds released earnings")
+}
+
+fn provider_tnk_locked_epochs(provider: &Value, params: &TnkSettlementParams) -> Result<u64> {
+    let successful_sessions = provider
+        .get("probation")
+        .and_then(|probation| probation.get("successful_sessions"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let provider_holdback = if successful_sessions < params.probation_successful_sessions {
+        params
+            .holdback_epochs
+            .max(params.new_provider_holdback_epochs)
+    } else {
+        params.holdback_epochs
+    };
+    Ok(provider_holdback.max(params.challenge_epochs))
 }
 
 async fn refresh_tnk_holdbacks(
@@ -21904,7 +23937,8 @@ async fn refresh_tnk_holdbacks(
         params.canary_probe_holdback_bps > 0 && params.canary_probe_release_min_passes > 0;
     let mut kept = Vec::new();
     for bucket in holdbacks {
-        if bucket.epoch.saturating_add(locked_epochs) > current_epoch {
+        let bucket_locked_epochs = bucket.locked_epochs.unwrap_or(locked_epochs);
+        if bucket.epoch.saturating_add(bucket_locked_epochs) > current_epoch {
             kept.push(bucket);
             continue;
         }
@@ -21925,13 +23959,13 @@ async fn refresh_tnk_holdbacks(
             kept.push(bucket);
             continue;
         }
-        let gated_mu =
-            (u128::from(bucket.mu) * u128::from(params.canary_probe_holdback_bps) / 10_000) as u64;
-        if gated_mu > 0 {
+        let gated_au = bucket.au * u128::from(params.canary_probe_holdback_bps) / 10_000;
+        if gated_au > 0 {
             kept.push(LedgerHoldbackBucket {
                 epoch: bucket.epoch,
-                mu: gated_mu,
+                au: gated_au,
                 probe_gate: true,
+                locked_epochs: bucket.locked_epochs,
             });
         }
     }
@@ -21957,36 +23991,40 @@ async fn tnk_probe_passed(
 
 fn normalize_tnk_holdbacks(earning: &LedgerEarningRecord) -> Result<Vec<LedgerHoldbackBucket>> {
     if earning.holdbacks.is_empty() {
-        if earning.held_mu == 0 {
+        if earning.held_au == 0 {
             return Ok(Vec::new());
         }
         return Ok(vec![LedgerHoldbackBucket {
             epoch: earning.updated_epoch,
-            mu: earning.held_mu,
+            au: earning.held_au,
             probe_gate: false,
+            locked_epochs: None,
         }]);
     }
-    let mut by_bucket = BTreeMap::<(u64, bool), u64>::new();
+    let mut by_bucket = BTreeMap::<(u64, bool, Option<u64>), MoneyAu>::new();
     for bucket in &earning.holdbacks {
-        if bucket.mu == 0 {
+        if bucket.au == 0 {
             bail!("TNK holdback bucket amount must be positive");
         }
-        let key = (bucket.epoch, bucket.probe_gate);
+        let key = (bucket.epoch, bucket.probe_gate, bucket.locked_epochs);
         let next = by_bucket
             .get(&key)
             .copied()
             .unwrap_or(0)
-            .checked_add(bucket.mu)
+            .checked_add(bucket.au)
             .context("TNK holdback bucket overflow")?;
         by_bucket.insert(key, next);
     }
     Ok(by_bucket
         .into_iter()
-        .map(|((epoch, probe_gate), mu)| LedgerHoldbackBucket {
-            epoch,
-            mu,
-            probe_gate,
-        })
+        .map(
+            |((epoch, probe_gate, locked_epochs), au)| LedgerHoldbackBucket {
+                epoch,
+                au,
+                probe_gate,
+                locked_epochs,
+            },
+        )
         .collect())
 }
 
@@ -22026,7 +24064,7 @@ fn tnk_provider_payout_target(provider: &Value, provider_id: &str, admin: &str) 
 
 fn resolve_tnk_nonce(
     wallet_pubkey: &str,
-    amount_mu: u64,
+    amount_au: MoneyAu,
     treasury_address: &str,
     rate: &PayTnkRate,
     args: &PayTnkArgs,
@@ -22043,8 +24081,8 @@ fn resolve_tnk_nonce(
         .as_nanos();
     Ok(blake3::hash(
         format!(
-            "mayhem:tnk-deposit-nonce:v1:{wallet_pubkey}:{amount_mu}:{treasury_address}:{}:{now}:{}",
-            rate.tnk_usd_e6,
+            "mayhem:tnk-deposit-nonce:v1:{wallet_pubkey}:{amount_au}:{treasury_address}:{}:{now}:{}",
+            rate.tnk_usd_au,
             std::process::id()
         )
         .as_bytes(),
@@ -22062,22 +24100,20 @@ fn derive_tnk_memo_hash(wallet_pubkey: &str, nonce: &str) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn mu_to_tnk_e18_ceil_u128(mu: u64, rate_tnk_usd_e6: u64) -> Result<u128> {
-    if rate_tnk_usd_e6 == 0 {
-        bail!("rate_tnk_usd_e6 must be positive");
+fn au_to_tnk_e18_ceil_u128(au: MoneyAu, rate_tnk_usd_au: MoneyAu) -> Result<u128> {
+    if rate_tnk_usd_au == 0 {
+        bail!("rate_tnk_usd_au must be positive");
     }
-    let numerator = u128::from(mu)
-        .checked_mul(TNK_E18)
-        .context("TNK conversion overflow")?;
-    Ok(numerator.div_ceil(u128::from(rate_tnk_usd_e6)))
+    let numerator = au.checked_mul(TNK_E18).context("TNK conversion overflow")?;
+    Ok(numerator.div_ceil(rate_tnk_usd_au))
 }
 
-fn tnk_e18_to_mu_floor(tnk_e18: u128, rate_tnk_usd_e6: u64) -> Result<u64> {
-    let mu = tnk_e18
-        .checked_mul(u128::from(rate_tnk_usd_e6))
+fn tnk_e18_to_au_floor(tnk_e18: u128, rate_tnk_usd_au: MoneyAu) -> Result<MoneyAu> {
+    let au = tnk_e18
+        .checked_mul(rate_tnk_usd_au)
         .context("TNK credit conversion overflow")?
         / TNK_E18;
-    u64::try_from(mu).context("TNK credit conversion overflowed u64")
+    Ok(au)
 }
 
 fn tnk_e18_to_decimal(tnk_e18: u128) -> String {
@@ -22097,16 +24133,21 @@ fn pay_tnk_deposit_intent_command(
     amount: &str,
     treasury_address: &str,
     nonce: &str,
-    tnk_usd_e6: u64,
+    tnk_usd_au: MoneyAu,
+    keypair: Option<&Path>,
     rpc_url: Option<&str>,
 ) -> String {
     let mut command = format!(
-        "mayhem pay tnk --amount {} --treasury-address {} --nonce {} --tnk-usd-e6 {} --submit-intent",
+        "mayhem pay tnk --amount {} --treasury-address {} --nonce {} --tnk-usd-au {} --submit-intent",
         shell_single_quote(amount),
         shell_single_quote(treasury_address),
         shell_single_quote(nonce),
-        tnk_usd_e6
+        tnk_usd_au
     );
+    if let Some(keypair) = keypair {
+        command.push_str(" --keypair ");
+        command.push_str(&shell_single_quote(&keypair.display().to_string()));
+    }
     if let Some(rpc_url) = rpc_url.filter(|value| !value.trim().is_empty()) {
         command.push_str(" --rpc-url ");
         command.push_str(&shell_single_quote(rpc_url));
@@ -22116,16 +24157,16 @@ fn pay_tnk_deposit_intent_command(
 
 fn emit_tnk_handoff(
     json_output: bool,
-    amount_mu: u64,
+    amount_au: MoneyAu,
     msb_transfer_command: &str,
-    memo_hash: &str,
+    deposit_binding: &str,
     deposit_intent_command: &str,
 ) -> Result<()> {
     let lines = [
-        format!("Mayhem tnk deposit for {}", mu_to_usd_amount(amount_mu)),
+        format!("Mayhem tnk deposit for {}", au_to_usd_amount(amount_au)),
         format!("Copy/paste deposit intent command: {deposit_intent_command}"),
         format!("Copy/paste MSB transfer command: {msb_transfer_command}"),
-        format!("Copy/paste transfer memo/reference: {memo_hash}"),
+        format!("Deposit binding: {deposit_binding}"),
     ];
     if json_output {
         let mut stderr = io::stderr().lock();
@@ -22150,8 +24191,10 @@ async fn submit_msb_transfer(
     to: &str,
     amount: &str,
     timeout_seconds: u64,
+    max_retries: u64,
+    expected_balance_before: Option<&str>,
 ) -> Result<MsbTransferOutput> {
-    run_msb_transfer_helper(vec![
+    let mut args = vec![
         "transfer".to_owned(),
         "--network".to_owned(),
         network.to_owned(),
@@ -22163,31 +24206,6 @@ async fn submit_msb_transfer(
         to.to_owned(),
         "--amount".to_owned(),
         amount.to_owned(),
-        "--timeout-seconds".to_owned(),
-        timeout_seconds.to_string(),
-    ])
-    .await
-}
-
-async fn submit_msb_batch_transfer(
-    network: &str,
-    stores_directory: &Path,
-    store_name: &str,
-    outputs: &[MsbBatchTransferOutputEntry],
-    timeout_seconds: u64,
-    max_retries: u64,
-    expected_balance_before: Option<&str>,
-) -> Result<MsbBatchTransferOutput> {
-    let mut args = vec![
-        "batch-transfer".to_owned(),
-        "--network".to_owned(),
-        network.to_owned(),
-        "--stores-directory".to_owned(),
-        stores_directory.display().to_string(),
-        "--store-name".to_owned(),
-        store_name.to_owned(),
-        "--outputs-json".to_owned(),
-        serde_json::to_string(outputs)?,
         "--timeout-seconds".to_owned(),
         timeout_seconds.to_string(),
         "--max-retries".to_owned(),
@@ -22212,19 +24230,18 @@ where
         .and_then(Path::parent)
         .context("resolving repository root for MSB transfer helper")?;
     let msb_app = repo_root.join("intercom/trac/msb");
-    let pear = env::var_os("MAYHEM_PEAR_BIN").unwrap_or_else(|| "pear".into());
+    let pear_runtime = resolve_pear_runtime_path()?;
     let mut helper_args = vec!["--transfer-helper".to_owned()];
     helper_args.extend(args);
-    let output = Command::new(&pear)
+    let output = Command::new(&pear_runtime)
         .arg("run")
-        .arg("--no-ask")
         .arg(&msb_app)
         .args(helper_args)
         .output()
         .await
         .with_context(|| {
             format!(
-                "running MSB transfer helper via Pear app {}",
+                "running MSB transfer helper via pear-runtime app {}",
                 msb_app.display()
             )
         })?;
@@ -22232,7 +24249,7 @@ where
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "MSB transfer helper failed via Pear: {}{}{}",
+            "MSB transfer helper failed via pear-runtime: {}{}{}",
             stderr.trim(),
             if stderr.trim().is_empty() || stdout.trim().is_empty() {
                 ""
@@ -22242,7 +24259,42 @@ where
             stdout.trim()
         );
     }
-    serde_json::from_slice(&output.stdout).context("parsing Pear MSB transfer helper JSON output")
+    parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
+}
+
+fn parse_msb_transfer_helper_json<T>(stdout: &[u8], stderr: &[u8]) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(value) = serde_json::from_slice(stdout) {
+        return Ok(value);
+    }
+    let stdout_text = String::from_utf8_lossy(stdout);
+    for (idx, _) in stdout_text.match_indices('{') {
+        if let Ok(value) = serde_json::from_str::<T>(stdout_text[idx..].trim()) {
+            return Ok(value);
+        }
+    }
+    let stderr_text = String::from_utf8_lossy(stderr);
+    bail!(
+        "parsing Pear MSB transfer helper JSON output failed; stdout: {}; stderr: {}",
+        truncate_log_for_error(stdout_text.trim()),
+        truncate_log_for_error(stderr_text.trim())
+    )
+}
+
+fn truncate_log_for_error(value: &str) -> String {
+    const MAX: usize = 2_000;
+    if value.len() <= MAX {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx <= MAX)
+        .last()
+        .unwrap_or(0);
+    format!("{}...(truncated)", &value[..end])
 }
 
 #[derive(Debug)]
@@ -22255,9 +24307,9 @@ struct PayCheckout {
 #[derive(Debug)]
 struct PayCreditStatus {
     credited: bool,
-    before_mu: u64,
-    current_mu: u64,
-    target_mu: u64,
+    before_au: MoneyAu,
+    current_au: MoneyAu,
+    target_au: MoneyAu,
     waited_ms: u64,
 }
 
@@ -22265,7 +24317,7 @@ struct PayCheckoutRequest<'a> {
     rail: PayRail,
     paygate_url: &'a str,
     who: &'a str,
-    amount_mu: u64,
+    amount_au: MoneyAu,
     currency: &'a str,
     locale: &'a str,
     idempotency_key: Option<&'a str>,
@@ -22274,13 +24326,13 @@ struct PayCheckoutRequest<'a> {
 }
 
 #[cfg(test)]
-fn checkout_handoff_lines(rail: PayRail, amount_mu: u64, url: &str) -> [String; 2] {
-    checkout_handoff_lines_with_currency(rail, amount_mu, "usd", url)
+fn checkout_handoff_lines(rail: PayRail, amount_au: MoneyAu, url: &str) -> [String; 2] {
+    checkout_handoff_lines_with_currency(rail, amount_au, "usd", url)
 }
 
 fn checkout_handoff_lines_with_currency(
     rail: PayRail,
-    amount_mu: u64,
+    amount_au: MoneyAu,
     currency: &str,
     url: &str,
 ) -> [String; 2] {
@@ -22288,7 +24340,7 @@ fn checkout_handoff_lines_with_currency(
         format!(
             "Mayhem {} checkout for {} {}",
             rail.as_str(),
-            mu_to_usd_amount(amount_mu),
+            au_to_usd_amount(amount_au),
             currency.to_ascii_uppercase()
         ),
         format!("Copy/paste checkout URL: {url}"),
@@ -22304,11 +24356,11 @@ fn checkout_copy_paste_value(url: &str) -> Value {
 fn emit_checkout_handoff(
     json_output: bool,
     rail: PayRail,
-    amount_mu: u64,
+    amount_au: MoneyAu,
     currency: &str,
     url: &str,
 ) -> Result<()> {
-    let lines = checkout_handoff_lines_with_currency(rail, amount_mu, currency, url);
+    let lines = checkout_handoff_lines_with_currency(rail, amount_au, currency, url);
     if json_output {
         let mut stderr = io::stderr().lock();
         for line in lines {
@@ -22340,7 +24392,7 @@ async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheck
         .unwrap_or_else(|| default_checkout_cancel_url(request.paygate_url, request.rail));
     let mut body = json!({
         "who": request.who,
-        "mu": request.amount_mu,
+        "au": money_au_json(request.amount_au),
     });
     body["success_url"] = Value::String(success_url);
     body["cancel_url"] = Value::String(cancel_url);
@@ -22470,29 +24522,29 @@ async fn wait_for_credit(
     rpc: &PeerRpcClient,
     who: &str,
     rail: &str,
-    before_mu: u64,
-    target_mu: u64,
+    before_au: MoneyAu,
+    target_au: MoneyAu,
     timeout: Duration,
     interval: Duration,
 ) -> Result<PayCreditStatus> {
     let started = Instant::now();
     loop {
-        let current_mu = read_user_balance_mu(rpc, who, rail).await?;
-        if current_mu >= target_mu {
+        let current_au = read_user_balance_au(rpc, who, rail).await?;
+        if current_au >= target_au {
             return Ok(PayCreditStatus {
                 credited: true,
-                before_mu,
-                current_mu,
-                target_mu,
+                before_au,
+                current_au,
+                target_au,
                 waited_ms: millis_since(started),
             });
         }
         if started.elapsed() >= timeout {
             return Ok(PayCreditStatus {
                 credited: false,
-                before_mu,
-                current_mu,
-                target_mu,
+                before_au,
+                current_au,
+                target_au,
                 waited_ms: millis_since(started),
             });
         }
@@ -22504,12 +24556,12 @@ fn millis_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn read_user_balance_mu(rpc: &PeerRpcClient, who: &str, rail: &str) -> Result<u64> {
+async fn read_user_balance_au(rpc: &PeerRpcClient, who: &str, rail: &str) -> Result<MoneyAu> {
     read_balance_record(rpc, who, rail)
         .await?
-        .get("mu")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("normalized {rail} balance record for {who} is missing mu"))
+        .get("au")
+        .and_then(value_money_au)
+        .ok_or_else(|| anyhow::anyhow!("normalized {rail} balance record for {who} is missing au"))
 }
 
 async fn read_balance_record(rpc: &PeerRpcClient, who: &str, rail: &str) -> Result<Value> {
@@ -22522,8 +24574,8 @@ fn normalize_balance_record(who: &str, rail: &str, value: Option<Value>) -> Resu
         json!({
             "user": who,
             "rail": rail,
-            "denom": "mu_usd",
-            "mu": 0,
+            "denom": "au_usd",
+            "au": money_au_json(0),
             "updated_epoch": 0,
             "updated_at": null,
         })
@@ -22532,10 +24584,10 @@ fn normalize_balance_record(who: &str, rail: &str, value: Option<Value>) -> Resu
         .as_object_mut()
         .context("balance record must be a JSON object")?;
     match object.get("denom").and_then(Value::as_str) {
-        Some("mu_usd") | None => {
+        Some("au_usd") | None => {
             object
                 .entry("denom")
-                .or_insert_with(|| Value::String("mu_usd".to_owned()));
+                .or_insert_with(|| Value::String("au_usd".to_owned()));
         }
         Some(denom) => bail!("balance record for {who} has unsupported denomination {denom}"),
     }
@@ -22553,8 +24605,12 @@ fn normalize_balance_record(who: &str, rail: &str, value: Option<Value>) -> Resu
             object.insert("rail".to_owned(), Value::String(rail.to_owned()));
         }
     }
-    if object.get("mu").and_then(Value::as_u64).is_none() {
-        bail!("balance record for {who} is missing non-negative integer mu");
+    if object
+        .get("au")
+        .and_then(Value::as_str)
+        .is_none_or(|value| parse_decimal_money_au(value).is_err())
+    {
+        bail!("balance record for {who} is missing canonical decimal-string au");
     }
     object
         .entry("updated_epoch")
@@ -22563,7 +24619,7 @@ fn normalize_balance_record(who: &str, rail: &str, value: Option<Value>) -> Resu
     Ok(record)
 }
 
-fn parse_usd_amount_to_mu(amount: &str) -> Result<u64> {
+fn parse_usd_amount_to_au(amount: &str) -> Result<MoneyAu> {
     let amount = amount.trim();
     if amount.is_empty() {
         bail!("--amount must be positive");
@@ -22586,36 +24642,68 @@ fn parse_usd_amount_to_mu(amount: &str) -> Result<u64> {
     {
         bail!("--amount must be a USD decimal, for example 10 or 10.25");
     }
-    let dollars = dollars.parse::<u64>()?;
+    let dollars = dollars.parse::<MoneyAu>()?;
     let cents = match cents.len() {
         0 => 0,
-        1 => cents.parse::<u64>()? * 10,
-        2 => cents.parse::<u64>()?,
+        1 => cents.parse::<MoneyAu>()? * 10,
+        2 => cents.parse::<MoneyAu>()?,
         _ => unreachable!("length checked above"),
     };
-    let total_cents = dollars
-        .checked_mul(100)
-        .and_then(|value| value.checked_add(cents))
+    let total_au = dollars
+        .checked_mul(1_000_000_000_000_000_000)
+        .and_then(|value| value.checked_add(cents.checked_mul(10_000_000_000_000_000)?))
         .context("--amount overflowed")?;
-    if total_cents == 0 {
+    if total_au == 0 {
         bail!("--amount must be positive");
     }
-    total_cents
-        .checked_mul(10_000)
-        .context("--amount overflowed mu_usd")
+    Ok(total_au)
 }
 
-fn mu_to_usd_amount(mu: u64) -> String {
-    let cents = mu / 10_000;
+fn parse_decimal_money_au(value: &str) -> Result<MoneyAu> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.as_bytes().iter().all(u8::is_ascii_digit)
+    {
+        bail!("money amount must be a canonical decimal string");
+    }
+    Ok(value.parse::<MoneyAu>()?)
+}
+
+fn value_money_au(value: &Value) -> Option<MoneyAu> {
+    value
+        .as_str()
+        .and_then(|value| parse_decimal_money_au(value).ok())
+}
+
+fn toml_value_money_au(value: &toml::Value) -> Option<MoneyAu> {
+    value
+        .as_str()
+        .and_then(|value| parse_decimal_money_au(value).ok())
+}
+
+fn money_au_json(value: MoneyAu) -> Value {
+    Value::String(value.to_string())
+}
+
+fn money_au_map_json(map: &BTreeMap<String, MoneyAu>) -> Value {
+    Value::Object(
+        map.iter()
+            .map(|(key, value)| (key.clone(), money_au_json(*value)))
+            .collect(),
+    )
+}
+
+fn au_to_usd_amount(au: MoneyAu) -> String {
+    let cents = au.saturating_add(5_000_000_000_000_000) / 10_000_000_000_000_000;
     format!("{}.{:02}", cents / 100, cents % 100)
 }
 
 fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
     let locked = record
-        .held_mu
-        .checked_add(record.paid_cum_mu)
-        .context("earning held_mu + paid_cum_mu overflowed")?;
-    if record.total_mu < locked {
+        .held_au
+        .checked_add(record.paid_cum_au)
+        .context("earning held_au + paid_cum_au overflowed")?;
+    if record.total_au < locked {
         bail!(
             "earning record for {} violates total >= held + paid",
             record.provider
@@ -22625,11 +24713,11 @@ fn earning_view(record: LedgerEarningRecord) -> Result<EarningsView> {
         provider: record.provider,
         rail: record.rail,
         denom: record.denom,
-        total_mu: record.total_mu,
-        held_mu: record.held_mu,
-        paid_cum_mu: record.paid_cum_mu,
-        released_mu: record.total_mu - locked,
-        claimable_mu: record.total_mu - locked,
+        total_au: record.total_au,
+        held_au: record.held_au,
+        paid_cum_au: record.paid_cum_au,
+        released_au: record.total_au - locked,
+        claimable_au: record.total_au - locked,
         claim_model: "tap_non_custodial_claim".to_owned(),
         holdbacks: record.holdbacks,
         updated_epoch: record.updated_epoch,
@@ -22653,8 +24741,8 @@ fn print_payouts_report(report: &Value) {
         let key = entry.get("key").and_then(Value::as_str).unwrap_or("");
         let value = entry.get("value").unwrap_or(&Value::Null);
         println!(
-            "{key}: fee sweep mu={} msb_tx={}",
-            value.get("sweep_mu").and_then(Value::as_u64).unwrap_or(0),
+            "{key}: fee sweep au={} msb_tx={}",
+            value.get("sweep_au").and_then(value_money_au).unwrap_or(0),
             value
                 .get("sweep_msb_tx_hash")
                 .and_then(Value::as_str)
@@ -22685,24 +24773,24 @@ fn print_earnings_report(report: &Value) {
             "{}/{}: total={} held={} paid={} released={} claimable={} {}",
             entry.get("rail").and_then(Value::as_str).unwrap_or("fiat"),
             entry.get("provider").and_then(Value::as_str).unwrap_or(""),
-            entry.get("total_mu").and_then(Value::as_u64).unwrap_or(0),
-            entry.get("held_mu").and_then(Value::as_u64).unwrap_or(0),
+            entry.get("total_au").and_then(value_money_au).unwrap_or(0),
+            entry.get("held_au").and_then(value_money_au).unwrap_or(0),
             entry
-                .get("paid_cum_mu")
-                .and_then(Value::as_u64)
+                .get("paid_cum_au")
+                .and_then(value_money_au)
                 .unwrap_or(0),
             entry
-                .get("released_mu")
-                .and_then(Value::as_u64)
+                .get("released_au")
+                .and_then(value_money_au)
                 .unwrap_or(0),
             entry
-                .get("claimable_mu")
-                .and_then(Value::as_u64)
+                .get("claimable_au")
+                .and_then(value_money_au)
                 .unwrap_or(0),
             entry
                 .get("denom")
                 .and_then(Value::as_str)
-                .unwrap_or("mu_usd")
+                .unwrap_or("au_usd")
         );
     }
 }
@@ -22757,7 +24845,7 @@ fn read_json_array(path: &Path, label: &str) -> Result<Vec<Value>> {
     );
 }
 
-fn read_prior_earnings(path: Option<&Path>) -> Result<BTreeMap<String, u64>> {
+fn read_prior_earnings(path: Option<&Path>) -> Result<BTreeMap<String, String>> {
     let Some(path) = path else {
         return Ok(BTreeMap::new());
     };
@@ -22767,10 +24855,11 @@ fn read_prior_earnings(path: Option<&Path>) -> Result<BTreeMap<String, u64>> {
         .with_context(|| format!("{} must contain a JSON object", path.display()))?;
     let mut out = BTreeMap::new();
     for (key, value) in object {
-        let mu = value
-            .as_u64()
-            .or_else(|| value.get("total_mu").and_then(Value::as_u64))
-            .with_context(|| format!("prior earning for {key} must be a u64 or record.total_mu"))?;
+        let au = value_money_au(value)
+            .or_else(|| value.get("total_au").and_then(value_money_au))
+            .with_context(|| {
+                format!("prior earning for {key} must be a canonical au string or record.total_au")
+            })?;
         let rail_key = match (
             value.get("rail").and_then(Value::as_str),
             value.get("provider").and_then(Value::as_str),
@@ -22778,7 +24867,7 @@ fn read_prior_earnings(path: Option<&Path>) -> Result<BTreeMap<String, u64>> {
             (Some(rail), Some(provider)) => format!("{rail}/{provider}"),
             _ => key.clone(),
         };
-        out.insert(rail_key, mu);
+        out.insert(rail_key, au.to_string());
     }
     Ok(out)
 }
@@ -22942,10 +25031,10 @@ fn verify_epoch_evidence(
     );
     push_evidence_check(
         &mut checks,
-        &format!("ev/dep/{epoch}.mu_total"),
-        &totals["dep_mu"],
+        &format!("ev/dep/{epoch}.au_total"),
+        &totals["dep_au"],
         evidence.dep.as_ref(),
-        "mu_total",
+        "au_total",
     );
     push_evidence_check(
         &mut checks,
@@ -22963,10 +25052,10 @@ fn verify_epoch_evidence(
     );
     push_evidence_check(
         &mut checks,
-        &format!("ev/use/{epoch}.mu_total"),
-        &totals["use_mu"],
+        &format!("ev/use/{epoch}.au_total"),
+        &totals["use_au"],
         evidence.r#use.as_ref(),
-        "mu_total",
+        "au_total",
     );
     push_evidence_check(
         &mut checks,
@@ -22991,10 +25080,10 @@ fn verify_epoch_evidence(
     );
     push_evidence_check(
         &mut checks,
-        &format!("ev/earn/{epoch}.mu_cum_total"),
-        &totals["earn_mu"],
+        &format!("ev/earn/{epoch}.au_cum_total"),
+        &totals["earn_au"],
         evidence.earn.as_ref(),
-        "mu_cum_total",
+        "au_cum_total",
     );
     push_evidence_check(
         &mut checks,
@@ -23005,17 +25094,17 @@ fn verify_epoch_evidence(
     );
     push_evidence_check(
         &mut checks,
-        &format!("ev/fee/{epoch}.mu_fee_epoch"),
-        &totals["fee_mu"],
+        &format!("ev/fee/{epoch}.au_fee_epoch"),
+        &totals["fee_au"],
         evidence.fee.as_ref(),
-        "mu_fee_epoch",
+        "au_fee_epoch",
     );
     push_evidence_check(
         &mut checks,
-        &format!("ev/fee/{epoch}.mu_fee_cum"),
-        &totals["fee_cum_mu"],
+        &format!("ev/fee/{epoch}.au_fee_cum"),
+        &totals["fee_cum_au"],
         evidence.fee.as_ref(),
-        "mu_fee_cum",
+        "au_fee_cum",
     );
     checks
 }
@@ -23171,8 +25260,10 @@ struct LedgerPriceRecord {
     #[serde(default)]
     ctx_bracket_table_ver: Option<u32>,
     rate_map: Vec<RateMapEntry>,
-    per_req_mu: u64,
-    min_session_mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    per_req_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    min_session_au: MoneyAu,
     effective_at: u64,
     #[serde(default)]
     set_by_role: Option<String>,
@@ -23238,9 +25329,12 @@ struct ContractCatalog {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct LedgerHoldbackBucket {
     epoch: u64,
-    mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    au: MoneyAu,
     #[serde(default, skip_serializing_if = "is_false")]
     probe_gate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked_epochs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23248,9 +25342,12 @@ struct LedgerEarningRecord {
     provider: String,
     rail: String,
     denom: String,
-    total_mu: u64,
-    held_mu: u64,
-    paid_cum_mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    total_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    held_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    paid_cum_au: MoneyAu,
     #[serde(default)]
     holdbacks: Vec<LedgerHoldbackBucket>,
     #[serde(default)]
@@ -23273,8 +25370,10 @@ struct LedgerEarningRecord {
 struct LedgerFeeRecord {
     rail: String,
     denom: String,
-    cum_mu: u64,
-    swept_cum_mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    cum_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    swept_cum_au: MoneyAu,
     #[serde(default)]
     updated_epoch: u64,
     #[serde(default)]
@@ -23292,7 +25391,9 @@ struct LedgerFeeRecord {
 #[derive(Debug, Clone)]
 struct TnkSettlementParams {
     holdback_epochs: u64,
+    new_provider_holdback_epochs: u64,
     challenge_epochs: u64,
+    probation_successful_sessions: u64,
     canary_probe_holdback_bps: u64,
     canary_probe_release_min_passes: u64,
     rate_staleness_seconds: u64,
@@ -23301,7 +25402,7 @@ struct TnkSettlementParams {
 #[derive(Debug, Clone)]
 struct TnkSettlementPlan {
     payload: Value,
-    msb_outputs: Vec<MsbBatchTransferOutputEntry>,
+    msb_outputs: Vec<MsbSettlementTransferOutput>,
     skipped_providers: Vec<Value>,
     already_settled: Option<Value>,
 }
@@ -23311,11 +25412,16 @@ struct EarningsView {
     provider: String,
     rail: String,
     denom: String,
-    total_mu: u64,
-    held_mu: u64,
-    paid_cum_mu: u64,
-    released_mu: u64,
-    claimable_mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    total_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    held_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    paid_cum_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    released_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    claimable_au: MoneyAu,
     claim_model: String,
     holdbacks: Vec<LedgerHoldbackBucket>,
     updated_epoch: u64,
@@ -23333,9 +25439,10 @@ struct EpochAuditBundle {
     #[serde(default)]
     payouts: Vec<Value>,
     #[serde(default)]
-    prior_earnings: BTreeMap<String, u64>,
+    prior_earnings: BTreeMap<String, String>,
     #[serde(default)]
-    prior_fee_cum_mu: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    prior_fee_cum_au: MoneyAu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23386,6 +25493,16 @@ struct ProviderCandidate {
     ctx_bracket_schedule: CtxBracketSchedule,
 }
 
+#[derive(Debug, Clone)]
+struct ProviderAutoFitSelection {
+    candidates: Vec<ProviderCandidate>,
+    total_required_bytes: u64,
+    total_budget_bytes: u64,
+    modalities: Vec<String>,
+    score: f64,
+    rationale: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ProviderCtxFeasibility {
     requested_ctx: u64,
@@ -23401,6 +25518,7 @@ struct ProviderCtxFeasibility {
 }
 
 impl ProviderCtxFeasibility {
+    #[cfg(test)]
     fn not_applicable(served_ctx: u64, catalog_ctx_max: u64) -> Self {
         Self {
             requested_ctx: served_ctx,
@@ -23430,6 +25548,7 @@ struct ProviderMemoryBudget {
 }
 
 impl ProviderMemoryBudget {
+    #[cfg(test)]
     fn not_applicable() -> Self {
         Self {
             pool: "not_applicable".to_owned(),
@@ -23521,6 +25640,7 @@ struct HeartbeatContext<'a> {
     rooms: &'a [LedgerRoom],
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
+    identity_anchor: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23691,7 +25811,7 @@ impl ProviderHeartbeatLoad {
 struct ProviderProtectionConfig {
     max_sessions: u32,
     accept_rate_per_minute: u32,
-    budget_mu: u64,
+    budget_au: MoneyAu,
     budget_units: u64,
     budget_period: Duration,
 }
@@ -23702,7 +25822,7 @@ impl ProviderProtectionConfig {
         if max_sessions == 0 {
             bail!("provider --max-sessions must be greater than zero");
         }
-        if (args.serve_budget_mu > 0 || args.serve_budget_units > 0)
+        if (args.serve_budget_au > 0 || args.serve_budget_units > 0)
             && args.serve_budget_period_seconds == 0
         {
             bail!("provider --serve-budget-period-seconds must be greater than zero when a serving budget is set");
@@ -23710,7 +25830,7 @@ impl ProviderProtectionConfig {
         Ok(Self {
             max_sessions,
             accept_rate_per_minute: args.accept_rate_per_minute,
-            budget_mu: args.serve_budget_mu,
+            budget_au: args.serve_budget_au,
             budget_units: args.serve_budget_units,
             budget_period: Duration::from_secs(args.serve_budget_period_seconds.max(1)),
         })
@@ -23721,7 +25841,7 @@ impl ProviderProtectionConfig {
         Self {
             max_sessions,
             accept_rate_per_minute: 0,
-            budget_mu: 0,
+            budget_au: 0,
             budget_units: 0,
             budget_period: Duration::from_secs(86_400),
         }
@@ -23733,7 +25853,7 @@ struct ProviderProtectionState {
     config: ProviderProtectionConfig,
     accepted_at: VecDeque<Instant>,
     period_started: Instant,
-    used_mu: u64,
+    used_au: MoneyAu,
     used_units: u64,
 }
 
@@ -23743,7 +25863,7 @@ impl ProviderProtectionState {
             config,
             accepted_at: VecDeque::new(),
             period_started: Instant::now(),
-            used_mu: 0,
+            used_au: 0,
             used_units: 0,
         }
     }
@@ -23772,12 +25892,12 @@ impl ProviderProtectionState {
                 ),
             };
         }
-        if self.config.budget_mu > 0 && self.used_mu >= self.config.budget_mu {
+        if self.config.budget_au > 0 && self.used_au >= self.config.budget_au {
             return ProviderSessionDecision::Reject {
                 code: "QUOTA",
                 reason: format!(
-                    "provider has reached its local serving budget of {}µUSD for this period",
-                    self.config.budget_mu
+                    "provider has reached its local serving budget of {} for this period",
+                    au_to_usd_amount(self.config.budget_au)
                 ),
             };
         }
@@ -23799,9 +25919,9 @@ impl ProviderProtectionState {
         self.accepted_at.push_back(now);
     }
 
-    fn record_usage(&mut self, usage: &ReceiptUsage, mu_owed: u64) {
+    fn record_usage(&mut self, usage: &ReceiptUsage, au_owed: MoneyAu) {
         self.reset_if_period_elapsed(Instant::now());
-        self.used_mu = self.used_mu.saturating_add(mu_owed);
+        self.used_au = self.used_au.saturating_add(au_owed);
         self.used_units = self
             .used_units
             .saturating_add(provider_session_usage_units(usage));
@@ -23810,7 +25930,7 @@ impl ProviderProtectionState {
     fn reset_if_period_elapsed(&mut self, now: Instant) {
         if now.duration_since(self.period_started) >= self.config.budget_period {
             self.period_started = now;
-            self.used_mu = 0;
+            self.used_au = 0;
             self.used_units = 0;
         }
     }
@@ -24300,7 +26420,8 @@ struct ProviderSessionHeartbeatTask {
     rooms: Vec<LedgerRoom>,
     attestation: Tier1AttestationReport,
     attestation_head: String,
-    min_ask_mu: u64,
+    identity_anchor: String,
+    min_ask_au: MoneyAu,
     max_sessions: u32,
     load: ProviderHeartbeatLoad,
 }
@@ -24316,6 +26437,7 @@ struct ProviderSessionContext<'a> {
     rooms: &'a [LedgerRoom],
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
+    identity_anchor: &'a str,
     rules: &'a RulesRef,
 }
 
@@ -24340,11 +26462,11 @@ struct ActiveProviderSession {
     rail: String,
     price_ver: u64,
     locked_rate_map: Vec<RateMapEntry>,
-    locked_per_req_mu: u64,
-    locked_min_session_mu: u64,
+    locked_per_req_au: MoneyAu,
+    locked_min_session_au: MoneyAu,
     served_ctx: u32,
-    ctx_bracket: String,
-    ctx_bracket_table_ver: u32,
+    ctx_bracket: Option<String>,
+    ctx_bracket_table_ver: Option<u32>,
     checkpoint_every: CheckpointPolicy,
 }
 
@@ -24363,13 +26485,13 @@ struct ProviderSessionTerms {
     room_ids: Vec<String>,
     price_ver: u64,
     rate_map: Vec<RateMapEntry>,
-    per_req_mu: u64,
-    min_session_mu: u64,
-    min_ask_mu: u64,
+    per_req_au: MoneyAu,
+    min_session_au: MoneyAu,
+    min_ask_au: MoneyAu,
     rules_ver: u64,
     ctx: u64,
-    ctx_bracket: String,
-    ctx_bracket_table_ver: u32,
+    ctx_bracket: Option<String>,
+    ctx_bracket_table_ver: Option<u32>,
     ctx_bracket_schedule: CtxBracketSchedule,
 }
 
@@ -24478,6 +26600,462 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
     }
 }
 
+struct ProviderServePlanComputed {
+    rpc_url: String,
+    provider_catalog: ProviderResolvedCatalog,
+    candidates: Vec<ProviderCandidate>,
+    selection: ProviderAutoFitSelection,
+    gpu_layers: Option<u32>,
+}
+
+async fn compute_provider_serve_plan(
+    home: &Path,
+    args: &ProviderServePlanArgs,
+) -> Result<ProviderServePlanComputed> {
+    let (rpc_url, provider_catalog, candidates, gpu_layers) =
+        compute_provider_serve_candidates(home, args).await?;
+    let selection = select_provider_auto_fit_set(&candidates)?;
+    Ok(ProviderServePlanComputed {
+        rpc_url,
+        provider_catalog,
+        candidates,
+        selection,
+        gpu_layers,
+    })
+}
+
+async fn compute_provider_explicit_serve_plan(
+    home: &Path,
+    args: &ProviderServePlanArgs,
+    requested: &[String],
+) -> Result<ProviderServePlanComputed> {
+    if requested.is_empty() {
+        bail!("explicit provider serve plan requires at least one admin enclave/model id");
+    }
+    let (rpc_url, provider_catalog, candidates, gpu_layers) =
+        compute_provider_serve_candidates(home, args).await?;
+    let selection = select_provider_explicit_set(&candidates, requested)?;
+    Ok(ProviderServePlanComputed {
+        rpc_url,
+        provider_catalog,
+        candidates,
+        selection,
+        gpu_layers,
+    })
+}
+
+async fn compute_provider_serve_candidates(
+    home: &Path,
+    args: &ProviderServePlanArgs,
+) -> Result<(
+    String,
+    ProviderResolvedCatalog,
+    Vec<ProviderCandidate>,
+    Option<u32>,
+)> {
+    let config = read_mayhem_config(home)?;
+    let mut start_args = provider_start_args_for_serve_plan(args, home);
+    if start_args.engine_backend == "auto" {
+        if let Some(config_backend) = config
+            .as_ref()
+            .and_then(|config| config.provider.as_ref())
+            .and_then(|provider| provider.engine_backend.clone())
+            .filter(|backend| !backend.trim().is_empty())
+        {
+            start_args.engine_backend = config_backend;
+        }
+    }
+    if start_args.gpu_layers.is_none() {
+        start_args.gpu_layers = config
+            .as_ref()
+            .and_then(|config| config.provider.as_ref())
+            .and_then(|provider| provider.gpu_layers);
+    }
+    apply_provider_resource_config_defaults(&mut start_args, config.as_ref());
+    let rpc_url = start_args
+        .rpc_url
+        .clone()
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.network.as_ref())
+                .and_then(|network| network.rpc_url.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned());
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let contract = read_contract_catalog(&rpc).await?;
+    let provider_catalog =
+        resolve_provider_start_catalog(&start_args, &home, &rpc, &rpc_url).await?;
+    let hardware = provider_hwprobe(&start_args)?;
+    let candidates = build_provider_candidates(
+        &contract,
+        &provider_catalog.catalog_doc,
+        &hardware,
+        &start_args,
+    )?;
+    Ok((rpc_url, provider_catalog, candidates, start_args.gpu_layers))
+}
+
+async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let computed = compute_provider_serve_plan(&home, &args).await?;
+    let selection = &computed.selection;
+    let up_command = provider_auto_fit_up_command(&home, selection, computed.gpu_layers);
+    let selected = selection
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let price = candidate
+                .price
+                .as_ref()
+                .and_then(|price| price.current.as_ref());
+            json!({
+                "enclave_id": &candidate.enclave.enclave_id,
+                "model_id": &candidate.enclave.model_id,
+                "backend": &candidate.enclave.backend,
+                "artifact": &candidate.artifact_name,
+                "model_class": &candidate.enclave.model_class,
+                "served_ctx": candidate.served_ctx,
+                "required_bytes": candidate.feasibility.estimated_required_bytes,
+                "required_human": human_bytes(candidate.feasibility.estimated_required_bytes),
+                "budget_pool": candidate.feasibility.memory_budget.pool,
+                "budget_bytes": candidate.feasibility.memory_budget.budget_bytes,
+                "budget_human": human_bytes(candidate.feasibility.memory_budget.budget_bytes),
+                "estimated_tok_s": candidate.verdict.est_tok_s,
+                "score": provider_auto_fit_candidate_score(candidate),
+                "price_ver": price.map(|price| price.ver),
+                "rate_map": price.map(|price| price.rate_map.clone()).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "ok": true,
+        "mode": "provider-serve-plan",
+        "home": home,
+        "rpc_url": computed.rpc_url,
+        "catalog": {
+            "source": computed.provider_catalog.source,
+            "path": computed.provider_catalog.catalog_path,
+            "hash": computed.provider_catalog.catalog_hash,
+        },
+        "candidate_count": computed.candidates.len(),
+        "selected_count": selection.candidates.len(),
+        "selected": selected,
+        "total_required_bytes": selection.total_required_bytes,
+        "total_required_human": human_bytes(selection.total_required_bytes),
+        "total_budget_bytes": selection.total_budget_bytes,
+        "total_budget_human": human_bytes(selection.total_budget_bytes),
+        "modalities": selection.modalities,
+        "score": selection.score,
+        "rationale": selection.rationale,
+        "copy_paste": {
+            "up": up_command,
+        },
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "{}",
+            report["rationale"]
+                .as_str()
+                .unwrap_or("auto-fit plan ready")
+        );
+        println!("Selected enclaves:");
+        for item in report["selected"].as_array().into_iter().flatten() {
+            println!(
+                "- {} via {} ({})",
+                item["model_id"].as_str().unwrap_or("unknown"),
+                item["backend"].as_str().unwrap_or("unknown"),
+                short_hash(item["enclave_id"].as_str().unwrap_or(""))
+            );
+        }
+        println!(
+            "Copy/paste start command: {}",
+            report["copy_paste"]["up"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("building mayhemd control HTTP client")?;
+    let supervisor_url = mayhemd_control_url(&home)?;
+    let serve_plan_args = ProviderServePlanArgs {
+        home: Some(home.clone()),
+        rpc_url: None,
+        catalog_path: None,
+        signature_path: None,
+        keys_dir: None,
+        canaries_dir: None,
+        engine_backend: "auto".to_owned(),
+        gpu_layers: args.gpu_layers,
+        fixture: None,
+        disk_path: None,
+        skip_disk_bench: false,
+        ctx: None,
+        memory_reserve: None,
+        json: true,
+        dev_skip_catalog_verify: false,
+    };
+    let requested = vec![args.enclave.clone()];
+    let computed =
+        compute_provider_explicit_serve_plan(&home, &serve_plan_args, &requested).await?;
+    let selected = computed
+        .selection
+        .candidates
+        .first()
+        .context("explicit provider add did not select a candidate")?;
+    let child = provider_serve_child_config(
+        &home,
+        &selected.enclave.enclave_id,
+        computed.gpu_layers,
+        Some(selected.served_ctx),
+        None,
+    )?;
+    let response = post_gateway_json(&client, &format!("{supervisor_url}/children/add"), &child)
+        .await
+        .context("adding provider worker to mayhemd")?;
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "supervisor_url": supervisor_url,
+        "requested": args.enclave,
+        "enclave": selected.enclave.enclave_id,
+        "model_id": selected.enclave.model_id,
+        "served_ctx": selected.served_ctx,
+        "child": child,
+        "response": response,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Provider worker added: {}",
+            report["response"]["name"].as_str().unwrap_or("provider")
+        );
+        println!(
+            "Copy/paste status command: mayhem status --home {}",
+            report["home"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+async fn provider_serve_remove(args: ProviderServeRemoveArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("building mayhemd control HTTP client")?;
+    let supervisor_url = mayhemd_control_url(&home)?;
+    let status = fetch_gateway_json(&client, &format!("{supervisor_url}/status")).await?;
+    let child_name = provider_serve_child_name_for_target(&status, &args.target)?;
+    let response = post_gateway_json(
+        &client,
+        &format!("{supervisor_url}/children/remove"),
+        &json!({ "name": child_name }),
+    )
+    .await
+    .context("removing provider worker from mayhemd")?;
+    let report = json!({
+        "ok": true,
+        "home": home,
+        "supervisor_url": supervisor_url,
+        "target": args.target,
+        "child_name": child_name,
+        "response": response,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Provider worker removed: {}",
+            report["child_name"].as_str().unwrap_or("provider")
+        );
+        println!(
+            "Copy/paste status command: mayhem status --home {}",
+            report["home"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn mayhemd_control_url(home: &Path) -> Result<String> {
+    let _pid = read_pid_file(&mayhemd_pid_path(home))?
+        .filter(|pid| process_is_running(*pid))
+        .context("mayhemd is not running; start it with `mayhem up` first")?;
+    let state = read_json_file_if_exists(&mayhemd_state_path(home))?;
+    let bind = supervisor_bind_from_home(home, state.as_ref())
+        .context("could not determine mayhemd supervisor bind address")?;
+    Ok(format!("http://{bind}"))
+}
+
+fn provider_serve_child_config(
+    home: &Path,
+    enclave: &str,
+    gpu_layers: Option<u32>,
+    ctx: Option<u64>,
+    name: Option<String>,
+) -> Result<Value> {
+    let config_path = config_path_for_home(home);
+    let config = read_config_toml_value(&config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let rpc_url = toml_get_path(&config, "network.rpc_url")
+        .and_then(toml::Value::as_str)
+        .and_then(non_empty_string)
+        .unwrap_or_else(|| DEFAULT_RPC_URL.to_owned());
+    let sc_bridge_url = toml_get_path(&config, "network.sc_bridge_url")
+        .and_then(toml::Value::as_str)
+        .and_then(non_empty_string)
+        .context("network.sc_bridge_url missing; run `mayhem up` before live provider serve add")?;
+    let sc_bridge_token = toml_get_path(&config, "network.sc_bridge_token")
+        .and_then(toml::Value::as_str)
+        .and_then(non_empty_string)
+        .context(
+            "network.sc_bridge_token missing; run `mayhem up` before live provider serve add",
+        )?;
+    let configured_gpu_layers = toml_get_path(&config, "provider.gpu_layers")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u32::try_from(value).ok());
+    let mut args = vec![
+        "provider".to_owned(),
+        "start".to_owned(),
+        "--home".to_owned(),
+        home.display().to_string(),
+        "--rpc-url".to_owned(),
+        rpc_url,
+        "--sc-bridge-url".to_owned(),
+        sc_bridge_url,
+        "--sc-bridge-token".to_owned(),
+        sc_bridge_token,
+        "--serve-sessions".to_owned(),
+        "--enclave".to_owned(),
+        enclave.to_owned(),
+    ];
+    if let Some(gpu_layers) = gpu_layers.or(configured_gpu_layers) {
+        args.extend(["--gpu-layers".to_owned(), gpu_layers.to_string()]);
+    }
+    if let Some(ctx) = ctx.filter(|ctx| *ctx > 0) {
+        args.extend(["--ctx".to_owned(), ctx.to_string()]);
+    }
+    let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
+    Ok(json!({
+        "name": name.unwrap_or_else(|| format!("provider-live-{}", up_provider_worker_slug(enclave))),
+        "command": mayhem_path.display().to_string(),
+        "args": args,
+        "restart": true,
+        "restart_backoff_ms": 1000,
+    }))
+}
+
+fn provider_serve_child_name_for_target(status: &Value, target: &str) -> Result<String> {
+    let children = status
+        .get("children")
+        .and_then(Value::as_object)
+        .context("mayhemd status did not include children")?;
+    for child in children.values() {
+        let name = child.get("name").and_then(Value::as_str).unwrap_or("");
+        if name == target {
+            return Ok(name.to_owned());
+        }
+        let args = child
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| args.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if args
+            .windows(2)
+            .any(|pair| pair[0] == "--enclave" && pair[1] == target)
+        {
+            return Ok(name.to_owned());
+        }
+    }
+    bail!("no running supervised provider worker found for {target}");
+}
+
+fn provider_start_args_for_serve_plan(
+    args: &ProviderServePlanArgs,
+    home: &Path,
+) -> ProviderStartArgs {
+    ProviderStartArgs {
+        home: Some(home.to_path_buf()),
+        enclave: None,
+        rooms: "auto".to_owned(),
+        rpc_url: args.rpc_url.clone(),
+        session_rpc_url: None,
+        sc_bridge_url: None,
+        sc_bridge_token: None,
+        wallet_password: None,
+        catalog_path: args.catalog_path.clone(),
+        signature_path: args.signature_path.clone(),
+        keys_dir: args.keys_dir.clone(),
+        canaries_dir: args.canaries_dir.clone(),
+        artifact: None,
+        downloads_dir: None,
+        hf_token_file: None,
+        engine_backend: args.engine_backend.clone(),
+        gpu_layers: args.gpu_layers,
+        fixture: args.fixture.clone(),
+        disk_path: args.disk_path.clone(),
+        skip_disk_bench: args.skip_disk_bench,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        enclave_binary: None,
+        sim: true,
+        no_heartbeat: true,
+        heartbeat_count: 1,
+        min_ask_au: 0,
+        ctx: args.ctx,
+        memory_reserve: args.memory_reserve.clone(),
+        disk_reserve: None,
+        max_sessions: None,
+        accept_rate_per_minute: 0,
+        serve_budget_au: 0,
+        serve_budget_units: 0,
+        serve_budget_period_seconds: 86_400,
+        serve_sessions: false,
+        serve_sessions_seconds: 0,
+        dev_session_shim: false,
+        print_json: args.json,
+        dev_skip_catalog_verify: args.dev_skip_catalog_verify,
+        load_progress: None,
+    }
+}
+
+fn provider_auto_fit_up_command(
+    home: &Path,
+    selection: &ProviderAutoFitSelection,
+    gpu_layers: Option<u32>,
+) -> String {
+    let enclaves = selection
+        .candidates
+        .iter()
+        .map(|candidate| candidate.enclave.enclave_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut parts = vec![
+        "mayhem".to_owned(),
+        "up".to_owned(),
+        "--provider".to_owned(),
+        "--enclaves".to_owned(),
+        shell_single_quote(&enclaves),
+        "--home".to_owned(),
+        shell_single_quote(&home.display().to_string()),
+    ];
+    if let Some(gpu_layers) = gpu_layers {
+        parts.push("--provider-gpu-layers".to_owned());
+        parts.push(gpu_layers.to_string());
+    }
+    parts.join(" ")
+}
+
 async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     validate_provider_start_security_mode(&args, cfg!(debug_assertions))?;
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
@@ -24493,6 +27071,12 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         {
             args.engine_backend = config_backend;
         }
+    }
+    if args.gpu_layers.is_none() {
+        args.gpu_layers = config
+            .as_ref()
+            .and_then(|config| config.provider.as_ref())
+            .and_then(|provider| provider.gpu_layers);
     }
     apply_provider_resource_config_defaults(&mut args, config.as_ref());
     let (disk_reserve_bytes, disk_reserve_source) =
@@ -24554,6 +27138,8 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
 
     provider_log(&args, "Running hwprobe and selecting a backend");
     let hardware = provider_hwprobe(&args)?;
+    let hardware_fingerprint = provider_hardware_fingerprint(&hardware);
+    let identity_anchor = format!("fingerprint:{hardware_fingerprint}");
     let candidates =
         build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
     let selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
@@ -24587,6 +27173,22 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             selected.served_ctx, selected.model.caps.ctx_max
         ),
     );
+    if let Some(gpu_layers) = args.gpu_layers {
+        if selected.artifact.engine == "llama.cpp" {
+            provider_log(
+                &args,
+                &format!("llama.cpp GPU layer override active: {gpu_layers}"),
+            );
+        } else {
+            provider_log(
+                &args,
+                &format!(
+                    "Ignoring --gpu-layers for {} artifact {}",
+                    selected.artifact.engine, selected.artifact_name
+                ),
+            );
+        }
+    }
     if let Some(message) = &selected.feasibility.message {
         provider_log(&args, message);
     }
@@ -24725,6 +27327,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             rooms: &rooms,
             attestation: &attestation,
             attestation_head: &attestation.report_head,
+            identity_anchor: &identity_anchor,
             rules: &rules,
         })?)
     } else {
@@ -24741,6 +27344,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &password,
         &wallet,
         &selected.enclave,
+        Some(&hardware_fingerprint),
         args.sim,
     )
     .await?;
@@ -24769,6 +27373,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             rooms: &rooms,
             attestation: &attestation,
             attestation_head: &attestation.report_head,
+            identity_anchor: &identity_anchor,
         })
         .await?
     };
@@ -24842,10 +27447,11 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "enclave_pubkey": attestation.report.enclave_pubkey,
             "att_tier": attestation.report.att_tier,
             "runtime_config": attestation.report.runtime_config,
+            "identity_anchor": identity_anchor.clone(),
         },
         "rules": &rules,
         "market": {
-            "min_ask_mu": args.min_ask_mu,
+            "min_ask_au": args.min_ask_au,
         },
         "context": {
             "served_ctx": selected.served_ctx,
@@ -24860,7 +27466,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         "protection": {
             "max_sessions": protection_config.max_sessions,
             "accept_rate_per_minute": protection_config.accept_rate_per_minute,
-            "serve_budget_mu": protection_config.budget_mu,
+            "serve_budget_au": protection_config.budget_au,
             "serve_budget_units": protection_config.budget_units,
             "serve_budget_period_seconds": protection_config.budget_period.as_secs(),
         },
@@ -24911,6 +27517,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 rooms: &rooms,
                 attestation: &attestation,
                 attestation_head: &attestation.report_head,
+                identity_anchor: &identity_anchor,
                 rules: &rules,
             },
             ProviderSessionRuntime {
@@ -25150,14 +27757,14 @@ fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
         "home": home,
         "path": path,
         "target": target,
-        "min_ask_mu": value,
-        "markets": table,
+        "min_ask_au": value.map(money_au_json),
+        "markets": money_au_map_json(&table),
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if let Some(target) = report["target"].as_str() {
-        match report["min_ask_mu"].as_u64() {
-            Some(mu) => println!("{target}: {mu} mu_usd"),
+    } else if let Some(target) = target.as_deref() {
+        match value {
+            Some(au) => println!("{target}: {au} au_usd"),
             None => println!("{target}: not set"),
         }
     } else {
@@ -25168,8 +27775,8 @@ fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
         if table.is_empty() {
             println!("(empty; providers accept the admin market price)");
         } else {
-            for (target, mu) in table {
-                println!("{target}: {mu} mu_usd");
+            for (target, au) in table {
+                println!("{target}: {au} au_usd");
             }
         }
     }
@@ -25183,10 +27790,7 @@ fn provider_min_ask_set(args: ProviderMinAskSetArgs) -> Result<()> {
     let target = normalize_provider_market_target(&args.target)?;
     let mut config = read_config_toml_value(&path)?;
     let table = ensure_toml_table_path(&mut config, &["provider", "min_ask"])?;
-    table.insert(
-        target.clone(),
-        toml::Value::Integer(i64::try_from(args.mu).context("min-ask mu exceeds i64")?),
-    );
+    toml_table_set_money_au(table, &target, args.au)?;
     write_config_toml_value(&path, &config)?;
     let report = json!({
         "ok": true,
@@ -25194,15 +27798,15 @@ fn provider_min_ask_set(args: ProviderMinAskSetArgs) -> Result<()> {
         "home": home,
         "path": path,
         "target": target,
-        "min_ask_mu": args.mu,
+        "min_ask_au": money_au_json(args.au),
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "Set provider min-ask {} = {} mu_usd in {}",
+            "Set provider min-ask {} = {} au_usd in {}",
             report["target"].as_str().unwrap_or(""),
-            report["min_ask_mu"].as_u64().unwrap_or(0),
+            args.au,
             report["path"].as_str().unwrap_or("")
         );
     }
@@ -25214,12 +27818,18 @@ fn provider_limits_get(args: ProviderLimitsGetArgs) -> Result<()> {
     let home = absolutize(home)?;
     let path = config_path_for_home(&home);
     let config = read_config_toml_value(&path)?;
-    let limits = provider_limits_value(&config);
+    let target = args
+        .enclave
+        .as_deref()
+        .map(normalize_provider_market_target)
+        .transpose()?;
+    let limits = provider_limits_value(&config, target.as_deref());
     let report = json!({
         "ok": true,
         "action": "provider.limits.get",
         "home": home,
         "path": path,
+        "target": target.as_deref().unwrap_or("global"),
         "limits": limits,
     });
     if args.json {
@@ -25243,64 +27853,57 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
     let home = absolutize(home)?;
     let path = config_path_for_home(&home);
     let mut config = read_config_toml_value(&path)?;
+    let target = args
+        .enclave
+        .as_deref()
+        .map(normalize_provider_market_target)
+        .transpose()?;
+    if target.is_some() && (args.memory_reserve.is_some() || args.disk_reserve.is_some()) {
+        bail!("--memory-reserve and --disk-reserve are machine-level limits; set them without --enclave");
+    }
+    let table = if let Some(target) = target.as_deref() {
+        ensure_provider_enclave_limits_table(&mut config, target)?
+    } else {
+        ensure_toml_table_path(&mut config, &["provider", "limits"])?
+    };
     if let Some(max_concurrent) = args.max_concurrent {
         if max_concurrent == 0 {
             bail!("--max-concurrent must be greater than zero");
         }
-        toml_set_u64(
-            &mut config,
-            "provider.limits.max_sessions",
-            u64::from(max_concurrent),
-        )?;
+        toml_table_set_u64(table, "max_sessions", u64::from(max_concurrent))?;
     }
     if let Some(accept_rate) = args.accept_rate.as_deref() {
-        toml_set_u64(
-            &mut config,
-            "provider.limits.accept_rate_per_minute",
+        toml_table_set_u64(
+            table,
+            "accept_rate_per_minute",
             u64::from(parse_provider_accept_rate(accept_rate)?),
         )?;
     }
     if let Some(budget) = args.budget.as_deref() {
         let parsed = parse_provider_budget(budget)?;
         match parsed.kind {
-            ProviderBudgetKind::Mu => {
-                toml_set_u64(
-                    &mut config,
-                    "provider.limits.serve_budget_mu",
-                    parsed.amount,
-                )?;
-                toml_set_u64(&mut config, "provider.limits.serve_budget_units", 0)?;
+            ProviderBudgetKind::Au => {
+                toml_table_set_money_au(table, "serve_budget_au", parsed.amount)?;
+                toml_table_set_u64(table, "serve_budget_units", 0)?;
             }
             ProviderBudgetKind::Tokens => {
-                toml_set_u64(
-                    &mut config,
-                    "provider.limits.serve_budget_units",
-                    parsed.amount,
+                toml_table_set_u64(
+                    table,
+                    "serve_budget_units",
+                    u64::try_from(parsed.amount).context("token budget exceeds u64")?,
                 )?;
-                toml_set_u64(&mut config, "provider.limits.serve_budget_mu", 0)?;
+                toml_table_set_money_au(table, "serve_budget_au", 0)?;
             }
         }
-        toml_set_u64(
-            &mut config,
-            "provider.limits.serve_budget_period_seconds",
-            parsed.period_seconds,
-        )?;
+        toml_table_set_u64(table, "serve_budget_period_seconds", parsed.period_seconds)?;
     }
     if let Some(memory_reserve) = args.memory_reserve.as_deref() {
         provider_memory_reserve_bytes(Some(memory_reserve), 16 * GIB_BYTES, false)?;
-        toml_set_string(
-            &mut config,
-            "provider.limits.memory_reserve",
-            memory_reserve.to_owned(),
-        )?;
+        toml_table_set_string(table, "memory_reserve", memory_reserve.to_owned());
     }
     if let Some(disk_reserve) = args.disk_reserve.as_deref() {
         provider_disk_reserve_bytes(Some(disk_reserve))?;
-        toml_set_string(
-            &mut config,
-            "provider.limits.disk_reserve",
-            disk_reserve.to_owned(),
-        )?;
+        toml_table_set_string(table, "disk_reserve", disk_reserve.to_owned());
     }
     write_config_toml_value(&path, &config)?;
     let report = json!({
@@ -25308,7 +27911,8 @@ fn provider_limits_set(args: ProviderLimitsSetArgs) -> Result<()> {
         "action": "provider.limits.set",
         "home": home,
         "path": path,
-        "limits": provider_limits_value(&config),
+        "target": target.as_deref().unwrap_or("global"),
+        "limits": provider_limits_value(&config, target.as_deref()),
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -25406,13 +28010,13 @@ async fn provider_earnings(args: ProviderEarningsArgs) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ProviderBudgetKind {
-    Mu,
+    Au,
     Tokens,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct ParsedProviderBudget {
-    amount: u64,
+    amount: u128,
     kind: ProviderBudgetKind,
     period_seconds: u64,
 }
@@ -25464,7 +28068,7 @@ fn provider_market_config_keys(selected: &ProviderCandidate) -> Vec<String> {
 fn provider_config_min_ask(
     config: Option<&MayhemConfig>,
     selected: &ProviderCandidate,
-) -> Option<u64> {
+) -> Option<MoneyAu> {
     let min_ask = config
         .and_then(|config| config.provider.as_ref())
         .and_then(|provider| provider.min_ask.as_ref())?;
@@ -25473,41 +28077,96 @@ fn provider_config_min_ask(
         .find_map(|key| min_ask.get(&key).copied())
 }
 
+fn provider_config_enclave_limits(
+    config: Option<&MayhemConfig>,
+    selected: &ProviderCandidate,
+) -> Option<ConfigProviderLimits> {
+    let limits = config
+        .and_then(|config| config.provider.as_ref())
+        .and_then(|provider| provider.enclave_limits.as_ref())?;
+    provider_market_config_keys(selected)
+        .into_iter()
+        .find_map(|key| limits.get(&key).cloned())
+}
+
 fn apply_provider_config_defaults(
     args: &mut ProviderStartArgs,
     config: Option<&MayhemConfig>,
     selected: &ProviderCandidate,
 ) {
-    if args.min_ask_mu == 0 {
-        if let Some(min_ask_mu) = provider_config_min_ask(config, selected) {
-            args.min_ask_mu = min_ask_mu;
+    if args.min_ask_au == 0 {
+        if let Some(min_ask_au) = provider_config_min_ask(config, selected) {
+            args.min_ask_au = min_ask_au;
         }
     }
-    let Some(limits) = config
+    let cli_max_sessions = args.max_sessions.is_some();
+    let cli_accept_rate = args.accept_rate_per_minute != 0;
+    let cli_budget_au = args.serve_budget_au != 0;
+    let cli_budget_units = args.serve_budget_units != 0;
+    let cli_budget_period = args.serve_budget_period_seconds != 86_400;
+    if let Some(limits) = config
         .and_then(|config| config.provider.as_ref())
         .and_then(|provider| provider.limits.as_ref())
-    else {
-        return;
-    };
-    if args.max_sessions.is_none() {
-        args.max_sessions = limits.max_sessions;
+    {
+        apply_provider_limit_defaults(
+            args,
+            limits,
+            cli_max_sessions,
+            cli_accept_rate,
+            cli_budget_au,
+            cli_budget_units,
+            cli_budget_period,
+        );
     }
-    if args.accept_rate_per_minute == 0 {
+    if let Some(limits) = provider_config_enclave_limits(config, selected) {
+        apply_provider_limit_defaults(
+            args,
+            &limits,
+            cli_max_sessions,
+            cli_accept_rate,
+            cli_budget_au,
+            cli_budget_units,
+            cli_budget_period,
+        );
+    }
+}
+
+fn apply_provider_limit_defaults(
+    args: &mut ProviderStartArgs,
+    limits: &ConfigProviderLimits,
+    cli_max_sessions: bool,
+    cli_accept_rate: bool,
+    cli_budget_au: bool,
+    cli_budget_units: bool,
+    cli_budget_period: bool,
+) {
+    if !cli_max_sessions {
+        if let Some(value) = limits.max_sessions {
+            args.max_sessions = Some(value);
+        }
+    }
+    if !cli_accept_rate {
         if let Some(value) = limits.accept_rate_per_minute {
             args.accept_rate_per_minute = value;
         }
     }
-    if args.serve_budget_mu == 0 {
-        if let Some(value) = limits.serve_budget_mu {
-            args.serve_budget_mu = value;
+    if !cli_budget_au {
+        if let Some(value) = limits.serve_budget_au {
+            args.serve_budget_au = value;
+            if !cli_budget_units {
+                args.serve_budget_units = 0;
+            }
         }
     }
-    if args.serve_budget_units == 0 {
+    if !cli_budget_units {
         if let Some(value) = limits.serve_budget_units {
             args.serve_budget_units = value;
+            if !cli_budget_au {
+                args.serve_budget_au = 0;
+            }
         }
     }
-    if args.serve_budget_period_seconds == 86_400 {
+    if !cli_budget_period {
         if let Some(value) = limits.serve_budget_period_seconds {
             args.serve_budget_period_seconds = value;
         }
@@ -25532,30 +28191,39 @@ fn apply_provider_resource_config_defaults(
     }
 }
 
-fn provider_min_ask_table(config: &toml::Value) -> BTreeMap<String, u64> {
+fn provider_min_ask_table(config: &toml::Value) -> BTreeMap<String, MoneyAu> {
     toml_get_path(config, "provider.min_ask")
         .and_then(toml::Value::as_table)
         .map(|table| {
             table
                 .iter()
                 .filter_map(|(key, value)| {
-                    value
-                        .as_integer()
-                        .and_then(|value| u64::try_from(value).ok())
-                        .map(|value| (key.clone(), value))
+                    toml_value_money_au(value).map(|value| (key.clone(), value))
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn provider_limits_value(config: &toml::Value) -> Value {
-    let limits = toml_get_path(config, "provider.limits").and_then(toml::Value::as_table);
+fn provider_limits_value(config: &toml::Value, target: Option<&str>) -> Value {
+    let limits = if let Some(target) = target {
+        toml_get_path(config, "provider.enclave_limits")
+            .and_then(toml::Value::as_table)
+            .and_then(|limits| limits.get(target))
+            .and_then(toml::Value::as_table)
+    } else {
+        toml_get_path(config, "provider.limits").and_then(toml::Value::as_table)
+    };
     let get_u64 = |key: &str| {
         limits
             .and_then(|limits| limits.get(key))
             .and_then(toml::Value::as_integer)
             .and_then(|value| u64::try_from(value).ok())
+    };
+    let get_money = |key: &str| {
+        limits
+            .and_then(|limits| limits.get(key))
+            .and_then(toml_value_money_au)
     };
     let get_str = |key: &str| {
         limits
@@ -25565,12 +28233,26 @@ fn provider_limits_value(config: &toml::Value) -> Value {
     json!({
         "max_sessions": get_u64("max_sessions"),
         "accept_rate_per_minute": get_u64("accept_rate_per_minute").unwrap_or(0),
-        "serve_budget_mu": get_u64("serve_budget_mu").unwrap_or(0),
+        "serve_budget_au": get_money("serve_budget_au").map(money_au_json).unwrap_or_else(|| money_au_json(0)),
         "serve_budget_units": get_u64("serve_budget_units").unwrap_or(0),
         "serve_budget_period_seconds": get_u64("serve_budget_period_seconds").unwrap_or(86_400),
         "memory_reserve": get_str("memory_reserve"),
         "disk_reserve": get_str("disk_reserve"),
     })
+}
+
+fn ensure_provider_enclave_limits_table<'a>(
+    config: &'a mut toml::Value,
+    target: &str,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    let limits = ensure_toml_table_path(config, &["provider", "enclave_limits"])?;
+    let entry = limits
+        .entry(target.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if !entry.is_table() {
+        bail!("provider.enclave_limits.{target} exists in config.toml but is not a table");
+    }
+    Ok(entry.as_table_mut().expect("checked table"))
 }
 
 fn parse_provider_accept_rate(value: &str) -> Result<u32> {
@@ -25584,7 +28266,7 @@ fn parse_provider_accept_rate(value: &str) -> Result<u32> {
 
 fn parse_provider_budget(value: &str) -> Result<ParsedProviderBudget> {
     let (amount_kind, period) = value.trim().split_once('/').with_context(|| {
-        format!("--budget must look like 2500000mu/day or 500000tokens/epoch, got {value:?}")
+        format!("--budget must look like 1000000000000000000au/day or 500000tokens/epoch, got {value:?}")
     })?;
     let period_seconds = match period.trim().to_ascii_lowercase().as_str() {
         "day" | "daily" => 86_400,
@@ -25605,16 +28287,14 @@ fn parse_provider_budget(value: &str) -> Result<ParsedProviderBudget> {
         (digits, ProviderBudgetKind::Tokens)
     } else if let Some(digits) = lower.strip_suffix("token") {
         (digits, ProviderBudgetKind::Tokens)
-    } else if let Some(digits) = lower.strip_suffix("mu") {
-        (digits, ProviderBudgetKind::Mu)
-    } else if let Some(digits) = lower.strip_suffix("musd") {
-        (digits, ProviderBudgetKind::Mu)
+    } else if let Some(digits) = lower.strip_suffix("au") {
+        (digits, ProviderBudgetKind::Au)
     } else {
-        bail!("budget amount must end in mu or tokens");
+        bail!("budget amount must end in au or tokens");
     };
     let amount = digits
         .trim()
-        .parse::<u64>()
+        .parse::<u128>()
         .with_context(|| format!("budget amount must be an integer, got {amount_kind:?}"))?;
     Ok(ParsedProviderBudget {
         amount,
@@ -25710,8 +28390,9 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let ctx = provider_tx_context(&args.tx).await?;
     let contract = read_contract_catalog(&ctx.rpc).await?;
     let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
-    let price = require_current_mu_usd_price(&contract.prices, &enclave.enclave_id)?;
+    let price = require_current_au_usd_price(&contract.prices, &enclave.enclave_id)?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
+    let hardware_fingerprint = current_provider_hardware_fingerprint();
     let provider_feature = ensure_provider_registered(
         &ctx.rpc,
         &ctx.keypair_path,
@@ -25726,6 +28407,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         &ctx.password,
         &ctx.wallet,
         &enclave,
+        Some(&hardware_fingerprint),
         args.tx.sim,
     )
     .await?;
@@ -25748,6 +28430,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         "sim": args.tx.sim,
         "enclave": enclave,
         "price": price,
+        "hardware_fingerprint": hardware_fingerprint,
         "rooms": rooms,
         "features": {
             "provider": provider_feature,
@@ -25877,7 +28560,7 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
             enclave.enclave_id
         );
     }
-    let price = require_current_mu_usd_price(&contract.prices, &enclave.enclave_id)?;
+    let price = require_current_au_usd_price(&contract.prices, &enclave.enclave_id)?;
     let serve_key = format!("serve/{}/{}", ctx.wallet.public_key, enclave.enclave_id);
     let serving = read_state_value(&ctx.rpc, &serve_key).await?;
     if serving
@@ -26014,14 +28697,26 @@ fn provider_lifecycle_nonce(
     })))
 }
 
+#[cfg(test)]
 fn provider_lifecycle_intent(
     provider: &str,
     op: &str,
     enclave_id: Option<&str>,
     room_id: Option<&str>,
 ) -> Result<Value> {
+    provider_lifecycle_intent_with_anchors(provider, op, enclave_id, room_id, None, None)
+}
+
+fn provider_lifecycle_intent_with_anchors(
+    provider: &str,
+    op: &str,
+    enclave_id: Option<&str>,
+    room_id: Option<&str>,
+    hardware_fingerprint: Option<&str>,
+    device_key: Option<&str>,
+) -> Result<Value> {
     let nonce = provider_lifecycle_nonce(provider, op, enclave_id, room_id)?;
-    let value = match (enclave_id, room_id) {
+    let mut value = match (enclave_id, room_id) {
         (Some(enclave_id), Some(room_id)) => json!({
             "op": op,
             "provider": provider,
@@ -26042,6 +28737,20 @@ fn provider_lifecycle_intent(
         }),
         (None, Some(_)) => bail!("room lifecycle intent requires enclave_id"),
     };
+    if op == "join_enclave" {
+        if let Some(fingerprint) = hardware_fingerprint {
+            if !is_hex_len(fingerprint, 64) {
+                bail!("provider hardware fingerprint must be a 32-byte hex digest");
+            }
+            value["hardware_fingerprint"] = json!(fingerprint);
+        }
+        if let Some(device_key) = device_key {
+            if !is_hex_len(device_key, 64) {
+                bail!("provider device key must be a 32-byte hex digest");
+            }
+            value["device_key"] = json!(device_key);
+        }
+    }
     Ok(value)
 }
 
@@ -26081,10 +28790,10 @@ fn resolve_provider_lifecycle_enclave(
     }
 }
 
-fn current_mu_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRecord> {
+fn current_au_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRecord> {
     let current = schedule.current.as_ref()?;
-    (schedule.denom == "mu_usd"
-        && current.denom == "mu_usd"
+    (schedule.denom == "au_usd"
+        && current.denom == "au_usd"
         && schedule.ctx_bracket.as_deref() == current.ctx_bracket.as_deref()
         && schedule.ctx_bracket_table_ver == current.ctx_bracket_table_ver
         && !current.rate_map.is_empty()
@@ -26099,23 +28808,23 @@ fn ledger_price_market_key(enclave_id: &str, ctx_bracket: Option<&str>) -> Strin
     }
 }
 
-fn current_mu_usd_price_for_ctx<'a>(
+fn current_au_usd_price_for_ctx<'a>(
     schedule: &'a LedgerPriceSchedule,
     ctx_bracket: Option<&str>,
 ) -> Option<&'a LedgerPriceRecord> {
-    let current = current_mu_usd_price(schedule)?;
+    let current = current_au_usd_price(schedule)?;
     (schedule.ctx_bracket.as_deref() == ctx_bracket
         && current.ctx_bracket.as_deref() == ctx_bracket)
         .then_some(current)
 }
 
-fn find_current_mu_usd_price_schedule<'a>(
+fn find_current_au_usd_price_schedule<'a>(
     prices: &'a [LedgerPriceSchedule],
     enclave_id: &str,
     ctx_bracket: Option<&str>,
 ) -> Option<&'a LedgerPriceSchedule> {
     prices.iter().find(|price| {
-        price.enclave_id == enclave_id && current_mu_usd_price_for_ctx(price, ctx_bracket).is_some()
+        price.enclave_id == enclave_id && current_au_usd_price_for_ctx(price, ctx_bracket).is_some()
     })
 }
 
@@ -26172,7 +28881,7 @@ fn require_admin_role_marker(field: &str, role: Option<&str>) -> Result<()> {
     bail!("{field} must be admin; got {}", role.unwrap_or("<missing>"))
 }
 
-fn require_current_mu_usd_price<'a>(
+fn require_current_au_usd_price<'a>(
     prices: &'a [LedgerPriceSchedule],
     enclave_id: &str,
 ) -> Result<&'a LedgerPriceSchedule> {
@@ -26184,9 +28893,9 @@ fn require_current_mu_usd_price<'a>(
                 "enclave {enclave_id} has no admin price; ask the admin to run `mayhem admin set-price` before providers join it"
             )
         })?;
-    if current_mu_usd_price(schedule).is_none() {
+    if current_au_usd_price(schedule).is_none() {
         bail!(
-            "enclave {enclave_id} has no current mu_usd admin price; ask the admin to run `mayhem admin set-price` before providers join it"
+            "enclave {enclave_id} has no current au_usd admin price; ask the admin to run `mayhem admin set-price` before providers join it"
         );
     }
     Ok(schedule)
@@ -27189,6 +29898,56 @@ fn provider_hwprobe(args: &ProviderStartArgs) -> Result<HardwareReport> {
     Ok(probe(options))
 }
 
+fn provider_hardware_fingerprint(hardware: &HardwareReport) -> String {
+    let mut gpus = hardware
+        .gpus
+        .iter()
+        .map(|gpu| {
+            json!({
+                "vendor": gpu.vendor.clone(),
+                "name": gpu.name.clone(),
+                "backend": gpu.backend.clone(),
+                "memory_bytes": gpu.memory_bytes,
+                "dedicated_memory_bytes": gpu.dedicated_memory_bytes,
+                "shared_memory_bytes": gpu.shared_memory_bytes,
+                "unified_memory": gpu.unified_memory,
+                "compute_capability": gpu.compute_capability.clone(),
+                "supports_nvfp4": gpu.supports_nvfp4,
+                "supports_fp8": gpu.supports_fp8,
+                "supports_tensor_parallel": gpu.supports_tensor_parallel,
+            })
+        })
+        .collect::<Vec<_>>();
+    gpus.sort_by_key(|gpu| stable_json_value(gpu).to_string());
+    stable_value_hash(&json!({
+        "domain": "mayhem-provider-hw-fingerprint-v1",
+        "schema_version": hardware.schema_version,
+        "source_kind": hardware.source.kind.clone(),
+        "host": {
+            "os": hardware.host.os.clone(),
+            "arch": hardware.host.arch.clone(),
+            "family": hardware.host.family.clone(),
+        },
+        "cpu": {
+            "model": hardware.cpu.model.clone(),
+            "physical_cores": hardware.cpu.physical_cores,
+            "logical_cores": hardware.cpu.logical_cores,
+            "flags": hardware.cpu.flags.clone(),
+        },
+        "memory": {
+            "total_bytes": hardware.memory.total_bytes,
+            "unified_memory": hardware.memory.unified_memory,
+        },
+        "gpus": gpus,
+    }))
+}
+
+fn current_provider_hardware_fingerprint() -> String {
+    let mut options = ProbeOptions::default();
+    options.run_disk_bench = false;
+    provider_hardware_fingerprint(&probe(options))
+}
+
 async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
     let prices = read_prefix_entries(rpc, "price/")
         .await?
@@ -27397,7 +30156,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
 
     let mut prices_by_market = BTreeMap::new();
     for schedule in &contract.prices {
-        let Some(price) = current_mu_usd_price(schedule) else {
+        let Some(price) = current_au_usd_price(schedule) else {
             continue;
         };
         let mut price = price.clone();
@@ -27419,7 +30178,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             continue;
         }
         if !contract.prices.iter().any(|price| {
-            price.enclave_id == enclave.enclave_id && current_mu_usd_price(price).is_some()
+            price.enclave_id == enclave.enclave_id && current_au_usd_price(price).is_some()
         }) {
             continue;
         };
@@ -27547,13 +30306,13 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     enclave_id: serving.enclave_id.clone(),
                     room_id: serving.room_id.clone(),
                     price_ver: serving_price.ver,
-                    price_ref_mu: Some(gateway_price_ref_from_ledger_with_history(
+                    price_ref_au: Some(gateway_price_ref_from_ledger_with_history(
                         serving_price,
                         price_history_by_market
                             .get(market_key.as_str())
                             .map(Vec::as_slice),
                     )),
-                    min_ask_mu: 0,
+                    min_ask_au: 0,
                     att_tier: effective_att_tier,
                     quant: normalize_ledger_quant(&enclave.quant),
                     admin_pubkey: enclave.created_by.clone(),
@@ -27628,7 +30387,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     .unwrap_or_else(|| DEFAULT_MODEL_CLASS.to_owned()),
                 providers_online,
                 rooms,
-                price_ref_mu: gateway_price_ref_from_ledger_with_history(
+                price_ref_au: gateway_price_ref_from_ledger_with_history(
                     &price.price,
                     price_history_by_market
                         .get(price.market_key.as_str())
@@ -27653,7 +30412,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
     }
     if models.is_empty() {
         bail!(
-            "no canonical contract-backed models found; ask the admin to register an enclave, set a current mu_usd price, open a room, and confirm an active provider joined it, or use --dev-embedded-catalog for local smoke only"
+            "no canonical contract-backed models found; ask the admin to register an enclave, set a current au_usd price, open a room, and confirm an active provider joined it, or use --dev-embedded-catalog for local smoke only"
         );
     }
     Ok(models)
@@ -27738,6 +30497,20 @@ fn version_gate_summary(action: &str, gates: &[ModelVersionGate]) -> String {
     )
 }
 
+fn gateway_update_models_from_version_gates(
+    gates: &[ModelVersionGate],
+) -> Vec<GatewayUpdateModelNotice> {
+    gates
+        .iter()
+        .map(|gate| GatewayUpdateModelNotice {
+            model_id: gate.model_id.clone(),
+            min_app_version: gate.min_app_version.clone(),
+            installed_app_version: gate.installed_app_version.clone(),
+            message: gate.message.clone(),
+        })
+        .collect()
+}
+
 fn filter_gateway_models_by_app_version(
     models: Vec<GatewayModel>,
     catalog_doc: &catalog::CatalogDocument,
@@ -27770,13 +30543,13 @@ fn filter_gateway_models_by_app_version(
     Ok((allowed, blocked))
 }
 
-fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64, u64, u64) {
+fn price_sort_key(price: &LedgerPriceRecord) -> (MoneyAu, MoneyAu, MoneyAu, MoneyAu, MoneyAu, u64) {
     (
-        price.min_session_mu,
-        price.per_req_mu,
+        price.min_session_au,
+        price.per_req_au,
         rate_map_cost_basis_per_1k(&price.rate_map),
-        text_rate_per_1k_mu(&price.rate_map, INPUT_TOKEN_UNIT),
-        text_rate_per_1k_mu(&price.rate_map, OUTPUT_TOKEN_UNIT),
+        text_rate_per_1k_au(&price.rate_map, INPUT_TOKEN_UNIT),
+        text_rate_per_1k_au(&price.rate_map, OUTPUT_TOKEN_UNIT),
         price.ver,
     )
 }
@@ -27784,16 +30557,16 @@ fn price_sort_key(price: &LedgerPriceRecord) -> (u64, u64, u64, u64, u64, u64) {
 fn gateway_price_ref_from_ledger_with_history(
     price: &LedgerPriceRecord,
     history: Option<&[Value]>,
-) -> PriceRefMu {
+) -> PriceRefAu {
     let history = history
         .map(|entries| entries.iter().take(720).cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    PriceRefMu {
-        denom: "mu_usd".to_owned(),
+    PriceRefAu {
+        denom: "au_usd".to_owned(),
         ver: price.ver,
         rate_map: normalize_rate_map(price.rate_map.clone()),
-        per_req_mu: price.per_req_mu,
-        min_session_mu: price.min_session_mu,
+        per_req_au: price.per_req_au,
+        min_session_au: price.min_session_au,
         derivation: price.derivation.clone().or_else(|| history.last().cloned()),
         history,
     }
@@ -27930,6 +30703,44 @@ fn provider_context_source(args: &ProviderStartArgs, selected: &ProviderCandidat
         (false, true) => "default_auto_memory_fallback",
         (true, false) => "cli",
         (false, false) => "default",
+    }
+}
+
+fn provider_context_budget_label(
+    hardware: &HardwareReport,
+    budget: &ProviderMemoryBudget,
+) -> String {
+    let base = match budget.pool.as_str() {
+        "dedicated_gpu_memory" | "nvidia_dedicated_memory" => {
+            format!(
+                "{} dedicated VRAM budget from {}",
+                human_bytes(budget.budget_bytes),
+                budget.source
+            )
+        }
+        "nvidia_unified_memory" | "unified_memory" => {
+            format!(
+                "{} unified memory budget from {}",
+                human_bytes(budget.budget_bytes),
+                budget.source
+            )
+        }
+        _ => format!(
+            "{} {} budget from {}",
+            human_bytes(budget.budget_bytes),
+            budget.pool,
+            budget.source
+        ),
+    };
+    let wddm_shared = hardware.host.os == "windows"
+        && hardware
+            .gpus
+            .iter()
+            .any(|gpu| gpu.shared_memory_bytes.unwrap_or(0) > 0 && !gpu.unified_memory);
+    if wddm_shared && budget.pool.contains("dedicated") {
+        format!("{base}; WDDM shared GPU memory is ignored to avoid silent paging")
+    } else {
+        base
     }
 }
 
@@ -28305,6 +31116,10 @@ fn read_provider_memory_claimed_bytes(home: Option<&Path>) -> Result<u64> {
             let _ = fs::remove_file(&path);
             continue;
         }
+        if !process_is_running(record.pid) {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
         total = total.saturating_add(record.claimed_bytes);
     }
     Ok(total)
@@ -28356,10 +31171,36 @@ fn provider_context_feasibility(
 ) -> Result<ProviderCtxFeasibility> {
     let requested_ctx = resolve_provider_served_ctx(model, args.ctx);
     if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
-        return Ok(ProviderCtxFeasibility::not_applicable(
+        let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
+        let memory_budget =
+            provider_memory_budget(hardware, verdict, &enclave.backend, args, claimed_bytes)?;
+        let estimate = provider_memory_estimate(enclave, model, artifact, requested_ctx);
+        if estimate.required_bytes > memory_budget.budget_bytes {
+            bail!(
+                "model {} needs {} (weights {}, working memory {}, overhead {}) but only {} is usable after reserve {} and local claims {} in {}",
+                model.model_id,
+                human_bytes(estimate.required_bytes),
+                human_bytes(estimate.weights_bytes),
+                human_bytes(estimate.kv_bytes),
+                human_bytes(estimate.overhead_bytes),
+                human_bytes(memory_budget.budget_bytes),
+                human_bytes(memory_budget.reserve_bytes),
+                human_bytes(memory_budget.claimed_bytes),
+                memory_budget.pool
+            );
+        }
+        return Ok(ProviderCtxFeasibility {
             requested_ctx,
-            model.caps.ctx_max,
-        ));
+            served_ctx: requested_ctx,
+            catalog_ctx_max: model.caps.ctx_max,
+            fallback_applied: false,
+            message: None,
+            estimated_required_bytes: estimate.required_bytes,
+            estimated_weights_bytes: estimate.weights_bytes,
+            estimated_kv_bytes: estimate.kv_bytes,
+            estimated_overhead_bytes: estimate.overhead_bytes,
+            memory_budget,
+        });
     }
     let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
     let memory_budget =
@@ -28382,9 +31223,9 @@ fn provider_context_feasibility(
             let fallback_applied = served_ctx != requested_ctx;
             let message = fallback_applied.then(|| {
                 format!(
-                    "Context auto-fallback: requested/default {} tokens did not fit available {}; serving {} tokens in the active admin context table.",
+                    "Context auto-fallback: requested/default {} tokens did not fit {}; serving {} tokens from the active admin context table so the working set fits without spilling.",
                     requested_ctx,
-                    human_bytes(memory_budget.budget_bytes),
+                    provider_context_budget_label(hardware, &memory_budget),
                     served_ctx
                 )
             });
@@ -28678,7 +31519,7 @@ fn build_provider_candidates(
             &contract.ctx_bracket_schedule,
             now,
         )?;
-        let Some(price) = find_current_mu_usd_price_schedule(
+        let Some(price) = find_current_au_usd_price_schedule(
             &contract.prices,
             &enclave.enclave_id,
             price_ctx_bracket.as_deref(),
@@ -28688,9 +31529,9 @@ fn build_provider_candidates(
                 enclave,
                 match price_ctx_bracket.as_deref() {
                     Some(ctx_bracket) => format!(
-                        "missing current mu_usd admin price for context bracket {ctx_bracket}"
+                        "missing current au_usd admin price for context bracket {ctx_bracket}"
                     ),
-                    None => "missing current mu_usd admin price for this enclave".to_owned(),
+                    None => "missing current au_usd admin price for this enclave".to_owned(),
                 },
                 None,
             ));
@@ -28732,7 +31573,7 @@ fn build_provider_candidates(
             bail!("{}", provider_rejection_summary("auto", &relevant));
         }
         bail!(
-            "no feasible active admin-created enclaves with a current mu_usd admin price found in contract state; providers can only join priced enclaves the admin already registered"
+            "no feasible active admin-created enclaves with a current au_usd admin price found in contract state; providers can only join priced enclaves the admin already registered"
         );
     }
     if env::var_os("MAYHEM_PROVIDER_CANDIDATE_DEBUG").is_some() {
@@ -28956,6 +31797,247 @@ fn select_provider_candidate(
         .max_by_key(|candidate| backend_rank(&candidate.enclave.backend))
         .cloned()
         .context("no provider candidate available")
+}
+
+fn select_provider_auto_fit_set(
+    candidates: &[ProviderCandidate],
+) -> Result<ProviderAutoFitSelection> {
+    if candidates.is_empty() {
+        bail!("no provider candidates available for auto-fit");
+    }
+    let mut ranked = candidates.iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        provider_auto_fit_candidate_score(b)
+            .partial_cmp(&provider_auto_fit_candidate_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.enclave.enclave_id.cmp(&b.enclave.enclave_id))
+    });
+    let exact_len = ranked.len().min(20);
+    let ranked = &ranked[..exact_len];
+    let mut best: Option<ProviderAutoFitSelection> = None;
+    for mask in 1_u64..(1_u64 << exact_len) {
+        let set = ranked
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| ((mask & (1_u64 << index)) != 0).then_some(*candidate))
+            .collect::<Vec<_>>();
+        let Some(selection) = provider_auto_fit_selection_from_set(&set) else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|current| {
+                selection
+                    .score
+                    .partial_cmp(&current.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .is_gt()
+                    || ((selection.score - current.score).abs() < f64::EPSILON
+                        && selection.candidates.len() > current.candidates.len())
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some(selection);
+        }
+    }
+    best.context("no auto-fit candidate set fits the shared provider memory budget")
+}
+
+fn select_provider_explicit_set(
+    candidates: &[ProviderCandidate],
+    requested: &[String],
+) -> Result<ProviderAutoFitSelection> {
+    let mut selected = Vec::new();
+    let mut seen_enclaves = BTreeSet::new();
+    for request in requested {
+        let candidate = select_provider_candidate(candidates, Some(request))?;
+        if !seen_enclaves.insert(candidate.enclave.enclave_id.clone()) {
+            bail!(
+                "requested enclave/model {request} resolves to a duplicate admin enclave {}; pass each enclave only once",
+                candidate.enclave.enclave_id
+            );
+        }
+        selected.push(candidate);
+    }
+    let refs = selected.iter().collect::<Vec<_>>();
+    let mut selection = provider_auto_fit_selection_from_set(&refs).with_context(|| {
+        let required = selected.iter().fold(0_u64, |total, candidate| {
+            total.saturating_add(candidate.feasibility.estimated_required_bytes)
+        });
+        let budget = selected
+            .iter()
+            .fold(BTreeMap::<String, u64>::new(), |mut pools, candidate| {
+                pools
+                    .entry(candidate.feasibility.memory_budget.pool.clone())
+                    .and_modify(|value| {
+                        *value = (*value).min(candidate.feasibility.memory_budget.budget_bytes)
+                    })
+                    .or_insert(candidate.feasibility.memory_budget.budget_bytes);
+                pools
+            })
+            .values()
+            .copied()
+            .fold(0_u64, u64::saturating_add);
+        format!(
+            "requested provider enclave set does not fit the shared memory budget: needs {} against {} after one reserve and current local claims",
+            human_bytes(required),
+            human_bytes(budget)
+        )
+    })?;
+    let model_names = selection
+        .candidates
+        .iter()
+        .map(|candidate| candidate.enclave.model_id.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let modality_label = if selection.modalities.is_empty() {
+        "admin markets".to_owned()
+    } else {
+        selection.modalities.join(",")
+    };
+    selection.rationale = format!(
+        "serving requested {model_names}: fits in {}/{} shared budget across {}; one OS reserve is applied to the set",
+        human_bytes(selection.total_required_bytes),
+        human_bytes(selection.total_budget_bytes),
+        modality_label
+    );
+    Ok(selection)
+}
+
+fn provider_auto_fit_selection_from_set(
+    set: &[&ProviderCandidate],
+) -> Option<ProviderAutoFitSelection> {
+    let mut seen_models = BTreeSet::new();
+    let mut pool_budgets: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut modalities = BTreeSet::new();
+    let mut score = 0.0_f64;
+    for candidate in set {
+        if !seen_models.insert(candidate.enclave.model_id.clone()) {
+            return None;
+        }
+        for modality in provider_candidate_modalities(candidate) {
+            modalities.insert(modality);
+        }
+        score += provider_auto_fit_candidate_score(candidate);
+        let required = candidate.feasibility.estimated_required_bytes;
+        if required == 0 {
+            continue;
+        }
+        let budget = candidate.feasibility.memory_budget.budget_bytes;
+        let entry = pool_budgets
+            .entry(candidate.feasibility.memory_budget.pool.clone())
+            .or_insert((0, budget));
+        entry.0 = entry.0.saturating_add(required);
+        entry.1 = entry.1.min(budget);
+    }
+    if pool_budgets
+        .values()
+        .any(|(required, budget)| required > budget)
+    {
+        return None;
+    }
+    let total_required_bytes = pool_budgets.values().fold(0_u64, |total, (required, _)| {
+        total.saturating_add(*required)
+    });
+    let total_budget_bytes = pool_budgets
+        .values()
+        .fold(0_u64, |total, (_, budget)| total.saturating_add(*budget));
+    let modalities = modalities.into_iter().collect::<Vec<_>>();
+    let modality_bonus = 1.0 + (modalities.len().saturating_sub(1) as f64 * 0.05);
+    let score = score * modality_bonus;
+    let candidates = set
+        .iter()
+        .map(|candidate| (*candidate).clone())
+        .collect::<Vec<_>>();
+    let model_names = candidates
+        .iter()
+        .map(|candidate| candidate.enclave.model_id.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let modality_label = if modalities.is_empty() {
+        "admin markets".to_owned()
+    } else {
+        modalities.join(",")
+    };
+    let rationale = format!(
+        "serving {model_names}: fits in {}/{} shared budget across {}; best current earnings mix",
+        human_bytes(total_required_bytes),
+        human_bytes(total_budget_bytes),
+        modality_label
+    );
+    Some(ProviderAutoFitSelection {
+        candidates,
+        total_required_bytes,
+        total_budget_bytes,
+        modalities,
+        score,
+        rationale,
+    })
+}
+
+fn provider_auto_fit_candidate_score(candidate: &ProviderCandidate) -> f64 {
+    let price = candidate
+        .price
+        .as_ref()
+        .and_then(|price| price.current.as_ref());
+    let Some(price) = price else {
+        return 0.0;
+    };
+    let per_unit_au = price
+        .rate_map
+        .iter()
+        .map(|entry| entry.per_unit_au as f64 / entry.granularity.max(1) as f64)
+        .sum::<f64>();
+    let throughput = candidate
+        .verdict
+        .est_tok_s
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(|| provider_auto_fit_default_throughput(candidate));
+    (per_unit_au * throughput).max((price.per_req_au + price.min_session_au) as f64)
+}
+
+fn provider_auto_fit_default_throughput(candidate: &ProviderCandidate) -> f64 {
+    if candidate.enclave.model_class == DEFAULT_MODEL_CLASS {
+        1.0
+    } else {
+        0.25
+    }
+}
+
+fn provider_candidate_modalities(candidate: &ProviderCandidate) -> Vec<String> {
+    let mut modalities = BTreeSet::new();
+    for modality in &candidate.model.adapter.modality_set {
+        if !modality.trim().is_empty() {
+            modalities.insert(modality.trim().to_owned());
+        }
+    }
+    for modality in &candidate.model.caps.output_modalities {
+        if !modality.trim().is_empty() {
+            modalities.insert(modality.trim().to_owned());
+        }
+    }
+    if let Some(modality) = candidate.model.caps.output_modality.as_deref() {
+        if !modality.trim().is_empty() {
+            modalities.insert(modality.trim().to_owned());
+        }
+    }
+    if candidate.model.caps.vision {
+        modalities.insert("vision".to_owned());
+    }
+    if candidate.model.caps.image {
+        modalities.insert("image".to_owned());
+    }
+    if candidate.model.caps.audio
+        && !modalities
+            .iter()
+            .any(|modality| matches!(modality.as_str(), "audio" | "stt" | "tts"))
+    {
+        modalities.insert("audio".to_owned());
+    }
+    if modalities.is_empty() {
+        modalities.insert(candidate.enclave.model_class.clone());
+    }
+    modalities.into_iter().collect()
 }
 
 fn backend_rank(backend: &str) -> u8 {
@@ -29604,6 +32686,7 @@ async fn ensure_joined_enclave(
     password: &str,
     wallet: &WalletInfo,
     enclave: &LedgerEnclave,
+    hardware_fingerprint: Option<&str>,
     sim: bool,
 ) -> Result<Value> {
     let key = format!("serve/{}/{}", wallet.public_key, enclave.enclave_id);
@@ -29614,7 +32697,7 @@ async fn ensure_joined_enclave(
             );
         }
     }
-    let submitted = submit_provider_lifecycle_feature(
+    let submitted = submit_provider_lifecycle_feature_with_anchors(
         ProviderLifecycleSubmitContext {
             rpc,
             keypair_path,
@@ -29624,6 +32707,8 @@ async fn ensure_joined_enclave(
         },
         "join_enclave",
         Some(&enclave.enclave_id),
+        None,
+        hardware_fingerprint,
         None,
     )
     .await?;
@@ -29772,7 +32857,25 @@ async fn submit_provider_lifecycle_feature(
     enclave_id: Option<&str>,
     room_id: Option<&str>,
 ) -> Result<Value> {
-    let intent = provider_lifecycle_intent(&ctx.wallet.public_key, op, enclave_id, room_id)?;
+    submit_provider_lifecycle_feature_with_anchors(ctx, op, enclave_id, room_id, None, None).await
+}
+
+async fn submit_provider_lifecycle_feature_with_anchors(
+    ctx: ProviderLifecycleSubmitContext<'_>,
+    op: &str,
+    enclave_id: Option<&str>,
+    room_id: Option<&str>,
+    hardware_fingerprint: Option<&str>,
+    device_key: Option<&str>,
+) -> Result<Value> {
+    let intent = provider_lifecycle_intent_with_anchors(
+        &ctx.wallet.public_key,
+        op,
+        enclave_id,
+        room_id,
+        hardware_fingerprint,
+        device_key,
+    )?;
     let sig = sign_message(
         ctx.keypair_path,
         ctx.password,
@@ -29837,6 +32940,23 @@ where
     bail!("timed out waiting for {key}; last value: {last}");
 }
 
+async fn sc_bridge_transport_peer(bridge: &mut ScBridgeClient) -> Result<String> {
+    let info = bridge
+        .info()
+        .await
+        .context("reading SC-Bridge local peer info")?;
+    let peer = info
+        .pointer("/info/peerPubkey")
+        .and_then(Value::as_str)
+        .or_else(|| info.pointer("/info/peer_pubkey").and_then(Value::as_str))
+        .or_else(|| info.pointer("/info/peer").and_then(Value::as_str))
+        .or_else(|| info.get("peer").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| is_hex_len(value, 64))
+        .ok_or_else(|| anyhow!("SC-Bridge info did not expose a 32-byte peer public key"))?;
+    Ok(peer.to_owned())
+}
+
 async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value>> {
     let sc_bridge_url = ctx.args.sc_bridge_url.clone().or_else(|| {
         ctx.config
@@ -29860,6 +32980,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
     let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(url, token)?)
         .await
         .context("connecting to SC-Bridge for provider heartbeats")?;
+    let transport_peer = sc_bridge_transport_peer(&mut bridge).await?;
     let mut sent = Vec::new();
     let count = u64::from(ctx.args.heartbeat_count.max(1));
     let protection = ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
@@ -29874,8 +32995,10 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.rooms,
                 ctx.attestation,
                 ctx.attestation_head,
-                ctx.args.min_ask_mu,
+                ctx.identity_anchor,
+                ctx.args.min_ask_au,
                 protection.max_sessions,
+                Some(transport_peer.as_str()),
                 seq,
                 seq == 0,
                 ProviderLoadSnapshot::default(),
@@ -29895,8 +33018,10 @@ async fn send_provider_heartbeat_round(
     rooms: &[LedgerRoom],
     attestation: &Tier1AttestationReport,
     attestation_head: &str,
-    min_ask_mu: u64,
+    identity_anchor: &str,
+    min_ask_au: MoneyAu,
     max_sessions: u32,
+    transport_peer: Option<&str>,
     seq: u64,
     join_rooms: bool,
     load: ProviderLoadSnapshot,
@@ -29920,6 +33045,7 @@ async fn send_provider_heartbeat_round(
             "enclave_id": selected.enclave.enclave_id,
             "model_id": selected.enclave.model_id,
             "room_id": room.room_id,
+            "identity_anchor": identity_anchor,
             "accepting_new": load.accepting_new,
             "sat": provider_saturation(load.active_slots, max_sessions),
             "slots": {
@@ -29943,7 +33069,7 @@ async fn send_provider_heartbeat_round(
                 .and_then(|price| price.current.as_ref())
                 .map(|price| price.ver)
                 .unwrap_or(0),
-            "min_ask_mu": min_ask_mu,
+            "min_ask_au": min_ask_au,
             "caps": {
                 "tools": caps.tools,
                 "json": caps.json,
@@ -29957,6 +33083,9 @@ async fn send_provider_heartbeat_round(
             "ts": ts,
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
+        if let Some(transport_peer) = transport_peer {
+            heartbeat["transport_peer"] = json!(transport_peer);
+        }
         let signing_payload = String::from_utf8(heartbeat_signing_payload(&heartbeat)?)
             .context("heartbeat signing payload was not UTF-8")?;
         let sig = sign_message(keypair_path, password, &signing_payload).await?;
@@ -29969,9 +33098,11 @@ async fn send_provider_heartbeat_round(
             "room_id": room.room_id,
             "sidechannel": room.sidechannel,
             "seq": seq,
-            "min_ask_mu": min_ask_mu,
+            "min_ask_au": min_ask_au,
             "max_sessions": max_sessions,
+            "transport_peer": transport_peer,
             "accepting_new": load.accepting_new,
+            "identity_anchor": identity_anchor,
         }));
     }
     Ok(sent)
@@ -29994,6 +33125,7 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
     )?)
     .await
     .context("connecting to SC-Bridge for live provider session heartbeats")?;
+    let transport_peer = sc_bridge_transport_peer(&mut bridge).await?;
     let mut seq = 0_u64;
     let mut join_rooms = true;
     while !ctx.load.is_stopped() {
@@ -30006,8 +33138,10 @@ async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> R
             &ctx.rooms,
             &ctx.attestation,
             &ctx.attestation_head,
-            ctx.min_ask_mu,
+            &ctx.identity_anchor,
+            ctx.min_ask_au,
             ctx.max_sessions,
+            Some(transport_peer.as_str()),
             seq,
             join_rooms,
             ctx.load.snapshot(),
@@ -30054,16 +33188,16 @@ async fn serve_provider_sessions(
     provider_log(
         ctx.args,
         &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask_mu {} max_sessions {}",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask_au {} max_sessions {}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
             responder.mode(),
             terms.price_ver,
             format_rate_map(&terms.rate_map),
-            terms.ctx_bracket.as_str(),
-            terms.ctx_bracket_table_ver,
-            terms.min_ask_mu,
+            terms.ctx_bracket.as_deref().unwrap_or("base"),
+            terms.ctx_bracket_table_ver.unwrap_or(0),
+            terms.min_ask_au,
             protection_config.max_sessions
         ),
     );
@@ -30084,7 +33218,8 @@ async fn serve_provider_sessions(
                 rooms: ctx.rooms.to_vec(),
                 attestation: ctx.attestation.clone(),
                 attestation_head: ctx.attestation_head.to_owned(),
-                min_ask_mu: ctx.args.min_ask_mu,
+                identity_anchor: ctx.identity_anchor.to_owned(),
+                min_ask_au: ctx.args.min_ask_au,
                 max_sessions: protection_config.max_sessions,
                 load: heartbeat_load.clone(),
             },
@@ -30561,6 +33696,12 @@ async fn handle_provider_session_frame(
         .to_owned();
     match frame.get("t").and_then(Value::as_str) {
         Some("s.open") => {
+            if !provider_session_open_targets_enclave(&frame, terms) {
+                provider_session_debug(format!(
+                    "ignoring s.open for session {session_id} from {remote}: frame targets a different enclave"
+                ));
+                return Ok(());
+            }
             provider_session_debug(format!(
                 "handling s.open for session {session_id} from {remote}"
             ));
@@ -30651,8 +33792,8 @@ async fn handle_provider_session_frame(
                             locked_rate_map: normalize_rate_map(
                                 spend_voucher.body.locked_rate_map.clone(),
                             ),
-                            locked_per_req_mu: spend_voucher.body.locked_per_req_mu,
-                            locked_min_session_mu: spend_voucher.body.locked_min_session_mu,
+                            locked_per_req_au: spend_voucher.body.locked_per_req_au,
+                            locked_min_session_au: spend_voucher.body.locked_min_session_au,
                             served_ctx: spend_voucher.body.served_ctx,
                             ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
                             ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
@@ -30743,10 +33884,8 @@ async fn handle_provider_session_frame(
             provider_session_debug(format!("handling s.req_chunk for session {session_id}"));
             if !sessions.contains_key(&session_id) {
                 provider_session_debug(format!(
-                    "closing unknown session {session_id} after s.req_chunk from {remote}"
+                    "ignoring s.req_chunk for unknown session {session_id} from {remote}"
                 ));
-                send_provider_session_close(bridge, &remote, &session_id, "err:unknown_session")
-                    .await?;
                 return Ok(());
             }
             if let Err(err) =
@@ -30783,10 +33922,8 @@ async fn handle_provider_session_frame(
             pending_requests.remove(&session_id);
             let Some(active) = sessions.get(&session_id).cloned() else {
                 provider_session_debug(format!(
-                    "closing unknown session {session_id} after s.req from {remote}"
+                    "ignoring s.req for unknown session {session_id} from {remote}"
                 ));
-                send_provider_session_close(bridge, &remote, &session_id, "err:unknown_session")
-                    .await?;
                 return Ok(());
             };
             let request_id = frame
@@ -30858,8 +33995,23 @@ async fn handle_provider_session_frame(
                     request_load.finish_with_output(&output);
                     if let Some(stream) = live_stream.as_mut() {
                         if let Err(err) = stream.finish() {
+                            let err_text = format!("{err:#}");
+                            if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
+                                request_load.finish();
+                                provider_session_debug(format!(
+                                    "client disconnected during live flush after partial receipt for session {session_id} request {request_id}"
+                                ));
+                                sessions.remove(&session_id);
+                                pending_requests.remove(&session_id);
+                                remove_provider_session_pending_payloads(
+                                    pending_payloads,
+                                    &session_id,
+                                );
+                                heartbeat_load.set_active_sessions(sessions.len());
+                                return Ok(());
+                            }
                             provider_session_debug(format!(
-                                "flushing live response failed for session {session_id}: {err:#}"
+                                "flushing live response failed for session {session_id}: {err_text}"
                             ));
                             send_provider_session_error(
                                 bridge,
@@ -30888,8 +34040,19 @@ async fn handle_provider_session_frame(
                 }
                 Err(err) => {
                     request_load.finish();
+                    let err_text = format!("{err:#}");
+                    if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
+                        provider_session_debug(format!(
+                            "client disconnected after partial receipt for session {session_id} request {request_id}"
+                        ));
+                        sessions.remove(&session_id);
+                        pending_requests.remove(&session_id);
+                        remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                        heartbeat_load.set_active_sessions(sessions.len());
+                        return Ok(());
+                    }
                     provider_session_debug(format!(
-                        "response failed for session {session_id}: {err:#}"
+                        "response failed for session {session_id}: {err_text}"
                     ));
                     send_provider_session_error(
                         bridge,
@@ -30968,7 +34131,7 @@ async fn handle_provider_session_frame(
                     return Ok(());
                 }
             };
-            protection.record_usage(&receipt.body.usage, receipt.body.mu_owed_cum);
+            protection.record_usage(&receipt.body.usage, receipt.body.au_owed_cum);
             provider_session_debug(format!(
                 "waiting for receipt ack on session {session_id} request {request_id}"
             ));
@@ -31022,6 +34185,8 @@ struct ProviderSessionLiveStreamState {
     next_index: u64,
     receipt_seq: u64,
     last_checkpoint_tokens: u64,
+    delivered_tokens: u64,
+    prompt_tokens: u64,
 }
 
 struct ProviderSessionLiveStream<'a> {
@@ -31038,10 +34203,14 @@ struct ProviderSessionLiveStream<'a> {
     last_checkpoint_tokens: u64,
     first_ttft_ms: Option<u64>,
     delivered_tokens: u64,
+    prompt_tokens: u64,
     streamed_any: bool,
     pending_text: String,
     pending_token_ids: Vec<i32>,
 }
+
+const PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT: &str =
+    "provider live stream cancelled after client disconnect";
 
 impl<'a> ProviderSessionLiveStream<'a> {
     fn new(
@@ -31068,6 +34237,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             last_checkpoint_tokens: 0,
             first_ttft_ms: None,
             delivered_tokens: 0,
+            prompt_tokens: 0,
             streamed_any: false,
             pending_text: String::new(),
             pending_token_ids: Vec::new(),
@@ -31075,6 +34245,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn on_token(&mut self, chunk: TokenChunk, prompt_tokens: u64) -> Result<()> {
+        self.prompt_tokens = prompt_tokens;
         if self.first_ttft_ms.is_none() {
             let ttft_ms = duration_millis_u64(self.request_started.elapsed()).max(1);
             self.first_ttft_ms = Some(ttft_ms);
@@ -31138,6 +34309,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             self.last_checkpoint_tokens = self.delivered_tokens;
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
+        self.poll_client_disconnect()?;
         Ok(())
     }
 
@@ -31146,7 +34318,8 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn finish(&mut self) -> Result<()> {
-        self.flush_pending_delta()
+        self.flush_pending_delta()?;
+        self.poll_client_disconnect()
     }
 
     fn flush_pending_delta(&mut self) -> Result<()> {
@@ -31183,11 +34356,82 @@ impl<'a> ProviderSessionLiveStream<'a> {
         Ok(())
     }
 
+    fn poll_client_disconnect(&mut self) -> Result<()> {
+        let event = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.bridge
+                    .next_session_frame(Duration::from_millis(0))
+                    .await
+            })
+        });
+        let event = match event {
+            Ok(event) => event,
+            Err(BridgeError::Timeout) => return Ok(()),
+            Err(err) => return Err(err).context("polling provider session close"),
+        };
+        if event.get("session_id").and_then(Value::as_str) != Some(self.active.session_id.as_str())
+        {
+            self.bridge.requeue_event_front(event);
+            return Ok(());
+        }
+        let frame = event.get("frame").cloned().unwrap_or(Value::Null);
+        if frame.get("t").and_then(Value::as_str) == Some("s.close")
+            && frame.get("reason").and_then(Value::as_str) == Some("client_disconnect")
+        {
+            self.send_client_disconnect_receipt()?;
+            bail!("{PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT}");
+        }
+        self.bridge.requeue_event_front(event);
+        Ok(())
+    }
+
+    fn send_client_disconnect_receipt(&mut self) -> Result<()> {
+        if self.delivered_tokens == 0 || self.delivered_tokens == self.last_checkpoint_tokens {
+            return Ok(());
+        }
+        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_tokens);
+        let receipt = provider_session_receipt_for_usage(
+            self.terms,
+            self.active,
+            self.body,
+            usage,
+            self.receipt_seq,
+            false,
+            self.runtime_keypair,
+        )
+        .context("building client-disconnect provider session receipt")?;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                send_provider_session_receipt_frame(
+                    self.bridge,
+                    self.active,
+                    self.request_id,
+                    &receipt,
+                    "client_disconnect",
+                )
+                .await?;
+                let _ = wait_for_provider_receipt_ack(
+                    self.bridge,
+                    self.active,
+                    &receipt,
+                    Duration::from_secs(5),
+                )
+                .await;
+                Ok::<(), anyhow::Error>(())
+            })
+        })?;
+        self.last_checkpoint_tokens = self.delivered_tokens;
+        self.receipt_seq = self.receipt_seq.saturating_add(1);
+        Ok(())
+    }
+
     fn into_state(self) -> Option<ProviderSessionLiveStreamState> {
         self.streamed_any.then_some(ProviderSessionLiveStreamState {
             next_index: self.next_index,
             receipt_seq: self.receipt_seq,
             last_checkpoint_tokens: self.last_checkpoint_tokens,
+            delivered_tokens: self.delivered_tokens,
+            prompt_tokens: self.prompt_tokens,
         })
     }
 }
@@ -31294,6 +34538,19 @@ async fn send_provider_session_output(
         index = index.saturating_add(1);
     }
 
+    if let Some(state) = &live_stream_state {
+        send_provider_client_disconnect_receipt_if_requested(
+            bridge,
+            active,
+            request_id,
+            terms,
+            body,
+            state,
+            runtime_keypair,
+        )
+        .await?;
+    }
+
     for frame in provider_session_final_delta_frames(
         request_id,
         index,
@@ -31314,6 +34571,19 @@ async fn send_provider_session_output(
             .context("sending final response frame")?;
     }
 
+    if let Some(state) = &live_stream_state {
+        send_provider_client_disconnect_receipt_if_requested(
+            bridge,
+            active,
+            request_id,
+            terms,
+            body,
+            state,
+            runtime_keypair,
+        )
+        .await?;
+    }
+
     let receipt = provider_session_receipt_for_usage(
         terms,
         active,
@@ -31326,6 +34596,67 @@ async fn send_provider_session_output(
     .context("building provider session receipt")?;
     send_provider_session_receipt_frame(bridge, active, request_id, &receipt, "final").await?;
     Ok(receipt)
+}
+
+async fn send_provider_client_disconnect_receipt_if_requested(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    terms: &ProviderSessionTerms,
+    body: &Value,
+    state: &ProviderSessionLiveStreamState,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<()> {
+    if !provider_session_client_disconnect_requested(bridge, active).await? {
+        return Ok(());
+    }
+    if state.delivered_tokens > 0 && state.delivered_tokens != state.last_checkpoint_tokens {
+        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_tokens);
+        let receipt = provider_session_receipt_for_usage(
+            terms,
+            active,
+            body,
+            usage,
+            state.receipt_seq,
+            false,
+            runtime_keypair,
+        )
+        .context("building client-disconnect provider session receipt")?;
+        send_provider_session_receipt_frame(
+            bridge,
+            active,
+            request_id,
+            &receipt,
+            "client_disconnect",
+        )
+        .await?;
+        let _ =
+            wait_for_provider_receipt_ack(bridge, active, &receipt, Duration::from_secs(5)).await;
+    }
+    bail!("{PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT}");
+}
+
+async fn provider_session_client_disconnect_requested(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+) -> Result<bool> {
+    let event = match bridge.next_session_frame(Duration::from_millis(25)).await {
+        Ok(event) => event,
+        Err(BridgeError::Timeout) => return Ok(false),
+        Err(err) => return Err(err).context("polling provider session close before final receipt"),
+    };
+    if event.get("session_id").and_then(Value::as_str) != Some(active.session_id.as_str()) {
+        bridge.requeue_event_front(event);
+        return Ok(false);
+    }
+    let frame = event.get("frame").cloned().unwrap_or(Value::Null);
+    if frame.get("t").and_then(Value::as_str) == Some("s.close")
+        && frame.get("reason").and_then(Value::as_str) == Some("client_disconnect")
+    {
+        return Ok(true);
+    }
+    bridge.requeue_event_front(event);
+    Ok(false)
 }
 
 fn provider_session_checkpoint_tokens(active: &ActiveProviderSession) -> u64 {
@@ -31863,14 +35194,14 @@ fn provider_session_receipt_for_usage(
         model_id: terms.model_id.clone(),
         price_ver: active.price_ver,
         locked_rate_map: active.locked_rate_map.clone(),
-        locked_per_req_mu: active.locked_per_req_mu,
-        locked_min_session_mu: active.locked_min_session_mu,
+        locked_per_req_au: active.locked_per_req_au,
+        locked_min_session_au: active.locked_min_session_au,
         served_ctx: active.served_ctx,
         ctx_bracket: active.ctx_bracket.clone(),
         ctx_bracket_table_ver: active.ctx_bracket_table_ver,
         rules_ver: terms.rules_ver,
         usage: usage.clone(),
-        mu_owed_cum: provider_session_mu_owed(active, &usage),
+        au_owed_cum: provider_session_au_owed(active, &usage),
         prompt_hash: provider_session_prompt_hash(body),
         ts: unix_epoch_millis()?,
     };
@@ -31881,11 +35212,11 @@ fn provider_session_receipt_for_usage(
     })
 }
 
-fn provider_session_mu_owed(active: &ActiveProviderSession, usage: &ReceiptUsage) -> u64 {
-    priced_usage_mu(
+fn provider_session_au_owed(active: &ActiveProviderSession, usage: &ReceiptUsage) -> MoneyAu {
+    priced_usage_au(
         &active.locked_rate_map,
-        active.locked_per_req_mu,
-        active.locked_min_session_mu,
+        active.locked_per_req_au,
+        active.locked_min_session_au,
         usage,
     )
 }
@@ -31965,6 +35296,13 @@ fn provider_embedding_input_texts_from_value(value: &Value) -> Result<Vec<String
     }
 }
 
+fn provider_embedding_input_token_count(inputs: &[String]) -> u64 {
+    inputs
+        .iter()
+        .map(|input| rough_text_tokens(input))
+        .fold(0_u64, u64::saturating_add)
+}
+
 async fn provider_session_attestation(
     runtime: &ProviderSessionRuntime<'_>,
     terms: &ProviderSessionTerms,
@@ -32036,7 +35374,7 @@ fn provider_session_responder(
             ctx.artifact_paths.primary.display()
         ),
     );
-    let load_config = provider_engine_load_config(ctx.selected, ctx.artifact_paths)?;
+    let load_config = provider_engine_load_config(ctx.args, ctx.selected, ctx.artifact_paths)?;
     match ctx.selected.artifact.engine.as_str() {
         "llama.cpp" => {
             let mut backend = mayhem_engine::LlamaCppBackend::new()
@@ -32129,6 +35467,7 @@ fn provider_session_responder(
 }
 
 fn provider_engine_load_config(
+    args: &ProviderStartArgs,
     selected: &ProviderCandidate,
     artifact_paths: &ProviderArtifactPaths,
 ) -> Result<LoadConfig> {
@@ -32175,7 +35514,11 @@ fn provider_engine_load_config(
     };
     config.artifact = artifact;
     config.ctx_size = ctx_size.max(1);
-    config.gpu_layers = selected.verdict.n_layers_gpu;
+    config.gpu_layers = if selected.artifact.engine == "llama.cpp" {
+        args.gpu_layers.or(selected.verdict.n_layers_gpu)
+    } else {
+        selected.verdict.n_layers_gpu
+    };
     config.memory_limit_bytes = (selected.feasibility.memory_budget.budget_bytes > 0)
         .then_some(selected.feasibility.memory_budget.budget_bytes);
     if let Some(mmproj_path) = artifact_paths.sidecars.get("mmproj") {
@@ -32563,26 +35906,32 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         .selected
         .price
         .as_ref()
-        .and_then(current_mu_usd_price)
+        .and_then(current_au_usd_price)
         .context("selected provider enclave has no current admin price")?;
     let started_at = unix_epoch_seconds()?;
     let served_ctx = u32::try_from(ctx.selected.served_ctx).unwrap_or(u32::MAX);
-    let (ctx_bracket, ctx_bracket_table_ver) = ctx_bracket_for_tokens_in_schedule(
-        served_ctx,
-        &ctx.selected.ctx_bracket_schedule,
-        started_at,
-    )
-    .context("selected provider context is not covered by the active context bracket table")?;
-    if ctx.selected.enclave.model_class == DEFAULT_MODEL_CLASS {
+    let (ctx_bracket, ctx_bracket_table_ver) = if ctx.selected.enclave.model_class
+        == DEFAULT_MODEL_CLASS
+    {
+        let (ctx_bracket, ctx_bracket_table_ver) = ctx_bracket_for_tokens_in_schedule(
+            served_ctx,
+            &ctx.selected.ctx_bracket_schedule,
+            started_at,
+        )
+        .context("selected provider context is not covered by the active context bracket table")?;
         if price.ctx_bracket.as_deref() != Some(ctx_bracket.as_str()) {
             bail!(
                 "selected provider enclave price is for context {:?}, but served context resolves to {ctx_bracket}",
                 price.ctx_bracket
             );
         }
-    } else if price.ctx_bracket.is_some() {
-        bail!("selected non-text provider enclave has an unexpected context-bracket price");
-    }
+        (Some(ctx_bracket), Some(ctx_bracket_table_ver))
+    } else {
+        if price.ctx_bracket.is_some() {
+            bail!("selected non-text provider enclave has an unexpected context-bracket price");
+        }
+        (None, None)
+    };
     Ok(ProviderSessionTerms {
         contract_version: CONTRACT_VERSION,
         provider: ctx.wallet.public_key.clone(),
@@ -32592,9 +35941,9 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         room_ids: ctx.rooms.iter().map(|room| room.room_id.clone()).collect(),
         price_ver: price.ver,
         rate_map: price.rate_map.clone(),
-        per_req_mu: price.per_req_mu,
-        min_session_mu: price.min_session_mu,
-        min_ask_mu: ctx.args.min_ask_mu,
+        per_req_au: price.per_req_au,
+        min_session_au: price.min_session_au,
+        min_ask_au: ctx.args.min_ask_au,
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.served_ctx,
         ctx_bracket,
@@ -32684,10 +36033,10 @@ fn provider_session_contract_decision(
             "admin price schedule is no longer present for this enclave".to_owned(),
         );
     };
-    if current_mu_usd_price(schedule).is_none() {
+    if current_au_usd_price(schedule).is_none() {
         return reject(
             "PRICE_VER",
-            "admin price schedule is no longer current mu_usd".to_owned(),
+            "admin price schedule is no longer current au_usd".to_owned(),
         );
     };
 
@@ -32840,7 +36189,7 @@ fn provider_session_spend_reservation_value(
         "served_ctx": spend_voucher.body.served_ctx,
         "ctx_bracket": spend_voucher.body.ctx_bracket,
         "ctx_bracket_table_ver": spend_voucher.body.ctx_bracket_table_ver,
-        "max_spend_mu": spend_voucher.body.max_spend_mu,
+        "max_spend_au": money_au_json(spend_voucher.body.max_spend_au),
         "voucher": voucher,
         "provider_sig": "",
     }))
@@ -32861,7 +36210,7 @@ fn spend_reservation_evidence(value: &Value) -> Value {
         "served_ctx": value.get("served_ctx").cloned().unwrap_or(Value::Null),
         "ctx_bracket": value.get("ctx_bracket").cloned().unwrap_or(Value::Null),
         "ctx_bracket_table_ver": value.get("ctx_bracket_table_ver").cloned().unwrap_or(Value::Null),
-        "max_spend_mu": value.get("max_spend_mu").cloned().unwrap_or(Value::Null),
+        "max_spend_au": value.get("max_spend_au").cloned().unwrap_or(Value::Null),
         "voucher": stable_json_value(value.get("voucher").unwrap_or(&Value::Null)),
     })
 }
@@ -32906,6 +36255,10 @@ fn provider_session_open_at(frame: &Value) -> Result<u64> {
         .context("s.open missing contract policy timestamp at")
 }
 
+fn provider_session_open_targets_enclave(frame: &Value, terms: &ProviderSessionTerms) -> bool {
+    frame.get("enclave_id").and_then(Value::as_str) == Some(terms.enclave_id.as_str())
+}
+
 fn provider_session_open_decision(
     frame: &Value,
     terms: &ProviderSessionTerms,
@@ -32939,7 +36292,7 @@ fn provider_session_open_decision(
             "att_nonce must be 32 bytes of hex".to_owned(),
         );
     }
-    if frame.get("enclave_id").and_then(Value::as_str) != Some(terms.enclave_id.as_str()) {
+    if !provider_session_open_targets_enclave(frame, terms) {
         return reject(
             "ENCLAVE",
             "session enclave_id is not this admin-created enclave".to_owned(),
@@ -33010,16 +36363,16 @@ fn provider_session_open_decision(
             "voucher locked_rate_map does not match admin price".to_owned(),
         );
     }
-    if voucher.body.locked_per_req_mu != terms.per_req_mu {
+    if voucher.body.locked_per_req_au != terms.per_req_au {
         return reject(
             "VOUCHER",
-            "voucher locked_per_req_mu does not match admin price".to_owned(),
+            "voucher locked_per_req_au does not match admin price".to_owned(),
         );
     }
-    if voucher.body.locked_min_session_mu != terms.min_session_mu {
+    if voucher.body.locked_min_session_au != terms.min_session_au {
         return reject(
             "VOUCHER",
-            "voucher locked_min_session_mu does not match admin price".to_owned(),
+            "voucher locked_min_session_au does not match admin price".to_owned(),
         );
     }
     if u64::from(voucher.body.served_ctx) != terms.ctx {
@@ -33031,50 +36384,80 @@ fn provider_session_open_decision(
     if frame.get("served_ctx").and_then(Value::as_u64) != Some(u64::from(voucher.body.served_ctx)) {
         return reject("VOUCHER", "frame served_ctx mismatch".to_owned());
     }
-    if frame.get("ctx_bracket").and_then(Value::as_str) != Some(voucher.body.ctx_bracket.as_str()) {
+    let frame_ctx_bracket = match frame.get("ctx_bracket").unwrap_or(&Value::Null) {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        _ => return reject("VOUCHER", "frame ctx_bracket mismatch".to_owned()),
+    };
+    if frame_ctx_bracket != voucher.body.ctx_bracket {
         return reject("VOUCHER", "frame ctx_bracket mismatch".to_owned());
     }
-    if frame.get("ctx_bracket_table_ver").and_then(Value::as_u64)
-        != Some(u64::from(voucher.body.ctx_bracket_table_ver))
+    let frame_ctx_bracket_table_ver = match frame
+        .get("ctx_bracket_table_ver")
+        .unwrap_or(&Value::Null)
     {
+        Value::Null => None,
+        Value::Number(value) => match value.as_u64().and_then(|value| u32::try_from(value).ok()) {
+            Some(value) => Some(value),
+            None => return reject("VOUCHER", "frame ctx_bracket_table_ver mismatch".to_owned()),
+        },
+        _ => return reject("VOUCHER", "frame ctx_bracket_table_ver mismatch".to_owned()),
+    };
+    if frame_ctx_bracket_table_ver != voucher.body.ctx_bracket_table_ver {
         return reject("VOUCHER", "frame ctx_bracket_table_ver mismatch".to_owned());
     }
-    let Some((expected_ctx_bracket, expected_ctx_bracket_table_ver)) =
-        ctx_bracket_for_tokens_in_schedule(
-            voucher.body.served_ctx,
-            &terms.ctx_bracket_schedule,
-            opened_at,
-        )
-    else {
+    if voucher.body.ctx_bracket != terms.ctx_bracket {
         return reject(
             "VOUCHER",
-            "active context bracket table does not cover served_ctx".to_owned(),
-        );
-    };
-    if voucher.body.ctx_bracket != expected_ctx_bracket {
-        return reject(
-            "VOUCHER",
-            "voucher ctx_bracket does not match active admin context table".to_owned(),
+            "voucher ctx_bracket does not match provider price context".to_owned(),
         );
     }
-    if voucher.body.ctx_bracket_table_ver != expected_ctx_bracket_table_ver {
+    if voucher.body.ctx_bracket_table_ver != terms.ctx_bracket_table_ver {
         return reject(
             "VOUCHER",
-            "voucher ctx_bracket_table_ver does not match active admin context table".to_owned(),
+            "voucher ctx_bracket_table_ver does not match provider price context".to_owned(),
         );
     }
-    if voucher.body.max_spend_mu == 0 {
+    if let (Some(_), Some(_)) = (&terms.ctx_bracket, terms.ctx_bracket_table_ver) {
+        let Some((expected_ctx_bracket, expected_ctx_bracket_table_ver)) =
+            ctx_bracket_for_tokens_in_schedule(
+                voucher.body.served_ctx,
+                &terms.ctx_bracket_schedule,
+                opened_at,
+            )
+        else {
+            return reject(
+                "VOUCHER",
+                "active context bracket table does not cover served_ctx".to_owned(),
+            );
+        };
+        if voucher.body.ctx_bracket.as_deref() != Some(expected_ctx_bracket.as_str()) {
+            return reject(
+                "VOUCHER",
+                "voucher ctx_bracket does not match active admin context table".to_owned(),
+            );
+        }
+        if voucher.body.ctx_bracket_table_ver != Some(expected_ctx_bracket_table_ver) {
+            return reject(
+                "VOUCHER",
+                "voucher ctx_bracket_table_ver does not match active admin context table"
+                    .to_owned(),
+            );
+        }
+    }
+    if voucher.body.max_spend_au == 0 {
         return reject(
             "BALANCE",
-            "voucher max_spend_mu must be positive".to_owned(),
+            "voucher max_spend_au must be positive".to_owned(),
         );
     }
-    if voucher.body.max_spend_mu < terms.min_ask_mu {
+    if voucher.body.max_spend_au < terms.min_ask_au {
         return reject(
             "PRICE_FLOOR",
             format!(
-                "session quote {}µUSD is below provider min_ask_mu {}µUSD",
-                voucher.body.max_spend_mu, terms.min_ask_mu
+                "session quote {} is below provider minimum ask {}",
+                au_to_usd_amount(voucher.body.max_spend_au),
+                au_to_usd_amount(terms.min_ask_au)
             ),
         );
     }
@@ -33246,6 +36629,7 @@ fn provider_engine_session_response(
 
     if body.get("kind").and_then(Value::as_str) == Some("embedding") {
         let inputs = provider_embedding_input_texts_from_body(body)?;
+        let prompt_tokens = provider_embedding_input_token_count(&inputs);
         let dimensions = body
             .get("dimensions")
             .and_then(Value::as_u64)
@@ -33260,10 +36644,10 @@ fn provider_engine_session_response(
             embeddings: Some(output.embeddings),
             artifacts: Vec::new(),
             finish_reason: "stop".to_owned(),
-            prompt_tokens: u64::from(output.usage.prompt_tokens),
+            prompt_tokens,
             completion_tokens: 0,
             token_ids: Vec::new(),
-            usage: ReceiptUsage::text(u64::from(output.usage.prompt_tokens), 0),
+            usage: ReceiptUsage::text(prompt_tokens, 0),
         });
     }
 
@@ -34469,8 +37853,8 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         | "provider_disk_reserve"
         | "provider.disk_reserve"
         | "provider.limits.disk_reserve" => Ok("provider.limits.disk_reserve"),
-        "max_price" | "max_price_mu" | "user.max_price" | "user.max_price_mu" => {
-            Ok("user.max_price_mu")
+        "max_price" | "max_price_au" | "user.max_price" | "user.max_price_au" => {
+            Ok("user.max_price_au")
         }
         "max_wait" | "max_wait_seconds" | "user.max_wait" | "user.max_wait_seconds" => {
             Ok("user.max_wait_seconds")
@@ -34478,7 +37862,7 @@ fn canonical_config_key(key: &str) -> Result<&'static str> {
         "min_ctx" | "user.min_ctx" => Ok("user.min_ctx"),
         "role" | "role.mode" => Ok("role.mode"),
         "" => bail!("config key must not be empty"),
-        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_mu, user.max_wait_seconds, user.min_ctx, and role.mode"),
+        _ => bail!("unsupported config key {key}; supported keys are network, rpc_url, gateway_url, paygate_url, sc_bridge_url, sc_bridge_token, tnk_treasury_address, subnet_channel, subnet_bootstrap, msb_channel, msb_bootstrap, identity.keypair_path, identity.store_name, provider.engine_backend, provider.limits.memory_reserve, provider.limits.disk_reserve, user.max_price_au, user.max_wait_seconds, user.min_ctx, and role.mode"),
     }
 }
 
@@ -34522,6 +37906,39 @@ fn toml_set_u64(value: &mut toml::Value, key: &str, new_value: u64) -> Result<()
         toml::Value::Integer(i64::try_from(new_value).context("config integer exceeds i64")?),
     );
     Ok(())
+}
+
+fn toml_set_money_au(value: &mut toml::Value, key: &str, new_value: MoneyAu) -> Result<()> {
+    toml_set_string(value, key, new_value.to_string())
+}
+
+fn toml_table_set_u64(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    new_value: u64,
+) -> Result<()> {
+    table.insert(
+        key.to_owned(),
+        toml::Value::Integer(i64::try_from(new_value).context("config integer exceeds i64")?),
+    );
+    Ok(())
+}
+
+fn toml_table_set_money_au(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    new_value: MoneyAu,
+) -> Result<()> {
+    table.insert(key.to_owned(), toml::Value::String(new_value.to_string()));
+    Ok(())
+}
+
+fn toml_table_set_string(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    new_value: String,
+) {
+    table.insert(key.to_owned(), toml::Value::String(new_value));
 }
 
 fn toml_remove_path(value: &mut toml::Value, key: &str) -> Result<()> {
@@ -34610,10 +38027,20 @@ fn read_current_accepted_rules(home: &Path) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
+fn portable_rules_metadata_path(path: &Path) -> String {
+    let portable = env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf))
+        .or_else(|| path.file_name().map(PathBuf::from))
+        .unwrap_or_else(|| path.to_path_buf());
+    portable.to_string_lossy().replace('\\', "/")
+}
+
 fn persist_rules_acceptance(home: &Path, rules_doc: &RulesDoc, rules: &RulesRef) -> Result<()> {
     let dir = rules_state_dir(home);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let versioned_path = dir.join(format!("accepted-{}-{}.md", rules.ver, rules.hash));
+    let versioned_name = format!("accepted-{}-{}.md", rules.ver, rules.hash);
+    let versioned_path = dir.join(&versioned_name);
     fs::write(&versioned_path, &rules_doc.text)
         .with_context(|| format!("writing {}", versioned_path.display()))?;
     fs::write(dir.join("current.md"), &rules_doc.text)
@@ -34623,9 +38050,9 @@ fn persist_rules_acceptance(home: &Path, rules_doc: &RulesDoc, rules: &RulesRef)
         serde_json::to_vec_pretty(&json!({
             "ver": rules.ver,
             "hash": rules.hash,
-            "path": rules_doc.path,
+            "path": portable_rules_metadata_path(&rules_doc.path),
             "bytes": rules_doc.bytes,
-            "accepted_text": versioned_path,
+            "accepted_text": versioned_name,
         }))?,
     )
     .with_context(|| format!("writing {}", dir.join("current.json").display()))?;
@@ -34750,7 +38177,15 @@ async fn materialize_wallet(
             if exists {
                 inspect_wallet(keypair_path, password).await
             } else {
-                create_wallet(keypair_path, password, args.mnemonic.as_deref(), false).await
+                create_wallet(
+                    keypair_path,
+                    password,
+                    args.mnemonic.as_deref(),
+                    false,
+                    None,
+                    None,
+                )
+                .await
             }
         }
         WalletMode::Create => {
@@ -34760,7 +38195,15 @@ async fn materialize_wallet(
                     keypair_path.display()
                 );
             }
-            create_wallet(keypair_path, password, args.mnemonic.as_deref(), args.force).await
+            create_wallet(
+                keypair_path,
+                password,
+                args.mnemonic.as_deref(),
+                args.force,
+                None,
+                None,
+            )
+            .await
         }
         WalletMode::Import => {
             if exists && !args.force {
@@ -34773,7 +38216,7 @@ async fn materialize_wallet(
                 .mnemonic
                 .as_deref()
                 .context("--wallet import requires --mnemonic")?;
-            create_wallet(keypair_path, password, Some(mnemonic), true).await
+            create_wallet(keypair_path, password, Some(mnemonic), true, None, None).await
         }
         WalletMode::Reuse => {
             if !exists {
@@ -34792,6 +38235,8 @@ async fn create_wallet(
     password: &str,
     mnemonic: Option<&str>,
     force: bool,
+    ethereum_private_key: Option<&str>,
+    ethereum_mnemonic: Option<&str>,
 ) -> Result<WalletInfo> {
     let mut args = vec![
         "create".to_owned(),
@@ -34804,6 +38249,12 @@ async fn create_wallet(
     if let Some(mnemonic) = mnemonic {
         args.extend(["--mnemonic".to_owned(), mnemonic.to_owned()]);
     }
+    if let Some(private_key) = ethereum_private_key {
+        args.extend(["--ethereum-private-key".to_owned(), private_key.to_owned()]);
+    }
+    if let Some(mnemonic) = ethereum_mnemonic {
+        args.extend(["--ethereum-mnemonic".to_owned(), mnemonic.to_owned()]);
+    }
     if force {
         args.push("--force".to_owned());
     }
@@ -34815,6 +38266,24 @@ async fn inspect_wallet(keypair_path: &Path, password: &str) -> Result<WalletInf
         "inspect".to_owned(),
         "--keypair".to_owned(),
         keypair_path.display().to_string(),
+    ];
+    if !password.is_empty() {
+        args.extend(["--password".to_owned(), password.to_owned()]);
+    }
+    run_wallet_helper(args).await
+}
+
+async fn inspect_wallet_for_network_prefix(
+    keypair_path: &Path,
+    password: &str,
+    network_prefix: &str,
+) -> Result<WalletInfo> {
+    let mut args = vec![
+        "inspect".to_owned(),
+        "--keypair".to_owned(),
+        keypair_path.display().to_string(),
+        "--network-prefix".to_owned(),
+        network_prefix.to_owned(),
     ];
     if !password.is_empty() {
         args.extend(["--password".to_owned(), password.to_owned()]);
@@ -34848,6 +38317,18 @@ async fn rotate_wallet_password(
     ];
     if !old_password.is_empty() {
         args.extend(["--password".to_owned(), old_password.to_owned()]);
+    }
+    run_wallet_helper(args).await
+}
+
+async fn ethereum_wallet_key(keypair_path: &Path, password: &str) -> Result<EthereumKeyOutput> {
+    let mut args = vec![
+        "eth-key".to_owned(),
+        "--keypair".to_owned(),
+        keypair_path.display().to_string(),
+    ];
+    if !password.is_empty() {
+        args.extend(["--password".to_owned(), password.to_owned()]);
     }
     run_wallet_helper(args).await
 }
@@ -35166,7 +38647,10 @@ fn print_human_report(report: &Value) -> Result<()> {
         report["wallet"]["public_key"].as_str().unwrap_or("")
     );
     if let Some(address) = report["wallet"]["address"].as_str() {
-        println!("Address: {address}");
+        println!("Trac address: {address}");
+    }
+    if let Some(address) = report["wallet"]["ethereum_address"].as_str() {
+        println!("Ethereum address: {address}");
     }
     if let Some(mnemonic) = report["wallet"]["mnemonic"].as_str() {
         println!("Mnemonic (shown once): {mnemonic}");
@@ -35396,14 +38880,45 @@ mod tests {
     }
 
     #[test]
+    fn wallet_cli_parses_ethereum_import_key() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "wallet",
+            "import",
+            "--keypair",
+            "/tmp/mayhem-wallet/db/keypair.json",
+            "--mnemonic",
+            "bar same olive hurry place manage truck sleep banana wrist harvest bus clap prefer clarify copy leader jeans acoustic stairs cover echo reopen grow",
+            "--ethereum-private-key",
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--force",
+            "--json",
+        ])
+        .unwrap();
+
+        let Commands::Wallet { command } = cli.command else {
+            panic!("expected wallet command");
+        };
+        let WalletCommands::Import(args) = command else {
+            panic!("expected import command");
+        };
+        assert!(args.force);
+        assert_eq!(
+            args.ethereum_private_key.as_deref(),
+            Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(args.ethereum_mnemonic.is_none());
+    }
+
+    #[test]
     fn deposit_cli_parses_tap_status_and_withdraw() {
         let deposit = Cli::try_parse_from([
             "mayhem",
             "deposit",
             "tap",
-            "--from",
-            "0x1111111111111111111111111111111111111111",
-            "--amount-tap",
+            "--keypair",
+            "/tmp/mayhem-wallet/db/keypair.json",
+            "--amount",
             "1.25",
             "--token",
             "0x2222222222222222222222222222222222222222",
@@ -35411,6 +38926,9 @@ mod tests {
             "0x3333333333333333333333333333333333333333",
             "--chain-id",
             "61000",
+            "--rpc-url",
+            "http://127.0.0.1:61000",
+            "--confirm",
             "--json",
         ])
         .unwrap();
@@ -35421,7 +38939,13 @@ mod tests {
             panic!("expected deposit tap command");
         };
         assert_eq!(args.amount_tap.as_deref(), Some("1.25"));
+        assert_eq!(
+            args.wallet.keypair.as_deref(),
+            Some(Path::new("/tmp/mayhem-wallet/db/keypair.json"))
+        );
+        assert_eq!(args.rpc_url.as_deref(), Some("http://127.0.0.1:61000"));
         assert_eq!(args.chain_id, Some(61_000));
+        assert!(args.confirm);
         assert!(args.json);
 
         let status = Cli::try_parse_from([
@@ -35430,11 +38954,11 @@ mod tests {
             "status",
             "--who",
             "user-a",
-            "--memo-hash",
+            "--deposit-binding",
             "aa",
             "--rail",
             "tnk",
-            "--target-mu",
+            "--target-au",
             "1000",
             "--json",
         ])
@@ -35448,7 +38972,7 @@ mod tests {
         assert_eq!(args.who.as_deref(), Some("user-a"));
         assert_eq!(args.memo_hash.as_deref(), Some("aa"));
         assert_eq!(args.rail, Some(GatewayLedgerRail::Tnk));
-        assert_eq!(args.target_mu, Some(1000));
+        assert_eq!(args.target_au, Some(1000));
 
         let withdraw = Cli::try_parse_from([
             "mayhem",
@@ -35751,22 +39275,22 @@ mod tests {
     }
 
     #[test]
-    fn config_max_price_and_generic_alias_persist_numeric_toml() {
+    fn config_max_price_and_generic_alias_persist_string_toml() {
         let home = test_temp_dir("mayhem-config-max-price");
         config_max_price(ConfigMaxPriceArgs {
             home: Some(home.clone()),
-            mu: Some(12_345),
+            au: Some(12_345),
             clear: false,
             json: true,
         })
         .unwrap();
         let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
         assert_eq!(
-            toml_get_path(&config, "user.max_price_mu").and_then(toml::Value::as_integer),
-            Some(12_345)
+            toml_get_path(&config, "user.max_price_au").and_then(toml::Value::as_str),
+            Some("12345")
         );
         let typed = read_mayhem_config(&home).unwrap().unwrap();
-        assert_eq!(typed.user.and_then(|user| user.max_price_mu), Some(12_345));
+        assert_eq!(typed.user.and_then(|user| user.max_price_au), Some(12_345));
 
         config_set(ConfigSetArgs {
             home: Some(home.clone()),
@@ -35784,8 +39308,8 @@ mod tests {
         .unwrap();
         let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
         assert_eq!(
-            toml_get_path(&config, "user.max_price_mu").and_then(toml::Value::as_integer),
-            Some(54_321)
+            toml_get_path(&config, "user.max_price_au").and_then(toml::Value::as_str),
+            Some("54321")
         );
         assert_eq!(
             toml_get_path(&config, "user.max_wait_seconds").and_then(toml::Value::as_integer),
@@ -35796,13 +39320,13 @@ mod tests {
 
         config_max_price(ConfigMaxPriceArgs {
             home: Some(home.clone()),
-            mu: None,
+            au: None,
             clear: true,
             json: true,
         })
         .unwrap();
         let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
-        assert!(toml_get_path(&config, "user.max_price_mu").is_none());
+        assert!(toml_get_path(&config, "user.max_price_au").is_none());
         fs::remove_dir_all(&home).unwrap();
     }
 
@@ -35819,10 +39343,10 @@ mod tests {
         assert!(normalize_provider_market_target("test/model:T9").is_err());
         assert_eq!(parse_provider_accept_rate("12/min").unwrap(), 12);
         assert_eq!(
-            parse_provider_budget("2500mu/day").unwrap(),
+            parse_provider_budget("2500au/day").unwrap(),
             ParsedProviderBudget {
                 amount: 2500,
-                kind: ProviderBudgetKind::Mu,
+                kind: ProviderBudgetKind::Au,
                 period_seconds: 86_400,
             }
         );
@@ -35861,28 +39385,80 @@ mod tests {
         let config: MayhemConfig = toml::from_str(
             r#"
             [provider.min_ask]
-            "test/model@4bit:T1" = 700
+            "test/model@4bit:T1" = "700"
 
             [provider.limits]
             max_sessions = 2
             accept_rate_per_minute = 9
-            serve_budget_mu = 1000
+            serve_budget_au = "1000"
             serve_budget_period_seconds = 3600
             memory_reserve = "15%"
             disk_reserve = "20GB"
+
+            [provider.enclave_limits."test/model@4bit:T1"]
+            max_sessions = 4
+            accept_rate_per_minute = 12
+            serve_budget_units = 2500
+            serve_budget_period_seconds = 1800
             "#,
         )
         .unwrap();
         let mut args = test_provider_start_args();
         apply_provider_resource_config_defaults(&mut args, Some(&config));
         apply_provider_config_defaults(&mut args, Some(&config), &selected);
-        assert_eq!(args.min_ask_mu, 700);
-        assert_eq!(args.max_sessions, Some(2));
-        assert_eq!(args.accept_rate_per_minute, 9);
-        assert_eq!(args.serve_budget_mu, 1000);
-        assert_eq!(args.serve_budget_period_seconds, 3600);
+        assert_eq!(args.min_ask_au, 700);
+        assert_eq!(args.max_sessions, Some(4));
+        assert_eq!(args.accept_rate_per_minute, 12);
+        assert_eq!(args.serve_budget_au, 0);
+        assert_eq!(args.serve_budget_units, 2500);
+        assert_eq!(args.serve_budget_period_seconds, 1800);
         assert_eq!(args.memory_reserve.as_deref(), Some("15%"));
         assert_eq!(args.disk_reserve.as_deref(), Some("20GB"));
+
+        let mut cli_args = test_provider_start_args();
+        cli_args.max_sessions = Some(7);
+        cli_args.accept_rate_per_minute = 3;
+        apply_provider_config_defaults(&mut cli_args, Some(&config), &selected);
+        assert_eq!(cli_args.max_sessions, Some(7));
+        assert_eq!(cli_args.accept_rate_per_minute, 3);
+    }
+
+    #[test]
+    fn provider_limits_set_writes_enclave_scoped_limits() {
+        let home = test_temp_dir("mayhem-provider-enclave-limits");
+        provider_limits_set(ProviderLimitsSetArgs {
+            home: Some(home.clone()),
+            enclave: Some("test/model:T3".to_owned()),
+            max_concurrent: Some(5),
+            accept_rate: Some("6/min".to_owned()),
+            budget: Some("42tokens/day".to_owned()),
+            memory_reserve: None,
+            disk_reserve: None,
+            json: true,
+        })
+        .unwrap();
+
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        let target = normalize_provider_market_target("test/model:T3").unwrap();
+        let limits = provider_limits_value(&config, Some(&target));
+        assert_eq!(limits["max_sessions"].as_u64(), Some(5));
+        assert_eq!(limits["accept_rate_per_minute"].as_u64(), Some(6));
+        assert_eq!(limits["serve_budget_units"].as_u64(), Some(42));
+        assert_eq!(limits["serve_budget_au"].as_str(), Some("0"));
+
+        let err = provider_limits_set(ProviderLimitsSetArgs {
+            home: Some(home.clone()),
+            enclave: Some("test/model:T3".to_owned()),
+            max_concurrent: None,
+            accept_rate: None,
+            budget: None,
+            memory_reserve: Some("15%".to_owned()),
+            disk_reserve: None,
+            json: true,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("machine-level limits"));
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -35891,15 +39467,15 @@ mod tests {
             &[json!({
                 "id": "test/model",
                 "mayhem": {
-                    "price_ref_mu": {
-                        "denom": "mu_usd",
+                    "price_ref_au": {
+                        "denom": "au_usd",
                         "ver": 1,
                         "rate_map": [
-                            { "unit": "input_token", "per_unit_mu": 1, "granularity": 1000 },
-                            { "unit": "output_token", "per_unit_mu": 2, "granularity": 1000 }
+                            { "unit": "input_token", "per_unit_au": "1", "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_au": "2", "granularity": 1000 }
                         ],
-                        "per_req_mu": 0,
-                        "min_session_mu": 0
+                        "per_req_au": "0",
+                        "min_session_au": "0"
                     },
                     "route_candidates": [{
                         "provider": "55".repeat(32),
@@ -35907,15 +39483,15 @@ mod tests {
                         "room_id": "aa".repeat(16),
                         "att_tier": 1,
                         "quant": "int4",
-                        "price_ref_mu": {
-                            "denom": "mu_usd",
+                        "price_ref_au": {
+                            "denom": "au_usd",
                             "ver": 1,
                             "rate_map": [
-                                { "unit": "input_token", "per_unit_mu": 1, "granularity": 1000 },
-                                { "unit": "output_token", "per_unit_mu": 2, "granularity": 1000 }
+                                { "unit": "input_token", "per_unit_au": "1", "granularity": 1000 },
+                                { "unit": "output_token", "per_unit_au": "2", "granularity": 1000 }
                             ],
-                            "per_req_mu": 0,
-                            "min_session_mu": 0
+                            "per_req_au": "0",
+                            "min_session_au": "0"
                         }
                     }, {
                         "provider": "66".repeat(32),
@@ -35923,15 +39499,15 @@ mod tests {
                         "room_id": "bb".repeat(16),
                         "att_tier": 3,
                         "quant": "fp16",
-                        "price_ref_mu": {
-                            "denom": "mu_usd",
+                        "price_ref_au": {
+                            "denom": "au_usd",
                             "ver": 2,
                             "rate_map": [
-                                { "unit": "input_token", "per_unit_mu": 90, "granularity": 1000 },
-                                { "unit": "output_token", "per_unit_mu": 180, "granularity": 1000 }
+                                { "unit": "input_token", "per_unit_au": "90", "granularity": 1000 },
+                                { "unit": "output_token", "per_unit_au": "180", "granularity": 1000 }
                             ],
-                            "per_req_mu": 0,
-                            "min_session_mu": 0,
+                            "per_req_au": "0",
+                            "min_session_au": "0",
                             "derivation": { "epoch": 7, "source": "market" }
                         }
                     }]
@@ -35944,8 +39520,8 @@ mod tests {
         assert_eq!(markets.len(), 1);
         assert_eq!(markets[0]["enclave_id"], "22".repeat(32));
         assert_eq!(markets[0]["att_tier"], 3);
-        assert_eq!(markets[0]["price_ref_mu"]["ver"], 2);
-        assert_eq!(markets[0]["price_ref_mu"]["derivation"]["epoch"], 7);
+        assert_eq!(markets[0]["price_ref_au"]["ver"], 2);
+        assert_eq!(markets[0]["price_ref_au"]["derivation"]["epoch"], 7);
     }
 
     #[tokio::test]
@@ -36025,7 +39601,7 @@ mod tests {
                     "provider": "provider-a",
                     "user": "user-a",
                     "enclave_id": "enclave-a",
-                    "mu_owed_cum": 42,
+                    "au_owed_cum": "42",
                     "usage": {"output_token": 3},
                     "ts": 7200000,
                     "final_receipt": true
@@ -36036,7 +39612,7 @@ mod tests {
         assert_eq!(latest["seq"].as_u64(), Some(2));
         assert_eq!(latest["provider"].as_str(), Some("provider-a"));
         assert_eq!(latest["model_id"].as_str(), Some("model-a"));
-        assert_eq!(latest["mu_owed_cum"].as_u64(), Some(42));
+        assert_eq!(latest["au_owed_cum"].as_str(), Some("42"));
 
         let previous = receipt_history_summary(&json!({
             "body": {
@@ -36044,7 +39620,7 @@ mod tests {
                 "seq": 1,
                 "model_id": "model-a",
                 "provider": "provider-a",
-                "mu_owed_cum": 12
+                "au_owed_cum": "12"
             }
         }));
         let other = receipt_history_summary(&json!({
@@ -36054,7 +39630,7 @@ mod tests {
                     "seq": 1,
                     "model_id": "model-b",
                     "provider": "provider-b",
-                    "mu_owed_cum": 9
+                    "au_owed_cum": "9"
                 }
             }
         }));
@@ -36147,9 +39723,9 @@ mod tests {
             "2",
             "--receipt-json",
             r#"{"receipt":{"body":{"session_id":"s1"}}}"#,
-            "--claimed-mu-owed-cum",
+            "--claimed-au-owed-cum",
             "2000",
-            "--previous-mu-owed-cum",
+            "--previous-au-owed-cum",
             "1000",
             "--json",
         ])
@@ -36162,8 +39738,8 @@ mod tests {
         };
         assert_eq!(args.epoch, 1);
         assert_eq!(args.proof_epoch, 2);
-        assert_eq!(args.claimed_mu_owed_cum, 2000);
-        assert_eq!(args.previous_mu_owed_cum, Some(1000));
+        assert_eq!(args.claimed_au_owed_cum, 2000);
+        assert_eq!(args.previous_au_owed_cum, Some(1000));
         assert!(args.tx.json);
 
         let challenge = Cli::try_parse_from([
@@ -36190,6 +39766,7 @@ mod tests {
         assert_eq!(args.epoch, Some(1));
         assert_eq!(args.proof_epoch, Some(2));
         assert_eq!(args.max_challenges, Some(1));
+        assert_eq!(args.dispute_aging_seconds, 3 * 24 * 60 * 60);
         assert!(args.tx.json);
     }
 
@@ -36199,6 +39776,7 @@ mod tests {
             tx: test_participant_tx_args(),
             session_id: "session-1".to_owned(),
             reason: "service_failure".to_owned(),
+            rail: GatewayLedgerRail::Fiat,
             provider: Some("55".repeat(32)),
             counterparty: None,
             enclave_id: Some("11".repeat(32)),
@@ -36211,6 +39789,7 @@ mod tests {
         .unwrap();
         assert_eq!(dispute["op"], "dispute");
         assert_eq!(dispute["session_id"], "session-1");
+        assert_eq!(dispute["rail"], "fiat");
         assert_eq!(dispute["provider"].as_str(), Some("55".repeat(32).as_str()));
         assert_eq!(
             dispute["enclave_id"].as_str(),
@@ -36228,11 +39807,11 @@ mod tests {
             at: Some(43),
             reason: "over_credit".to_owned(),
             receipt_json: Some(
-                r#"{"receipt":{"body":{"session_id":"s1","mu_owed_cum":1000}}}"#.to_owned(),
+                r#"{"receipt":{"body":{"session_id":"s1","au_owed_cum": "1000"}}}"#.to_owned(),
             ),
             receipt_file: None,
-            claimed_mu_owed_cum: 2000,
-            previous_mu_owed_cum: Some(1000),
+            claimed_au_owed_cum: 2000,
+            previous_au_owed_cum: Some(1000),
         })
         .unwrap();
         assert_eq!(fraud["op"], "fraud_proof");
@@ -36240,8 +39819,8 @@ mod tests {
         assert_eq!(fraud["proof_epoch"].as_u64(), Some(2));
         assert_eq!(fraud["at"].as_u64(), Some(43));
         assert_eq!(fraud["reason"], "over_credit");
-        assert_eq!(fraud["claimed_mu_owed_cum"].as_u64(), Some(2000));
-        assert_eq!(fraud["previous_mu_owed_cum"].as_u64(), Some(1000));
+        assert_eq!(fraud["claimed_au_owed_cum"].as_str(), Some("2000"));
+        assert_eq!(fraud["previous_au_owed_cum"].as_str(), Some("1000"));
         assert_eq!(fraud["receipt"]["receipt"]["body"]["session_id"], "s1");
 
         let err = fraud_proof_payload(&FraudProofSubmitArgs {
@@ -36254,12 +39833,75 @@ mod tests {
                 reason: "over_credit".to_owned(),
                 receipt_json: Some(r#"{"receipt":{"body":{"session_id":"s1"}}}"#.to_owned()),
                 receipt_file: None,
-                claimed_mu_owed_cum: 2000,
-                previous_mu_owed_cum: None,
+                claimed_au_owed_cum: 2000,
+                previous_au_owed_cum: None,
             }
         })
         .unwrap_err();
         assert!(err.to_string().contains("over_credit"));
+    }
+
+    #[test]
+    fn admin_dispute_cli_parses_keypair_and_resolution_payloads() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "disputes",
+            "resolve",
+            "7",
+            "--outcome",
+            "upheld",
+            "--reason",
+            "provider timed out after accepting the session",
+            "--keypair",
+            "/tmp/admin/db/keypair.json",
+            "--submit",
+            "--sim",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Disputes { command } = *command else {
+            panic!("expected admin disputes command");
+        };
+        let AdminDisputeCommands::Resolve(args) = command else {
+            panic!("expected admin disputes resolve");
+        };
+        assert_eq!(args.dispute_id, 7);
+        assert_eq!(args.outcome, AdminDisputeOutcome::Upheld);
+        assert_eq!(
+            args.tx.keypair.as_deref(),
+            Some(Path::new("/tmp/admin/db/keypair.json"))
+        );
+        assert!(args.tx.submit);
+        assert!(args.tx.sim);
+        assert!(args.tx.json);
+
+        let payload = admin_dispute_resolve_payload(&args).unwrap();
+        assert_eq!(payload["op"], "dispute_resolve");
+        assert_eq!(payload["dispute_id"].as_u64(), Some(7));
+        assert_eq!(payload["outcome"], "provider_fault");
+        assert_eq!(payload["deposit_action"], "refund");
+        assert_eq!(payload["slash"].as_bool(), Some(true));
+        assert_eq!(payload["rationale_hash"].as_str().map(str::len), Some(64));
+
+        let rejected = admin_dispute_resolve_payload(&AdminDisputesResolveArgs {
+            tx: test_admin_tx_args(),
+            dispute_id: 8,
+            outcome: AdminDisputeOutcome::Rejected,
+            reason: Some("invalid claim".to_owned()),
+            rationale_hash: None,
+            at: Some(123),
+            no_slash: false,
+            beneficiary: None,
+            sim_reviewed: true,
+        })
+        .unwrap();
+        assert_eq!(rejected["outcome"], "opener_fault");
+        assert_eq!(rejected["deposit_action"], "forfeit");
+        assert!(rejected.get("slash").is_none());
     }
 
     #[test]
@@ -36279,12 +39921,12 @@ mod tests {
                     "model_id": "mayhem/test",
                     "price_ver": 1,
                     "locked_rate_map": [
-                        { "unit": "input_token", "per_unit_mu": 50, "granularity": 1 },
-                        { "unit": "output_token", "per_unit_mu": 50, "granularity": 1 }
+                        { "unit": "input_token", "per_unit_au": "50", "granularity": 1 },
+                        { "unit": "output_token", "per_unit_au": "50", "granularity": 1 }
                     ],
                     "rules_ver": 1,
                     "usage": { "input_token": 1, "output_token": 1 },
-                    "mu_owed_cum": 100,
+                    "au_owed_cum": "100",
                     "prompt_hash": "44".repeat(32),
                     "ts": 1_000,
                 },
@@ -36293,7 +39935,7 @@ mod tests {
             }
         });
         let envelope = normalized_receipt_envelope(&receipt).unwrap();
-        let inflated = receipt_envelope_with_mu_owed_cum(&envelope, 200);
+        let inflated = receipt_envelope_with_au_owed_cum(&envelope, 200);
         let committed_use_root = usage_leaf_hash_from_envelope(&inflated).unwrap();
         let commit = json!({
             "type": "epoch_commit",
@@ -36305,7 +39947,7 @@ mod tests {
             "roots": { "use": committed_use_root },
             "totals": {
                 "use_count": 1,
-                "use_mu": 200
+                "use_au": "200"
             }
         });
 
@@ -36316,12 +39958,12 @@ mod tests {
         let candidate = &candidates[0];
         assert_eq!(candidate.epoch, 1);
         assert_eq!(candidate.proof_epoch, 2);
-        assert_eq!(candidate.actual_mu, 100);
-        assert_eq!(candidate.claimed_mu, 200);
-        assert_eq!(candidate.claimed_mu_owed_cum, 200);
-        assert_eq!(candidate.previous_mu_owed_cum, 0);
+        assert_eq!(candidate.actual_au, 100);
+        assert_eq!(candidate.claimed_au, 200);
+        assert_eq!(candidate.claimed_au_owed_cum, 200);
+        assert_eq!(candidate.previous_au_owed_cum, 0);
         assert_eq!(candidate.command["op"], "fraud_proof");
-        assert_eq!(candidate.command["receipt"]["body"]["mu_owed_cum"], 100);
+        assert_eq!(candidate.command["receipt"]["body"]["au_owed_cum"], "100");
         assert!(candidate.command["receipt"]
             .get("enclave_pubkey")
             .is_some_and(Value::is_null));
@@ -36346,11 +39988,11 @@ mod tests {
                     "model_id": "mayhem/test",
                     "price_ver": 1,
                     "locked_rate_map": [
-                        { "unit": "input_token", "per_unit_mu": 100, "granularity": 1 }
+                        { "unit": "input_token", "per_unit_au": "100", "granularity": 1 }
                     ],
                     "rules_ver": 1,
                     "usage": { "input_token": 1 },
-                    "mu_owed_cum": 100,
+                    "au_owed_cum": "100",
                     "prompt_hash": "44".repeat(32),
                     "ts": 1_000,
                 },
@@ -36365,7 +40007,7 @@ mod tests {
             "roots": { "use": "00".repeat(32) },
             "totals": {
                 "use_count": 1,
-                "use_mu": 200
+                "use_au": "200"
             }
         });
 
@@ -36383,14 +40025,14 @@ mod tests {
         fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
         fs::create_dir_all(restored_path.parent().unwrap()).unwrap();
 
-        let created = create_wallet(&keypair_path, "old-pass", None, false)
+        let created = create_wallet(&keypair_path, "old-pass", None, false, None, None)
             .await
             .unwrap();
         let backup = backup_wallet(&keypair_path, "old-pass").await.unwrap();
         let mnemonic = backup.mnemonic.as_deref().unwrap();
         assert!(!mnemonic.is_empty());
 
-        let restored = create_wallet(&restored_path, "new-pass", Some(mnemonic), true)
+        let restored = create_wallet(&restored_path, "new-pass", Some(mnemonic), true, None, None)
             .await
             .unwrap();
         let inspected = inspect_wallet(&restored_path, "new-pass").await.unwrap();
@@ -36399,6 +40041,58 @@ mod tests {
         assert_eq!(created.public_key, inspected.public_key);
         assert_eq!(created.address, restored.address);
         assert_eq!(created.address, inspected.address);
+        assert_eq!(created.ethereum_address, restored.ethereum_address);
+        assert_eq!(created.ethereum_address, inspected.ethereum_address);
+        assert_eq!(
+            created.ethereum_derivation_path.as_deref(),
+            Some("m/44'/60'/0'/0/0")
+        );
+        assert_eq!(created.ethereum_source.as_deref(), Some("mnemonic"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn wallet_imported_ethereum_key_survives_password_rotation() {
+        let temp = test_temp_dir("mayhem-wallet-ethereum-import");
+        let keypair_path = temp.join("main").join("db").join("keypair.json");
+        fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
+
+        let ethereum_private_key =
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let created = create_wallet(
+            &keypair_path,
+            "old-pass",
+            None,
+            false,
+            Some(ethereum_private_key),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created.ethereum_source.as_deref(),
+            Some("imported_private_key")
+        );
+        assert!(created
+            .ethereum_address
+            .as_deref()
+            .unwrap()
+            .starts_with("0x"));
+
+        let backup = backup_wallet(&keypair_path, "old-pass").await.unwrap();
+        assert_eq!(
+            backup.ethereum_private_key.as_deref(),
+            Some(ethereum_private_key)
+        );
+
+        let rotated = rotate_wallet_password(&keypair_path, "old-pass", "new-pass")
+            .await
+            .unwrap();
+        assert_eq!(created.ethereum_address, rotated.ethereum_address);
+        assert!(inspect_wallet(&keypair_path, "old-pass").await.is_err());
+        let inspected = inspect_wallet(&keypair_path, "new-pass").await.unwrap();
+        assert_eq!(created.ethereum_address, inspected.ethereum_address);
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -36409,7 +40103,7 @@ mod tests {
         let keypair_path = temp.join("main").join("db").join("keypair.json");
         fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
 
-        let created = create_wallet(&keypair_path, "seed-pass", None, false)
+        let created = create_wallet(&keypair_path, "seed-pass", None, false, None, None)
             .await
             .unwrap();
         let seed = wallet_signing_seed(&keypair_path, "seed-pass", &created.public_key)
@@ -36429,7 +40123,7 @@ mod tests {
         let keypair_path = temp.join("main").join("db").join("keypair.json");
         fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
 
-        let created = create_wallet(&keypair_path, "old-pass", None, false)
+        let created = create_wallet(&keypair_path, "old-pass", None, false, None, None)
             .await
             .unwrap();
         let rotated = rotate_wallet_password(&keypair_path, "old-pass", "new-pass")
@@ -36453,6 +40147,37 @@ mod tests {
     }
 
     #[test]
+    fn rules_acceptance_metadata_uses_portable_paths() {
+        let home = test_temp_dir("mayhem-rules-portable");
+        let rules_doc = RulesDoc {
+            path: env::current_dir().unwrap().join("RULES.md"),
+            text: "release rules\n".to_owned(),
+            hash: "ab".repeat(32),
+            bytes: "release rules\n".len(),
+        };
+        let rules = RulesRef {
+            ver: 2,
+            hash: rules_doc.hash.clone(),
+        };
+
+        persist_rules_acceptance(&home, &rules_doc, &rules).unwrap();
+
+        let current: Value =
+            serde_json::from_slice(&fs::read(home.join("rules").join("current.json")).unwrap())
+                .unwrap();
+        assert_eq!(current["path"], json!("RULES.md"));
+        assert_eq!(
+            current["accepted_text"],
+            json!(format!("accepted-{}-{}.md", rules.ver, rules.hash))
+        );
+        assert!(!current["accepted_text"]
+            .as_str()
+            .unwrap()
+            .contains(std::path::MAIN_SEPARATOR));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn admin_set_price_cli_parses_rate_map_json() {
         let cli = Cli::try_parse_from([
             "mayhem",
@@ -36461,10 +40186,10 @@ mod tests {
             "--enclave-id",
             "enclave-a",
             "--rate-map-json",
-            r#"[{"unit":"input_token","per_unit_mu":20,"granularity":1000},{"unit":"output_token","per_unit_mu":60,"granularity":1000}]"#,
-            "--per-req-mu",
+            r#"[{"unit":"input_token","per_unit_au": "20","granularity":1000},{"unit":"output_token","per_unit_au": "60","granularity":1000}]"#,
+            "--per-req-au",
             "1",
-            "--min-session-mu",
+            "--min-session-au",
             "100",
             "--effective-at",
             "21600",
@@ -36486,25 +40211,223 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("input_token"));
-        assert_eq!(args.per_req_mu, 1);
-        assert_eq!(args.min_session_mu, 100);
+        assert_eq!(args.per_req_au, 1);
+        assert_eq!(args.min_session_au, 100);
         assert_eq!(args.effective_at, 21600);
         assert_eq!(args.ctx_bracket.as_deref(), Some("le32k"));
         assert!(args.tx.json);
     }
 
     #[test]
-    fn admin_set_price_payload_uses_canonical_mu_usd_terms() {
+    fn admin_set_model_ref_cli_carries_non_text_model_class() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "set-model-ref",
+            "--model",
+            "openai/whisper-tiny-en@ggml",
+            "--model-class",
+            "stt",
+            "--rate-map-json",
+            r#"[{"unit":"audio_second","per_unit_au": "250","granularity":1}]"#,
+            "--source-hash",
+            "1c657a13d65443ba72e497e15aee94b71e4478b5a046a4c1756c2799d1415b8e",
+            "--json",
+        ])
+        .unwrap();
+
+        let Commands::Admin { command } = cli.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::SetModelRef(args) = *command else {
+            panic!("expected set-model-ref command");
+        };
+        assert_eq!(args.model_class, "stt");
+        assert_eq!(
+            admin_set_model_ref_payload(&args).unwrap(),
+            json!({
+                "op": "set_model_ref",
+                "model_id": "openai/whisper-tiny-en@ggml",
+                "model_class": "stt",
+                "rate_map": [
+                    { "unit": "audio_second", "per_unit_au": "250", "granularity": 1 }
+                ],
+                "source_hash": "1c657a13d65443ba72e497e15aee94b71e4478b5a046a4c1756c2799d1415b8e",
+            })
+        );
+    }
+
+    #[test]
+    fn admin_update_enclave_cli_builds_admin_metadata_payload() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "update-enclave",
+            "--enclave-id",
+            "enclave-a",
+            "--binary-hash",
+            "AA".repeat(32).as_str(),
+            "--att-tier",
+            "1",
+            "--caps-json",
+            r#"{"tools":true,"json":true,"ctx":8192}"#,
+            "--json",
+        ])
+        .unwrap();
+
+        let Commands::Admin { command } = cli.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::UpdateEnclave(args) = *command else {
+            panic!("expected update-enclave command");
+        };
+        let (tx_type, payload) =
+            admin_command_payload(&AdminCommands::UpdateEnclave(args)).unwrap();
+
+        assert_eq!(tx_type, "updateEnclave");
+        assert_eq!(
+            payload,
+            json!({
+                "op": "update_enclave",
+                "enclave_id": "enclave-a",
+                "binary_hash": "aa".repeat(32),
+                "att_tier": 1,
+                "caps": { "tools": true, "json": true, "ctx": 8192 },
+            })
+        );
+    }
+
+    #[test]
+    fn admin_update_enclave_requires_changed_field_and_complete_artifact_source() {
+        let no_change = AdminUpdateEnclaveArgs {
+            tx: test_admin_tx_args(),
+            enclave_id: "enclave-a".to_owned(),
+            model_class: None,
+            backend: None,
+            artifact_root: None,
+            artifact_root_kind: None,
+            artifact_repo: None,
+            artifact_revision: None,
+            artifact_path: None,
+            artifact_sidecars_json: None,
+            artifact_sidecars_file: None,
+            source_sha256: None,
+            manifest_hash: None,
+            att_tier: None,
+            quant: None,
+            binary_hash: None,
+            caps_json: None,
+            caps_file: None,
+        };
+        assert!(admin_update_enclave_payload(&no_change)
+            .unwrap_err()
+            .to_string()
+            .contains("at least one enclave field"));
+
+        let partial_source = AdminUpdateEnclaveArgs {
+            artifact_repo: Some("admin/model".to_owned()),
+            ..no_change
+        };
+        assert!(admin_update_enclave_payload(&partial_source)
+            .unwrap_err()
+            .to_string()
+            .contains("pass all of --artifact-repo"));
+    }
+
+    #[test]
+    fn admin_set_enclave_min_tier_payload_requires_notice_and_launch_tier() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "set-enclave-min-tier",
+            "--enclave-id",
+            "aa".repeat(32).as_str(),
+            "--min-att-tier",
+            "1",
+            "--submitted-epoch",
+            "10",
+            "--effective-epoch",
+            "34",
+            "--submitted-at",
+            "1783517300",
+            "--reason",
+            "tier escalation notice",
+            "--json",
+        ])
+        .unwrap();
+
+        let Commands::Admin { command } = cli.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::SetEnclaveMinTier(args) = *command else {
+            panic!("expected set-enclave-min-tier command");
+        };
+        let (tx_type, payload) =
+            admin_command_payload(&AdminCommands::SetEnclaveMinTier(args)).unwrap();
+        assert_eq!(tx_type, "setEnclaveMinTier");
+        assert_eq!(
+            payload,
+            json!({
+                "op": "set_enclave_min_tier",
+                "enclave_id": "aa".repeat(32),
+                "min_att_tier": 1,
+                "submitted_epoch": 10,
+                "effective_epoch": 34,
+                "submitted_at": 1783517300u64,
+                "reason_hash": blake3::hash(b"tier escalation notice").to_hex().to_string(),
+            })
+        );
+
+        let tier2 = AdminSetEnclaveMinTierArgs {
+            tx: test_admin_tx_args(),
+            enclave_id: "aa".repeat(32),
+            min_att_tier: 2,
+            submitted_epoch: 10,
+            effective_epoch: 34,
+            submitted_at: 1783517300,
+            reason_hash: Some("bb".repeat(32)),
+            reason: None,
+        };
+        assert!(admin_set_enclave_min_tier_payload(&tier2)
+            .unwrap_err()
+            .to_string()
+            .contains("not launch-advertisable"));
+
+        let immediate = AdminSetEnclaveMinTierArgs {
+            min_att_tier: 1,
+            effective_epoch: 10,
+            ..tier2
+        };
+        assert!(admin_set_enclave_min_tier_payload(&immediate)
+            .unwrap_err()
+            .to_string()
+            .contains("after --submitted-epoch"));
+    }
+
+    #[test]
+    fn provider_friendly_error_keeps_binary_hash_mismatch_actionable() {
+        let err = anyhow::anyhow!(
+            "measured enclave binary hash aa does not match admin enclave record bb"
+        );
+
+        let message = provider_friendly_error(&err);
+
+        assert!(message.contains("Mayhem binary"), "{message}");
+        assert!(!message.contains("model artifact"), "{message}");
+    }
+
+    #[test]
+    fn admin_set_price_payload_uses_canonical_au_usd_terms() {
         let args = AdminSetPriceArgs {
             tx: test_admin_tx_args(),
             enclave_id: "enclave-a".to_owned(),
             rate_map_json: Some(
-                r#"[{"unit":"output_token","per_unit_mu":60,"granularity":1000},{"unit":"input_token","per_unit_mu":20,"granularity":1000}]"#
+                r#"[{"unit":"output_token","per_unit_au": "60","granularity":1000},{"unit":"input_token","per_unit_au": "20","granularity":1000}]"#
                     .to_owned(),
             ),
             rate_map_file: None,
-            per_req_mu: 0,
-            min_session_mu: 100,
+            per_req_au: 0,
+            min_session_au: 100,
             effective_at: 21_600,
             ctx_bracket: Some("le32k".to_owned()),
         };
@@ -36515,11 +40438,11 @@ mod tests {
                 "op": "set_price",
                 "enclave_id": "enclave-a",
                 "rate_map": [
-                    { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
-                    { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                    { "unit": "input_token", "per_unit_au": "20", "granularity": 1000 },
+                    { "unit": "output_token", "per_unit_au": "60", "granularity": 1000 }
                 ],
-                "per_req_mu": 0,
-                "min_session_mu": 100,
+                "per_req_au": "0",
+                "min_session_au": "100",
                 "effective_at": 21_600,
                 "ctx_bracket": "le32k",
             })
@@ -36531,9 +40454,9 @@ mod tests {
         let seed = AdminPriceSeedArgs {
             tx: test_admin_tx_args(),
             enclave_id: "enclave-a".to_owned(),
-            p0_mu: 42,
-            per_req_mu: 3,
-            min_session_mu: 100,
+            p0_au: 42,
+            per_req_au: 3,
+            min_session_au: 100,
             effective_at: Some(10),
             ctx_bracket: Some("le32k".to_owned()),
         };
@@ -36543,11 +40466,12 @@ mod tests {
                 "op": "set_price",
                 "enclave_id": "enclave-a",
                 "rate_map": [
-                    { "unit": "input_token", "per_unit_mu": 42, "granularity": 1000 },
-                    { "unit": "output_token", "per_unit_mu": 42, "granularity": 1000 },
+                    { "unit": "input_token", "per_unit_au": "42", "granularity": 1000 },
+                    { "unit": "cached_input_token", "per_unit_au": "11", "granularity": 1000 },
+                    { "unit": "output_token", "per_unit_au": "42", "granularity": 1000 },
                 ],
-                "per_req_mu": 3,
-                "min_session_mu": 100,
+                "per_req_au": "3",
+                "min_session_au": "100",
                 "effective_at": 10,
                 "ctx_bracket": "le32k",
             })
@@ -36623,7 +40547,38 @@ mod tests {
             panic!("expected min-ask set");
         };
         assert_eq!(args.target, "test/model:T3");
-        assert_eq!(args.mu, 900);
+        assert_eq!(args.au, 900);
+        assert!(args.json);
+
+        let limits = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "limits",
+            "set",
+            "--enclave",
+            "test/model:T3",
+            "--max-concurrent",
+            "2",
+            "--accept-rate",
+            "10/min",
+            "--budget",
+            "2500au/day",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = limits.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Limits { command } = *command else {
+            panic!("expected limits command");
+        };
+        let ProviderLimitsCommands::Set(args) = command else {
+            panic!("expected limits set");
+        };
+        assert_eq!(args.enclave.as_deref(), Some("test/model:T3"));
+        assert_eq!(args.max_concurrent, Some(2));
+        assert_eq!(args.accept_rate.as_deref(), Some("10/min"));
+        assert_eq!(args.budget.as_deref(), Some("2500au/day"));
         assert!(args.json);
 
         let price = Cli::try_parse_from([
@@ -36791,6 +40746,8 @@ mod tests {
         let args = AdminBanProviderArgs {
             tx: test_admin_tx_args(),
             provider: "provider-a".to_owned(),
+            device_key: None,
+            hardware_fingerprint: None,
             reason_hash: None,
             reason: Some("served wrong artifact".to_owned()),
         };
@@ -36858,7 +40815,7 @@ mod tests {
     "caps": {{ "tools": true, "json": true, "ctx_max": 8192, "vision": false }},
     "requirements": {{ "min_ram_gb": 1, "min_vram_gb_full_offload": 0, "cpu_flags": [], "backends": ["llama.cpp"] }},
     "canary": {{ "set_id": "canary-dev-v1", "match_min": 0.9, "fingerprints": {{}} }},
-    "price_ref_mu": {{ "denom": "mu_usd", "in_per_1k": 20, "out_per_1k": 60 }}
+    "price_ref_au": {{ "denom": "au_usd", "in_per_1k": "20", "out_per_1k": "60" }}
   }}]
 }}
 "#,
@@ -37044,7 +41001,7 @@ mod tests {
     fn admin_oracle_payment_payloads_match_contract_schemas() {
         let rate_payload = admin_rate_oracle_payload(&AdminRateOracleArgs {
             tx: test_admin_tx_args(),
-            tnk_usd_e6: 50_000,
+            tnk_usd_au: 50_000,
             source: AdminRateSource::GateSpot,
             ts: 3_600,
         });
@@ -37052,7 +41009,7 @@ mod tests {
             rate_payload,
             json!({
                 "op": "rate_oracle",
-                "tnk_usd_e6": 50_000,
+                "tnk_usd_au": "50000",
                 "source": "gate-spot",
                 "ts": 3_600,
             })
@@ -37067,7 +41024,7 @@ mod tests {
         assert_eq!(
             admin_command_payload(&AdminCommands::RateOracle(AdminRateOracleArgs {
                 tx: test_admin_tx_args(),
-                tnk_usd_e6: 50_000,
+                tnk_usd_au: 50_000,
                 source: AdminRateSource::GateSpot,
                 ts: 3_600,
             }))
@@ -37078,7 +41035,7 @@ mod tests {
 
         let tap_rate_payload = admin_tap_rate_oracle_payload(&AdminTapRateOracleArgs {
             tx: test_admin_tx_args(),
-            tap_usd_e6: 50_000,
+            tap_usd_au: 50_000,
             source: AdminTapRateSource::UniswapV2,
             ts: 3_600,
         });
@@ -37086,7 +41043,7 @@ mod tests {
             tap_rate_payload,
             json!({
                 "op": "tap_rate_oracle",
-                "tap_usd_e6": 50_000,
+                "tap_usd_au": "50000",
                 "source": "uniswap-v2",
                 "ts": 3_600,
             })
@@ -37101,7 +41058,7 @@ mod tests {
         assert_eq!(
             admin_command_payload(&AdminCommands::TapRateOracle(AdminTapRateOracleArgs {
                 tx: test_admin_tx_args(),
-                tap_usd_e6: 50_000,
+                tap_usd_au: 50_000,
                 source: AdminTapRateSource::UniswapV2,
                 ts: 3_600,
             }))
@@ -37119,20 +41076,20 @@ mod tests {
             "treasury_from": "testtrac1treasury",
             "operator_to": "testtrac1operator",
             "epoch_apply_hash": "a".repeat(64),
-            "rate_tnk_usd_e6": 50_000,
+            "rate_tnk_usd_au": "50000",
             "rate_source": "gate-spot",
             "rate_ts": 25_200,
-            "msb_tx_hash": "b".repeat(64),
+            "msb_tx_hashes": ["b".repeat(64)],
             "transfer_root": "c".repeat(64),
             "provider_count": 0,
-            "provider_mu": 0,
-            "operator_fee_mu": 1,
-            "gross_mu": 1,
+            "provider_au": 0,
+            "operator_fee_au": 1,
+            "gross_au": "1",
             "tnk_e18": "20000000000000",
             "outputs": [{
                 "role": "operator_fee",
                 "to": "testtrac1operator",
-                "mu": 1,
+                "au": "1",
                 "tnk_e18": "20000000000000"
             }]
         });
@@ -37147,7 +41104,7 @@ mod tests {
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
-                msb_tx_hash: None,
+                msb_tx_hashes: Vec::new(),
                 msb_transfer_timeout_seconds: 180,
                 msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
@@ -37175,7 +41132,7 @@ mod tests {
                 operator_tnk_address: None,
                 msb_network: None,
                 submit_transfer: false,
-                msb_tx_hash: None,
+                msb_tx_hashes: Vec::new(),
                 msb_transfer_timeout_seconds: 180,
                 msb_transfer_max_retries: 3,
                 expected_treasury_balance_before: None,
@@ -37249,7 +41206,7 @@ mod tests {
                 tx: test_admin_tx_args(),
                 rail: AdminFiatRail::Stripe,
                 who: "user-a".to_owned(),
-                mu: 10_000_000,
+                au: 10_000_000,
                 ext_ref_hash: "stripe-ref-hash".to_owned(),
                 fiat_currency: "usd".to_owned(),
                 fiat_amount_minor: 1_000,
@@ -37261,7 +41218,7 @@ mod tests {
                 "op": "fiat_deposit",
                 "rail": "stripe",
                 "who": "user-a",
-                "mu": 10_000_000,
+                "au": "10000000",
                 "ext_ref_hash": "stripe-ref-hash",
                 "fiat_currency": "usd",
                 "fiat_amount_minor": 1_000,
@@ -37275,7 +41232,7 @@ mod tests {
                 tx: test_admin_tx_args(),
                 rail: AdminFiatRail::Stripe,
                 who: "user-a".to_owned(),
-                mu: 5_000_000,
+                au: 5_000_000,
                 ext_ref_hash: "stripe-ref-hash".to_owned(),
                 dispute_ref_hash: "stripe-dispute-hash".to_owned(),
                 fiat_currency: "eur".to_owned(),
@@ -37288,7 +41245,7 @@ mod tests {
                 "op": "fiat_chargeback",
                 "rail": "stripe",
                 "who": "user-a",
-                "mu": 5_000_000,
+                "au": "5000000",
                 "ext_ref_hash": "stripe-ref-hash",
                 "dispute_ref_hash": "stripe-dispute-hash",
                 "fiat_currency": "eur",
@@ -37315,13 +41272,13 @@ mod tests {
         });
         let totals = json!({
             "dep_count": 0,
-            "dep_mu": 0,
+            "dep_au": "0",
             "use_count": 1,
-            "use_mu": 2_000,
+            "use_au": "2000",
             "provider_count": 1,
-            "earn_mu": 1_700,
-            "fee_mu": 300,
-            "fee_cum_mu": 300,
+            "earn_au": "1700",
+            "fee_au": "300",
+            "fee_cum_au": "300",
         });
 
         let commit = admin_epoch_commit_payload(&AdminEpochCommitArgs {
@@ -37353,12 +41310,13 @@ mod tests {
             page: None,
             last_page: false,
             recomputed_file: None,
-            debits_json: Some(r#"[{"user":"user-a","mu":2000}]"#.to_owned()),
+            debits_json: Some(r#"[{"user":"user-a","au": "2000"}]"#.to_owned()),
             debits_file: None,
-            earnings_json: Some(r#"[{"provider":"provider-a","gross_mu":2000}]"#.to_owned()),
+            earnings_json: Some(r#"[{"provider":"provider-a","gross_au": "2000"}]"#.to_owned()),
             earnings_file: None,
             market_usage_json: Some(
-                r#"[{"enclave_id":"enclave-a","demand_mu":2000,"session_count":1}]"#.to_owned(),
+                r#"[{"enclave_id":"enclave-a","demand_au": "2000","session_count":1,"provider_count":1}]"#
+                    .to_owned(),
             ),
             market_usage_file: None,
             roots_json: Some(commit["roots"].to_string()),
@@ -37373,9 +41331,9 @@ mod tests {
                 "op": "epoch_apply",
                 "epoch": 7,
                 "at": 25_200,
-                "debits": [{"user": "user-a", "mu": 2000}],
-                "earnings": [{"provider": "provider-a", "gross_mu": 2000}],
-                "market_usage": [{"enclave_id": "enclave-a", "demand_mu": 2000, "session_count": 1}],
+                "debits": [{"user": "user-a", "au": "2000"}],
+                "earnings": [{"provider": "provider-a", "gross_au": "2000"}],
+                "market_usage": [{"enclave_id": "enclave-a", "demand_au": "2000", "session_count": 1, "provider_count": 1}],
                 "roots": commit["roots"],
                 "totals": commit["totals"],
             })
@@ -37388,9 +41346,9 @@ mod tests {
             epoch_apply_feature_key(&json!({
                 "totals": commit["totals"],
                 "roots": commit["roots"],
-                "earnings": [{"gross_mu": 2000, "provider": "provider-a"}],
-                "debits": [{"mu": 2000, "user": "user-a"}],
-                "market_usage": [{"demand_mu": 2000, "enclave_id": "enclave-a", "session_count": 1}],
+                "earnings": [{"gross_au": "2000", "provider": "provider-a"}],
+                "debits": [{"au": "2000", "user": "user-a"}],
+                "market_usage": [{"demand_au": "2000", "enclave_id": "enclave-a", "session_count": 1, "provider_count": 1}],
                 "at": 25_200,
                 "epoch": 7,
                 "op": "epoch_apply",
@@ -37405,9 +41363,9 @@ mod tests {
             page: Some(0),
             last_page: false,
             recomputed_file: None,
-            debits_json: Some(r#"[{"user":"user-a","mu":2000}]"#.to_owned()),
+            debits_json: Some(r#"[{"user":"user-a","au": "2000"}]"#.to_owned()),
             debits_file: None,
-            earnings_json: Some(r#"[{"provider":"provider-a","gross_mu":2000}]"#.to_owned()),
+            earnings_json: Some(r#"[{"provider":"provider-a","gross_au": "2000"}]"#.to_owned()),
             earnings_file: None,
             market_usage_json: None,
             market_usage_file: None,
@@ -37423,8 +41381,8 @@ mod tests {
                 "op": "epoch_apply",
                 "epoch": 8,
                 "at": 28_800,
-                "debits": [{"user": "user-a", "mu": 2000}],
-                "earnings": [{"provider": "provider-a", "gross_mu": 2000}],
+                "debits": [{"user": "user-a", "au": "2000"}],
+                "earnings": [{"provider": "provider-a", "gross_au": "2000"}],
                 "page": 0,
                 "last_page": false,
             })
@@ -37439,7 +41397,7 @@ mod tests {
             "earn": "e".repeat(64),
             "fee": "f".repeat(64),
         });
-        let totals = json!({ "use_mu": 0 });
+        let totals = json!({ "use_au": "0" });
 
         let bad_roots = admin_epoch_commit_payload(&AdminEpochCommitArgs {
             tx: test_admin_tx_args(),
@@ -37679,25 +41637,25 @@ mod tests {
     fn provider_lifecycle_requires_current_admin_price() {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
-        assert!(require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).is_ok());
+        assert!(require_current_au_usd_price(&contract.prices, &"11".repeat(32)).is_ok());
 
         contract.prices.clear();
-        let err = require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        let err = require_current_au_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
         assert!(err.to_string().contains("has no admin price"));
 
         let mut contract = test_contract(&root);
         contract.prices[0].current = None;
-        let err = require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        let err = require_current_au_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
         assert!(err
             .to_string()
-            .contains("has no current mu_usd admin price"));
+            .contains("has no current au_usd admin price"));
 
         let mut contract = test_contract(&root);
         contract.prices[0].current.as_mut().unwrap().denom = "provider_points".to_owned();
-        let err = require_current_mu_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        let err = require_current_au_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
         assert!(err
             .to_string()
-            .contains("has no current mu_usd admin price"));
+            .contains("has no current au_usd admin price"));
     }
 
     #[test]
@@ -37950,6 +41908,76 @@ mod tests {
         assert!(normalize_provider_accepted_rails_arg("fiat,fiat").is_err());
         assert!(normalize_provider_accepted_rails_arg("coinbase").is_err());
 
+        let serve_plan = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "serve",
+            "plan",
+            "--fixture",
+            "linux-nvidia",
+            "--ctx",
+            "8192",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = serve_plan.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Serve { command } = *command else {
+            panic!("expected provider serve command");
+        };
+        let ProviderServeCommands::Plan(args) = command else {
+            panic!("expected provider serve plan command");
+        };
+        assert_eq!(args.fixture.as_deref(), Some("linux-nvidia"));
+        assert_eq!(args.ctx, Some(8192));
+        assert!(args.json);
+
+        let serve_add = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "serve",
+            "add",
+            "enclave-a",
+            "--gpu-layers",
+            "35",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = serve_add.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Serve { command } = *command else {
+            panic!("expected provider serve command");
+        };
+        let ProviderServeCommands::Add(args) = command else {
+            panic!("expected provider serve add command");
+        };
+        assert_eq!(args.enclave, "enclave-a");
+        assert_eq!(args.gpu_layers, Some(35));
+        assert!(args.json);
+
+        let serve_remove = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "serve",
+            "remove",
+            "enclave-a",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = serve_remove.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Serve { command } = *command else {
+            panic!("expected provider serve command");
+        };
+        let ProviderServeCommands::Remove(args) = command else {
+            panic!("expected provider serve remove command");
+        };
+        assert_eq!(args.target, "enclave-a");
+        assert!(args.json);
+
         assert!(Cli::try_parse_from(["mayhem", "pay", "coinbase"]).is_err());
     }
 
@@ -37970,6 +41998,199 @@ mod tests {
         };
         assert!(verbose);
         assert!(matches!(*command, ProviderCommands::Start(_)));
+    }
+
+    fn test_auto_fit_candidate(
+        nibble: char,
+        model_id: &str,
+        modality: &str,
+        required_gib: u64,
+        budget_gib: u64,
+        per_1k_au: MoneyAu,
+        tok_s: f64,
+    ) -> ProviderCandidate {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let mut model = catalog.models.remove(0);
+        model.model_id = model_id.to_owned();
+        model.model_class = if modality == "text" {
+            DEFAULT_MODEL_CLASS.to_owned()
+        } else {
+            modality.to_owned()
+        };
+        model.caps.output_modality = Some(modality.to_owned());
+        model.caps.output_modalities = vec![modality.to_owned()];
+        model.caps.image = modality == "image";
+        model.caps.audio = matches!(modality, "audio" | "stt" | "tts");
+        model.adapter.modality_set = vec![modality.to_owned()];
+        let artifact_name = "gguf-q4_k_m".to_owned();
+        let artifact = model.artifacts[&artifact_name].clone();
+        let enclave_id = nibble.to_string().repeat(64);
+        ProviderCandidate {
+            enclave: LedgerEnclave {
+                enclave_id: enclave_id.clone(),
+                model_id: model_id.to_owned(),
+                model_class: model.model_class.clone(),
+                backend: "llama.cpp".to_owned(),
+                artifact_root: artifact.artifact_root.clone(),
+                artifact_root_kind: artifact.artifact_root_kind.clone(),
+                artifact_source: LedgerArtifactSource {
+                    kind: artifact.source.kind.clone(),
+                    repo: artifact.source.repo.clone(),
+                    revision: artifact.source.revision.clone(),
+                    path: artifact.path.clone(),
+                },
+                artifact_sidecars: BTreeMap::new(),
+                source_sha256: artifact.source_sha256.clone(),
+                manifest_hash: "22".repeat(32),
+                att_tier: 1,
+                quant: "int4".to_owned(),
+                binary_hash: "33".repeat(32),
+                caps: json!({ "ctx": 8192 }),
+                status: "active".to_owned(),
+                created_by: "44".repeat(32),
+                created_by_role: Some("admin".to_owned()),
+            },
+            model,
+            artifact_name,
+            artifact,
+            verdict: BackendVerdict {
+                backend: "llama.cpp".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: None,
+                est_tok_s: Some(tok_s),
+                n_layers_gpu: None,
+                max_sessions: 1,
+                kv_cache_bytes_budget: 0,
+            },
+            price: Some(LedgerPriceSchedule {
+                enclave_id,
+                model_id: model_id.to_owned(),
+                denom: "au_usd".to_owned(),
+                ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+                current: Some(LedgerPriceRecord {
+                    ver: 1,
+                    denom: "au_usd".to_owned(),
+                    ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                    ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+                    rate_map: vec![RateMapEntry {
+                        unit: "output_token".to_owned(),
+                        per_unit_au: per_1k_au,
+                        granularity: 1000,
+                    }],
+                    per_req_au: 0,
+                    min_session_au: 0,
+                    effective_at: 0,
+                    set_by_role: Some("admin".to_owned()),
+                    derivation: None,
+                }),
+                pending: None,
+            }),
+            served_ctx: 8192,
+            feasibility: ProviderCtxFeasibility {
+                requested_ctx: 8192,
+                served_ctx: 8192,
+                catalog_ctx_max: 8192,
+                fallback_applied: false,
+                message: None,
+                estimated_required_bytes: required_gib * GIB_BYTES,
+                estimated_weights_bytes: required_gib * GIB_BYTES,
+                estimated_kv_bytes: 0,
+                estimated_overhead_bytes: 0,
+                memory_budget: ProviderMemoryBudget {
+                    pool: "dedicated_vram".to_owned(),
+                    source: "test".to_owned(),
+                    unified: false,
+                    total_bytes: (budget_gib + 1) * GIB_BYTES,
+                    available_bytes: (budget_gib + 1) * GIB_BYTES,
+                    reserve_bytes: GIB_BYTES,
+                    claimed_bytes: 0,
+                    budget_bytes: budget_gib * GIB_BYTES,
+                },
+            },
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        }
+    }
+
+    #[test]
+    fn provider_auto_fit_selects_price_weighted_multimodality_set() {
+        let heavy =
+            test_auto_fit_candidate('1', "expensive/chat-heavy", "text", 23, 24, 10_000, 80.0);
+        let chat = test_auto_fit_candidate('2', "launch/chat-small", "text", 8, 24, 4_000, 80.0);
+        let embedding =
+            test_auto_fit_candidate('3', "launch/embed-small", "embedding", 2, 24, 60_000, 20.0);
+        let stt = test_auto_fit_candidate('4', "launch/stt-small", "stt", 2, 24, 50_000, 10.0);
+
+        let selection = select_provider_auto_fit_set(&[heavy, chat, embedding, stt]).unwrap();
+        let models = selection
+            .candidates
+            .iter()
+            .map(|candidate| candidate.enclave.model_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            models,
+            BTreeSet::from([
+                "launch/chat-small",
+                "launch/embed-small",
+                "launch/stt-small"
+            ])
+        );
+        assert_eq!(selection.total_required_bytes, 12 * GIB_BYTES);
+        assert_eq!(selection.total_budget_bytes, 24 * GIB_BYTES);
+        assert_eq!(
+            selection.modalities,
+            vec!["embedding".to_owned(), "stt".to_owned(), "text".to_owned()]
+        );
+        assert!(selection.rationale.contains("best current earnings mix"));
+    }
+
+    #[test]
+    fn provider_auto_fit_never_selects_set_over_shared_budget() {
+        let a = test_auto_fit_candidate('5', "launch/a", "text", 15, 24, 100_000, 40.0);
+        let b = test_auto_fit_candidate('6', "launch/b", "embedding", 15, 24, 100_000, 40.0);
+        let c = test_auto_fit_candidate('7', "launch/c", "stt", 15, 24, 100_000, 40.0);
+
+        let selection = select_provider_auto_fit_set(&[a, b, c]).unwrap();
+        assert_eq!(selection.candidates.len(), 1);
+        assert!(selection.total_required_bytes <= selection.total_budget_bytes);
+
+        let too_large =
+            test_auto_fit_candidate('8', "launch/too-large", "text", 25, 24, 100_000, 40.0);
+        let err = select_provider_auto_fit_set(&[too_large]).unwrap_err();
+        assert!(err.to_string().contains("no auto-fit candidate set fits"));
+    }
+
+    #[test]
+    fn provider_explicit_set_uses_one_shared_budget() {
+        let chat = test_auto_fit_candidate('9', "launch/chat", "text", 8, 24, 4_000, 80.0);
+        let embedding =
+            test_auto_fit_candidate('a', "launch/embed", "embedding", 2, 24, 60_000, 20.0);
+        let stt = test_auto_fit_candidate('b', "launch/stt", "stt", 2, 24, 50_000, 10.0);
+        let candidates = vec![chat, embedding, stt];
+        let requested = vec![
+            "launch/chat".to_owned(),
+            "launch/embed".to_owned(),
+            "launch/stt".to_owned(),
+        ];
+
+        let selection = select_provider_explicit_set(&candidates, &requested).unwrap();
+        assert_eq!(selection.candidates.len(), 3);
+        assert_eq!(selection.total_required_bytes, 12 * GIB_BYTES);
+        assert_eq!(selection.total_budget_bytes, 24 * GIB_BYTES);
+        assert!(selection.rationale.contains("one OS reserve"));
+    }
+
+    #[test]
+    fn provider_explicit_set_refuses_over_shared_budget() {
+        let a = test_auto_fit_candidate('c', "launch/huge-a", "text", 15, 24, 100_000, 40.0);
+        let b = test_auto_fit_candidate('d', "launch/huge-b", "embedding", 15, 24, 100_000, 40.0);
+        let candidates = vec![a, b];
+        let requested = vec!["launch/huge-a".to_owned(), "launch/huge-b".to_owned()];
+
+        let err = select_provider_explicit_set(&candidates, &requested).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not fit the shared memory budget"));
     }
 
     #[test]
@@ -38096,18 +42317,18 @@ mod tests {
         let mut unpriced = contract.clone();
         unpriced.prices.clear();
         let err = build_provider_candidates(&unpriced, &catalog, &hardware, &args).unwrap_err();
-        assert!(err.to_string().contains("current mu_usd admin price"));
+        assert!(err.to_string().contains("current au_usd admin price"));
 
         let mut wrong_denom = contract.clone();
         wrong_denom.prices[0].denom = "provider_points".to_owned();
         let err = build_provider_candidates(&wrong_denom, &catalog, &hardware, &args).unwrap_err();
-        assert!(err.to_string().contains("current mu_usd admin price"));
+        assert!(err.to_string().contains("current au_usd admin price"));
 
         let mut provider_created = contract.clone();
         provider_created.enclaves[0].created_by_role = Some("provider".to_owned());
         let err =
             build_provider_candidates(&provider_created, &catalog, &hardware, &args).unwrap_err();
-        assert!(err.to_string().contains("current mu_usd admin price"));
+        assert!(err.to_string().contains("current au_usd admin price"));
 
         let mut provider_priced = contract.clone();
         provider_priced.prices[0]
@@ -38117,7 +42338,7 @@ mod tests {
             .set_by_role = Some("provider".to_owned());
         let err =
             build_provider_candidates(&provider_priced, &catalog, &hardware, &args).unwrap_err();
-        assert!(err.to_string().contains("current mu_usd admin price"));
+        assert!(err.to_string().contains("current au_usd admin price"));
 
         let mut missing_role = contract.clone();
         missing_role.enclaves[0].created_by_role = None;
@@ -38162,6 +42383,88 @@ mod tests {
     }
 
     #[test]
+    fn provider_candidates_count_non_text_worker_memory() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].model_class = "embedding".to_owned();
+        catalog.models[0].caps.ctx_max = 512;
+        catalog.models[0].caps.output_modality = Some("embedding".to_owned());
+        catalog.models[0].caps.output_modalities = vec!["embedding".to_owned()];
+        catalog.models[0].adapter.request_shape_family = "openai_embeddings".to_owned();
+        catalog.models[0].adapter.tool_call_strategy = "none".to_owned();
+        catalog.models[0].adapter.modality_set = vec!["embedding".to_owned()];
+        catalog.models[0].adapter.response_normalization = "openai_embeddings".to_owned();
+
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].model_class = "embedding".to_owned();
+        contract.enclaves[0].caps = json!({ "tools": false, "json": false, "ctx": 512 });
+        contract.prices[0].ctx_bracket = None;
+        contract.prices[0].ctx_bracket_table_ver = None;
+        if let Some(current) = contract.prices[0].current.as_mut() {
+            current.ctx_bracket = None;
+            current.ctx_bracket_table_ver = None;
+        }
+
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let args = test_provider_start_args();
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(selected.enclave.model_class, "embedding");
+        assert!(selected.feasibility.estimated_required_bytes > 0);
+        assert!(selected.feasibility.estimated_weights_bytes > 0);
+        assert!(selected.feasibility.estimated_overhead_bytes > 0);
+        assert_ne!(selected.feasibility.memory_budget.pool, "not_applicable");
+    }
+
+    #[test]
+    fn provider_candidates_windows_wddm_fallback_uses_dedicated_vram_wording() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 131_072;
+        catalog.models[0].params_b = 80.0;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({ "tools": true, "json": true, "ctx": 131_072 });
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.host.os = "windows".to_owned();
+        hardware.host.family = "windows".to_owned();
+        hardware.memory.total_bytes = 64 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(48 * GIB_BYTES);
+        hardware.gpus.truncate(1);
+        hardware.gpus[0].memory_bytes = Some(24 * GIB_BYTES);
+        hardware.gpus[0].dedicated_memory_bytes = Some(24 * GIB_BYTES);
+        hardware.gpus[0].shared_memory_bytes = Some(32 * GIB_BYTES);
+        hardware.gpus[0].unified_memory = false;
+        let mut args = test_provider_start_args();
+        args.ctx = Some(131_072);
+
+        let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
+        let selected = &candidates[0];
+        let message = selected.feasibility.message.as_deref().unwrap();
+
+        assert_eq!(selected.feasibility.requested_ctx, 131_072);
+        assert_eq!(selected.served_ctx, 8_192);
+        assert!(selected.feasibility.fallback_applied);
+        assert_eq!(
+            selected.feasibility.memory_budget.pool,
+            "dedicated_gpu_memory"
+        );
+        assert_eq!(
+            selected.feasibility.memory_budget.total_bytes,
+            24 * GIB_BYTES
+        );
+        assert!(
+            selected.feasibility.estimated_required_bytes
+                <= selected.feasibility.memory_budget.budget_bytes
+        );
+        assert!(message.contains("Context auto-fallback"));
+        assert!(message.contains("dedicated VRAM budget"));
+        assert!(message.contains("WDDM shared GPU memory is ignored"));
+        assert!(message.contains("without spilling"));
+    }
+
+    #[test]
     fn provider_candidates_refuse_when_minimum_context_cannot_fit() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -38181,6 +42484,40 @@ mod tests {
         assert!(message.contains("minimum context 8192 tokens cannot fit"));
         assert!(message.contains("estimated required"));
         assert!(message.contains("after reserve"));
+    }
+
+    #[test]
+    fn provider_memory_claim_reader_prunes_dead_pid_claims() {
+        let home = test_temp_dir("mayhem-provider-memory-claims");
+        let dir = provider_memory_claims_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let now = unix_epoch_seconds().unwrap();
+        let live = ProviderMemoryClaimRecord {
+            schema_version: 1,
+            pid: std::process::id(),
+            provider: "provider".to_owned(),
+            enclave_id: "aa".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            backend: "llama.cpp".to_owned(),
+            served_ctx: 8192,
+            claimed_bytes: 123,
+            created_at: now,
+        };
+        let dead = ProviderMemoryClaimRecord {
+            pid: u32::MAX,
+            claimed_bytes: 456,
+            ..live.clone()
+        };
+        let live_path = dir.join("live.json");
+        let dead_path = dir.join("dead.json");
+        fs::write(&live_path, serde_json::to_vec(&live).unwrap()).unwrap();
+        fs::write(&dead_path, serde_json::to_vec(&dead).unwrap()).unwrap();
+
+        let claimed = read_provider_memory_claimed_bytes(Some(&home)).unwrap();
+
+        assert_eq!(claimed, 123);
+        assert!(live_path.exists());
+        assert!(!dead_path.exists());
     }
 
     #[test]
@@ -38230,17 +42567,17 @@ mod tests {
         contract.prices.push(LedgerPriceSchedule {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
-            denom: "mu_usd".to_owned(),
+            denom: "au_usd".to_owned(),
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 1,
-                denom: "mu_usd".to_owned(),
+                denom: "au_usd".to_owned(),
                 ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                 ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(1, 2),
-                per_req_mu: 0,
-                min_session_mu: 0,
+                per_req_au: 0,
+                min_session_au: 0,
                 effective_at: 0,
                 set_by_role: Some("admin".to_owned()),
                 derivation: None,
@@ -38312,17 +42649,17 @@ mod tests {
         contract.prices.push(LedgerPriceSchedule {
             enclave_id: "22".repeat(32),
             model_id: "test/model@4bit".to_owned(),
-            denom: "mu_usd".to_owned(),
+            denom: "au_usd".to_owned(),
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 1,
-                denom: "mu_usd".to_owned(),
+                denom: "au_usd".to_owned(),
                 ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                 ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(1, 2),
-                per_req_mu: 0,
-                min_session_mu: 0,
+                per_req_au: 0,
+                min_session_au: 0,
                 effective_at: 0,
                 set_by_role: Some("admin".to_owned()),
                 derivation: None,
@@ -38670,11 +43007,11 @@ mod tests {
             "ctx_bracket": ctx_bracket_for_tokens(8192),
             "ctx_bracket_table_ver": CTX_BRACKET_TABLE_VERSION,
             "model_id": "test/model@4bit",
-            "denom": "mu_usd",
+            "denom": "au_usd",
             "price_ver": 1u64,
             "usage": {
                 "usage_root": "66".repeat(32),
-                "active_demand_mu": 12_345u64,
+                "active_demand_au": "12345",
                 "session_count": 2u64
             },
             "controller": {
@@ -38691,23 +43028,23 @@ mod tests {
                 "ctx_bracket": ctx_bracket_for_tokens(8192),
                 "ctx_bracket_table_ver": CTX_BRACKET_TABLE_VERSION,
                 "rate_map": [],
-                "per_req_mu": 0u64,
-                "min_session_mu": 0u64
+                "per_req_au": "0",
+                "min_session_au": "0"
             },
             "result_price": {
                 "ver": 1u64,
                 "ctx_bracket": ctx_bracket_for_tokens(8192),
                 "ctx_bracket_table_ver": CTX_BRACKET_TABLE_VERSION,
                 "rate_map": [],
-                "per_req_mu": 0u64,
-                "min_session_mu": 0u64
+                "per_req_au": "0",
+                "min_session_au": "0"
             },
             "derivation_hash": "77".repeat(32),
             "price_root": "88".repeat(32)
         }));
         let mut prior_derivation = contract.price_derivations[0].clone();
         prior_derivation["epoch"] = json!(5u64);
-        prior_derivation["usage"]["active_demand_mu"] = json!(8_765u64);
+        prior_derivation["usage"]["active_demand_au"] = json!("8765");
         prior_derivation["derivation_hash"] = json!("76".repeat(32));
         contract.price_derivations.push(prior_derivation);
         let models = gateway_models_from_contract(&contract).unwrap();
@@ -38718,22 +43055,22 @@ mod tests {
         assert_eq!(models[0].mayhem.source, "contract");
         assert_eq!(models[0].mayhem.providers_online, 1);
         assert_eq!(models[0].mayhem.rooms, 1);
-        assert_eq!(models[0].mayhem.price_ref_mu.denom, "mu_usd");
-        assert_eq!(models[0].mayhem.price_ref_mu.ver, 1);
+        assert_eq!(models[0].mayhem.price_ref_au.denom, "au_usd");
+        assert_eq!(models[0].mayhem.price_ref_au.ver, 1);
         assert_eq!(
-            models[0].mayhem.price_ref_mu.rate_map,
+            models[0].mayhem.price_ref_au.rate_map,
             normalize_rate_map(text_generation_rate_map(1, 2))
         );
         let derivation = models[0]
             .mayhem
-            .price_ref_mu
+            .price_ref_au
             .derivation
             .as_ref()
             .expect("contract price derivation is surfaced to gateway");
         assert_eq!(derivation["epoch"].as_u64(), Some(7));
         assert_eq!(
-            derivation["usage"]["active_demand_mu"].as_u64(),
-            Some(12_345)
+            derivation["usage"]["active_demand_au"].as_str(),
+            Some("12345")
         );
         let expected_price_root = "88".repeat(32);
         assert_eq!(
@@ -38742,7 +43079,7 @@ mod tests {
         );
         let history_epochs = models[0]
             .mayhem
-            .price_ref_mu
+            .price_ref_au
             .history
             .iter()
             .map(|entry| entry["epoch"].as_u64().unwrap())
@@ -38773,10 +43110,10 @@ mod tests {
         assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 1);
         assert_eq!(models[0].mayhem.route_candidates[0].quant, "int4");
         let route_price = models[0].mayhem.route_candidates[0]
-            .price_ref_mu
+            .price_ref_au
             .as_ref()
             .expect("route carries its own enclave market price");
-        assert_eq!(route_price.denom, "mu_usd");
+        assert_eq!(route_price.denom, "au_usd");
         assert_eq!(route_price.ver, 1);
         assert_eq!(
             route_price.rate_map,
@@ -38980,17 +43317,17 @@ mod tests {
         contract.prices.push(LedgerPriceSchedule {
             enclave_id: second_enclave_id.clone(),
             model_id: second_model_id.clone(),
-            denom: "mu_usd".to_owned(),
+            denom: "au_usd".to_owned(),
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 2,
-                denom: "mu_usd".to_owned(),
+                denom: "au_usd".to_owned(),
                 ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                 ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(3, 5),
-                per_req_mu: 0,
-                min_session_mu: 0,
+                per_req_au: 0,
+                min_session_au: 0,
                 effective_at: 0,
                 set_by_role: Some("admin".to_owned()),
                 derivation: None,
@@ -39027,9 +43364,9 @@ mod tests {
             helper.mayhem.route_candidates[0].enclave_id,
             second_enclave_id
         );
-        assert_eq!(helper.mayhem.price_ref_mu.ver, 2);
+        assert_eq!(helper.mayhem.price_ref_au.ver, 2);
         assert_eq!(
-            helper.mayhem.price_ref_mu.rate_map,
+            helper.mayhem.price_ref_au.rate_map,
             normalize_rate_map(text_generation_rate_map(3, 5))
         );
         assert_eq!(
@@ -39089,17 +43426,17 @@ mod tests {
         contract.prices.push(LedgerPriceSchedule {
             enclave_id: tier3_enclave_id.clone(),
             model_id: model_id.clone(),
-            denom: "mu_usd".to_owned(),
+            denom: "au_usd".to_owned(),
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             current: Some(LedgerPriceRecord {
                 ver: 9,
-                denom: "mu_usd".to_owned(),
+                denom: "au_usd".to_owned(),
                 ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                 ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 rate_map: text_generation_rate_map(90, 180),
-                per_req_mu: 123,
-                min_session_mu: 456,
+                per_req_au: 123,
+                min_session_au: 456,
                 effective_at: 0,
                 set_by_role: Some("admin".to_owned()),
                 derivation: Some(json!({
@@ -39115,7 +43452,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         let model = &models[0];
         assert_eq!(model.id, model_id);
-        assert_eq!(model.mayhem.price_ref_mu.ver, 1);
+        assert_eq!(model.mayhem.price_ref_au.ver, 1);
         assert_eq!(model.mayhem.providers_online, 2);
         assert_eq!(model.mayhem.rooms, 2);
         assert_eq!(model.mayhem.attestation_tiers["T1"], 1);
@@ -39132,7 +43469,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let tier1 = by_tier[&1];
         let tier1_price = tier1
-            .price_ref_mu
+            .price_ref_au
             .as_ref()
             .expect("tier-1 route has its own price");
         assert_eq!(tier1.enclave_id, "11".repeat(32));
@@ -39146,7 +43483,7 @@ mod tests {
 
         let tier3 = by_tier[&3];
         let tier3_price = tier3
-            .price_ref_mu
+            .price_ref_au
             .as_ref()
             .expect("tier-3 route has its own price");
         assert_eq!(tier3.enclave_id, "77".repeat(32));
@@ -39158,8 +43495,8 @@ mod tests {
             tier3_price.rate_map,
             normalize_rate_map(text_generation_rate_map(90, 180))
         );
-        assert_eq!(tier3_price.per_req_mu, 123);
-        assert_eq!(tier3_price.min_session_mu, 456);
+        assert_eq!(tier3_price.per_req_au, 123);
+        assert_eq!(tier3_price.min_session_au, 456);
         assert_eq!(
             tier3_price.derivation.as_ref().unwrap()["epoch"].as_u64(),
             Some(12)
@@ -39240,6 +43577,7 @@ mod tests {
     fn provider_session_open_enforces_admin_terms() {
         let terms = test_provider_session_terms();
         let frame = test_session_open_frame(&terms);
+        assert!(provider_session_open_targets_enclave(&frame, &terms));
         assert_eq!(
             provider_session_open_decision(&frame, &terms),
             ProviderSessionDecision::Accept
@@ -39251,7 +43589,7 @@ mod tests {
             ProviderSessionDecision::Reject { code: "SCHEMA", .. }
         ));
         let mut priced_out_terms = terms.clone();
-        priced_out_terms.min_ask_mu = 1001;
+        priced_out_terms.min_ask_au = 1001;
         assert!(matches!(
             provider_session_open_decision(&frame, &priced_out_terms),
             ProviderSessionDecision::Reject {
@@ -39307,6 +43645,10 @@ mod tests {
 
         let mut wrong_enclave = frame.clone();
         wrong_enclave["enclave_id"] = json!("22".repeat(32));
+        assert!(!provider_session_open_targets_enclave(
+            &wrong_enclave,
+            &terms
+        ));
         assert!(matches!(
             provider_session_open_decision(&wrong_enclave, &terms),
             ProviderSessionDecision::Reject {
@@ -39413,8 +43755,8 @@ mod tests {
     fn provider_session_open_uses_admin_ctx_bracket_schedule() {
         let mut terms = test_provider_session_terms();
         terms.ctx = 12_000;
-        terms.ctx_bracket = "le16k".to_owned();
-        terms.ctx_bracket_table_ver = 2;
+        terms.ctx_bracket = Some("le16k".to_owned());
+        terms.ctx_bracket_table_ver = Some(2);
         terms.ctx_bracket_schedule = CtxBracketSchedule {
             current: mayhem_proto::CtxBracketTableRecord {
                 ver: 2,
@@ -39442,12 +43784,48 @@ mod tests {
         let mut stale_table = frame.clone();
         stale_table["ctx_bracket"] = json!("le32k");
         stale_table["voucher"]["ctx_bracket"] = json!("le32k");
-        match provider_session_open_decision(&stale_table, &terms) {
+        let mut stale_terms = terms.clone();
+        stale_terms.ctx_bracket = Some("le32k".to_owned());
+        match provider_session_open_decision(&stale_table, &stale_terms) {
             ProviderSessionDecision::Reject { code, reason } => {
                 assert_eq!(code, "VOUCHER");
                 assert!(reason.contains("active admin context table"));
             }
             other => panic!("stale context table should reject: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_session_open_accepts_unbracketed_non_text_terms() {
+        let mut terms = test_provider_session_terms();
+        terms.ctx_bracket = None;
+        terms.ctx_bracket_table_ver = None;
+        terms.rate_map = vec![RateMapEntry {
+            unit: "input_token".to_owned(),
+            per_unit_au: 2,
+            granularity: 1000,
+        }];
+        let frame = test_session_open_frame(&terms);
+        assert!(frame["ctx_bracket"].is_null());
+        assert!(frame["ctx_bracket_table_ver"].is_null());
+        assert!(frame["voucher"]["ctx_bracket"].is_null());
+        assert!(frame["voucher"]["ctx_bracket_table_ver"].is_null());
+        assert_eq!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Accept
+        );
+
+        let mut bracketed = frame;
+        bracketed["ctx_bracket"] = json!("le8k");
+        bracketed["ctx_bracket_table_ver"] = json!(CTX_BRACKET_TABLE_VERSION);
+        bracketed["voucher"]["ctx_bracket"] = json!("le8k");
+        bracketed["voucher"]["ctx_bracket_table_ver"] = json!(CTX_BRACKET_TABLE_VERSION);
+        match provider_session_open_decision(&bracketed, &terms) {
+            ProviderSessionDecision::Reject { code, reason } => {
+                assert_eq!(code, "VOUCHER");
+                assert!(reason.contains("provider price context"));
+            }
+            other => panic!("bracketed non-text session should reject: {other:?}"),
         }
     }
 
@@ -39466,12 +43844,12 @@ mod tests {
         assert_eq!(value["enclave_id"], terms.enclave_id);
         assert_eq!(value["price_ver"], terms.price_ver);
         assert_eq!(value["rules_ver"], terms.rules_ver);
-        assert_eq!(value["max_spend_mu"], 1000);
+        assert_eq!(value["max_spend_au"], "1000");
         assert_eq!(value["provider_sig"], "");
 
         let message = spend_reservation_message(&value);
         assert!(message.starts_with("mayhem-spend-reservation-v1"));
-        assert!(message.contains("\"max_spend_mu\":1000"));
+        assert!(message.contains("\"max_spend_au\":\"1000\""));
         assert!(!message.contains("provider_sig"));
 
         let key = spend_reservation_feature_key(&value).unwrap();
@@ -39746,8 +44124,8 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
-            locked_per_req_mu: terms.per_req_mu,
-            locked_min_session_mu: terms.min_session_mu,
+            locked_per_req_au: terms.per_req_au,
+            locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
@@ -39783,16 +44161,16 @@ mod tests {
         assert_eq!(receipt.body.model_id, terms.model_id);
         assert_eq!(receipt.body.price_ver, active.price_ver);
         assert_eq!(receipt.body.locked_rate_map, active.locked_rate_map);
-        assert_eq!(receipt.body.locked_per_req_mu, active.locked_per_req_mu);
+        assert_eq!(receipt.body.locked_per_req_au, active.locked_per_req_au);
         assert_eq!(
-            receipt.body.locked_min_session_mu,
-            active.locked_min_session_mu
+            receipt.body.locked_min_session_au,
+            active.locked_min_session_au
         );
         assert_eq!(receipt.body.served_ctx, active.served_ctx);
         assert_eq!(receipt.body.rules_ver, terms.rules_ver);
         assert_eq!(receipt.body.usage.input_tokens(), 3);
         assert_eq!(receipt.body.usage.output_tokens(), 4);
-        assert_eq!(receipt.body.mu_owed_cum, 1);
+        assert_eq!(receipt.body.au_owed_cum, 1);
         assert_eq!(
             receipt.body.prompt_hash,
             provider_session_prompt_hash(&body)
@@ -39819,8 +44197,8 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
-            locked_per_req_mu: terms.per_req_mu,
-            locked_min_session_mu: terms.min_session_mu,
+            locked_per_req_au: terms.per_req_au,
+            locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
@@ -39847,8 +44225,8 @@ mod tests {
         assert!(!receipt.body.final_receipt);
         assert_eq!(receipt.body.usage, usage);
         assert_eq!(
-            receipt.body.mu_owed_cum,
-            provider_session_mu_owed(&active, &usage)
+            receipt.body.au_owed_cum,
+            provider_session_au_owed(&active, &usage)
         );
 
         let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
@@ -39877,11 +44255,11 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: 1,
             locked_rate_map: text_generation_rate_map(1, 2),
-            locked_per_req_mu: 0,
-            locked_min_session_mu: 0,
+            locked_per_req_au: 0,
+            locked_min_session_au: 0,
             served_ctx: 8192,
-            ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
-            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
+            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
         };
         assert_eq!(
@@ -39912,8 +44290,8 @@ mod tests {
             rail: "fiat".to_owned(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
-            locked_per_req_mu: terms.per_req_mu,
-            locked_min_session_mu: terms.min_session_mu,
+            locked_per_req_au: terms.per_req_au,
+            locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
@@ -40264,8 +44642,10 @@ mod tests {
         assert!(output.tool.is_none());
         assert_eq!(output.embeddings, Some(vec![vec![0.1, 0.2, 0.3]]));
         assert_eq!(output.finish_reason, "stop");
-        assert_eq!(output.prompt_tokens, 3);
+        assert_eq!(output.prompt_tokens, 4);
         assert_eq!(output.completion_tokens, 0);
+        assert_eq!(output.usage.input_tokens(), 4);
+        assert_eq!(output.usage.output_tokens(), 0);
         let request = backend.last_embedding_request.expect("embedding request");
         assert_eq!(request.inputs, vec!["similar phrase", "similar sentence"]);
         assert_eq!(request.dimensions, Some(3));
@@ -40538,7 +44918,7 @@ mod tests {
             primary: PathBuf::from("/tmp/admin-approved.gguf"),
             sidecars: BTreeMap::new(),
         };
-        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
 
         assert_eq!(
             config.artifact.path,
@@ -40551,6 +44931,28 @@ mod tests {
             config.memory_limit_bytes,
             Some(selected.feasibility.memory_budget.budget_bytes)
         );
+    }
+
+    #[test]
+    fn provider_engine_load_config_honors_llama_gpu_layer_override() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let mut args = test_provider_start_args();
+        args.gpu_layers = Some(0);
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        assert!(selected.verdict.n_layers_gpu.unwrap_or(0) > 0);
+        let artifact_paths = ProviderArtifactPaths {
+            primary: PathBuf::from("/tmp/admin-approved.gguf"),
+            sidecars: BTreeMap::new(),
+        };
+
+        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
+
+        assert_eq!(config.gpu_layers, Some(0));
     }
 
     #[test]
@@ -40652,7 +45054,7 @@ mod tests {
             primary: primary.clone(),
             sidecars: sidecar_paths,
         };
-        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
         let checkpoint_dir = temp.join(".trtllm-checkpoints/nvfp4");
         let engine_dir = temp.join(".trtllm-engines/nvfp4");
 
@@ -40785,7 +45187,7 @@ mod tests {
             primary: primary.clone(),
             sidecars: sidecar_paths,
         };
-        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
         let checkpoint_dir = temp.join(".vllm-checkpoints/vllm-fp16");
 
         assert_eq!(selected.artifact_name, "vllm-fp16");
@@ -40882,7 +45284,7 @@ mod tests {
             )]),
         };
 
-        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
 
         let projector = config.vision_projector.expect("vision projector");
         assert_eq!(
@@ -40972,7 +45374,8 @@ mod tests {
             )]),
         };
 
-        let config = provider_engine_load_config(&selected, &artifact_paths).unwrap();
+        let args = test_provider_start_args();
+        let config = provider_engine_load_config(&args, &selected, &artifact_paths).unwrap();
 
         assert_eq!(
             config.artifact.format,
@@ -41075,11 +45478,11 @@ mod tests {
                     session_id: id.to_owned(),
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
-                    locked_per_req_mu: 0,
-                    locked_min_session_mu: 0,
+                    locked_per_req_au: 0,
+                    locked_min_session_au: 0,
                     served_ctx: 8192,
-                    ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
-                    ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
+                    ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                    ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -41110,11 +45513,11 @@ mod tests {
                     session_id: id.to_owned(),
                     price_ver: 1,
                     locked_rate_map: text_generation_rate_map(1, 2),
-                    locked_per_req_mu: 0,
-                    locked_min_session_mu: 0,
+                    locked_per_req_au: 0,
+                    locked_min_session_au: 0,
                     served_ctx: 8192,
-                    ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
-                    ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
+                    ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+                    ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                 },
             );
@@ -41405,7 +45808,7 @@ mod tests {
         let mut rate = ProviderProtectionState::new(ProviderProtectionConfig {
             max_sessions: 4,
             accept_rate_per_minute: 1,
-            budget_mu: 0,
+            budget_au: 0,
             budget_units: 0,
             budget_period: Duration::from_secs(86_400),
         });
@@ -41416,28 +45819,28 @@ mod tests {
             ProviderSessionDecision::Reject { code: "RATE", .. }
         ));
 
-        let mut quota_mu = ProviderProtectionState::new(ProviderProtectionConfig {
+        let mut quota_au = ProviderProtectionState::new(ProviderProtectionConfig {
             max_sessions: 4,
             accept_rate_per_minute: 0,
-            budget_mu: 10,
+            budget_au: 10,
             budget_units: 0,
             budget_period: Duration::from_secs(1),
         });
-        quota_mu.record_usage(&ReceiptUsage::text(1, 1), 10);
+        quota_au.record_usage(&ReceiptUsage::text(1, 1), 10);
         assert!(matches!(
-            quota_mu.acceptance_decision(0),
+            quota_au.acceptance_decision(0),
             ProviderSessionDecision::Reject { code: "QUOTA", .. }
         ));
-        quota_mu.period_started = Instant::now() - Duration::from_secs(2);
+        quota_au.period_started = Instant::now() - Duration::from_secs(2);
         assert_eq!(
-            quota_mu.acceptance_decision(0),
+            quota_au.acceptance_decision(0),
             ProviderSessionDecision::Accept
         );
 
         let mut quota_units = ProviderProtectionState::new(ProviderProtectionConfig {
             max_sessions: 4,
             accept_rate_per_minute: 0,
-            budget_mu: 0,
+            budget_au: 0,
             budget_units: 3,
             budget_period: Duration::from_secs(86_400),
         });
@@ -41877,7 +46280,7 @@ mod tests {
                 "final": true,
                 "user": "u",
                 "provider": "p",
-                "mu_owed_cum": 100
+                "au_owed_cum": "100"
             },
             "receipt_ack": { "session_id": "s1", "seq": 2, "user_sig": "sig" }
         });
@@ -41973,7 +46376,7 @@ mod tests {
                 "final": true,
                 "user": "u",
                 "provider": "p",
-                "mu_owed_cum": 100
+                "au_owed_cum": "100"
             },
             "receipt_ack": { "session_id": "large-session", "seq": 9, "user_sig": "sig" },
             "metadata": "x".repeat(96 * 1024),
@@ -42064,18 +46467,19 @@ mod tests {
     }
 
     #[test]
-    fn earning_view_computes_released_mu_after_holdback_and_paid() {
+    fn earning_view_computes_released_au_after_holdback_and_paid() {
         let view = earning_view(LedgerEarningRecord {
             provider: "provider-a".to_owned(),
             rail: "fiat".to_owned(),
-            denom: "mu_usd".to_owned(),
-            total_mu: 10_000,
-            held_mu: 2_500,
-            paid_cum_mu: 3_000,
+            denom: "au_usd".to_owned(),
+            total_au: 10_000,
+            held_au: 2_500,
+            paid_cum_au: 3_000,
             holdbacks: vec![LedgerHoldbackBucket {
                 epoch: 7,
-                mu: 2_500,
+                au: 2_500,
                 probe_gate: false,
+                locked_epochs: None,
             }],
             updated_epoch: 7,
             updated_at: None,
@@ -42087,18 +46491,18 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(view.released_mu, 4_500);
-        assert_eq!(view.claimable_mu, 4_500);
+        assert_eq!(view.released_au, 4_500);
+        assert_eq!(view.claimable_au, 4_500);
         assert_eq!(view.claim_model, "tap_non_custodial_claim");
         assert_eq!(view.holdbacks[0].epoch, 7);
 
         assert!(earning_view(LedgerEarningRecord {
-            total_mu: 1,
-            held_mu: 1,
-            paid_cum_mu: 1,
+            total_au: 1,
+            held_au: 1,
+            paid_cum_au: 1,
             provider: "bad-provider".to_owned(),
             rail: "fiat".to_owned(),
-            denom: "mu_usd".to_owned(),
+            denom: "au_usd".to_owned(),
             holdbacks: Vec::new(),
             updated_epoch: 0,
             updated_at: None,
@@ -42122,36 +46526,36 @@ mod tests {
             },
             "totals": {
                 "dep_count": 1,
-                "dep_mu": 2,
+                "dep_au": "2",
                 "use_count": 3,
-                "use_mu": 4,
+                "use_au": "4",
                 "provider_count": 5,
-                "earn_mu": 6,
-                "fee_mu": 7,
-                "fee_cum_mu": 8,
+                "earn_au": "6",
+                "fee_au": "7",
+                "fee_cum_au": "8",
             }
         });
         let evidence = EpochEvidenceSnapshot {
             dep: Some(json!({
                 "merkle_root": "a".repeat(64),
                 "count": 1,
-                "mu_total": 2,
+                "au_total": "2",
             })),
             r#use: Some(json!({
                 "merkle_root": "b".repeat(64),
                 "sessions": 3,
-                "mu_total": 4,
+                "au_total": "4",
                 "providers": 5,
             })),
             earn: Some(json!({
                 "merkle_root": "c".repeat(64),
                 "provider_count": 5,
-                "mu_cum_total": 6,
+                "au_cum_total": "6",
             })),
             fee: Some(json!({
                 "merkle_root": "d".repeat(64),
-                "mu_fee_epoch": 7,
-                "mu_fee_cum": 8,
+                "au_fee_epoch": "7",
+                "au_fee_cum": "8",
             })),
         };
 
@@ -42162,78 +46566,87 @@ mod tests {
         let mismatched = EpochEvidenceSnapshot {
             fee: Some(json!({
                 "merkle_root": "d".repeat(64),
-                "mu_fee_epoch": 7,
-                "mu_fee_cum": 9,
+                "au_fee_epoch": "7",
+                "au_fee_cum": "9",
             })),
             ..evidence
         };
         let checks = verify_epoch_evidence(4, &recomputed, &mismatched);
         assert!(checks.iter().any(|check| {
-            check.key == "ev/fee/4.mu_fee_cum" && !check.ok && check.actual == json!(9)
+            check.key == "ev/fee/4.au_fee_cum" && !check.ok && check.actual == json!("9")
         }));
     }
 
     #[test]
-    fn pay_amount_parser_uses_integer_micro_usd() {
-        assert_eq!(parse_usd_amount_to_mu("10").unwrap(), 10_000_000);
-        assert_eq!(parse_usd_amount_to_mu("10.25").unwrap(), 10_250_000);
-        assert_eq!(parse_usd_amount_to_mu("0.01").unwrap(), 10_000);
-        assert!(parse_usd_amount_to_mu("0").is_err());
-        assert!(parse_usd_amount_to_mu("1.001").is_err());
-        assert!(parse_usd_amount_to_mu("-1").is_err());
+    fn pay_amount_parser_uses_integer_atto_usd() {
+        assert_eq!(
+            parse_usd_amount_to_au("10").unwrap(),
+            10_000_000_000_000_000_000
+        );
+        assert_eq!(
+            parse_usd_amount_to_au("10.25").unwrap(),
+            10_250_000_000_000_000_000
+        );
+        assert_eq!(
+            parse_usd_amount_to_au("0.01").unwrap(),
+            10_000_000_000_000_000
+        );
+        assert!(parse_usd_amount_to_au("0").is_err());
+        assert!(parse_usd_amount_to_au("1.001").is_err());
+        assert!(parse_usd_amount_to_au("-1").is_err());
     }
 
     #[test]
-    fn balance_record_defaults_missing_contract_key_to_zero_mu_usd() {
+    fn balance_record_defaults_missing_contract_key_to_zero_au_usd() {
         let record = normalize_balance_record("user", "tnk", None).unwrap();
 
         assert_eq!(record["user"], "user");
         assert_eq!(record["rail"], "tnk");
-        assert_eq!(record["denom"], "mu_usd");
-        assert_eq!(record["mu"], 0);
+        assert_eq!(record["denom"], "au_usd");
+        assert_eq!(record["au"], "0");
         assert_eq!(record["updated_epoch"], 0);
         assert!(record["updated_at"].is_null());
     }
 
     #[test]
-    fn balance_record_validates_denom_user_and_mu() {
+    fn balance_record_validates_denom_user_and_au() {
         let record = normalize_balance_record(
             "user",
             "fiat",
             Some(json!({
                 "user": "user",
                 "rail": "fiat",
-                "denom": "mu_usd",
-                "mu": 42,
+                "denom": "au_usd",
+                "au": "42",
                 "updated_epoch": 3,
                 "updated_at": 7
             })),
         )
         .unwrap();
-        assert_eq!(record["mu"], 42);
+        assert_eq!(record["au"], "42");
 
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "denom": "provider_coin", "mu": 1 }))
+            Some(json!({ "user": "user", "denom": "provider_coin", "au": "1" }))
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "other", "denom": "mu_usd", "mu": 1 }))
+            Some(json!({ "user": "other", "denom": "au_usd", "au": "1" }))
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "rail": "tap", "denom": "mu_usd", "mu": 1 }))
+            Some(json!({ "user": "user", "rail": "tap", "denom": "au_usd", "au": "1" }))
         )
         .is_err());
         assert!(normalize_balance_record(
             "user",
             "fiat",
-            Some(json!({ "user": "user", "denom": "mu_usd" }))
+            Some(json!({ "user": "user", "denom": "au_usd" }))
         )
         .is_err());
     }
@@ -42304,14 +46717,14 @@ mod tests {
     fn pay_checkout_handoff_includes_copy_paste_url() {
         let lines = checkout_handoff_lines(
             PayRail::Stripe,
-            10_000_000,
+            10_000_000_000_000_000_000,
             "https://checkout.stripe.com/c/pay/cs_test",
         );
 
         assert_eq!(lines[0], "Mayhem stripe checkout for 10.00 USD");
         let eur_lines = checkout_handoff_lines_with_currency(
             PayRail::Stripe,
-            10_000_000,
+            10_000_000_000_000_000_000,
             "eur",
             "https://checkout.stripe.com/c/pay/cs_test",
         );
@@ -42337,12 +46750,12 @@ mod tests {
     }
 
     #[test]
-    fn pay_tnk_helpers_prepare_memo_bound_transfer() {
-        let tnk_e18 = mu_to_tnk_e18_ceil_u128(10_000_000, 50_000).unwrap();
+    fn pay_tnk_helpers_prepare_deposit_bound_transfer() {
+        let tnk_e18 = au_to_tnk_e18_ceil_u128(10_000_000, 50_000).unwrap();
         assert_eq!(tnk_e18, 200 * TNK_E18);
         assert_eq!(tnk_e18_to_decimal(tnk_e18), "200");
         assert_eq!(tnk_e18_to_decimal(1_234_567_890_000_000_000), "1.23456789");
-        assert_eq!(tnk_e18_to_mu_floor(tnk_e18, 50_000).unwrap(), 10_000_000);
+        assert_eq!(tnk_e18_to_au_floor(tnk_e18, 50_000).unwrap(), 10_000_000);
 
         let pubkey = "00".repeat(32);
         let nonce = "11".repeat(32);
@@ -42359,7 +46772,7 @@ mod tests {
                 tnk_e18,
                 10_000_000,
                 &PayTnkRate {
-                    tnk_usd_e6: 50_000,
+                    tnk_usd_au: 50_000,
                     source: "gate-spot".to_owned(),
                     ts: Some(3_600),
                 },
@@ -42369,10 +46782,27 @@ mod tests {
                 "memo_hash": memo_hash,
                 "treasury_address": "testtrac1treasury",
                 "tnk_e18": "200000000000000000000",
-                "quoted_mu": 10_000_000,
-                "rate_tnk_usd_e6": 50_000,
+                "quoted_au": "10000000",
+                "rate_tnk_usd_au": "50000",
                 "rate_source": "gate-spot",
             })
+        );
+    }
+
+    #[test]
+    fn pay_tnk_handoff_uses_deposit_binding_not_transfer_memo() {
+        let command = pay_tnk_deposit_intent_command(
+            "10.00",
+            "testtrac1treasury",
+            &"cd".repeat(32),
+            50_000,
+            None,
+            None,
+        );
+        assert!(!command.to_lowercase().contains("memo"));
+        assert_eq!(
+            command,
+            "mayhem pay tnk --amount '10.00' --treasury-address 'testtrac1treasury' --nonce 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd' --tnk-usd-au 50000 --submit-intent"
         );
     }
 
@@ -42383,14 +46813,16 @@ mod tests {
             "testtrac1treasury",
             &"ab".repeat(32),
             50_000,
+            Some(Path::new("/tmp/mayhem/stores/main/db/keypair.json")),
             Some("http://127.0.0.1:49223/v1"),
         );
 
         assert!(command.starts_with("mayhem pay tnk "));
         assert!(command.contains("--amount '10.25'"));
         assert!(command.contains("--treasury-address 'testtrac1treasury'"));
-        assert!(command.contains("--tnk-usd-e6 50000"));
+        assert!(command.contains("--tnk-usd-au 50000"));
         assert!(command.contains(" --submit-intent"));
+        assert!(command.contains(" --keypair '/tmp/mayhem/stores/main/db/keypair.json'"));
         assert!(command.ends_with(" --rpc-url 'http://127.0.0.1:49223/v1'"));
     }
 
@@ -42433,7 +46865,37 @@ mod tests {
             resolve_tnk_msb_network(Some("testnet"), "trac1treasury").unwrap(),
             "testnet1"
         );
+        assert_eq!(msb_network_address_prefix("mainnet").unwrap(), "trac");
+        assert_eq!(msb_network_address_prefix("testnet1").unwrap(), "testtrac");
+        assert_eq!(msb_network_address_prefix("testnet").unwrap(), "testtrac");
         assert!(resolve_tnk_msb_network(None, "not-an-address").is_err());
+        assert!(msb_network_address_prefix("devnet").is_err());
+    }
+
+    #[test]
+    fn msb_transfer_helper_json_parser_tolerates_pear_stdout_noise() {
+        let stdout = br#"DEPRECATED: pear run is deprecated and will be removed
+Use the pear-runtime module instead
+State initialization...
+{
+  "ok": true,
+  "command": "transfer",
+  "network": "testnet1",
+  "from": "testtrac1treasury",
+  "to": "testtrac1provider",
+  "amount": "0.255",
+  "tx_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "before_balance": "3.029480088089557716",
+  "validator_connections": 1
+}
+"#;
+        let parsed: MsbTransferOutput =
+            parse_msb_transfer_helper_json(stdout, b"helper logs").unwrap();
+        assert_eq!(
+            parsed.tx_hash,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(parsed.amount, "0.255");
     }
 
     #[test]
@@ -42443,22 +46905,22 @@ mod tests {
                 "role": "provider",
                 "provider": "11".repeat(32),
                 "to": "testtrac1provider",
-                "mu": 850_000,
+                "au": "850000",
                 "tnk_e18": "17000000000000000000",
             }),
             json!({
                 "role": "operator_fee",
                 "to": "testtrac1operator",
-                "mu": 150_000,
+                "au": "150000",
                 "tnk_e18": "3000000000000000000",
             }),
         ];
         let totals = tnk_settlement_output_totals(&outputs).unwrap();
 
         assert_eq!(totals.provider_count, 1);
-        assert_eq!(totals.provider_mu, 850_000);
-        assert_eq!(totals.operator_fee_mu, 150_000);
-        assert_eq!(totals.gross_mu, 1_000_000);
+        assert_eq!(totals.provider_au, 850_000);
+        assert_eq!(totals.operator_fee_au, 150_000);
+        assert_eq!(totals.gross_au, 1_000_000);
         assert_eq!(totals.tnk_e18, "20000000000000000000");
         assert_eq!(
             stable_value_hash(&json!({
@@ -42504,25 +46966,28 @@ mod tests {
         let earning = LedgerEarningRecord {
             provider: "11".repeat(32),
             rail: "tnk".to_owned(),
-            denom: "mu_usd".to_owned(),
-            total_mu: 10_000,
-            held_mu: 4_000,
-            paid_cum_mu: 1_000,
+            denom: "au_usd".to_owned(),
+            total_au: 10_000,
+            held_au: 4_000,
+            paid_cum_au: 1_000,
             holdbacks: vec![
                 LedgerHoldbackBucket {
                     epoch: 7,
-                    mu: 1_000,
+                    au: 1_000,
                     probe_gate: false,
+                    locked_epochs: Some(168),
                 },
                 LedgerHoldbackBucket {
                     epoch: 7,
-                    mu: 500,
+                    au: 500,
                     probe_gate: false,
+                    locked_epochs: Some(168),
                 },
                 LedgerHoldbackBucket {
                     epoch: 7,
-                    mu: 250,
+                    au: 250,
                     probe_gate: true,
+                    locked_epochs: Some(168),
                 },
             ],
             updated_epoch: 7,
@@ -42537,9 +47002,9 @@ mod tests {
         let buckets = normalize_tnk_holdbacks(&earning).unwrap();
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].epoch, 7);
-        assert_eq!(buckets[0].mu, 1_500);
+        assert_eq!(buckets[0].au, 1_500);
         assert!(!buckets[0].probe_gate);
-        assert_eq!(buckets[1].mu, 250);
+        assert_eq!(buckets[1].au, 250);
         assert!(buckets[1].probe_gate);
     }
 
@@ -42621,7 +47086,7 @@ mod tests {
         assert_eq!(store.tokens.len(), 1);
         let token = &store.tokens[0];
         assert_eq!(token.name, "agent-loop");
-        assert_eq!(token.budget_mu, Some(10_000_000));
+        assert_eq!(token.budget_au, Some(10_000_000_000_000_000_000));
         assert_eq!(token.budget_period, Some(GatewayTokenBudgetPeriod::Day));
         assert_eq!(token.max_rate_per_minute, Some(60));
         assert_eq!(
@@ -42689,11 +47154,12 @@ mod tests {
             "mayhem": {
                 "providers_online": 3,
                 "rooms": 2,
-                "price_ref_mu": {
-                    "denom": "mu_usd",
+                "price_ref_au": {
+                    "denom": "au_usd",
                     "rate_map": [
-                        { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
-                        { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                        { "unit": "input_token", "per_unit_au": "20", "granularity": 1000 },
+                        { "unit": "cached_input_token", "per_unit_au": "5", "granularity": 1000 },
+                        { "unit": "output_token", "per_unit_au": "60", "granularity": 1000 }
                     ]
                 },
                 "attestation_tiers": { "T1": 2, "T2": 1 },
@@ -42719,8 +47185,11 @@ mod tests {
         assert_eq!(summaries[0].id, "mayhem/test");
         assert_eq!(summaries[0].providers_online, 3);
         assert_eq!(summaries[0].rooms, 2);
-        assert_eq!(summaries[0].denom, "mu_usd");
-        assert_eq!(summaries[0].rate_map, text_generation_rate_map(20, 60));
+        assert_eq!(summaries[0].denom, "au_usd");
+        assert_eq!(
+            summaries[0].rate_map,
+            normalize_rate_map(text_generation_rate_map(20, 60))
+        );
         assert!(summaries[0].tools);
         assert!(!summaries[0].json);
         assert_eq!(summaries[0].context, 8192);
@@ -42748,11 +47217,11 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": {
-                        "denom": "mu_usd",
+                    "price_ref_au": {
+                        "denom": "au_usd",
                         "rate_map": [
-                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
-                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                            { "unit": "input_token", "per_unit_au": "20", "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_au": "60", "granularity": 1000 }
                         ]
                     },
                     "attestation_tiers": { "T1": 1 },
@@ -42765,11 +47234,11 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": {
-                        "denom": "mu_usd",
+                    "price_ref_au": {
+                        "denom": "au_usd",
                         "rate_map": [
-                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
-                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                            { "unit": "input_token", "per_unit_au": "20", "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_au": "60", "granularity": 1000 }
                         ]
                     },
                     "attestation_tiers": { "T3": 1, "T4": 1 },
@@ -42803,11 +47272,11 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": {
-                        "denom": "mu_usd",
+                    "price_ref_au": {
+                        "denom": "au_usd",
                         "rate_map": [
-                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
-                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                            { "unit": "input_token", "per_unit_au": "20", "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_au": "60", "granularity": 1000 }
                         ]
                     },
                     "attestation_tiers": { "T1": 1 },
@@ -42819,11 +47288,11 @@ mod tests {
                 "mayhem": {
                     "providers_online": 1,
                     "rooms": 1,
-                    "price_ref_mu": {
-                        "denom": "mu_usd",
+                    "price_ref_au": {
+                        "denom": "au_usd",
                         "rate_map": [
-                            { "unit": "input_token", "per_unit_mu": 20, "granularity": 1000 },
-                            { "unit": "output_token", "per_unit_mu": 60, "granularity": 1000 }
+                            { "unit": "input_token", "per_unit_au": "20", "granularity": 1000 },
+                            { "unit": "output_token", "per_unit_au": "60", "granularity": 1000 }
                         ]
                     },
                     "attestation_tiers": { "T4": 1 },
@@ -44812,6 +49281,7 @@ mod tests {
             home: None,
             rpc_url: None,
             peer_store_name: "main".to_owned(),
+            keypair: None,
             wallet_password: None,
             submit: false,
             sim: false,
@@ -44838,7 +49308,7 @@ mod tests {
             rail: AdminPayoutMethod::Tnk,
             epoch: 7,
             who: "provider-a".to_owned(),
-            mu: 1_000_000,
+            au: 1_000_000,
             tnk_e18: Some("500000000000000000".to_owned()),
             msb_tx_hash: Some("msb-tx".to_owned()),
             external_ref: None,
@@ -44866,6 +49336,7 @@ mod tests {
             downloads_dir: None,
             hf_token_file: None,
             engine_backend: "auto".to_owned(),
+            gpu_layers: None,
             fixture: None,
             disk_path: None,
             skip_disk_bench: true,
@@ -44874,13 +49345,13 @@ mod tests {
             sim: false,
             no_heartbeat: true,
             heartbeat_count: 1,
-            min_ask_mu: 0,
+            min_ask_au: 0,
             ctx: None,
             memory_reserve: None,
             disk_reserve: None,
             max_sessions: None,
             accept_rate_per_minute: 0,
-            serve_budget_mu: 0,
+            serve_budget_au: 0,
             serve_budget_units: 0,
             serve_budget_period_seconds: 86_400,
             serve_sessions: false,
@@ -44952,13 +49423,13 @@ mod tests {
             room_ids: vec!["aa".repeat(16)],
             price_ver: 1,
             rate_map: text_generation_rate_map(1, 2),
-            per_req_mu: 0,
-            min_session_mu: 0,
-            min_ask_mu: 0,
+            per_req_au: 0,
+            min_session_au: 0,
+            min_ask_au: 0,
             rules_ver: 3,
             ctx: 8192,
-            ctx_bracket: ctx_bracket_for_tokens(8192).to_owned(),
-            ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
+            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
         }
     }
@@ -44973,12 +49444,12 @@ mod tests {
             enclave_id: terms.enclave_id.clone(),
             price_ver: terms.price_ver,
             locked_rate_map: normalize_rate_map(terms.rate_map.clone()),
-            locked_per_req_mu: terms.per_req_mu,
-            locked_min_session_mu: terms.min_session_mu,
+            locked_per_req_au: terms.per_req_au,
+            locked_min_session_au: terms.min_session_au,
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
-            max_spend_mu: 1000,
+            max_spend_au: 1000,
             checkpoint_every: mayhem_proto::CheckpointPolicy {
                 tokens: 8192,
                 ms: 30000,
@@ -45009,12 +49480,12 @@ mod tests {
                 "enclave_id": voucher_body.enclave_id,
                 "price_ver": voucher_body.price_ver,
                 "locked_rate_map": voucher_body.locked_rate_map,
-                "locked_per_req_mu": voucher_body.locked_per_req_mu,
-                "locked_min_session_mu": voucher_body.locked_min_session_mu,
+                "locked_per_req_au": money_au_json(voucher_body.locked_per_req_au),
+                "locked_min_session_au": money_au_json(voucher_body.locked_min_session_au),
                 "served_ctx": voucher_body.served_ctx,
                 "ctx_bracket": voucher_body.ctx_bracket.clone(),
                 "ctx_bracket_table_ver": voucher_body.ctx_bracket_table_ver,
-                "max_spend_mu": voucher_body.max_spend_mu,
+                "max_spend_au": money_au_json(voucher_body.max_spend_au),
                 "checkpoint_every": {
                     "tokens": voucher_body.checkpoint_every.tokens,
                     "ms": voucher_body.checkpoint_every.ms
@@ -45401,14 +49872,8 @@ mod tests {
         path
     }
 
-    #[test]
-    fn up_supervisor_config_contains_peer_gateway_and_provider_children() {
-        let home = std::env::temp_dir().join(format!(
-            "mayhem-up-config-test-{}-{}",
-            std::process::id(),
-            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let plan = UpPlan {
+    fn test_up_supervisor_plan(home: PathBuf, provider_workers: Vec<UpProviderWorker>) -> UpPlan {
+        UpPlan {
             home: home.clone(),
             config_path: home.join("config.toml"),
             supervisor_config_path: home.join("mayhemd-up.toml"),
@@ -45417,7 +49882,7 @@ mod tests {
             pear_runtime: PathBuf::from("/tmp/pear-runtime"),
             intercom_dir: PathBuf::from("/tmp/intercom"),
             role: Role::Both,
-            provider: true,
+            provider: !provider_workers.is_empty(),
             network: "mainnet".to_owned(),
             subnet_channel: Some("mayhem-mainnet-v1".to_owned()),
             subnet_bootstrap: Some("a".repeat(64)),
@@ -45439,7 +49904,26 @@ mod tests {
             gateway_active_token_count: 1,
             timeout: Duration::from_secs(1),
             dev_embedded_catalog: false,
-        };
+            provider_workers,
+            provider_auto_fit: false,
+            provider_gpu_layers: Some(0),
+        }
+    }
+
+    #[test]
+    fn up_supervisor_config_contains_peer_gateway_and_provider_children() {
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-up-config-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let plan = test_up_supervisor_plan(
+            home.clone(),
+            vec![UpProviderWorker {
+                name: "provider".to_owned(),
+                enclave: Some("qwen/qwen2.5-1.5b-instruct@small".to_owned()),
+            }],
+        );
         let text = up_supervisor_config(&plan).unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
         let children = parsed
@@ -45469,7 +49953,102 @@ mod tests {
         assert!(text.contains("0.0.0.0:11435"));
         assert!(text.contains("--require-auth"));
         assert!(text.contains("--serve-sessions"));
+        assert!(text.contains("--enclave"));
+        assert!(text.contains("qwen/qwen2.5-1.5b-instruct@small"));
+        assert!(text.contains("--gpu-layers"));
+        assert!(text.contains("\"0\""));
         assert!(!text.contains("--peer-dht-bootstrap"));
+    }
+
+    #[test]
+    fn up_enclaves_parser_trims_and_rejects_bad_lists() {
+        assert_eq!(
+            parse_up_enclaves(Some(" chat-llm , embedding , stt ")).unwrap(),
+            vec![
+                "chat-llm".to_owned(),
+                "embedding".to_owned(),
+                "stt".to_owned()
+            ]
+        );
+        assert!(parse_up_enclaves(Some("chat,,embedding"))
+            .unwrap_err()
+            .to_string()
+            .contains("empty entry"));
+        assert!(parse_up_enclaves(Some("chat, chat"))
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn up_provider_workers_resolve_multi_enclave_names() {
+        let args = UpArgs::try_parse_from([
+            "mayhem",
+            "--provider",
+            "--enclaves",
+            "chat-llm,embedding/stt",
+        ])
+        .unwrap();
+        let workers = resolve_up_provider_workers(&args).unwrap();
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].enclave.as_deref(), Some("chat-llm"));
+        assert_eq!(workers[0].name, "provider-01-chat-llm");
+        assert_eq!(workers[1].enclave.as_deref(), Some("embedding/stt"));
+        assert_eq!(workers[1].name, "provider-02-embedding-stt");
+
+        let auto_fit = UpArgs::try_parse_from(["mayhem", "--provider", "--auto-fit"]).unwrap();
+        assert!(resolve_up_provider_workers(&auto_fit).unwrap().is_empty());
+
+        let err = resolve_up_provider_workers(
+            &UpArgs::try_parse_from(["mayhem", "--provider", "--auto-fit", "--enclaves", "chat"])
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("use --auto-fit by itself"));
+
+        let err = resolve_up_provider_workers(
+            &UpArgs::try_parse_from(["mayhem", "--enclaves", "chat-llm"]).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--enclaves requires --provider"));
+    }
+
+    #[test]
+    fn up_supervisor_config_defers_multi_provider_children_until_live_preflight() {
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-up-multi-provider-config-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let plan = test_up_supervisor_plan(
+            home,
+            vec![
+                UpProviderWorker {
+                    name: "provider-01-chat-llm".to_owned(),
+                    enclave: Some("chat-llm".to_owned()),
+                },
+                UpProviderWorker {
+                    name: "provider-02-embedding".to_owned(),
+                    enclave: Some("embedding".to_owned()),
+                },
+                UpProviderWorker {
+                    name: "provider-03-stt".to_owned(),
+                    enclave: Some("stt".to_owned()),
+                },
+            ],
+        );
+        let text = up_supervisor_config(&plan).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let children = parsed
+            .get("supervisor")
+            .and_then(|value| value.get("children"))
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        let names = children
+            .iter()
+            .filter_map(|child| child.get("name").and_then(toml::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["peer", "gateway"]);
     }
 
     #[test]
@@ -45583,6 +50162,10 @@ mod tests {
         let args = UpArgs {
             home: Some(home.clone()),
             provider: false,
+            provider_enclave: None,
+            enclaves: None,
+            auto_fit: false,
+            provider_gpu_layers: None,
             network: None,
             subnet_channel: None,
             subnet_bootstrap: None,
@@ -45742,8 +50325,8 @@ mod tests {
                     token_prefixes: BTreeMap::new(),
                     perceptual_hashes: BTreeMap::new(),
                 },
-                price_ref_mu: catalog::PriceRef {
-                    denom: "mu_usd".to_owned(),
+                price_ref_au: catalog::PriceRef {
+                    denom: "au_usd".to_owned(),
                     in_per_1k: 1,
                     out_per_1k: 2,
                     rate_map: Vec::new(),
@@ -45835,17 +50418,17 @@ mod tests {
             prices: vec![LedgerPriceSchedule {
                 enclave_id: "11".repeat(32),
                 model_id: "test/model@4bit".to_owned(),
-                denom: "mu_usd".to_owned(),
+                denom: "au_usd".to_owned(),
                 ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                 ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                 current: Some(LedgerPriceRecord {
                     ver: 1,
-                    denom: "mu_usd".to_owned(),
+                    denom: "au_usd".to_owned(),
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     rate_map: text_generation_rate_map(1, 2),
-                    per_req_mu: 0,
-                    min_session_mu: 0,
+                    per_req_au: 0,
+                    min_session_au: 0,
                     effective_at: 0,
                     set_by_role: Some("admin".to_owned()),
                     derivation: None,
