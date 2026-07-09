@@ -28,6 +28,7 @@ const DEFAULT_STATE_FILE: &str = "mayhemd-state.json";
 #[derive(Debug, Parser)]
 #[command(name = "mayhemd")]
 #[command(about = "Mayhem local process supervisor")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Args {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]

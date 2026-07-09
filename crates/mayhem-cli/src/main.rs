@@ -146,6 +146,7 @@ const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
 #[command(about = "Mayhem network CLI")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
@@ -8059,7 +8060,7 @@ async fn fetch_update_url(url: &str) -> Result<Vec<u8>> {
         return fs::read(path).with_context(|| format!("reading {url}"));
     }
     let client = reqwest::Client::builder()
-        .user_agent("mayhem-update/0.1")
+        .user_agent(format!("mayhem-update/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building update HTTP client")?;
     let response = client

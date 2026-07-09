@@ -80,6 +80,19 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+workspace_version() {
+  awk '
+    /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+    /^\[/ { in_workspace_package = 0 }
+    in_workspace_package && $1 == "version" {
+      value = $3
+      gsub(/"/, "", value)
+      print value
+      exit
+    }
+  ' "$ROOT_DIR/Cargo.toml"
+}
+
 copy_runtime_tree() {
   local src="$1"
   local dest="$2"
@@ -204,7 +217,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$VERSION" ]]; then
-  if git -C "$ROOT_DIR" describe --tags --always --dirty >/dev/null 2>&1; then
+  WORKSPACE_VERSION="$(workspace_version)"
+  if [[ -n "$WORKSPACE_VERSION" ]]; then
+    VERSION="v$WORKSPACE_VERSION"
+  elif git -C "$ROOT_DIR" describe --tags --always --dirty >/dev/null 2>&1; then
     VERSION="$(git -C "$ROOT_DIR" describe --tags --always --dirty)"
   else
     VERSION="dev"
