@@ -46,8 +46,10 @@ export async function getStatus(peer) {
     msb: {
       ready: true,
       bootstrapHex: peer.msbClient.bootstrapHex,
+      channel: peer.msbClient.channelUtf8,
       networkId: peer.msbClient.networkId,
-      signedLength: peer.msbClient.getSignedLength()
+      signedLength: peer.msbClient.getSignedLength(),
+      connectedValidators: peer.msbClient.getConnectedValidatorsCount()
     },
   };
 }

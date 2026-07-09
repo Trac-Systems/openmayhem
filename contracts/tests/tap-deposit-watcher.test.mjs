@@ -9,6 +9,7 @@ import {
   buildAdminCommand,
   buildAdminCommandArgs,
   mergeDeposits,
+  resolveActiveBillingEpoch,
   scanTapDeposits,
   TAP_DEPOSIT_EVENT_SIGNATURE,
   TAP_DEPOSIT_WATCHER_ID,
@@ -19,6 +20,22 @@ import {
 const CHAIN_ID = 61000;
 const TAP_USD_AU = '2000000000000000000';
 const U = (n) => ethers.parseUnits(String(n), 18);
+
+test('tap deposit watcher derives the active billing epoch from ledger apply state', async () => {
+  const stateFetch = async () => ({
+    ok: true,
+    json: async () => ({ value: { updated_epoch: 7 } }),
+  });
+  const emptyFetch = async () => ({ ok: true, json: async () => ({ value: null }) });
+
+  assert.equal(await resolveActiveBillingEpoch(undefined, 'http://peer/v1', { fetchImpl: stateFetch }), 8);
+  assert.equal(await resolveActiveBillingEpoch(undefined, 'http://peer/v1', { fetchImpl: emptyFetch }), 1);
+  assert.equal(await resolveActiveBillingEpoch('12', null), 12);
+  await assert.rejects(
+    resolveActiveBillingEpoch(undefined, null),
+    /Missing --epoch or --peer-rpc/,
+  );
+});
 
 test('tap deposit watcher scans MayhemInferencePool Deposit logs and builds admin command', async () => {
   const ganache = Ganache.provider({

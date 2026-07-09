@@ -46,6 +46,12 @@ export class MsbClient extends ReadyResource {
         return b4a.isBuffer(buf) ? buf.toString('hex') : null;
     }
 
+    get channelUtf8() {
+        const channel = this.#msb.config.channel
+        if (b4a.isBuffer(channel)) return b4a.toString(channel, 'utf8');
+        return channel == null ? null : String(channel);
+    }
+
     async getTxvHex() {
         const txv = await this.#msb.state.getIndexerSequenceState();
         return txv.toString('hex');

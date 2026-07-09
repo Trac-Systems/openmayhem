@@ -83,6 +83,27 @@ export async function readContractStateValue(rpcUrl, key, {
   return body?.value ?? null;
 }
 
+export async function resolveActiveBillingEpoch(explicitEpoch, rpcUrl, {
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (explicitEpoch !== undefined && explicitEpoch !== null && explicitEpoch !== '') {
+    const epoch = positiveSafeInteger(explicitEpoch);
+    if (epoch === null) throw new Error('--epoch must be a positive safe integer');
+    return epoch;
+  }
+  if (!rpcUrl) throw new Error('Missing --epoch or --peer-rpc for active billing epoch discovery.');
+  const applyState = await readContractStateValue(rpcUrl, 'epoch/apply/state', { fetchImpl });
+  const updatedEpoch = applyState?.updated_epoch ?? 0;
+  if (!Number.isSafeInteger(updatedEpoch) || updatedEpoch < 0) {
+    throw new Error('epoch/apply/state.updated_epoch must be a non-negative safe integer');
+  }
+  const epoch = updatedEpoch + 1;
+  if (!Number.isSafeInteger(epoch) || epoch <= 0) {
+    throw new Error('active billing epoch overflowed');
+  }
+  return epoch;
+}
+
 function readJsonIfExists(filePath, fallback) {
   if (!filePath || !fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -405,8 +426,8 @@ async function main() {
   const treasuryAddress = String(args['treasury-address'] || process.env.MAYHEM_TNK_TREASURY_ADDRESS || '').trim();
   if (!treasuryAddress) throw new Error('Missing --treasury-address.');
 
-  const epoch = parsePositiveInt(args.epoch, '--epoch');
-  if (epoch < 1) throw new Error('--epoch must be >= 1');
+  const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
+  const epoch = await resolveActiveBillingEpoch(args.epoch, adminRpcUrl);
   const at = parsePositiveInt(args.at ?? Math.floor(Date.now() / 1000), '--at');
   const timeoutSec = parsePositiveInt(args.timeout ?? 30, '--timeout', 30);
   const finalitySignedLengths = parsePositiveInt(
@@ -458,7 +479,7 @@ async function main() {
   }
 
   const pendingEntries = await readPendingIntents({
-    peerRpc: args['peer-rpc'] || process.env.MAYHEM_PEER_RPC,
+    peerRpc: adminRpcUrl,
     pendingFile: args['pending-file'],
   });
 
@@ -480,7 +501,7 @@ async function main() {
     sim,
     json: true,
     mayhemBin: args['mayhem-bin'] || 'mayhem',
-    rpcUrl: args['admin-rpc-url'] || args['peer-rpc'],
+    rpcUrl: adminRpcUrl,
     home: args['admin-home'],
     peerStoreName: args['admin-peer-store-name'],
     walletPassword: args['admin-wallet-password-env']

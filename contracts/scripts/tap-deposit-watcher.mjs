@@ -239,6 +239,25 @@ export async function readContractStateValue(rpcUrl, key, {
   return body?.value ?? null;
 }
 
+export async function resolveActiveBillingEpoch(explicitEpoch, rpcUrl, {
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (explicitEpoch !== undefined && explicitEpoch !== null && explicitEpoch !== '') {
+    return parsePositiveInt(explicitEpoch, '--epoch');
+  }
+  if (!rpcUrl) throw new Error('Missing --epoch or --peer-rpc for active billing epoch discovery.');
+  const applyState = await readContractStateValue(rpcUrl, 'epoch/apply/state', { fetchImpl });
+  const updatedEpoch = applyState?.updated_epoch ?? 0;
+  if (!Number.isSafeInteger(updatedEpoch) || updatedEpoch < 0) {
+    throw new Error('epoch/apply/state.updated_epoch must be a non-negative safe integer');
+  }
+  const epoch = updatedEpoch + 1;
+  if (!Number.isSafeInteger(epoch) || epoch <= 0) {
+    throw new Error('active billing epoch overflowed');
+  }
+  return epoch;
+}
+
 export function tapDepositStateMatches(deposit, {
   seen,
   balance,
@@ -422,7 +441,8 @@ async function main() {
   const tapUsdAu = args['tap-usd-au'] || process.env.MAYHEM_TAP_USD_AU
     ? positiveDecimalBigInt(args['tap-usd-au'] || process.env.MAYHEM_TAP_USD_AU, '--tap-usd-au').toString()
     : undefined;
-  const epoch = parsePositiveInt(args.epoch, '--epoch');
+  const adminRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
+  const epoch = await resolveActiveBillingEpoch(args.epoch, adminRpcUrl);
   const at = parseNonNegativeInt(args.at ?? Math.floor(Date.now() / 1000), '--at');
   const cursorPath = path.resolve(args.cursor || DEFAULT_CURSOR);
   const cursor = normalizeCursor(readJsonIfExists(cursorPath, {}));
@@ -462,7 +482,7 @@ async function main() {
     sim,
     json: true,
     mayhemBin: args['mayhem-bin'] || 'mayhem',
-    rpcUrl: args['admin-rpc-url'] || args['peer-rpc'],
+    rpcUrl: adminRpcUrl,
     home: args['admin-home'],
     peerStoreName: args['admin-peer-store-name'],
     walletPassword: args['admin-wallet-password-env']

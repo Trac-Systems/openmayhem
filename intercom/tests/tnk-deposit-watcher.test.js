@@ -7,6 +7,7 @@ import {
   matchPendingTransfers,
   pendingEntriesFromState,
   pubKeyHexToMsbAddress,
+  resolveActiveBillingEpoch,
   transferFromTxDetails,
   waitForDepositState,
 } from '../scripts/tnk-deposit-watcher.mjs';
@@ -14,6 +15,22 @@ import {
 const pubkey = '00'.repeat(32);
 const sender = pubKeyHexToMsbAddress(pubkey, 'testtrac');
 const treasury = 'testtrac1treasury';
+
+test('tnk deposit watcher derives the active billing epoch from ledger apply state', async () => {
+  const stateFetch = async () => ({
+    ok: true,
+    json: async () => ({ value: { updated_epoch: 4 } }),
+  });
+  const emptyFetch = async () => ({ ok: true, json: async () => ({ value: null }) });
+
+  assert.equal(await resolveActiveBillingEpoch(undefined, 'http://peer/v1', { fetchImpl: stateFetch }), 5);
+  assert.equal(await resolveActiveBillingEpoch(undefined, 'http://peer/v1', { fetchImpl: emptyFetch }), 1);
+  assert.equal(await resolveActiveBillingEpoch('9', null), 9);
+  await assert.rejects(
+    resolveActiveBillingEpoch(undefined, null),
+    /Missing --epoch or --peer-rpc/,
+  );
+});
 
 test('tnk deposit watcher matches quoted pending intents by user-derived MSB sender, treasury, and amount', () => {
   const pendingEntries = pendingEntriesFromState({

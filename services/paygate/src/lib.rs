@@ -613,12 +613,6 @@ impl PaygateConfig {
                         "contract.dry_run is forbidden in Stripe live mode".to_owned(),
                     ));
                 }
-                if contract_rpc_is_localhost(&self.contract_rpc_url) {
-                    return Err(PaygateError::InvalidConfig(
-                        "Stripe live mode requires an explicit non-local contract.rpc_url"
-                            .to_owned(),
-                    ));
-                }
             }
         }
         Ok(())
@@ -2160,16 +2154,6 @@ fn validate_stripe_secret_key_mode(secret_key: &str, mode: StripeMode) -> Result
     }
 }
 
-fn contract_rpc_is_localhost(value: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(value.trim()) else {
-        return false;
-    };
-    matches!(
-        parsed.host_str(),
-        Some("127.0.0.1") | Some("localhost") | Some("::1")
-    )
-}
-
 fn json_string_field(value: &Value, field: &str) -> Result<String> {
     value
         .get(field)
@@ -2505,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn stripe_live_mode_rejects_dry_run_and_local_contract_rpc() {
+    fn stripe_live_mode_rejects_dry_run_and_unofficial_api_base() {
         let dry_run = PaygateConfig::from_toml_str(
             r#"
             [contract]
@@ -2531,8 +2515,8 @@ mod tests {
             webhook_secret = "whsec_local"
             "#,
         )
-        .expect_err("live Stripe refuses default localhost RPC");
-        assert!(local.to_string().contains("non-local contract.rpc_url"));
+        .expect("live Stripe may use the loopback peer after the service mainnet proof");
+        assert_eq!(local.contract_rpc_url, DEFAULT_CONTRACT_RPC_URL);
 
         let api_base = PaygateConfig::from_toml_str(
             r#"
