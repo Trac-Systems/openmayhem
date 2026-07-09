@@ -69,6 +69,7 @@ pub struct ReceiptCheckpoint {
     pub seq: u64,
     pub final_receipt: bool,
     pub usage: ReceiptUsage,
+    #[serde(with = "mayhem_proto::decimal_u128")]
     pub au_owed_cum: MoneyAu,
     pub uncheckpointed_usage: ReceiptUsage,
     pub reason: String,
@@ -115,6 +116,7 @@ pub struct SessionFailoverState {
     input_tokens: u64,
     delivered_output_tokens: u64,
     last_receipted_usage: ReceiptUsage,
+    #[serde(with = "mayhem_proto::decimal_u128")]
     last_receipted_au: MoneyAu,
     next_receipt_seq: u64,
     open_attempts: u8,
@@ -635,6 +637,40 @@ mod tests {
         let duplicated_prompt_charge = redispatch.partial_receipt.au_owed_cum
             + price().au_for_usage(&ReceiptUsage::text(1_000, 5));
         assert!(final_receipt.au_owed_cum < duplicated_prompt_charge);
+    }
+
+    #[test]
+    fn failover_money_serializes_as_decimal_strings() {
+        let large_au = 20_000_000_000_000_000_000_001_u128;
+        let large_au_text = large_au.to_string();
+        let checkpoint = ReceiptCheckpoint {
+            seq: 7,
+            final_receipt: false,
+            usage: ReceiptUsage::text(1_000, 8),
+            au_owed_cum: large_au,
+            uncheckpointed_usage: ReceiptUsage::text(0, 8),
+            reason: "checkpoint".to_owned(),
+            ts_millis: 42,
+        };
+        let checkpoint_json = serde_json::to_value(&checkpoint).expect("checkpoint serializes");
+        assert_eq!(
+            checkpoint_json["au_owed_cum"].as_str(),
+            Some(large_au_text.as_str())
+        );
+        let decoded_checkpoint: ReceiptCheckpoint =
+            serde_json::from_value(checkpoint_json).expect("checkpoint deserializes");
+        assert_eq!(decoded_checkpoint.au_owed_cum, large_au);
+
+        let mut state = SessionFailoverState::new(FailoverPolicy::default(), price(), 1_000, 0);
+        state.last_receipted_au = large_au;
+        let state_json = serde_json::to_value(&state).expect("failover state serializes");
+        assert_eq!(
+            state_json["last_receipted_au"].as_str(),
+            Some(large_au_text.as_str())
+        );
+        let decoded_state: SessionFailoverState =
+            serde_json::from_value(state_json).expect("failover state deserializes");
+        assert_eq!(decoded_state.last_receipted_au, large_au);
     }
 
     #[test]
