@@ -17,7 +17,9 @@ pub const DEFAULT_SATURATION_BETA: f64 = 1.0;
 pub const DEFAULT_PRICE_GAMMA: f64 = 0.7;
 pub const DEFAULT_THROUGHPUT_RATIO_GRACE: f64 = 0.8;
 pub const DEFAULT_UNDERDELIVERY_RATIO: f64 = 0.5;
-pub const DEFAULT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.5;
+pub const DEFAULT_UNDERDELIVERY_EVENT_STREAK: u32 = 2;
+pub const DEFAULT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.1;
+pub const DEFAULT_TRANSIENT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.5;
 pub const DEFAULT_LLM_GENERATION_FLOOR_TOK_S: f64 = 5.0;
 pub const DEFAULT_LLM_PREFILL_FLOOR_TOK_S: f64 = 100.0;
 pub const DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S: f64 = 10.0;
@@ -29,7 +31,7 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_EWMA_THRESHOLD: f64 = 0.8;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES: u32 = 3;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_COOLOFF_MILLIS: u64 = 30_000;
 pub const DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK: u32 = 3;
-pub const DEFAULT_CAPACITY_MISMATCH_FACTOR_FLOOR: f64 = 0.5;
+pub const DEFAULT_CAPACITY_MISMATCH_FACTOR_FLOOR: f64 = 0.1;
 const UNVERIFIED_CAPACITY_GROUP: &str = "unverified:identity_anchor";
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -432,7 +434,9 @@ impl ProviderTable {
                     Some(update_ewma(observed.ewma_throughput_ratio, ratio, alpha));
                 if ratio < DEFAULT_UNDERDELIVERY_RATIO {
                     observed.underdelivery_streak = observed.underdelivery_streak.saturating_add(1);
-                    if observed.underdelivery_streak >= 3 && !observed.underdelivery_event_emitted {
+                    if observed.underdelivery_streak >= DEFAULT_UNDERDELIVERY_EVENT_STREAK
+                        && !observed.underdelivery_event_emitted
+                    {
                         observed.underdelivery_event_emitted = true;
                         underdelivery_event = Some(ProviderUnderdeliveryEvent {
                             key: key.clone(),
@@ -711,7 +715,8 @@ pub fn eligible_candidates(
             let latency_factor = (median_ttft / effective_ttft_ms).clamp(0.25, 4.0);
             let error_factor = (1.0 - entry.observed.ewma_error_rate).clamp(0.05, 1.0);
             let throughput_ratio = throughput_delivery_ratio(&entry);
-            let throughput_factor = throughput_standing_factor(throughput_ratio);
+            let throughput_factor =
+                throughput_standing_factor(throughput_ratio, entry.observed.underdelivery_streak);
             let free_slots = heartbeat.q.free_slots;
             let engine_backlog = heartbeat.q.engine_backlog;
             let engine_backlog_factor = engine_backlog_factor(engine_backlog);
@@ -846,19 +851,24 @@ fn throughput_delivery_ratio(entry: &ProviderTableEntry) -> Option<f64> {
     })
 }
 
-fn throughput_standing_factor(ratio: Option<f64>) -> f64 {
+fn throughput_standing_factor(ratio: Option<f64>, underdelivery_streak: u32) -> f64 {
     let Some(ratio) = ratio.filter(|value| value.is_finite()) else {
         return 1.0;
     };
     if ratio >= DEFAULT_THROUGHPUT_RATIO_GRACE {
         return 1.0;
     }
+    let floor = if underdelivery_streak >= DEFAULT_UNDERDELIVERY_EVENT_STREAK {
+        DEFAULT_THROUGHPUT_FACTOR_FLOOR
+    } else {
+        DEFAULT_TRANSIENT_THROUGHPUT_FACTOR_FLOOR
+    };
     if ratio <= DEFAULT_UNDERDELIVERY_RATIO {
-        return DEFAULT_THROUGHPUT_FACTOR_FLOOR;
+        return floor;
     }
     let span = DEFAULT_THROUGHPUT_RATIO_GRACE - DEFAULT_UNDERDELIVERY_RATIO;
     let progress = (ratio - DEFAULT_UNDERDELIVERY_RATIO) / span;
-    DEFAULT_THROUGHPUT_FACTOR_FLOOR + (1.0 - DEFAULT_THROUGHPUT_FACTOR_FLOOR) * progress
+    floor + (1.0 - floor) * progress
 }
 
 fn engine_backlog_factor(backlog: u32) -> f64 {
@@ -1664,16 +1674,42 @@ mod tests {
         honest_heartbeat.perf.tok_s = Some(15.0);
         table.upsert_heartbeat(honest_heartbeat, now);
 
-        for offset in 0..3 {
-            table.record_observation_at(
+        assert!(table
+            .record_observation_at(
                 &over_key,
                 ProviderObservationSample {
                     ttft_ms: 100,
                     tok_s: Some(40.0),
                     error: false,
                 },
-                now + offset,
-            );
+                now,
+            )
+            .is_none());
+        let underdelivery = table
+            .record_observation_at(
+                &over_key,
+                ProviderObservationSample {
+                    ttft_ms: 100,
+                    tok_s: Some(40.0),
+                    error: false,
+                },
+                now + 1,
+            )
+            .expect("second underdelivery emits");
+        assert_eq!(underdelivery.key, over_key);
+        assert_eq!(underdelivery.streak, DEFAULT_UNDERDELIVERY_EVENT_STREAK);
+        assert!(table
+            .record_observation_at(
+                &over_key,
+                ProviderObservationSample {
+                    ttft_ms: 100,
+                    tok_s: Some(40.0),
+                    error: false,
+                },
+                now + 2,
+            )
+            .is_none());
+        for offset in 0..3 {
             table.record_observation_at(
                 &honest_key,
                 ProviderObservationSample {
@@ -1701,6 +1737,7 @@ mod tests {
             .expect("honest candidate");
         assert!(over.throughput_ratio.unwrap() < DEFAULT_UNDERDELIVERY_RATIO);
         assert_eq!(over.throughput_factor, DEFAULT_THROUGHPUT_FACTOR_FLOOR);
+        assert!(over.throughput_factor < DEFAULT_TRANSIENT_THROUGHPUT_FACTOR_FLOOR);
         assert_eq!(over.entry.observed.underdelivery_streak, 3);
         assert_eq!(honest.throughput_ratio, Some(1.0));
         assert_eq!(honest.throughput_factor, 1.0);
@@ -1864,6 +1901,11 @@ mod tests {
         assert!(table
             .record_capacity_mismatch_at(&mismatch_key, now + 4)
             .is_none());
+        for offset in 5..=8 {
+            assert!(table
+                .record_capacity_mismatch_at(&mismatch_key, now + offset)
+                .is_none());
+        }
 
         let request = eligible_request(now + 10);
         let entries = table.entries(now + 10);
@@ -1877,6 +1919,7 @@ mod tests {
             .find(|candidate| candidate.entry.key == honest_key)
             .expect("honest candidate");
         assert!(mismatch.capacity_mismatch_factor < 1.0);
+        assert!(mismatch.capacity_mismatch_factor < DEFAULT_CAPACITY_MISMATCH_FACTOR_FLOOR * 5.0);
         assert!(honest.capacity_mismatch_factor == 1.0);
         assert!(honest.weight > mismatch.weight);
         assert_eq!(mismatch.entry.observed.consecutive_failures, 0);

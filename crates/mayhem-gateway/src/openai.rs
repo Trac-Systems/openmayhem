@@ -19791,7 +19791,7 @@ mod tests {
         assert_eq!(event.command["evidence_hash"], json!(event.evidence_hash));
         assert_eq!(event.command["epoch"], json!(event.at / 7_200 + 1));
         assert_eq!(event.evidence["epoch_seconds"], json!(7_200));
-        assert_eq!(event.evidence["streak"], json!(3));
+        assert_eq!(event.evidence["streak"], json!(2));
         assert_eq!(event.evidence["ratio"], json!(0.2));
     }
 

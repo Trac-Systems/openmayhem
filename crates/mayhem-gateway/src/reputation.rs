@@ -137,7 +137,7 @@ impl ReputationEventKind {
             Self::ProbeOk => Some((0.5, 1.0)),
             Self::ProbeFail => Some((-6.0, 1.0)),
             Self::UptimeTick => Some((0.1, 1.0)),
-            Self::Underdelivery => Some((-2.0, 1.0)),
+            Self::Underdelivery => Some((-6.0, 1.0)),
             Self::DisputeLost => Some((-20.0, 1.0)),
             Self::ProvenanceViolation => None,
         }
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn underdelivery_is_a_soft_negative_reputation_event() {
+    fn underdelivery_is_a_strong_negative_reputation_event() {
         let folded = fold_reputation(
             PROVIDER,
             &[event("under-1", 0, ReputationEventKind::Underdelivery)],
@@ -310,8 +310,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(folded.raw_milli, -2_000);
-        assert_eq!(folded.r_bps, 4800);
+        assert_eq!(folded.raw_milli, -6_000);
+        assert_eq!(folded.r_bps, 4403);
         assert!(!folded.provenance_violation);
     }
 
