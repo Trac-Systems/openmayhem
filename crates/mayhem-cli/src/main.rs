@@ -86,6 +86,10 @@ use tokio::time::{sleep, timeout};
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
+const MAINNET_MSB_NETWORK_ID: u64 = 918;
+const MAINNET_MSB_BOOTSTRAP: &str =
+    "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685";
+const MAINNET_MSB_CHANNEL: &str = "0000trac0network0msb0mainnet0000";
 const DEFAULT_QUANT_BUCKET: &str = "unknown";
 const TNK_E18: u128 = 1_000_000_000_000_000_000;
 const AU_PER_USD: MoneyAu = 1_000_000_000_000_000_000;
@@ -379,6 +383,8 @@ enum ConfigCommands {
 
 #[derive(Debug, Subcommand)]
 enum AdminCommands {
+    /// Register a fresh admin/indexer subnet on mainnet and set its sole initial admin.
+    InitSubnet(AdminInitSubnetArgs),
     /// Set the active rules version and hash.
     SetRules(AdminSetRulesArgs),
     /// Schedule admin-owned contract parameters.
@@ -3234,6 +3240,37 @@ struct AdminReadArgs {
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
     #[arg(long)]
     rpc_url: Option<String>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Parser)]
+struct AdminInitSubnetArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// SC-Bridge websocket URL. Defaults to config.toml.
+    #[arg(long)]
+    sc_bridge_url: Option<String>,
+
+    /// SC-Bridge token. Defaults to the local config; never printed.
+    #[arg(long)]
+    sc_bridge_token: Option<String>,
+
+    /// Broadcast the paid MSB subnet deployment after the read-only preflight.
+    #[arg(long)]
+    confirm: bool,
+
+    /// Seconds to wait for the admin state to become readable.
+    #[arg(long, default_value_t = 120)]
+    timeout_seconds: u64,
 
     /// Print a machine-readable report.
     #[arg(long)]
@@ -13262,6 +13299,7 @@ fn aggregate_prompt_fingerprint_map<'a>(
 
 async fn admin(command: AdminCommands) -> Result<()> {
     match &command {
+        AdminCommands::InitSubnet(args) => return admin_init_subnet(args).await,
         AdminCommands::Disputes { command } => return admin_disputes(command).await,
         AdminCommands::Ban { command } => return admin_ban(command).await,
         AdminCommands::Tier3 { command } => return admin_tier3(command).await,
@@ -13363,6 +13401,183 @@ async fn admin_read_rpc(args: &AdminReadArgs) -> Result<(String, PeerRpcClient)>
     let home = absolutize(home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     Ok((rpc_url.clone(), PeerRpcClient::new(&rpc_url)?))
+}
+
+async fn admin_init_subnet(args: &AdminInitSubnetArgs) -> Result<()> {
+    if args.timeout_seconds == 0 {
+        bail!("--timeout-seconds must be positive");
+    }
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let status = rpc
+        .status()
+        .await
+        .context("reading bootstrap peer status")?;
+    let peer = status
+        .get("peer")
+        .and_then(Value::as_object)
+        .context("peer status is missing peer")?;
+    let msb = status
+        .get("msb")
+        .and_then(Value::as_object)
+        .context("peer status is missing msb")?;
+    let peer_pubkey = peer
+        .get("pubKeyHex")
+        .and_then(Value::as_str)
+        .filter(|value| is_hex_len(value, 64))
+        .context("peer status is missing a 32-byte peer public key")?
+        .to_ascii_lowercase();
+    let peer_msb_address = peer
+        .get("msbAddress")
+        .and_then(Value::as_str)
+        .context("peer status is missing the peer MSB address")?;
+    let base_writable = peer
+        .get("baseWritable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_indexer = peer
+        .get("isIndexer")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let network_id = msb.get("networkId").and_then(Value::as_u64);
+    let msb_bootstrap = msb
+        .get("bootstrapHex")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let msb_channel = msb.get("channel").and_then(Value::as_str).unwrap_or("");
+    let validators = msb
+        .get("connectedValidators")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if network_id != Some(MAINNET_MSB_NETWORK_ID)
+        || msb_bootstrap != MAINNET_MSB_BOOTSTRAP
+        || msb_channel != MAINNET_MSB_CHANNEL
+        || validators == 0
+    {
+        bail!(
+            "fresh subnet initialization requires a synced official MSB mainnet peer with a validator connection"
+        );
+    }
+    let existing_admin = read_state_value(&rpc, "admin").await?;
+    if existing_admin
+        .as_ref()
+        .and_then(Value::as_str)
+        .is_some_and(|admin| !admin.eq_ignore_ascii_case(&peer_pubkey))
+    {
+        bail!("subnet already has a different admin; refusing fresh initialization");
+    }
+    let copy_paste = format!(
+        "mayhem admin init-subnet --home {} --confirm --json",
+        shell_single_quote(&home.display().to_string())
+    );
+    let mut report = json!({
+        "ok": true,
+        "confirmed": false,
+        "rpc_url": rpc_url,
+        "peer_pubkey": peer_pubkey,
+        "peer_msb_address": peer_msb_address,
+        "base_writable": base_writable,
+        "is_indexer": is_indexer,
+        "existing_admin": existing_admin,
+        "msb": {
+            "network_id": network_id,
+            "bootstrap": msb_bootstrap,
+            "channel": msb_channel,
+            "connected_validators": validators,
+        },
+        "copy_paste_confirm_command": copy_paste,
+    });
+    if !args.confirm {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("Fresh mainnet subnet preflight ready.");
+            println!("Peer MSB address: {peer_msb_address}");
+            println!("Bootstrap writer: {base_writable}; indexer: {is_indexer}");
+            println!("Copy/paste confirm command:");
+            println!("{copy_paste}");
+        }
+        return Ok(());
+    }
+    if !base_writable || !is_indexer {
+        bail!(
+            "peer is not the fresh writable bootstrap/indexer; restart it without an existing subnet bootstrap before confirming"
+        );
+    }
+
+    let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
+        Some(&home),
+        args.sc_bridge_url.as_deref(),
+        args.sc_bridge_token.as_deref(),
+    )?;
+    let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(&sc_bridge_url, sc_bridge_token)?)
+        .await
+        .context("connecting to bootstrap SC-Bridge")?;
+    let deployment = bridge
+        .cli("/deploy_subnet")
+        .await
+        .context("broadcasting mainnet subnet deployment")?;
+    let deployment_result = deployment
+        .get("result")
+        .context("subnet deployment did not return a result")?;
+    let deployment_body = deployment_result
+        .get("bdo")
+        .and_then(Value::as_object)
+        .context("subnet deployment result is missing bdo")?;
+    let deployment_tx = deployment_body
+        .get("tx")
+        .and_then(Value::as_str)
+        .filter(|value| is_hex_len(value, 64))
+        .context("subnet deployment result is missing a transaction hash")?
+        .to_ascii_lowercase();
+    let subnet_bootstrap = deployment_body
+        .get("bs")
+        .and_then(Value::as_str)
+        .filter(|value| is_hex_len(value, 64))
+        .context("subnet deployment result is missing a bootstrap")?
+        .to_ascii_lowercase();
+
+    if existing_admin.is_none() {
+        bridge
+            .cli(format!("/add_admin --address {peer_pubkey}"))
+            .await
+            .context("setting the sole initial subnet admin")?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(args.timeout_seconds);
+    let admin_state = loop {
+        let current = read_state_value(&rpc, "admin").await?;
+        if current
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|admin| admin.eq_ignore_ascii_case(&peer_pubkey))
+        {
+            break current;
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for the initial admin state");
+        }
+        sleep(Duration::from_millis(500)).await;
+    };
+    report["confirmed"] = json!(true);
+    report["subnet_bootstrap"] = json!(subnet_bootstrap);
+    report["subnet_deployment_tx"] = json!(deployment_tx);
+    report["admin"] = admin_state.unwrap_or(Value::Null);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Fresh mainnet Intercom subnet initialized.");
+        println!("Subnet bootstrap: {}", report["subnet_bootstrap"]);
+        println!(
+            "MSB deployment transaction: {}",
+            report["subnet_deployment_tx"]
+        );
+        println!("Initial admin: {peer_pubkey}");
+    }
+    Ok(())
 }
 
 async fn admin_tier3_list(args: &AdminTier3ListArgs) -> Result<()> {
@@ -14817,6 +15032,9 @@ async fn read_reputation_probation_policy(rpc: &PeerRpcClient, at: u64) -> Resul
 
 fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
     match command {
+        AdminCommands::InitSubnet(_) => {
+            unreachable!("admin init-subnet is handled before admin_tx_args")
+        }
         AdminCommands::SetRules(args) => &args.tx,
         AdminCommands::SetParams(args) => &args.tx,
         AdminCommands::SetModelRef(args) => &args.tx,
@@ -14870,6 +15088,9 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
 
 fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value)> {
     match command {
+        AdminCommands::InitSubnet(_) => {
+            bail!("admin init-subnet is handled outside generic paid admin commands")
+        }
         AdminCommands::SetRules(args) => Ok(("setRules", admin_set_rules_payload(args))),
         AdminCommands::SetParams(args) => Ok(("setParams", admin_set_params_payload(args)?)),
         AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args)?)),
@@ -43830,6 +44051,29 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("over_credit"));
+    }
+
+    #[test]
+    fn admin_init_subnet_cli_requires_explicit_confirmation() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "init-subnet",
+            "--home",
+            "/tmp/mayhem-mainnet",
+            "--confirm",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::InitSubnet(args) = *command else {
+            panic!("expected init-subnet command");
+        };
+        assert_eq!(args.home.as_deref(), Some(Path::new("/tmp/mayhem-mainnet")));
+        assert!(args.confirm);
+        assert!(args.json);
     }
 
     #[test]

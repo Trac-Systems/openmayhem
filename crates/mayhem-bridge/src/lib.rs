@@ -140,6 +140,23 @@ impl ScBridgeClient {
         self.request(json!({ "type": "info" }), "info").await
     }
 
+    pub async fn cli(&mut self, command: impl AsRef<str>) -> Result<Value> {
+        let response = self
+            .request(
+                json!({ "type": "cli", "command": command.as_ref() }),
+                "cli_result",
+            )
+            .await?;
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            let error = response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("SC-Bridge CLI command failed");
+            return Err(BridgeError::Protocol(error.to_owned()));
+        }
+        Ok(response)
+    }
+
     pub async fn session_subscribe(
         &mut self,
         session_ids: impl IntoIterator<Item = impl AsRef<str>>,
