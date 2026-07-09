@@ -21,7 +21,8 @@ __pycache__/
 stores/
 **/stores/
 **/keypair.json
-docs/test-resources.local.md
-docs/evidence/**/raw-*/
+# docs/ is internal working material — purged from git history 2026-07-09, never re-add
+docs/
+/docs/
 target/
 dist/
