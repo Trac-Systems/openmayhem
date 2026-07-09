@@ -9289,6 +9289,26 @@ fn apply_artifact_metadata_reports(
                     )
                 })?;
             source.insert("revision".to_owned(), json!(target_source_revision));
+
+            if let Some(sidecars) = artifact.get_mut("sidecars").and_then(Value::as_object_mut) {
+                for sidecar in sidecars.values_mut() {
+                    let Some(sidecar_source) =
+                        sidecar.get_mut("source").and_then(Value::as_object_mut)
+                    else {
+                        continue;
+                    };
+                    let matches_artifact_source =
+                        sidecar_source.get("kind").and_then(Value::as_str)
+                            == Some(&entry.source_kind)
+                            && sidecar_source.get("repo").and_then(Value::as_str)
+                                == Some(&entry.source_repo)
+                            && sidecar_source.get("revision").and_then(Value::as_str)
+                                == Some(&entry.source_revision);
+                    if matches_artifact_source {
+                        sidecar_source.insert("revision".to_owned(), json!(target_source_revision));
+                    }
+                }
+            }
         }
         artifact.insert("weights_bytes".to_owned(), json!(entry.weights_bytes));
         if artifact
@@ -10058,7 +10078,11 @@ fn catalog_artifact_stage_plan_report(
         .map(|entry| entry.model_id.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    let preflight_command = catalog_artifact_stage_preflight_command(hf_token_file.as_deref());
+    let needs_llama_cpp = stage_commands
+        .iter()
+        .any(|entry| entry.engine == "llama.cpp");
+    let preflight_command =
+        catalog_artifact_stage_preflight_command(hf_token_file.as_deref(), needs_llama_cpp);
     CatalogArtifactStagePlanReport {
         catalog_path,
         artifact_base,
@@ -10174,13 +10198,25 @@ fn catalog_artifact_publish_plan_report(
                     "{}.artifact-metadata.json",
                     safe_path_component(artifact_name)
                 ));
-            let upload_command = catalog_artifact_upload_command(
+            let upload_command = match catalog_artifact_upload_command(
                 model,
                 artifact_name,
                 artifact,
                 &current_artifact_path,
                 hf_token_file.as_deref(),
-            );
+            ) {
+                Ok(command) => command,
+                Err(err) => {
+                    entry_errors.push(err.to_string());
+                    catalog_canary_plan_command(vec![
+                        "false".to_owned(),
+                        format!(
+                            "invalid artifact upload command for {} {}",
+                            model.model_id, artifact_name
+                        ),
+                    ])
+                }
+            };
             let revision_command =
                 catalog_artifact_revision_command(&artifact.source.repo, hf_token_file.as_deref());
             let metadata_command_template = catalog_artifact_metadata_plan_command(
@@ -10339,6 +10375,7 @@ fn catalog_artifact_stage_source_dir(
 
 fn catalog_artifact_stage_preflight_command(
     hf_token_file: Option<&Path>,
+    needs_llama_cpp: bool,
 ) -> CatalogCanaryPlanCommand {
     let mut checks = vec![
         hf_cli_path_assignment(),
@@ -10352,7 +10389,9 @@ fn catalog_artifact_stage_preflight_command(
             hf_token_file.display()
         ));
     }
-    checks.push("test -n \"${MAYHEM_LLAMA_CPP_DIR:-}\" || { echo \"GGUF staging needs MAYHEM_LLAMA_CPP_DIR pointing at a llama.cpp checkout\" >&2; exit 1; }".to_owned());
+    if needs_llama_cpp {
+        checks.push("test -n \"${MAYHEM_LLAMA_CPP_DIR:-}\" || { echo \"GGUF staging needs MAYHEM_LLAMA_CPP_DIR pointing at a llama.cpp checkout\" >&2; exit 1; }".to_owned());
+    }
     checks.push("command -v python3 >/dev/null".to_owned());
     let script = checks.join(" && ");
     let mut command =
@@ -10408,7 +10447,7 @@ fn catalog_artifact_stage_command(
         )?),
         "vllm" => Ok(catalog_artifact_stage_vllm_command(
             source_dir,
-            &artifact.path,
+            artifact,
             artifact_path,
         )?),
         other => bail!("unsupported artifact engine {other} for staging"),
@@ -10507,23 +10546,74 @@ fn catalog_artifact_stage_trt_command(
 
 fn catalog_artifact_stage_vllm_command(
     source_dir: &Path,
-    source_path: &str,
+    artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
 ) -> Result<CatalogCanaryPlanCommand> {
-    let source_file = source_dir.join(source_path);
-    let script = format!(
-        "mkdir -p {} && test -s {} || {{ echo \"vLLM source safetensors not found: {}\" >&2; exit 1; }} && cp -f {} {} && test -s {}",
-        shell_single_quote(&artifact_path.parent().unwrap_or_else(|| Path::new(".")).display().to_string()),
-        shell_single_quote(&source_file.display().to_string()),
-        source_file.display(),
-        shell_single_quote(&source_file.display().to_string()),
-        shell_single_quote(&artifact_path.display().to_string()),
-        shell_single_quote(&artifact_path.display().to_string())
+    let target_root = catalog_artifact_local_root(artifact_path, &artifact.path)?;
+    let mut files = vec![("weights", artifact.path.as_str())];
+    files.extend(
+        artifact
+            .sidecars
+            .iter()
+            .map(|(name, sidecar)| (name.as_str(), sidecar.path.as_str())),
     );
+    let mut seen_paths = BTreeSet::new();
+    let mut steps = Vec::new();
+    for (label, relative) in files {
+        let relative = validate_catalog_artifact_relative_path(relative)?;
+        if !seen_paths.insert(relative.clone()) {
+            bail!(
+                "vLLM artifact has duplicate staged path {}",
+                relative.display()
+            );
+        }
+        let source_file = source_dir.join(&relative);
+        let target_file = target_root.join(&relative);
+        let target_parent = target_file.parent().unwrap_or_else(|| Path::new("."));
+        steps.push(format!(
+            "mkdir -p {} && test -s {} || {{ echo \"vLLM {label} source file not found: {}\" >&2; exit 1; }} && cp -f {} {} && test -s {}",
+            shell_single_quote(&target_parent.display().to_string()),
+            shell_single_quote(&source_file.display().to_string()),
+            source_file.display(),
+            shell_single_quote(&source_file.display().to_string()),
+            shell_single_quote(&target_file.display().to_string()),
+            shell_single_quote(&target_file.display().to_string())
+        ));
+    }
+    let script = steps.join(" && ");
     let mut command =
         catalog_canary_plan_command(vec!["sh".to_owned(), "-lc".to_owned(), script.clone()]);
     command.shell = script;
     Ok(command)
+}
+
+fn validate_catalog_artifact_relative_path(relative: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(relative);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!("catalog artifact path must be relative: {relative:?}");
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("catalog artifact path must not contain traversal: {relative:?}");
+    }
+    Ok(path)
+}
+
+fn catalog_artifact_local_root(artifact_path: &Path, relative: &str) -> Result<PathBuf> {
+    let relative = validate_catalog_artifact_relative_path(relative)?;
+    let mut root = artifact_path.to_path_buf();
+    for _ in relative.components() {
+        if !root.pop() {
+            bail!(
+                "artifact path {} cannot contain catalog-relative path {}",
+                artifact_path.display(),
+                relative.display()
+            );
+        }
+    }
+    Ok(root)
 }
 
 fn catalog_artifact_stage_follow_up_command(
@@ -10553,14 +10643,14 @@ fn catalog_artifact_upload_command(
     artifact: &catalog::CatalogArtifact,
     current_artifact_path: &Path,
     hf_token_file: Option<&Path>,
-) -> CatalogCanaryPlanCommand {
-    let (upload_path, repo_path) = if artifact.engine == "mlx" {
-        (
-            current_artifact_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-            ".".to_owned(),
-        )
+) -> Result<CatalogCanaryPlanCommand> {
+    validate_catalog_artifact_relative_path(&artifact.path)?;
+    let upload_directory =
+        artifact.engine == "mlx" || (artifact.engine == "vllm" && !artifact.sidecars.is_empty());
+    let upload_root;
+    let (upload_path, repo_path) = if upload_directory {
+        upload_root = catalog_artifact_local_root(current_artifact_path, &artifact.path)?;
+        (upload_root.as_path(), ".".to_owned())
     } else {
         (current_artifact_path, artifact.path.clone())
     };
@@ -10577,7 +10667,7 @@ fn catalog_artifact_upload_command(
     ];
     let mut command = catalog_canary_plan_command(argv);
     command.shell = with_hf_shell_prefix(command.shell, hf_token_file, true);
-    command
+    Ok(command)
 }
 
 fn catalog_artifact_publish_preflight_command(
@@ -53650,6 +53740,42 @@ State initialization...
     }
 
     #[test]
+    fn artifact_stage_plan_vllm_copies_only_declared_sidecars() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].artifacts.clear();
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), test_vllm_artifact());
+
+        let report = catalog_artifact_stage_plan_report(CatalogArtifactStagePlanInput {
+            catalog_doc: &catalog,
+            catalog_path: PathBuf::from("/tmp/catalog.json"),
+            artifact_base: PathBuf::from("/tmp/mayhem-stage-artifacts"),
+            source_cache_dir: PathBuf::from("/tmp/mayhem-source-cache"),
+            hf_token_file: None,
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        assert!(!report
+            .preflight_command
+            .shell
+            .contains("MAYHEM_LLAMA_CPP_DIR"));
+        let entry = &report.stage_commands[0];
+        assert_eq!(entry.artifact, "nvfp4");
+        assert!(entry
+            .stage_command
+            .shell
+            .contains("/tmp/mayhem-source-cache/huggingface/test_source/"));
+        assert!(entry.stage_command.shell.contains("model.safetensors"));
+        assert!(entry.stage_command.shell.contains("config.json"));
+        assert!(entry.stage_command.shell.contains("tokenizer.json"));
+        assert!(entry.stage_command.shell.contains("tokenizer_config.json"));
+        assert!(!entry.stage_command.shell.contains(".cache"));
+    }
+
+    #[test]
     fn artifact_stage_plan_emits_trt_qformat_command() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -53880,6 +54006,53 @@ State initialization...
     }
 
     #[test]
+    fn artifact_publish_plan_uploads_vllm_sidecar_directory() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].artifacts.clear();
+        catalog.models[0]
+            .artifacts
+            .insert("nvfp4".to_owned(), test_vllm_artifact());
+        let temp = env::temp_dir().join(format!(
+            "mayhem-artifact-publish-plan-vllm-{}-{}",
+            std::process::id(),
+            now_millis_for_path()
+        ));
+        let artifact_base = temp.join("artifacts");
+        let artifact = catalog.models[0].artifacts.get("nvfp4").unwrap();
+        let expected_artifact_path = catalog_canary_plan_artifact_path(&artifact_base, artifact);
+        let expected_upload_dir = expected_artifact_path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&expected_upload_dir).unwrap();
+        fs::write(&expected_artifact_path, b"vllm model").unwrap();
+        fs::write(expected_upload_dir.join("config.json"), b"{}").unwrap();
+        fs::write(expected_upload_dir.join("tokenizer.json"), b"{}").unwrap();
+        fs::write(expected_upload_dir.join("tokenizer_config.json"), b"{}").unwrap();
+
+        let report = catalog_artifact_publish_plan_report(CatalogArtifactPublishPlanInput {
+            catalog_doc: &catalog,
+            catalog_path: temp.join("catalog.json"),
+            artifact_base: artifact_base.clone(),
+            report_dir: temp.join("reports"),
+            catalog_output: temp.join("reports/catalog.with-artifacts.json"),
+            catalog_sign: None,
+            hf_token_file: None,
+            launch_only: true,
+        });
+
+        assert!(report.ok, "{:?}", report.errors);
+        let entry = &report.publish_commands[0];
+        assert_eq!(entry.current_artifact_path, expected_artifact_path);
+        assert_eq!(
+            entry.upload_command.argv[7],
+            expected_upload_dir.display().to_string()
+        );
+        assert_eq!(entry.upload_command.argv[8], ".");
+        assert!(!entry.upload_command.shell.contains(".cache"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn artifact_publish_plan_marks_missing_local_artifacts_not_ready() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -54009,6 +54182,27 @@ State initialization...
             .get_mut("gguf-q4_k_m")
             .unwrap()
             .artifact_root_kind = "blake3_descriptor_until_p2_4".to_owned();
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .sidecars
+            .insert(
+                "config".to_owned(),
+                catalog::CatalogArtifactSidecar {
+                    source: catalog::SourceRef {
+                        kind: "huggingface".to_owned(),
+                        repo: "test/model".to_owned(),
+                        revision: "1".repeat(40),
+                        publisher_key: None,
+                    },
+                    path: "config.json".to_owned(),
+                    artifact_root: "55".repeat(32),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 2,
+                    source_sha256: "66".repeat(32),
+                },
+            );
         let published_revision = "44".repeat(20);
         let metadata = catalog_artifact_metadata_report(
             Some((
@@ -54051,6 +54245,22 @@ State initialization...
                             "repo": "test/model",
                             "revision": "1".repeat(40)
                         },
+                        "sidecars": {
+                            "config": {
+                                "source": {
+                                    "kind": "huggingface",
+                                    "repo": "test/model",
+                                    "revision": "1".repeat(40)
+                                }
+                            },
+                            "external": {
+                                "source": {
+                                    "kind": "huggingface",
+                                    "repo": "test/external",
+                                    "revision": "7".repeat(40)
+                                }
+                            }
+                        },
                         "artifact_root_kind": "blake3_descriptor_until_p2_4",
                         "artifact_root": "00".repeat(32),
                         "weights_bytes": 42
@@ -54063,6 +54273,16 @@ State initialization...
         assert_eq!(
             catalog_value["models"][0]["artifacts"]["gguf-q4_k_m"]["source"]["revision"],
             json!(published_revision)
+        );
+        assert_eq!(
+            catalog_value["models"][0]["artifacts"]["gguf-q4_k_m"]["sidecars"]["config"]["source"]
+                ["revision"],
+            json!(published_revision)
+        );
+        assert_eq!(
+            catalog_value["models"][0]["artifacts"]["gguf-q4_k_m"]["sidecars"]["external"]
+                ["source"]["revision"],
+            json!("7".repeat(40))
         );
 
         let _ = fs::remove_file(path);
@@ -55710,6 +55930,48 @@ State initialization...
                     rate_map: Vec::new(),
                 },
             }],
+        }
+    }
+
+    fn test_vllm_artifact() -> catalog::CatalogArtifact {
+        let source = catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "test/model-vllm".to_owned(),
+            revision: "4".repeat(40),
+            publisher_key: None,
+        };
+        let sidecar = |path: &str, byte: &str| catalog::CatalogArtifactSidecar {
+            source: source.clone(),
+            path: path.to_owned(),
+            artifact_root: byte.repeat(64),
+            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+            weights_bytes: 2,
+            source_sha256: byte.repeat(64),
+        };
+        let mut sidecars = BTreeMap::new();
+        sidecars.insert("vllm_config".to_owned(), sidecar("config.json", "a"));
+        sidecars.insert(
+            "vllm_tokenizer_json".to_owned(),
+            sidecar("tokenizer.json", "b"),
+        );
+        sidecars.insert(
+            "vllm_tokenizer_config".to_owned(),
+            sidecar("tokenizer_config.json", "c"),
+        );
+        catalog::CatalogArtifact {
+            engine: "vllm".to_owned(),
+            source,
+            path: "model.safetensors".to_owned(),
+            artifact_root: "dd".repeat(32),
+            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+            weights_bytes: 24,
+            source_sha256: Some("ee".repeat(32)),
+            tokenizer_sha256: None,
+            chat_template_sha256: None,
+            min_compute_cap: Some("12.0".to_owned()),
+            download_check: false,
+            notes: None,
+            sidecars,
         }
     }
 
