@@ -15,25 +15,13 @@ import {
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
+import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
 const U = (n) => ethers.parseUnits(String(n), 18);
 
-function receipt({ session, provider, epoch, user = 'user-a', au, seq = 1 }) {
-  return {
-    epoch,
-    receipt: {
-      body: {
-        session_id: session,
-        seq,
-        user,
-        provider,
-        au_owed_cum: au,
-      },
-    },
-  };
-}
+const receipt = signedTapReceipt;
 
 test('TAP loop holds immature earnings, then provider self-claims without a custodial payout wallet', async () => {
   const ganache = Ganache.provider({
@@ -61,13 +49,14 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
   await (await buyer.sendTransaction(depositIntent.transactions[1])).wait();
   assert.equal(await pool.totalDeposited(), U(3));
 
+  const providerId = makeReceiptIdentity();
   const bundle = {
     epoch: 1,
-    receipts: [receipt({ session: 's1', provider: 'provider_a', epoch: 1, au: usdAu(2) })],
+    receipts: [receipt({ session: 's1', provider: providerId, epoch: 1, au: usdAu(2) })],
   };
   const immature = await rollTapSettlement({
     bundle,
-    providerAccounts: { provider_a: providerAccount },
+    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 1,
@@ -86,7 +75,7 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
 
   const matured = await rollTapSettlement({
     bundle,
-    providerAccounts: { provider_a: providerAccount },
+    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 2,

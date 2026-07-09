@@ -20,6 +20,7 @@ import {
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
+import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
@@ -57,27 +58,7 @@ function runNode(args, options = {}) {
   });
 }
 
-function receipt({
-  session,
-  provider,
-  user = 'user-a',
-  au,
-  seq = 1,
-  extra = {},
-}) {
-  return {
-    receipt: {
-      body: {
-        session_id: session,
-        seq,
-        user,
-        provider,
-        au_owed_cum: au,
-      },
-    },
-    ...extra,
-  };
-}
+const receipt = signedTapReceipt;
 
 test('TAP settlement roller posts root and provider proof verifies independently', async () => {
   const ganache = Ganache.provider({
@@ -97,14 +78,17 @@ test('TAP settlement roller posts root and provider proof verifies independently
   await (await token.connect(buyer).approve(poolAddr, U(10))).wait();
   await (await pool.connect(buyer).deposit(U(10))).wait();
 
+  const providerAId = makeReceiptIdentity();
+  const providerBId = makeReceiptIdentity();
   const providerAccounts = {
-    provider_a: await providerA.getAddress(),
-    provider_b: await providerB.getAddress(),
+    [providerAId.publicKeyHex]: await providerA.getAddress(),
+    [providerBId.publicKeyHex]: await providerB.getAddress(),
   };
   const bundle = {
+    epoch: 1,
     receipts: [
-      receipt({ session: 's1', provider: 'provider_a', au: usdAu(1) }),
-      receipt({ session: 's2', provider: 'provider_b', au: usdAu(3) }),
+      receipt({ session: 's1', provider: providerAId, au: usdAu(1) }),
+      receipt({ session: 's2', provider: providerBId, au: usdAu(3) }),
     ],
   };
   const rolled = await rollTapSettlement({
@@ -112,6 +96,7 @@ test('TAP settlement roller posts root and provider proof verifies independently
     providerAccounts,
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
     operatorAddress: await operatorTreasury.getAddress(),
@@ -123,8 +108,8 @@ test('TAP settlement roller posts root and provider proof verifies independently
   const claimA = providerShareWei(spentA);
   const claimB = providerShareWei(spentB);
   const expectedDist = distribution([
-    { account: providerAccounts.provider_a.toLowerCase(), amount: claimA },
-    { account: providerAccounts.provider_b.toLowerCase(), amount: claimB },
+    { account: providerAccounts[providerAId.publicKeyHex].toLowerCase(), amount: claimA },
+    { account: providerAccounts[providerBId.publicKeyHex].toLowerCase(), amount: claimB },
   ]);
 
   assert.equal(rolled.posted, true);
@@ -143,11 +128,11 @@ test('TAP settlement roller posts root and provider proof verifies independently
   assert.equal(await pool.operatorClaimable(), 0n);
 
   await (await pool.connect(providerA).claim(
-    providerAccounts.provider_a,
+    providerAccounts[providerAId.publicKeyHex],
     claimA,
-    rolled.proofs[providerAccounts.provider_a.toLowerCase()].proof
+    rolled.proofs[providerAccounts[providerAId.publicKeyHex].toLowerCase()].proof
   )).wait();
-  assert.equal(await token.balanceOf(providerAccounts.provider_a), claimA);
+  assert.equal(await token.balanceOf(providerAccounts[providerAId.publicKeyHex]), claimA);
 });
 
 test('TAP settlement roller uses provider account mapping and skips repeated roots', async () => {
@@ -166,29 +151,44 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   await (await token.connect(buyer).approve(poolAddr, U(5))).wait();
   await (await pool.connect(buyer).deposit(U(5))).wait();
 
+  const providerId = makeReceiptIdentity();
   const bundle = {
-    receipts: [receipt({ session: 's1', provider: 'provider_a', au: usdAu(1) })],
+    epoch: 1,
+    receipts: [receipt({ session: 's1', provider: providerId, au: usdAu(1) })],
   };
   assert.throws(
-    () => buildTapSettlement({ bundle, tapUsdAu: TAP_USD_AU, ledgerFeeBps: 1500 }),
+    () => buildTapSettlement({ bundle, tapUsdAu: TAP_USD_AU, ledgerFeeBps: 1500, settleThroughEpoch: 7 }),
     /Missing TAP claim address/
   );
   assert.throws(
     () => buildTapSettlement({
       bundle,
-      providerAccounts: { provider_a: '0x1111111111111111111111111111111111111111' },
+      providerAccounts: { [providerId.publicKeyHex]: '0x1111111111111111111111111111111111111111' },
+      tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500,
+      settleThroughEpoch: 1,
+      challengeEpochs: 0,
+    }),
+    /challenge_epochs must be non-zero/
+  );
+  assert.throws(
+    () => buildTapSettlement({
+      bundle,
+      providerAccounts: { [providerId.publicKeyHex]: '0x1111111111111111111111111111111111111111' },
       tapUsdAu: TAP_USD_AU,
       ledgerFeeBps: 1200,
+      settleThroughEpoch: 7,
     }),
     /must equal on-chain OPERATOR_BPS/
   );
 
-  const providerAccounts = { provider_a: await providerA.getAddress() };
+  const providerAccounts = { [providerId.publicKeyHex]: await providerA.getAddress() };
   const first = await rollTapSettlement({
     bundle,
     providerAccounts,
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
     operatorAddress: await operatorTreasury.getAddress(),
@@ -201,6 +201,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
     providerAccounts,
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
     operatorAddress: await operatorTreasury.getAddress(),
@@ -211,33 +212,67 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   assert.deepEqual(replay.reasons, ['no new spend since last root']);
 });
 
-test('TAP settlement roller supports weighted multi-provider receipts', () => {
+test('TAP settlement roller refuses unsigned multi-provider split controls', () => {
+  const providerId = makeReceiptIdentity();
   const a = '0x1111111111111111111111111111111111111111';
   const b = '0x2222222222222222222222222222222222222222';
-  const settlement = buildTapSettlement({
-    tapUsdAu: TAP_USD_AU,
-    ledgerFeeBps: 1500,
-    bundle: {
-      receipts: [{
-        receipt: {
-          body: {
-            session_id: 's1',
-            seq: 1,
-            user: 'user-a',
-            provider: 'ignored-primary',
+  assert.throws(
+    () => buildTapSettlement({
+      tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500,
+      bundle: {
+        epoch: 1,
+        receipts: [receipt({
+          session: 's1',
+          provider: providerId,
+          au: usdAu(4),
+          extraBody: {
             provider_refs: ['pa', 'pb'],
             contribution_weights_bps: [2_500, 7_500],
-            au_owed_cum: usdAu(4),
           },
-        },
-      }],
-    },
-    providerAccounts: { pa: a, pb: b },
-  });
-  const spent = auToTapWei(usdAu(4), TAP_USD_AU);
-  assert.equal(settlement.cumulative_spent_wei, spent.toString());
-  assert.equal(settlement.proofs[a].cumulative_wei, providerShareWei(spent, 2_500).toString());
-  assert.equal(settlement.proofs[b].cumulative_wei, providerShareWei(spent, 7_500).toString());
+        })],
+      },
+      providerAccounts: { [providerId.publicKeyHex]: a, pa: a, pb: b },
+      settleThroughEpoch: 7,
+    }),
+    /multi-provider TAP receipts require a signed contribution schema/
+  );
+});
+
+test('TAP settlement roller rejects unsigned and tampered receipts before root construction', () => {
+  const providerId = makeReceiptIdentity();
+  const account = '0x1111111111111111111111111111111111111111';
+  const signed = receipt({ session: 's1', provider: providerId, au: usdAu(2) });
+  assert.throws(
+    () => buildTapSettlement({
+      tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500,
+      bundle: {
+        epoch: 1,
+        receipts: [{
+          receipt: {
+            body: signed.receipt.body,
+          },
+        }],
+      },
+      providerAccounts: { [providerId.publicKeyHex]: account },
+      settleThroughEpoch: 7,
+    }),
+    /Invalid enclave receipt signature/
+  );
+
+  const tampered = structuredClone(signed);
+  tampered.receipt.body.au_owed_cum = usdAu(3);
+  assert.throws(
+    () => buildTapSettlement({
+      tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500,
+      bundle: { epoch: 1, receipts: [tampered] },
+      providerAccounts: { [providerId.publicKeyHex]: account },
+      settleThroughEpoch: 7,
+    }),
+    /Invalid enclave receipt signature/
+  );
 });
 
 test('guardian pre-sign screen halts invariant violations', async () => {
@@ -309,6 +344,67 @@ test('guardian pre-sign screen halts invariant violations', async () => {
   });
   assert.equal(decreasedProvider.ok, false);
   assert.match(decreasedProvider.reasons.join('; '), /cumulative for .* decreased/);
+
+  const droppedWithoutClaimCheck = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '1100',
+      entries: [],
+    },
+    previous: {
+      epoch: 1,
+      cumulative_spent_wei: '1000',
+      entries: [{ account: a, cumulative_wei: '700' }],
+    },
+    epoch: 2,
+    currentEpoch: 1,
+    prevSpentWei: '1000',
+    totalDepositedWei: '1100',
+    maxEpochDeltaWei: '0',
+  });
+  assert.equal(droppedWithoutClaimCheck.ok, false);
+  assert.match(droppedWithoutClaimCheck.reasons.join('; '), /on-chain claimed check required/);
+
+  const droppedUnclaimed = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '1100',
+      entries: [],
+    },
+    previous: {
+      epoch: 1,
+      cumulative_spent_wei: '1000',
+      entries: [{ account: a, cumulative_wei: '700' }],
+    },
+    epoch: 2,
+    currentEpoch: 1,
+    prevSpentWei: '1000',
+    totalDepositedWei: '1100',
+    maxEpochDeltaWei: '0',
+    pool: { claimed: async () => 100n },
+  });
+  assert.equal(droppedUnclaimed.ok, false);
+  assert.match(droppedUnclaimed.reasons.join('; '), /dropped below unclaimed prior/);
+
+  const droppedAfterFullyClaimed = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '1100',
+      entries: [],
+    },
+    previous: {
+      epoch: 1,
+      cumulative_spent_wei: '1000',
+      entries: [{ account: a, cumulative_wei: '700' }],
+    },
+    epoch: 2,
+    currentEpoch: 1,
+    prevSpentWei: '1000',
+    totalDepositedWei: '1100',
+    maxEpochDeltaWei: '0',
+    pool: { claimed: async () => 700n },
+  });
+  assert.equal(droppedAfterFullyClaimed.ok, true);
 });
 
 test('TAP settlement CLI dry-runs and broadcasts with env key against a locked JSON-RPC node', async (t) => {
@@ -353,11 +449,13 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const bundlePath = path.join(tmp, 'bundle.json');
   const providerAccountsPath = path.join(tmp, 'providers.json');
+  const providerId = makeReceiptIdentity();
   fs.writeFileSync(bundlePath, JSON.stringify({
-    receipts: [receipt({ session: 'cli-s1', provider: 'provider_cli', au: usdAu(1) })],
+    epoch: 1,
+    receipts: [receipt({ session: 'cli-s1', provider: providerId, au: usdAu(1) })],
   }, null, 2));
   fs.writeFileSync(providerAccountsPath, JSON.stringify({
-    provider_cli: await providerSigner.getAddress(),
+    [providerId.publicKeyHex]: await providerSigner.getAddress(),
   }, null, 2));
 
   const baseArgs = [
@@ -369,6 +467,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     '--eth-rpc', rpc,
     '--pool', poolAddr,
     '--operator-address', await operatorTreasury.getAddress(),
+    '--settle-through-epoch', '7',
     '--json',
   ];
   const baseEnv = { ...process.env };

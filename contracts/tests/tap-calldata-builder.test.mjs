@@ -17,6 +17,7 @@ import {
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
+import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
@@ -26,19 +27,7 @@ const OPERATOR_KEY = testKey(1);
 const BUYER_KEY = testKey(2);
 const POOR_BUYER_KEY = testKey(3);
 
-function receipt({ session, provider, user = 'user-a', au, seq = 1 }) {
-  return {
-    receipt: {
-      body: {
-        session_id: session,
-        seq,
-        user,
-        provider,
-        au_owed_cum: au,
-      },
-    },
-  };
-}
+const receipt = signedTapReceipt;
 
 async function localPool(accounts = 5) {
   const ganache = Ganache.provider({
@@ -181,13 +170,16 @@ test('claim calldata executes MayhemInferencePool.claim from provider wallet', a
   await (await token.connect(buyer).approve(poolAddr, U('3'))).wait();
   await (await pool.connect(buyer).deposit(U('3'))).wait();
 
+  const providerId = makeReceiptIdentity();
   const rolled = await rollTapSettlement({
     bundle: {
-      receipts: [receipt({ session: 's1', provider: 'provider_a', au: usdAu(2) })],
+      epoch: 1,
+      receipts: [receipt({ session: 's1', provider: providerId, au: usdAu(2) })],
     },
-    providerAccounts: { provider_a: providerAccount },
+    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
     operatorAddress: await operator.getAddress(),

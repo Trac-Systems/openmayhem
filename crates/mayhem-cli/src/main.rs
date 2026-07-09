@@ -1020,6 +1020,14 @@ struct UpArgs {
     #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS)]
     hardware_quote_verifier_timeout_seconds: u64,
 
+    /// Also supervise the fraud-proof challenger watcher from this one-terminal stack.
+    #[arg(long)]
+    fraud_challenger: bool,
+
+    /// Poll interval for the supervised fraud-proof challenger.
+    #[arg(long, default_value_t = 15)]
+    fraud_challenger_poll_interval_seconds: u64,
+
     /// Intercom/Pear network: mainnet, testnet1, local, or development. Defaults to config, env, or mainnet.
     #[arg(long)]
     network: Option<String>,
@@ -17874,11 +17882,16 @@ struct UpPlan {
     provider_hardware_quote_timeout_seconds: u64,
     hardware_quote_verifier_command: Option<PathBuf>,
     hardware_quote_verifier_timeout_seconds: u64,
+    fraud_challenger: bool,
+    fraud_challenger_poll_interval_seconds: u64,
 }
 
 async fn up(args: UpArgs) -> Result<()> {
     if args.timeout_seconds == 0 {
         bail!("--timeout-seconds must be positive");
+    }
+    if args.fraud_challenger && args.fraud_challenger_poll_interval_seconds == 0 {
+        bail!("--fraud-challenger-poll-interval-seconds must be positive when --fraud-challenger is set");
     }
     let plan = prepare_up_plan(&args).await?;
     write_up_supervisor_config(&plan)?;
@@ -17994,6 +18007,10 @@ async fn up(args: UpArgs) -> Result<()> {
         "provider_workers": provider_worker_report,
         "provider_auto_fit": &provider_auto_fit_report,
         "provider_explicit_launch": &provider_explicit_launch_report,
+        "fraud_challenger": {
+            "supervised": plan.fraud_challenger,
+            "poll_interval_seconds": plan.fraud_challenger_poll_interval_seconds,
+        },
         "role": plan.role.as_str(),
         "network": {
             "name": &plan.network,
@@ -18087,6 +18104,12 @@ async fn up(args: UpArgs) -> Result<()> {
                     );
                 }
             }
+        }
+        if plan.fraud_challenger {
+            println!(
+                "Fraud-proof challenger is supervised by mayhemd every {}s.",
+                plan.fraud_challenger_poll_interval_seconds
+            );
         }
     }
     Ok(())
@@ -18519,6 +18542,8 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         provider_hardware_quote_timeout_seconds: args.provider_hardware_quote_timeout_seconds,
         hardware_quote_verifier_command,
         hardware_quote_verifier_timeout_seconds: args.hardware_quote_verifier_timeout_seconds,
+        fraud_challenger: args.fraud_challenger,
+        fraud_challenger_poll_interval_seconds: args.fraud_challenger_poll_interval_seconds,
     })
 }
 
@@ -18834,6 +18859,31 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         gateway_args.push("--dev-embedded-catalog".to_owned());
     }
     write_supervisor_child(&mut out, "gateway", &plan.mayhem_path, &gateway_args, None)?;
+
+    if plan.fraud_challenger {
+        let challenger_args = vec![
+            "fraud-proof".to_owned(),
+            "challenge".to_owned(),
+            "--home".to_owned(),
+            plan.home.display().to_string(),
+            "--rpc-url".to_owned(),
+            plan.rpc_url.clone(),
+            "--gateway-url".to_owned(),
+            plan.gateway_url.clone(),
+            "--watch".to_owned(),
+            "--submit".to_owned(),
+            "--poll-interval-seconds".to_owned(),
+            plan.fraud_challenger_poll_interval_seconds.to_string(),
+            "--json".to_owned(),
+        ];
+        write_supervisor_child(
+            &mut out,
+            "fraud-challenger",
+            &plan.mayhem_path,
+            &challenger_args,
+            None,
+        )?;
+    }
 
     if plan.provider && !up_provider_workers_deferred(plan) {
         for worker in &plan.provider_workers {
@@ -52567,6 +52617,8 @@ State initialization...
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
             hardware_quote_verifier_command: None,
             hardware_quote_verifier_timeout_seconds: DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
+            fraud_challenger: false,
+            fraud_challenger_poll_interval_seconds: 15,
         }
     }
 
@@ -52618,6 +52670,62 @@ State initialization...
         assert!(text.contains("--gpu-layers"));
         assert!(text.contains("\"0\""));
         assert!(!text.contains("--peer-dht-bootstrap"));
+    }
+
+    #[test]
+    fn up_supervisor_config_can_launch_fraud_challenger() {
+        let home = std::env::temp_dir().join(format!(
+            "mayhem-up-fraud-challenger-config-test-{}-{}",
+            std::process::id(),
+            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut plan = test_up_supervisor_plan(home.clone(), Vec::new());
+        plan.fraud_challenger = true;
+        plan.fraud_challenger_poll_interval_seconds = 11;
+
+        let text = up_supervisor_config(&plan).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let children = parsed
+            .get("supervisor")
+            .and_then(|value| value.get("children"))
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        let names = children
+            .iter()
+            .filter_map(|child| child.get("name").and_then(toml::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["peer", "gateway", "fraud-challenger"]);
+
+        let challenger = children
+            .iter()
+            .find(|child| {
+                child.get("name").and_then(toml::Value::as_str) == Some("fraud-challenger")
+            })
+            .unwrap();
+        let args = challenger
+            .get("args")
+            .and_then(toml::Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(&args[0..2], &["fraud-proof", "challenge"]);
+        assert!(args.contains(&"--watch"));
+        assert!(args.contains(&"--submit"));
+        assert!(args.contains(&"--json"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--rpc-url", plan.rpc_url.as_str()]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--gateway-url", plan.gateway_url.as_str()]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--poll-interval-seconds", "11"]));
+        let home_str = home.display().to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--home" && pair[1] == home_str));
     }
 
     #[test]
@@ -52831,6 +52939,8 @@ State initialization...
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
             hardware_quote_verifier_command: None,
             hardware_quote_verifier_timeout_seconds: DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
+            fraud_challenger: false,
+            fraud_challenger_poll_interval_seconds: 15,
             network: None,
             subnet_channel: None,
             subnet_bootstrap: None,

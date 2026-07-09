@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,10 @@ export const PROVIDER_BPS = 7_500n;
 export const OPERATOR_BPS = 1_500n;
 export const BURN_BPS = 1_000n;
 const PROVIDER_CAP_TOLERANCE_WEI = 0n;
+const SESSION_RECEIPT_SCHEMA_VERSION = 8;
+const SIGNING_MESSAGE_VERSION = 2;
+const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 export const POOL_SETTLEMENT_ABI = [
   'function setRoot(bytes32 newRoot, uint256 newEpoch, uint256 newCumulativeSpent)',
@@ -150,12 +155,21 @@ function normalizeAddress(value, label) {
   }
 }
 
-function maybeAddress(value) {
-  try {
-    return ethers.getAddress(String(value ?? '')).toLowerCase();
-  } catch (_error) {
-    return null;
-  }
+function isHexBytes(value, bytes) {
+  return typeof value === 'string' && new RegExp(`^[0-9a-f]{${bytes * 2}}$`, 'i').test(value);
+}
+
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function ed25519PublicKeyFromRawHex(publicKeyHex) {
+  if (!isHexBytes(publicKeyHex, 32)) throw new Error('receipt public key must be 32 bytes of hex');
+  return crypto.createPublicKey({
+    key: Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(publicKeyHex, 'hex')]),
+    format: 'der',
+    type: 'spki',
+  });
 }
 
 function safeAu(value, label, { allowZero = false } = {}) {
@@ -175,6 +189,82 @@ function addWei(map, account, amountWei) {
   map.set(account, (map.get(account) ?? 0n) + amountWei);
 }
 
+export function canonicalReceiptBody(body) {
+  const canonical = {
+    schema_version: body.schema_version,
+    session_id: body.session_id,
+    seq: body.seq,
+    final: body.final,
+    rail: body.rail,
+    user: body.user,
+    provider: body.provider,
+    enclave_id: body.enclave_id,
+    model_id: body.model_id,
+    price_ver: body.price_ver,
+    locked_rate_map: body.locked_rate_map,
+    locked_per_req_au: body.locked_per_req_au,
+    locked_min_session_au: body.locked_min_session_au,
+    served_ctx: body.served_ctx,
+  };
+  if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
+  if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
+  canonical.rules_ver = body.rules_ver;
+  canonical.usage = body.usage;
+  canonical.au_owed_cum = body.au_owed_cum;
+  canonical.prompt_hash = body.prompt_hash;
+  canonical.ts = body.ts;
+  return canonical;
+}
+
+export function receiptMessage(body, signingVersion = SIGNING_MESSAGE_VERSION) {
+  if (signingVersion !== SIGNING_MESSAGE_VERSION) {
+    throw new Error(`Unsupported signing message version: ${signingVersion}`);
+  }
+  return JSON.stringify({
+    domain: 'mayhem-session-receipt',
+    signing_version: signingVersion,
+    body: canonicalReceiptBody(body),
+  });
+}
+
+function verifyEd25519Hex(signatureHex, message, publicKeyHex, label) {
+  if (!isHexBytes(signatureHex, 64)) throw new Error(`Invalid ${label} receipt signature`);
+  const publicKey = ed25519PublicKeyFromRawHex(publicKeyHex);
+  const ok = crypto.verify(null, Buffer.from(message), publicKey, Buffer.from(signatureHex, 'hex'));
+  if (!ok) throw new Error(`Invalid ${label} receipt signature`);
+}
+
+export function verifyReceiptEnvelope(envelope) {
+  if (!isObject(envelope?.body)) throw new Error('receipt body must be an object');
+  const body = envelope.body;
+  if (body.schema_version !== SESSION_RECEIPT_SCHEMA_VERSION) {
+    throw new Error(`receipt schema_version must be ${SESSION_RECEIPT_SCHEMA_VERSION}`);
+  }
+  if (body.rail !== 'tap') throw new Error('TAP settlement receipt rail must be tap');
+  for (const field of ['session_id', 'model_id', 'prompt_hash']) {
+    if (typeof body[field] !== 'string' || body[field].length === 0 || body[field].length > 256) {
+      throw new Error(`Invalid receipt ${field}`);
+    }
+  }
+  if (!isHexBytes(body.user, 32)) throw new Error('Invalid receipt user public key');
+  if (!isHexBytes(body.provider, 32)) throw new Error('Invalid receipt provider public key');
+  if (!Number.isSafeInteger(body.seq) || body.seq < 0) throw new Error('Invalid receipt sequence');
+  if (typeof body.final !== 'boolean') throw new Error('Invalid receipt final flag');
+  if (!Number.isSafeInteger(body.price_ver) || body.price_ver < 1) throw new Error('Invalid receipt price version');
+  if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) throw new Error('Invalid receipt rules version');
+  if (!Number.isSafeInteger(body.served_ctx) || body.served_ctx < 0) throw new Error('Invalid receipt served context');
+  if (!Number.isSafeInteger(body.ts) || body.ts < 0) throw new Error('Invalid receipt timestamp');
+  safeAu(body.locked_per_req_au, 'receipt locked_per_req_au', { allowZero: true });
+  safeAu(body.locked_min_session_au, 'receipt locked_min_session_au', { allowZero: true });
+  safeAu(body.au_owed_cum, 'receipt au_owed_cum');
+  const enclaveKey = envelope.enclave_pubkey ?? (isHexBytes(body.enclave_id, 32) ? body.enclave_id : null);
+  if (!enclaveKey) throw new Error('receipt enclave public key is required');
+  const message = receiptMessage(body);
+  verifyEd25519Hex(envelope.enclave_sig, message, enclaveKey, 'enclave');
+  verifyEd25519Hex(envelope.user_sig, message, body.user, 'user');
+  return true;
+}
+
 export function auToTapWei(au, tapUsdAu) {
   const safe = safeAu(au, 'au', { allowZero: true });
   const rate = safeAu(tapUsdAu, 'tap_usd_au');
@@ -190,14 +280,33 @@ export function providerShareWei(spentWei, weightBps = 10_000) {
 
 function receiptEnvelope(entry) {
   const receipt = entry.receipt ?? entry;
-  const body = receipt.body ?? receipt;
+  const bodySource = receipt.body ?? receipt;
+  const {
+    enclave_sig: _enclaveSig,
+    user_sig: _userSig,
+    enclave_pubkey: _enclavePubkey,
+    receipt_ack: _receiptAck,
+    voucher: _voucher,
+    ...body
+  } = bodySource;
   if (!isObject(body)) throw new Error('receipt body must be an object');
-  return { entry, body };
+  return {
+    entry,
+    body,
+    envelope: {
+      body,
+      enclave_sig: receipt.enclave_sig ?? entry.enclave_sig ?? null,
+      user_sig: receipt.user_sig ?? entry.user_sig ?? null,
+      enclave_pubkey: receipt.enclave_pubkey ?? entry.enclave_pubkey ?? bodySource.enclave_pubkey ?? null,
+    },
+  };
 }
 
 function receiptDeltaAu(entry, body, previousBySession) {
   const explicit = entry.settle_au ?? entry.au_delta;
-  if (explicit !== undefined) return safeAu(explicit, 'receipt settle_au');
+  if (explicit !== undefined) {
+    throw new Error('TAP settlement amount must derive from signed receipt cumulative amount');
+  }
   const current = safeAu(body.au_owed_cum, 'receipt au_owed_cum');
   const session = body.session_id;
   if (typeof session !== 'string' || session.length === 0) throw new Error('receipt session_id is required');
@@ -216,41 +325,29 @@ function providerAccountFor(providerId, entry, body, providerAccounts) {
     ?? entry.tap_address
     ?? body.provider_tap_address
     ?? body.tap_address;
-  if (direct) return normalizeAddress(direct, 'provider TAP address');
-  if (providerAccounts && providerAccounts[providerId]) {
-    return normalizeAddress(providerAccounts[providerId], `provider account for ${providerId}`);
+  if (direct) {
+    throw new Error('provider TAP address must come from operator provider-account map');
   }
-  const providerAsAddress = maybeAddress(providerId);
-  if (providerAsAddress) return providerAsAddress;
+  const mapped = providerAccounts?.[providerId] ?? providerAccounts?.[providerId.toLowerCase()];
+  if (mapped) {
+    return normalizeAddress(mapped, `provider account for ${providerId}`);
+  }
   throw new Error(`Missing TAP claim address for provider ${providerId}`);
 }
 
 function receiptProviders(entry, body, providerAccounts) {
   const refs = entry.provider_refs ?? body.provider_refs;
   if (refs !== undefined) {
-    if (!Array.isArray(refs) || refs.length === 0) throw new Error('provider_refs must be a non-empty array');
-    const weights = entry.contribution_weights_bps ?? body.contribution_weights_bps;
-    if (weights !== undefined && (!Array.isArray(weights) || weights.length !== refs.length)) {
-      throw new Error('contribution_weights_bps must match provider_refs length');
-    }
-    const evenWeight = Math.floor(10_000 / refs.length);
-    return refs.map((providerId, index) => {
-      if (typeof providerId !== 'string' || providerId.length === 0) {
-        throw new Error('provider_refs entries must be non-empty strings');
-      }
-      return {
-        provider_id: providerId,
-        account: providerAccountFor(providerId, entry, body, providerAccounts),
-        weight_bps: weights === undefined
-          ? (index === refs.length - 1 ? 10_000 - evenWeight * (refs.length - 1) : evenWeight)
-          : parseNonNegativeInt(weights[index], 'provider weight bps'),
-      };
-    });
+    throw new Error('multi-provider TAP receipts require a signed contribution schema');
+  }
+  if (entry.contribution_weights_bps !== undefined || body.contribution_weights_bps !== undefined) {
+    throw new Error('multi-provider TAP receipts require a signed contribution schema');
   }
   const providerId = body.provider;
   if (typeof providerId !== 'string' || providerId.length === 0) {
     throw new Error('receipt provider is required');
   }
+  if (!isHexBytes(providerId, 32)) throw new Error('receipt provider must be a 32-byte public key');
   return [{
     provider_id: providerId,
     account: providerAccountFor(providerId, entry, body, providerAccounts),
@@ -269,12 +366,45 @@ function releasePolicy({ settleThroughEpoch, challengeEpochs = 0, holdbackEpochs
   const through = parseOptionalNonNegativeInt(settleThroughEpoch, 'settle through epoch');
   const challenge = parseNonNegativeInt(challengeEpochs, 'challenge epochs', 0);
   const holdback = parseNonNegativeInt(holdbackEpochs, 'holdback epochs', 0);
+  if (challenge <= 0) throw new Error('TAP settlement challenge_epochs must be non-zero');
   return {
     settle_through_epoch: through,
     challenge_epochs: challenge,
     holdback_epochs: holdback,
     release_delay_epochs: Math.max(challenge, holdback),
   };
+}
+
+function tapSettlementChallengeEpochs(inputBundle, explicitChallengeEpochs) {
+  const raw = explicitChallengeEpochs
+    ?? inputBundle?.challenge_epochs
+    ?? inputBundle?.release_policy?.challenge_epochs
+    ?? inputBundle?.params?.challenge_epochs
+    ?? inputBundle?.audited_epoch?.params?.challenge_epochs
+    ?? inputBundle?.recomputed?.params?.challenge_epochs
+    ?? DEFAULT_TAP_CHALLENGE_EPOCHS;
+  return parseNonNegativeInt(raw, 'TAP settlement challenge_epochs');
+}
+
+function tapSettlementHoldbackEpochs(inputBundle, explicitHoldbackEpochs) {
+  const raw = explicitHoldbackEpochs
+    ?? inputBundle?.holdback_epochs
+    ?? inputBundle?.release_policy?.holdback_epochs
+    ?? inputBundle?.params?.holdback_epochs
+    ?? inputBundle?.audited_epoch?.params?.holdback_epochs
+    ?? inputBundle?.recomputed?.params?.holdback_epochs
+    ?? 0;
+  return parseNonNegativeInt(raw, 'TAP settlement holdback_epochs', 0);
+}
+
+function tapSettlementThroughEpoch(inputBundle, explicitSettleThroughEpoch) {
+  return explicitSettleThroughEpoch
+    ?? inputBundle?.settle_through_epoch
+    ?? inputBundle?.settleThroughEpoch
+    ?? inputBundle?.release_policy?.settle_through_epoch
+    ?? inputBundle?.proof_epoch
+    ?? inputBundle?.settlement_epoch
+    ?? null;
 }
 
 function tapLedgerFeeBps(inputBundle, explicitFeeBps) {
@@ -366,14 +496,18 @@ export function buildTapSettlement({
   ledgerFeeBps,
   prior = null,
   settleThroughEpoch = null,
-  challengeEpochs = 0,
+  challengeEpochs = null,
   holdbackEpochs = 0,
 } = {}) {
   const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
   const rate = safeAu(tapUsdAu, 'tap_usd_au').toString();
   const feeBps = tapLedgerFeeBps(inputBundle, ledgerFeeBps);
-  const policy = releasePolicy({ settleThroughEpoch, challengeEpochs, holdbackEpochs });
+  const policy = releasePolicy({
+    settleThroughEpoch: tapSettlementThroughEpoch(inputBundle, settleThroughEpoch),
+    challengeEpochs: tapSettlementChallengeEpochs(inputBundle, challengeEpochs),
+    holdbackEpochs: tapSettlementHoldbackEpochs(inputBundle, holdbackEpochs),
+  });
   const bundleEpoch = inputBundle?.epoch ?? inputBundle?.receipt_epoch ?? inputBundle?.settlement_epoch;
   const previousBySession = new Map();
   const perProvider = priorProviderMap(prior);
@@ -390,7 +524,8 @@ export function buildTapSettlement({
       Number(a.body.seq ?? 0) - Number(b.body.seq ?? 0)
     ));
 
-  for (const { entry, body } of sorted) {
+  for (const { entry, body, envelope } of sorted) {
+    verifyReceiptEnvelope(envelope);
     const deltaAu = receiptDeltaAu(entry, body, previousBySession);
     if (deltaAu === 0n) continue;
     const release = receiptReleaseInfo(entry, body, bundleEpoch, policy);
@@ -599,6 +734,7 @@ export async function guardianPreSignReport({
     reasons.push(error?.message || 'invalid settlement entries');
   }
   const previousByAccount = priorProviderMap(previous);
+  const currentByAccount = new Map(entries.map((entry) => [entry.account, entry.amount]));
   let totalOwedWei = 0n;
   for (const entry of entries) {
     if (entry.amount <= 0n) reasons.push(`non-positive amount for ${entry.account}`);
@@ -610,6 +746,22 @@ export async function guardianPreSignReport({
       reasons.push(`cumulative for ${entry.account} decreased`);
     }
     totalOwedWei += entry.amount;
+  }
+  for (const [account, previousAmount] of previousByAccount.entries()) {
+    const currentAmount = currentByAccount.get(account);
+    if (currentAmount !== undefined && currentAmount >= previousAmount) continue;
+    if (!pool?.claimed) {
+      reasons.push(`cumulative for ${account} dropped; on-chain claimed check required`);
+      continue;
+    }
+    try {
+      const claimedWei = parseBigIntString(await pool.claimed(account), `claimed(${account})`);
+      if (claimedWei < previousAmount) {
+        reasons.push(`cumulative for ${account} dropped below unclaimed prior`);
+      }
+    } catch (error) {
+      reasons.push(`claimed(${account}) read failed: ${errorMessage(error)}`);
+    }
   }
 
   const providerCapWei = bpsOf(cumulativeSpentWei, PROVIDER_BPS);
@@ -917,7 +1069,7 @@ async function main() {
     tapUsdAu,
     ledgerFeeBps,
     settleThroughEpoch: args['settle-through-epoch'],
-    challengeEpochs: args['challenge-epochs'] ?? 0,
+    challengeEpochs: args['challenge-epochs'],
     holdbackEpochs: args['holdback-epochs'] ?? 0,
     pool,
     ownerSigner,
