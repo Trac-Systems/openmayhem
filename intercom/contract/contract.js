@@ -46,6 +46,7 @@ const DEFAULT_DISPUTE_DEPOSIT_AU = ONE_USD_AU;
 const DEFAULT_MAX_APPLY_BATCH = 2_000;
 const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
+const DEFAULT_MAX_FIAT_SETTLEMENT_OUTPUTS = 5_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
 export const SESSION_RECEIPT_SCHEMA_VERSION = 8;
@@ -60,6 +61,7 @@ const CTX_BRACKETS = Object.freeze([
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const USD_AU = 1_000_000_000_000_000_000n;
+const FIAT_MINOR_AU = 10_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 const PARAM_DEFINITIONS = Object.freeze({
@@ -102,6 +104,7 @@ const PARAM_DEFINITIONS = Object.freeze({
   max_apply_batch: { default: DEFAULT_MAX_APPLY_BATCH, min: 1, max: Number.MAX_SAFE_INTEGER },
   max_market_usage_entries: { default: DEFAULT_MAX_MARKET_USAGE_ENTRIES, min: 0, max: Number.MAX_SAFE_INTEGER },
   max_tnk_settlement_outputs: { default: DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS, min: 1, max: Number.MAX_SAFE_INTEGER },
+  max_fiat_settlement_outputs: { default: DEFAULT_MAX_FIAT_SETTLEMENT_OUTPUTS, min: 1, max: Number.MAX_SAFE_INTEGER },
   param_activation_delay_seconds: { default: DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS, min: 0, max: 30 * DAY_SECONDS },
 });
 const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
@@ -144,6 +147,7 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'max_apply_batch',
   'max_market_usage_entries',
   'max_tnk_settlement_outputs',
+  'max_fiat_settlement_outputs',
   'param_activation_delay_seconds',
 ]);
 const REPUTATION_EVENT_KINDS = new Set([
@@ -1100,6 +1104,11 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'fiat_settlement') {
+      const result = await this.applyFiatSettlementFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
     if (value.op === 'anchor_reputation') {
       const result = await this.applyReputationAnchorFeature(key, value);
       this._mayhemLastFeatureResult = result;
@@ -1431,6 +1440,20 @@ class MayhemContract extends Contract {
     this.tx = key;
     try {
       return await this.tnkSettlement();
+    } finally {
+      this.tx = previousTx;
+    }
+  }
+
+  async applyFiatSettlementFeature(key, value) {
+    const expectedKey = await this.fiatSettlementFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return;
+
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      return await this.fiatSettlement();
     } finally {
       this.tx = previousTx;
     }
@@ -4681,6 +4704,403 @@ class MayhemContract extends Contract {
       operator_fee_au: this.value.operator_fee_au,
       gross_au: this.value.gross_au,
       tnk_e18: this.value.tnk_e18,
+      outputs,
+    };
+  }
+
+  async fiatSettlement() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateFiatSettlementValue(this.value);
+    if (shapeError) return shapeError;
+    const settlementParams = await this.activeParamsAt(this.value.at, ['max_fiat_settlement_outputs']);
+    if (this.value.outputs.length > settlementParams.max_fiat_settlement_outputs) {
+      return new Error('Fiat settlement output count exceeds max_fiat_settlement_outputs.');
+    }
+
+    const outputs = this.normalizeFiatSettlementOutputs(this.value.outputs);
+    if (outputs instanceof Error) return outputs;
+    if (stableJson(outputs) !== stableJson(this.value.outputs)) {
+      return new Error('Fiat settlement outputs must be canonical.');
+    }
+    const totals = this.fiatSettlementTotals(outputs);
+    if (totals instanceof Error) return totals;
+    if (totals.provider_count !== this.value.provider_count) {
+      return new Error('Fiat settlement provider count does not match outputs.');
+    }
+    if (this.compareAu(totals.provider_au, this.value.provider_au) !== 0) {
+      return new Error('Fiat settlement provider amount does not match outputs.');
+    }
+    if (this.compareAu(totals.operator_fee_au, this.value.operator_fee_au) !== 0) {
+      return new Error('Fiat settlement operator fee does not match outputs.');
+    }
+    if (this.compareAu(totals.gross_au, this.value.gross_au) !== 0) {
+      return new Error('Fiat settlement gross amount does not match outputs.');
+    }
+
+    const transferRoot = await this.fiatSettlementTransferRoot(outputs);
+    if (transferRoot !== this.value.transfer_root) {
+      return new Error('Fiat settlement transfer root does not match outputs.');
+    }
+
+    const record = this.fiatSettlementRecord(outputs);
+    const key = `settle/fiat/${this.value.epoch}`;
+    const existing = await this.get(key);
+    if (existing) {
+      if (stableJson(existing) === stableJson(record)) {
+        return {
+          ok: true,
+          op: 'fiatSettlement',
+          epoch: this.value.epoch,
+          rail: 'fiat',
+          idempotent: true,
+          stripe_refs: this.value.stripe_refs,
+        };
+      }
+      return new Error('Fiat settlement already exists for epoch.');
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    if (
+      applyState.updated_epoch !== this.value.epoch ||
+      applyState.last_apply_hash !== this.value.epoch_apply_hash
+    ) {
+      return new Error('Fiat settlement epoch apply hash does not match current state.');
+    }
+
+    const params = await this.activeParamsAt(this.value.at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    const earningUpdates = [];
+    for (const [outputIndex, output] of outputs.entries()) {
+      if (output.role !== 'provider') continue;
+      const stripeRef = this.value.stripe_refs[outputIndex];
+      if (!stripeRef.startsWith('tr_')) {
+        return new Error('Fiat provider settlement requires a Stripe transfer id.');
+      }
+      const provider = await this.get(`prov/${output.provider}`);
+      if (!provider) return new Error('Provider not found.');
+      if (provider.status !== 'active' && provider.status !== 'banned') {
+        return new Error('Fiat settlement provider status is not payable.');
+      }
+      const payoutError = await this.requireAdminSetPayoutTarget(provider);
+      if (payoutError) return payoutError;
+      if (provider.payout.method !== 'stripe') {
+        return new Error('Fiat settlement provider payout target must be Stripe.');
+      }
+      if (provider.payout.addr !== output.to) {
+        return new Error('Fiat settlement provider payout target mismatch.');
+      }
+      if (provider.payout.currency !== output.currency) {
+        return new Error('Fiat settlement provider payout currency mismatch.');
+      }
+
+      const earning = await this.earningRecord(output.provider, 'fiat');
+      if (earning instanceof Error) return earning;
+      const earningError = this.guardianValidateEarningRecord(earning, output.provider, 'fiat');
+      if (earningError) return earningError;
+      const probeGate = await this.probeGateForEarning(output.provider, earning, params);
+      if (probeGate instanceof Error) return probeGate;
+      const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
+      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const refreshed = this.refreshEarningHoldback(
+        earning,
+        this.value.epoch,
+        lockedEarningEpochs,
+        probeGate
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const payable = this.safeSubAu(
+        this.safeSubAu(refreshed.total_au, refreshed.held_au),
+        refreshed.paid_cum_au
+      );
+      if (payable instanceof Error) return payable;
+      const transferable = this.fiatWholeMinorTransferAu(payable);
+      if (transferable instanceof Error) return transferable;
+      if (this.isZeroAu(transferable)) return new Error('Fiat settlement provider has no whole-cent payable earnings.');
+      if (this.compareAu(output.au, transferable) !== 0) {
+        return new Error('Fiat settlement provider amount does not match payable whole-cent earnings.');
+      }
+      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, output.au);
+      if (paidCumAu instanceof Error) return paidCumAu;
+      const nextEarning = {
+        ...refreshed,
+        paid_cum_au: paidCumAu,
+        updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
+        last_settlement_epoch: this.value.epoch,
+        last_settlement_stripe_ref: stripeRef,
+      };
+      const nextError = this.guardianValidateEarningRecord(nextEarning, output.provider, 'fiat');
+      if (nextError) return nextError;
+      earningUpdates.push(nextEarning);
+    }
+
+    const fee = await this.feeCumRecord('fiat');
+    if (fee instanceof Error) return fee;
+    const feeError = this.guardianValidateFeeRecord(fee, 'fiat');
+    if (feeError) return feeError;
+    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+    if (payableFee instanceof Error) return payableFee;
+    const transferableFee = this.fiatWholeMinorTransferAu(payableFee);
+    if (transferableFee instanceof Error) return transferableFee;
+    if (this.compareAu(transferableFee, this.value.operator_fee_au) !== 0) {
+      return new Error('Fiat settlement operator fee does not match fee state.');
+    }
+    const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
+    if (this.isZeroAu(transferableFee) && operatorOutputs.length !== 0) {
+      return new Error('Fiat settlement has unexpected operator fee output.');
+    }
+    if (this.compareAu(transferableFee, ZERO_AU) > 0) {
+      if (operatorOutputs.length !== 1) return new Error('Fiat settlement missing operator fee output.');
+      if (operatorOutputs[0].to !== this.value.operator_to) {
+        return new Error('Fiat settlement operator target mismatch.');
+      }
+    }
+    const operatorOutputIndex = outputs.findIndex((entry) => entry.role === 'operator_fee');
+    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, this.value.operator_fee_au);
+    if (sweptCumAu instanceof Error) return sweptCumAu;
+    const nextFee = {
+      ...fee,
+      swept_cum_au: sweptCumAu,
+      updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
+      last_settlement_epoch: this.value.epoch,
+      last_settlement_stripe_ref: operatorOutputIndex >= 0
+        ? this.value.stripe_refs[operatorOutputIndex]
+        : (fee.last_settlement_stripe_ref ?? null),
+    };
+    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
+    if (nextFeeError) return nextFeeError;
+
+    for (const earning of earningUpdates) {
+      await this.put(this.earningKey(earning.provider, 'fiat'), earning);
+    }
+    await this.put(this.feeCumKey('fiat'), nextFee);
+    await this.put(key, record);
+    console.log('mayhem fiatSettlement', {
+      epoch: this.value.epoch,
+      provider_au: this.value.provider_au,
+      operator_fee_au: this.value.operator_fee_au,
+      gross_au: this.value.gross_au,
+      stripe_refs: this.value.stripe_refs,
+    });
+    return {
+      ok: true,
+      op: 'fiatSettlement',
+      epoch: this.value.epoch,
+      rail: 'fiat',
+      processor: 'stripe',
+      idempotent: false,
+      provider_au: this.value.provider_au,
+      operator_fee_au: this.value.operator_fee_au,
+      gross_au: this.value.gross_au,
+      stripe_refs: this.value.stripe_refs,
+      transfer_root: this.value.transfer_root,
+    };
+  }
+
+  validateFiatSettlementValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'epoch',
+        'at',
+        'rail',
+        'processor',
+        'operator_to',
+        'epoch_apply_hash',
+        'stripe_refs',
+        'transfer_root',
+        'provider_count',
+        'provider_au',
+        'operator_fee_au',
+        'gross_au',
+        'outputs',
+      ],
+      'Fiat settlement'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'fiat_settlement') return new Error('Invalid fiat settlement op.');
+    if (value.rail !== 'fiat') return new Error('Fiat settlement rail must be fiat.');
+    if (value.processor !== 'stripe') return new Error('Fiat settlement processor must be stripe.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid fiat settlement epoch.');
+    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid fiat settlement timestamp.');
+    if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid fiat operator target.');
+    if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid fiat settlement apply hash.');
+    if (!Array.isArray(value.stripe_refs) || value.stripe_refs.length === 0) {
+      return new Error('Fiat settlement requires one Stripe reference per output.');
+    }
+    const seenRefs = new Set();
+    for (const ref of value.stripe_refs) {
+      if (!this.isSafeKeyPart(ref)) return new Error('Invalid fiat settlement Stripe reference.');
+      if (seenRefs.has(ref)) return new Error('Duplicate fiat settlement Stripe reference.');
+      seenRefs.add(ref);
+    }
+    if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid fiat settlement transfer root.');
+    if (!Number.isSafeInteger(value.provider_count) || value.provider_count < 0) {
+      return new Error('Invalid fiat settlement total.');
+    }
+    for (const key of ['provider_au', 'operator_fee_au', 'gross_au']) {
+      const amount = this.normalizeAu(value[key], `Fiat settlement ${key}`, { allowZero: key !== 'gross_au' });
+      if (amount instanceof Error) return new Error('Invalid fiat settlement total.');
+    }
+    const gross = this.safeAddAu(value.provider_au, value.operator_fee_au);
+    if (gross instanceof Error) return gross;
+    if (this.compareAu(gross, value.gross_au) !== 0) return new Error('Fiat settlement gross amount does not balance.');
+    if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
+      return new Error('Fiat settlement outputs are required.');
+    }
+    if (value.stripe_refs.length !== value.outputs.length) {
+      return new Error('Fiat settlement Stripe reference count must match outputs.');
+    }
+    return null;
+  }
+
+  normalizeFiatSettlementOutputs(outputs) {
+    if (!Array.isArray(outputs) || outputs.length === 0) {
+      return new Error('Fiat settlement outputs are required.');
+    }
+    const providers = new Set();
+    const providerOutputs = [];
+    const operatorOutputs = [];
+    for (const output of outputs) {
+      if (!output || typeof output !== 'object' || Array.isArray(output)) {
+        return new Error('Invalid fiat settlement output.');
+      }
+      if (output.role === 'provider') {
+        const shapeError = this.validateExactObjectKeys(
+          output,
+          ['role', 'provider', 'to', 'currency', 'amount_minor', 'au'],
+          'Fiat settlement provider output'
+        );
+        if (shapeError) return shapeError;
+        if (!this.isHexBytes(output.provider, 32) || output.provider !== output.provider.toLowerCase()) {
+          return new Error('Invalid fiat settlement provider id.');
+        }
+        if (providers.has(output.provider)) return new Error('Duplicate fiat settlement provider output.');
+        providers.add(output.provider);
+        const normalized = this.normalizeFiatSettlementOutput(output);
+        if (normalized instanceof Error) return normalized;
+        providerOutputs.push(normalized);
+      } else if (output.role === 'operator_fee') {
+        const shapeError = this.validateExactObjectKeys(
+          output,
+          ['role', 'to', 'currency', 'amount_minor', 'au'],
+          'Fiat settlement operator output'
+        );
+        if (shapeError) return shapeError;
+        if (operatorOutputs.length > 0) return new Error('Duplicate fiat settlement operator output.');
+        const normalized = this.normalizeFiatSettlementOutput(output);
+        if (normalized instanceof Error) return normalized;
+        operatorOutputs.push(normalized);
+      } else {
+        return new Error('Invalid fiat settlement output role.');
+      }
+    }
+    providerOutputs.sort((left, right) => compareCodepoint(left.provider, right.provider));
+    return [...providerOutputs, ...operatorOutputs];
+  }
+
+  normalizeFiatSettlementOutput(output) {
+    if (!this.isSafeKeyPart(output.to)) return new Error('Invalid fiat settlement output target.');
+    const currency = this.normalizeFiatCurrency(output.currency);
+    if (currency instanceof Error) return currency;
+    const amountMinor = this.normalizeFiatMinor(output.amount_minor);
+    if (amountMinor instanceof Error) return amountMinor;
+    const au = this.normalizeAu(output.au, 'Fiat settlement output amount', { allowZero: false });
+    if (au instanceof Error) return new Error('Invalid fiat settlement output amount.');
+    const expectedAu = this.fiatMinorToAu(amountMinor);
+    if (expectedAu instanceof Error) return expectedAu;
+    if (this.compareAu(au, expectedAu) !== 0) {
+      return new Error('Fiat settlement output amount must match fiat minor units.');
+    }
+    return output.role === 'provider'
+      ? {
+          role: 'provider',
+          provider: output.provider,
+          to: output.to,
+          currency,
+          amount_minor: amountMinor,
+          au,
+        }
+      : {
+          role: 'operator_fee',
+          to: output.to,
+          currency,
+          amount_minor: amountMinor,
+          au,
+        };
+  }
+
+  fiatSettlementTotals(outputs) {
+    let providerAu = ZERO_AU;
+    let operatorFeeAu = ZERO_AU;
+    let providerCount = 0;
+    for (const output of outputs) {
+      if (output.role === 'provider') {
+        providerCount += 1;
+        providerAu = this.safeAddAu(providerAu, output.au);
+        if (providerAu instanceof Error) return providerAu;
+      } else {
+        operatorFeeAu = this.safeAddAu(operatorFeeAu, output.au);
+        if (operatorFeeAu instanceof Error) return operatorFeeAu;
+      }
+    }
+    const grossAu = this.safeAddAu(providerAu, operatorFeeAu);
+    if (grossAu instanceof Error) return grossAu;
+    return {
+      provider_count: providerCount,
+      provider_au: providerAu,
+      operator_fee_au: operatorFeeAu,
+      gross_au: grossAu,
+    };
+  }
+
+  normalizeFiatMinor(value) {
+    if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) {
+      return new Error('Fiat minor amount must be a canonical decimal string.');
+    }
+    const parsed = BigInt(value);
+    if (parsed <= 0n) return new Error('Fiat minor amount must be positive.');
+    return parsed.toString();
+  }
+
+  fiatMinorToAu(amountMinor) {
+    const parsed = this.normalizeFiatMinor(amountMinor);
+    if (parsed instanceof Error) return parsed;
+    return this.canonicalAu(BigInt(parsed) * FIAT_MINOR_AU);
+  }
+
+  fiatWholeMinorTransferAu(au) {
+    const parsed = this.parseAu(au, 'Fiat payable amount');
+    if (parsed instanceof Error) return parsed;
+    return this.canonicalAu((parsed / FIAT_MINOR_AU) * FIAT_MINOR_AU);
+  }
+
+  async fiatSettlementTransferRoot(outputs) {
+    return await this.opaqueHash('mayhem-fiat-settlement-transfer-root-v1', outputs);
+  }
+
+  fiatSettlementRecord(outputs) {
+    return {
+      type: 'fiat_settlement',
+      op: 'fiat_settlement',
+      idempotency_key: `mayhem:fiat:settle:v1:stripe:mayhem:${this.value.epoch}:${this.value.epoch_apply_hash}`,
+      epoch: this.value.epoch,
+      at: this.value.at,
+      rail: 'fiat',
+      processor: 'stripe',
+      operator_to: this.value.operator_to,
+      epoch_apply_hash: this.value.epoch_apply_hash,
+      stripe_refs: this.value.stripe_refs,
+      transfer_root: this.value.transfer_root,
+      provider_count: this.value.provider_count,
+      provider_au: this.value.provider_au,
+      operator_fee_au: this.value.operator_fee_au,
+      gross_au: this.value.gross_au,
       outputs,
     };
   }
@@ -9649,6 +10069,19 @@ class MayhemContract extends Contract {
       'hex'
     );
     return `settle/tnk/${value.epoch}/${digest}`;
+  }
+
+  async fiatSettlementFeatureKey(value) {
+    const shapeError = this.validateFiatSettlementValue(value);
+    if (shapeError) return shapeError;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-fiat-settlement-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    return `settle/fiat/${value.epoch}/${digest}`;
   }
 
   async reputationAnchorFeatureKey(value) {

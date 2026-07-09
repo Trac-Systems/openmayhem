@@ -267,6 +267,7 @@ const contractParamDescriptions = new Map([
   ['max_apply_batch', 'Maximum epochApply debits plus earnings per page.'],
   ['max_market_usage_entries', 'Maximum epochApply market usage entries per page.'],
   ['max_tnk_settlement_outputs', 'Maximum TNK settlement outputs per epoch settlement.'],
+  ['max_fiat_settlement_outputs', 'Maximum fiat settlement outputs per epoch settlement.'],
   ['dispute_deposit_au', 'Dispute bond amount.'],
   ['price_rate_limit_seconds', 'Admin seed price change throttle.'],
   ['market_target_utilization_bps', 'Target utilization for the market price curve.'],

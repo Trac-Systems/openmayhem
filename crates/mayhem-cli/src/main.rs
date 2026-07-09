@@ -432,6 +432,8 @@ enum AdminCommands {
     TapRateOracle(AdminTapRateOracleArgs),
     /// Record one epoch TNK settlement backed by real treasury-signed MSB transfers.
     TnkSettlement(AdminTnkSettlementArgs),
+    /// Record one epoch fiat settlement backed by Stripe Connect transfer evidence.
+    FiatSettlement(AdminFiatSettlementArgs),
     /// Confirm a TNK deposit intent into the canonical credit ledger.
     TnkDeposit(AdminTnkDepositArgs),
     /// Confirm a finalized TAP escrow Deposit event into the canonical credit ledger.
@@ -4040,6 +4042,56 @@ struct AdminTnkSettlementArgs {
     /// Refuse transfer retry unless the treasury balance before the first broadcast matches this decimal TNK value.
     #[arg(long)]
     expected_treasury_balance_before: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminFiatSettlementArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Full fiat_settlement feature JSON produced by the settlement runner.
+    #[arg(long)]
+    settlement_json: Option<String>,
+
+    /// Path to full fiat_settlement feature JSON produced by the settlement runner.
+    #[arg(long, value_name = "PATH")]
+    settlement_file: Option<PathBuf>,
+
+    /// Epoch to plan from live contract state when settlement JSON is not supplied.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    /// Settlement timestamp in Unix seconds. Defaults to now when planning from state.
+    #[arg(long)]
+    at: Option<u64>,
+
+    /// Operator/platform Stripe balance reference for retained fiat fees.
+    #[arg(long)]
+    operator_stripe_ref: Option<String>,
+
+    /// Operator/platform target recorded for retained fiat fees.
+    #[arg(long, default_value = "platform_balance")]
+    operator_stripe_account: String,
+
+    /// Operator fee evidence currency. Defaults to EUR for the operator platform balance.
+    #[arg(long, default_value = "eur")]
+    operator_currency: String,
+
+    /// Broadcast provider Stripe Connect transfers. Requires --submit.
+    #[arg(long)]
+    submit_transfer: bool,
+
+    /// Use already-created Stripe references in output order; provider refs must be tr_*.
+    #[arg(long = "stripe-ref", value_delimiter = ',')]
+    stripe_refs: Vec<String>,
+
+    /// File with STRIPE_SECRET_KEY/MAYHEM_STRIPE_SECRET_KEY. Defaults to .mayhem-local/secrets/stripe.txt when present.
+    #[arg(long, value_name = "PATH")]
+    stripe_env_file: Option<PathBuf>,
+
+    /// Stripe API base URL. Defaults to MAYHEM_STRIPE_API_BASE_URL or https://api.stripe.com.
+    #[arg(long)]
+    stripe_api_base_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -12401,6 +12453,9 @@ async fn admin(command: AdminCommands) -> Result<()> {
         AdminCommands::TnkSettlement(args) => {
             return run_admin_tnk_settlement_feature(args).await;
         }
+        AdminCommands::FiatSettlement(args) => {
+            return run_admin_fiat_settlement_feature(args).await;
+        }
         AdminCommands::ReputationAnchor(args) => {
             return run_admin_reputation_anchor(args).await;
         }
@@ -13949,6 +14004,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::RateOracle(args) => &args.tx,
         AdminCommands::TapRateOracle(args) => &args.tx,
         AdminCommands::TnkSettlement(args) => &args.tx,
+        AdminCommands::FiatSettlement(args) => &args.tx,
         AdminCommands::TnkDeposit(args) => &args.tx,
         AdminCommands::TapDeposit(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
@@ -14037,6 +14093,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         }
         AdminCommands::TnkSettlement(_) => {
             bail!("TNK settlement updates are free features, not paid admin txs")
+        }
+        AdminCommands::FiatSettlement(_) => {
+            bail!("fiat settlement updates are free features, not paid admin txs")
         }
         AdminCommands::TnkDeposit(args) => Ok(("tnkDeposit", admin_tnk_deposit_payload(args))),
         AdminCommands::TapDeposit(args) => Ok(("tapDeposit", admin_tap_deposit_payload(args))),
@@ -15140,6 +15199,19 @@ fn admin_tnk_settlement_payload(args: &AdminTnkSettlementArgs) -> Result<Value> 
     Ok(value)
 }
 
+fn admin_fiat_settlement_payload(args: &AdminFiatSettlementArgs) -> Result<Value> {
+    let value = json_arg_or_file_object(
+        args.settlement_json.as_deref(),
+        args.settlement_file.as_ref(),
+        None,
+        "fiat settlement",
+    )?;
+    if value.get("op").and_then(Value::as_str) != Some("fiat_settlement") {
+        bail!("fiat settlement payload must have op=fiat_settlement");
+    }
+    Ok(value)
+}
+
 async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Result<()> {
     if args.submit_transfer && !args.msb_tx_hashes.is_empty() {
         bail!("pass only one of --submit-transfer or --msb-tx-hash");
@@ -15388,6 +15460,252 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_tnk_settlement_runner_report(&report)?;
+    }
+    Ok(())
+}
+
+async fn run_admin_fiat_settlement_feature(args: &AdminFiatSettlementArgs) -> Result<()> {
+    if args.settlement_json.is_some() || args.settlement_file.is_some() {
+        let value = admin_fiat_settlement_payload(args)?;
+        let key = fiat_settlement_feature_key(&value)?;
+        return run_admin_feature_command(&args.tx, "fiatSettlement", key, value).await;
+    }
+    run_admin_fiat_settlement_runner(args).await
+}
+
+async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Result<()> {
+    if args.submit_transfer && !args.stripe_refs.is_empty() {
+        bail!("pass only one of --submit-transfer or --stripe-ref");
+    }
+    if args.submit_transfer && args.tx.sim {
+        bail!("--submit-transfer cannot be combined with --sim");
+    }
+    if args.submit_transfer && !args.tx.submit {
+        bail!("--submit-transfer requires --submit so the Stripe transfers and contract evidence are submitted together");
+    }
+    let epoch = args
+        .epoch
+        .context("--epoch is required when planning fiat settlement from contract state")?;
+    if epoch == 0 {
+        bail!("--epoch must be positive");
+    }
+    let at = args.at.unwrap_or(now_unix_seconds()?);
+    let operator_to =
+        normalize_fiat_settlement_ref(&args.operator_stripe_account, "operator Stripe account")?;
+    let operator_currency = normalize_admin_fiat_currency(&args.operator_currency)?;
+    let provided_refs = args
+        .stripe_refs
+        .iter()
+        .map(|value| normalize_fiat_settlement_ref(value, "Stripe reference"))
+        .collect::<Result<Vec<_>>>()?;
+
+    let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let mut plan = build_fiat_settlement_plan(
+        &rpc,
+        epoch,
+        at,
+        &operator_to,
+        &operator_currency,
+        args.operator_stripe_ref.as_deref(),
+        if provided_refs.is_empty() {
+            None
+        } else {
+            Some(provided_refs.as_slice())
+        },
+    )
+    .await?;
+
+    if plan.already_settled.is_none()
+        && plan
+            .payload
+            .get("stripe_refs")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        && args.tx.submit
+        && !args.submit_transfer
+    {
+        bail!("--submit requires one --stripe-ref per output or --submit-transfer for provider Stripe transfer evidence");
+    }
+
+    let mut stripe_transfers = Vec::new();
+    if plan.already_settled.is_none() && args.submit_transfer {
+        let secret_key = load_stripe_secret_key(args.stripe_env_file.as_ref(), &home)?;
+        let api_base_url = stripe_api_base_url(args.stripe_api_base_url.as_deref())?;
+        let client = reqwest::Client::new();
+        let mut refs = Vec::with_capacity(plan.stripe_outputs.len());
+        for (index, output) in plan.stripe_outputs.iter().enumerate() {
+            if output.role == "provider" {
+                let transfer = stripe_create_transfer(
+                    &client,
+                    &api_base_url,
+                    &secret_key,
+                    output,
+                    &format!(
+                        "mayhem:fiat:settle:v1:{epoch}:{}:{}",
+                        output.provider.as_deref().unwrap_or("provider"),
+                        plan.epoch_apply_hash
+                    ),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "submitting Stripe transfer {} of {} to {}",
+                        index + 1,
+                        plan.stripe_outputs.len(),
+                        output.to
+                    )
+                })?;
+                if transfer.destination != output.to {
+                    bail!(
+                        "Stripe transfer destination {} did not match planned {}",
+                        transfer.destination,
+                        output.to
+                    );
+                }
+                if transfer.currency != output.currency
+                    || transfer.amount_minor != output.amount_minor
+                {
+                    bail!(
+                        "Stripe transfer result does not match planned output {}",
+                        index + 1
+                    );
+                }
+                refs.push(transfer.id.clone());
+                stripe_transfers.push(json!({
+                    "output_index": index,
+                    "transfer": transfer,
+                }));
+            } else {
+                refs.push(operator_fiat_settlement_ref(
+                    args.operator_stripe_ref.as_deref(),
+                    epoch,
+                    &plan.epoch_apply_hash,
+                )?);
+            }
+        }
+        plan.payload["stripe_refs"] = json!(refs);
+    }
+
+    let settlement_report = plan.payload.clone();
+    let feature = if plan.already_settled.is_none()
+        && plan
+            .payload
+            .get("stripe_refs")
+            .and_then(Value::as_array)
+            .is_some_and(|refs| refs.len() == plan.stripe_outputs.len() && !refs.is_empty())
+    {
+        Some(json!({
+            "feature": "mayhem",
+            "key": fiat_settlement_feature_key(&plan.payload)?,
+            "value": plan.payload.clone(),
+        }))
+    } else {
+        None
+    };
+
+    let mut feature_result = None;
+    if let Some(feature) = feature.as_ref().filter(|_| args.tx.submit && !args.tx.sim) {
+        let submitted = rpc
+            .submit_feature(feature)
+            .await
+            .context("submitting free fiat settlement feature")?;
+        if submitted.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!("fiat settlement feature was not accepted: {submitted}");
+        }
+        feature_result = Some(submitted);
+    }
+
+    let copy_paste_submit = format!(
+        "mayhem admin fiat-settlement --epoch {} --at {} --operator-stripe-account {} --operator-currency {} --submit-transfer --submit{}{}{}{}",
+        epoch,
+        at,
+        shell_single_quote(&operator_to),
+        shell_single_quote(&operator_currency),
+        args.tx
+            .home
+            .as_ref()
+            .map(|home| format!(" --home {}", shell_single_quote(&home.display().to_string())))
+            .unwrap_or_default(),
+        (args.tx.peer_store_name != "main")
+            .then(|| format!(
+                " --peer-store-name {}",
+                shell_single_quote(&args.tx.peer_store_name)
+            ))
+            .unwrap_or_default(),
+        args.tx
+            .rpc_url
+            .as_deref()
+            .map(|url| format!(" --rpc-url {}", shell_single_quote(url)))
+            .unwrap_or_default(),
+        args.stripe_env_file
+            .as_ref()
+            .map(|path| format!(" --stripe-env-file {}", shell_single_quote(&path.display().to_string())))
+            .unwrap_or_default()
+    );
+    let feature_rpc_command = feature.as_ref().map(|feature| {
+        let feature_json = serde_json::to_string(feature).unwrap_or_default();
+        format!(
+            "curl -sS -X POST {} -H 'content-type: application/json' --data {}",
+            shell_single_quote(&format!(
+                "{}/contract/feature",
+                rpc_url.trim_end_matches('/')
+            )),
+            shell_single_quote(&feature_json)
+        )
+    });
+    let stripe_transfer_commands = plan
+        .stripe_outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, output)| output.role == "provider")
+        .map(|(index, output)| {
+            format!(
+                "curl -sS {} -u \"$STRIPE_SECRET_KEY:\" -H {} -d amount={} -d currency={} -d destination={} -d metadata[mayhem_epoch]={} -d metadata[mayhem_output_index]={}",
+                shell_single_quote(&format!("{}/v1/transfers", stripe_api_base_url(args.stripe_api_base_url.as_deref()).unwrap_or_else(|_| "https://api.stripe.com".to_owned()).trim_end_matches('/'))),
+                shell_single_quote(&format!(
+                    "Idempotency-Key: mayhem:fiat:settle:v1:{epoch}:{}:{}",
+                    output.provider.as_deref().unwrap_or("provider"),
+                    plan.epoch_apply_hash
+                )),
+                output.amount_minor,
+                shell_single_quote(&output.currency),
+                shell_single_quote(&output.to),
+                epoch,
+                index
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let report = json!({
+        "ok": true,
+        "submitted": feature_result.is_some(),
+        "sim": args.tx.submit && args.tx.sim,
+        "already_settled": plan.already_settled,
+        "rpc_url": rpc_url,
+        "epoch": epoch,
+        "at": at,
+        "processor": "stripe",
+        "operator_to": operator_to,
+        "settlement": settlement_report,
+        "feature": feature,
+        "feature_result": feature_result,
+        "stripe_transfers": stripe_transfers,
+        "stripe_outputs": plan.stripe_outputs,
+        "skipped_providers": plan.skipped_providers,
+        "copy_paste": {
+            "submit_settlement": copy_paste_submit,
+            "stripe_transfer_curl": stripe_transfer_commands,
+            "feature_rpc": feature_rpc_command,
+        },
+    });
+
+    if args.tx.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_fiat_settlement_runner_report(&report)?;
     }
     Ok(())
 }
@@ -15646,6 +15964,18 @@ fn tnk_settlement_feature_key(value: &Value) -> Result<String> {
         "value": value,
     }));
     Ok(format!("settle/tnk/{epoch}/{digest}"))
+}
+
+fn fiat_settlement_feature_key(value: &Value) -> Result<String> {
+    let epoch = value
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .context("fiat settlement feature payload missing epoch")?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-fiat-settlement-feature-v1",
+        "value": value,
+    }));
+    Ok(format!("settle/fiat/{epoch}/{digest}"))
 }
 
 fn read_optional_json_file(path: Option<&PathBuf>, label: &str) -> Result<Option<Value>> {
@@ -16129,6 +16459,104 @@ fn print_tnk_settlement_runner_report(report: &Value) -> Result<()> {
     );
     println!("Copy/paste Pear MSB transfer helper commands:");
     for command in report["copy_paste"]["msb_transfer_helpers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        println!("{command}");
+    }
+    if let Some(command) = report["copy_paste"]["feature_rpc"].as_str() {
+        println!("Copy/paste feature RPC command:");
+        println!("{command}");
+    }
+    Ok(())
+}
+
+fn print_fiat_settlement_runner_report(report: &Value) -> Result<()> {
+    println!("Fiat settlement runner report.");
+    println!("Epoch: {}", report["epoch"].as_u64().unwrap_or(0));
+    println!(
+        "Processor: {}",
+        report["processor"].as_str().unwrap_or("stripe")
+    );
+    println!("Operator: {}", report["operator_to"].as_str().unwrap_or(""));
+    if !report["already_settled"].is_null() {
+        println!("Already settled: true");
+        let refs = report["already_settled"]["stripe_refs"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        if refs > 0 {
+            println!("Stripe refs: {refs}");
+        }
+        return Ok(());
+    }
+    println!("Already settled: false");
+    if let Some(settlement) = report.get("settlement").filter(|value| !value.is_null()) {
+        println!(
+            "Gross: {} au_usd",
+            settlement["gross_au"].as_str().unwrap_or("0")
+        );
+        println!(
+            "Providers: {} / provider_au: {} / operator_fee_au: {}",
+            settlement["provider_count"].as_u64().unwrap_or(0),
+            settlement["provider_au"].as_str().unwrap_or("0"),
+            settlement["operator_fee_au"].as_str().unwrap_or("0")
+        );
+        println!(
+            "Transfer root: {}",
+            settlement["transfer_root"].as_str().unwrap_or("")
+        );
+        if let Some(refs) = settlement["stripe_refs"].as_array() {
+            if refs.is_empty() {
+                println!("Stripe refs: pending (dry plan only)");
+            } else {
+                println!("Stripe refs: {}", refs.len());
+                for (index, reference) in refs.iter().enumerate() {
+                    if let Some(reference) = reference.as_str() {
+                        println!("  {}: {}", index + 1, reference);
+                    }
+                }
+            }
+        } else {
+            println!("Stripe refs: pending (dry plan only)");
+        }
+    }
+    println!(
+        "Skipped providers: {}",
+        report["skipped_providers"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0)
+    );
+    for skipped in report["skipped_providers"].as_array().into_iter().flatten() {
+        println!(
+            "  skipped provider={} au={} reason={}",
+            skipped["provider"].as_str().unwrap_or(""),
+            skipped["au"].as_str().unwrap_or("0"),
+            skipped["reason"].as_str().unwrap_or("")
+        );
+    }
+    if let Some(feature) = report.get("feature").filter(|value| !value.is_null()) {
+        println!("Feature key: {}", feature["key"].as_str().unwrap_or(""));
+    }
+    if report["submitted"].as_bool() == Some(true) {
+        println!("Submitted: true");
+    } else if report["sim"].as_bool() == Some(true) {
+        println!("Submitted: false (--sim dry-run)");
+    } else {
+        println!("Submitted: false");
+    }
+    println!("Copy/paste full settlement command:");
+    println!(
+        "{}",
+        report["copy_paste"]["submit_settlement"]
+            .as_str()
+            .unwrap_or("")
+    );
+    println!("Copy/paste Stripe transfer curl commands:");
+    for command in report["copy_paste"]["stripe_transfer_curl"]
         .as_array()
         .into_iter()
         .flatten()
@@ -25160,8 +25588,11 @@ fn normalize_tnk_holdbacks(earning: &LedgerEarningRecord) -> Result<Vec<LedgerHo
 }
 
 fn tnk_provider_payout_target(provider: &Value, provider_id: &str, admin: &str) -> Result<String> {
-    if provider.get("status").and_then(Value::as_str) != Some("active") {
-        bail!("provider is not active");
+    if !matches!(
+        provider.get("status").and_then(Value::as_str),
+        Some("active" | "banned")
+    ) {
+        bail!("provider status is not payable");
     }
     let payout = provider
         .get("payout")
@@ -25191,6 +25622,520 @@ fn tnk_provider_payout_target(provider: &Value, provider_id: &str, admin: &str) 
         bail!("provider payout record owner mismatch");
     }
     Ok(addr.to_owned())
+}
+
+const FIAT_MINOR_AU_CLI: MoneyAu = 10_000_000_000_000_000;
+
+async fn build_fiat_settlement_plan(
+    rpc: &PeerRpcClient,
+    epoch: u64,
+    at: u64,
+    operator_to: &str,
+    operator_currency: &str,
+    operator_ref: Option<&str>,
+    stripe_refs: Option<&[String]>,
+) -> Result<FiatSettlementPlan> {
+    if !is_safe_key_part(operator_to) {
+        bail!("operator Stripe account is not contract-safe");
+    }
+    let operator_currency = normalize_admin_fiat_currency(operator_currency)?;
+    if let Some(existing) = read_state_value(rpc, &format!("settle/fiat/{epoch}")).await? {
+        return Ok(FiatSettlementPlan {
+            payload: existing.clone(),
+            stripe_outputs: Vec::new(),
+            skipped_providers: Vec::new(),
+            already_settled: Some(existing),
+            epoch_apply_hash: String::new(),
+        });
+    }
+
+    let apply_state = read_state_value(rpc, "epoch/apply/state")
+        .await?
+        .context("epoch/apply/state not found; apply the epoch before fiat settlement")?;
+    let applied_epoch = apply_state
+        .get("updated_epoch")
+        .and_then(Value::as_u64)
+        .context("epoch/apply/state missing updated_epoch")?;
+    if applied_epoch != epoch {
+        bail!(
+            "epoch/apply/state is at epoch {applied_epoch}, not requested settlement epoch {epoch}"
+        );
+    }
+    let epoch_apply_hash = apply_state
+        .get("last_apply_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| is_hex_len(hash, 64))
+        .context("epoch/apply/state missing 32-byte last_apply_hash")?
+        .to_ascii_lowercase();
+
+    let params = read_tnk_settlement_params(rpc, at).await?;
+    let admin = read_state_value(rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .context("admin key missing; provider payout targets cannot be verified")?;
+    let providers = read_prefix_entries(rpc, "prov/")
+        .await?
+        .into_iter()
+        .filter_map(|entry| {
+            let provider = entry
+                .value
+                .get("provider")
+                .and_then(Value::as_str)?
+                .to_owned();
+            Some((provider, entry.value))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut skipped_providers = Vec::new();
+    let mut outputs = Vec::new();
+    let mut earnings = read_prefix_values::<LedgerEarningRecord>(rpc, "earn/fiat/").await?;
+    earnings.sort_by(|left, right| left.provider.cmp(&right.provider));
+    for earning in earnings {
+        if earning.rail != "fiat" {
+            continue;
+        }
+        let Some(provider) = providers.get(&earning.provider) else {
+            skipped_providers.push(json!({
+                "provider": earning.provider,
+                "au": money_au_json(0),
+                "reason": "provider record missing",
+            }));
+            continue;
+        };
+        let payable_au = tnk_payable_earning_au(rpc, &earning, provider, epoch, &params).await?;
+        let transferable_au = fiat_whole_minor_au(payable_au);
+        if transferable_au == 0 {
+            if payable_au > 0 {
+                skipped_providers.push(json!({
+                    "provider": earning.provider,
+                    "au": money_au_json(payable_au),
+                    "reason": "payable amount is below one Stripe minor unit",
+                }));
+            }
+            continue;
+        }
+        match fiat_provider_payout_target(provider, &earning.provider, &admin) {
+            Ok((to, currency)) => outputs.push(FiatSettlementOutput {
+                role: "provider".to_owned(),
+                provider: Some(earning.provider),
+                to,
+                currency,
+                amount_minor: fiat_au_to_minor(transferable_au)?,
+                au: transferable_au,
+            }),
+            Err(error) => skipped_providers.push(json!({
+                "provider": earning.provider,
+                "au": money_au_json(transferable_au),
+                "reason": error.to_string(),
+            })),
+        }
+    }
+
+    let fee = read_fee_record(rpc, "fiat").await?;
+    let payable_fee_au = fee
+        .cum_au
+        .checked_sub(fee.swept_cum_au)
+        .context("fee/fiat/cum swept amount exceeds cumulative fee")?;
+    let operator_fee_au = fiat_whole_minor_au(payable_fee_au);
+    if operator_fee_au > 0 {
+        outputs.push(FiatSettlementOutput {
+            role: "operator_fee".to_owned(),
+            provider: None,
+            to: operator_to.to_owned(),
+            currency: operator_currency,
+            amount_minor: fiat_au_to_minor(operator_fee_au)?,
+            au: operator_fee_au,
+        });
+    }
+    if outputs.is_empty() {
+        bail!(
+            "fiat settlement has no whole-cent provider or operator fee outputs; nothing to record"
+        );
+    }
+
+    let provided_refs = stripe_refs.map(|refs| refs.to_vec()).unwrap_or_default();
+    if !provided_refs.is_empty() && provided_refs.len() != outputs.len() {
+        bail!(
+            "fiat settlement requires one --stripe-ref per output: got {}, expected {}",
+            provided_refs.len(),
+            outputs.len()
+        );
+    }
+    if provided_refs.is_empty()
+        && operator_ref.is_some()
+        && !outputs.iter().any(|output| output.role == "operator_fee")
+    {
+        bail!("--operator-stripe-ref was provided but the settlement has no operator fee output");
+    }
+    let refs = if provided_refs.is_empty() {
+        Vec::new()
+    } else {
+        validate_fiat_settlement_refs(&outputs, provided_refs)?
+    };
+    let output_values = fiat_settlement_output_values(&outputs);
+    let transfer_root = stable_value_hash(&json!({
+        "domain": "mayhem-fiat-settlement-transfer-root-v1",
+        "value": output_values,
+    }));
+    let totals = fiat_settlement_output_totals(&outputs)?;
+    let payload = json!({
+        "op": "fiat_settlement",
+        "epoch": epoch,
+        "at": at,
+        "rail": "fiat",
+        "processor": "stripe",
+        "operator_to": operator_to,
+        "epoch_apply_hash": epoch_apply_hash,
+        "stripe_refs": refs,
+        "transfer_root": transfer_root,
+        "provider_count": totals.provider_count,
+        "provider_au": money_au_json(totals.provider_au),
+        "operator_fee_au": money_au_json(totals.operator_fee_au),
+        "gross_au": money_au_json(totals.gross_au),
+        "outputs": output_values,
+    });
+
+    Ok(FiatSettlementPlan {
+        payload,
+        stripe_outputs: outputs,
+        skipped_providers,
+        already_settled: None,
+        epoch_apply_hash,
+    })
+}
+
+fn fiat_settlement_output_values(outputs: &[FiatSettlementOutput]) -> Vec<Value> {
+    outputs
+        .iter()
+        .map(|output| {
+            let mut value = json!({
+                "role": output.role,
+                "to": output.to,
+                "currency": output.currency,
+                "amount_minor": output.amount_minor.to_string(),
+                "au": money_au_json(output.au),
+            });
+            if let Some(provider) = output.provider.as_ref() {
+                value["provider"] = json!(provider);
+            }
+            value
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct FiatSettlementTotals {
+    provider_count: u64,
+    provider_au: MoneyAu,
+    operator_fee_au: MoneyAu,
+    gross_au: MoneyAu,
+}
+
+fn fiat_settlement_output_totals(outputs: &[FiatSettlementOutput]) -> Result<FiatSettlementTotals> {
+    let mut provider_count = 0_u64;
+    let mut provider_au = 0_u128;
+    let mut operator_fee_au = 0_u128;
+    for output in outputs {
+        match output.role.as_str() {
+            "provider" => {
+                provider_count = provider_count
+                    .checked_add(1)
+                    .context("fiat settlement provider count overflow")?;
+                provider_au = provider_au
+                    .checked_add(output.au)
+                    .context("fiat settlement provider amount overflow")?;
+            }
+            "operator_fee" => {
+                operator_fee_au = operator_fee_au
+                    .checked_add(output.au)
+                    .context("fiat settlement operator amount overflow")?;
+            }
+            other => bail!("invalid fiat settlement output role {other}"),
+        }
+    }
+    let gross_au = provider_au
+        .checked_add(operator_fee_au)
+        .context("fiat settlement gross amount overflow")?;
+    Ok(FiatSettlementTotals {
+        provider_count,
+        provider_au,
+        operator_fee_au,
+        gross_au,
+    })
+}
+
+async fn read_fee_record(rpc: &PeerRpcClient, rail: &str) -> Result<LedgerFeeRecord> {
+    match read_state_value(rpc, &format!("fee/{rail}/cum")).await? {
+        Some(value) => serde_json::from_value(value)
+            .with_context(|| format!("parsing fee/{rail}/cum contract state")),
+        None => Ok(LedgerFeeRecord {
+            rail: rail.to_owned(),
+            denom: "au_usd".to_owned(),
+            cum_au: 0,
+            swept_cum_au: 0,
+            updated_epoch: 0,
+            updated_at: None,
+            last_apply_hash: None,
+            last_fee_bps: None,
+            last_settlement_epoch: None,
+            last_settlement_msb_tx_hash: None,
+        }),
+    }
+}
+
+fn fiat_whole_minor_au(au: MoneyAu) -> MoneyAu {
+    (au / FIAT_MINOR_AU_CLI) * FIAT_MINOR_AU_CLI
+}
+
+fn fiat_au_to_minor(au: MoneyAu) -> Result<u64> {
+    if au == 0 || au % FIAT_MINOR_AU_CLI != 0 {
+        bail!("fiat settlement amount must be a positive whole Stripe minor unit");
+    }
+    u64::try_from(au / FIAT_MINOR_AU_CLI)
+        .context("fiat settlement amount exceeds Stripe u64 minor units")
+}
+
+fn fiat_provider_payout_target(
+    provider: &Value,
+    provider_id: &str,
+    admin: &str,
+) -> Result<(String, String)> {
+    if !matches!(
+        provider.get("status").and_then(Value::as_str),
+        Some("active" | "banned")
+    ) {
+        bail!("provider status is not payable");
+    }
+    let payout = provider
+        .get("payout")
+        .and_then(Value::as_object)
+        .context("provider payout target is not set")?;
+    if payout.get("method").and_then(Value::as_str) != Some("stripe") {
+        bail!("provider payout target is not Stripe");
+    }
+    if payout.get("set_by").and_then(Value::as_str) != Some(admin) {
+        bail!("provider payout target was not set by the current admin");
+    }
+    if payout.get("set_by_role").and_then(Value::as_str) != Some("admin") {
+        bail!("provider payout target must be admin-set");
+    }
+    let addr = payout
+        .get("addr")
+        .and_then(Value::as_str)
+        .context("provider payout target missing address")?;
+    if !is_safe_key_part(addr) {
+        bail!("provider payout target address is not contract-safe");
+    }
+    let currency = payout
+        .get("currency")
+        .and_then(Value::as_str)
+        .context("provider payout target missing fiat currency")
+        .and_then(normalize_admin_fiat_currency)?;
+    if provider
+        .get("provider")
+        .and_then(Value::as_str)
+        .is_some_and(|actual| actual != provider_id)
+    {
+        bail!("provider payout record owner mismatch");
+    }
+    Ok((addr.to_owned(), currency))
+}
+
+fn normalize_fiat_settlement_ref(value: &str, label: &str) -> Result<String> {
+    let value = value.trim();
+    if !is_safe_key_part(value) {
+        bail!("{label} is not contract-safe");
+    }
+    Ok(value.to_owned())
+}
+
+fn operator_fiat_settlement_ref(
+    override_ref: Option<&str>,
+    epoch: u64,
+    epoch_apply_hash: &str,
+) -> Result<String> {
+    if let Some(value) = override_ref {
+        return normalize_fiat_settlement_ref(value, "operator Stripe reference");
+    }
+    Ok(format!(
+        "platform_balance:{epoch}:{}",
+        epoch_apply_hash.get(..16).unwrap_or(epoch_apply_hash)
+    ))
+}
+
+fn validate_fiat_settlement_refs(
+    outputs: &[FiatSettlementOutput],
+    refs: Vec<String>,
+) -> Result<Vec<String>> {
+    if refs.len() != outputs.len() {
+        bail!("fiat settlement Stripe reference count must match outputs");
+    }
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(refs.len());
+    for (output, reference) in outputs.iter().zip(refs.iter()) {
+        let reference = normalize_fiat_settlement_ref(reference, "Stripe reference")?;
+        if !seen.insert(reference.clone()) {
+            bail!("duplicate fiat settlement Stripe reference");
+        }
+        if output.role == "provider" && !reference.starts_with("tr_") {
+            bail!("provider Stripe references must be transfer ids starting with tr_");
+        }
+        normalized.push(reference);
+    }
+    Ok(normalized)
+}
+
+fn stripe_api_base_url(override_url: Option<&str>) -> Result<String> {
+    let value = override_url
+        .map(str::to_owned)
+        .or_else(|| env::var("MAYHEM_STRIPE_API_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.stripe.com".to_owned());
+    let trimmed = value.trim().trim_end_matches('/').to_owned();
+    if trimmed.is_empty() || !trimmed.starts_with("https://") {
+        bail!("Stripe API base URL must be https");
+    }
+    Ok(trimmed)
+}
+
+fn load_stripe_secret_key(path: Option<&PathBuf>, home: &Path) -> Result<String> {
+    if let Ok(value) =
+        env::var("STRIPE_SECRET_KEY").or_else(|_| env::var("MAYHEM_STRIPE_SECRET_KEY"))
+    {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(value.to_owned());
+        }
+    }
+    let candidates = if let Some(path) = path {
+        vec![path.clone()]
+    } else {
+        vec![
+            PathBuf::from(".mayhem-local/secrets/stripe.txt"),
+            home.join("secrets/stripe.txt"),
+        ]
+    };
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&candidate)
+            .with_context(|| format!("reading Stripe secret file {}", candidate.display()))?;
+        if let Some(secret) = stripe_secret_key_from_text(&text) {
+            return Ok(secret);
+        }
+    }
+    bail!("missing STRIPE_SECRET_KEY; set env, MAYHEM_STRIPE_SECRET_KEY, or pass --stripe-env-file")
+}
+
+fn stripe_secret_key_from_text(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=')?;
+        if matches!(key.trim(), "STRIPE_SECRET_KEY" | "MAYHEM_STRIPE_SECRET_KEY") {
+            let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+async fn stripe_create_transfer(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    output: &FiatSettlementOutput,
+    idempotency_key: &str,
+) -> Result<StripeTransferResult> {
+    let provider = output
+        .provider
+        .as_deref()
+        .context("Stripe provider transfer output missing provider")?;
+    let params = [
+        ("amount", output.amount_minor.to_string()),
+        ("currency", output.currency.clone()),
+        ("destination", output.to.clone()),
+        ("metadata[mayhem_provider]", provider.to_owned()),
+        ("metadata[mayhem_au]", output.au.to_string()),
+    ];
+    let response = client
+        .post(format!(
+            "{}/v1/transfers",
+            api_base_url.trim_end_matches('/')
+        ))
+        .basic_auth(secret_key, Some(""))
+        .header("Idempotency-Key", idempotency_key)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_urlencoded_body(&params))
+        .send()
+        .await
+        .context("calling Stripe transfers API")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("Stripe transfer returned {status}: {body}");
+    }
+    let value: Value = serde_json::from_str(&body).context("parsing Stripe transfer response")?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("tr_"))
+        .context("Stripe transfer response missing transfer id")?
+        .to_owned();
+    let amount_minor = value
+        .get("amount")
+        .and_then(Value::as_u64)
+        .context("Stripe transfer response missing amount")?;
+    let currency = value
+        .get("currency")
+        .and_then(Value::as_str)
+        .context("Stripe transfer response missing currency")
+        .and_then(normalize_admin_fiat_currency)?;
+    let destination = value
+        .get("destination")
+        .and_then(Value::as_str)
+        .context("Stripe transfer response missing destination")?
+        .to_owned();
+    Ok(StripeTransferResult {
+        id,
+        amount_minor,
+        currency,
+        destination,
+    })
+}
+
+fn form_urlencoded_body(params: &[(&str, String)]) -> String {
+    params
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                form_urlencode_component(key),
+                form_urlencode_component(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn form_urlencode_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(byte));
+            }
+            b' ' => out.push('+'),
+            _ => {
+                let _ = write!(&mut out, "%{byte:02X}");
+            }
+        }
+    }
+    out
 }
 
 fn resolve_tnk_nonce(
@@ -26600,6 +27545,34 @@ struct TnkSettlementPlan {
     msb_outputs: Vec<MsbSettlementTransferOutput>,
     skipped_providers: Vec<Value>,
     already_settled: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct FiatSettlementPlan {
+    payload: Value,
+    stripe_outputs: Vec<FiatSettlementOutput>,
+    skipped_providers: Vec<Value>,
+    already_settled: Option<Value>,
+    epoch_apply_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FiatSettlementOutput {
+    role: String,
+    provider: Option<String>,
+    to: String,
+    currency: String,
+    amount_minor: u64,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    au: MoneyAu,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StripeTransferResult {
+    id: String,
+    amount_minor: u64,
+    currency: String,
+    destination: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43475,6 +44448,85 @@ mod tests {
             "TNK settlement updates are free features, not paid admin txs"
         );
 
+        let fiat_settlement_payload = json!({
+            "op": "fiat_settlement",
+            "epoch": 7,
+            "at": 25_200,
+            "rail": "fiat",
+            "processor": "stripe",
+            "operator_to": "platform_balance",
+            "epoch_apply_hash": "a".repeat(64),
+            "stripe_refs": ["tr_test_provider", "platform_balance:7:fee"],
+            "transfer_root": "c".repeat(64),
+            "provider_count": 1,
+            "provider_au": "850000000000000000",
+            "operator_fee_au": "150000000000000000",
+            "gross_au": "1000000000000000000",
+            "outputs": [
+                {
+                    "role": "provider",
+                    "provider": "b".repeat(64),
+                    "to": "acct_provider",
+                    "currency": "usd",
+                    "amount_minor": "85",
+                    "au": "850000000000000000"
+                },
+                {
+                    "role": "operator_fee",
+                    "to": "platform_balance",
+                    "currency": "eur",
+                    "amount_minor": "15",
+                    "au": "150000000000000000"
+                }
+            ]
+        });
+        assert_eq!(
+            admin_fiat_settlement_payload(&AdminFiatSettlementArgs {
+                tx: test_admin_tx_args(),
+                settlement_json: Some(fiat_settlement_payload.to_string()),
+                settlement_file: None,
+                epoch: None,
+                at: None,
+                operator_stripe_ref: None,
+                operator_stripe_account: "platform_balance".to_owned(),
+                operator_currency: "eur".to_owned(),
+                submit_transfer: false,
+                stripe_refs: Vec::new(),
+                stripe_env_file: None,
+                stripe_api_base_url: None,
+            })
+            .unwrap(),
+            fiat_settlement_payload
+        );
+        assert!(fiat_settlement_feature_key(&fiat_settlement_payload)
+            .unwrap()
+            .starts_with("settle/fiat/7/"));
+        assert_eq!(
+            fiat_settlement_feature_key(&fiat_settlement_payload)
+                .unwrap()
+                .len(),
+            "settle/fiat/7/".len() + 64
+        );
+        assert_eq!(
+            admin_command_payload(&AdminCommands::FiatSettlement(AdminFiatSettlementArgs {
+                tx: test_admin_tx_args(),
+                settlement_json: Some(fiat_settlement_payload.to_string()),
+                settlement_file: None,
+                epoch: None,
+                at: None,
+                operator_stripe_ref: None,
+                operator_stripe_account: "platform_balance".to_owned(),
+                operator_currency: "eur".to_owned(),
+                submit_transfer: false,
+                stripe_refs: Vec::new(),
+                stripe_env_file: None,
+                stripe_api_base_url: None,
+            }))
+            .unwrap_err()
+            .to_string(),
+            "fiat settlement updates are free features, not paid admin txs"
+        );
+
         assert_eq!(
             admin_tnk_deposit_payload(&AdminTnkDepositArgs {
                 tx: test_admin_tx_args(),
@@ -43593,6 +44645,77 @@ mod tests {
     fn admin_payout_confirm_payload_is_retired() {
         let err = admin_payout_confirm_payload(&test_payout_confirm_args()).unwrap_err();
         assert!(err.to_string().contains("payout-confirm is retired"));
+    }
+
+    #[test]
+    fn fiat_settlement_helpers_floor_to_stripe_minor_units_and_validate_refs() {
+        assert_eq!(
+            fiat_whole_minor_au(FIAT_MINOR_AU_CLI * 85 + 1),
+            FIAT_MINOR_AU_CLI * 85
+        );
+        assert_eq!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85).unwrap(), 85);
+        assert!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85 + 1).is_err());
+
+        let outputs = vec![
+            FiatSettlementOutput {
+                role: "provider".to_owned(),
+                provider: Some("aa".repeat(32)),
+                to: "acct_provider".to_owned(),
+                currency: "usd".to_owned(),
+                amount_minor: 85,
+                au: FIAT_MINOR_AU_CLI * 85,
+            },
+            FiatSettlementOutput {
+                role: "operator_fee".to_owned(),
+                provider: None,
+                to: "platform_balance".to_owned(),
+                currency: "eur".to_owned(),
+                amount_minor: 15,
+                au: FIAT_MINOR_AU_CLI * 15,
+            },
+        ];
+        assert_eq!(
+            validate_fiat_settlement_refs(
+                &outputs,
+                vec![
+                    "tr_test_provider".to_owned(),
+                    "platform_balance:7:fee".to_owned()
+                ]
+            )
+            .unwrap(),
+            vec!["tr_test_provider", "platform_balance:7:fee"]
+        );
+        assert!(validate_fiat_settlement_refs(
+            &outputs,
+            vec![
+                "pi_not_transfer".to_owned(),
+                "platform_balance:7:fee".to_owned()
+            ]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("tr_"));
+    }
+
+    #[test]
+    fn fiat_settlement_stripe_secret_and_form_helpers_are_terminal_safe() {
+        assert_eq!(
+            stripe_secret_key_from_text(
+                r#"
+                # comment
+                STRIPE_SECRET_KEY="sk_test_123"
+                "#
+            )
+            .as_deref(),
+            Some("sk_test_123")
+        );
+        assert_eq!(
+            form_urlencoded_body(&[
+                ("amount", "85".to_owned()),
+                ("metadata[mayhem_provider]", "aa bb".to_owned()),
+            ]),
+            "amount=85&metadata%5Bmayhem_provider%5D=aa+bb"
+        );
     }
 
     #[test]
