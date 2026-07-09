@@ -1060,7 +1060,7 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
     assert!(body["data"][0]["mayhem"]["attestation_tier_labels"]["T2"]
         .as_str()
         .expect("tier 2 label")
-        .contains("Apple App Attest strong / NVIDIA GB10 device medium"));
+        .contains("TPM EK / Apple App Attest / NVIDIA GB10"));
 }
 
 #[tokio::test]

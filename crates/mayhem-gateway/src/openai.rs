@@ -16485,7 +16485,7 @@ fn attestation_tier_labels_for_counts(tiers: &BTreeMap<String, u32>) -> BTreeMap
             let label = match tier.as_str() {
                 "T1" => "Tier 1 - software self-attestation; economic/trust only",
                 "T2" => {
-                    "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
+                    "Tier 2 - hardware device identity; TPM EK / Apple App Attest / NVIDIA GB10; not prompt-confidential"
                 }
                 "T3" => {
                     "Tier 3 - hardware confidential compute; prompt-confidential when supported"

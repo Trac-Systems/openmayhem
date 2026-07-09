@@ -22748,7 +22748,7 @@ fn attestation_tier_label(tier: &str) -> &'static str {
     match tier {
         "T1" => "Tier 1 - software self-attestation; economic/trust only",
         "T2" => {
-            "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
+            "Tier 2 - hardware device identity; TPM EK / Apple App Attest / NVIDIA GB10; not prompt-confidential"
         }
         "T3" => "Tier 3 - hardware confidential compute; prompt-confidential when supported",
         "T4" => "Tier 4 - admin KYB verified identity; not prompt-confidential",
@@ -49561,7 +49561,7 @@ State initialization...
                 "attestation_tiers": { "T1": 2, "T2": 1 },
                 "quant_buckets": { "int4": 2, "fp16": 1 },
                 "attestation_tier_labels": {
-                    "T2": "Tier 2 - hardware device identity; Apple App Attest strong / NVIDIA GB10 device medium; not prompt-confidential"
+                    "T2": "Tier 2 - hardware device identity; TPM EK / Apple App Attest / NVIDIA GB10; not prompt-confidential"
                 },
                 "caps": {
                     "tools": true,
@@ -49597,7 +49597,7 @@ State initialization...
         assert_eq!(summaries[0].attestation_tiers["T2"], 1);
         assert_eq!(summaries[0].quant_buckets["int4"], 2);
         assert_eq!(summaries[0].quant_buckets["fp16"], 1);
-        assert!(summaries[0].attestation_tier_labels["T2"].contains("GB10"));
+        assert!(summaries[0].attestation_tier_labels["T2"].contains("TPM EK"));
         assert_eq!(summaries[0].max_attestation_tier, 2);
         assert!(!summaries[0].prompt_confidential);
         assert!(summaries[0]
