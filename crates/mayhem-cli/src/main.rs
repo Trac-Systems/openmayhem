@@ -11883,7 +11883,9 @@ fn catalog_canary_evidence_report(
                     .to_owned(),
             );
         }
-        if calibration.existing_catalog_fingerprint != entry.expected_fingerprint {
+        if mode == CatalogCanaryReportMode::ApplyToCatalog
+            && calibration.existing_catalog_fingerprint != entry.expected_fingerprint
+        {
             entry.errors.push(
                 "report existing_catalog_fingerprint does not match current catalog".to_owned(),
             );
@@ -11894,13 +11896,6 @@ fn catalog_canary_evidence_report(
                 calibration.catalog_fingerprint,
                 entry.expected_fingerprint.as_deref().unwrap_or("<missing>")
             ));
-        }
-        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
-            && calibration.matches_existing_catalog != Some(true)
-        {
-            entry
-                .errors
-                .push("report was not generated as a catalog match".to_owned());
         }
         let mut prompt_ids = BTreeSet::new();
         for prompt in &calibration.prompts {
@@ -53201,6 +53196,70 @@ State initialization...
         assert_eq!(report.artifact_count, 1);
         assert_eq!(report.report_count, 1);
         assert_eq!(report.entries[0].matches_catalog, Some(true));
+    }
+
+    #[test]
+    fn canary_evidence_accepts_first_calibration_after_apply() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), None);
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let apply = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir.clone(),
+            true,
+            std::slice::from_ref(&report_path),
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        assert!(apply.ok, "{:?}", apply.errors);
+
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let evidence = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.with-canaries.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+        );
+
+        assert!(evidence.ok, "{:?}", evidence.errors);
+        assert_eq!(evidence.entries[0].matches_catalog, Some(true));
+        assert_eq!(calibration.existing_catalog_fingerprint, None);
+        assert_eq!(calibration.matches_existing_catalog, None);
+    }
+
+    #[test]
+    fn canary_apply_rejects_report_based_on_stale_catalog_fingerprint() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("cc".repeat(32), Some("bb".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error
+                .contains("existing_catalog_fingerprint does not match current catalog")));
     }
 
     #[test]
