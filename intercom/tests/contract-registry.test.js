@@ -46,6 +46,15 @@ const artifactSidecars = {
   },
 };
 
+const launchMeasurements = {
+  schema_version: 1,
+  effective_epoch: 0,
+  platform: 'azure-h100-sev-snp-nvidia-cc',
+  measurements: {
+    snp_launch_digest: 'a'.repeat(96),
+  },
+};
+
 const providerRegistration = {
   op: 'register_provider',
 };
@@ -633,7 +642,7 @@ test('MayhemContract requires a current admin price before provider serving rows
       policy: {},
     },
     admin.publicKey,
-    9
+    10
   );
   assert.equal(opened.ok, true, opened.message);
 
@@ -796,6 +805,60 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     (await storage.get(`roomserve/${roomId}/${provider.publicKey}/${enclaveId}`)).value.status,
     'active'
   );
+});
+
+test('MayhemContract appends Tier-3 measurement blessings as admin-only feature records', async () => {
+  const admin = await makeIdentity();
+  const outsider = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const value = {
+    op: 'tier3_bless_measurement',
+    platform: 'azure-h100-sev-snp-nvidia-cc',
+    measurement_name: 'snp_launch_digest',
+    measurement: 'a'.repeat(96),
+    effective_epoch: 7,
+    at: 1783517300,
+    region: 'centralus',
+    derivation_hash: 'b'.repeat(64),
+    source: 'admin-derive',
+  };
+  const key = await contract.tier3MeasurementFeatureKey(value);
+  if (key instanceof Error) throw key;
+
+  contract._mayhemLastFeatureResult = undefined;
+  const rejectedRaw = await executeFeature(contract, storage, 'mayhem_feature', key, value, outsider.publicKey);
+  const rejected = rejectedRaw ?? contract._mayhemLastFeatureResult;
+  assert.match(rejected.message, /admin required/i);
+  assert.equal(await storage.get(`tier3/measurement/${value.platform}`), null);
+
+  contract._mayhemLastFeatureResult = undefined;
+  const appliedRaw = await executeFeature(contract, storage, 'mayhem_feature', key, value, admin.publicKey);
+  const applied = appliedRaw ?? contract._mayhemLastFeatureResult;
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(applied.status, 'blessed');
+  const first = await storage.get(`tier3/measurement/${value.platform}`);
+  assert.deepEqual(first.value.measurements.snp_launch_digest, [value.measurement]);
+  assert.equal(first.value.entries.length, 1);
+  assert.equal(first.value.entries[0].region, 'centralus');
+
+  contract._mayhemLastFeatureResult = undefined;
+  const duplicateRaw = await executeFeature(contract, storage, 'mayhem_feature', key, value, admin.publicKey);
+  const duplicate = duplicateRaw ?? contract._mayhemLastFeatureResult;
+  assert.equal(duplicate.status, 'already_blessed');
+  assert.equal((await storage.get(`tier3/measurement/${value.platform}`)).value.entries.length, 1);
+
+  const rolled = { ...value, measurement: 'c'.repeat(96), at: value.at + 1 };
+  const rolledKey = await contract.tier3MeasurementFeatureKey(rolled);
+  if (rolledKey instanceof Error) throw rolledKey;
+  contract._mayhemLastFeatureResult = undefined;
+  const rolledRaw = await executeFeature(contract, storage, 'mayhem_feature', rolledKey, rolled, admin.publicKey);
+  const rolledResult = rolledRaw ?? contract._mayhemLastFeatureResult;
+  assert.equal(rolledResult.status, 'blessed');
+  const afterRoll = await storage.get(`tier3/measurement/${value.platform}`);
+  assert.deepEqual(afterRoll.value.measurements.snp_launch_digest, [value.measurement, rolled.measurement]);
+  assert.equal(afterRoll.value.entries.length, 2);
 });
 
 test('MayhemContract provider serving price gate fails closed without current admin key', async () => {
@@ -1168,7 +1231,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   assert.equal(stored.value.updated_at, makeTxKey(11));
 });
 
-test('MayhemContract keeps launch enclave attestation tier at 1 until quote generation is wired', async () => {
+test('MayhemContract allows launch enclave hardware tiers and rejects KYB-only tier', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });
@@ -1204,11 +1267,11 @@ test('MayhemContract keeps launch enclave attestation tier at 1 until quote gene
     admin.publicKey,
     2
   );
-  assert.notEqual(tier2Register.ok, true);
-  assert.match(tier2Register.message, /not launch-advertisable/i);
-  assert.equal(await storage.get(`enclave/${'f'.repeat(64)}`), null);
+  assert.equal(tier2Register.ok, true, tier2Register.message);
+  const tier2Stored = await storage.get(`enclave/${'f'.repeat(64)}`);
+  assert.equal(tier2Stored.value.att_tier, 2);
 
-  const tier3Update = await execute(
+  const tier3MissingMeasurement = await execute(
     contract,
     storage,
     'updateEnclave',
@@ -1220,10 +1283,42 @@ test('MayhemContract keeps launch enclave attestation tier at 1 until quote gene
     admin.publicKey,
     3
   );
-  assert.notEqual(tier3Update.ok, true);
-  assert.match(tier3Update.message, /not launch-advertisable/i);
-  const afterRejectedUpdate = await storage.get(`enclave/${'d'.repeat(64)}`);
-  assert.equal(afterRejectedUpdate.value.att_tier, 1);
+  assert.notEqual(tier3MissingMeasurement.ok, true);
+  assert.match(tier3MissingMeasurement.message, /launch_measurements/i);
+
+  const tier3Update = await execute(
+    contract,
+    storage,
+    'updateEnclave',
+    {
+      op: 'update_enclave',
+      enclave_id: 'd'.repeat(64),
+      att_tier: 3,
+      launch_measurements: launchMeasurements,
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(tier3Update.ok, true, tier3Update.message);
+  const afterTier3Update = await storage.get(`enclave/${'d'.repeat(64)}`);
+  assert.equal(afterTier3Update.value.att_tier, 3);
+  assert.deepEqual(afterTier3Update.value.launch_measurements, launchMeasurements);
+
+  const tier4Register = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    {
+      ...enclaveRegistration,
+      enclave_id: 'b'.repeat(64),
+      att_tier: 4,
+    },
+    admin.publicKey,
+    5
+  );
+  assert.notEqual(tier4Register.ok, true);
+  assert.match(tier4Register.message, /Tier 4 is provider KYB/i);
+  assert.equal(await storage.get(`enclave/${'b'.repeat(64)}`), null);
 
   const fractionalRegister = await execute(
     contract,
@@ -1235,7 +1330,7 @@ test('MayhemContract keeps launch enclave attestation tier at 1 until quote gene
       att_tier: 3 / 2,
     },
     admin.publicKey,
-    4
+    5
   );
   assert.notEqual(fractionalRegister.ok, true);
   assert.match(fractionalRegister.message, /invalid schema/i);
@@ -1328,9 +1423,28 @@ test('MayhemContract schedules enclave min-tier notice without stranding active 
     admin.publicKey,
     8
   );
-  assert.notEqual(tier2.ok, true);
-  assert.match(tier2.message, /not launch-advertisable/i);
-  assert.equal(await storage.get(`tierpolicy/enclave/${enclaveId}`), null);
+  assert.equal(tier2.ok, true, tier2.message);
+  const tier2Policy = await storage.get(`tierpolicy/enclave/${enclaveId}`);
+  assert.equal(tier2Policy.value.pending.min_att_tier, 2);
+
+  const tier4 = await execute(
+    contract,
+    storage,
+    'setEnclaveMinTier',
+    {
+      op: 'set_enclave_min_tier',
+      enclave_id: enclaveId,
+      min_att_tier: 4,
+      submitted_epoch: 10,
+      effective_epoch: 34,
+      submitted_at: 0,
+      reason_hash: 'e'.repeat(64),
+    },
+    admin.publicKey,
+    9
+  );
+  assert.notEqual(tier4.ok, true);
+  assert.match(tier4.message, /Tier 4 is provider KYB/i);
 
   const scheduled = await execute(
     contract,

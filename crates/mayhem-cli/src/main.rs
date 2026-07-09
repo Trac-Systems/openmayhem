@@ -10,7 +10,7 @@ use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -29,13 +29,14 @@ use mayhem_bridge::{
     DEFAULT_SC_BRIDGE_URL,
 };
 use mayhem_enclave::{
-    build_merkle_manifest, build_merkle_manifest_with_progress, download_resumable_with_progress,
-    finalize_tier1_attestation_report, load_or_create_runtime_keypair_store, measure_binary,
+    build_hardware_attestation_report, build_merkle_manifest, build_merkle_manifest_with_progress,
+    download_resumable_with_progress, finalize_tier1_attestation_report,
+    load_or_create_runtime_keypair_store, measure_binary, prepare_hardware_quote_binding,
     prepare_tier1_attestation_report, read_sealed_manifest, seal_artifact, DownloadReport,
-    DownloadRequest, DownloadSource, KeyContext, ProgressEvent, ProgressPhase, RuntimeKeyContext,
-    RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationDraft,
-    Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
-    SEALED_STORE_MANIFEST,
+    DownloadRequest, DownloadSource, HardwareAttestationOptions, HardwareQuoteBindingOptions,
+    KeyContext, ProgressEvent, ProgressPhase, RuntimeKeyContext, RuntimeKeypair,
+    RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationReport,
+    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
@@ -53,31 +54,32 @@ use mayhem_gateway::{
         ScBridgeGatewaySessionConfig, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_ROUTE_MAX_WAIT_MS,
     },
     priced_usage_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
-    HeartbeatReceiver, ProbationCaps, ProbationPolicy, ProviderProbation, RateMapEntry,
-    ReputationEvent, ReputationEventKind, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, INPUT_TOKEN_UNIT,
-    OUTPUT_TOKEN_UNIT,
+    HardwareQuoteVerifierCommand, HeartbeatReceiver, ProbationCaps, ProbationPolicy,
+    ProviderProbation, RateMapEntry, ReputationEvent, ReputationEventKind,
+    DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+    INPUT_TOKEN_UNIT, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, probe, BackendVerdict, FixtureProfile, GpuInfo, GpuVendor, HardwareReport,
     ProbeOptions, VerdictStatus,
 };
 use mayhem_proto::{
-    chunk_json_payload, ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at,
-    default_ctx_bracket_schedule, reassemble_json_payload, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    validate_ctx_bracket_schedule, AttestationRuntimeConfig, CatalogEnclaveIdentity,
-    CheckpointPolicy, CtxBracketSchedule, MoneyAu, PayloadChunk, PayloadChunkManifest, ReceiptAck,
-    ReceiptBody, ReceiptUsage, SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_STEP,
+    catalog_enclave_id, chunk_json_payload, ctx_bracket_for_tokens_in_schedule,
+    ctx_bracket_table_at, default_ctx_bracket_schedule, reassemble_json_payload,
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, validate_ctx_bracket_schedule, AttestationRuntimeConfig,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
+    MoneyAu, PayloadChunk, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SpendVoucher, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_PAYGATE_URL: &str = "http://127.0.0.1:11436";
@@ -100,6 +102,7 @@ const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
 const PROVIDER_SESSION_ARTIFACT_CHUNK_SIZE: usize = 16 * 1024;
 const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
+const DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS: u64 = 120;
 const OPENCODE_TEST_MARKER: &str = "mayhem-opencode-tool-ok";
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const GIB_BYTES: u64 = 1024 * 1024 * 1024;
@@ -414,6 +417,11 @@ enum AdminCommands {
         #[command(subcommand)]
         command: AdminDeviceCommands,
     },
+    /// Tier-3 confidential-compute golden measurement operations.
+    Tier3 {
+        #[command(subcommand)]
+        command: AdminTier3Commands,
+    },
     /// Accredit an auditor key for probe submission.
     AuditorRegister(AdminAuditorRegisterArgs),
     /// Fold real reputation events and anchor rep/<provider> snapshots.
@@ -474,6 +482,16 @@ enum AdminBanCommands {
 enum AdminDeviceCommands {
     /// Rebind a healthy device key to a replacement provider wallet.
     Rebind(AdminDeviceRebindArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminTier3Commands {
+    /// List admin-blessed Tier-3 platform measurement sets.
+    List(AdminTier3ListArgs),
+    /// Derive a Tier-3 measurement independently and record the local confirmation.
+    Derive(AdminTier3DeriveArgs),
+    /// Append one admin-blessed Tier-3 measurement to the ledger set.
+    Bless(AdminTier3BlessArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -982,6 +1000,26 @@ struct UpArgs {
     #[arg(long)]
     provider_gpu_layers: Option<u32>,
 
+    /// Hardware quote kind emitted by the supervised provider, for example nvidia_nvtrust_offline_jwt.
+    #[arg(long)]
+    provider_hardware_quote_kind: Option<String>,
+
+    /// Provider-side command that emits nonce-bound hardware quote JSON/evidence.
+    #[arg(long, value_name = "PATH")]
+    provider_hardware_quote_command: Option<PathBuf>,
+
+    /// Seconds to wait for the supervised provider hardware quote command.
+    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS)]
+    provider_hardware_quote_timeout_seconds: u64,
+
+    /// Gateway/admin-side command that verifies raw hardware quote evidence.
+    #[arg(long, value_name = "PATH")]
+    hardware_quote_verifier_command: Option<PathBuf>,
+
+    /// Seconds to wait for the gateway/admin hardware quote verifier.
+    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS)]
+    hardware_quote_verifier_timeout_seconds: u64,
+
     /// Intercom/Pear network: mainnet, testnet1, local, or development. Defaults to config, env, or mainnet.
     #[arg(long)]
     network: Option<String>,
@@ -1156,6 +1194,14 @@ struct UseArgs {
     /// Trusted NVIDIA nvTrust/local-verifier JWKS JSON file for offline confidential-compute quotes.
     #[arg(long, value_name = "PATH")]
     nvidia_offline_jwks_file: Option<PathBuf>,
+
+    /// Gateway/admin-side command that verifies raw hardware quote evidence.
+    #[arg(long, value_name = "PATH")]
+    hardware_quote_verifier_command: Option<PathBuf>,
+
+    /// Seconds to wait for the gateway/admin hardware quote verifier.
+    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS)]
+    hardware_quote_verifier_timeout_seconds: u64,
 
     /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
     #[arg(long)]
@@ -2977,7 +3023,7 @@ impl AdminBanTargetType {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 struct AdminTxArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -3012,6 +3058,120 @@ struct AdminTxArgs {
     json: bool,
 }
 
+#[derive(Debug, Parser)]
+struct AdminTier3ListArgs {
+    #[command(flatten)]
+    read: AdminReadArgs,
+
+    /// Restrict output to one platform label.
+    #[arg(long)]
+    platform: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminTier3DeriveArgs {
+    #[command(flatten)]
+    read: AdminReadArgs,
+
+    /// Tier-3 platform recipe label, e.g. azure-h100-sev-snp-nvidia-cc.
+    #[arg(long)]
+    platform: String,
+
+    /// Region used for the independent derivation attempt.
+    #[arg(long)]
+    region: Option<String>,
+
+    /// Measurement name to record from the derivation.
+    #[arg(long, default_value = "snp_launch_digest")]
+    measurement_name: String,
+
+    /// Already-derived measurement hex from an admin-owned attestation run.
+    #[arg(long)]
+    measurement: Option<String>,
+
+    /// Optional command that prints derivation JSON to stdout.
+    #[arg(long, value_name = "PATH")]
+    derive_command: Option<PathBuf>,
+
+    /// How this measurement was independently obtained.
+    #[arg(long, value_enum, default_value_t = Tier3DeriveSourceKind::AdminBoot)]
+    source_kind: Tier3DeriveSourceKind,
+
+    /// Vendor endorsement artifact that supports a vendor-endorsed measurement source.
+    #[arg(long, value_name = "PATH")]
+    endorsement_file: Option<PathBuf>,
+
+    /// Measurement from an alerting provider quote; output reports MATCH/NO-MATCH.
+    #[arg(long)]
+    alert_measurement: Option<String>,
+
+    /// Also write the derivation report to this path.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum Tier3DeriveSourceKind {
+    /// Measurement came from an admin-booted independent VM/host.
+    AdminBoot,
+    /// Measurement was computed offline from pinned firmware/kernel/initrd inputs.
+    OfflineCompute,
+    /// Measurement came from a vendor-signed endorsement artifact.
+    VendorEndorsement,
+}
+
+impl Tier3DeriveSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AdminBoot => "admin-boot",
+            Self::OfflineCompute => "offline-compute",
+            Self::VendorEndorsement => "vendor-endorsement",
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+struct AdminTier3BlessArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Tier-3 platform label whose append-only measurement set is updated.
+    #[arg(long)]
+    platform: String,
+
+    /// Measurement name being blessed.
+    #[arg(long, default_value = "snp_launch_digest")]
+    measurement_name: String,
+
+    /// Golden measurement hex to append.
+    #[arg(long)]
+    measurement: String,
+
+    /// Activation epoch for new registrations/sessions.
+    #[arg(long)]
+    effective_epoch: u64,
+
+    /// Region used by the admin derivation that confirmed this measurement.
+    #[arg(long)]
+    region: Option<String>,
+
+    /// Override the derivation hash stored in the blessing record.
+    #[arg(long)]
+    derivation_hash: Option<String>,
+
+    /// Source label for the blessing.
+    #[arg(long, default_value = "admin-derive")]
+    source: String,
+
+    /// Submit the real append after reviewing `mayhem admin tier3 bless --sim`.
+    #[arg(long)]
+    confirm: bool,
+
+    /// Allow blessing without a matching local derive record.
+    #[arg(long)]
+    allow_unconfirmed: bool,
+}
+
 #[derive(Debug, Clone, Parser)]
 struct AdminReadArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
@@ -3025,6 +3185,24 @@ struct AdminReadArgs {
     /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Tier3DerivationRecord {
+    schema_version: u32,
+    platform: String,
+    region: Option<String>,
+    measurement_name: String,
+    measurement: String,
+    alert_measurement: Option<String>,
+    match_alert: Option<bool>,
+    derived_at: u64,
+    #[serde(default)]
+    source_kind: Option<String>,
+    source: String,
+    #[serde(default)]
+    endorsement_sha256: Option<String>,
+    derivation_hash: String,
 }
 
 #[derive(Debug, Parser)]
@@ -3318,6 +3496,14 @@ struct AdminRegisterEnclaveArgs {
     #[arg(long)]
     binary_hash: String,
 
+    /// Admin-published Tier-3 launch measurements JSON.
+    #[arg(long)]
+    launch_measurements_json: Option<String>,
+
+    /// Path to a JSON file containing admin-published Tier-3 launch measurements.
+    #[arg(long, value_name = "PATH")]
+    launch_measurements_file: Option<PathBuf>,
+
     #[arg(long, default_value_t = 1)]
     att_tier: u8,
 
@@ -3388,6 +3574,14 @@ struct AdminUpdateEnclaveArgs {
 
     #[arg(long)]
     binary_hash: Option<String>,
+
+    /// Admin-published Tier-3 launch measurements JSON.
+    #[arg(long)]
+    launch_measurements_json: Option<String>,
+
+    /// Path to a JSON file containing admin-published Tier-3 launch measurements.
+    #[arg(long, value_name = "PATH")]
+    launch_measurements_file: Option<PathBuf>,
 
     /// JSON object for enclave caps, e.g. '{"tools":true,"json":true,"ctx":8192}'.
     #[arg(long)]
@@ -4626,6 +4820,18 @@ struct ProviderStartArgs {
     /// Binary path to measure for Tier-1 attestation. Defaults to the running mayhem binary.
     #[arg(long, value_name = "PATH")]
     enclave_binary: Option<PathBuf>,
+
+    /// Hardware quote kind produced by --hardware-quote-command for Tier-2/3 provider reports.
+    #[arg(long, value_name = "KIND")]
+    hardware_quote_kind: Option<String>,
+
+    /// Command that prints bound hardware quote evidence as JSON or a raw evidence string.
+    #[arg(long, value_name = "PATH")]
+    hardware_quote_command: Option<PathBuf>,
+
+    /// Maximum seconds to wait for --hardware-quote-command.
+    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS)]
+    hardware_quote_timeout_seconds: u64,
 
     /// Build and sign provider registration/join feature records without appending them.
     #[arg(long)]
@@ -6234,6 +6440,9 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         skip_disk_bench: true,
         chunk_size: DEFAULT_CHUNK_SIZE,
         enclave_binary: None,
+        hardware_quote_kind: None,
+        hardware_quote_command: None,
+        hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
         sim: false,
         no_heartbeat: true,
         heartbeat_count: 1,
@@ -12111,6 +12320,7 @@ async fn admin(command: AdminCommands) -> Result<()> {
     match &command {
         AdminCommands::Disputes { command } => return admin_disputes(command).await,
         AdminCommands::Ban { command } => return admin_ban(command).await,
+        AdminCommands::Tier3 { command } => return admin_tier3(command).await,
         AdminCommands::EpochApply(args) => return run_admin_epoch_apply_feature(args).await,
         AdminCommands::TnkDeposit(args) => {
             return run_admin_deposit_feature(
@@ -12193,11 +12403,496 @@ async fn admin_ban(command: &AdminBanCommands) -> Result<()> {
     }
 }
 
+async fn admin_tier3(command: &AdminTier3Commands) -> Result<()> {
+    match command {
+        AdminTier3Commands::List(args) => admin_tier3_list(args).await,
+        AdminTier3Commands::Derive(args) => admin_tier3_derive(args).await,
+        AdminTier3Commands::Bless(args) => admin_tier3_bless(args).await,
+    }
+}
+
 async fn admin_read_rpc(args: &AdminReadArgs) -> Result<(String, PeerRpcClient)> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     Ok((rpc_url.clone(), PeerRpcClient::new(&rpc_url)?))
+}
+
+async fn admin_tier3_list(args: &AdminTier3ListArgs) -> Result<()> {
+    if let Some(platform) = args.platform.as_deref() {
+        validate_tier3_platform(platform)?;
+    }
+    let (rpc_url, rpc) = admin_read_rpc(&args.read).await?;
+    let mut records = Vec::new();
+    for entry in read_prefix_entries(&rpc, "tier3/measurement/").await? {
+        let tail = entry
+            .key
+            .strip_prefix("tier3/measurement/")
+            .unwrap_or(entry.key.as_str());
+        if tail.contains('/') {
+            continue;
+        }
+        if args
+            .platform
+            .as_deref()
+            .is_some_and(|platform| platform != tail)
+        {
+            continue;
+        }
+        records.push(json!({
+            "platform": tail,
+            "key": entry.key,
+            "record": entry.value,
+        }));
+    }
+    records.sort_by(|left, right| {
+        left["platform"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(right["platform"].as_str().unwrap_or(""))
+    });
+    let count = records.len();
+    let report = json!({
+        "ok": true,
+        "action": "admin.tier3.list",
+        "rpc_url": rpc_url,
+        "platform": args.platform,
+        "count": count,
+        "records": records,
+    });
+    if args.read.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if count == 0 {
+        println!("No Tier-3 measurement sets found.");
+    } else {
+        println!("Tier-3 measurement sets:");
+        for record in report["records"].as_array().into_iter().flatten() {
+            let platform = record["platform"].as_str().unwrap_or("");
+            let entries = record["record"]
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            println!("{platform}: {entries} blessed measurement(s)");
+        }
+    }
+    Ok(())
+}
+
+async fn admin_tier3_derive(args: &AdminTier3DeriveArgs) -> Result<()> {
+    validate_tier3_platform(&args.platform)?;
+    validate_tier3_measurement_name(&args.measurement_name)?;
+    if args.measurement.is_some() && args.derive_command.is_some() {
+        bail!("pass only one of --measurement or --derive-command");
+    }
+    if args.endorsement_file.is_some()
+        && args.source_kind != Tier3DeriveSourceKind::VendorEndorsement
+    {
+        bail!("--endorsement-file requires --source-kind vendor-endorsement");
+    }
+    let mut command_output = None;
+    let (measurement, source) = if let Some(measurement) = args.measurement.as_deref() {
+        let source = match args.source_kind {
+            Tier3DeriveSourceKind::AdminBoot => "admin-provided-measurement",
+            Tier3DeriveSourceKind::OfflineCompute => "offline-compute",
+            Tier3DeriveSourceKind::VendorEndorsement => "vendor-endorsement",
+        };
+        (normalize_tier3_measurement(measurement)?, source.to_owned())
+    } else if let Some(command) = args.derive_command.as_ref() {
+        let output = run_tier3_derive_command(command, args)?;
+        if let Some(source_kind) = output.source_kind.as_deref() {
+            if source_kind != args.source_kind.as_str() {
+                bail!(
+                    "Tier-3 derive command returned source_kind {source_kind}, expected {}",
+                    args.source_kind.as_str()
+                );
+            }
+        }
+        let source = output
+            .source
+            .clone()
+            .unwrap_or_else(|| format!("derive-command:{}", command.display()));
+        let measurement = normalize_tier3_measurement(&output.measurement)?;
+        command_output = Some(output);
+        (measurement, source)
+    } else {
+        bail!("Tier-3 derive needs --measurement or --derive-command for this platform recipe");
+    };
+    let endorsement_sha256 = tier3_derivation_endorsement_sha256(args, command_output.as_ref())?;
+    if args.source_kind == Tier3DeriveSourceKind::VendorEndorsement && endorsement_sha256.is_none()
+    {
+        bail!(
+            "--source-kind vendor-endorsement requires --endorsement-file or derive-command JSON endorsement_sha256"
+        );
+    }
+    let alert_measurement = args
+        .alert_measurement
+        .as_deref()
+        .map(normalize_tier3_measurement)
+        .transpose()?;
+    let match_alert = alert_measurement
+        .as_deref()
+        .map(|alert| alert == measurement.as_str());
+    let home = args
+        .read
+        .home
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let mut record = Tier3DerivationRecord {
+        schema_version: 1,
+        platform: args.platform.clone(),
+        region: args.region.clone(),
+        measurement_name: args.measurement_name.clone(),
+        measurement,
+        alert_measurement,
+        match_alert,
+        derived_at: unix_epoch_seconds()?,
+        source_kind: Some(args.source_kind.as_str().to_owned()),
+        source,
+        endorsement_sha256,
+        derivation_hash: String::new(),
+    };
+    record.derivation_hash = tier3_derivation_hash(&record);
+    let store_path = tier3_derivation_store_path(&home);
+    let mut records = read_tier3_derivations(&store_path)?;
+    records.retain(|existing| {
+        !(existing.platform == record.platform
+            && existing.measurement_name == record.measurement_name
+            && existing.measurement == record.measurement)
+    });
+    records.push(record.clone());
+    write_tier3_derivations(&store_path, &records)?;
+
+    let report = json!({
+        "ok": true,
+        "action": "admin.tier3.derive",
+        "record": record,
+        "store": store_path,
+    });
+    if let Some(output) = args.output.as_ref() {
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(output, serde_json::to_vec_pretty(&report)?)
+            .with_context(|| format!("writing {}", output.display()))?;
+    }
+    if args.read.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Tier-3 measurement derived.");
+        println!(
+            "Platform: {}",
+            report["record"]["platform"].as_str().unwrap_or("")
+        );
+        println!(
+            "Measurement: {}={}",
+            report["record"]["measurement_name"].as_str().unwrap_or(""),
+            report["record"]["measurement"].as_str().unwrap_or("")
+        );
+        if let Some(match_alert) = report["record"]["match_alert"].as_bool() {
+            println!(
+                "Alert match: {}",
+                if match_alert { "MATCH" } else { "NO-MATCH" }
+            );
+        }
+        println!("Source: {}", record.source);
+        if let Some(endorsement_sha256) = record.endorsement_sha256.as_deref() {
+            println!("Endorsement SHA-256: {endorsement_sha256}");
+        }
+        println!("Derivation hash: {}", record.derivation_hash);
+        println!("Stored: {}", store_path.display());
+    }
+    Ok(())
+}
+
+async fn admin_tier3_bless(args: &AdminTier3BlessArgs) -> Result<()> {
+    let mut tx = args.tx.clone();
+    if args.confirm && tx.sim {
+        bail!("do not combine --confirm with --sim");
+    }
+    if args.confirm {
+        tx.submit = true;
+        tx.sim = false;
+    } else if tx.sim && !tx.submit {
+        tx.submit = true;
+    }
+    if tx.submit && !tx.sim && !args.confirm {
+        bail!(
+            "real Tier-3 measurement blessing requires reviewing `mayhem admin tier3 bless --sim` first, then rerun with --confirm"
+        );
+    }
+    let home = tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let measurement = normalize_tier3_measurement(&args.measurement)?;
+    validate_tier3_platform(&args.platform)?;
+    validate_tier3_measurement_name(&args.measurement_name)?;
+    if let Some(region) = args.region.as_deref() {
+        validate_tier3_platform(region)?;
+    }
+    if let Some(hash) = args.derivation_hash.as_deref() {
+        validate_hex32_config("--derivation-hash", Some(hash))?;
+    }
+    let store_path = tier3_derivation_store_path(&home);
+    let derivations = read_tier3_derivations(&store_path)?;
+    let local = derivations.iter().find(|record| {
+        record.platform == args.platform
+            && record.measurement_name == args.measurement_name
+            && record.measurement == measurement
+            && args
+                .region
+                .as_deref()
+                .map_or(true, |region| record.region.as_deref() == Some(region))
+    });
+    if local.is_none() && !args.allow_unconfirmed {
+        bail!(
+            "Tier-3 measurement has not been confirmed by `mayhem admin tier3 derive`; run derive first or pass --allow-unconfirmed for an explicit emergency override"
+        );
+    }
+    let derivation_hash = args
+        .derivation_hash
+        .clone()
+        .or_else(|| local.map(|record| record.derivation_hash.clone()));
+    let value = admin_tier3_bless_payload(args, &measurement, derivation_hash.as_deref())?;
+    let key = tier3_measurement_feature_key(&value)?;
+    run_admin_feature_command(&tx, "tier3Measurement", key, value).await
+}
+
+#[derive(Debug, Deserialize)]
+struct Tier3DeriveCommandOutput {
+    #[serde(default)]
+    measurement: String,
+    #[serde(default)]
+    measurement_name: Option<String>,
+    #[serde(default)]
+    measurements: Value,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_kind: Option<String>,
+    #[serde(default)]
+    endorsement_sha256: Option<String>,
+}
+
+fn run_tier3_derive_command(
+    command: &Path,
+    args: &AdminTier3DeriveArgs,
+) -> Result<Tier3DeriveCommandOutput> {
+    let endorsement_file_env = args
+        .endorsement_file
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let output = std::process::Command::new(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("MAYHEM_TIER3_PLATFORM", &args.platform)
+        .env("MAYHEM_TIER3_MEASUREMENT_NAME", &args.measurement_name)
+        .env("MAYHEM_TIER3_REGION", args.region.as_deref().unwrap_or(""))
+        .env("MAYHEM_TIER3_SOURCE_KIND", args.source_kind.as_str())
+        .env("MAYHEM_TIER3_ENDORSEMENT_FILE", endorsement_file_env)
+        .output()
+        .with_context(|| format!("running Tier-3 derive command {}", command.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Tier-3 derive command {} exited with {}; stderr: {}",
+            command.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("Tier-3 derive command stdout UTF-8")?;
+    let mut parsed: Tier3DeriveCommandOutput =
+        serde_json::from_str(stdout.trim()).with_context(|| {
+            format!(
+                "parsing Tier-3 derive command JSON from {}",
+                command.display()
+            )
+        })?;
+    if parsed.measurement.is_empty() {
+        if let Some(value) = parsed
+            .measurements
+            .get(&args.measurement_name)
+            .and_then(measurement_value_first_string)
+        {
+            parsed.measurement = value.to_owned();
+        }
+    }
+    if let Some(name) = parsed.measurement_name.as_deref() {
+        validate_tier3_measurement_name(name)?;
+        if name != args.measurement_name {
+            bail!(
+                "Tier-3 derive command returned measurement_name {name}, expected {}",
+                args.measurement_name
+            );
+        }
+    }
+    if parsed.measurement.is_empty() {
+        bail!("Tier-3 derive command did not return measurement or measurements.<name>");
+    }
+    Ok(parsed)
+}
+
+fn tier3_derivation_endorsement_sha256(
+    args: &AdminTier3DeriveArgs,
+    command_output: Option<&Tier3DeriveCommandOutput>,
+) -> Result<Option<String>> {
+    if let Some(path) = args.endorsement_file.as_ref() {
+        let path = absolutize(path.clone())?;
+        return file_sha256_hex(&path)
+            .with_context(|| format!("hashing Tier-3 endorsement {}", path.display()))
+            .map(Some);
+    }
+    let Some(hash) = command_output.and_then(|output| output.endorsement_sha256.as_deref()) else {
+        return Ok(None);
+    };
+    validate_hex32_config("endorsement_sha256", Some(hash))?;
+    Ok(Some(hash.to_ascii_lowercase()))
+}
+
+fn measurement_value_first_string(value: &Value) -> Option<&str> {
+    if let Some(value) = value.as_str() {
+        return Some(value);
+    }
+    if let Some(values) = value.as_array() {
+        return values.iter().find_map(measurement_value_first_string);
+    }
+    if let Some(object) = value.as_object() {
+        return object
+            .get("measurement")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                object
+                    .get("values")
+                    .and_then(measurement_value_first_string)
+            });
+    }
+    None
+}
+
+fn admin_tier3_bless_payload(
+    args: &AdminTier3BlessArgs,
+    measurement: &str,
+    derivation_hash: Option<&str>,
+) -> Result<Value> {
+    validate_tier3_platform(&args.platform)?;
+    validate_tier3_measurement_name(&args.measurement_name)?;
+    if let Some(region) = args.region.as_deref() {
+        validate_tier3_platform(region)?;
+    }
+    if let Some(hash) = derivation_hash {
+        validate_hex32_config("derivation_hash", Some(hash))?;
+    }
+    if args.source.is_empty() || args.source.len() > 64 {
+        bail!("--source must be 1-64 characters");
+    }
+    let mut value = json!({
+        "op": "tier3_bless_measurement",
+        "platform": &args.platform,
+        "measurement_name": &args.measurement_name,
+        "measurement": measurement,
+        "effective_epoch": args.effective_epoch,
+        "at": unix_epoch_seconds()?,
+        "source": &args.source,
+    });
+    if let Some(region) = args.region.as_deref() {
+        value["region"] = json!(region);
+    }
+    if let Some(derivation_hash) = derivation_hash {
+        value["derivation_hash"] = json!(derivation_hash);
+    }
+    Ok(value)
+}
+
+fn tier3_measurement_feature_key(value: &Value) -> Result<String> {
+    let platform = value
+        .get("platform")
+        .and_then(Value::as_str)
+        .context("Tier-3 measurement payload missing platform")?;
+    validate_tier3_platform(platform)?;
+    let digest = stable_value_hash(&json!({
+        "domain": "mayhem-tier3-measurement-feature-v1",
+        "value": value,
+    }));
+    Ok(format!("tier3/measurement/{platform}/{digest}"))
+}
+
+fn tier3_derivation_store_path(home: &Path) -> PathBuf {
+    home.join("tier3").join("derivations.json")
+}
+
+fn read_tier3_derivations(path: &Path) -> Result<Vec<Tier3DerivationRecord>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let value = read_json_file(&path.to_path_buf())
+        .with_context(|| format!("reading Tier-3 derivations from {}", path.display()))?;
+    serde_json::from_value(value)
+        .with_context(|| format!("parsing Tier-3 derivations from {}", path.display()))
+}
+
+fn write_tier3_derivations(path: &Path, records: &[Tier3DerivationRecord]) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(records)?)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn tier3_derivation_hash(record: &Tier3DerivationRecord) -> String {
+    stable_value_hash(&json!({
+        "schema_version": record.schema_version,
+        "platform": record.platform,
+        "region": record.region,
+        "measurement_name": record.measurement_name,
+        "measurement": record.measurement,
+        "alert_measurement": record.alert_measurement,
+        "match_alert": record.match_alert,
+        "derived_at": record.derived_at,
+        "source_kind": record.source_kind,
+        "source": record.source,
+        "endorsement_sha256": record.endorsement_sha256,
+    }))
+}
+
+fn validate_tier3_platform(value: &str) -> Result<()> {
+    if !is_safe_key_part(value) {
+        bail!("Tier-3 platform/region must be a non-empty safe label");
+    }
+    Ok(())
+}
+
+fn validate_tier3_measurement_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        bail!("Tier-3 measurement name must be a non-empty safe label");
+    }
+    Ok(())
+}
+
+fn normalize_tier3_measurement(value: &str) -> Result<String> {
+    let value = value.trim().trim_start_matches("0x").to_ascii_lowercase();
+    if value.len() < 64
+        || value.len() > 256
+        || value.len() % 2 != 0
+        || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("Tier-3 measurement must be 32-128 bytes of hex");
+    }
+    Ok(value)
 }
 
 async fn admin_ban_list(args: &AdminBanListArgs) -> Result<()> {
@@ -13155,6 +13850,9 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::Device { command } => match command {
             AdminDeviceCommands::Rebind(args) => &args.tx,
         },
+        AdminCommands::Tier3 { .. } => {
+            unreachable!("admin tier3 commands are handled before admin_tx_args")
+        }
         AdminCommands::AuditorRegister(args) => &args.tx,
         AdminCommands::ReputationAnchor(args) => &args.tx,
         AdminCommands::RateOracle(args) => &args.tx,
@@ -13234,6 +13932,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
                 Ok(("deviceRebind", admin_device_rebind_payload(args)?))
             }
         },
+        AdminCommands::Tier3 { .. } => {
+            bail!("admin tier3 commands are handled outside generic paid admin commands")
+        }
         AdminCommands::AuditorRegister(args) => {
             Ok(("auditorRegister", admin_auditor_register_payload(args)))
         }
@@ -13420,6 +14121,14 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "enclave caps",
     )?;
     enforce_backend_caps(&args.backend, &mut caps)?;
+    let launch_measurements = optional_json_arg_or_file(
+        args.launch_measurements_json.as_deref(),
+        args.launch_measurements_file.as_ref(),
+        "launch measurements",
+    )?;
+    if args.att_tier >= 3 && launch_measurements.is_none() {
+        bail!("Tier-3 enclave registration requires --launch-measurements-json or --launch-measurements-file");
+    }
     let mut payload = json!({
         "op": "register_enclave",
         "enclave_id": &args.enclave_id,
@@ -13440,6 +14149,13 @@ fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Val
         "binary_hash": &args.binary_hash,
         "caps": caps,
     });
+    if let Some(launch_measurements) = launch_measurements {
+        if !launch_measurements.is_object() {
+            bail!("launch measurements JSON must be an object");
+        }
+        validate_admin_launch_measurements_json(&launch_measurements, args.att_tier >= 3)?;
+        payload["launch_measurements"] = launch_measurements;
+    }
     if let Some(source_sha256) = &args.source_sha256 {
         payload["source_sha256"] = json!(source_sha256.to_ascii_lowercase());
     }
@@ -13515,6 +14231,22 @@ fn admin_update_enclave_payload(args: &AdminUpdateEnclaveArgs) -> Result<Value> 
         changed = true;
     }
 
+    if let Some(launch_measurements) = optional_json_arg_or_file(
+        args.launch_measurements_json.as_deref(),
+        args.launch_measurements_file.as_ref(),
+        "launch measurements",
+    )? {
+        if !launch_measurements.is_object() {
+            bail!("launch measurements JSON must be an object");
+        }
+        validate_admin_launch_measurements_json(
+            &launch_measurements,
+            args.att_tier.unwrap_or(3) >= 3,
+        )?;
+        payload["launch_measurements"] = launch_measurements;
+        changed = true;
+    }
+
     if let Some(mut caps) = optional_json_arg_or_file(
         args.caps_json.as_deref(),
         args.caps_file.as_ref(),
@@ -13535,6 +14267,46 @@ fn admin_update_enclave_payload(args: &AdminUpdateEnclaveArgs) -> Result<Value> 
     }
 
     Ok(payload)
+}
+
+fn validate_admin_launch_measurements_json(value: &Value, tier3_required: bool) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        bail!("launch measurements JSON must be an object");
+    };
+    let measurements = object.get("measurements").unwrap_or(value);
+    if tier3_required {
+        let platform = object
+            .get("platform")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("Tier-3 launch measurements JSON must include platform")?;
+        validate_tier3_platform(platform)?;
+    }
+    let Some(measurements) = measurements.as_object() else {
+        bail!("launch measurements JSON measurements must be an object");
+    };
+    if tier3_required && measurements.is_empty() {
+        bail!("Tier-3 launch measurements JSON must include at least one measurement");
+    }
+    for (name, value) in measurements {
+        if matches!(
+            name.as_str(),
+            "schema_version" | "effective_epoch" | "platform" | "entries"
+        ) {
+            continue;
+        }
+        validate_tier3_measurement_name(name)?;
+        let mut values = BTreeSet::new();
+        collect_launch_measurement_strings(value, &mut values);
+        if values.is_empty() {
+            bail!("launch measurements {name} must contain at least one hex measurement");
+        }
+        for measurement in values {
+            normalize_tier3_measurement(&measurement)?;
+        }
+    }
+    Ok(())
 }
 
 fn admin_set_enclave_min_tier_payload(args: &AdminSetEnclaveMinTierArgs) -> Result<Value> {
@@ -13574,12 +14346,12 @@ fn insert_optional_payload_string(
 }
 
 fn validate_launch_enclave_attestation_tier(att_tier: u8) -> Result<()> {
-    if att_tier <= mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER {
+    if att_tier <= mayhem_proto::TIER3_CONFIDENTIAL_COMPUTE_TIER {
         return Ok(());
     }
     bail!(
-        "hardware attestation tiers above {} are not launch-advertisable until Mayhem provider quote generation is wired; register a Tier 1 enclave instead",
-        mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER
+        "enclave attestation tiers above {} are not launch-advertisable; Tier 4 is provider KYB, not enclave hardware",
+        mayhem_proto::TIER3_CONFIDENTIAL_COMPUTE_TIER
     )
 }
 
@@ -16971,6 +17743,11 @@ struct UpPlan {
     provider_workers: Vec<UpProviderWorker>,
     provider_auto_fit: bool,
     provider_gpu_layers: Option<u32>,
+    provider_hardware_quote_kind: Option<String>,
+    provider_hardware_quote_command: Option<PathBuf>,
+    provider_hardware_quote_timeout_seconds: u64,
+    hardware_quote_verifier_command: Option<PathBuf>,
+    hardware_quote_verifier_timeout_seconds: u64,
 }
 
 async fn up(args: UpArgs) -> Result<()> {
@@ -17550,6 +18327,33 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let pear_runtime = resolve_pear_runtime_path()?;
     let intercom_dir = repo_path("intercom")?;
     let supervisor_config_path = home.join("mayhemd-up.toml");
+    let provider_hardware_quote_command = match (
+        args.provider_hardware_quote_kind.as_ref(),
+        args.provider_hardware_quote_command.as_ref(),
+    ) {
+        (Some(_), Some(command)) => {
+            if args.provider_hardware_quote_timeout_seconds == 0 {
+                bail!("--provider-hardware-quote-timeout-seconds must be positive");
+            }
+            Some(resolve_provider_quote_command(command)?)
+        }
+        (None, None) => None,
+        (Some(_), None) => bail!(
+            "--provider-hardware-quote-command is required with --provider-hardware-quote-kind"
+        ),
+        (None, Some(_)) => bail!(
+            "--provider-hardware-quote-kind is required with --provider-hardware-quote-command"
+        ),
+    };
+    let hardware_quote_verifier_command = match args.hardware_quote_verifier_command.as_ref() {
+        Some(command) => {
+            if args.hardware_quote_verifier_timeout_seconds == 0 {
+                bail!("--hardware-quote-verifier-timeout-seconds must be positive");
+            }
+            Some(resolve_provider_quote_command(command)?)
+        }
+        None => None,
+    };
     Ok(UpPlan {
         home,
         config_path,
@@ -17584,6 +18388,11 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         provider_workers,
         provider_auto_fit: args.auto_fit,
         provider_gpu_layers: args.provider_gpu_layers,
+        provider_hardware_quote_kind: args.provider_hardware_quote_kind.clone(),
+        provider_hardware_quote_command,
+        provider_hardware_quote_timeout_seconds: args.provider_hardware_quote_timeout_seconds,
+        hardware_quote_verifier_command,
+        hardware_quote_verifier_timeout_seconds: args.hardware_quote_verifier_timeout_seconds,
     })
 }
 
@@ -17887,6 +18696,14 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     if plan.gateway_require_auth {
         gateway_args.push("--require-auth".to_owned());
     }
+    if let Some(command) = &plan.hardware_quote_verifier_command {
+        gateway_args.extend([
+            "--hardware-quote-verifier-command".to_owned(),
+            command.display().to_string(),
+            "--hardware-quote-verifier-timeout-seconds".to_owned(),
+            plan.hardware_quote_verifier_timeout_seconds.to_string(),
+        ]);
+    }
     if plan.dev_embedded_catalog {
         gateway_args.push("--dev-embedded-catalog".to_owned());
     }
@@ -17912,6 +18729,19 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             }
             if let Some(gpu_layers) = plan.provider_gpu_layers {
                 provider_args.extend(["--gpu-layers".to_owned(), gpu_layers.to_string()]);
+            }
+            if let (Some(kind), Some(command)) = (
+                plan.provider_hardware_quote_kind.as_ref(),
+                plan.provider_hardware_quote_command.as_ref(),
+            ) {
+                provider_args.extend([
+                    "--hardware-quote-kind".to_owned(),
+                    kind.clone(),
+                    "--hardware-quote-command".to_owned(),
+                    command.display().to_string(),
+                    "--hardware-quote-timeout-seconds".to_owned(),
+                    plan.provider_hardware_quote_timeout_seconds.to_string(),
+                ]);
             }
             write_supervisor_child(
                 &mut out,
@@ -18997,6 +19827,18 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         None => None,
     };
+    let hardware_quote_verifier_command = match &args.hardware_quote_verifier_command {
+        Some(command) => {
+            if args.hardware_quote_verifier_timeout_seconds == 0 {
+                bail!("--hardware-quote-verifier-timeout-seconds must be positive");
+            }
+            Some(HardwareQuoteVerifierCommand {
+                command: resolve_provider_quote_command(command)?,
+                timeout: Duration::from_secs(args.hardware_quote_verifier_timeout_seconds),
+            })
+        }
+        None => None,
+    };
     let (
         state,
         source,
@@ -19241,6 +20083,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         Some(jwks) => state.with_nvidia_offline_jwks(jwks),
         None => state,
     };
+    let state = match hardware_quote_verifier_command {
+        Some(verifier) => state.with_hardware_quote_verifier_command(verifier),
+        None => state,
+    };
     let state = state.with_receipt_checkpoint_every(receipt_checkpoint_every.clone());
     let state = apply_gateway_canary_policy_args(state, &args)?;
     let state = state
@@ -19294,6 +20140,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "nvidia_gb10_device_jwks": args.nvidia_gb10_device_jwks_file.is_some(),
         "nvidia_nras_jwks": args.nvidia_nras_jwks_file.is_some(),
         "nvidia_offline_jwks": args.nvidia_offline_jwks_file.is_some(),
+        "hardware_quote_verifier_command": args.hardware_quote_verifier_command.as_ref().map(|path| path.display().to_string()),
     });
 
     if args.json {
@@ -19365,6 +20212,13 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             }
             if args.nvidia_offline_jwks_file.is_some() {
                 println!("NVIDIA offline verifier fallback: trusted JWKS loaded.");
+            }
+            if let Some(command) = &args.hardware_quote_verifier_command {
+                println!(
+                    "Hardware quote verifier: {} (timeout {}s).",
+                    command.display(),
+                    args.hardware_quote_verifier_timeout_seconds
+                );
             }
         }
         println!("Use Ctrl-C to stop.");
@@ -24325,12 +25179,7 @@ async fn run_msb_transfer_helper<T>(args: Vec<String>) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .context("resolving repository root for MSB transfer helper")?;
-    let msb_app = repo_root.join("intercom/trac/msb");
+    let msb_app = repo_path("intercom/trac/msb")?;
     let pear_runtime = resolve_pear_runtime_path()?;
     let mut helper_args = vec!["--transfer-helper".to_owned()];
     helper_args.extend(args);
@@ -25304,11 +26153,22 @@ struct LedgerEnclave {
     quant: String,
     binary_hash: String,
     #[serde(default)]
+    launch_measurements: Value,
+    #[serde(default)]
     caps: Value,
     status: String,
     created_by: String,
     #[serde(default)]
     created_by_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LedgerTier3MeasurementSet {
+    platform: String,
+    #[serde(default)]
+    measurements: Value,
+    #[serde(default)]
+    entries: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -25478,6 +26338,7 @@ struct ContractCatalog {
     kyb: Vec<LedgerProviderKyb>,
     prices: Vec<LedgerPriceSchedule>,
     price_derivations: Vec<Value>,
+    tier3_measurements: Vec<LedgerTier3MeasurementSet>,
     ctx_bracket_schedule: CtxBracketSchedule,
     rules: Option<RulesRef>,
 }
@@ -25772,6 +26633,49 @@ struct ProviderCandidateRejection {
 struct ProviderArtifactPaths {
     primary: PathBuf,
     sidecars: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderHardwareQuoteConfig {
+    kind: HardwareQuoteKind,
+    command: PathBuf,
+    timeout: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+struct HardwareQuoteCommandOutput {
+    kind: Option<String>,
+    evidence: Option<String>,
+    evidence_path: Option<String>,
+    binding: Option<String>,
+    #[serde(default)]
+    endorsements: Vec<String>,
+    #[serde(default)]
+    metadata: Value,
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    platform_id: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    snp_chip_family: Option<String>,
+    #[serde(default)]
+    snp_chip_id: Option<String>,
+    #[serde(default)]
+    snp_tcb: Option<String>,
+    #[serde(default)]
+    snp_firmware_svn: Option<String>,
+    #[serde(default)]
+    snp: Value,
+    #[serde(default)]
+    gpu_model: Option<String>,
+    #[serde(default)]
+    gpu_driver: Option<String>,
+    #[serde(default)]
+    gpu_vbios: Option<String>,
+    #[serde(default)]
+    gpu: Value,
 }
 
 const TRT_CHECKPOINT_REQUIRED_SIDECARS: [(&str, &str); 3] = [
@@ -26603,6 +27507,8 @@ struct ProviderSessionRuntime<'a> {
     rooms: &'a [LedgerRoom],
     keypair_path: &'a Path,
     password: &'a str,
+    provider_signing_seed: Option<[u8; 32]>,
+    hardware_quote_config: Option<ProviderHardwareQuoteConfig>,
     attestation_identity: CatalogEnclaveIdentity,
     runtime_config: AttestationRuntimeConfig,
     runtime_keypair: &'a RuntimeKeypair,
@@ -27164,6 +28070,9 @@ fn provider_start_args_for_serve_plan(
         skip_disk_bench: args.skip_disk_bench,
         chunk_size: DEFAULT_CHUNK_SIZE,
         enclave_binary: None,
+        hardware_quote_kind: None,
+        hardware_quote_command: None,
+        hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
         sim: true,
         no_heartbeat: true,
         heartbeat_count: 1,
@@ -27235,6 +28144,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             .and_then(|provider| provider.gpu_layers);
     }
     apply_provider_resource_config_defaults(&mut args, config.as_ref());
+    let hardware_quote_config = provider_hardware_quote_config(&args)?;
     let (disk_reserve_bytes, disk_reserve_source) =
         provider_disk_reserve_bytes(args.disk_reserve.as_deref())?;
     let rpc_url = args
@@ -27401,7 +28311,14 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     }
     write_provider_load_progress_stage(&args, "seal enclave artifact", "seal", "complete", 100);
 
-    provider_log(&args, "Preparing Tier-1 attestation");
+    let attestation_tier = hardware_quote_config
+        .as_ref()
+        .map(|config| config.kind.attestation_tier())
+        .unwrap_or(mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER);
+    provider_log(
+        &args,
+        &format!("Preparing Tier-{attestation_tier} attestation"),
+    );
     write_provider_load_progress_stage(&args, "prepare attestation", "attest", "running", 0);
     let runtime_context = RuntimeKeyContext {
         provider_id: wallet.public_key.clone(),
@@ -27445,23 +28362,30 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         binary_hash: binary_hash.clone(),
     };
     let runtime_config = provider_attestation_runtime_config(&selected)?;
-    let draft = prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
-        identity: attestation_identity.clone(),
-        runtime_keypair: runtime_keypair.clone(),
-        provider_pubkey: wallet.public_key.clone(),
-        binary_path: binary_path.clone(),
-        boot_epoch: now,
-        report_ts: now,
-        nonce_u,
-        runtime_config: runtime_config.clone(),
-    })?;
-    let provider_attestation_sig = sign_hex(
+    let provider_signing_seed = if hardware_quote_config.is_some() {
+        Some(
+            wallet_signing_seed(&keypair_path, &password, &wallet.public_key)
+                .await
+                .context("loading provider signing seed for hardware attestation")?,
+        )
+    } else {
+        None
+    };
+    let attestation = provider_attestation_report(
+        hardware_quote_config.as_ref(),
+        attestation_identity.clone(),
+        &runtime_keypair,
+        &wallet.public_key,
+        provider_signing_seed,
         &keypair_path,
         &password,
-        &draft.provider_signing_message_hex,
+        &binary_path,
+        now,
+        now,
+        nonce_u,
+        runtime_config.clone(),
     )
     .await?;
-    let attestation = finalize_tier1_attestation_report(draft, provider_attestation_sig)?;
     if attestation.report.enclave_id != selected.enclave.enclave_id {
         bail!(
             "admin enclave id {} is not bound to the measured identity {}; providers cannot serve unbound enclaves",
@@ -27681,6 +28605,8 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 rooms: &rooms,
                 keypair_path: &keypair_path,
                 password: &password,
+                provider_signing_seed,
+                hardware_quote_config: hardware_quote_config.clone(),
                 attestation_identity,
                 runtime_config,
                 runtime_keypair: &runtime_keypair,
@@ -30132,6 +31058,10 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         kyb: read_prefix_values_filtered(rpc, "kyb/", |tail| !tail.contains('/')).await?,
         prices,
         price_derivations,
+        tier3_measurements: read_prefix_values_filtered(rpc, "tier3/measurement/", |tail| {
+            !tail.contains('/')
+        })
+        .await?,
         ctx_bracket_schedule,
         rules: read_state_value(rpc, "rules/current")
             .await?
@@ -30470,6 +31400,10 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
                     manifest_hash: enclave.manifest_hash.clone(),
                     binary_hash: enclave.binary_hash.clone(),
+                    launch_measurements: launch_measurements_with_tier3_registry(
+                        enclave,
+                        &contract.tier3_measurements,
+                    ),
                     kyb,
                     reputation_bps: reputation
                         .map(|record| record.r_bps.min(10_000))
@@ -30724,6 +31658,90 @@ fn gateway_price_ref_from_ledger_with_history(
 
 fn normalize_ledger_quant(value: &str) -> String {
     normalize_quant_bucket(value).unwrap_or_else(|_| DEFAULT_QUANT_BUCKET.to_owned())
+}
+
+fn launch_measurements_with_tier3_registry(
+    enclave: &LedgerEnclave,
+    tier3_sets: &[LedgerTier3MeasurementSet],
+) -> Value {
+    let mut merged = enclave.launch_measurements.clone();
+    let Some(platform) = merged
+        .get("platform")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return merged;
+    };
+    let Some(registry) = tier3_sets.iter().find(|set| set.platform == platform) else {
+        return merged;
+    };
+    let Some(object) = merged.as_object_mut() else {
+        return merged;
+    };
+    let measurements = object
+        .entry("measurements".to_owned())
+        .or_insert_with(|| json!({}));
+    if !measurements.is_object() {
+        *measurements = json!({});
+    }
+    if let (Some(target), Some(source)) = (
+        measurements.as_object_mut(),
+        registry.measurements.as_object(),
+    ) {
+        for (name, value) in source {
+            merge_launch_measurement_value(target, name, value);
+        }
+    }
+    if !registry.entries.is_empty() {
+        let entries = object
+            .entry("entries".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !entries.is_array() {
+            *entries = Value::Array(Vec::new());
+        }
+        if let Some(entries) = entries.as_array_mut() {
+            entries.extend(registry.entries.iter().cloned());
+        }
+    }
+    merged
+}
+
+fn merge_launch_measurement_value(target: &mut Map<String, Value>, name: &str, value: &Value) {
+    let mut values = BTreeSet::new();
+    if let Some(existing) = target.get(name) {
+        collect_launch_measurement_strings(existing, &mut values);
+    }
+    collect_launch_measurement_strings(value, &mut values);
+    if !values.is_empty() {
+        target.insert(
+            name.to_owned(),
+            Value::Array(values.into_iter().map(Value::String).collect()),
+        );
+    }
+}
+
+fn collect_launch_measurement_strings(value: &Value, out: &mut BTreeSet<String>) {
+    if let Some(value) = value.as_str() {
+        let value = value.trim().to_ascii_lowercase();
+        if !value.is_empty() {
+            out.insert(value);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for value in values {
+            collect_launch_measurement_strings(value, out);
+        }
+        return;
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(measurement) = object.get("measurement") {
+            collect_launch_measurement_strings(measurement, out);
+        }
+        if let Some(values) = object.get("values") {
+            collect_launch_measurement_strings(values, out);
+        }
+    }
 }
 
 fn price_derivation_sort_key(derivation: &Value) -> (u64, u64, String) {
@@ -31444,6 +32462,329 @@ fn tensor_parallel_capable_gpu_count(hardware: &HardwareReport) -> usize {
         .count()
 }
 
+fn provider_hardware_quote_config(
+    args: &ProviderStartArgs,
+) -> Result<Option<ProviderHardwareQuoteConfig>> {
+    match (&args.hardware_quote_kind, &args.hardware_quote_command) {
+        (None, None) => Ok(None),
+        (Some(_), None) => {
+            bail!("--hardware-quote-kind requires --hardware-quote-command")
+        }
+        (None, Some(_)) => {
+            bail!("--hardware-quote-command requires --hardware-quote-kind")
+        }
+        (Some(kind), Some(command)) => {
+            if args.hardware_quote_timeout_seconds == 0 {
+                bail!("--hardware-quote-timeout-seconds must be positive");
+            }
+            Ok(Some(ProviderHardwareQuoteConfig {
+                kind: parse_hardware_quote_kind(kind)?,
+                command: resolve_provider_quote_command(command)?,
+                timeout: Duration::from_secs(args.hardware_quote_timeout_seconds),
+            }))
+        }
+    }
+}
+
+fn resolve_provider_quote_command(command: &Path) -> Result<PathBuf> {
+    if command.components().count() == 1 {
+        return Ok(command.to_path_buf());
+    }
+    absolutize(command.to_path_buf())
+}
+
+fn parse_hardware_quote_kind(value: &str) -> Result<HardwareQuoteKind> {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    serde_json::from_value(Value::String(normalized.clone()))
+        .with_context(|| format!("unsupported hardware quote kind {value:?}"))
+}
+
+fn hardware_quote_kind_name(kind: &HardwareQuoteKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{kind:?}"))
+}
+
+fn provider_quote_generation_attestation_tier(args: &ProviderStartArgs) -> Result<u8> {
+    Ok(provider_hardware_quote_config(args)?
+        .map(|config| config.kind.attestation_tier())
+        .unwrap_or(mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER))
+}
+
+async fn collect_provider_hardware_quote(
+    config: &ProviderHardwareQuoteConfig,
+    identity: &CatalogEnclaveIdentity,
+    runtime_keypair: &RuntimeKeypair,
+    provider_signing_seed: [u8; 32],
+    binary_path: &Path,
+    boot_epoch: u64,
+    report_ts: u64,
+    nonce_u: &str,
+    runtime_config: &AttestationRuntimeConfig,
+) -> Result<HardwareQuote> {
+    let binding = prepare_hardware_quote_binding(&HardwareQuoteBindingOptions {
+        identity: identity.clone(),
+        runtime_keypair: runtime_keypair.clone(),
+        provider_signing_seed,
+        binary_path: binary_path.to_path_buf(),
+        boot_epoch,
+        report_ts,
+        nonce_u: nonce_u.to_owned(),
+        hw_quote_kind: config.kind.clone(),
+        runtime_config: runtime_config.clone(),
+    })
+    .context("preparing Mayhem hardware quote binding")?;
+    let kind_name = hardware_quote_kind_name(&config.kind);
+    let mut command = Command::new(&config.command);
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("MAYHEM_HW_QUOTE_KIND", &kind_name)
+        .env("MAYHEM_HW_QUOTE_BINDING", &binding)
+        .env("MAYHEM_HW_QUOTE_NONCE", &binding)
+        .env("MAYHEM_ATTESTATION_NONCE_U", nonce_u)
+        .env(
+            "MAYHEM_ATTESTATION_ENCLAVE_ID",
+            catalog_enclave_id(identity),
+        )
+        .env("MAYHEM_ATTESTATION_BINARY_HASH", &identity.binary_hash)
+        .env("MAYHEM_ATTESTATION_MANIFEST_HASH", &identity.manifest_hash);
+    let output = timeout(config.timeout, command.output())
+        .await
+        .with_context(|| {
+            format!(
+                "hardware quote command {} timed out after {}s",
+                config.command.display(),
+                config.timeout.as_secs()
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "running hardware quote command {}",
+                config.command.display()
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!(
+            "hardware quote command {} failed with status {}; stdout: {}; stderr: {}",
+            config.command.display(),
+            output.status,
+            truncate_log_for_error(stdout.trim()),
+            truncate_log_for_error(stderr.trim())
+        );
+    }
+    parse_hardware_quote_command_output(&config.kind, &binding, stdout.trim()).with_context(|| {
+        format!(
+            "parsing hardware quote command {}",
+            config.command.display()
+        )
+    })
+}
+
+fn parse_hardware_quote_command_output(
+    expected_kind: &HardwareQuoteKind,
+    expected_binding: &str,
+    stdout: &str,
+) -> Result<HardwareQuote> {
+    if stdout.is_empty() {
+        bail!("hardware quote command printed no evidence");
+    }
+    let parsed = serde_json::from_str::<HardwareQuoteCommandOutput>(stdout)
+        .or_else(|_| {
+            stdout
+                .match_indices('{')
+                .find_map(|(idx, _)| {
+                    serde_json::from_str::<HardwareQuoteCommandOutput>(stdout[idx..].trim()).ok()
+                })
+                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("not JSON")))
+        })
+        .ok();
+    let Some(parsed) = parsed else {
+        return Ok(HardwareQuote {
+            kind: expected_kind.clone(),
+            evidence: stdout.to_owned(),
+            binding: expected_binding.to_owned(),
+            endorsements: Vec::new(),
+            metadata: Value::Null,
+        });
+    };
+    let kind = match parsed.kind.as_deref() {
+        Some(kind) => parse_hardware_quote_kind(kind)?,
+        None => expected_kind.clone(),
+    };
+    if &kind != expected_kind {
+        bail!(
+            "hardware quote command returned kind {}, expected {}",
+            hardware_quote_kind_name(&kind),
+            hardware_quote_kind_name(expected_kind)
+        );
+    }
+    if let Some(binding) = parsed.binding.as_deref() {
+        if binding != expected_binding {
+            bail!("hardware quote command returned a binding different from Mayhem's binding");
+        }
+    }
+    let evidence = match (parsed.evidence.as_deref(), parsed.evidence_path.as_deref()) {
+        (Some(evidence), None) => evidence.to_owned(),
+        (None, Some(path)) => {
+            let path = absolutize(PathBuf::from(path))?;
+            fs::read_to_string(&path)
+                .with_context(|| format!("reading hardware quote evidence {}", path.display()))?
+        }
+        (Some(_), Some(_)) => {
+            bail!("hardware quote command JSON must set only one of evidence or evidence_path")
+        }
+        (None, None) => bail!("hardware quote command JSON missing evidence"),
+    };
+    if evidence.trim().is_empty() {
+        bail!("hardware quote command returned empty evidence");
+    }
+    let metadata = hardware_quote_command_metadata(&parsed);
+    Ok(HardwareQuote {
+        kind,
+        evidence,
+        binding: expected_binding.to_owned(),
+        endorsements: parsed.endorsements,
+        metadata,
+    })
+}
+
+fn hardware_quote_command_metadata(parsed: &HardwareQuoteCommandOutput) -> Value {
+    let mut metadata = parsed.metadata.clone();
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    let object = metadata
+        .as_object_mut()
+        .expect("metadata was set to object");
+    if let Some(platform) = parsed
+        .platform_id
+        .as_deref()
+        .or(parsed.platform.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("platform_id".to_owned(), json!(platform));
+    }
+    if let Some(region) = parsed
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("region".to_owned(), json!(region));
+    }
+    if !parsed.snp.is_null() {
+        object.insert("snp".to_owned(), parsed.snp.clone());
+    }
+    if parsed.snp_chip_family.is_some()
+        || parsed.snp_chip_id.is_some()
+        || parsed.snp_tcb.is_some()
+        || parsed.snp_firmware_svn.is_some()
+    {
+        let snp = object.entry("snp".to_owned()).or_insert_with(|| json!({}));
+        if !snp.is_object() {
+            *snp = json!({});
+        }
+        let snp = snp.as_object_mut().expect("snp was set to object");
+        if let Some(value) = parsed.snp_chip_family.as_deref() {
+            snp.insert("chip_family".to_owned(), json!(value));
+        }
+        if let Some(value) = parsed.snp_chip_id.as_deref() {
+            snp.insert("chip_id".to_owned(), json!(value));
+        }
+        if let Some(value) = parsed.snp_tcb.as_deref() {
+            snp.insert("tcb".to_owned(), json!(value));
+        }
+        if let Some(value) = parsed.snp_firmware_svn.as_deref() {
+            snp.insert("firmware_svn".to_owned(), json!(value));
+        }
+    }
+    if !parsed.gpu.is_null() {
+        object.insert("gpu".to_owned(), parsed.gpu.clone());
+    }
+    if parsed.gpu_model.is_some() || parsed.gpu_driver.is_some() || parsed.gpu_vbios.is_some() {
+        let gpu = object.entry("gpu".to_owned()).or_insert_with(|| json!({}));
+        if !gpu.is_object() {
+            *gpu = json!({});
+        }
+        let gpu = gpu.as_object_mut().expect("gpu was set to object");
+        if let Some(value) = parsed.gpu_model.as_deref() {
+            gpu.insert("model".to_owned(), json!(value));
+        }
+        if let Some(value) = parsed.gpu_driver.as_deref() {
+            gpu.insert("driver".to_owned(), json!(value));
+        }
+        if let Some(value) = parsed.gpu_vbios.as_deref() {
+            gpu.insert("vbios".to_owned(), json!(value));
+        }
+    }
+    metadata
+}
+
+async fn provider_attestation_report(
+    quote_config: Option<&ProviderHardwareQuoteConfig>,
+    identity: CatalogEnclaveIdentity,
+    runtime_keypair: &RuntimeKeypair,
+    provider_pubkey: &str,
+    provider_signing_seed: Option<[u8; 32]>,
+    keypair_path: &Path,
+    password: &str,
+    binary_path: &Path,
+    boot_epoch: u64,
+    report_ts: u64,
+    nonce_u: String,
+    runtime_config: AttestationRuntimeConfig,
+) -> Result<Tier1AttestationReport> {
+    if let Some(config) = quote_config {
+        let provider_signing_seed = provider_signing_seed
+            .context("hardware quote attestation requires provider signing seed")?;
+        let hw_quote = collect_provider_hardware_quote(
+            config,
+            &identity,
+            runtime_keypair,
+            provider_signing_seed,
+            binary_path,
+            boot_epoch,
+            report_ts,
+            &nonce_u,
+            &runtime_config,
+        )
+        .await?;
+        return build_hardware_attestation_report(&HardwareAttestationOptions {
+            identity,
+            runtime_keypair: runtime_keypair.clone(),
+            provider_signing_seed,
+            binary_path: binary_path.to_path_buf(),
+            boot_epoch,
+            report_ts,
+            nonce_u,
+            hw_quote,
+            runtime_config,
+        })
+        .context("building hardware provider attestation report");
+    }
+
+    let draft = prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
+        identity,
+        runtime_keypair: runtime_keypair.clone(),
+        provider_pubkey: provider_pubkey.to_owned(),
+        binary_path: binary_path.to_path_buf(),
+        boot_epoch,
+        report_ts,
+        nonce_u,
+        runtime_config,
+    })?;
+    let provider_attestation_sig =
+        sign_hex(keypair_path, password, &draft.provider_signing_message_hex).await?;
+    finalize_tier1_attestation_report(draft, provider_attestation_sig)
+        .context("finalizing provider attestation")
+}
+
 fn merge_model_caps(target: &mut ModelCaps, next: &ModelCaps) {
     target.tools |= next.tools;
     target.json |= next.json;
@@ -31463,7 +32804,7 @@ fn build_provider_candidates(
 ) -> Result<Vec<ProviderCandidate>> {
     let requested_backend = requested_backend(args, hardware)?;
     let requested_enclave = args.enclave.as_deref();
-    let provider_attestation_tier = provider_quote_generation_attestation_tier();
+    let provider_attestation_tier = provider_quote_generation_attestation_tier(args)?;
     let mut candidates = Vec::new();
     let mut rejections = Vec::new();
     let mut version_gates = BTreeMap::new();
@@ -31758,10 +33099,6 @@ fn build_provider_candidates(
         }
     }
     Ok(candidates)
-}
-
-fn provider_quote_generation_attestation_tier() -> u8 {
-    mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER
 }
 
 fn requested_provider_enclave_matches(requested: &str, enclave: &LedgerEnclave) -> bool {
@@ -35455,26 +36792,25 @@ async fn provider_session_attestation(
     att_nonce: &str,
 ) -> Result<Tier1AttestationReport> {
     let report_ts = unix_epoch_seconds()?;
-    let draft = prepare_provider_session_attestation(ProviderSessionAttestationInput {
-        identity: &runtime.attestation_identity,
-        runtime_keypair: runtime.runtime_keypair,
-        provider_pubkey: &terms.provider,
-        binary_path: runtime.binary_path,
-        boot_epoch: runtime.boot_epoch,
-        report_ts,
-        att_nonce,
-        runtime_config: runtime.runtime_config.clone(),
-    })?;
-    let provider_attestation_sig = sign_hex(
+    provider_attestation_report(
+        runtime.hardware_quote_config.as_ref(),
+        runtime.attestation_identity.clone(),
+        runtime.runtime_keypair,
+        &terms.provider,
+        runtime.provider_signing_seed,
         runtime.keypair_path,
         runtime.password,
-        &draft.provider_signing_message_hex,
+        runtime.binary_path,
+        runtime.boot_epoch,
+        report_ts,
+        att_nonce.to_owned(),
+        runtime.runtime_config.clone(),
     )
-    .await?;
-    finalize_tier1_attestation_report(draft, provider_attestation_sig)
-        .context("finalizing per-session provider attestation")
+    .await
+    .context("preparing per-session provider attestation")
 }
 
+#[cfg(test)]
 struct ProviderSessionAttestationInput<'a> {
     identity: &'a CatalogEnclaveIdentity,
     runtime_keypair: &'a RuntimeKeypair,
@@ -35486,9 +36822,10 @@ struct ProviderSessionAttestationInput<'a> {
     runtime_config: AttestationRuntimeConfig,
 }
 
+#[cfg(test)]
 fn prepare_provider_session_attestation(
     input: ProviderSessionAttestationInput<'_>,
-) -> Result<Tier1AttestationDraft> {
+) -> Result<mayhem_enclave::Tier1AttestationDraft> {
     prepare_tier1_attestation_report(&Tier1ExternalProviderAttestationOptions {
         identity: input.identity.clone(),
         runtime_keypair: input.runtime_keypair.clone(),
@@ -37898,21 +39235,91 @@ fn user_home_dir() -> Result<PathBuf> {
     bail!("HOME/USERPROFILE is not set; pass an explicit path")
 }
 
-fn repo_path(relative: &str) -> Result<PathBuf> {
-    let path = absolutize(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(relative),
-    )?;
-    Ok(fs::canonicalize(&path).unwrap_or(path))
+fn default_rules_path() -> Result<PathBuf> {
+    if let Ok(repo_rules) = repo_path("RULES.md") {
+        if repo_rules.exists() {
+            return absolutize(repo_rules);
+        }
+    }
+    let cwd_rules = PathBuf::from("RULES.md");
+    if cwd_rules.exists() {
+        return absolutize(cwd_rules);
+    }
+    bail!(
+        "RULES.md was not found; set MAYHEM_ASSET_DIR to the Mayhem release/share directory or pass --rules-path"
+    )
 }
 
-fn default_rules_path() -> Result<PathBuf> {
-    let repo_rules = repo_path("RULES.md")?;
-    if repo_rules.exists() {
-        return absolutize(repo_rules);
+fn repo_path(relative: &str) -> Result<PathBuf> {
+    let relative_path = validate_asset_relative_path(relative)?;
+    Ok(mayhem_asset_root()?.join(relative_path))
+}
+
+fn validate_asset_relative_path(relative: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(relative);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!("asset path must be relative: {relative:?}");
     }
-    absolutize(PathBuf::from("RULES.md"))
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => bail!("asset path must not contain traversal: {relative:?}"),
+        }
+    }
+    Ok(path)
+}
+
+fn mayhem_asset_root() -> Result<PathBuf> {
+    if let Some(value) = env::var_os("MAYHEM_ASSET_DIR") {
+        let root = absolutize(PathBuf::from(value))?;
+        if mayhem_asset_root_marker(&root) {
+            return Ok(fs::canonicalize(&root).unwrap_or(root));
+        }
+        bail!(
+            "MAYHEM_ASSET_DIR={} does not look like a Mayhem asset directory",
+            root.display()
+        );
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            push_asset_root_candidates(&mut candidates, dir);
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        push_asset_root_candidates(&mut candidates, &cwd);
+    }
+
+    for candidate in candidates {
+        if mayhem_asset_root_marker(&candidate) {
+            return Ok(fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
+
+    bail!(
+        "Mayhem assets were not found; set MAYHEM_ASSET_DIR to the release/share directory or run from a Mayhem checkout"
+    )
+}
+
+fn push_asset_root_candidates(out: &mut Vec<PathBuf>, start: &Path) {
+    for ancestor in start.ancestors().take(6) {
+        push_unique_path(out, ancestor.join("share").join("mayhem"));
+        push_unique_path(out, ancestor.join("share"));
+        push_unique_path(out, ancestor.to_path_buf());
+    }
+}
+
+fn push_unique_path(out: &mut Vec<PathBuf>, path: PathBuf) {
+    if !out.iter().any(|existing| existing == &path) {
+        out.push(path);
+    }
+}
+
+fn mayhem_asset_root_marker(root: &Path) -> bool {
+    root.join("catalog").join("models.json").is_file()
+        || root.join("intercom").join("package.json").is_file()
+        || root.join("RULES.md").is_file()
 }
 
 fn absolutize(path: PathBuf) -> Result<PathBuf> {
@@ -38544,7 +39951,8 @@ where
 {
     let helper = env::var_os("MAYHEM_WALLET_HELPER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/wallet-helper.mjs"));
+        .map(absolutize)
+        .unwrap_or_else(|| repo_path("crates/mayhem-cli/src/wallet-helper.mjs"))?;
     let node = env::var_os("MAYHEM_NODE_BIN").unwrap_or_else(|| "node".into());
     let output = Command::new(&node)
         .arg(&helper)
@@ -40427,6 +41835,211 @@ mod tests {
     }
 
     #[test]
+    fn admin_tier3_cli_builds_bless_payload_and_feature_key() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "tier3",
+            "bless",
+            "--platform",
+            "azure-h100-sev-snp-nvidia-cc",
+            "--measurement-name",
+            "snp_launch_digest",
+            "--measurement",
+            "ab".repeat(48).as_str(),
+            "--effective-epoch",
+            "7",
+            "--region",
+            "centralus",
+            "--derivation-hash",
+            "cd".repeat(32).as_str(),
+            "--sim",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = cli.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Tier3 { command } = *command else {
+            panic!("expected tier3 command");
+        };
+        let AdminTier3Commands::Bless(args) = command else {
+            panic!("expected tier3 bless command");
+        };
+        assert!(args.tx.sim);
+        let measurement = normalize_tier3_measurement(&args.measurement).unwrap();
+        let payload =
+            admin_tier3_bless_payload(&args, &measurement, args.derivation_hash.as_deref())
+                .unwrap();
+        assert_eq!(payload["op"], "tier3_bless_measurement");
+        assert_eq!(payload["platform"], "azure-h100-sev-snp-nvidia-cc");
+        assert_eq!(payload["region"], "centralus");
+        assert_eq!(payload["measurement"], "ab".repeat(48));
+        assert_eq!(payload["derivation_hash"], "cd".repeat(32));
+        assert!(payload["at"].as_u64().is_some());
+        let key = tier3_measurement_feature_key(&payload).unwrap();
+        assert!(key.starts_with("tier3/measurement/azure-h100-sev-snp-nvidia-cc/"));
+    }
+
+    #[tokio::test]
+    async fn admin_tier3_bless_requires_local_derive_by_default() {
+        let temp = test_temp_dir("mayhem-tier3-bless-no-derive");
+        let args = AdminTier3BlessArgs {
+            tx: AdminTxArgs {
+                home: Some(temp.clone()),
+                rpc_url: None,
+                peer_store_name: "main".to_owned(),
+                keypair: None,
+                wallet_password: None,
+                submit: false,
+                sim: false,
+                json: true,
+            },
+            platform: "azure-h100-sev-snp-nvidia-cc".to_owned(),
+            measurement_name: "snp_launch_digest".to_owned(),
+            measurement: "ab".repeat(48),
+            effective_epoch: 7,
+            region: Some("centralus".to_owned()),
+            derivation_hash: None,
+            source: "admin-derive".to_owned(),
+            confirm: false,
+            allow_unconfirmed: false,
+        };
+
+        let err = admin_tier3_bless(&args).await.unwrap_err();
+        assert!(err.to_string().contains("tier3 derive"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn admin_tier3_bless_real_submit_requires_confirm() {
+        let temp = test_temp_dir("mayhem-tier3-bless-no-confirm");
+        let args = AdminTier3BlessArgs {
+            tx: AdminTxArgs {
+                home: Some(temp.clone()),
+                rpc_url: None,
+                peer_store_name: "main".to_owned(),
+                keypair: None,
+                wallet_password: None,
+                submit: true,
+                sim: false,
+                json: true,
+            },
+            platform: "azure-h100-sev-snp-nvidia-cc".to_owned(),
+            measurement_name: "snp_launch_digest".to_owned(),
+            measurement: "ab".repeat(48),
+            effective_epoch: 7,
+            region: Some("centralus".to_owned()),
+            derivation_hash: None,
+            source: "admin-derive".to_owned(),
+            confirm: false,
+            allow_unconfirmed: true,
+        };
+
+        let err = admin_tier3_bless(&args).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("reviewing `mayhem admin tier3 bless --sim`"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn admin_tier3_derive_records_offline_and_vendor_endorsement_sources() {
+        let temp = test_temp_dir("mayhem-tier3-derive-sources");
+        let offline_args = AdminTier3DeriveArgs {
+            read: AdminReadArgs {
+                home: Some(temp.clone()),
+                rpc_url: None,
+                json: true,
+            },
+            platform: "onprem-qemu-v1".to_owned(),
+            region: None,
+            measurement_name: "snp_launch_digest".to_owned(),
+            measurement: Some("ab".repeat(48)),
+            derive_command: None,
+            source_kind: Tier3DeriveSourceKind::OfflineCompute,
+            endorsement_file: None,
+            alert_measurement: Some("ab".repeat(48)),
+            output: None,
+        };
+        admin_tier3_derive(&offline_args).await.unwrap();
+
+        let endorsement_path = temp.join("azure-uvm-reference-info.cose");
+        fs::write(&endorsement_path, b"microsoft signed endorsement fixture").unwrap();
+        let endorsement_hash = file_sha256_hex(&endorsement_path).unwrap();
+        let vendor_args = AdminTier3DeriveArgs {
+            read: AdminReadArgs {
+                home: Some(temp.clone()),
+                rpc_url: None,
+                json: true,
+            },
+            platform: "azure-ncc".to_owned(),
+            region: Some("centralus".to_owned()),
+            measurement_name: "snp_launch_digest".to_owned(),
+            measurement: Some("cd".repeat(48)),
+            derive_command: None,
+            source_kind: Tier3DeriveSourceKind::VendorEndorsement,
+            endorsement_file: Some(endorsement_path),
+            alert_measurement: None,
+            output: None,
+        };
+        admin_tier3_derive(&vendor_args).await.unwrap();
+
+        let records = read_tier3_derivations(&tier3_derivation_store_path(&temp)).unwrap();
+        let offline = records
+            .iter()
+            .find(|record| record.measurement == "ab".repeat(48))
+            .expect("offline record");
+        assert_eq!(offline.source_kind.as_deref(), Some("offline-compute"));
+        assert_eq!(offline.source, "offline-compute");
+        assert_eq!(offline.match_alert, Some(true));
+        assert_eq!(offline.endorsement_sha256, None);
+
+        let vendor = records
+            .iter()
+            .find(|record| record.measurement == "cd".repeat(48))
+            .expect("vendor record");
+        assert_eq!(vendor.source_kind.as_deref(), Some("vendor-endorsement"));
+        assert_eq!(vendor.source, "vendor-endorsement");
+        assert_eq!(
+            vendor.endorsement_sha256.as_deref(),
+            Some(endorsement_hash.as_str())
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn admin_tier3_vendor_endorsement_derive_requires_endorsement_proof() {
+        let temp = test_temp_dir("mayhem-tier3-derive-vendor-no-proof");
+        let args = AdminTier3DeriveArgs {
+            read: AdminReadArgs {
+                home: Some(temp.clone()),
+                rpc_url: None,
+                json: true,
+            },
+            platform: "azure-ncc".to_owned(),
+            region: Some("centralus".to_owned()),
+            measurement_name: "snp_launch_digest".to_owned(),
+            measurement: Some("cd".repeat(48)),
+            derive_command: None,
+            source_kind: Tier3DeriveSourceKind::VendorEndorsement,
+            endorsement_file: None,
+            alert_measurement: None,
+            output: None,
+        };
+
+        let err = admin_tier3_derive(&args).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("vendor-endorsement requires --endorsement-file"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn admin_update_enclave_cli_builds_admin_metadata_payload() {
         let cli = Cli::try_parse_from([
             "mayhem",
@@ -40485,6 +42098,8 @@ mod tests {
             att_tier: None,
             quant: None,
             binary_hash: None,
+            launch_measurements_json: None,
+            launch_measurements_file: None,
             caps_json: None,
             caps_file: None,
         };
@@ -40557,10 +42172,25 @@ mod tests {
             reason_hash: Some("bb".repeat(32)),
             reason: None,
         };
-        assert!(admin_set_enclave_min_tier_payload(&tier2)
+        assert_eq!(
+            admin_set_enclave_min_tier_payload(&tier2).unwrap()["min_att_tier"],
+            json!(2)
+        );
+
+        let tier4 = AdminSetEnclaveMinTierArgs {
+            tx: test_admin_tx_args(),
+            enclave_id: "aa".repeat(32),
+            min_att_tier: 4,
+            submitted_epoch: 10,
+            effective_epoch: 34,
+            submitted_at: 1783517300,
+            reason_hash: Some("bb".repeat(32)),
+            reason: None,
+        };
+        assert!(admin_set_enclave_min_tier_payload(&tier4)
             .unwrap_err()
             .to_string()
-            .contains("not launch-advertisable"));
+            .contains("Tier 4 is provider KYB"));
 
         let immediate = AdminSetEnclaveMinTierArgs {
             min_att_tier: 1,
@@ -41013,6 +42643,8 @@ mod tests {
             dev_skip_catalog_verify: true,
             manifest_hash: "55".repeat(32),
             binary_hash: "66".repeat(32),
+            launch_measurements_json: None,
+            launch_measurements_file: None,
             att_tier: 1,
             quant: None,
             caps_json: Some(r#"{"tools":true,"json":true,"ctx":8192}"#.to_owned()),
@@ -41027,15 +42659,39 @@ mod tests {
 
         let mut tier2_args = args;
         tier2_args.att_tier = 2;
-        let err = admin_register_enclave_payload(&tier2_args).expect_err(
-            "Tier-2 enclave registration must stay disabled until quote generation is wired",
+        let tier2_payload = admin_register_enclave_payload(&tier2_args)
+            .expect("Tier-2 enclave hardware registration is launch-advertisable");
+        assert_eq!(tier2_payload["att_tier"], json!(2));
+
+        let mut tier3_missing_measurement = tier2_args;
+        tier3_missing_measurement.att_tier = 3;
+        let err = admin_register_enclave_payload(&tier3_missing_measurement)
+            .expect_err("Tier 3 requires admin-published golden measurements");
+        assert!(err.to_string().contains("launch-measurements"), "{err:#}");
+
+        let mut tier3_args = tier3_missing_measurement;
+        tier3_args.launch_measurements_json = Some(
+            r#"{"schema_version":1,"effective_epoch":0,"platform":"azure-h100-sev-snp-nvidia-cc","measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#
+                .to_owned(),
         );
+        let tier3_payload = admin_register_enclave_payload(&tier3_args)
+            .expect("Tier 3 accepts admin-published golden measurements");
+        assert_eq!(tier3_payload["att_tier"], json!(3));
+        assert_eq!(
+            tier3_payload["launch_measurements"]["measurements"]["snp_launch_digest"],
+            json!("abababababababababababababababababababababababababababababababababababababababababababababababab")
+        );
+
+        let mut tier4_args = tier3_args;
+        tier4_args.att_tier = 4;
+        let err = admin_register_enclave_payload(&tier4_args)
+            .expect_err("Tier 4 is provider KYB, not enclave hardware");
         assert!(
-            err.to_string().contains("not launch-advertisable"),
+            err.to_string().contains("Tier 4 is provider KYB"),
             "{err:#}"
         );
 
-        let mut fake_repo = tier2_args;
+        let mut fake_repo = tier4_args;
         fake_repo.att_tier = 1;
         fake_repo.artifact_repo = "provider/fake-model".to_owned();
         let err = admin_register_enclave_payload(&fake_repo)
@@ -41686,6 +43342,7 @@ mod tests {
             att_tier: 1,
             quant: "int4".to_owned(),
             binary_hash: "dd".repeat(32),
+            launch_measurements: Value::Null,
             caps: json!({}),
             status: "active".to_owned(),
             created_by: "admin".to_owned(),
@@ -41767,6 +43424,7 @@ mod tests {
             att_tier: 1,
             quant: "int4".to_owned(),
             binary_hash: "dd".repeat(32),
+            launch_measurements: Value::Null,
             caps: json!({}),
             status: "retired".to_owned(),
             created_by: "admin".to_owned(),
@@ -42201,6 +43859,7 @@ mod tests {
                 att_tier: 1,
                 quant: "int4".to_owned(),
                 binary_hash: "33".repeat(32),
+                launch_measurements: Value::Null,
                 caps: json!({ "ctx": 8192 }),
                 status: "active".to_owned(),
                 created_by: "44".repeat(32),
@@ -43112,7 +44771,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_candidates_require_producible_quote_tier_for_tier2_enclave() {
+    fn provider_candidates_require_producible_quote_tier_for_hardware_enclave() {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
         let mut hardware = test_hardware(FixtureProfile::CpuOnly);
@@ -43127,7 +44786,7 @@ mod tests {
             1
         );
 
-        contract.enclaves[0].att_tier = 2;
+        contract.enclaves[0].att_tier = 3;
         let err = build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap_err();
         assert!(err
             .to_string()
@@ -43149,6 +44808,94 @@ mod tests {
             message.contains("hardware probe tier 2 is only a signal"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn provider_candidates_allow_configured_tier3_quote_command() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let mut args = test_provider_start_args();
+        args.hardware_quote_kind = Some("nvidia_nvtrust_offline_jwt".to_owned());
+        args.hardware_quote_command = Some(PathBuf::from("mayhem-nvtrust-quote"));
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].att_tier = 3;
+
+        let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .expect("configured Tier-3 quote command can serve Tier-3 enclave");
+        assert_eq!(candidates.len(), 1);
+
+        contract.enclaves[0].att_tier = 4;
+        let err = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .expect_err("Tier 4 is provider KYB, not an enclave hardware quote");
+        assert!(
+            err.to_string()
+                .contains("provider path can currently generate verified Tier 3"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn provider_quote_config_requires_kind_and_command_together() {
+        let mut args = test_provider_start_args();
+        args.hardware_quote_kind = Some("nvidia_nras_jwt".to_owned());
+        assert!(provider_hardware_quote_config(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("--hardware-quote-command"));
+
+        args.hardware_quote_kind = None;
+        args.hardware_quote_command = Some(PathBuf::from("quote"));
+        assert!(provider_hardware_quote_config(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("--hardware-quote-kind"));
+    }
+
+    #[test]
+    fn provider_quote_config_keeps_bare_commands_on_path() {
+        let mut args = test_provider_start_args();
+        args.hardware_quote_kind = Some("nvidia_nras_jwt".to_owned());
+        args.hardware_quote_command = Some(PathBuf::from("gpu-attestation"));
+
+        let config = provider_hardware_quote_config(&args)
+            .expect("quote config parses")
+            .expect("quote config present");
+        assert_eq!(config.command, PathBuf::from("gpu-attestation"));
+
+        args.hardware_quote_command = Some(PathBuf::from("tools/gpu-attestation"));
+        let config = provider_hardware_quote_config(&args)
+            .expect("quote config parses")
+            .expect("quote config present");
+        assert!(config.command.is_absolute());
+        assert!(config.command.ends_with(Path::new("tools/gpu-attestation")));
+    }
+
+    #[test]
+    fn provider_quote_parser_carries_platform_hint_and_signed_fact_metadata() {
+        let quote = parse_hardware_quote_command_output(
+            &HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+            "binding-1",
+            r#"{
+              "kind":"nvidia_nvtrust_offline_jwt",
+              "evidence":"raw evidence",
+              "platform_id":"azure-ncc",
+              "region":"centralus",
+              "snp_chip_family":"genoa",
+              "snp_chip_id":"chip-123",
+              "snp_tcb":"svn27",
+              "gpu_model":"H100",
+              "gpu_driver":"550.90",
+              "gpu_vbios":"96.00.00"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(quote.binding, "binding-1");
+        assert_eq!(quote.metadata["platform_id"], "azure-ncc");
+        assert_eq!(quote.metadata["region"], "centralus");
+        assert_eq!(quote.metadata["snp"]["chip_id"], "chip-123");
+        assert_eq!(quote.metadata["gpu"]["model"], "H100");
     }
 
     #[test]
@@ -44249,6 +45996,92 @@ mod tests {
             draft.provider_signing_message_hex,
             other_draft.provider_signing_message_hex
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_boot_hardware_attestation_is_fresh_per_boot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = test_temp_dir("mayhem-provider-boot-attestation");
+        let quote_command = temp.join("quote.sh");
+        fs::write(
+            &quote_command,
+            r#"#!/bin/sh
+printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_id":"azure-ncc"}\n' "$MAYHEM_ATTESTATION_NONCE_U" "$MAYHEM_HW_QUOTE_BINDING"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&quote_command, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let binary_path = std::env::current_exe().unwrap();
+        let identity = CatalogEnclaveIdentity {
+            admin_pubkey: "44".repeat(32),
+            model_id: "test/model@tier3".to_owned(),
+            artifact_root: "aa".repeat(32),
+            artifact_sidecar_roots: BTreeMap::new(),
+            manifest_hash: "bb".repeat(32),
+            binary_hash: measure_binary(&binary_path).unwrap(),
+        };
+        let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
+        let config = ProviderHardwareQuoteConfig {
+            kind: HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+            command: quote_command.clone(),
+            timeout: Duration::from_secs(5),
+        };
+        let provider_pubkey = "55".repeat(32);
+        let runtime_config = AttestationRuntimeConfig {
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
+            backend: "vllm".to_owned(),
+            ctx: 8192,
+            tp_degree: 1,
+            max_batch_size: None,
+            max_num_tokens: None,
+        };
+
+        let first = provider_attestation_report(
+            Some(&config),
+            identity.clone(),
+            &runtime_keypair,
+            &provider_pubkey,
+            Some([7; 32]),
+            &quote_command,
+            "",
+            &binary_path,
+            100,
+            101,
+            "88".repeat(32),
+            runtime_config.clone(),
+        )
+        .await
+        .unwrap();
+        let second = provider_attestation_report(
+            Some(&config),
+            identity,
+            &runtime_keypair,
+            &provider_pubkey,
+            Some([7; 32]),
+            &quote_command,
+            "",
+            &binary_path,
+            200,
+            201,
+            "99".repeat(32),
+            runtime_config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.report.boot_epoch, 100);
+        assert_eq!(second.report.boot_epoch, 200);
+        assert_ne!(first.report_head, second.report_head);
+        let first_quote = first.report.hw_quote.as_ref().unwrap();
+        let second_quote = second.report.hw_quote.as_ref().unwrap();
+        assert!(first_quote.evidence.contains(&"88".repeat(32)));
+        assert!(second_quote.evidence.contains(&"99".repeat(32)));
+        assert_ne!(first_quote.binding, second_quote.binding);
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -49547,6 +51380,9 @@ State initialization...
             skip_disk_bench: true,
             chunk_size: DEFAULT_CHUNK_SIZE,
             enclave_binary: None,
+            hardware_quote_kind: None,
+            hardware_quote_command: None,
+            hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
             sim: false,
             no_heartbeat: true,
             heartbeat_count: 1,
@@ -50112,6 +51948,11 @@ State initialization...
             provider_workers,
             provider_auto_fit: false,
             provider_gpu_layers: Some(0),
+            provider_hardware_quote_kind: None,
+            provider_hardware_quote_command: None,
+            provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
+            hardware_quote_verifier_command: None,
+            hardware_quote_verifier_timeout_seconds: DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
         }
     }
 
@@ -50371,6 +52212,11 @@ State initialization...
             enclaves: None,
             auto_fit: false,
             provider_gpu_layers: None,
+            provider_hardware_quote_kind: None,
+            provider_hardware_quote_command: None,
+            provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
+            hardware_quote_verifier_command: None,
+            hardware_quote_verifier_timeout_seconds: DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
             network: None,
             subnet_channel: None,
             subnet_bootstrap: None,
@@ -50563,6 +52409,7 @@ State initialization...
             att_tier: 1,
             quant: "int4".to_owned(),
             binary_hash: "33".repeat(32),
+            launch_measurements: Value::Null,
             caps: json!({ "tools": true, "json": true, "ctx": 8192 }),
             status: "active".to_owned(),
             created_by: "44".repeat(32),
@@ -50641,6 +52488,7 @@ State initialization...
                 pending: None,
             }],
             price_derivations: Vec::new(),
+            tier3_measurements: Vec::new(),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
             rules: Some(RulesRef {
                 ver: 3,

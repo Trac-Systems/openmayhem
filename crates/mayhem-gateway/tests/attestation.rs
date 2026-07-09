@@ -2,6 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -11,7 +14,7 @@ use mayhem_enclave::{
 };
 use mayhem_gateway::{
     verify_attestation, verify_tier1_attestation, AttestationVerificationRequest,
-    EnclaveContractRecord, GatewayError,
+    EnclaveContractRecord, GatewayError, HardwareQuoteVerifierCommand,
 };
 use mayhem_proto::{
     catalog_enclave_id, hardware_quote_binding, AttestationBody, AttestationRuntimeConfig,
@@ -59,6 +62,7 @@ fn test_report() -> (
         artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
+        launch_measurements: serde_json::Value::Null,
         att_tier: 1,
         caps: serde_json::json!({}),
     };
@@ -75,11 +79,51 @@ fn test_hardware_report(
     EnclaveContractRecord,
     BTreeSet<String>,
 ) {
-    test_hardware_report_with_evidence(quote_kind, |_, _| "test-hardware-quote".to_owned())
+    test_hardware_report_with_evidence_and_metadata(quote_kind, None, |_, _| {
+        "test-hardware-quote".to_owned()
+    })
+}
+
+fn test_hardware_report_with_metadata(
+    quote_kind: HardwareQuoteKind,
+    metadata: serde_json::Value,
+) -> (
+    tempfile::TempDir,
+    mayhem_proto::AttestationReport,
+    EnclaveContractRecord,
+    BTreeSet<String>,
+) {
+    test_hardware_report_with_evidence_and_metadata(quote_kind, Some(metadata), |_, _| {
+        "test-hardware-quote".to_owned()
+    })
+}
+
+fn golden_launch_measurements() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "effective_epoch": 0,
+        "platform": "azure-h100-sev-snp-nvidia-cc",
+        "measurements": {
+            "snp_launch_digest": "ab".repeat(48)
+        }
+    })
 }
 
 fn test_hardware_report_with_evidence(
     quote_kind: HardwareQuoteKind,
+    evidence_for_binding: impl FnOnce(&AttestationBody, &str) -> String,
+) -> (
+    tempfile::TempDir,
+    mayhem_proto::AttestationReport,
+    EnclaveContractRecord,
+    BTreeSet<String>,
+) {
+    test_hardware_report_with_evidence_and_metadata(quote_kind, None, evidence_for_binding)
+}
+
+fn test_hardware_report_with_evidence_and_metadata(
+    quote_kind: HardwareQuoteKind,
+    metadata: Option<serde_json::Value>,
     evidence_for_binding: impl FnOnce(&AttestationBody, &str) -> String,
 ) -> (
     tempfile::TempDir,
@@ -123,6 +167,16 @@ fn test_hardware_report_with_evidence(
         evidence: evidence_for_binding(&body, &binding),
         binding,
         endorsements: vec!["mock-root".to_owned()],
+        metadata: metadata.unwrap_or_else(|| {
+            if att_tier >= 3 {
+                serde_json::json!({
+                    "platform_id": "azure-h100-sev-snp-nvidia-cc",
+                    "region": "centralus"
+                })
+            } else {
+                serde_json::Value::Null
+            }
+        }),
     };
     let attestation = build_hardware_attestation_report(&HardwareAttestationOptions {
         identity: identity.clone(),
@@ -145,6 +199,11 @@ fn test_hardware_report_with_evidence(
         artifact_sidecar_roots: std::collections::BTreeMap::new(),
         manifest_hash: identity.manifest_hash,
         binary_hash: attestation.report.binary_hash.clone(),
+        launch_measurements: if attestation.report.att_tier >= 3 {
+            golden_launch_measurements()
+        } else {
+            serde_json::Value::Null
+        },
         att_tier: attestation.report.att_tier,
         caps: serde_json::json!({}),
     };
@@ -518,7 +577,7 @@ fn nvidia_gb10_tier2_device_identity_rejects_non_gb10_hardware() {
 }
 
 #[test]
-fn verifies_nvidia_nras_tier3_report_with_trusted_jwks() {
+fn nvidia_nras_tier3_report_requires_admin_verifier_even_with_trusted_jwks() {
     let (_temp, report, contract, trusted) =
         test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, true)
@@ -534,11 +593,14 @@ fn verifies_nvidia_nras_tier3_report_with_trusted_jwks() {
     );
     request.trusted_nvidia_nras_jwks = Some(&jwks);
 
-    let verified =
-        verify_tier1_attestation(&request).expect("signed NVIDIA NRAS hardware report verifies");
+    let err = verify_tier1_attestation(&request)
+        .expect_err("NVIDIA NRAS alone is not enough for Tier-3 prompt confidentiality");
 
-    assert_eq!(verified.att_tier, TIER3_CONFIDENTIAL_COMPUTE_TIER);
-    assert_eq!(verified.enclave_id, contract.enclave_id);
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("admin hardware quote verifier")
+    ));
 }
 
 #[test]
@@ -556,11 +618,13 @@ fn nvidia_nras_tier3_report_requires_trusted_jwks() {
         210,
     );
 
-    let err = verify_tier1_attestation(&request).expect_err("NVIDIA NRAS quotes need trusted JWKS");
+    let err = verify_tier1_attestation(&request)
+        .expect_err("NVIDIA NRAS quotes need admin verifier for Tier 3");
 
     assert!(matches!(
         err,
-        GatewayError::HardwareQuoteTrustRootMissing { .. }
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("admin hardware quote verifier")
     ));
 }
 
@@ -596,7 +660,7 @@ fn hardware_quote_kind_must_match_report_tier() {
 }
 
 #[test]
-fn nvidia_nras_tier3_report_rejects_signed_failed_appraisal() {
+fn nvidia_nras_tier3_report_without_admin_verifier_fails_before_appraisal() {
     let (_temp, report, contract, trusted) =
         test_hardware_report_with_evidence(HardwareQuoteKind::NvidiaNrasJwt, |_, binding| {
             test_nvidia_evidence(binding, false)
@@ -618,12 +682,12 @@ fn nvidia_nras_tier3_report_rejects_signed_failed_appraisal() {
     assert!(matches!(
         err,
         GatewayError::HardwareQuoteInvalid { reason, .. }
-            if reason.contains("measres")
+            if reason.contains("admin hardware quote verifier")
     ));
 }
 
 #[test]
-fn verifies_nvidia_nvtrust_offline_cc_quote_with_trusted_jwks() {
+fn nvidia_nvtrust_offline_cc_quote_requires_admin_verifier_even_with_trusted_jwks() {
     let (_temp, report, contract, trusted) = test_hardware_report_with_evidence(
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
         |_, binding| test_nvidia_offline_evidence(binding, true),
@@ -639,10 +703,14 @@ fn verifies_nvidia_nvtrust_offline_cc_quote_with_trusted_jwks() {
     );
     request.trusted_nvidia_offline_jwks = Some(&jwks);
 
-    let verified = verify_tier1_attestation(&request).expect("offline NVIDIA CC quote verifies");
+    let err = verify_tier1_attestation(&request)
+        .expect_err("offline NVIDIA token alone is not enough for Tier-3 prompt confidentiality");
 
-    assert_eq!(verified.att_tier, TIER3_CONFIDENTIAL_COMPUTE_TIER);
-    assert_eq!(verified.enclave_id, contract.enclave_id);
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("admin hardware quote verifier")
+    ));
 }
 
 #[test]
@@ -660,12 +728,13 @@ fn nvidia_nvtrust_offline_cc_quote_requires_trusted_jwks() {
         210,
     );
 
-    let err = verify_tier1_attestation(&request).expect_err("offline NVIDIA CC needs trusted JWKS");
+    let err = verify_tier1_attestation(&request)
+        .expect_err("offline NVIDIA CC needs admin verifier for Tier 3");
 
     assert!(matches!(
         err,
-        GatewayError::HardwareQuoteTrustRootMissing { kind }
-            if kind == "nvidia_nvtrust_offline_jwt"
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("admin hardware quote verifier")
     ));
 }
 
@@ -726,8 +795,209 @@ fn nvidia_nvtrust_offline_cc_quote_rejects_gb10_device_identity_claims() {
     ));
 }
 
+#[cfg(unix)]
+fn write_verifier_script(dir: &tempfile::TempDir, stdout_json: &str) -> std::path::PathBuf {
+    let path = dir.path().join("verify-hardware.sh");
+    let escaped = stdout_json.replace('\'', "'\\''");
+    fs::write(
+        &path,
+        format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{escaped}'\n"),
+    )
+    .expect("write verifier script");
+    let mut permissions = fs::metadata(&path).expect("script metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("chmod verifier script");
+    path
+}
+
+#[cfg(unix)]
+fn request_with_external_verifier<'a>(
+    report: &'a mayhem_proto::AttestationReport,
+    contract: &'a EnclaveContractRecord,
+    trusted: &'a BTreeSet<String>,
+    verifier: &'a HardwareQuoteVerifierCommand,
+) -> AttestationVerificationRequest<'a> {
+    let mut request = AttestationVerificationRequest::new(
+        report,
+        contract,
+        trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+    request.hardware_quote_verifier_command = Some(verifier);
+    request
+}
+
+#[cfg(unix)]
 #[test]
-fn sev_snp_and_tdx_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
+fn external_nvidia_cc_verifier_requires_gpu_cpu_roots_and_golden_measurement() {
+    let (temp, report, contract, trusted) =
+        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let verified = verify_tier1_attestation(&request)
+        .expect("external verifier accepts NVIDIA GPU + CPU CC + golden measurement");
+
+    assert_eq!(verified.att_tier, TIER3_CONFIDENTIAL_COMPUTE_TIER);
+}
+
+#[cfg(unix)]
+#[test]
+fn external_nvidia_cc_verifier_rejects_gpu_only_h100_without_cpu_root() {
+    let (temp, report, contract, trusted) =
+        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("NVIDIA GPU-only evidence is not Tier-3 prompt confidentiality");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("do not satisfy")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_verifier_accepts_intel_tdx_cpu_root_for_nvidia_cc_best_effort() {
+    let (temp, report, contract, trusted) =
+        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","intel_tdx_dcap"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    verify_tier1_attestation(&request)
+        .expect("Intel TDX/DCAP CPU root is supported as a best-effort CPU CC root");
+}
+
+#[cfg(unix)]
+#[test]
+fn external_verifier_rejects_unknown_measurement_even_on_real_roots() {
+    let (temp, report, contract, trusted) =
+        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"},"platform_id":"provider-declared-azure-ncc","region":"centralus","snp_chip_family":"genoa","snp_chip_id":"chip-123","snp_tcb":"svn27","gpu_model":"H100","gpu_driver":"550.90","gpu_vbios":"96.00.00"}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("hardware-valid unknown image measurement is rejected");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("does not match")
+                && reason.contains("platform=provider-declared-azure-ncc")
+                && reason.contains("region=centralus")
+                && reason.contains("snp_chip_id=chip-123")
+                && reason.contains("gpu_model=H100")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_verifier_requires_tier3_quote_platform_hint_but_does_not_trust_it() {
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        serde_json::Value::Null,
+    );
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("Tier-3 quote submissions must carry a platform hint for admin workflow");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("platform_id")
+    ));
+
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+        serde_json::json!({
+            "platform_id": "provider-can-lie-here",
+            "region": "wrong-region"
+        }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    verify_tier1_attestation(&request)
+        .expect("declared platform/region hints do not influence Tier-3 trust acceptance");
+}
+
+#[cfg(unix)]
+#[test]
+fn external_verifier_rejects_tier3_enclave_without_golden_measurement() {
+    let (temp, report, mut contract, trusted) =
+        test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);
+    contract.launch_measurements = serde_json::Value::Null;
+    let script = write_verifier_script(
+        &temp,
+        r#"{"ok":true,"kind":"nvidia_nvtrust_offline_jwt","att_tier":3,"roots":["nvidia_gpu_cert_chain","nvidia_driver_rim","nvidia_vbios_rim","amd_sev_snp_vcek"],"matched_measurements":{"snp_launch_digest":"abababababababababababababababababababababababababababababababababababababababababababababababab"}}"#,
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(5),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("Tier-3 registration without golden measurement fails closed");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("no admin-published launch measurements")
+    ));
+}
+
+#[test]
+fn tier3_quote_kinds_fail_closed_without_admin_verifier() {
     let (_temp, report, contract, trusted) = test_hardware_report(HardwareQuoteKind::IntelTdxDcap);
     let request = AttestationVerificationRequest::new(
         &report,
@@ -738,9 +1008,13 @@ fn sev_snp_and_tdx_quote_kinds_fail_closed_until_vendor_verifiers_are_wired() {
         210,
     );
 
-    let err = verify_tier1_attestation(&request).expect_err("vendor quote verifier is required");
+    let err = verify_tier1_attestation(&request).expect_err("admin quote verifier is required");
 
-    assert!(matches!(err, GatewayError::HardwareQuoteUnsupported { .. }));
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("admin hardware quote verifier")
+    ));
 }
 
 #[test]

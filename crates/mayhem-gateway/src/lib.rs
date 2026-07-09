@@ -12,7 +12,13 @@ pub use pricing::*;
 pub use provider_table::*;
 pub use reputation::*;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    io::{Read, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::{
@@ -22,16 +28,18 @@ use jsonwebtoken::{
 };
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
-    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuoteKind, MoneyAu,
-    ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuote, HardwareQuoteKind,
+    MoneyAu, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
+use wait_timeout::ChildExt;
 
 pub const CRATE_NAME: &str = "mayhem-gateway";
 pub const DEFAULT_MAX_REPORT_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS: u64 = 5 * 60;
+pub const DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS: u64 = 120;
 pub const HEARTBEAT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = 30_000;
 pub const DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS: u64 = 5_000;
@@ -129,8 +137,15 @@ pub struct EnclaveContractRecord {
     pub artifact_sidecar_roots: BTreeMap<String, String>,
     pub manifest_hash: String,
     pub binary_hash: String,
+    pub launch_measurements: Value,
     pub att_tier: u8,
     pub caps: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HardwareQuoteVerifierCommand {
+    pub command: PathBuf,
+    pub timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -147,6 +162,7 @@ pub struct AttestationVerificationRequest<'a> {
     pub trusted_nvidia_gb10_device_jwks: Option<&'a Value>,
     pub trusted_nvidia_nras_jwks: Option<&'a Value>,
     pub trusted_nvidia_offline_jwks: Option<&'a Value>,
+    pub hardware_quote_verifier_command: Option<&'a HardwareQuoteVerifierCommand>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,6 +303,7 @@ impl<'a> AttestationVerificationRequest<'a> {
             trusted_nvidia_gb10_device_jwks: None,
             trusted_nvidia_nras_jwks: None,
             trusted_nvidia_offline_jwks: None,
+            hardware_quote_verifier_command: None,
         }
     }
 }
@@ -546,6 +563,16 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
             actual: quote.binding.clone(),
         });
     }
+    let kind = hardware_quote_kind_name(&quote.kind);
+    if quote.kind.attestation_tier() >= 3 && request.hardware_quote_verifier_command.is_none() {
+        return Err(hardware_quote_invalid(
+            kind,
+            "Tier-3 confidential compute requires an admin hardware quote verifier command that checks GPU/CPU roots and golden launch measurements",
+        ));
+    }
+    if let Some(verifier) = request.hardware_quote_verifier_command {
+        return verify_hardware_quote_with_command(request, quote, &expected, verifier);
+    }
     match quote.kind {
         HardwareQuoteKind::AppleAppAttestJwt => verify_apple_app_attest_quote(
             &quote.evidence,
@@ -573,6 +600,647 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
             request.trusted_nvidia_offline_jwks,
             &expected,
         ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HardwareQuoteVerifierCommandOutput {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    binding: Option<String>,
+    #[serde(default)]
+    att_tier: Option<u8>,
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    roots: Vec<String>,
+    #[serde(default)]
+    verified_roots: Vec<String>,
+    #[serde(default)]
+    matched_measurement_name: Option<String>,
+    #[serde(default)]
+    matched_measurement: Option<String>,
+    #[serde(default)]
+    matched_measurements: Value,
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    platform_id: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    unknown_measurement: Option<String>,
+    #[serde(default)]
+    snp_chip_family: Option<String>,
+    #[serde(default)]
+    snp_chip_id: Option<String>,
+    #[serde(default)]
+    snp_tcb: Option<String>,
+    #[serde(default)]
+    snp_firmware_svn: Option<String>,
+    #[serde(default)]
+    gpu_model: Option<String>,
+    #[serde(default)]
+    gpu_driver: Option<String>,
+    #[serde(default)]
+    gpu_vbios: Option<String>,
+    #[serde(default)]
+    alert: Value,
+}
+
+fn verify_hardware_quote_with_command(
+    request: &AttestationVerificationRequest<'_>,
+    quote: &HardwareQuote,
+    expected_binding: &str,
+    verifier: &HardwareQuoteVerifierCommand,
+) -> Result<()> {
+    const KIND: &str = "external_verifier";
+    if verifier.timeout.is_zero() {
+        return Err(hardware_quote_invalid(
+            KIND,
+            "admin verifier timeout must be positive",
+        ));
+    }
+    let kind = hardware_quote_kind_name(&quote.kind);
+    let golden_measurements = golden_launch_measurements(&request.contract.launch_measurements);
+    if quote.kind.attestation_tier() >= 3 && golden_measurements.is_empty() {
+        return Err(hardware_quote_invalid(
+            kind,
+            "Tier-3 enclave has no admin-published launch measurements",
+        ));
+    }
+    let declared_platform = if quote.kind.attestation_tier() >= 3 {
+        let platform = tier3_quote_platform_id(kind, quote)?;
+        Some(platform.to_owned())
+    } else {
+        None
+    };
+    let input = json!({
+        "schema_version": 1,
+        "kind": kind,
+        "expected_binding": expected_binding,
+        "declared_platform": declared_platform.as_deref(),
+        "golden_launch_measurements": &golden_measurements,
+        "quote": quote,
+        "report": request.report,
+        "contract": {
+            "enclave_id": &request.contract.enclave_id,
+            "admin_pubkey": &request.contract.admin_pubkey,
+            "model_id": &request.contract.model_id,
+            "model_class": &request.contract.model_class,
+            "artifact_root": &request.contract.artifact_root,
+            "artifact_sidecar_roots": &request.contract.artifact_sidecar_roots,
+            "manifest_hash": &request.contract.manifest_hash,
+            "binary_hash": &request.contract.binary_hash,
+            "launch_measurements": &request.contract.launch_measurements,
+            "att_tier": request.contract.att_tier,
+            "caps": &request.contract.caps,
+        }
+    });
+    let mut input = serde_json::to_vec(&input).map_err(|err| {
+        hardware_quote_invalid(KIND, format!("admin verifier input JSON failed: {err}"))
+    })?;
+    input.push(b'\n');
+    let mut child = Command::new(&verifier.command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("MAYHEM_HW_VERIFY_KIND", kind)
+        .env("MAYHEM_HW_VERIFY_BINDING", expected_binding)
+        .env(
+            "MAYHEM_HW_VERIFY_PLATFORM",
+            declared_platform.as_deref().unwrap_or(""),
+        )
+        .env(
+            "MAYHEM_HW_VERIFY_ATTESTATION_TIER",
+            quote.kind.attestation_tier().to_string(),
+        )
+        .spawn()
+        .map_err(|err| {
+            hardware_quote_invalid(
+                KIND,
+                format!(
+                    "admin verifier {} could not start: {err}",
+                    verifier.command.display()
+                ),
+            )
+        })?;
+    let write_result = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| hardware_quote_invalid(KIND, "admin verifier stdin was not available"))
+        .and_then(|stdin| {
+            stdin.write_all(&input).map_err(|err| {
+                hardware_quote_invalid(KIND, format!("admin verifier stdin write failed: {err}"))
+            })
+        });
+    drop(child.stdin.take());
+    if let Err(err) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let status = match child.wait_timeout(verifier.timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(hardware_quote_invalid(
+                KIND,
+                format!(
+                    "admin verifier {} timed out after {}s",
+                    verifier.command.display(),
+                    verifier.timeout.as_secs()
+                ),
+            ));
+        }
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(hardware_quote_invalid(
+                KIND,
+                format!("admin verifier wait failed: {err}"),
+            ));
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout).map_err(|err| {
+            hardware_quote_invalid(KIND, format!("admin verifier stdout read failed: {err}"))
+        })?;
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).map_err(|err| {
+            hardware_quote_invalid(KIND, format!("admin verifier stderr read failed: {err}"))
+        })?;
+    }
+    if !status.success() {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "admin verifier exited with {status}; stderr: {}",
+                short_verifier_stream(&stderr)
+            ),
+        ));
+    }
+    let verdict: HardwareQuoteVerifierCommandOutput =
+        serde_json::from_str(stdout.trim()).map_err(|err| {
+            hardware_quote_invalid(
+                kind,
+                format!("admin verifier stdout was not verdict JSON: {err}"),
+            )
+        })?;
+    if !verdict.ok {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "admin verifier rejected quote: {}{}",
+                verdict.reason.as_deref().unwrap_or("no reason supplied"),
+                tier3_alert_suffix(&verdict, &quote.metadata, None)
+            ),
+        ));
+    }
+    if verdict.kind.as_deref().is_some_and(|actual| actual != kind) {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "admin verifier returned kind {}, expected {kind}",
+                verdict.kind.as_deref().unwrap_or_default()
+            ),
+        ));
+    }
+    if verdict
+        .binding
+        .as_deref()
+        .is_some_and(|actual| actual != expected_binding)
+    {
+        return Err(GatewayError::HardwareQuoteBindingMismatch {
+            expected: expected_binding.to_owned(),
+            actual: verdict.binding.unwrap_or_default(),
+        });
+    }
+    if verdict
+        .att_tier
+        .is_some_and(|actual| actual != quote.kind.attestation_tier())
+    {
+        return Err(GatewayError::ContractMismatch {
+            field: "hw_quote.verifier.att_tier",
+            expected: quote.kind.attestation_tier().to_string(),
+            actual: verdict.att_tier.unwrap_or_default().to_string(),
+        });
+    }
+    let roots = verifier_verified_roots(&verdict);
+    if roots.is_empty() {
+        return Err(hardware_quote_invalid(
+            kind,
+            "admin verifier did not name any verified vendor root",
+        ));
+    }
+    if !verifier_roots_satisfy_quote_kind(&quote.kind, &roots) {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "admin verifier roots {:?} do not satisfy {kind}",
+                verdict_roots_for_error(&roots)
+            ),
+        ));
+    }
+    if quote.kind.attestation_tier() >= 3 {
+        verify_verdict_matches_golden_measurement(
+            kind,
+            &verdict,
+            &golden_measurements,
+            &quote.metadata,
+        )?;
+    }
+    Ok(())
+}
+
+fn tier3_quote_platform_id<'a>(kind: &'static str, quote: &'a HardwareQuote) -> Result<&'a str> {
+    let platform = quote
+        .metadata
+        .get("platform_id")
+        .or_else(|| quote.metadata.get("platform"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            hardware_quote_invalid(kind, "Tier-3 quote metadata must carry platform_id")
+        })?;
+    if !platform
+        .as_bytes()
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(hardware_quote_invalid(
+            kind,
+            "Tier-3 quote metadata platform_id is not a safe label",
+        ));
+    }
+    Ok(platform)
+}
+
+fn golden_launch_measurements(value: &Value) -> BTreeMap<String, BTreeSet<String>> {
+    fn insert_measurement(
+        out: &mut BTreeMap<String, BTreeSet<String>>,
+        name: &str,
+        measurement: &str,
+    ) {
+        let name = normalize_verifier_root(name);
+        let measurement = measurement.trim().to_ascii_lowercase();
+        if !name.is_empty() && !measurement.is_empty() {
+            out.entry(name).or_default().insert(measurement);
+        }
+    }
+
+    fn collect_value(out: &mut BTreeMap<String, BTreeSet<String>>, name: &str, value: &Value) {
+        if let Some(measurement) = value.as_str() {
+            insert_measurement(out, name, measurement);
+            return;
+        }
+        if let Some(values) = value.as_array() {
+            for value in values {
+                collect_value(out, name, value);
+            }
+            return;
+        }
+        if let Some(object) = value.as_object() {
+            if let Some(measurement) = object.get("measurement").and_then(Value::as_str) {
+                insert_measurement(out, name, measurement);
+            }
+            if let Some(values) = object.get("values") {
+                collect_value(out, name, values);
+            }
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    let measurements = value
+        .get("measurements")
+        .and_then(Value::as_object)
+        .or_else(|| value.as_object());
+    if let Some(measurements) = measurements {
+        for (name, value) in measurements {
+            if matches!(
+                name.as_str(),
+                "schema_version" | "effective_epoch" | "platform" | "entries"
+            ) {
+                continue;
+            }
+            collect_value(&mut out, name, value);
+        }
+    }
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            let Some(object) = entry.as_object() else {
+                continue;
+            };
+            let Some(measurement) = object.get("measurement").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = object
+                .get("measurement_name")
+                .or_else(|| object.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("measurement");
+            insert_measurement(&mut out, name, measurement);
+        }
+    }
+    out
+}
+
+fn verify_verdict_matches_golden_measurement(
+    kind: &'static str,
+    verdict: &HardwareQuoteVerifierCommandOutput,
+    golden: &BTreeMap<String, BTreeSet<String>>,
+    quote_metadata: &Value,
+) -> Result<()> {
+    let matched = verifier_matched_measurements(verdict);
+    if matched.is_empty() {
+        return Err(hardware_quote_invalid(
+            kind,
+            "admin verifier did not report a matched launch measurement",
+        ));
+    }
+    let value_matches_any =
+        |measurement: &str| golden.values().any(|values| values.contains(measurement));
+    for (name, measurement) in &matched {
+        if golden
+            .get(name)
+            .is_some_and(|values| values.contains(measurement))
+            || (name == "measurement" && value_matches_any(measurement))
+        {
+            return Ok(());
+        }
+    }
+    Err(hardware_quote_invalid(
+        kind,
+        format!(
+            "hardware quote measurement does not match the admin-published launch measurement{}",
+            tier3_alert_suffix(verdict, quote_metadata, Some(&matched))
+        ),
+    ))
+}
+
+fn verifier_matched_measurements(
+    verdict: &HardwareQuoteVerifierCommandOutput,
+) -> BTreeMap<String, String> {
+    let mut matched = BTreeMap::new();
+    if let Some(value) = verdict.matched_measurement.as_deref() {
+        let name = verdict
+            .matched_measurement_name
+            .as_deref()
+            .map(normalize_verifier_root)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "measurement".to_owned());
+        matched.insert(name, value.trim().to_ascii_lowercase());
+    }
+    if let Some(object) = verdict.matched_measurements.as_object() {
+        for (name, value) in object {
+            if let Some(value) = value.as_str() {
+                let name = normalize_verifier_root(name);
+                if !name.is_empty() {
+                    matched.insert(name, value.trim().to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    matched.retain(|_, value| !value.is_empty());
+    matched
+}
+
+fn tier3_alert_suffix(
+    verdict: &HardwareQuoteVerifierCommandOutput,
+    quote_metadata: &Value,
+    matched: Option<&BTreeMap<String, String>>,
+) -> String {
+    let mut parts = Vec::new();
+    push_alert_part(
+        &mut parts,
+        "platform",
+        verifier_string(verdict.platform_id.as_deref())
+            .or_else(|| verifier_string(verdict.platform.as_deref()))
+            .or_else(|| json_string_path(&verdict.alert, &["platform_id"]))
+            .or_else(|| json_string_path(&verdict.alert, &["platform"]))
+            .or_else(|| json_string_path(quote_metadata, &["platform_id"]))
+            .or_else(|| json_string_path(quote_metadata, &["platform"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "region",
+        verifier_string(verdict.region.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["region"]))
+            .or_else(|| json_string_path(quote_metadata, &["region"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "unknown_measurement",
+        verifier_string(verdict.unknown_measurement.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["unknown_measurement"]))
+            .or_else(|| {
+                matched.and_then(|matched| matched.iter().next().map(|(_, value)| value.clone()))
+            })
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "snp_chip_family",
+        verifier_string(verdict.snp_chip_family.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["snp", "chip_family"]))
+            .or_else(|| json_string_path(quote_metadata, &["snp", "chip_family"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "snp_chip_id",
+        verifier_string(verdict.snp_chip_id.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["snp", "chip_id"]))
+            .or_else(|| json_string_path(quote_metadata, &["snp", "chip_id"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "snp_tcb",
+        verifier_string(verdict.snp_tcb.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["snp", "tcb"]))
+            .or_else(|| json_string_path(quote_metadata, &["snp", "tcb"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "snp_firmware_svn",
+        verifier_string(verdict.snp_firmware_svn.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["snp", "firmware_svn"]))
+            .or_else(|| json_string_path(quote_metadata, &["snp", "firmware_svn"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "gpu_model",
+        verifier_string(verdict.gpu_model.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["gpu", "model"]))
+            .or_else(|| json_string_path(quote_metadata, &["gpu", "model"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "gpu_driver",
+        verifier_string(verdict.gpu_driver.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["gpu", "driver"]))
+            .or_else(|| json_string_path(quote_metadata, &["gpu", "driver"]))
+            .as_deref(),
+    );
+    push_alert_part(
+        &mut parts,
+        "gpu_vbios",
+        verifier_string(verdict.gpu_vbios.as_deref())
+            .or_else(|| json_string_path(&verdict.alert, &["gpu", "vbios"]))
+            .or_else(|| json_string_path(quote_metadata, &["gpu", "vbios"]))
+            .as_deref(),
+    );
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; Tier-3 measurement alert: {}", parts.join(", "))
+    }
+}
+
+fn push_alert_part(parts: &mut Vec<String>, name: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(format!("{name}={value}"));
+    }
+}
+
+fn verifier_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn json_string_path(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            current
+                .as_u64()
+                .map(|value| value.to_string())
+                .or_else(|| current.as_i64().map(|value| value.to_string()))
+        })
+}
+
+fn hardware_quote_kind_name(kind: &HardwareQuoteKind) -> &'static str {
+    match kind {
+        HardwareQuoteKind::AppleAppAttestJwt => "apple_app_attest_jwt",
+        HardwareQuoteKind::AmdSevSnpVcek => "amd_sev_snp_vcek",
+        HardwareQuoteKind::IntelTdxDcap => "intel_tdx_dcap",
+        HardwareQuoteKind::NvidiaGb10DeviceJwt => "nvidia_gb10_device_jwt",
+        HardwareQuoteKind::NvidiaNrasJwt => "nvidia_nras_jwt",
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt => "nvidia_nvtrust_offline_jwt",
+    }
+}
+
+fn verifier_verified_roots(verdict: &HardwareQuoteVerifierCommandOutput) -> Vec<String> {
+    let mut roots = verdict
+        .root
+        .iter()
+        .chain(verdict.roots.iter())
+        .chain(verdict.verified_roots.iter())
+        .map(|root| normalize_verifier_root(root))
+        .filter(|root| !root.is_empty())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn normalize_verifier_root(root: &str) -> String {
+    root.trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn verifier_roots_satisfy_quote_kind(kind: &HardwareQuoteKind, roots: &[String]) -> bool {
+    match kind {
+        HardwareQuoteKind::AppleAppAttestJwt => root_has_all(roots, &["apple", "app", "attest"]),
+        HardwareQuoteKind::AmdSevSnpVcek => has_amd_sev_snp_vcek_root(roots),
+        HardwareQuoteKind::IntelTdxDcap => has_intel_tdx_dcap_root(roots),
+        HardwareQuoteKind::NvidiaGb10DeviceJwt => {
+            root_has_all(roots, &["nvidia", "gb10"])
+                || root_has_all(roots, &["nvidia", "device", "identity"])
+        }
+        HardwareQuoteKind::NvidiaNrasJwt => {
+            root_has_all(roots, &["nvidia", "nras"])
+                || (has_raw_nvidia_gpu_roots(roots) && has_confidential_cpu_root(roots))
+        }
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt => {
+            has_raw_nvidia_gpu_roots(roots) && has_confidential_cpu_root(roots)
+        }
+    }
+}
+
+fn has_confidential_cpu_root(roots: &[String]) -> bool {
+    has_amd_sev_snp_vcek_root(roots) || has_intel_tdx_dcap_root(roots)
+}
+
+fn has_amd_sev_snp_vcek_root(roots: &[String]) -> bool {
+    root_has_all(roots, &["amd", "sev", "snp", "vcek"])
+        || root_has_all(roots, &["amd", "ark", "genoa"])
+}
+
+fn has_intel_tdx_dcap_root(roots: &[String]) -> bool {
+    root_has_all(roots, &["intel", "tdx", "dcap"])
+}
+
+fn has_raw_nvidia_gpu_roots(roots: &[String]) -> bool {
+    (root_has_all(roots, &["nvidia", "gpu", "cert", "chain"])
+        || root_has_all(roots, &["nvidia", "gpu", "attestation", "report"]))
+        && root_has_all(roots, &["nvidia", "driver", "rim"])
+        && root_has_all(roots, &["nvidia", "vbios", "rim"])
+}
+
+fn root_has_all(roots: &[String], parts: &[&str]) -> bool {
+    roots
+        .iter()
+        .any(|root| parts.iter().all(|part| root.contains(part)))
+}
+
+fn verdict_roots_for_error(roots: &[String]) -> Vec<&str> {
+    roots.iter().map(String::as_str).take(8).collect()
+}
+
+fn short_verifier_stream(stream: &str) -> String {
+    let stream = stream.trim();
+    if stream.len() <= 512 {
+        stream.to_owned()
+    } else {
+        format!("{}...", stream.chars().take(512).collect::<String>())
     }
 }
 

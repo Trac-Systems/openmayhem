@@ -9,6 +9,7 @@ param(
     [string]$ReleaseBaseUrl = $env:MAYHEM_RELEASE_BASE_URL,
     [string]$Version = $(if ($env:MAYHEM_VERSION) { $env:MAYHEM_VERSION } else { "latest" }),
     [string]$InstallDir = $(if ($env:MAYHEM_INSTALL_DIR) { $env:MAYHEM_INSTALL_DIR } else { Join-Path (Join-Path $HOME ".mayhem") "bin" }),
+    [string]$ShareDir = $env:MAYHEM_SHARE_DIR,
     [switch]$SkipNode,
     [switch]$SkipPear,
     [switch]$SkipOpencode,
@@ -41,6 +42,10 @@ $Bins = @(
 
 $script:PathEntries = @()
 $script:TempDirs = @()
+
+if ([string]::IsNullOrWhiteSpace($ShareDir)) {
+    $ShareDir = Join-Path (Join-Path (Split-Path -Parent $InstallDir) "share") "mayhem"
+}
 
 function Write-Log {
     param([string]$Message)
@@ -379,6 +384,130 @@ function Copy-ArtifactBins {
     }
 }
 
+function Join-RelativePath {
+    param(
+        [string]$Root,
+        [string]$RelativePath
+    )
+
+    $path = $Root
+    foreach ($part in ($RelativePath -split "/")) {
+        if (-not [string]::IsNullOrWhiteSpace($part)) {
+            $path = Join-Path $path $part
+        }
+    }
+    return $path
+}
+
+function Reset-RuntimeAssetDir {
+    $paths = @(
+        (Join-Path $ShareDir "RULES.md"),
+        (Join-Path $ShareDir "catalog"),
+        (Join-Path $ShareDir "intercom"),
+        (Join-Path $ShareDir "contracts"),
+        (Join-Path (Join-Path (Join-Path $ShareDir "crates") "mayhem-cli") "src")
+    )
+    foreach ($path in $paths) {
+        Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path $ShareDir -Force | Out-Null
+}
+
+function Copy-FilteredDirectory {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+
+    if (-not (Test-Path -Path $Source -PathType Container)) {
+        Fail "missing runtime asset directory: $Source"
+    }
+    $skip = @("node_modules", ".git", "tests", "test", "coverage", ".cache", "logs", "store")
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
+        if ($item.PSIsContainer) {
+            if ($skip -contains $item.Name) {
+                continue
+            }
+            Copy-FilteredDirectory -Source $item.FullName -Destination (Join-Path $Destination $item.Name)
+        } else {
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $Destination $item.Name) -Force
+        }
+    }
+}
+
+function Copy-SourceAssets {
+    Reset-RuntimeAssetDir
+    Copy-Item -Path (Join-Path $SourceDir "RULES.md") -Destination (Join-Path $ShareDir "RULES.md") -Force
+    Copy-FilteredDirectory -Source (Join-Path $SourceDir "catalog") -Destination (Join-Path $ShareDir "catalog")
+    Copy-FilteredDirectory -Source (Join-Path $SourceDir "intercom") -Destination (Join-Path $ShareDir "intercom")
+    Copy-FilteredDirectory -Source (Join-Path $SourceDir "contracts") -Destination (Join-Path $ShareDir "contracts")
+    $helperDir = Join-Path (Join-Path (Join-Path $ShareDir "crates") "mayhem-cli") "src"
+    New-Item -ItemType Directory -Path $helperDir -Force | Out-Null
+    foreach ($helper in Get-ChildItem -Path (Join-Path (Join-Path (Join-Path $SourceDir "crates") "mayhem-cli") "src") -Filter "*.mjs") {
+        Copy-Item -LiteralPath $helper.FullName -Destination (Join-Path $helperDir $helper.Name) -Force
+    }
+    Write-Log "installed Mayhem runtime assets into $ShareDir"
+}
+
+function Copy-PackageAssets {
+    param(
+        [string]$PackageRoot,
+        [string[]]$VerifiedFiles
+    )
+
+    if ($VerifiedFiles -notcontains "share/mayhem/RULES.md") {
+        Fail "SHA256SUMS does not verify share/mayhem/RULES.md"
+    }
+
+    Reset-RuntimeAssetDir
+    foreach ($relativePath in $VerifiedFiles) {
+        if (-not $relativePath.StartsWith("share/mayhem/")) {
+            continue
+        }
+        $assetRelative = $relativePath.Substring("share/mayhem/".Length)
+        $source = Join-RelativePath -Root $PackageRoot -RelativePath $relativePath
+        $target = Join-RelativePath -Root $ShareDir -RelativePath $assetRelative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $target -Force
+    }
+    Write-Log "installed Mayhem runtime assets into $ShareDir"
+}
+
+function Invoke-NpmInstall {
+    param([string]$Directory)
+
+    if (-not (Test-Path -Path (Join-Path $Directory "package.json") -PathType Leaf)) {
+        return
+    }
+    Write-Log "installing runtime dependencies in $Directory"
+    Push-Location $Directory
+    try {
+        if (Test-Path -Path "package-lock.json" -PathType Leaf) {
+            & npm "ci" "--omit=dev"
+        } else {
+            & npm "install" "--omit=dev"
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Fail "npm dependency install failed in $Directory"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Hydrate-RuntimeAssets {
+    if ($SkipNode) {
+        Write-Log "skipping runtime dependency install because -SkipNode was set"
+        return
+    }
+    Ensure-Node
+    Invoke-NpmInstall -Directory (Join-Path (Join-Path (Join-Path $ShareDir "intercom") "trac") "msb")
+    Invoke-NpmInstall -Directory (Join-Path (Join-Path (Join-Path $ShareDir "intercom") "trac") "trac-peer")
+    Invoke-NpmInstall -Directory (Join-Path $ShareDir "intercom")
+    Invoke-NpmInstall -Directory (Join-Path $ShareDir "contracts")
+}
+
 function Verify-ExtractedChecksums {
     param([string]$ExtractDir)
 
@@ -457,6 +586,7 @@ function Install-FromArtifact {
     Expand-MayhemArchive -ArchivePath $archive -Destination $extractDir
     $verifiedPackage = Verify-ExtractedChecksums -ExtractDir $extractDir
     Copy-ArtifactBins -PackageRoot $verifiedPackage.Root -VerifiedFiles $verifiedPackage.Files
+    Copy-PackageAssets -PackageRoot $verifiedPackage.Root -VerifiedFiles $verifiedPackage.Files
 }
 
 function Install-FromSource {
@@ -487,6 +617,7 @@ function Install-FromSource {
         }
         Copy-Item -Path $src -Destination (Join-Path $InstallDir "$bin.exe") -Force
     }
+    Copy-SourceAssets
 }
 
 function Ensure-Node {
@@ -640,10 +771,12 @@ function Main {
         Install-FromArtifact
     }
 
+    Hydrate-RuntimeAssets
     Install-Opencode
     Update-UserPath
     Smoke-Test
     Write-Log "installed Mayhem binaries into $InstallDir"
+    Write-Log "installed Mayhem runtime assets into $ShareDir"
 }
 
 try {

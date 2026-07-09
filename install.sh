@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="${MAYHEM_SOURCE_DIR:-$SCRIPT_DIR}"
 INSTALL_DIR="${MAYHEM_INSTALL_DIR:-$HOME/.mayhem/bin}"
+SHARE_DIR="${MAYHEM_SHARE_DIR:-}"
 VERSION="${MAYHEM_VERSION:-latest}"
 ARTIFACT="${MAYHEM_ARTIFACT:-}"
 ARTIFACT_URL="${MAYHEM_ARTIFACT_URL:-}"
@@ -49,6 +50,7 @@ Options:
   --release-base-url <url>  Base URL used with --version when no artifact URL is set
   --version <version>       Version for release artifact lookup (default: latest)
   --install-dir <dir>       Binary install directory (default: ~/.mayhem/bin)
+  --share-dir <dir>         Runtime asset directory (default: sibling share/mayhem)
   --skip-node               Do not require Node/npm before Pear checks
   --skip-pear               Do not install or warm up Pear
   --skip-opencode           Do not install the pinned opencode binary
@@ -407,6 +409,93 @@ verified_package_file() {
   grep -Fx -- "$rel" <<< "$VERIFIED_PACKAGE_FILES" >/dev/null
 }
 
+reset_runtime_asset_dir() {
+  rm -rf \
+    "$SHARE_DIR/RULES.md" \
+    "$SHARE_DIR/catalog" \
+    "$SHARE_DIR/intercom" \
+    "$SHARE_DIR/contracts" \
+    "$SHARE_DIR/crates/mayhem-cli/src"
+  mkdir -p "$SHARE_DIR"
+}
+
+copy_runtime_tree() {
+  local src="$1"
+  local dest="$2"
+  local base parent
+
+  [[ -d "$src" ]] || die "missing runtime asset directory: $src"
+  parent="$(dirname "$src")"
+  base="$(basename "$src")"
+  mkdir -p "$(dirname "$dest")"
+  tar \
+    --exclude "$base/node_modules" \
+    --exclude "$base/.git" \
+    --exclude "$base/tests" \
+    --exclude "$base/trac/*/node_modules" \
+    --exclude "$base/trac/*/.git" \
+    --exclude "$base/trac/*/tests" \
+    --exclude "$base/trac/*/test" \
+    --exclude "$base/trac/*/coverage" \
+    --exclude "$base/trac/*/.cache" \
+    --exclude "$base/trac/*/logs" \
+    --exclude "$base/trac/*/store" \
+    -C "$parent" -cf - "$base" | tar -C "$(dirname "$dest")" -xf -
+}
+
+copy_source_assets() {
+  reset_runtime_asset_dir
+  cp "$SOURCE_DIR/RULES.md" "$SHARE_DIR/RULES.md"
+  cp -R "$SOURCE_DIR/catalog" "$SHARE_DIR/catalog"
+  copy_runtime_tree "$SOURCE_DIR/intercom" "$SHARE_DIR/intercom"
+  copy_runtime_tree "$SOURCE_DIR/contracts" "$SHARE_DIR/contracts"
+  mkdir -p "$SHARE_DIR/crates/mayhem-cli/src"
+  cp "$SOURCE_DIR/crates/mayhem-cli/src/"*.mjs "$SHARE_DIR/crates/mayhem-cli/src/"
+  log "installed Mayhem runtime assets into $SHARE_DIR"
+}
+
+copy_artifact_assets() {
+  local package_root="$1"
+  local rel asset_rel target
+
+  verified_package_file "share/mayhem/RULES.md" || die "SHA256SUMS does not verify share/mayhem/RULES.md"
+  reset_runtime_asset_dir
+  while IFS= read -r rel || [[ -n "$rel" ]]; do
+    case "$rel" in
+      share/mayhem/*)
+        asset_rel="${rel#share/mayhem/}"
+        target="$SHARE_DIR/$asset_rel"
+        mkdir -p "$(dirname "$target")"
+        cp "$package_root/$rel" "$target"
+        ;;
+    esac
+  done <<< "$VERIFIED_PACKAGE_FILES"
+  log "installed Mayhem runtime assets into $SHARE_DIR"
+}
+
+hydrate_npm_package() {
+  local dir="$1"
+  [[ -f "$dir/package.json" ]] || return 0
+  log "installing runtime dependencies in $dir"
+  if [[ -f "$dir/package-lock.json" ]]; then
+    (cd "$dir" && npm ci --omit=dev)
+  else
+    (cd "$dir" && npm install --omit=dev)
+  fi
+}
+
+hydrate_runtime_assets() {
+  if [[ "$SKIP_NODE" == "1" ]]; then
+    log "skipping runtime dependency install because --skip-node was set"
+    return 0
+  fi
+  ensure_node
+  hydrate_npm_package "$SHARE_DIR/intercom/trac/msb"
+  hydrate_npm_package "$SHARE_DIR/intercom/trac/trac-peer"
+  hydrate_npm_package "$SHARE_DIR/intercom"
+  hydrate_npm_package "$SHARE_DIR/contracts"
+}
+
 copy_artifact_bins() {
   local package_root="$1"
   local bin rel src
@@ -437,6 +526,7 @@ install_from_artifact() {
   extract_archive "$archive" "$extract_dir"
   verify_extracted_checksums "$extract_dir"
   copy_artifact_bins "$VERIFIED_PACKAGE_ROOT"
+  copy_artifact_assets "$VERIFIED_PACKAGE_ROOT"
 }
 
 install_from_source() {
@@ -455,6 +545,7 @@ install_from_source() {
     cp "$src" "$INSTALL_DIR/$bin"
     chmod 0755 "$INSTALL_DIR/$bin"
   done
+  copy_source_assets
 }
 
 ensure_node() {
@@ -604,6 +695,11 @@ while [[ $# -gt 0 ]]; do
       INSTALL_DIR="$2"
       shift 2
       ;;
+    --share-dir)
+      [[ $# -ge 2 ]] || die "--share-dir requires a value"
+      SHARE_DIR="$2"
+      shift 2
+      ;;
     --skip-node)
       SKIP_NODE=1
       shift
@@ -649,6 +745,10 @@ if [[ "$FROM_SOURCE" != "1" && -z "$ARTIFACT" && -z "$ARTIFACT_URL" && -z "$RELE
   fi
 fi
 
+if [[ -z "$SHARE_DIR" ]]; then
+  SHARE_DIR="$(dirname "$INSTALL_DIR")/share/mayhem"
+fi
+
 add_path_entry "$INSTALL_DIR"
 ensure_pear
 
@@ -658,8 +758,10 @@ else
   install_from_artifact
 fi
 
+hydrate_runtime_assets
 install_opencode
 update_shell_profile
 smoke_test
 
 log "installed Mayhem binaries into $INSTALL_DIR"
+log "installed Mayhem runtime assets into $SHARE_DIR"

@@ -36,8 +36,9 @@ use crate::{
         DEFAULT_LLM_GENERATION_FLOOR_TOK_S, DEFAULT_SATURATION_CUTOFF,
     },
     verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
-    HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
-    ProviderHeartbeat, ProviderKey, ProviderProbation, ReputationEventKind,
+    HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf,
+    HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat, ProviderKey, ProviderProbation,
+    ReputationEventKind,
 };
 use axum::{
     body::Body,
@@ -279,6 +280,8 @@ pub struct GatewayRouteCandidate {
     pub artifact_sidecar_roots: BTreeMap<String, String>,
     pub manifest_hash: String,
     pub binary_hash: String,
+    #[serde(default)]
+    pub launch_measurements: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kyb: Option<ProviderKybInfo>,
     #[serde(default = "default_reputation_bps")]
@@ -991,6 +994,7 @@ struct HardwareQuoteTrust {
     nvidia_gb10_device_jwks: Option<Value>,
     nvidia_nras_jwks: Option<Value>,
     nvidia_offline_jwks: Option<Value>,
+    verifier_command: Option<HardwareQuoteVerifierCommand>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1378,6 +1382,7 @@ pub struct GatewaySessionAttestation {
     pub trusted_nvidia_gb10_device_jwks: Option<Value>,
     pub trusted_nvidia_nras_jwks: Option<Value>,
     pub trusted_nvidia_offline_jwks: Option<Value>,
+    pub hardware_quote_verifier_command: Option<HardwareQuoteVerifierCommand>,
 }
 
 #[derive(Clone, Debug)]
@@ -1789,6 +1794,16 @@ impl GatewayState {
     pub fn with_nvidia_offline_jwks(mut self, jwks: Value) -> Self {
         let mut trust = (*self.hardware_quote_trust).clone();
         trust.nvidia_offline_jwks = Some(jwks);
+        self.hardware_quote_trust = Arc::new(trust);
+        self
+    }
+
+    pub fn with_hardware_quote_verifier_command(
+        mut self,
+        verifier: HardwareQuoteVerifierCommand,
+    ) -> Self {
+        let mut trust = (*self.hardware_quote_trust).clone();
+        trust.verifier_command = Some(verifier);
         self.hardware_quote_trust = Arc::new(trust);
         self
     }
@@ -7558,6 +7573,8 @@ fn validate_direct_session_accept(
             attestation.trusted_nvidia_gb10_device_jwks.as_ref();
         request.trusted_nvidia_nras_jwks = attestation.trusted_nvidia_nras_jwks.as_ref();
         request.trusted_nvidia_offline_jwks = attestation.trusted_nvidia_offline_jwks.as_ref();
+        request.hardware_quote_verifier_command =
+            attestation.hardware_quote_verifier_command.as_ref();
         verify_tier1_attestation(&request).map_err(|err| {
             fail(format!(
                 "provider accept attestation verification failed: {err}"
@@ -14294,6 +14311,7 @@ impl GatewayState {
                 artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
+                launch_measurements: candidate.launch_measurements.clone(),
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
@@ -14305,6 +14323,7 @@ impl GatewayState {
                 .clone(),
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_max_spend_au(price, request, &prompt_text);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
@@ -14394,6 +14413,7 @@ impl GatewayState {
                 artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
+                launch_measurements: candidate.launch_measurements.clone(),
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
@@ -14405,6 +14425,7 @@ impl GatewayState {
                 .clone(),
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
@@ -14493,6 +14514,7 @@ impl GatewayState {
                 artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
+                launch_measurements: candidate.launch_measurements.clone(),
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
@@ -14504,6 +14526,7 @@ impl GatewayState {
                 .clone(),
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_image_generation_max_spend_au(price, request);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
@@ -14592,6 +14615,7 @@ impl GatewayState {
                 artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
+                launch_measurements: candidate.launch_measurements.clone(),
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
@@ -14603,6 +14627,7 @@ impl GatewayState {
                 .clone(),
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
@@ -14691,6 +14716,7 @@ impl GatewayState {
                 artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
+                launch_measurements: candidate.launch_measurements.clone(),
                 att_tier: candidate.att_tier,
                 caps: candidate.caps.clone(),
             },
@@ -14702,6 +14728,7 @@ impl GatewayState {
                 .clone(),
             trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
             trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
+            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
         });
         let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
         ensure_max_price_allows(max_spend_au, options.max_price_au)?;
@@ -18578,6 +18605,7 @@ mod tests {
             artifact_sidecar_roots: identity.artifact_sidecar_roots.clone(),
             manifest_hash: identity.manifest_hash.clone(),
             binary_hash: identity.binary_hash.clone(),
+            launch_measurements: Value::Null,
             att_tier: 1,
             caps: json!({}),
         };
@@ -18623,6 +18651,7 @@ mod tests {
                 trusted_nvidia_gb10_device_jwks: None,
                 trusted_nvidia_nras_jwks: None,
                 trusted_nvidia_offline_jwks: None,
+                hardware_quote_verifier_command: None,
             }),
             hedge: GatewayHedgeInvocation::default(),
             failover: GatewayFailoverInvocation::default(),
@@ -18892,6 +18921,7 @@ mod tests {
             artifact_sidecar_roots: BTreeMap::new(),
             manifest_hash: format!("{:02x}", idx.wrapping_add(190)).repeat(32),
             binary_hash: format!("{:02x}", idx.wrapping_add(200)).repeat(32),
+            launch_measurements: Value::Null,
             kyb: None,
             reputation_bps: 10_000,
             probation: None,

@@ -2896,6 +2896,7 @@ mod tests {
                 evidence: "jwt.invalid.parts".to_owned(),
                 binding: binding.clone(),
                 endorsements: Vec::new(),
+                metadata: serde_json::Value::Null,
             },
             runtime_config: binding_options.runtime_config,
         })?;

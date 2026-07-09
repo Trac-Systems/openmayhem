@@ -346,6 +346,8 @@ pub struct HardwareQuote {
     pub binding: String,
     #[serde(default)]
     pub endorsements: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1305,6 +1307,7 @@ mod tests {
             evidence: "jwt.invalid.parts".to_owned(),
             binding: base.clone(),
             endorsements: Vec::new(),
+            metadata: serde_json::Value::Null,
         });
         assert_eq!(hardware_quote_binding(&body).unwrap(), base);
         body.nonce_u = "bb".repeat(32);

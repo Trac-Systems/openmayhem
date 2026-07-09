@@ -1586,19 +1586,19 @@ fn probe_tee(gpus: &[GpuInfo]) -> TeeInfo {
     let tier = 1;
     let mut notes = Vec::new();
     if sev_snp {
-        notes.push("AMD SEV/SEV-SNP signal detected; Mayhem launch keeps this at Tier 1 until real vendor quote generation is wired".to_owned());
+        notes.push("AMD SEV/SEV-SNP signal detected; hwprobe is signal-only and does not advertise higher tiers without a configured bound quote command".to_owned());
     }
     if tdx {
-        notes.push("Intel TDX signal detected; Mayhem launch keeps this at Tier 1 until real vendor quote generation is wired".to_owned());
+        notes.push("Intel TDX signal detected; hwprobe is signal-only and does not advertise higher tiers without a configured bound quote command".to_owned());
     }
     if gpu_confidential_compute {
-        notes.push("NVIDIA confidential compute signal detected; Mayhem launch keeps this at Tier 1 until real vendor quote generation is wired".to_owned());
+        notes.push("NVIDIA confidential compute signal detected; hwprobe is signal-only and does not advertise higher tiers without a configured bound quote command".to_owned());
     }
     if apple_device_identity {
-        notes.push("Apple Metal device identity signal detected; not advertised above Tier 1 until real App Attest quote generation is wired".to_owned());
+        notes.push("Apple Metal device identity signal detected; hwprobe is signal-only and does not advertise higher tiers without a configured bound quote command".to_owned());
     }
     if gb10_device_identity {
-        notes.push("NVIDIA GB10 device identity signal detected; not advertised above Tier 1 until real device quote generation is wired".to_owned());
+        notes.push("NVIDIA GB10 device identity signal detected; hwprobe is signal-only and does not advertise higher tiers without a configured bound quote command".to_owned());
     }
     if notes.is_empty() {
         notes.push("hardware TEE not detected; Tier 1 software-rooted attestation".to_owned());
@@ -1786,9 +1786,12 @@ fn fixture_tee(tier: u8) -> TeeInfo {
         tdx: false,
         gpu_confidential_compute: tier >= 2,
         notes: if tier >= 2 {
-            vec!["fixture hardware identity signals; launch advertises Tier 1 until real quote generation is wired".to_owned()]
+            vec!["fixture hardware identity signals; hwprobe remains signal-only without a configured bound quote command".to_owned()]
         } else {
-            vec!["fixture Tier 1 software-rooted attestation; launch advertises Tier 1 until real quote generation is wired".to_owned()]
+            vec![
+                "fixture Tier 1 software-rooted attestation; no hardware quote command configured"
+                    .to_owned(),
+            ]
         },
     }
 }
@@ -1973,7 +1976,7 @@ mod tests {
             .tee
             .notes
             .iter()
-            .any(|note| note.contains("launch advertises Tier 1")));
+            .any(|note| note.contains("hardware quote command")));
     }
 
     #[test]
@@ -1999,7 +2002,7 @@ mod tests {
             .tee
             .notes
             .iter()
-            .any(|note| note.contains("launch advertises Tier 1")));
+            .any(|note| note.contains("hardware quote command")));
     }
 
     #[test]

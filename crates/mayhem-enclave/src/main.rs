@@ -572,6 +572,7 @@ fn attest(args: AttestArgs) -> Result<(), Box<dyn std::error::Error>> {
                 evidence,
                 binding,
                 endorsements: args.hw_quote_endorsement,
+                metadata: serde_json::Value::Null,
             },
             runtime_config,
         })?

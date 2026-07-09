@@ -80,6 +80,53 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+copy_runtime_tree() {
+  local src="$1"
+  local dest="$2"
+  local base parent
+
+  [[ -d "$src" ]] || die "missing runtime asset directory: $src"
+  parent="$(dirname "$src")"
+  base="$(basename "$src")"
+  mkdir -p "$(dirname "$dest")"
+  tar \
+    --exclude "$base/node_modules" \
+    --exclude "$base/.git" \
+    --exclude "$base/tests" \
+    --exclude "$base/trac/*/node_modules" \
+    --exclude "$base/trac/*/.git" \
+    --exclude "$base/trac/*/tests" \
+    --exclude "$base/trac/*/test" \
+    --exclude "$base/trac/*/coverage" \
+    --exclude "$base/trac/*/.cache" \
+    --exclude "$base/trac/*/logs" \
+    --exclude "$base/trac/*/store" \
+    -C "$parent" -cf - "$base" | tar -C "$(dirname "$dest")" -xf -
+}
+
+stage_runtime_assets() {
+  local asset_dir="$1"
+
+  mkdir -p "$asset_dir"
+  cp "$ROOT_DIR/RULES.md" "$asset_dir/RULES.md"
+  cp -R "$ROOT_DIR/catalog" "$asset_dir/catalog"
+  copy_runtime_tree "$ROOT_DIR/intercom" "$asset_dir/intercom"
+  copy_runtime_tree "$ROOT_DIR/contracts" "$asset_dir/contracts"
+  mkdir -p "$asset_dir/crates/mayhem-cli/src"
+  cp "$ROOT_DIR/crates/mayhem-cli/src/"*.mjs "$asset_dir/crates/mayhem-cli/src/"
+}
+
+write_stage_checksums() {
+  local stage_dir="$1"
+  local rel hash
+
+  : > "$stage_dir/SHA256SUMS"
+  while IFS= read -r rel; do
+    hash="$(sha256_file "$stage_dir/$rel")"
+    printf '%s  %s\n' "$hash" "$rel" >> "$stage_dir/SHA256SUMS"
+  done < <(cd "$stage_dir" && find . -type f ! -name SHA256SUMS | sed 's#^\./##' | sort)
+}
+
 host_target() {
   local os arch
   os="$(uname -s)"
@@ -194,6 +241,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 ARCHIVE_BASENAME="mayhem-${VERSION}-${TARGET}"
 STAGE_DIR="$TMP_DIR/$ARCHIVE_BASENAME"
+ASSET_DIR="$STAGE_DIR/share/mayhem"
 mkdir -p "$STAGE_DIR/bin" "$OUT_DIR"
 
 for bin in "${BINS[@]}"; do
@@ -209,12 +257,7 @@ for doc in README.md RULES.md; do
   fi
 done
 
-: > "$STAGE_DIR/SHA256SUMS"
-for bin_file in "$STAGE_DIR"/bin/*; do
-  hash="$(sha256_file "$bin_file")"
-  rel="bin/$(basename "$bin_file")"
-  printf '%s  %s\n' "$hash" "$rel" >> "$STAGE_DIR/SHA256SUMS"
-done
+stage_runtime_assets "$ASSET_DIR"
 
 BUILT_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 MANIFEST="$STAGE_DIR/manifest.json"
@@ -240,6 +283,8 @@ MANIFEST="$STAGE_DIR/manifest.json"
   printf '  ]\n'
   printf '}\n'
 } > "$MANIFEST"
+
+write_stage_checksums "$STAGE_DIR"
 
 if [[ "$TARGET" == *windows* ]]; then
   command -v zip >/dev/null 2>&1 || die "zip is required for Windows archives"
