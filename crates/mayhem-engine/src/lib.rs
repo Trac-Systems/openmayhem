@@ -3517,17 +3517,16 @@ mod vllm_backend {
             command.env(name, path);
         }
 
-        if let Some(cuda_home) = resolve_vllm_cuda_home(python) {
+        let cuda_home = resolve_vllm_cuda_home(python);
+        let mut path_prefixes = Vec::new();
+        if let Some(cuda_home) = &cuda_home {
             let nvcc = cuda_home.join("bin/nvcc");
-            command.env("CUDA_HOME", &cuda_home);
-            command.env("CUDA_PATH", &cuda_home);
+            path_prefixes.push(cuda_home.join("bin"));
+            command.env("CUDA_HOME", cuda_home);
+            command.env("CUDA_PATH", cuda_home);
             if env::var_os("FLASHINFER_NVCC").is_none() {
                 command.env("FLASHINFER_NVCC", &nvcc);
             }
-            command.env(
-                "PATH",
-                prepend_env_path(&cuda_home.join("bin"), env::var_os("PATH")),
-            );
             let cuda_lib = if cuda_home.join("lib").is_dir() {
                 cuda_home.join("lib")
             } else {
@@ -3538,6 +3537,13 @@ mod vllm_backend {
                 prepend_env_path(&cuda_lib, env::var_os("LD_LIBRARY_PATH")),
             );
         }
+        if let Some(python_bin) = python.parent() {
+            path_prefixes.push(python_bin.to_path_buf());
+        }
+        command.env(
+            "PATH",
+            prepend_env_paths(&path_prefixes, env::var_os("PATH")),
+        );
         Ok(())
     }
 
@@ -3609,11 +3615,23 @@ mod vllm_backend {
     }
 
     fn prepend_env_path(path: &Path, current: Option<std::ffi::OsString>) -> std::ffi::OsString {
-        let mut paths = vec![path.to_path_buf()];
+        prepend_env_paths(&[path.to_path_buf()], current)
+    }
+
+    fn prepend_env_paths(
+        prefixes: &[PathBuf],
+        current: Option<std::ffi::OsString>,
+    ) -> std::ffi::OsString {
+        let mut paths = prefixes.to_vec();
         if let Some(current) = current {
             paths.extend(env::split_paths(&current));
         }
-        env::join_paths(paths).unwrap_or_else(|_| path.as_os_str().to_owned())
+        env::join_paths(paths).unwrap_or_else(|_| {
+            prefixes
+                .first()
+                .map(|path| path.as_os_str().to_owned())
+                .unwrap_or_default()
+        })
     }
 
     fn terminate_worker_process(child: &mut Child) {
@@ -3745,6 +3763,19 @@ mod vllm_backend {
             assert_eq!(bundled_cuda_home(&python).as_deref(), Some(cuda.as_path()));
 
             let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_worker_path_contains_cuda_and_python_tools() {
+            let cuda_bin = PathBuf::from("/runtime/cuda/bin");
+            let python_bin = PathBuf::from("/runtime/vllm/bin");
+            let current = env::join_paths([PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                .expect("test PATH");
+            let joined = prepend_env_paths(&[cuda_bin.clone(), python_bin.clone()], Some(current));
+            let paths = env::split_paths(&joined).collect::<Vec<_>>();
+            assert_eq!(paths[0], cuda_bin);
+            assert_eq!(paths[1], python_bin);
+            assert_eq!(paths[2], PathBuf::from("/usr/bin"));
         }
     }
 }
