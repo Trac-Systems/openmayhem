@@ -47,9 +47,15 @@ app_dir="$repo_root/intercom"
 stores_dir="$app_dir/stores"
 log_dir="$stores_dir/dev-net-logs"
 pear_runtime="${MAYHEM_PEAR_RUNTIME:-$HOME/Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime}"
+node_bin="${MAYHEM_NODE_BIN:-$(command -v node || true)}"
 
 if [[ ! -x "$pear_runtime" ]]; then
   echo "pear-runtime not found. Set MAYHEM_PEAR_RUNTIME to the runtime binary." >&2
+  exit 1
+fi
+
+if [[ -z "$node_bin" || ! -x "$node_bin" ]]; then
+  echo "node not found. Set MAYHEM_NODE_BIN to a Node 22/23 binary." >&2
   exit 1
 fi
 
@@ -131,7 +137,7 @@ cleanup_processes() {
 trap cleanup_processes EXIT INT TERM
 
 free_port() {
-  node -e 'const net = require("net"); const s = net.createServer(); s.listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });'
+  "$node_bin" -e 'const net = require("net"); const s = net.createServer(); s.listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); });'
 }
 
 admin_port="$(free_port)"
@@ -245,7 +251,7 @@ wait_log_value() {
 bridge_request() {
   local port="$1"
   local payload="$2"
-  node - "$port" "$token" "$payload" <<'NODE'
+  "$node_bin" - "$port" "$token" "$payload" <<'NODE'
 const [port, token, rawPayload] = process.argv.slice(2);
 const payload = JSON.parse(rawPayload);
 const ws = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -302,7 +308,7 @@ wait_bridge_connections() {
   local stats='{}'
   while (( SECONDS < deadline )); do
     stats="$(bridge_request "$port" '{"type":"stats"}' 2>/dev/null || true)"
-    if node -e 'const stats = JSON.parse(process.argv[1] || "{}"); process.exit((stats.connectionCount || 0) >= Number(process.argv[2]) ? 0 : 1)' "$stats" "$min_connections"; then
+    if "$node_bin" -e 'const stats = JSON.parse(process.argv[1] || "{}"); process.exit((stats.connectionCount || 0) >= Number(process.argv[2]) ? 0 : 1)' "$stats" "$min_connections"; then
       printf '%s\n' "$stats"
       return 0
     fi
@@ -351,7 +357,7 @@ fi
 
 echo "Running simulated Mayhem no-op on admin (--sim 1, no MSB fee)..."
 sim_result="$(bridge_request "$admin_port" '{"type":"cli","command":"/tx --command \"noop\" --sim 1"}')"
-node -e 'const r = JSON.parse(process.argv[1]); if (r.type !== "cli_result" || r.ok !== true || !r.result || r.result.ok !== true || r.result.op !== "noop") { console.error(process.argv[1]); process.exit(1); }' "$sim_result"
+"$node_bin" -e 'const r = JSON.parse(process.argv[1]); if (r.type !== "cli_result" || r.ok !== true || !r.result || r.result.ok !== true || r.result.op !== "noop") { console.error(process.argv[1]); process.exit(1); }' "$sim_result"
 
 cat <<EOF
 Mayhem dev-net ready.

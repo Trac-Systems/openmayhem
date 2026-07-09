@@ -118,13 +118,43 @@ OpenMayhem serves from anything with compute, consumer or datacenter. The engine
 
 No GPU? CPU-only machines still serve. Embeddings, small text models, and speech in/out are realistic on a plain CPU. Linux with an NVIDIA card is the fullest-featured platform, since all three GPU engines run there. A confidential-compute host (an AMD SEV-SNP machine with an H100-class GPU in CC mode, rented or on-prem) is just a Linux provider that can additionally prove Tier 3.
 
-**Dependencies per OS** — the installer handles these, listed here so you know what lands on your machine:
+### What you need installed first
 
-| OS | Needed | Notes |
-|---|---|---|
-| macOS | Xcode Command Line Tools, Rust toolchain, Node.js | `install.sh` checks and prompts; Metal ships with the OS |
-| Linux | `build-essential`/`gcc`, Rust toolchain, Node.js; NVIDIA driver + CUDA 12 for GPU serving | Python 3.10+ only if a vLLM/TensorRT artifact is selected |
-| Windows | Visual Studio Build Tools (MSVC), Rust toolchain, Node.js; NVIDIA driver | `install.ps1`; the engine runs sandboxed (AppContainer) |
+The installer checks for these and tells you what's missing, but it does not install OS packages for you. Set them up before running `install.sh` and the from-source build goes through in one pass. The build compiles native code (llama.cpp via cmake, Rust bindings via bindgen), which is why a C/C++ toolchain and libclang are on the list — `libclang` missing is the single most common build failure.
+
+**Every OS:**
+- Rust (stable, via [rustup](https://rustup.rs)) — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- Node.js 20+ with npm — carries the P2P runtime (Pear bootstrap)
+- git, curl, unzip
+
+**Linux (Debian/Ubuntu):**
+
+```bash
+sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git curl unzip
+```
+
+- GPU serving: an NVIDIA driver new enough for CUDA 12 (550+), and the CUDA toolkit (`nvcc`) so llama.cpp builds its CUDA kernels. Cloud GPU images usually ship both — check with `nvidia-smi` and `nvcc --version`.
+- vLLM or TensorRT-LLM artifacts only: Python 3.10+ with `venv` and `pip` (`sudo apt-get install -y python3 python3-venv python3-pip`). Skip if you serve llama.cpp artifacts only.
+- AMD GPUs: ROCm, or a Vulkan loader for the Vulkan path.
+- Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). Most server boards and all recent desktops have one; enable it in BIOS if `/dev/tpm*` is absent.
+
+**macOS (Apple Silicon):**
+
+```bash
+xcode-select --install        # Xcode Command Line Tools: clang, libclang, git
+brew install cmake node
+```
+
+Metal ships with the OS — nothing GPU-specific to install.
+
+**Windows 11 or newer:**
+
+- Visual Studio Build Tools with the "Desktop development with C++" workload (MSVC + Windows SDK)
+- LLVM for libclang: `winget install LLVM.LLVM` (set `LIBCLANG_PATH` to `C:\Program Files\LLVM\bin` if the build doesn't find it)
+- CMake: `winget install Kitware.CMake`
+- Rust via rustup (MSVC toolchain, the default), Node.js 20+: `winget install OpenJS.NodeJS.LTS`
+- Current NVIDIA driver for GPU serving
+- Run `install.ps1` from PowerShell; the engine runs sandboxed (AppContainer). TPM 2.0 is mandatory on Windows 11, so Tier 2 works out of the box.
 
 Before any download, the model list shows what actually fits on this machine: which models run, roughly how fast, at what context size, and how big the download is. Capacity math uses your GPU's dedicated memory (on Apple Silicon and GB10-class machines, the whole unified pool minus an OS reserve), and a model that only partially fits gets a CPU/GPU split computed for your card.
 
@@ -386,16 +416,12 @@ Context is part of the deal too. Providers advertise the context window they ser
 
 Attestation tiers describe what trust evidence a provider has. They don't all mean the same thing, and a higher number isn't simply "everything below it plus more."
 
-| Tier | Plain meaning | Can the provider read my prompt? |
+| Tier | Plain meaning | Could my prompts potentially be used for training? |
 |------|---------------|----------------------------------|
 | Tier 1 | Runs the OpenMayhem software. Trust is mostly economic: if they cheat, probes, receipts, holdbacks, and slashing cost them money. | Yes. |
-| Tier 2 | Proven genuine, unique Apple or NVIDIA hardware that attested the real app. Stops fake hardware and makes bans stick to the device — the served model is verified the same way as Tier 1, by network spot checks. | Yes. |
+| Tier 2 | A proven, unique physical machine, anchored in its TPM security chip — Windows 11 or newer (TPM is mandatory there) and Linux machines with a TPM, which covers most PCs and GPU servers. Stops fake hardware; the served model is verified the same way as Tier 1, by network spot checks. Apple machines join when macOS 27 ships its attestation support. | Yes. |
 | Tier 3 | Hardware confidential compute — an AMD SEV-SNP confidential VM with an NVIDIA GPU in CC mode. Your prompt is protected even from the provider's own machine, and the served model is the pinned model by construction, not by spot check. | No. |
-| Tier 4 | A real, identity-verified business (KYB). You know who they are. | Yes — Tier 4 is identity, not prompt privacy. |
-
-The short version: **only Tier 3 means the provider cannot read your prompt.** Same model, higher tier, higher price; each tier is its own market and the gap prices itself. A `--min-att-tier` request is a hard filter and is never silently downgraded.
-
-The network also spot-checks providers continuously with canary probes. Model identity, output quality, and advertised context get verified against what's actually served, and the results feed reputation, routing, and slashing.
+| Tier 4 | A real, identity-verified business (KYB). You know who they are — and KYB is not just a passport check: the process asks what they run, whether they can read your data at all, and what they do with it. We publish which KYB'd entity is behind which offering, so their answers are on the record under their legal name. | Depends — on what that business runs and declared. Their published KYB profile says. |
 
 ## Available Launch Models
 
@@ -416,8 +442,6 @@ This is the launch sellable surface. Dev catalog entries may exist for smoke wor
 | `openai/whisper-tiny-en@ggml` | Speech to text | `/v1/audio/transcriptions` | `ggml-tiny-en` / whisper.cpp | I3-E9 real STT path | Tier 1 launch |
 | `rhasspy/piper-en-us-lessac-low@onnx` | Text to speech | `/v1/audio/speech` | `onnx-lessac-low` / piper | I3-E9 real TTS path | Tier 1 launch |
 <!-- MAYHEM-LAUNCH-SURFACE:END -->
-
-Launch proves every code path with small models across every modality and engine; the same paths scale to larger models as the network grows. Higher trust tiers go on sale as their attestation is proven on real hardware, and Tier 3's already is: the full confidential-compute proof chain (SEV-SNP platform attestation to AMD's roots, GPU CC attestation to NVIDIA's) has run verified on a real H100 confidential VM. Tier-3 enclaves list as confidential-compute providers join. Tool support is route-specific: llama.cpp and vLLM routes serve tool/JSON paths where listed, while MLX and TensorRT-LLM routes de-advertise tools until their real constrained-decoding paths exist.
 
 **Routes:**
 

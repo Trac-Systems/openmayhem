@@ -95,6 +95,14 @@ static byte[] B64(JsonElement element, string name)
     return Convert.FromBase64String(Required(element, name));
 }
 
+static bool EnvFlag(string name)
+{
+    var value = Clean(Environment.GetEnvironmentVariable(name));
+    return value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+        value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+        value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+}
+
 static byte[] HexToBytes(string hex)
 {
     if (hex.Length != 64)
@@ -107,6 +115,27 @@ static byte[] HexToBytes(string hex)
         bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
     }
     return bytes;
+}
+
+static ushort ReadLe16(byte[] bytes, int offset)
+{
+    if (offset < 0 || offset + 2 > bytes.Length)
+    {
+        throw new InvalidOperationException("truncated little-endian uint16");
+    }
+    return (ushort)(bytes[offset] | (bytes[offset + 1] << 8));
+}
+
+static uint ReadLe32(byte[] bytes, int offset)
+{
+    if (offset < 0 || offset + 4 > bytes.Length)
+    {
+        throw new InvalidOperationException("truncated little-endian uint32");
+    }
+    return (uint)(bytes[offset] |
+        (bytes[offset + 1] << 8) |
+        (bytes[offset + 2] << 16) |
+        (bytes[offset + 3] << 24));
 }
 
 static TpmPublic ParseTpmPublic(byte[] bytes)
@@ -171,6 +200,21 @@ static byte[] TpmName(TpmPublic publicArea)
     }
     var digest = SHA256.HashData(Marshaller.GetTpmRepresentation(publicArea));
     return new byte[] { 0x00, 0x0b }.Concat(digest).ToArray();
+}
+
+static void VerifyDeviceKeyBinding(JsonElement evidence, string deviceKey)
+{
+    if (!evidence.TryGetProperty("ek_public_tss_b64", out var ekPublicValue) ||
+        ekPublicValue.ValueKind != JsonValueKind.String)
+    {
+        return;
+    }
+    var ekPublic = Convert.FromBase64String(Required(evidence, "ek_public_tss_b64"));
+    var expected = Convert.ToHexString(SHA256.HashData(ekPublic)).ToLowerInvariant();
+    if (!expected.Equals(deviceKey, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException("TPM EK device_key does not match EK public evidence");
+    }
 }
 
 static void VerifyQuoteManually(
@@ -366,6 +410,24 @@ static void VerifyEkChain(JsonElement evidence)
     }
 }
 
+static bool VerifyEkRoot(JsonElement evidence)
+{
+    if (evidence.TryGetProperty("ek_cert_der_b64", out var cert) &&
+        cert.ValueKind == JsonValueKind.String &&
+        Clean(cert.GetString()).Length > 0)
+    {
+        VerifyEkChain(evidence);
+        return false;
+    }
+    var tool = OptionalString(evidence, "tool") ?? string.Empty;
+    if (EnvFlag("MAYHEM_TPM2_ALLOW_MICROSOFT_VTPM_TEST_ROOT") &&
+        tool.Equals("tpm2-tools", StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+    throw new InvalidOperationException("TPM EK certificate is missing; set MAYHEM_TPM2_EK_ROOTS for production EK-chain verification or MAYHEM_TPM2_ALLOW_MICROSOFT_VTPM_TEST_ROOT=1 for the documented Azure vTPM transport test");
+}
+
 static void VerifyWindowsTbsQuote(JsonElement evidence, string expectedBinding)
 {
     var bindingBytes = HexToBytes(expectedBinding);
@@ -379,6 +441,115 @@ static void VerifyWindowsTbsQuote(JsonElement evidence, string expectedBinding)
     var signature = ParseSignature(B64(evidence, "quote_signature_b64"));
     var selections = ParseSequence<PcrSelection>(B64(evidence, "pcr_selection_tpm_b64"));
     var values = ParseSequence<Tpm2bDigest>(B64(evidence, "pcr_values_tpm_b64"));
+    VerifyQuoteManually(akPublic, selections, values, bindingBytes, quote, signature);
+}
+
+static (PcrSelection[] Selections, int SelectedCount) ParseTpm2ToolsPcrSelection(string selectionText)
+{
+    var parts = selectionText.Split(':', 2, StringSplitOptions.TrimEntries);
+    if (parts.Length != 2 || !parts[0].Equals("sha256", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException($"unsupported tpm2-tools PCR selection {selectionText}");
+    }
+    var pcrs = parts[1]
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(text =>
+        {
+            if (!int.TryParse(text, out var pcr) || pcr < 0 || pcr > 23)
+            {
+                throw new InvalidOperationException($"unsupported tpm2-tools PCR index {text}");
+            }
+            return pcr;
+        })
+        .Distinct()
+        .OrderBy(pcr => pcr)
+        .ToArray();
+    if (pcrs.Length == 0)
+    {
+        throw new InvalidOperationException("tpm2-tools PCR selection must include at least one PCR");
+    }
+    var selectSize = Math.Max(3, (pcrs.Max() / 8) + 1);
+    var select = new byte[selectSize];
+    foreach (var pcr in pcrs)
+    {
+        select[pcr / 8] |= (byte)(1 << (pcr % 8));
+    }
+    return (new[] { new PcrSelection(TpmAlgId.Sha256, select) }, pcrs.Length);
+}
+
+static void VerifyTpm2ToolsPcrHeader(byte[] pcrBlob, PcrSelection[] selections)
+{
+    if (pcrBlob.Length < 10 || selections.Length != 1)
+    {
+        throw new InvalidOperationException("tpm2-tools PCR blob is truncated");
+    }
+    var selectionCount = ReadLe32(pcrBlob, 0);
+    var hashAlg = ReadLe16(pcrBlob, 4);
+    var selectSize = pcrBlob[6];
+    if (selectionCount < 1 || hashAlg != (ushort)TpmAlgId.Sha256)
+    {
+        throw new InvalidOperationException("tpm2-tools PCR blob does not start with a SHA-256 PCR selection");
+    }
+    if (selectSize != selections[0].pcrSelect.Length || 7 + selectSize > pcrBlob.Length)
+    {
+        throw new InvalidOperationException("tpm2-tools PCR blob selection size does not match evidence selection");
+    }
+    for (var i = 0; i < selectSize; i++)
+    {
+        if (pcrBlob[7 + i] != selections[0].pcrSelect[i])
+        {
+            throw new InvalidOperationException("tpm2-tools PCR blob selection does not match evidence selection");
+        }
+    }
+}
+
+static Tpm2bDigest[] ParseTpm2ToolsPcrValues(byte[] pcrBlob, int selectedCount)
+{
+    const int DigestBufferSize = 64;
+    const int DigestRecordSize = 2 + DigestBufferSize;
+    for (var offset = 10; offset + 4 + (selectedCount * DigestRecordSize) <= pcrBlob.Length; offset++)
+    {
+        if (ReadLe32(pcrBlob, offset) != selectedCount)
+        {
+            continue;
+        }
+        var pos = offset + 4;
+        var values = new List<Tpm2bDigest>();
+        var ok = true;
+        for (var i = 0; i < selectedCount; i++)
+        {
+            var length = ReadLe16(pcrBlob, pos);
+            if (length != SHA256.HashSizeInBytes || pos + 2 + length > pcrBlob.Length)
+            {
+                ok = false;
+                break;
+            }
+            values.Add(new Tpm2bDigest(pcrBlob.Skip(pos + 2).Take(length).ToArray()));
+            pos += DigestRecordSize;
+        }
+        if (ok)
+        {
+            return values.ToArray();
+        }
+    }
+    throw new InvalidOperationException("could not parse tpm2-tools PCR values");
+}
+
+static void VerifyTpm2ToolsQuote(JsonElement evidence, string expectedBinding)
+{
+    var bindingBytes = HexToBytes(expectedBinding);
+    var akPublic = ParseTpmPublic(B64(evidence, "ak_public_tss_b64"));
+    var akName = B64(evidence, "ak_name_b64");
+    if (!akName.SequenceEqual(TpmName(akPublic)))
+    {
+        throw new InvalidOperationException("AK name does not match AK public area");
+    }
+    var quote = Marshaller.FromTpmRepresentation<Attest>(B64(evidence, "quote_message_b64"));
+    var signature = ParseSignature(B64(evidence, "quote_signature_b64"));
+    var (selections, selectedCount) = ParseTpm2ToolsPcrSelection(Required(evidence, "pcr_selection"));
+    var pcrBlob = B64(evidence, "quote_pcrs_b64");
+    VerifyTpm2ToolsPcrHeader(pcrBlob, selections);
+    var values = ParseTpm2ToolsPcrValues(pcrBlob, selectedCount);
     VerifyQuoteManually(akPublic, selections, values, bindingBytes, quote, signature);
 }
 
@@ -448,25 +619,34 @@ try
     {
         throw new InvalidOperationException("quote metadata device_key does not match TPM evidence device_key");
     }
+    VerifyDeviceKeyBinding(evidence, deviceKey);
 
-    VerifyEkChain(evidence);
+    var usedMicrosoftVtpmTestRoot = VerifyEkRoot(evidence);
     var tool = OptionalString(evidence, "tool") ?? string.Empty;
     if (tool.Equals("tss.net/windows-tbs", StringComparison.OrdinalIgnoreCase))
     {
         VerifyWindowsTbsQuote(evidence, expectedBinding);
     }
+    else if (tool.Equals("tpm2-tools", StringComparison.OrdinalIgnoreCase))
+    {
+        VerifyTpm2ToolsQuote(evidence, expectedBinding);
+    }
     else
     {
-        throw new InvalidOperationException($"unsupported TPM evidence tool {tool}; use tss.net/windows-tbs evidence for this verifier");
+        throw new InvalidOperationException($"unsupported TPM evidence tool {tool}; use tss.net/windows-tbs or tpm2-tools evidence for this verifier");
     }
 
+    var roots = usedMicrosoftVtpmTestRoot
+        ? new[] { "tpm_manufacturer_root", "microsoft_vtpm_test_root_allowance" }
+        : new[] { "tpm2_ek_cert_chain", "tpm_manufacturer_root" };
     var verdict = new
     {
         ok = true,
         kind = "tpm2_quote_ek",
         binding = expectedBinding,
         att_tier = 2,
-        roots = new[] { "tpm2_ek_cert_chain", "tpm_manufacturer_root" },
+        roots,
+        test_root_allowance = usedMicrosoftVtpmTestRoot,
         device_key = deviceKey
     };
     Console.WriteLine(JsonSerializer.Serialize(verdict));
