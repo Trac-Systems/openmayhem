@@ -3164,6 +3164,8 @@ mod vllm_backend {
     const REQUEST_TIMEOUT_ENV: &str = "MAYHEM_VLLM_REQUEST_TIMEOUT_SECS";
     const CACHE_DIR_ENV: &str = "MAYHEM_VLLM_CACHE_DIR";
     const CUDA_HOME_ENV: &str = "MAYHEM_VLLM_CUDA_HOME";
+    const BUILD_JOBS_ENV: &str = "MAYHEM_VLLM_BUILD_JOBS";
+    const DEFAULT_BUILD_JOBS: usize = 2;
     const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
     pub struct VllmBackend {
@@ -3520,6 +3522,7 @@ mod vllm_backend {
             })?;
             command.env(name, path);
         }
+        command.env("MAX_JOBS", vllm_build_jobs().to_string());
 
         let cuda_home = resolve_vllm_cuda_home(python);
         let mut path_prefixes = Vec::new();
@@ -3565,6 +3568,21 @@ mod vllm_backend {
                     .map(|home| home.join(".mayhem/cache/vllm"))
             })
             .unwrap_or_else(|| env::temp_dir().join("mayhem-vllm-cache"))
+    }
+
+    fn vllm_build_jobs() -> usize {
+        [BUILD_JOBS_ENV, "MAX_JOBS"]
+            .into_iter()
+            .find_map(|name| {
+                env::var(name)
+                    .ok()
+                    .and_then(|value| parse_build_jobs(&value))
+            })
+            .unwrap_or(DEFAULT_BUILD_JOBS)
+    }
+
+    fn parse_build_jobs(value: &str) -> Option<usize> {
+        value.parse::<usize>().ok().filter(|jobs| *jobs > 0)
     }
 
     fn resolve_vllm_cuda_home(python: &Path) -> Option<PathBuf> {
@@ -3780,6 +3798,13 @@ mod vllm_backend {
             assert_eq!(paths[0], cuda_bin);
             assert_eq!(paths[1], python_bin);
             assert_eq!(paths[2], PathBuf::from("/usr/bin"));
+        }
+
+        #[test]
+        fn vllm_build_jobs_requires_a_positive_integer() {
+            assert_eq!(parse_build_jobs("3"), Some(3));
+            assert_eq!(parse_build_jobs("0"), None);
+            assert_eq!(parse_build_jobs("many"), None);
         }
     }
 }
