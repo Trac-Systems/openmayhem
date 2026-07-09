@@ -3151,6 +3151,7 @@ mod vllm_backend {
     use serde_json::{json, Value};
     use std::cell::{Cell, RefCell};
     use std::env;
+    use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -3161,6 +3162,8 @@ mod vllm_backend {
     const WORKER: &str = include_str!("vllm_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_VLLM_PYTHON";
     const REQUEST_TIMEOUT_ENV: &str = "MAYHEM_VLLM_REQUEST_TIMEOUT_SECS";
+    const CACHE_DIR_ENV: &str = "MAYHEM_VLLM_CACHE_DIR";
+    const CUDA_HOME_ENV: &str = "MAYHEM_VLLM_CUDA_HOME";
     const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
     pub struct VllmBackend {
@@ -3361,6 +3364,7 @@ mod vllm_backend {
             memory_limit_bytes: Option<u64>,
         ) -> Result<Self> {
             let mut command = engine_worker_command(python, memory_limit_bytes);
+            configure_vllm_worker_environment(&mut command, python)?;
             command
                 .arg("-u")
                 .arg("-c")
@@ -3484,6 +3488,134 @@ mod vllm_backend {
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
     }
 
+    fn configure_vllm_worker_environment(
+        command: &mut std::process::Command,
+        python: &Path,
+    ) -> Result<()> {
+        let cache_root = vllm_cache_root();
+        let cache_dirs = [
+            ("XDG_CACHE_HOME", cache_root.join("xdg")),
+            ("TRITON_CACHE_DIR", cache_root.join("triton")),
+            ("VLLM_CACHE_ROOT", cache_root.join("vllm")),
+            ("TORCHINDUCTOR_CACHE_DIR", cache_root.join("torchinductor")),
+            ("CUDA_CACHE_PATH", cache_root.join("cuda")),
+            ("FLASHINFER_CACHE_DIR", cache_root.join("flashinfer")),
+            ("FLASHINFER_JIT_DIR", cache_root.join("flashinfer/jit")),
+            (
+                "FLASHINFER_WORKSPACE_DIR",
+                cache_root.join("flashinfer/workspace"),
+            ),
+        ];
+        for (name, default_path) in cache_dirs {
+            let path = env::var_os(name).map(PathBuf::from).unwrap_or(default_path);
+            fs::create_dir_all(&path).map_err(|err| {
+                EngineError::Vllm(format!(
+                    "creating vLLM cache directory {} failed: {err}",
+                    path.display()
+                ))
+            })?;
+            command.env(name, path);
+        }
+
+        if let Some(cuda_home) = resolve_vllm_cuda_home(python) {
+            let nvcc = cuda_home.join("bin/nvcc");
+            command.env("CUDA_HOME", &cuda_home);
+            command.env("CUDA_PATH", &cuda_home);
+            if env::var_os("FLASHINFER_NVCC").is_none() {
+                command.env("FLASHINFER_NVCC", &nvcc);
+            }
+            command.env(
+                "PATH",
+                prepend_env_path(&cuda_home.join("bin"), env::var_os("PATH")),
+            );
+            let cuda_lib = if cuda_home.join("lib").is_dir() {
+                cuda_home.join("lib")
+            } else {
+                cuda_home.join("lib64")
+            };
+            command.env(
+                "LD_LIBRARY_PATH",
+                prepend_env_path(&cuda_lib, env::var_os("LD_LIBRARY_PATH")),
+            );
+        }
+        Ok(())
+    }
+
+    fn vllm_cache_root() -> PathBuf {
+        env::var_os(CACHE_DIR_ENV)
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("MAYHEM_HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("cache/vllm"))
+            })
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".mayhem/cache/vllm"))
+            })
+            .unwrap_or_else(|| env::temp_dir().join("mayhem-vllm-cache"))
+    }
+
+    fn resolve_vllm_cuda_home(python: &Path) -> Option<PathBuf> {
+        if let Some(explicit) = env::var_os(CUDA_HOME_ENV).map(PathBuf::from) {
+            return cuda_home_with_nvcc(explicit);
+        }
+        bundled_cuda_home(python)
+            .or_else(|| {
+                env::var_os("CUDA_HOME")
+                    .map(PathBuf::from)
+                    .and_then(cuda_home_with_nvcc)
+            })
+            .or_else(|| cuda_home_with_nvcc(PathBuf::from("/usr/local/cuda")))
+            .or_else(newest_usr_local_cuda_home)
+    }
+
+    fn bundled_cuda_home(python: &Path) -> Option<PathBuf> {
+        let venv = python.parent()?.parent()?;
+        let lib = venv.join("lib");
+        let mut candidates = fs::read_dir(lib)
+            .ok()?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path().join("site-packages/nvidia"))
+            .filter_map(|nvidia| fs::read_dir(nvidia).ok())
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter_map(cuda_home_with_nvcc)
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.pop()
+    }
+
+    fn newest_usr_local_cuda_home() -> Option<PathBuf> {
+        let mut candidates = fs::read_dir("/usr/local")
+            .ok()?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("cuda-"))
+            })
+            .filter_map(cuda_home_with_nvcc)
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.pop()
+    }
+
+    fn cuda_home_with_nvcc(path: PathBuf) -> Option<PathBuf> {
+        path.join("bin/nvcc").is_file().then_some(path)
+    }
+
+    fn prepend_env_path(path: &Path, current: Option<std::ffi::OsString>) -> std::ffi::OsString {
+        let mut paths = vec![path.to_path_buf()];
+        if let Some(current) = current {
+            paths.extend(env::split_paths(&current));
+        }
+        env::join_paths(paths).unwrap_or_else(|_| path.as_os_str().to_owned())
+    }
+
     fn terminate_worker_process(child: &mut Child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -3531,7 +3663,7 @@ mod vllm_backend {
             "path": model_path,
             "ctx_size": config.ctx_size,
             "max_batch_size": config.batch_size.max(1),
-            "max_num_tokens": config.ubatch_size.max(config.ctx_size).max(1),
+            "max_num_tokens": config.ubatch_size.max(1),
             "tensor_parallel": config.vllm_tensor_parallel.unwrap_or(1),
             "dtype": config.vllm_dtype,
         });
@@ -3588,10 +3720,31 @@ mod vllm_backend {
             let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
             assert_eq!(payload["ctx_size"], json!(1024));
             assert_eq!(payload["max_batch_size"], json!(4));
-            assert_eq!(payload["max_num_tokens"], json!(1024));
+            assert_eq!(payload["max_num_tokens"], json!(512));
             assert_eq!(payload["tensor_parallel"], json!(2));
             assert_eq!(payload["dtype"], json!("float16"));
             assert_eq!(payload["gpu_memory_utilization"], json!(0.45));
+
+            config.ctx_size = 131_072;
+            let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
+            assert_eq!(payload["ctx_size"], json!(131_072));
+            assert_eq!(payload["max_num_tokens"], json!(512));
+        }
+
+        #[test]
+        fn bundled_cuda_home_follows_the_vllm_python_environment() {
+            let root =
+                env::temp_dir().join(format!("mayhem-vllm-cuda-home-{}", std::process::id()));
+            let python = root.join("bin/python");
+            let cuda = root.join("lib/python3.12/site-packages/nvidia/cu13");
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::create_dir_all(cuda.join("bin")).unwrap();
+            fs::write(&python, b"").unwrap();
+            fs::write(cuda.join("bin/nvcc"), b"").unwrap();
+
+            assert_eq!(bundled_cuda_home(&python).as_deref(), Some(cuda.as_path()));
+
+            let _ = fs::remove_dir_all(root);
         }
     }
 }

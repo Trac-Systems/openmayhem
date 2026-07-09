@@ -12932,7 +12932,11 @@ fn catalog_calibration_backend(
         config.batch_size = max_batch_size.max(1);
     }
     if let Some(max_num_tokens) = args.trt_max_num_tokens {
-        config.ubatch_size = max_num_tokens.max(config.ctx_size).max(1);
+        config.ubatch_size = if artifact.engine == "vllm" {
+            max_num_tokens.max(1)
+        } else {
+            max_num_tokens.max(config.ctx_size).max(1)
+        };
     }
     if let Some(sha256) = &artifact.source_sha256 {
         config.artifact = config.artifact.with_sha256(sha256.clone());
@@ -39751,7 +39755,7 @@ fn provider_engine_load_config(
             config.batch_size = max_batch_size;
         }
         if let Some(max_num_tokens) = enclave_max_num_tokens(&selected.enclave.caps)? {
-            config.ubatch_size = max_num_tokens.max(config.ctx_size);
+            config.ubatch_size = max_num_tokens.max(1);
         }
         config.vllm_dtype = selected
             .enclave
@@ -39776,14 +39780,6 @@ const VLLM_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("vllm_tokenizer_config", "tokenizer_config.json"),
 ];
 
-const VLLM_OPTIONAL_SIDECARS: &[(&str, &str)] = &[
-    ("vllm_generation_config", "generation_config.json"),
-    ("vllm_special_tokens_map", "special_tokens_map.json"),
-    ("vllm_tokenizer_model", "tokenizer.model"),
-    ("vllm_merges", "merges.txt"),
-    ("vllm_vocab", "vocab.json"),
-];
-
 fn materialize_vllm_artifacts(
     selected: &ProviderCandidate,
     artifact_paths: &ProviderArtifactPaths,
@@ -39798,60 +39794,46 @@ fn materialize_vllm_artifacts(
     })?;
     let payload_name = catalog_path_file_name(&selected.artifact.path, "vLLM primary artifact")?;
     link_or_copy_file(&artifact_paths.primary, &checkpoint_dir.join(payload_name))?;
-    for (sidecar, filename) in VLLM_REQUIRED_SIDECARS {
-        materialize_vllm_sidecar(
-            selected,
-            artifact_paths,
-            sidecar,
-            &checkpoint_dir,
-            filename,
-            true,
-        )?;
-    }
-    for (sidecar, filename) in VLLM_OPTIONAL_SIDECARS {
-        materialize_vllm_sidecar(
-            selected,
-            artifact_paths,
-            sidecar,
-            &checkpoint_dir,
-            filename,
-            false,
-        )?;
-    }
-    Ok(checkpoint_dir)
-}
-
-fn materialize_vllm_sidecar(
-    selected: &ProviderCandidate,
-    artifact_paths: &ProviderArtifactPaths,
-    sidecar: &str,
-    target_dir: &Path,
-    filename: &str,
-    required: bool,
-) -> Result<()> {
-    let destination = target_dir.join(filename);
-    if destination.is_file() {
-        return Ok(());
-    }
-    let Some(source) = artifact_paths.sidecars.get(sidecar) else {
-        if required {
+    for (sidecar_name, filename) in VLLM_REQUIRED_SIDECARS {
+        let sidecar = selected
+            .artifact
+            .sidecars
+            .get(*sidecar_name)
+            .with_context(|| {
+                format!(
+                    "vLLM artifact {}/{} requires admin catalog sidecar {}",
+                    selected.model.model_id, selected.artifact_name, sidecar_name
+                )
+            })?;
+        if sidecar.path != *filename {
             bail!(
-                "vLLM artifact {}/{} requires admin catalog sidecar {} -> {}",
+                "vLLM artifact {}/{} sidecar {} must use path {}, got {}",
                 selected.model.model_id,
                 selected.artifact_name,
-                sidecar,
-                filename
+                sidecar_name,
+                filename,
+                sidecar.path
             );
         }
-        return Ok(());
-    };
-    link_or_copy_file(source, &destination).with_context(|| {
-        format!(
-            "materializing vLLM sidecar {} at {}",
-            sidecar,
-            destination.display()
-        )
-    })
+    }
+    for (sidecar_name, sidecar) in &selected.artifact.sidecars {
+        let source = artifact_paths.sidecars.get(sidecar_name).with_context(|| {
+            format!(
+                "downloaded vLLM artifact {}/{} is missing admin sidecar {}",
+                selected.model.model_id, selected.artifact_name, sidecar_name
+            )
+        })?;
+        let relative = validate_catalog_artifact_relative_path(&sidecar.path)?;
+        let destination = checkpoint_dir.join(relative);
+        link_or_copy_file(source, &destination).with_context(|| {
+            format!(
+                "materializing vLLM sidecar {} at {}",
+                sidecar_name,
+                destination.display()
+            )
+        })?;
+    }
+    Ok(checkpoint_dir)
 }
 
 fn materialize_trt_llm_artifacts(
@@ -40018,8 +40000,13 @@ fn provider_attestation_runtime_config(
     } else {
         1
     };
-    let max_num_tokens =
-        enclave_max_num_tokens(&selected.enclave.caps)?.map(|tokens| tokens.max(ctx));
+    let max_num_tokens = enclave_max_num_tokens(&selected.enclave.caps)?.map(|tokens| {
+        if selected.artifact.engine == "trt-llm" {
+            tokens.max(ctx)
+        } else {
+            tokens.max(1)
+        }
+    });
     Ok(AttestationRuntimeConfig {
         model_class: selected.enclave.model_class.clone(),
         backend: selected.artifact.engine.clone(),
@@ -50305,18 +50292,22 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         vllm_artifact.min_compute_cap = Some("8.0".to_owned());
         vllm_artifact.notes = Some("admin-pinned vLLM safetensors checkpoint".to_owned());
         catalog.models[0].requirements.backends = vec!["vllm".to_owned()];
+        catalog.models[0].caps.ctx_max = 131_072;
 
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "vllm".to_owned();
         contract.enclaves[0].artifact_source.path = "model.safetensors".to_owned();
         contract.enclaves[0].quant = "bf16".to_owned();
+        let ctx_bracket = ctx_bracket_for_tokens(131_072).to_owned();
+        contract.prices[0].ctx_bracket = Some(ctx_bracket.clone());
+        contract.prices[0].current.as_mut().unwrap().ctx_bracket = Some(ctx_bracket);
         contract.enclaves[0].caps = json!({
             "tools": true,
             "json": true,
-            "ctx": 8192,
+            "ctx": 131072,
             "tp_degree": 2,
             "max_batch_size": 3,
-            "max_num_tokens": 16384,
+            "max_num_tokens": 4096,
             "vllm_dtype": "float16",
             "vllm_gpu_memory_utilization_pct": 45
         });
@@ -50325,6 +50316,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ("vllm_tokenizer_json", "tokenizer.json"),
             ("vllm_tokenizer_config", "tokenizer_config.json"),
             ("vllm_generation_config", "generation_config.json"),
+            ("vllm_chat_template", "chat_template.jinja"),
         ] {
             vllm_artifact.sidecars.insert(
                 name.to_owned(),
@@ -50364,7 +50356,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .insert("vllm-fp16".to_owned(), vllm_artifact);
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
         let mut args = test_provider_start_args();
-        args.ctx = Some(8192);
+        args.ctx = Some(131_072);
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
@@ -50384,6 +50376,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             (
                 "vllm_generation_config".to_owned(),
                 temp.join("generation_config.json"),
+            ),
+            (
+                "vllm_chat_template".to_owned(),
+                temp.join("chat_template.jinja"),
             ),
         ]);
         for path in sidecar_paths.values() {
@@ -50411,9 +50407,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .path
             .join("generation_config.json")
             .is_file());
+        assert!(config.artifact.path.join("chat_template.jinja").is_file());
+        assert_eq!(config.ctx_size, 131_072);
         assert_eq!(config.vllm_tensor_parallel, Some(2));
         assert_eq!(config.batch_size, 3);
-        assert_eq!(config.ubatch_size, 16384);
+        assert_eq!(config.ubatch_size, 4096);
         assert_eq!(config.vllm_dtype.as_deref(), Some("float16"));
         assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(45));
         assert_eq!(
@@ -50421,10 +50419,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             AttestationRuntimeConfig {
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 backend: "vllm".to_owned(),
-                ctx: 8192,
+                ctx: 131_072,
                 tp_degree: 2,
                 max_batch_size: Some(3),
-                max_num_tokens: Some(16384),
+                max_num_tokens: Some(4096),
             }
         );
         let _ = fs::remove_dir_all(temp);
