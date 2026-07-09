@@ -8,6 +8,7 @@ import { deployPool } from '../scripts/deploy-local.mjs';
 import {
   buildAdminCommand,
   buildAdminCommandArgs,
+  mergeDeposits,
   scanTapDeposits,
   TAP_DEPOSIT_EVENT_SIGNATURE,
   TAP_DEPOSIT_WATCHER_ID,
@@ -125,6 +126,37 @@ test('tap deposit watcher helpers compute policy au and verify replay-safe state
     balance: { user: deposit.who, rail: 'tap', denom: 'au_usd', au: '2000000000000000000' },
     depositRoot: { type: 'deposit_root', epoch: 9, count: 1, au_total: '2000000000000000000' },
   }), false);
+});
+
+test('tap deposit watcher keeps every unsubmitted deposit past the old 1000 backlog', () => {
+  const mkDeposit = (idx, overrides = {}) => ({
+    who: '0x1111111111111111111111111111111111111111',
+    tap_wei: U(1).toString(),
+    eth_tx_hash: `0x${idx.toString(16).padStart(64, '0')}`,
+    log_index: idx % 3,
+    block_number: idx,
+    block_hash: `0x${(idx + 1).toString(16).padStart(64, '0')}`,
+    pool_address: '0x2222222222222222222222222222222222222222',
+    chain_id: CHAIN_ID,
+    finalized_block_number: idx + 12,
+    confirmation_depth: 12,
+    confirmation_policy: 'depth-12',
+    event_signature: TAP_DEPOSIT_EVENT_SIGNATURE,
+    watcher_id: TAP_DEPOSIT_WATCHER_ID,
+    ...overrides,
+  });
+  const backlog = Array.from({ length: 1_205 }, (_, idx) => mkDeposit(idx + 1));
+  const replacement = mkDeposit(17, { block_number: 2_000 });
+
+  const merged = mergeDeposits(backlog, [replacement]);
+
+  assert.equal(merged.length, 1_205);
+  assert.equal(merged[0].block_number, 1);
+  assert.equal(merged.at(-1).block_number, 2_000);
+  assert.equal(
+    merged.filter((deposit) => deposit.eth_tx_hash === replacement.eth_tx_hash).length,
+    1
+  );
 });
 
 test('tap deposit watcher emits no credit for nonexistent Deposit logs', async () => {

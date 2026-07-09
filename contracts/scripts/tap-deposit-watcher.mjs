@@ -9,7 +9,6 @@ import { ethers } from 'ethers';
 const scriptPath = fileURLToPath(import.meta.url);
 const DEFAULT_CURSOR = path.resolve('.mayhem-local', 'tap-deposit-watcher.json');
 const TAP_WEI = 1_000_000_000_000_000_000n;
-const MAX_UNSUBMITTED_DEPOSITS = 1000;
 export const TAP_DEPOSIT_EVENT_SIGNATURE = ethers.id('Deposit(address,uint256)');
 export const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 
@@ -390,7 +389,7 @@ export async function scanTapDeposits({
   return { deposits, from, to: safeTo };
 }
 
-function mergeDeposits(existing, incoming) {
+export function mergeDeposits(existing, incoming) {
   const merged = new Map();
   for (const deposit of [...existing, ...incoming]) {
     try {
@@ -402,8 +401,7 @@ function mergeDeposits(existing, incoming) {
       Number(a.block_number) - Number(b.block_number)
       || Number(a.log_index) - Number(b.log_index)
       || String(a.eth_tx_hash).localeCompare(String(b.eth_tx_hash))
-    ))
-    .slice(-MAX_UNSUBMITTED_DEPOSITS);
+    ));
 }
 
 async function main() {
