@@ -3748,7 +3748,7 @@ struct AdminFeeSetArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    /// Operator fee in basis points; must be between 0 and 5000.
+    /// Operator fee in basis points; must be between 0 and 1500.
     bps: u64,
 
     /// Contract timestamp/slot when the change is submitted. Defaults to now.
@@ -14794,8 +14794,8 @@ fn admin_fee_set_payload_with_delay(
     submitted_at: u64,
     activation_delay_seconds: u64,
 ) -> Result<Value> {
-    if args.bps > 5_000 {
-        bail!("admin fee bps must be between 0 and 5000");
+    if args.bps > 1_500 {
+        bail!("admin fee bps must be between 0 and 1500");
     }
     let effective_at = args
         .effective_at
@@ -42750,11 +42750,11 @@ mod tests {
             })
         );
 
-        let bad = AdminFeeSetArgs { bps: 5_001, ..fee };
+        let bad = AdminFeeSetArgs { bps: 1_501, ..fee };
         assert!(admin_fee_set_payload(&bad)
             .unwrap_err()
             .to_string()
-            .contains("between 0 and 5000"));
+            .contains("between 0 and 1500"));
     }
 
     #[test]

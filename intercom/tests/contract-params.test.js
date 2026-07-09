@@ -258,7 +258,7 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     makeSetParams({
       submitted_at: DAY_SECONDS,
       effective_at: 2 * DAY_SECONDS,
-      values: { fee_bps: 5_001 },
+      values: { fee_bps: 1_501 },
     }),
     admin.publicKey,
     8

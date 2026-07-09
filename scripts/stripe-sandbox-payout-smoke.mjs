@@ -90,8 +90,8 @@ function parseArgs(argv) {
   if (!Number.isSafeInteger(args.amountCents) || args.amountCents <= 0) {
     throw new Error('--amount-cents must be a positive integer');
   }
-  if (!Number.isSafeInteger(args.feeBps) || args.feeBps < 0 || args.feeBps > 5000) {
-    throw new Error('--fee-bps must be an integer from 0 to 5000');
+  if (!Number.isSafeInteger(args.feeBps) || args.feeBps < 0 || args.feeBps > 1500) {
+    throw new Error('--fee-bps must be an integer from 0 to 1500');
   }
   const businessUrl = new URL(args.businessUrl);
   if (!['http:', 'https:'].includes(businessUrl.protocol)) {

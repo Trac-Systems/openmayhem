@@ -508,7 +508,7 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
       }
     }
     if (requireObject(add, auditedEpoch.params, 'audited_epoch.params')) {
-      requireIntegerRange(add, auditedEpoch.params.fee_bps, 0, 5_000, 'audited_epoch.params.fee_bps');
+      requireIntegerRange(add, auditedEpoch.params.fee_bps, 0, 1_500, 'audited_epoch.params.fee_bps');
     }
     requireBoolean(add, auditedEpoch.receipt_batches_verified, true, 'audited_epoch.receipt_batches_verified');
     requireBoolean(add, auditedEpoch.payout_evidence_verified, true, 'audited_epoch.payout_evidence_verified');

@@ -960,8 +960,8 @@ test('epoch root recompute requires admin params fee_bps and rejects loose fee_b
   await assert.rejects(
     recomputeEpoch({
       ...bundle,
-      params: { fee_bps: 5_001 },
+      params: { fee_bps: 1_501 },
     }),
-    /fee_bps must be <= 5000/
+    /fee_bps must be <= 1500/
   );
 });

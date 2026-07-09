@@ -1924,6 +1924,48 @@ test('MayhemContract admin verifies and revokes provider KYB without raw documen
   assert.equal(revokedKyb.value.revoke_reason_hash, 'b'.repeat(64));
   const revokedProvider = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(revokedProvider.value.kyb.status, 'revoked');
+
+  const replacement = await makeIdentity();
+  for (const op of [
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(replacement.wallet, 1, rulesHash),
+      },
+      sender: replacement.publicKey,
+      txNo: 10,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: replacement.publicKey,
+      txNo: 11,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  const replacementKyb = {
+    ...unsignedKyb,
+    provider: replacement.publicKey,
+  };
+  const replacementSignedKyb = {
+    ...replacementKyb,
+    admin_sig: signProviderKyb(admin.wallet, replacementKyb),
+  };
+  const regrantRevokedIdentity = await execute(
+    contract,
+    storage,
+    'setProviderKyb',
+    replacementSignedKyb,
+    admin.publicKey,
+    12
+  );
+  assert.match(regrantRevokedIdentity.message, /kyb identity is banned or revoked/i);
+  assert.equal(await storage.get(`kyb/${replacement.publicKey}`), null);
 });
 
 test('MayhemContract rejects provider-authored serving terms on joins', async () => {
@@ -2498,7 +2540,9 @@ test('MayhemContract provider/device bans are reversible and Tier-1 fingerprint 
   assert.equal(banned.ok, true, banned.message);
   assert.equal((await storage.get(`ban/provider/${provider.publicKey}`)).value.status, 'banned');
   assert.equal((await storage.get(`ban/device/${deviceKey}`)).value.status, 'banned');
-  assert.equal((await storage.get(`ban/fingerprint/${hardwareFingerprint}`)).value.status, 'banned');
+  const fingerprintBan = (await storage.get(`ban/fingerprint/${hardwareFingerprint}`)).value;
+  assert.equal(fingerprintBan.status, 'banned');
+  assert.equal(fingerprintBan.auto_reject, true);
 
   const rejectedDevice = await execute(
     contract,
@@ -2559,7 +2603,7 @@ test('MayhemContract provider/device bans are reversible and Tier-1 fingerprint 
   assert.equal(rebound.ok, true, rebound.message);
   assert.equal((await storage.get(`device/${deviceKey}`)).value.provider, replacement.publicKey);
 
-  const reviewJoin = await execute(
+  const rejectedFingerprint = await execute(
     contract,
     storage,
     'joinEnclave',
@@ -2567,15 +2611,37 @@ test('MayhemContract provider/device bans are reversible and Tier-1 fingerprint 
     replacement.publicKey,
     13
   );
-  assert.equal(reviewJoin.ok, true, reviewJoin.message);
-  const review = await storage.get(
-    `review/fingerprint/${hardwareFingerprint}/${replacement.publicKey}/${makeTxKey(13)}`
+  assert.match(rejectedFingerprint.message, /hardware fingerprint is banned/i);
+  assert.equal(await storage.get(`serve/${replacement.publicKey}/${enclaveId}`), null);
+
+  const fingerprintUnban = await execute(
+    contract,
+    storage,
+    'unban',
+    {
+      op: 'unban',
+      target_type: 'fingerprint',
+      target: hardwareFingerprint,
+      reason_hash: 'e'.repeat(64),
+    },
+    admin.publicKey,
+    14
   );
-  assert.equal(review.value.status, 'needs_admin_review');
-  assert.equal(review.value.auto_reject, false);
+  assert.equal(fingerprintUnban.ok, true, fingerprintUnban.message);
+  assert.equal((await storage.get(`ban/fingerprint/${hardwareFingerprint}`)).value.status, 'unbanned');
+
+  const cleanJoin = await execute(
+    contract,
+    storage,
+    'joinEnclave',
+    { ...providerJoin, hardware_fingerprint: hardwareFingerprint, device_key: deviceKey },
+    replacement.publicKey,
+    15
+  );
+  assert.equal(cleanJoin.ok, true, cleanJoin.message);
   const serving = await storage.get(`serve/${replacement.publicKey}/${enclaveId}`);
   assert.equal(serving.value.status, 'active');
-  assert.equal(serving.value.fingerprint_review.auto_reject, false);
+  assert.equal(serving.value.fingerprint_review, undefined);
 });
 
 test('MayhemContract admin retirement tombstones indexed provider room serving', async () => {

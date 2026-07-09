@@ -445,6 +445,44 @@ test('MayhemContract tnkSettlement releases clean-exit provider earnings after h
   }
 });
 
+test('MayhemContract tnkSettlement pays banned providers released non-slashed TNK earnings', async () => {
+  const ctx = await setupTnkSettlementContract();
+  const bannedProvider = ctx.providers[0];
+  const banned = await execute(
+    ctx.contract,
+    ctx.storage,
+    'banProvider',
+    {
+      op: 'ban_provider',
+      provider: bannedProvider.identity.publicKey,
+      reason_hash: '9'.repeat(64),
+    },
+    ctx.admin.publicKey,
+    20
+  );
+  assert.equal(banned.ok, true, banned.message);
+  assert.equal((await ctx.storage.get(`prov/${bannedProvider.identity.publicKey}`)).value.status, 'banned');
+
+  const settlement = await settlementValue(ctx, {
+    msb_tx_hashes: ["e".repeat(64), "f".repeat(64), "1".repeat(64)],
+  });
+  const settled = await executeTnkSettlementFeature(
+    ctx.contract,
+    ctx.storage,
+    settlement,
+    ctx.admin.publicKey
+  );
+  assert.equal(settled.ok, true, settled.message);
+
+  const earning = (await ctx.storage.get(`earn/tnk/${bannedProvider.identity.publicKey}`)).value;
+  const outputIndex = settlement.outputs.findIndex((output) => (
+    output.role === 'provider' && output.provider === bannedProvider.identity.publicKey
+  ));
+  assert.notEqual(outputIndex, -1);
+  assert.equal(earning.paid_cum_au, '1700000');
+  assert.equal(earning.last_settlement_msb_tx_hash, settlement.msb_tx_hashes[outputIndex]);
+});
+
 test('MayhemContract tnkSettlement uses the active admin max_tnk_settlement_outputs param', async () => {
   const ctx = await setupTnkSettlementContract({ max_tnk_settlement_outputs: 2 });
   const settlement = await settlementValue(ctx);

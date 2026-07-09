@@ -366,8 +366,8 @@ function collectEpoch(args) {
     'bundle.params.fee_bps',
     'params.fee_bps',
   ]);
-  if (!Number.isInteger(feeBps) || feeBps < 0 || feeBps > 5_000) {
-    throw new Error('epoch evidence params.fee_bps must be the admin-set fee_bps integer between 0 and 5000');
+  if (!Number.isInteger(feeBps) || feeBps < 0 || feeBps > 1_500) {
+    throw new Error('epoch evidence params.fee_bps must be the admin-set fee_bps integer between 0 and 1500');
   }
   const checks = Array.isArray(value.checks) ? value.checks : [];
   const checksOk = checks.length > 0 && checks.every((check) => check && check.ok === true);
@@ -596,9 +596,9 @@ function buildMetrics(args) {
     !auditedEpoch.params ||
     !Number.isInteger(auditedEpoch.params.fee_bps) ||
     auditedEpoch.params.fee_bps < 0 ||
-    auditedEpoch.params.fee_bps > 5_000
+    auditedEpoch.params.fee_bps > 1_500
   ) {
-    throw new Error('audited_epoch.params.fee_bps must be the admin-set fee_bps integer between 0 and 5000');
+    throw new Error('audited_epoch.params.fee_bps must be the admin-set fee_bps integer between 0 and 1500');
   }
   auditedEpoch.commit_tx = requireHex64(auditedEpoch.commit_tx, 'audited_epoch.commit_tx');
   auditedEpoch.apply_tx = requireHex64(auditedEpoch.apply_tx, 'audited_epoch.apply_tx');

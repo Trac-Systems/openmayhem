@@ -6,7 +6,7 @@ import { blake3 } from '@tracsystems/blake3';
 const ROOT_KINDS = ['dep', 'use', 'earn', 'fee', 'price'];
 const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
-const MAX_OPERATOR_FEE_BPS = 5_000;
+const MAX_OPERATOR_FEE_BPS = 1_500;
 const SESSION_RECEIPT_SCHEMA_VERSION = 8;
 
 export const stableValue = (value) => {
@@ -307,7 +307,7 @@ export async function recomputeEpoch(bundle) {
   }
   const epoch = safeCount(bundle.epoch, 'epoch');
   const feeBps = adminFeeBps(bundle);
-  if (feeBps > MAX_OPERATOR_FEE_BPS) throw new Error('fee_bps must be <= 5000');
+  if (feeBps > MAX_OPERATOR_FEE_BPS) throw new Error(`fee_bps must be <= ${MAX_OPERATOR_FEE_BPS}`);
 
   const deposits = Array.isArray(bundle.deposits) ? bundle.deposits : [];
   const receipts = Array.isArray(bundle.receipts) ? bundle.receipts : [];

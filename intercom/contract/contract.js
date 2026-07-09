@@ -40,7 +40,7 @@ const DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS = DAY_SECONDS;
 const PROBATION_SECONDS = 7 * DAY_SECONDS;
 const DEFAULT_FRAUD_SLASH_BPS = 10_000;
 const DEFAULT_DISPUTE_LOST_SLASH_BPS = 2_000;
-const MAX_OPERATOR_FEE_BPS = 5_000;
+const MAX_OPERATOR_FEE_BPS = 1_500;
 const MAX_LAUNCH_ENCLAVE_ATTESTATION_TIER = 3;
 const DEFAULT_DISPUTE_DEPOSIT_AU = ONE_USD_AU;
 const DEFAULT_MAX_APPLY_BATCH = 2_000;
@@ -1915,6 +1915,9 @@ class MayhemContract extends Contract {
     const key = `prov/${normalized.provider}`;
     const provider = await this.get(key);
     if (!provider) return new Error('Provider not found.');
+    if (provider.status === 'banned') return new Error('Provider is banned.');
+    const kybBanError = await this.rejectBannedProviderKyb(normalized);
+    if (kybBanError) return kybBanError;
 
     const record = {
       status: 'verified',
@@ -2006,6 +2009,16 @@ class MayhemContract extends Contract {
 
     await this.put(`kyb/${this.value.provider}`, revoked);
     await this.put(key, updatedProvider);
+    const kybBanIndexError = await this.writeProviderKybBanIndexes(revoked, {
+      status: 'revoked',
+      source: 'revoke_provider_kyb',
+      provider: this.value.provider,
+      reason_hash: this.value.reason_hash ?? null,
+      recorded_at: this.tx,
+      recorded_by: this.address,
+      recorded_by_role: 'admin',
+    });
+    if (kybBanIndexError instanceof Error) return kybBanIndexError;
     console.log('mayhem revokeProviderKyb', revoked);
     return {
       ok: true,
@@ -2098,8 +2111,20 @@ class MayhemContract extends Contract {
         banned_by: this.address,
         banned_by_role: 'admin',
         reversible: true,
-        auto_reject: false,
+        auto_reject: true,
       });
+    }
+    if (record.kyb?.status === 'verified') {
+      const kybBanIndexError = await this.writeProviderKybBanIndexes(record.kyb, {
+        status: 'banned',
+        source: 'ban_provider',
+        provider: this.value.provider,
+        reason_hash: this.value.reason_hash ?? null,
+        recorded_at: this.tx,
+        recorded_by: this.address,
+        recorded_by_role: 'admin',
+      });
+      if (kybBanIndexError instanceof Error) return kybBanIndexError;
     }
     console.log('mayhem banProvider', updated);
     return {
@@ -2578,24 +2603,10 @@ class MayhemContract extends Contract {
       }
     }
 
-    let fingerprintReview = null;
     if (hardwareFingerprint !== null) {
       const fingerprintBan = await this.get(`ban/fingerprint/${hardwareFingerprint}`);
       if (fingerprintBan?.status === 'banned') {
-        fingerprintReview = {
-          target_type: 'fingerprint',
-          hardware_fingerprint: hardwareFingerprint,
-          provider: providerId,
-          enclave_id: enclaveId,
-          status: 'needs_admin_review',
-          reason: 'fingerprint_matches_ban_record',
-          auto_reject: false,
-          recorded_at: stamp,
-        };
-        await this.put(
-          `review/fingerprint/${hardwareFingerprint}/${providerId}/${stamp}`,
-          fingerprintReview
-        );
+        return new Error('Provider hardware fingerprint is banned.');
       }
     }
 
@@ -2607,7 +2618,6 @@ class MayhemContract extends Contract {
       ...(normalizedServeTerms ?? {}),
       ...(hardwareFingerprint !== null ? { hardware_fingerprint: hardwareFingerprint } : {}),
       ...(deviceKey !== null ? { device_key: deviceKey } : {}),
-      ...(fingerprintReview !== null ? { fingerprint_review: fingerprintReview } : {}),
       joined_at: existing?.joined_at ?? stamp,
       updated_at: stamp,
       left_at: null,
@@ -2635,7 +2645,6 @@ class MayhemContract extends Contract {
       enclaves: this.providerEnclavesWith(provider, enclaveId),
       ...(hardwareFingerprint !== null ? { hardware_fingerprint: hardwareFingerprint } : {}),
       ...(deviceKey !== null ? { device_key: deviceKey, device_key_bound_at: stamp } : {}),
-      ...(fingerprintReview !== null ? { fingerprint_review: fingerprintReview } : {}),
       updated_at: stamp,
     });
     console.log('mayhem joinEnclave', record);
@@ -4346,8 +4355,9 @@ class MayhemContract extends Contract {
     for (const [outputIndex, output] of outputs.entries()) {
       if (output.role !== 'provider') continue;
       const provider = await this.get(`prov/${output.provider}`);
-      if (!provider || provider.status !== 'active') {
-        return new Error('TNK settlement provider is not active.');
+      if (!provider) return new Error('Provider not found.');
+      if (provider.status !== 'active' && provider.status !== 'banned') {
+        return new Error('TNK settlement provider status is not payable.');
       }
       const payoutError = await this.requireAdminSetPayoutTarget(provider);
       if (payoutError) return payoutError;
@@ -5698,6 +5708,85 @@ class MayhemContract extends Contract {
       default:
         return `ban/unknown/${target}`;
     }
+  }
+
+  normalizedKybIdentityValues(kyb) {
+    if (!kyb || typeof kyb !== 'object') return new Error('Invalid KYB identity.');
+    const legalName = typeof kyb.legal_name === 'string'
+      ? kyb.legal_name.trim().replace(/\s+/g, ' ').toLowerCase()
+      : '';
+    const kybRef = typeof kyb.kyb_ref === 'string' ? kyb.kyb_ref.trim() : '';
+    const proofHash = typeof kyb.proof_hash === 'string' ? kyb.proof_hash.toLowerCase() : '';
+    if (!legalName) return new Error('Invalid KYB legal name.');
+    if (!this.isSafeExternalRef(kybRef)) return new Error('Invalid provider KYB reference.');
+    if (!this.isHexBytes(proofHash, 32)) return new Error('Invalid provider KYB proof hash.');
+    return {
+      legal_name: legalName,
+      kyb_ref: kybRef,
+      proof_hash: proofHash,
+    };
+  }
+
+  async kybBanIndexKey(kind, value) {
+    return `ban/kyb/${kind}/${await this.opaqueHash('mayhem-kyb-ban-index-v1', { kind, value })}`;
+  }
+
+  async kybBanIndexKeys(kyb) {
+    const values = this.normalizedKybIdentityValues(kyb);
+    if (values instanceof Error) return values;
+    return [
+      await this.kybBanIndexKey('legal_name', values.legal_name),
+      await this.kybBanIndexKey('kyb_ref', values.kyb_ref),
+      await this.kybBanIndexKey('proof_hash', values.proof_hash),
+    ];
+  }
+
+  async rejectBannedProviderKyb(kyb) {
+    const keys = await this.kybBanIndexKeys(kyb);
+    if (keys instanceof Error) return keys;
+    for (const key of keys) {
+      const ban = await this.get(key);
+      if (ban?.status === 'banned' || ban?.status === 'revoked') {
+        return new Error('Provider KYB identity is banned or revoked.');
+      }
+    }
+    return null;
+  }
+
+  async writeProviderKybBanIndexes(kyb, meta) {
+    const keys = await this.kybBanIndexKeys(kyb);
+    if (keys instanceof Error) return keys;
+    const values = this.normalizedKybIdentityValues(kyb);
+    if (values instanceof Error) return values;
+    for (const key of keys) {
+      const current = await this.get(key);
+      await this.put(key, {
+        ...(current ?? {}),
+        target_type: 'kyb',
+        target: key.split('/').at(-1),
+        status: meta.status,
+        provider: meta.provider,
+        source: meta.source,
+        reason_hash: meta.reason_hash,
+        recorded_at: meta.recorded_at,
+        recorded_by: meta.recorded_by,
+        recorded_by_role: meta.recorded_by_role,
+        legal_name_hash: await this.kybBanIndexKey('legal_name', values.legal_name).then((k) => k.split('/').at(-1)),
+        kyb_ref_hash: await this.kybBanIndexKey('kyb_ref', values.kyb_ref).then((k) => k.split('/').at(-1)),
+        proof_hash: values.proof_hash,
+        providers: {
+          ...(current?.providers ?? {}),
+          [meta.provider]: {
+            provider: meta.provider,
+            source: meta.source,
+            reason_hash: meta.reason_hash,
+            recorded_at: meta.recorded_at,
+          },
+        },
+        reversible: true,
+      });
+    }
+    return null;
   }
 
   async providerLifecycleFeatureKey(intent) {
