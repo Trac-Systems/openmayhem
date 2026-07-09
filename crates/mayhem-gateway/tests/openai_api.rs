@@ -19,9 +19,9 @@ use mayhem_gateway::openai::{
     ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
-    aggregate_canary_fingerprints, priced_usage_au, text_generation_rate_map, token_fingerprint,
-    HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
-    ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
+    aggregate_canary_fingerprints, normalize_rate_map, priced_usage_au, text_generation_rate_map,
+    token_fingerprint, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue,
+    HeartbeatSlots, ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
     catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage,
@@ -1974,6 +1974,96 @@ async fn chat_completion_min_att_tier_filters_route_candidates() {
         .contains(&second_provider));
     assert_eq!(state.receipts().len(), 1);
     assert_eq!(state.receipts()[0].receipt.body.provider, second_provider);
+}
+
+#[tokio::test]
+async fn chat_completion_min_att_tier_two_routes_and_bills_tier2_market_price() {
+    let tier1_provider = "55".repeat(32);
+    let tier2_provider = "66".repeat(32);
+    let tier2_enclave = "77".repeat(32);
+    let mut model =
+        routed_test_model_with_providers(&[tier1_provider.clone(), tier2_provider.clone()]);
+    model.mayhem.attestation_tiers = BTreeMap::from([("T1".to_owned(), 1), ("T2".to_owned(), 1)]);
+    model.mayhem.route_candidates[0].att_tier = 1;
+    model.mayhem.route_candidates[0].price_ver = 1;
+    model.mayhem.route_candidates[0].price_ref_au = Some(PriceRefAu {
+        denom: "au_usd".to_owned(),
+        ver: 1,
+        rate_map: text_generation_rate_map(10, 20),
+        per_req_au: 0,
+        min_session_au: 0,
+        derivation: None,
+        history: Vec::new(),
+    });
+    model.mayhem.route_candidates[1].att_tier = 2;
+    model.mayhem.route_candidates[1].enclave_id = tier2_enclave.clone();
+    model.mayhem.route_candidates[1].price_ver = 22;
+    model.mayhem.route_candidates[1].price_ref_au = Some(PriceRefAu {
+        denom: "au_usd".to_owned(),
+        ver: 22,
+        rate_map: text_generation_rate_map(90, 180),
+        per_req_au: 123,
+        min_session_au: 456,
+        derivation: Some(json!({
+            "epoch": 9u64,
+            "enclave_id": tier2_enclave,
+            "price_root": "aa".repeat(32)
+        })),
+        history: Vec::new(),
+    });
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![model]).with_session_backend(Arc::new(
+        RetryThenDirectSessionBackend {
+            retry_provider: "ff".repeat(32),
+            calls: calls.clone(),
+        },
+    ));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "mayhem/routed-test",
+        "messages": [{ "role": "user", "content": "Use the Tier 2 device-identity market." }]
+    });
+
+    let (status, body) = json_request_with_headers(
+        app,
+        Method::POST,
+        "/v1/chat/completions",
+        request,
+        &[("X-Mayhem-Min-Att-Tier", "2")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        calls.lock().expect("calls lock").clone(),
+        vec![tier2_provider.clone()]
+    );
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("assistant content")
+        .contains(&tier2_provider));
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.body.provider, tier2_provider);
+    assert_eq!(receipt.body.enclave_id, "77".repeat(32));
+    assert_eq!(receipt.body.price_ver, 22);
+    assert_eq!(
+        receipt.body.locked_rate_map,
+        normalize_rate_map(text_generation_rate_map(90, 180))
+    );
+    assert_eq!(receipt.body.locked_per_req_au, 123);
+    assert_eq!(receipt.body.locked_min_session_au, 456);
+    assert_eq!(
+        receipt.body.au_owed_cum,
+        priced_usage_au(
+            &receipt.body.locked_rate_map,
+            receipt.body.locked_per_req_au,
+            receipt.body.locked_min_session_au,
+            &receipt.body.usage,
+        )
+    );
+    assert_eq!(receipt.body.au_owed_cum, 456);
 }
 
 #[tokio::test]
