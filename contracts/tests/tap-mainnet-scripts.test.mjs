@@ -144,3 +144,44 @@ test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a l
   assert.equal(verifyReport.source_file_count >= 1, true);
   assert.equal(verifyReport.constructor_args.length, 64 * 3);
 });
+
+test('mainnet deploy dry-run allows one-key owner and deployer config', async (t) => {
+  const server = Ganache.server({
+    logging: { quiet: true },
+    chain: { chainId: 1 },
+    wallet: {
+      lock: true,
+      accounts: [{ secretKey: OPERATOR_KEY, balance: GANACHE_BALANCE }],
+    },
+  });
+  await new Promise((resolve, reject) => {
+    server.listen(0, '127.0.0.1', (error) => (error ? reject(error) : resolve()));
+  });
+  t.after(() => closeServer(server));
+
+  const rpc = `http://127.0.0.1:${server.address().port}`;
+  const provider = new ethers.JsonRpcProvider(rpc);
+  t.after(() => { if (provider.destroy) provider.destroy(); });
+  const operator = new ethers.NonceManager(new ethers.Wallet(OPERATOR_KEY, provider));
+  const operatorAddress = ethers.getAddress(new ethers.Wallet(OPERATOR_KEY).address);
+  const art = compileAll();
+  const token = await new ethers.ContractFactory(art.MockTTAP.abi, art.MockTTAP.bytecode, operator).deploy();
+  await token.waitForDeployment();
+
+  const dryRun = await runNode([DEPLOY_SCRIPT, '--json'], {
+    env: {
+      ...process.env,
+      MAYHEM_TAP_DEPLOYER_PRIVATE_KEY: OPERATOR_KEY,
+      MAYHEM_TAP_ETH_RPC: rpc,
+      MAYHEM_TAP_TOKEN_ADDR: await token.getAddress(),
+      MAYHEM_TAP_POOL_OWNER: operatorAddress,
+      MAYHEM_TAP_MAX_EPOCH_DELTA: CAP,
+    },
+  });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const report = JSON.parse(dryRun.stdout);
+  assert.equal(report.chain_id, 1);
+  assert.equal(report.deployed, false);
+  assert.equal(ethers.getAddress(report.owner), operatorAddress);
+  assert.equal(ethers.getAddress(report.deployer), operatorAddress);
+});

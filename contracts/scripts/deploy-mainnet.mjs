@@ -184,11 +184,6 @@ export async function buildDeployPlan({
 
     const network = await provider.getNetwork();
     const chainId = Number(network.chainId);
-    if (chainId === 1 && owner.toLowerCase() === deployer.toLowerCase()) {
-      throw new Error(
-        'Ethereum mainnet deploy requires MAYHEM_TAP_POOL_OWNER to be a dedicated owner address distinct from the deployer/roller hot key.'
-      );
-    }
     const tokenCode = await provider.getCode(token);
     if (tokenCode === '0x') {
       throw new Error(`No contract code at TAP token ${token} on chainId ${chainId}`);
