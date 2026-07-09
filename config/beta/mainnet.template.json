@@ -132,7 +132,7 @@
     },
     "tap": {
       "chain_id": 1,
-      "token_address": "0x5e7F6e008C6d9D7AD4c7EB75Bd4ce62864cc7454",
+      "token_address": "<0x-canonical-TAP-token-address>",
       "pool_address": "<MayhemInferencePool-mainnet-address-after-C5>",
       "deployment_file_env": "MAYHEM_TAP_DEPLOYMENT_FILE",
       "eth_rpc_env": "MAYHEM_TAP_ETH_RPC",

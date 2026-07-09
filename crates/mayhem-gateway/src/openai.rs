@@ -13,10 +13,12 @@ use std::{
 
 use crate::{
     audit::{
-        aggregate_canary_fingerprints, evaluate_catalog_canary_token_prefix_probe,
+        aggregate_canary_fingerprints, evaluate_catalog_canary_perceptual_hash_probe,
+        evaluate_catalog_canary_token_prefix_probe, image_average_hash_hex,
         supported_canary_verification_method, token_fingerprint, CanaryProbeSpec,
-        CANARY_VERIFICATION_CONTEXT_NEEDLE, CANARY_VERIFICATION_TOKEN_FINGERPRINT,
-        DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
+        CANARY_VERIFICATION_CONTEXT_NEEDLE, CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH,
+        CANARY_VERIFICATION_TOKEN_FINGERPRINT, DEFAULT_CANARY_MATCH_MIN_BPS,
+        DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
         default_ttft_timeout_millis, midstream_stalled_after, x_mayhem_hedge_requested,
@@ -81,10 +83,12 @@ const EMBEDDED_CATALOG: &str = include_str!("../../../catalog/models.json");
 const EMBEDDED_CANARY_DEV_V1: &str = include_str!("../../../catalog/canaries/canary-dev-v1.json");
 const EMBEDDED_CANARY_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-launch-v1.json");
+const EMBEDDED_CANARY_IMAGE_LAUNCH_V1: &str =
+    include_str!("../../../catalog/canaries/canary-image-launch-v1.json");
 const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
-const X_MAYHEM_MAX_PRICE_MU_HEADER: &str = "x-mayhem-max-price-au";
+const X_MAYHEM_MAX_PRICE_AU_HEADER: &str = "x-mayhem-max-price-au";
 const X_MAYHEM_MAX_WAIT_MS_HEADER: &str = "x-mayhem-max-wait-ms";
 const X_MAYHEM_MIN_CTX_HEADER: &str = "x-mayhem-min-ctx";
 const X_MAYHEM_QUANT_HEADER: &str = "x-mayhem-quant";
@@ -956,6 +960,11 @@ pub struct GatewayCanaryPrompt {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Value>>,
     pub max_tokens: u32,
+    pub prompt: Option<String>,
+    pub size: Option<String>,
+    pub steps: Option<u64>,
+    pub cfg_scale: Option<f32>,
+    pub seed: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1082,7 +1091,7 @@ pub struct EmbeddingRequest {
     pub user: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImageGenerationRequest {
     pub model: String,
     pub prompt: String,
@@ -5674,6 +5683,16 @@ struct CanaryPromptDocument {
     tools: Option<Vec<Value>>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    steps: Option<u64>,
+    #[serde(default)]
+    cfg_scale: Option<f32>,
+    #[serde(default)]
+    seed: Option<i64>,
 }
 
 struct ExpectedProviderReceipt<'a> {
@@ -5863,23 +5882,32 @@ fn aggregate_token_prefixes_for_prompts(
 }
 
 fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
-    [EMBEDDED_CANARY_DEV_V1, EMBEDDED_CANARY_LAUNCH_V1]
-        .into_iter()
-        .filter_map(|raw| serde_json::from_str::<CanarySetDocument>(raw).ok())
-        .map(|doc| {
-            let prompts = doc
-                .prompts
-                .into_iter()
-                .map(|prompt| GatewayCanaryPrompt {
-                    id: prompt.id,
-                    messages: prompt.messages,
-                    tools: prompt.tools,
-                    max_tokens: prompt.max_tokens.unwrap_or(64).max(1),
-                })
-                .collect::<Vec<_>>();
-            (doc.set_id, prompts)
-        })
-        .collect()
+    [
+        EMBEDDED_CANARY_DEV_V1,
+        EMBEDDED_CANARY_LAUNCH_V1,
+        EMBEDDED_CANARY_IMAGE_LAUNCH_V1,
+    ]
+    .into_iter()
+    .filter_map(|raw| serde_json::from_str::<CanarySetDocument>(raw).ok())
+    .map(|doc| {
+        let prompts = doc
+            .prompts
+            .into_iter()
+            .map(|prompt| GatewayCanaryPrompt {
+                id: prompt.id,
+                messages: prompt.messages,
+                tools: prompt.tools,
+                max_tokens: prompt.max_tokens.unwrap_or(64).max(1),
+                prompt: prompt.prompt,
+                size: prompt.size,
+                steps: prompt.steps,
+                cfg_scale: prompt.cfg_scale,
+                seed: prompt.seed,
+            })
+            .collect::<Vec<_>>();
+        (doc.set_id, prompts)
+    })
+    .collect()
 }
 
 fn provider_table_from_models(models: &[GatewayModel], rules_ver: u64) -> ProviderTable {
@@ -6194,7 +6222,7 @@ fn parse_x_mayhem_max_wait_ms(headers: &HeaderMap) -> Result<u64, ApiError> {
 }
 
 fn parse_x_mayhem_max_price_au(headers: &HeaderMap) -> Result<Option<MoneyAu>, ApiError> {
-    let Some(value) = headers.get(X_MAYHEM_MAX_PRICE_MU_HEADER) else {
+    let Some(value) = headers.get(X_MAYHEM_MAX_PRICE_AU_HEADER) else {
         return Ok(None);
     };
     let value = value.to_str().map_err(|_| {
@@ -13512,6 +13540,11 @@ async fn build_image_generation(
         )?;
         Some(receipt_summary(&receipt))
     };
+    if !state.dev_session_shim {
+        state
+            .maybe_run_canary_probe_after_session(&model, &invocation)
+            .await;
+    }
     let data = image_generation_response_data(
         &output.artifacts,
         request.response_format.as_deref().unwrap_or("b64_json"),
@@ -13946,7 +13979,14 @@ impl GatewayState {
         if config.prompts.is_empty() {
             return;
         }
-        if config.verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+        if config.verification_method == CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
+            && !model_supports_image_generation(model)
+        {
+            return;
+        }
+        if config.verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT
+            && config.verification_method != CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
+        {
             return;
         }
         let route_key = canary_route_key(model, invocation);
@@ -13958,17 +13998,27 @@ impl GatewayState {
         if !should_probe {
             return;
         }
-        match self
-            .run_canary_probe_for_route(model, invocation, &config)
-            .await
-        {
+        let probe = match config.verification_method.as_str() {
+            CANARY_VERIFICATION_TOKEN_FINGERPRINT => {
+                self.run_canary_probe_for_route(model, invocation, &config)
+                    .await
+            }
+            CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => {
+                self.run_seed_perceptual_hash_probe_for_route(model, invocation, &config)
+                    .await
+            }
+            _ => return,
+        };
+        match probe {
             Ok(probe) => {
                 self.record_probe(probe);
-                if let Ok(Some(context_probe)) = self
-                    .run_context_needle_probe_for_route(model, invocation, &config)
-                    .await
-                {
-                    self.record_probe(context_probe);
+                if config.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+                    if let Ok(Some(context_probe)) = self
+                        .run_context_needle_probe_for_route(model, invocation, &config)
+                        .await
+                    {
+                        self.record_probe(context_probe);
+                    }
                 }
             }
             Err(err) => {
@@ -14259,6 +14309,191 @@ impl GatewayState {
             "provider": provider,
             "enclave_id": served_invocation.enclave_id,
             "canary_set": config.canary_set,
+            "epoch": self.canary_policy.epoch,
+            "evidence_hash": evidence_hash,
+        }));
+        let mut probe_command = json!({
+            "op": "probe_result",
+            "probe_id": probe_id,
+            "probe_kind": "canary",
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
+            "epoch": self.canary_policy.epoch,
+            "at": at,
+            "canary_set": config.canary_set,
+            "verification_method": config.verification_method,
+            "match_bps": evaluation.match_bps,
+            "pass": evaluation.pass,
+            "session_receipt_hash": session_receipt_hash,
+            "evidence_hash": evidence_hash,
+        });
+        probe_command["auditor_sig"] = json!(probe_result_signature(
+            &self.receipt_config.user_seed,
+            &probe_command,
+            &verifying_key_hex(&self.receipt_config.user_seed),
+        ));
+        let event = StoredProbeEvent {
+            probe_id: probe_command["probe_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            model_id: model.id.clone(),
+            provider,
+            enclave_id: served_invocation.enclave_id.clone(),
+            binary_hash,
+            canary_set: config.canary_set.clone(),
+            verification_method: evaluation.verification_method.clone(),
+            expected_fingerprint: evaluation.expected_fingerprint.clone(),
+            observed_fingerprint: evaluation.observed_fingerprint.clone(),
+            match_bps: evaluation.match_bps,
+            pass: evaluation.pass,
+            reputation_event_kind: evaluation.reputation_event_kind(),
+            session_receipt_hash,
+            evidence_hash,
+            evidence: json!({
+                "evidence": evidence,
+                "receipts": stored_receipts,
+            }),
+            probe_command,
+        };
+        Ok(event)
+    }
+
+    async fn run_seed_perceptual_hash_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let expected_hashes = canary_expected_perceptual_hashes(config, served_invocation)
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "no catalog canary perceptual hashes for served artifact",
+                    Some("model"),
+                )
+            })?;
+        let route = canary_served_route(model, served_invocation);
+        let mut prompt_reports = Vec::with_capacity(config.prompts.len());
+        let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
+        let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+        let mut observed_hashes = BTreeMap::new();
+
+        for prompt in &config.prompts {
+            if !expected_hashes.contains_key(&prompt.id) {
+                continue;
+            }
+            let request =
+                canary_image_generation_request(&model.id, prompt, self.canary_policy.seed);
+            validate_image_generation_request(model, &request)?;
+            let invocation = self.prepare_image_generation_invocation_for_route(
+                model,
+                &request,
+                route.as_ref(),
+                &GatewayRequestOptions::default(),
+            )?;
+            let result = self
+                .session_backend
+                .run_image_generation(model, &request, &invocation)
+                .await
+                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            let artifact = result
+                .output
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.content_type.starts_with("image/"))
+                .ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        "provider returned no image canary artifact",
+                        Some("model"),
+                    )
+                })?;
+            let observed_hash = image_average_hash_hex(&artifact.bytes)
+                .map_err(|err| ApiError::bad_gateway(err, Some("model")))?;
+            observed_hashes.insert(prompt.id.clone(), observed_hash.clone());
+            let receipt = self.meter_image_generation_session(
+                model,
+                &request,
+                &result.output,
+                &invocation,
+                result.provider_receipt.as_ref(),
+            )?;
+            let receipt_hash = stable_value_hash(&json!(receipt));
+            receipt_hashes.push(receipt_hash.clone());
+            stored_receipts.push(receipt);
+            prompt_reports.push(json!({
+                "prompt_id": prompt.id,
+                "request": request,
+                "artifact": artifact_summaries(std::slice::from_ref(artifact)),
+                "observed_perceptual_hash": observed_hash,
+                "session_id": invocation.session_id,
+                "receipt_hash": receipt_hash,
+            }));
+        }
+
+        if observed_hashes.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "no canary image prompts matched expected perceptual hashes",
+                Some("model"),
+            ));
+        }
+
+        let spec = CanaryProbeSpec {
+            model: model.id.clone(),
+            canary_set: config.canary_set.clone(),
+            prompt_id: format!("aggregate:{}", expected_hashes.len()),
+            prompt: config
+                .prompts
+                .iter()
+                .filter(|prompt| expected_hashes.contains_key(&prompt.id))
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            seed: self.canary_policy.seed,
+            max_tokens: 1,
+        };
+        let evaluation = evaluate_catalog_canary_perceptual_hash_probe(
+            &spec,
+            &expected_hashes,
+            &observed_hashes,
+            config.match_min_bps,
+        );
+        let provider = served_invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let binary_hash = served_invocation
+            .attestation
+            .as_ref()
+            .map(|attestation| attestation.contract.binary_hash.clone())
+            .unwrap_or_default();
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-image-canary-probe-evidence",
+            "model": model.id,
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
+            "canary_set": config.canary_set,
+            "verification_method": config.verification_method,
+            "verification_tolerance_bps": config.verification_tolerance_bps,
+            "catalog_expected_perceptual_hashes": expected_hashes,
+            "observed_perceptual_hashes": observed_hashes,
+            "evaluation": evaluation,
+            "prompts": prompt_reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        let evidence_hash = stable_value_hash(&evidence);
+        let session_receipt_hash = stable_value_hash(&json!({
+            "domain": "mayhem-canary-receipt-bundle-v1",
+            "receipt_hashes": receipt_hashes,
+        }));
+        let at = now_secs();
+        let probe_id = stable_value_hash(&json!({
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "canary_set": config.canary_set,
+            "verification_method": config.verification_method,
             "epoch": self.canary_policy.epoch,
             "evidence_hash": evidence_hash,
         }));
@@ -15503,6 +15738,22 @@ fn canary_expected_token_prefixes(
         .or_else(|| config.default_token_prefixes.clone())
 }
 
+fn canary_expected_perceptual_hashes(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<BTreeMap<String, String>> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .perceptual_hashes_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| config.default_perceptual_hashes.clone())
+}
+
 #[derive(Clone, Debug)]
 struct ContextNeedleSpec {
     answer: String,
@@ -15621,6 +15872,45 @@ fn canary_chat_request(
         seed: Some(seed),
         stop: None,
         max_tokens: Some(prompt.max_tokens.max(1)),
+    }
+}
+
+fn canary_image_prompt_text(prompt: &GatewayCanaryPrompt) -> String {
+    prompt
+        .prompt
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            prompt
+                .messages
+                .iter()
+                .map(|message| {
+                    message
+                        .content
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| message.content.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+}
+
+fn canary_image_generation_request(
+    model_id: &str,
+    prompt: &GatewayCanaryPrompt,
+    seed: i64,
+) -> ImageGenerationRequest {
+    ImageGenerationRequest {
+        model: model_id.to_owned(),
+        prompt: canary_image_prompt_text(prompt),
+        n: Some(1),
+        size: prompt.size.clone(),
+        response_format: Some("b64_json".to_owned()),
+        steps: prompt.steps,
+        cfg_scale: prompt.cfg_scale,
+        seed: Some(prompt.seed.unwrap_or(seed)),
+        user: None,
     }
 }
 

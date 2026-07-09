@@ -36,14 +36,17 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
   await (await token.connect(buyer).approve(poolAddr, U(3))).wait();
   await (await pool.connect(buyer).deposit(U(3))).wait();
 
+  const userId = makeReceiptIdentity();
   const providerId = makeReceiptIdentity();
   const bundle = {
     epoch: 1,
-    receipts: [receipt({ session: 's1', provider: providerId, au: usdAu(2) })],
+    receipts: [receipt({ session: 's1', user: userId, provider: providerId, au: usdAu(2) })],
+    buyer_refunds: [{ user: userId.publicKeyHex, refund_au: usdAu(1) }],
   };
   const rolled = await rollTapSettlement({
     bundle,
     providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    buyerAccounts: { [userId.publicKeyHex]: await buyer.getAddress() },
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -76,6 +79,22 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
     proof.proof
   )).wait();
   assert.equal(await token.balanceOf(providerAccount), expectedClaim);
+
+  const expectedRefund = auToTapWei(usdAu(1), TAP_USD_AU);
+  const refundProof = await claimProofForAccount({
+    settlement: rolled,
+    account: await buyer.getAddress(),
+    pool,
+  });
+  assert.equal(refundProof.claimable, true);
+  assert.equal(refundProof.cumulative_wei, expectedRefund.toString());
+  assert.equal(refundProof.claimable_wei, expectedRefund.toString());
+  await (await pool.connect(buyer).claim(
+    refundProof.account,
+    BigInt(refundProof.cumulative_wei),
+    refundProof.proof
+  )).wait();
+  assert.equal(await token.balanceOf(await buyer.getAddress()), expectedRefund);
 
   const after = await claimProofForAccount({
     settlement: rolled,

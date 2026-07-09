@@ -16932,9 +16932,13 @@ struct FraudProofChallengeCandidate {
     receipt_id: String,
     session_id: Option<String>,
     provider: Option<String>,
+    #[serde(with = "mayhem_proto::decimal_u128")]
     actual_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
     claimed_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
     claimed_au_owed_cum: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
     previous_au_owed_cum: MoneyAu,
     committed_use_root: String,
     proof_hash: String,
@@ -43063,6 +43067,18 @@ mod tests {
             .is_some_and(Value::is_null));
         assert!(candidate.copy_paste.contains("/tx --command"));
         assert_eq!(candidate.proof_hash.len(), 64);
+
+        let max = u128::MAX.to_string();
+        let mut display_candidate = candidate.clone();
+        display_candidate.actual_au = u128::MAX;
+        display_candidate.claimed_au = u128::MAX;
+        display_candidate.claimed_au_owed_cum = u128::MAX;
+        display_candidate.previous_au_owed_cum = u128::MAX;
+        let display = serde_json::to_value(&display_candidate).unwrap();
+        assert_eq!(display["actual_au"].as_str(), Some(max.as_str()));
+        assert_eq!(display["claimed_au"].as_str(), Some(max.as_str()));
+        assert_eq!(display["claimed_au_owed_cum"].as_str(), Some(max.as_str()));
+        assert_eq!(display["previous_au_owed_cum"].as_str(), Some(max.as_str()));
     }
 
     #[test]

@@ -247,6 +247,59 @@ pub fn evaluate_seed_perceptual_hash_probe(
     }
 }
 
+pub fn evaluate_catalog_canary_perceptual_hash_probe(
+    spec: &CanaryProbeSpec,
+    expected_hashes: &BTreeMap<String, String>,
+    observed_hashes: &BTreeMap<String, String>,
+    min_match_bps: u32,
+) -> CanaryProbeEvaluation {
+    let mut matched_positions = 0_u32;
+    let mut total_positions = 0_u32;
+    let mut expected_fingerprints = Vec::with_capacity(expected_hashes.len());
+    let mut observed_fingerprints = Vec::with_capacity(expected_hashes.len());
+
+    for (prompt_id, expected_hash) in expected_hashes {
+        let observed_hash = observed_hashes
+            .get(prompt_id)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let (matched, total, _) = perceptual_hash_match_stats(expected_hash, observed_hash)
+            .unwrap_or_else(|| (0, ((expected_hash.len() * 4).max(1)) as u32, 0));
+        matched_positions = matched_positions.saturating_add(matched);
+        total_positions = total_positions.saturating_add(total);
+        expected_fingerprints.push((prompt_id.as_str(), expected_hash.to_ascii_lowercase()));
+        observed_fingerprints.push((prompt_id.as_str(), observed_hash.to_ascii_lowercase()));
+    }
+
+    let match_bps = if total_positions == 0 {
+        0
+    } else {
+        ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
+    };
+    let expected_fingerprint = aggregate_canary_fingerprints(
+        expected_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+    let observed_fingerprint = aggregate_canary_fingerprints(
+        observed_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+
+    CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint,
+        observed_fingerprint,
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: total_positions > 0 && match_bps >= min_match_bps,
+    }
+}
+
 pub fn perceptual_hash_match_stats(
     expected_hash: &str,
     observed_hash: &str,
@@ -268,6 +321,28 @@ pub fn perceptual_hash_match_stats(
     }
     let match_bps = ((u64::from(matched_bits) * 10_000) / u64::from(total_bits)) as u32;
     Some((matched_bits, total_bits, match_bps))
+}
+
+pub fn image_average_hash_hex(bytes: &[u8]) -> Result<String, String> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|err| format!("invalid image artifact for perceptual hash: {err}"))?;
+    let gray = image
+        .resize_exact(8, 8, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let pixels = gray.as_raw();
+    if pixels.is_empty() {
+        return Err("image artifact has no pixels".to_owned());
+    }
+    let sum = pixels.iter().map(|pixel| u32::from(*pixel)).sum::<u32>();
+    let average = f64::from(sum) / pixels.len() as f64;
+    let mut bits = 0_u64;
+    for pixel in pixels {
+        bits <<= 1;
+        if f64::from(*pixel) >= average {
+            bits |= 1;
+        }
+    }
+    Ok(format!("{bits:016x}"))
 }
 
 fn hex_nibble(byte: u8) -> Option<u32> {
@@ -426,5 +501,48 @@ mod tests {
         let malformed = evaluate_seed_perceptual_hash_probe(&spec(), "ffff", "not-hex", 9_000);
         assert_eq!(malformed.match_bps, 0);
         assert!(!malformed.pass);
+    }
+
+    #[test]
+    fn catalog_perceptual_hash_evaluation_aggregates_prompt_hashes() {
+        let expected = BTreeMap::from([
+            ("first".to_owned(), "ffff".to_owned()),
+            ("second".to_owned(), "0000".to_owned()),
+        ]);
+        let observed = BTreeMap::from([
+            ("first".to_owned(), "fffe".to_owned()),
+            ("second".to_owned(), "0000".to_owned()),
+        ]);
+
+        let ok =
+            evaluate_catalog_canary_perceptual_hash_probe(&spec(), &expected, &observed, 9_000);
+        assert_eq!(ok.matched_positions, 31);
+        assert_eq!(ok.total_positions, 32);
+        assert_eq!(ok.match_bps, 9_687);
+        assert!(ok.pass);
+
+        let missing = BTreeMap::from([("first".to_owned(), "fffe".to_owned())]);
+        let fail =
+            evaluate_catalog_canary_perceptual_hash_probe(&spec(), &expected, &missing, 9_000);
+        assert_eq!(fail.total_positions, 32);
+        assert!(!fail.pass);
+    }
+
+    #[test]
+    fn image_average_hash_decodes_artifact_bytes() {
+        let mut image = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::new(8, 8);
+        for (x, _y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Luma([if x < 4 { 0 } else { 255 }]);
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("write png");
+
+        assert_eq!(
+            image_average_hash_hex(bytes.get_ref()).expect("image hash"),
+            "0f0f0f0f0f0f0f0f"
+        );
+        assert!(image_average_hash_hex(b"not an image").is_err());
     }
 }

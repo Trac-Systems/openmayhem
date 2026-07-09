@@ -19,9 +19,10 @@ use mayhem_gateway::openai::{
     ToolCallOutput, Usage,
 };
 use mayhem_gateway::{
-    aggregate_canary_fingerprints, normalize_rate_map, priced_usage_au, text_generation_rate_map,
-    token_fingerprint, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue,
-    HeartbeatSlots, ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
+    aggregate_canary_fingerprints, image_average_hash_hex, normalize_rate_map, priced_usage_au,
+    text_generation_rate_map, token_fingerprint, HeartbeatAttestation, HeartbeatCaps,
+    HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat, ReputationEventKind,
+    HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
     catalog_enclave_id, receipt_signing_bytes, CatalogEnclaveIdentity, ReceiptBody, ReceiptUsage,
@@ -148,6 +149,65 @@ impl GatewaySessionBackend for ImageGenerationDirectSessionBackend {
     ) -> GatewayImageGenerationFuture<'a> {
         Box::pin(async move {
             let image = b"\x89PNG mayhem image".to_vec();
+            let usage = image_usage_for_test(request);
+            let provider_receipt =
+                signed_image_provider_receipt(model, request, invocation, &usage)?;
+            Ok(GatewayImageGenerationResult {
+                output: ImageGenerationOutput {
+                    artifacts: vec![GatewayArtifactOutput {
+                        id: "image-1".to_owned(),
+                        content_type: "image/png".to_owned(),
+                        blake3: blake3::hash(&image).to_hex().to_string(),
+                        bytes: image,
+                    }],
+                    usage,
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: Some(provider_receipt),
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ImageCanarySessionBackend {
+    user_bytes: Vec<u8>,
+    canary_bytes: Vec<u8>,
+    requests: Arc<Mutex<Vec<ImageGenerationRequest>>>,
+}
+
+impl GatewaySessionBackend for ImageCanarySessionBackend {
+    fn name(&self) -> &str {
+        "test-image-canary-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        _request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async { Err(GatewaySessionError::new("chat not expected")) })
+    }
+
+    fn run_image_generation<'a>(
+        &'a self,
+        model: &'a GatewayModel,
+        request: &'a ImageGenerationRequest,
+        invocation: &'a GatewaySessionInvocation,
+    ) -> GatewayImageGenerationFuture<'a> {
+        Box::pin(async move {
+            self.requests
+                .lock()
+                .expect("image request lock")
+                .push(request.clone());
+            let image = if request.prompt.contains("fixed image canary") {
+                self.canary_bytes.clone()
+            } else {
+                self.user_bytes.clone()
+            };
             let usage = image_usage_for_test(request);
             let provider_receipt =
                 signed_image_provider_receipt(model, request, invocation, &usage)?;
@@ -1198,6 +1258,70 @@ async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
     assert_eq!(receipt.body.usage.get(USAGE_IMAGE), 1);
     assert_eq!(receipt.body.usage.get(USAGE_STEP), 3);
     assert_eq!(receipt.body.au_owed_cum, 506);
+}
+
+#[tokio::test]
+async fn automatic_seed_perceptual_hash_probe_records_image_mismatch() {
+    let expected_image = png_average_hash_fixture(false);
+    let substituted_image = png_average_hash_fixture(true);
+    let expected_hash = image_average_hash_hex(&expected_image).expect("expected image hash");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = GatewayState::from_models(vec![routed_image_generation_test_model()])
+        .with_canary_registry(test_image_canary_registry(expected_hash.clone()))
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(ImageCanarySessionBackend {
+            user_bytes: expected_image,
+            canary_bytes: substituted_image,
+            requests: requests.clone(),
+        }));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "admin/image-fixture",
+        "prompt": "a user image",
+        "n": 1,
+        "size": "64x64",
+        "steps": 1,
+        "response_format": "b64_json"
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/images/generations", request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mayhem"]["backend"], "test-image-canary-session");
+    assert_eq!(state.receipts().len(), 2);
+    let seen_requests = requests.lock().expect("image request lock").clone();
+    assert_eq!(seen_requests.len(), 2);
+    assert_eq!(seen_requests[0].prompt, "a user image");
+    assert_eq!(seen_requests[1].prompt, "fixed image canary");
+    assert_eq!(seen_requests[1].size.as_deref(), Some("64x64"));
+    assert_eq!(seen_requests[1].seed, Some(7));
+
+    let probes = state.probes();
+    assert_eq!(probes.len(), 1);
+    let probe = &probes[0];
+    assert_eq!(probe.verification_method, "seed_perceptual_hash");
+    assert!(!probe.pass);
+    assert_eq!(probe.reputation_event_kind, ReputationEventKind::ProbeFail);
+    assert_eq!(
+        probe.probe_command["verification_method"],
+        "seed_perceptual_hash"
+    );
+    assert_eq!(probe.probe_command["pass"], false);
+    assert_eq!(
+        probe.evidence["evidence"]["catalog_expected_perceptual_hashes"]["fixed-image"].as_str(),
+        Some(expected_hash.as_str())
+    );
+    assert_ne!(
+        probe.evidence["evidence"]["observed_perceptual_hashes"]["fixed-image"].as_str(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(
+        probe.evidence["receipts"]
+            .as_array()
+            .expect("canary receipts")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -2590,6 +2714,19 @@ fn image_prompt_hash_for_test(request: &ImageGenerationRequest) -> String {
     }))
 }
 
+fn png_average_hash_fixture(inverted: bool) -> Vec<u8> {
+    let mut image = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::new(8, 8);
+    for (x, _y, pixel) in image.enumerate_pixels_mut() {
+        let bright = if x < 4 { inverted } else { !inverted };
+        *pixel = image::Luma([if bright { 255 } else { 0 }]);
+    }
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageLuma8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("write png fixture");
+    bytes.into_inner()
+}
+
 fn audio_speech_prompt_hash_for_test(request: &AudioSpeechRequest) -> String {
     stable_value_hash_for_test(&json!({
         "kind": "audio_speech",
@@ -2695,6 +2832,11 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     }],
                     tools: None,
                     max_tokens: 8,
+                    prompt: None,
+                    size: None,
+                    steps: None,
+                    cfg_scale: None,
+                    seed: None,
                 }],
                 fingerprints_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
@@ -2705,6 +2847,40 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     BTreeMap::from([("fixed-probe".to_owned(), expected_tokens.to_vec())]),
                 )]),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
+                default_fingerprint: None,
+                default_token_prefixes: None,
+                default_perceptual_hashes: None,
+            },
+        )]),
+    }
+}
+
+fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
+    GatewayCanaryRegistry {
+        models: BTreeMap::from([(
+            "admin/image-fixture".to_owned(),
+            GatewayCanaryModelConfig {
+                canary_set: "canary-image-test-v1".to_owned(),
+                match_min_bps: 9_000,
+                verification_method: "seed_perceptual_hash".to_owned(),
+                verification_tolerance_bps: Some(500),
+                prompts: vec![GatewayCanaryPrompt {
+                    id: "fixed-image".to_owned(),
+                    messages: Vec::new(),
+                    tools: None,
+                    max_tokens: 1,
+                    prompt: Some("fixed image canary".to_owned()),
+                    size: Some("64x64".to_owned()),
+                    steps: Some(1),
+                    cfg_scale: Some(1.0),
+                    seed: Some(7),
+                }],
+                fingerprints_by_artifact_root: BTreeMap::new(),
+                token_prefixes_by_artifact_root: BTreeMap::new(),
+                perceptual_hashes_by_artifact_root: BTreeMap::from([(
+                    "aa".repeat(32),
+                    BTreeMap::from([("fixed-image".to_owned(), expected_hash)]),
+                )]),
                 default_fingerprint: None,
                 default_token_prefixes: None,
                 default_perceptual_hashes: None,

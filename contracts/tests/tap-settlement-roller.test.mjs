@@ -135,6 +135,76 @@ test('TAP settlement roller posts root and provider proof verifies independently
   assert.equal(await token.balanceOf(providerAccounts[providerAId.publicKeyHex]), claimA);
 });
 
+test('TAP settlement roller includes buyer refund leaves in the claim root', async () => {
+  const ganache = Ganache.provider({
+    logging: { quiet: true },
+    chain: { chainId: 61_000 },
+    wallet: { totalAccounts: 4 },
+  });
+  const provider = new ethers.BrowserProvider(ganache);
+  const operator = await provider.getSigner(0);
+  const buyer = await provider.getSigner(1);
+  const providerA = await provider.getSigner(2);
+  const operatorTreasury = await provider.getSigner(3);
+  const { token, pool, poolAddr } = await deployPool(operator);
+
+  await (await token.mint(await buyer.getAddress(), U(10))).wait();
+  await (await token.connect(buyer).approve(poolAddr, U(10))).wait();
+  await (await pool.connect(buyer).deposit(U(10))).wait();
+
+  const userId = makeReceiptIdentity();
+  const providerId = makeReceiptIdentity();
+  const providerAccount = await providerA.getAddress();
+  const buyerAccount = await buyer.getAddress();
+  const bundle = {
+    epoch: 1,
+    receipts: [receipt({ session: 'refund-s1', user: userId, provider: providerId, au: usdAu(4) })],
+    buyer_refunds: [{ user: userId.publicKeyHex, refund_au: usdAu(6) }],
+  };
+  const rolled = await rollTapSettlement({
+    bundle,
+    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    buyerAccounts: { [userId.publicKeyHex]: buyerAccount },
+    tapUsdAu: TAP_USD_AU,
+    ledgerFeeBps: 1500,
+    settleThroughEpoch: 7,
+    pool,
+    ownerSigner: operator,
+    operatorAddress: await operatorTreasury.getAddress(),
+    post: true,
+  });
+
+  const spentWei = auToTapWei(usdAu(4), TAP_USD_AU);
+  const providerClaim = providerShareWei(spentWei);
+  const buyerRefund = auToTapWei(usdAu(6), TAP_USD_AU);
+  const expectedDist = distribution([
+    { account: providerAccount.toLowerCase(), amount: providerClaim },
+    { account: buyerAccount.toLowerCase(), amount: buyerRefund },
+  ]);
+
+  assert.equal(rolled.posted, true);
+  assert.equal(rolled.cumulative_spent_wei, spentWei.toString());
+  assert.equal(rolled.provider_claimed_wei, providerClaim.toString());
+  assert.equal(rolled.buyer_refund_wei, buyerRefund.toString());
+  assert.equal(rolled.total_claimed_wei, (providerClaim + buyerRefund).toString());
+  assert.equal(rolled.providers.length, 1);
+  assert.equal(rolled.refunds.length, 1);
+  assert.equal(rolled.root, expectedDist.root);
+
+  await (await pool.connect(providerA).claim(
+    providerAccount,
+    providerClaim,
+    rolled.proofs[providerAccount.toLowerCase()].proof
+  )).wait();
+  await (await pool.connect(buyer).claim(
+    buyerAccount,
+    buyerRefund,
+    rolled.proofs[buyerAccount.toLowerCase()].proof
+  )).wait();
+  assert.equal(await token.balanceOf(providerAccount), providerClaim);
+  assert.equal(await token.balanceOf(buyerAccount), buyerRefund);
+});
+
 test('TAP settlement roller uses provider account mapping and skips repeated roots', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
@@ -294,6 +364,28 @@ test('guardian pre-sign screen halts invariant violations', async () => {
   assert.equal(overAllocated.ok, false);
   assert.match(overAllocated.reasons.join('; '), /provider owed > 75% spent cap/);
   assert.match(overAllocated.reasons.join('; '), /owed \+ operator cap \+ burn cap > deposited/);
+
+  const b = '0x2222222222222222222222222222222222222222';
+  const refundWithinEscrow = await guardianPreSignReport({
+    settlement: {
+      root,
+      cumulative_spent_wei: '1000',
+      providers: [{ account: a, cumulative_wei: '750' }],
+      refunds: [{ account: b, cumulative_wei: '100' }],
+      entries: [
+        { account: a, cumulative_wei: '750' },
+        { account: b, cumulative_wei: '100' },
+      ],
+    },
+    epoch: 1,
+    currentEpoch: 0,
+    prevSpentWei: '0',
+    totalDepositedWei: '1100',
+    maxEpochDeltaWei: '0',
+  });
+  assert.equal(refundWithinEscrow.ok, true);
+  assert.equal(refundWithinEscrow.provider_owed_wei, '750');
+  assert.equal(refundWithinEscrow.total_owed_wei, '850');
 
   const spentPastDeposits = await guardianPreSignReport({
     settlement: {

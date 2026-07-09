@@ -20,6 +20,7 @@ ed25519-dalek = "2"
 futures-util = "0.3"
 getrandom = "0.3"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jsonwebtoken = "9.3"
 mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-proto = { path = "../mayhem-proto" }

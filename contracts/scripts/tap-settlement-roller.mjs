@@ -189,6 +189,13 @@ function addWei(map, account, amountWei) {
   map.set(account, (map.get(account) ?? 0n) + amountWei);
 }
 
+function sortedDistributionEntries(map) {
+  return Array.from(map.entries())
+    .filter(([, amount]) => amount > 0n)
+    .map(([account, amount]) => ({ account, amount }))
+    .sort((a, b) => a.account.localeCompare(b.account));
+}
+
 export function canonicalReceiptBody(body) {
   const canonical = {
     schema_version: body.schema_version,
@@ -457,30 +464,52 @@ function receiptReleaseInfo(entry, body, bundleEpoch, policy) {
 
 function parseEntryAmount(entry, label) {
   if (isObject(entry)) {
-    return parseBigIntString(entry.amount ?? entry.cumulative_wei, label);
+    return parseBigIntString(
+      entry.amount
+        ?? entry.amount_wei
+        ?? entry.cumulative_wei
+        ?? entry.refund_wei
+        ?? entry.refund,
+      label
+    );
   }
   return parseBigIntString(entry, label);
 }
 
-export function settlementDistributionEntries(report, label = 'settlement') {
+function settlementDistributionEntriesFromSource(source, label) {
   const out = new Map();
-  const source = report?.providers ?? report?.entries ?? report?.proofs ?? {};
   if (Array.isArray(source)) {
     for (const entry of source) {
       const account = normalizeAddress(entry.account, `${label} account`);
-      out.set(account, parseEntryAmount(entry, `${label} cumulative wei`));
+      addWei(out, account, parseEntryAmount(entry, `${label} cumulative wei`));
     }
   } else if (isObject(source)) {
     for (const [account, entry] of Object.entries(source)) {
-      out.set(normalizeAddress(account, `${label} account`), parseEntryAmount(entry, `${label} cumulative wei`));
+      addWei(
+        out,
+        normalizeAddress(account, `${label} account`),
+        parseEntryAmount(entry, `${label} cumulative wei`)
+      );
     }
   }
-  return Array.from(out.entries())
-    .map(([account, amount]) => ({ account, amount }))
-    .sort((a, b) => a.account.localeCompare(b.account));
+  return sortedDistributionEntries(out);
 }
 
-function priorProviderMap(prior) {
+export function settlementDistributionEntries(report, label = 'settlement') {
+  return settlementDistributionEntriesFromSource(
+    report?.entries ?? report?.proofs ?? report?.providers ?? {},
+    label
+  );
+}
+
+function providerDistributionEntries(report, label = 'settlement providers') {
+  if (report?.providers !== undefined) {
+    return settlementDistributionEntriesFromSource(report.providers, label);
+  }
+  return settlementDistributionEntries(report, label);
+}
+
+function priorDistributionMap(prior) {
   const out = new Map();
   for (const entry of settlementDistributionEntries(prior, 'prior')) {
     out.set(entry.account, entry.amount);
@@ -488,10 +517,84 @@ function priorProviderMap(prior) {
   return out;
 }
 
+function priorProviderMap(prior) {
+  const out = new Map();
+  for (const entry of providerDistributionEntries(prior, 'prior providers')) {
+    out.set(entry.account, entry.amount);
+  }
+  return out;
+}
+
+function refundDistributionEntries(report, label = 'settlement refunds') {
+  if (report?.refunds === undefined) return [];
+  return settlementDistributionEntriesFromSource(report.refunds, label);
+}
+
+function priorRefundMap(prior) {
+  const out = new Map();
+  for (const entry of refundDistributionEntries(prior, 'prior refunds')) {
+    out.set(entry.account, entry.amount);
+  }
+  return out;
+}
+
+function buyerRefundSource(inputBundle) {
+  return inputBundle?.buyer_refunds
+    ?? inputBundle?.buyerRefunds
+    ?? inputBundle?.refunds
+    ?? [];
+}
+
+function buyerRefundAccount(entry, buyerAccounts) {
+  const direct = entry.account
+    ?? entry.buyer_tap_address
+    ?? entry.tap_address
+    ?? entry.eth_address;
+  if (direct) return normalizeAddress(direct, 'buyer refund account');
+  const buyerId = entry.buyer ?? entry.user ?? entry.user_pubkey ?? entry.user_public_key;
+  if (typeof buyerId !== 'string' || buyerId.length === 0) {
+    throw new Error('buyer refund requires account or buyer/user id');
+  }
+  const mapped = buyerAccounts?.[buyerId] ?? buyerAccounts?.[buyerId.toLowerCase()];
+  if (!mapped) throw new Error(`Missing TAP refund address for buyer ${buyerId}`);
+  return normalizeAddress(mapped, `buyer refund account for ${buyerId}`);
+}
+
+function buyerRefundWei(entry, rate) {
+  const wei = entry.cumulative_wei
+    ?? entry.amount_wei
+    ?? entry.refund_wei;
+  if (wei !== undefined) return parseBigIntString(wei, 'buyer refund wei');
+  const au = entry.cumulative_au
+    ?? entry.amount_au
+    ?? entry.refund_au;
+  if (au !== undefined) return auToTapWei(au, rate);
+  throw new Error('buyer refund requires cumulative_wei/amount_wei/refund_wei or cumulative_au/amount_au/refund_au');
+}
+
+function applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate) {
+  const source = buyerRefundSource(inputBundle);
+  if (Array.isArray(source)) {
+    for (const entry of source) {
+      if (!isObject(entry)) throw new Error('buyer refund entries must be objects');
+      addWei(perBuyerRefund, buyerRefundAccount(entry, buyerAccounts), buyerRefundWei(entry, rate));
+    }
+    return;
+  }
+  if (!isObject(source)) throw new Error('buyer refunds must be an array or account map');
+  for (const [account, entry] of Object.entries(source)) {
+    const amountWei = isObject(entry)
+      ? buyerRefundWei({ account, ...entry }, rate)
+      : parseBigIntString(entry, 'buyer refund wei');
+    addWei(perBuyerRefund, normalizeAddress(account, 'buyer refund account'), amountWei);
+  }
+}
+
 export function buildTapSettlement({
   bundle,
   receipts,
   providerAccounts = {},
+  buyerAccounts = {},
   tapUsdAu,
   ledgerFeeBps,
   prior = null,
@@ -511,6 +614,7 @@ export function buildTapSettlement({
   const bundleEpoch = inputBundle?.epoch ?? inputBundle?.receipt_epoch ?? inputBundle?.settlement_epoch;
   const previousBySession = new Map();
   const perProvider = priorProviderMap(prior);
+  const perBuyerRefund = priorRefundMap(prior);
   let cumulativeSpentWei = parseBigIntString(prior?.cumulative_spent_wei ?? prior?.cumulativeSpentWei, 'prior cumulative spent wei');
   let receiptCount = 0;
   let heldReceiptCount = 0;
@@ -548,10 +652,14 @@ export function buildTapSettlement({
     }
   }
 
-  const entries = Array.from(perProvider.entries())
-    .filter(([, amount]) => amount > 0n)
-    .map(([account, amount]) => ({ account, amount }))
-    .sort((a, b) => a.account.localeCompare(b.account));
+  applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate);
+
+  const providers = sortedDistributionEntries(perProvider);
+  const refunds = sortedDistributionEntries(perBuyerRefund);
+  const combined = new Map();
+  for (const entry of providers) addWei(combined, entry.account, entry.amount);
+  for (const entry of refunds) addWei(combined, entry.account, entry.amount);
+  const entries = sortedDistributionEntries(combined);
   if (entries.length === 0) {
     return {
       posted: false,
@@ -566,6 +674,8 @@ export function buildTapSettlement({
       held_au: heldAu.toString(),
       cumulative_spent_wei: cumulativeSpentWei.toString(),
       entries: [],
+      providers: [],
+      refunds: [],
       release_policy: policy,
     };
   }
@@ -580,7 +690,9 @@ export function buildTapSettlement({
       leaf: dist.leafFor(entry.account),
     },
   ]));
-  const providerClaimedWei = entries.reduce((sum, entry) => sum + entry.amount, 0n);
+  const providerClaimedWei = providers.reduce((sum, entry) => sum + entry.amount, 0n);
+  const buyerRefundWei = refunds.reduce((sum, entry) => sum + entry.amount, 0n);
+  const totalClaimedWei = entries.reduce((sum, entry) => sum + entry.amount, 0n);
   const providerCapWei = (cumulativeSpentWei * PROVIDER_BPS) / BPS;
   if (providerClaimedWei > providerCapWei) {
     throw new Error('provider distribution exceeds 75% TAP settlement cap');
@@ -598,9 +710,13 @@ export function buildTapSettlement({
     held_au: heldAu.toString(),
     cumulative_spent_wei: cumulativeSpentWei.toString(),
     provider_claimed_wei: providerClaimedWei.toString(),
+    buyer_refund_wei: buyerRefundWei.toString(),
+    total_claimed_wei: totalClaimedWei.toString(),
     provider_cap_wei: providerCapWei.toString(),
     root: dist.root,
     entries: entries.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
+    providers: providers.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
+    refunds: refunds.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
     proofs,
     release_policy: policy,
     dist,
@@ -679,6 +795,15 @@ async function poolAddressOrNull(pool) {
   }
 }
 
+async function poolRootOrNull(pool) {
+  if (!pool?.merkleRoot) return null;
+  try {
+    return String(await pool.merkleRoot()).toLowerCase();
+  } catch (_error) {
+    return null;
+  }
+}
+
 export async function guardianPreSignReport({
   settlement,
   pool,
@@ -718,22 +843,33 @@ export async function guardianPreSignReport({
       ? await pool.maxEpochDelta()
       : 0n;
   const poolAddress = await poolAddressOrNull(pool);
+  const previousRoot = (await poolRootOrNull(pool))
+    ?? (previous?.root ? String(previous.root).toLowerCase() : null)
+    ?? (previous?.merkle_root ? String(previous.merkle_root).toLowerCase() : null);
 
   if (!Number.isSafeInteger(newEpoch) || newEpoch <= priorEpoch) reasons.push('epoch !monotonic');
   if (cumulativeSpentWei < previousSpentWei) reasons.push('spent !monotonic');
-  if (cumulativeSpentWei === previousSpentWei) reasons.push('no new spend since last root');
+  if (cumulativeSpentWei === previousSpentWei) {
+    if (previousRoot && previousRoot === String(settlement.root).toLowerCase()) {
+      reasons.push('no new spend since last root');
+    } else {
+      flags.push('root changed without new spend');
+    }
+  }
   if (cumulativeSpentWei > depositedWei) reasons.push('spent > deposited');
   if (epochDeltaCapWei > 0n && cumulativeSpentWei >= previousSpentWei && cumulativeSpentWei - previousSpentWei > epochDeltaCapWei) {
     reasons.push('epoch delta > cap');
   }
 
   let entries = [];
+  let providerEntries = [];
   try {
     entries = settlementDistributionEntries(settlement, 'settlement');
+    providerEntries = providerDistributionEntries(settlement, 'settlement providers');
   } catch (error) {
     reasons.push(error?.message || 'invalid settlement entries');
   }
-  const previousByAccount = priorProviderMap(previous);
+  const previousByAccount = priorDistributionMap(previous);
   const currentByAccount = new Map(entries.map((entry) => [entry.account, entry.amount]));
   let totalOwedWei = 0n;
   for (const entry of entries) {
@@ -767,9 +903,10 @@ export async function guardianPreSignReport({
   const providerCapWei = bpsOf(cumulativeSpentWei, PROVIDER_BPS);
   const operatorCapWei = bpsOf(cumulativeSpentWei, OPERATOR_BPS);
   const burnCapWei = bpsOf(cumulativeSpentWei, BURN_BPS);
-  if (totalOwedWei > providerCapWei + PROVIDER_CAP_TOLERANCE_WEI) {
+  const providerOwedWei = providerEntries.reduce((sum, entry) => sum + entry.amount, 0n);
+  if (providerOwedWei > providerCapWei + PROVIDER_CAP_TOLERANCE_WEI) {
     reasons.push('provider owed > 75% spent cap');
-  } else if (totalOwedWei > providerCapWei) {
+  } else if (providerOwedWei > providerCapWei) {
     flags.push('provider owed exceeds exact 75% cap only by rounding tolerance');
   }
   if (totalOwedWei + operatorCapWei + burnCapWei > depositedWei) {
@@ -787,6 +924,7 @@ export async function guardianPreSignReport({
     total_deposited_wei: depositedWei.toString(),
     max_epoch_delta_wei: epochDeltaCapWei.toString(),
     total_owed_wei: totalOwedWei.toString(),
+    provider_owed_wei: providerOwedWei.toString(),
     provider_cap_wei: providerCapWei.toString(),
     operator_cap_wei: operatorCapWei.toString(),
     burn_cap_wei: burnCapWei.toString(),
@@ -798,6 +936,7 @@ export async function rollTapSettlement({
   bundle,
   receipts,
   providerAccounts,
+  buyerAccounts,
   tapUsdAu,
   ledgerFeeBps,
   prior,
@@ -814,6 +953,7 @@ export async function rollTapSettlement({
     bundle,
     receipts,
     providerAccounts,
+    buyerAccounts,
     tapUsdAu,
     ledgerFeeBps,
     prior,
@@ -983,6 +1123,7 @@ async function resolveTapUsdAu({ tapUsdAu, peerRpcUrl, fetchImpl } = {}) {
 function buildReplayCommand({
   bundlePath,
   providerAccountsPath,
+  buyerAccountsPath,
   tapUsdAu,
   ledgerFeeBps,
   priorPath,
@@ -999,6 +1140,7 @@ function buildReplayCommand({
   const args = ['node', 'contracts/scripts/tap-settlement-roller.mjs'];
   if (bundlePath) args.push('--bundle', bundlePath);
   if (providerAccountsPath) args.push('--provider-accounts', providerAccountsPath);
+  if (buyerAccountsPath) args.push('--buyer-accounts', buyerAccountsPath);
   if (tapUsdAu) args.push('--tap-usd-au', String(tapUsdAu));
   if (ledgerFeeBps !== undefined && ledgerFeeBps !== null) args.push('--ledger-fee-bps', String(ledgerFeeBps));
   if (priorPath) args.push('--prior', priorPath);
@@ -1035,6 +1177,10 @@ async function main() {
   const providerAccounts = providerAccountsPath
     ? readJson(path.resolve(providerAccountsPath), 'provider accounts')
     : {};
+  const buyerAccountsPath = args['buyer-accounts'];
+  const buyerAccounts = buyerAccountsPath
+    ? readJson(path.resolve(buyerAccountsPath), 'buyer accounts')
+    : {};
   const priorPath = args.prior;
   const prior = priorPath ? readJson(path.resolve(priorPath), 'prior settlement') : null;
   const peerRpcUrl = args['admin-rpc-url'] || args['peer-rpc'] || process.env.MAYHEM_PEER_RPC;
@@ -1065,6 +1211,7 @@ async function main() {
   const report = await rollTapSettlement({
     bundle,
     providerAccounts,
+    buyerAccounts,
     prior,
     tapUsdAu,
     ledgerFeeBps,
@@ -1081,6 +1228,7 @@ async function main() {
   report.copy_paste_replay_command = buildReplayCommand({
     bundlePath,
     providerAccountsPath,
+    buyerAccountsPath,
     tapUsdAu,
     ledgerFeeBps,
     priorPath,
@@ -1098,6 +1246,7 @@ async function main() {
     report.copy_paste_confirm_command = buildReplayCommand({
       bundlePath,
       providerAccountsPath,
+      buyerAccountsPath,
       tapUsdAu,
       ledgerFeeBps,
       priorPath,

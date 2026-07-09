@@ -148,6 +148,11 @@ pub struct RequestRequirements {
     pub output_tokens: u64,
     #[serde(default)]
     pub usage: ReceiptUsage,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "mayhem_proto::optional_decimal_u128"
+    )]
     pub max_price_au: Option<MoneyAu>,
     /// Minimum acceptable throughput in the request modality's natural unit.
     pub min_throughput: Option<f64>,
@@ -187,6 +192,7 @@ pub struct SelectionWeights {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SelectionCandidate {
     pub entry: ProviderTableEntry,
+    #[serde(with = "mayhem_proto::decimal_u128")]
     pub estimated_price_au: MoneyAu,
     pub effective_ttft_ms: f64,
     pub latency_factor: f64,
@@ -1296,6 +1302,37 @@ mod tests {
         let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].estimated_price_au, 1_500);
+    }
+
+    #[test]
+    fn money_au_fields_serialize_as_decimal_strings() {
+        let now = 1_000_000;
+        let max = u128::MAX.to_string();
+        let mut request = eligible_request(now);
+        request.max_price_au = Some(u128::MAX);
+        let value = serde_json::to_value(&request).expect("request json");
+        assert_eq!(value["max_price_au"].as_str(), Some(max.as_str()));
+        let roundtrip: RequestRequirements =
+            serde_json::from_value(value).expect("request roundtrip");
+        assert_eq!(roundtrip.max_price_au, Some(u128::MAX));
+
+        request.max_price_au = None;
+        let value = serde_json::to_value(&request).expect("request json");
+        assert!(value.get("max_price_au").is_none());
+
+        let entry = entry_for(1, now, 0.2, 100);
+        let mut candidates = eligible_candidates(
+            &[entry],
+            &eligible_request(now),
+            &SelectionWeights::default(),
+        );
+        assert_eq!(candidates.len(), 1);
+        candidates[0].estimated_price_au = u128::MAX;
+        let value = serde_json::to_value(&candidates[0]).expect("candidate json");
+        assert_eq!(value["estimated_price_au"].as_str(), Some(max.as_str()));
+        let roundtrip: SelectionCandidate =
+            serde_json::from_value(value).expect("candidate roundtrip");
+        assert_eq!(roundtrip.estimated_price_au, u128::MAX);
     }
 
     struct ScriptedRng {
