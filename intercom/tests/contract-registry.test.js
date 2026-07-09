@@ -383,6 +383,51 @@ test('MayhemContract requires model_class and allows admin model classes', async
   );
   assert.equal(modelRefResult.ok, true, modelRefResult.message);
   assert.equal((await storage.get(`modelref/${embeddingRegistration.model_id}`)).value.model_class, 'embedding');
+
+  const musicRegistration = {
+    ...enclaveRegistration,
+    enclave_id: '1'.repeat(64),
+    model_id: 'admin/music-small@fp16',
+    model_class: 'music-generation',
+    backend: 'comfyui',
+    artifact_root: '2'.repeat(64),
+    manifest_hash: '3'.repeat(64),
+    binary_hash: '4'.repeat(64),
+    caps: {
+      audio: true,
+      output_modality: 'audio',
+      output_modalities: ['audio'],
+    },
+  };
+  const musicRegistered = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    musicRegistration,
+    admin.publicKey,
+    6
+  );
+  assert.equal(musicRegistered.ok, true, musicRegistered.message);
+  assert.equal((await storage.get(`enclave/${musicRegistration.enclave_id}`)).value.model_class, 'music-generation');
+
+  const musicModelRef = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      op: 'set_model_ref',
+      model_id: musicRegistration.model_id,
+      model_class: 'music-generation',
+      rate_map: [
+        { unit: 'input_character', per_unit_au: '1', granularity: 100 },
+        { unit: 'audio_second', per_unit_au: '50', granularity: 1 },
+      ],
+    },
+    admin.publicKey,
+    7
+  );
+  assert.equal(musicModelRef.ok, true, musicModelRef.message);
+  assert.equal((await storage.get(`modelref/${musicRegistration.model_id}`)).value.model_class, 'music-generation');
 });
 
 test('MayhemContract rejects unsupported model classes and mismatched model references', async () => {

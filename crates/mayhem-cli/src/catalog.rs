@@ -19,6 +19,13 @@ const VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
 const VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
 const VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 const VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
+const MODEL_CLASS_EMBEDDING: &str = "embedding";
+const MODEL_CLASS_IMAGE_GENERATION: &str = "image-generation";
+const MODEL_CLASS_VIDEO_GENERATION: &str = "video-generation";
+const MODEL_CLASS_TTS: &str = "tts";
+const MODEL_CLASS_STT: &str = "stt";
+const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
+const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
@@ -723,10 +730,12 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
     }
 
     let required_units: &[&str] = match model.model_class.as_str() {
-        "image-generation" => &[USAGE_IMAGE, USAGE_STEP],
-        "embedding" => &[USAGE_INPUT_TOKEN],
-        "stt" => &[USAGE_AUDIO_SECOND],
-        "tts" => &[USAGE_INPUT_CHARACTER, USAGE_AUDIO_SECOND],
+        MODEL_CLASS_IMAGE_GENERATION => &[USAGE_IMAGE, USAGE_STEP],
+        MODEL_CLASS_EMBEDDING => &[USAGE_INPUT_TOKEN],
+        MODEL_CLASS_STT => &[USAGE_AUDIO_SECOND],
+        MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
+            &[USAGE_INPUT_CHARACTER, USAGE_AUDIO_SECOND]
+        }
         _ => &[USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN],
     };
     for unit in required_units {
@@ -753,6 +762,16 @@ fn validate_canary_verification(model: &CatalogModel, errors: &mut Vec<String>) 
             "{} canary.verification_method {} is not allowed for model_class {}",
             model.model_id, method, model.model_class
         ));
+    }
+    if model.tier == "launch" {
+        if let Some(required_method) = required_launch_output_canary_method(&model.model_class) {
+            if method != required_method {
+                errors.push(format!(
+                    "{} launch model_class {} requires output canary method {}, not {}",
+                    model.model_id, model.model_class, required_method, method
+                ));
+            }
+        }
     }
     if let Some(tolerance_bps) = model.canary.verification_tolerance_bps {
         if tolerance_bps > 10_000 {
@@ -791,13 +810,32 @@ fn canary_verification_method_allowed_for_class(model_class: &str, method: &str)
     matches!(
         (model_class, method),
         (DEFAULT_MODEL_CLASS, VERIFICATION_TOKEN_FINGERPRINT)
-            | ("embedding", VERIFICATION_EMBEDDING_COSINE)
-            | ("image-generation", VERIFICATION_SEED_PERCEPTUAL_HASH)
-            | ("video-generation", VERIFICATION_SEED_PERCEPTUAL_HASH)
-            | ("stt", VERIFICATION_TRANSCRIPT_MATCH)
-            | ("tts", VERIFICATION_AUDIO_FINGERPRINT)
+            | (MODEL_CLASS_EMBEDDING, VERIFICATION_EMBEDDING_COSINE)
+            | (
+                MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_VIDEO_GENERATION,
+                VERIFICATION_SEED_PERCEPTUAL_HASH
+            )
+            | (MODEL_CLASS_STT, VERIFICATION_TRANSCRIPT_MATCH)
+            | (
+                MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION,
+                VERIFICATION_AUDIO_FINGERPRINT
+            )
             | (_, VERIFICATION_ATTESTATION_OF_COMPUTE)
     )
+}
+
+fn required_launch_output_canary_method(model_class: &str) -> Option<&'static str> {
+    match model_class {
+        MODEL_CLASS_EMBEDDING => Some(VERIFICATION_EMBEDDING_COSINE),
+        MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_VIDEO_GENERATION => {
+            Some(VERIFICATION_SEED_PERCEPTUAL_HASH)
+        }
+        MODEL_CLASS_STT => Some(VERIFICATION_TRANSCRIPT_MATCH),
+        MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
+            Some(VERIFICATION_AUDIO_FINGERPRINT)
+        }
+        _ => None,
+    }
 }
 
 fn validate_token_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -1115,7 +1153,14 @@ fn valid_perceptual_hash(value: &str) -> bool {
 fn valid_model_class(model_class: &str) -> bool {
     matches!(
         model_class,
-        DEFAULT_MODEL_CLASS | "embedding" | "image-generation" | "video-generation" | "tts" | "stt"
+        DEFAULT_MODEL_CLASS
+            | MODEL_CLASS_EMBEDDING
+            | MODEL_CLASS_IMAGE_GENERATION
+            | MODEL_CLASS_VIDEO_GENERATION
+            | MODEL_CLASS_TTS
+            | MODEL_CLASS_STT
+            | MODEL_CLASS_AUDIO_GENERATION
+            | MODEL_CLASS_MUSIC_GENERATION
     )
 }
 
@@ -1127,11 +1172,14 @@ fn output_modality_allowed_for_class(model_class: &str, modality: &str) -> bool 
     matches!(
         (model_class, modality),
         (DEFAULT_MODEL_CLASS, "text")
-            | ("embedding", "embedding")
-            | ("image-generation", "image")
-            | ("video-generation", "video")
-            | ("tts", "audio")
-            | ("stt", "text")
+            | (MODEL_CLASS_EMBEDDING, "embedding")
+            | (MODEL_CLASS_IMAGE_GENERATION, "image")
+            | (MODEL_CLASS_VIDEO_GENERATION, "video")
+            | (
+                MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION,
+                "audio"
+            )
+            | (MODEL_CLASS_STT, "text")
     )
 }
 
@@ -1207,57 +1255,93 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
             | "openai_images"
             | "openai_audio_speech"
             | "openai_audio_transcriptions"
+            | "openai_audio_generations"
     ) {
         errors.push(format!(
             "{} adapter.request_shape_family is unsupported: {}",
             model.model_id, adapter.request_shape_family
         ));
     }
-    if model.model_class == "embedding" && adapter.request_shape_family != "openai_embeddings" {
+    if model.model_class == MODEL_CLASS_EMBEDDING
+        && adapter.request_shape_family != "openai_embeddings"
+    {
         errors.push(format!(
             "{} embedding model must use adapter.request_shape_family openai_embeddings",
             model.model_id
         ));
     }
-    if adapter.request_shape_family == "openai_embeddings" && model.model_class != "embedding" {
+    if adapter.request_shape_family == "openai_embeddings"
+        && model.model_class != MODEL_CLASS_EMBEDDING
+    {
         errors.push(format!(
             "{} adapter.request_shape_family openai_embeddings is only allowed for model_class embedding",
             model.model_id
         ));
     }
-    if model.model_class == "image-generation" && adapter.request_shape_family != "openai_images" {
+    if model.model_class == MODEL_CLASS_IMAGE_GENERATION
+        && adapter.request_shape_family != "openai_images"
+    {
         errors.push(format!(
             "{} image-generation model must use adapter.request_shape_family openai_images",
             model.model_id
         ));
     }
-    if adapter.request_shape_family == "openai_images" && model.model_class != "image-generation" {
+    if adapter.request_shape_family == "openai_images"
+        && model.model_class != MODEL_CLASS_IMAGE_GENERATION
+    {
         errors.push(format!(
             "{} adapter.request_shape_family openai_images is only allowed for model_class image-generation",
             model.model_id
         ));
     }
-    if model.model_class == "tts" && adapter.request_shape_family != "openai_audio_speech" {
+    if model.model_class == MODEL_CLASS_TTS && adapter.request_shape_family != "openai_audio_speech"
+    {
         errors.push(format!(
             "{} tts model must use adapter.request_shape_family openai_audio_speech",
             model.model_id
         ));
     }
-    if adapter.request_shape_family == "openai_audio_speech" && model.model_class != "tts" {
+    if adapter.request_shape_family == "openai_audio_speech" && model.model_class != MODEL_CLASS_TTS
+    {
         errors.push(format!(
             "{} adapter.request_shape_family openai_audio_speech is only allowed for model_class tts",
             model.model_id
         ));
     }
-    if model.model_class == "stt" && adapter.request_shape_family != "openai_audio_transcriptions" {
+    if model.model_class == MODEL_CLASS_STT
+        && adapter.request_shape_family != "openai_audio_transcriptions"
+    {
         errors.push(format!(
             "{} stt model must use adapter.request_shape_family openai_audio_transcriptions",
             model.model_id
         ));
     }
-    if adapter.request_shape_family == "openai_audio_transcriptions" && model.model_class != "stt" {
+    if adapter.request_shape_family == "openai_audio_transcriptions"
+        && model.model_class != MODEL_CLASS_STT
+    {
         errors.push(format!(
             "{} adapter.request_shape_family openai_audio_transcriptions is only allowed for model_class stt",
+            model.model_id
+        ));
+    }
+    if matches!(
+        model.model_class.as_str(),
+        MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
+    ) && adapter.request_shape_family != "openai_audio_generations"
+    {
+        errors.push(format!(
+            "{} {} model must use adapter.request_shape_family openai_audio_generations",
+            model.model_id, model.model_class
+        ));
+    }
+    if adapter.request_shape_family == "openai_audio_generations"
+        && !matches!(
+            model.model_class.as_str(),
+            MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
+        )
+    {
+        errors.push(format!(
+            "{} adapter.request_shape_family openai_audio_generations is only allowed for model_class audio-generation or music-generation",
             model.model_id
         ));
     }
@@ -1325,68 +1409,102 @@ fn validate_model_adapter(model: &CatalogModel, errors: &mut Vec<String>) {
             | "openai_images"
             | "openai_audio_speech"
             | "openai_audio_transcriptions"
+            | "openai_audio_generations"
     ) {
         errors.push(format!(
             "{} adapter.response_normalization is unsupported: {}",
             model.model_id, adapter.response_normalization
         ));
     }
-    if model.model_class == "embedding" && adapter.response_normalization != "openai_embeddings" {
+    if model.model_class == MODEL_CLASS_EMBEDDING
+        && adapter.response_normalization != "openai_embeddings"
+    {
         errors.push(format!(
             "{} embedding model must use adapter.response_normalization openai_embeddings",
             model.model_id
         ));
     }
-    if adapter.response_normalization == "openai_embeddings" && model.model_class != "embedding" {
+    if adapter.response_normalization == "openai_embeddings"
+        && model.model_class != MODEL_CLASS_EMBEDDING
+    {
         errors.push(format!(
             "{} adapter.response_normalization openai_embeddings is only allowed for model_class embedding",
             model.model_id
         ));
     }
-    if model.model_class == "image-generation" && adapter.response_normalization != "openai_images"
+    if model.model_class == MODEL_CLASS_IMAGE_GENERATION
+        && adapter.response_normalization != "openai_images"
     {
         errors.push(format!(
             "{} image-generation model must use adapter.response_normalization openai_images",
             model.model_id
         ));
     }
-    if adapter.response_normalization == "openai_images" && model.model_class != "image-generation"
+    if adapter.response_normalization == "openai_images"
+        && model.model_class != MODEL_CLASS_IMAGE_GENERATION
     {
         errors.push(format!(
             "{} adapter.response_normalization openai_images is only allowed for model_class image-generation",
             model.model_id
         ));
     }
-    if model.model_class == "tts" && adapter.response_normalization != "openai_audio_speech" {
+    if model.model_class == MODEL_CLASS_TTS
+        && adapter.response_normalization != "openai_audio_speech"
+    {
         errors.push(format!(
             "{} tts model must use adapter.response_normalization openai_audio_speech",
             model.model_id
         ));
     }
-    if adapter.response_normalization == "openai_audio_speech" && model.model_class != "tts" {
+    if adapter.response_normalization == "openai_audio_speech"
+        && model.model_class != MODEL_CLASS_TTS
+    {
         errors.push(format!(
             "{} adapter.response_normalization openai_audio_speech is only allowed for model_class tts",
             model.model_id
         ));
     }
-    if model.model_class == "stt" && adapter.response_normalization != "openai_audio_transcriptions"
+    if model.model_class == MODEL_CLASS_STT
+        && adapter.response_normalization != "openai_audio_transcriptions"
     {
         errors.push(format!(
             "{} stt model must use adapter.response_normalization openai_audio_transcriptions",
             model.model_id
         ));
     }
-    if adapter.response_normalization == "openai_audio_transcriptions" && model.model_class != "stt"
+    if adapter.response_normalization == "openai_audio_transcriptions"
+        && model.model_class != MODEL_CLASS_STT
     {
         errors.push(format!(
             "{} adapter.response_normalization openai_audio_transcriptions is only allowed for model_class stt",
             model.model_id
         ));
     }
+    if matches!(
+        model.model_class.as_str(),
+        MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
+    ) && adapter.response_normalization != "openai_audio_generations"
+    {
+        errors.push(format!(
+            "{} {} model must use adapter.response_normalization openai_audio_generations",
+            model.model_id, model.model_class
+        ));
+    }
+    if adapter.response_normalization == "openai_audio_generations"
+        && !matches!(
+            model.model_class.as_str(),
+            MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
+        )
+    {
+        errors.push(format!(
+            "{} adapter.response_normalization openai_audio_generations is only allowed for model_class audio-generation or music-generation",
+            model.model_id
+        ));
+    }
 }
 
 fn valid_adapter_modality(modality: &str) -> bool {
-    matches!(modality, "text" | "embedding" | "image" | "audio")
+    matches!(modality, "text" | "embedding" | "image" | "video" | "audio")
 }
 
 fn adapter_modality_allowed(model: &CatalogModel, modality: &str) -> bool {
@@ -2289,6 +2407,102 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("requires verification_tolerance_bps")));
+
+        let embedding = verification_test_model(
+            "admin/embedding@fixture",
+            MODEL_CLASS_EMBEDDING,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-embedding-v1".to_owned(),
+                match_min: 0.98,
+                verification_method: VERIFICATION_EMBEDDING_COSINE.to_owned(),
+                verification_tolerance_bps: Some(25),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-embedding".to_owned(), vec![0.1, 0.2, 0.3])]),
+                )]),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_model(&embedding, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut attested_embedding = embedding.clone();
+        attested_embedding.canary.verification_method =
+            VERIFICATION_ATTESTATION_OF_COMPUTE.to_owned();
+        attested_embedding.canary.verification_tolerance_bps = None;
+        attested_embedding.canary.embedding_vectors.clear();
+        let mut errors = Vec::new();
+        validate_model(&attested_embedding, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains(
+                "launch model_class embedding requires output canary method embedding_cosine",
+            )
+        }));
+
+        let stt = verification_test_model(
+            "admin/stt@fixture",
+            MODEL_CLASS_STT,
+            "whisper.cpp",
+            CanaryRef {
+                set_id: "canary-stt-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TRANSCRIPT_MATCH.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-audio".to_owned(), "hello mayhem".to_owned())]),
+                )]),
+                audio_fingerprints: BTreeMap::new(),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_model(&stt, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let audio = verification_test_model(
+            "admin/music@fixture",
+            MODEL_CLASS_MUSIC_GENERATION,
+            "comfyui",
+            CanaryRef {
+                set_id: "canary-music-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_AUDIO_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-audio".to_owned(), "c".repeat(64))]),
+                )]),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_model(&audio, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut attested_audio = audio.clone();
+        attested_audio.canary.verification_method = VERIFICATION_ATTESTATION_OF_COMPUTE.to_owned();
+        attested_audio.canary.audio_fingerprints.clear();
+        let mut errors = Vec::new();
+        validate_model(&attested_audio, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains(
+                "launch model_class music-generation requires output canary method audio_fingerprint"
+            )
+        }));
     }
 
     #[test]
@@ -2530,13 +2744,22 @@ mod tests {
         canary: CanaryRef,
     ) -> CatalogModel {
         let output_modality = match model_class {
-            "embedding" => "embedding",
-            "image-generation" => "image",
+            MODEL_CLASS_EMBEDDING => "embedding",
+            MODEL_CLASS_IMAGE_GENERATION => "image",
+            MODEL_CLASS_VIDEO_GENERATION => "video",
+            MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
+                "audio"
+            }
             _ => "text",
         };
         let request_shape_family = match model_class {
-            "embedding" => "openai_embeddings",
-            "image-generation" => "openai_images",
+            MODEL_CLASS_EMBEDDING => "openai_embeddings",
+            MODEL_CLASS_IMAGE_GENERATION => "openai_images",
+            MODEL_CLASS_TTS => "openai_audio_speech",
+            MODEL_CLASS_STT => "openai_audio_transcriptions",
+            MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
+                "openai_audio_generations"
+            }
             _ => "openai_chat",
         };
         let response_normalization = request_shape_family;
@@ -2591,9 +2814,12 @@ mod tests {
                 json: model_class == DEFAULT_MODEL_CLASS,
                 ctx_max: 1024,
                 vision: false,
-                image: model_class == "image-generation",
-                video: false,
-                audio: false,
+                image: model_class == MODEL_CLASS_IMAGE_GENERATION,
+                video: model_class == MODEL_CLASS_VIDEO_GENERATION,
+                audio: matches!(
+                    model_class,
+                    MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION
+                ),
                 output_modality: Some(output_modality.to_owned()),
                 output_modalities: vec![output_modality.to_owned()],
             },

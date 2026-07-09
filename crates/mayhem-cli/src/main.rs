@@ -129,6 +129,19 @@ const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
 const RELEASE_SIGNATURE_FILE_SUFFIX: &str = ".sig";
 const CONTRACT_SIGNING_MESSAGE_VERSION: u32 = 2;
 const PROVIDER_ACCEPTED_RAIL_ORDER: [&str; 3] = ["fiat", "tap", "tnk"];
+const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
+const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
+const CANARY_VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
+const CANARY_VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
+const CANARY_VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
+const CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
+const MODEL_CLASS_EMBEDDING: &str = "embedding";
+const MODEL_CLASS_IMAGE_GENERATION: &str = "image-generation";
+const MODEL_CLASS_VIDEO_GENERATION: &str = "video-generation";
+const MODEL_CLASS_TTS: &str = "tts";
+const MODEL_CLASS_STT: &str = "stt";
+const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
+const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
@@ -11214,6 +11227,23 @@ fn catalog_canary_plan_sign_options(
     }))
 }
 
+fn required_launch_output_canary_method(model: &catalog::CatalogModel) -> Option<&'static str> {
+    if model.tier != "launch" {
+        return None;
+    }
+    match model.model_class.as_str() {
+        MODEL_CLASS_EMBEDDING => Some(CANARY_VERIFICATION_EMBEDDING_COSINE),
+        MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_VIDEO_GENERATION => {
+            Some(CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH)
+        }
+        MODEL_CLASS_STT => Some(CANARY_VERIFICATION_TRANSCRIPT_MATCH),
+        MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
+            Some(CANARY_VERIFICATION_AUDIO_FINGERPRINT)
+        }
+        _ => None,
+    }
+}
+
 fn catalog_canary_evidence(args: CatalogCanaryEvidenceArgs) -> Result<()> {
     let catalog_path = args
         .catalog_path
@@ -11396,13 +11426,16 @@ fn catalog_canary_evidence_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
-        if model.canary.verification_method == "attestation_of_compute" {
+        let required_output_method = required_launch_output_canary_method(model);
+        if model.canary.verification_method == CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE
+            && required_output_method.is_none()
+        {
             continue;
         }
         let canary_check = canary_set_matrix_check(
             &canaries_dir,
             &model.canary.set_id,
-            model.canary.verification_method == "token_fingerprint",
+            model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
         );
         let canary_set_sha256 = match canary_set_file_sha256(&canaries_dir, &model.canary.set_id) {
             Ok(hash) => Some(hash),
@@ -11414,6 +11447,14 @@ fn catalog_canary_evidence_report(
         };
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
+            if let Some(required_method) = required_output_method {
+                if model.canary.verification_method != required_method {
+                    entry_errors.push(format!(
+                        "launch model_class {} requires output canary method {}, not {}",
+                        model.model_class, required_method, model.canary.verification_method
+                    ));
+                }
+            }
             if let Err(err) = &canary_check {
                 entry_errors.push(err.clone());
             }
@@ -12126,16 +12167,27 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
         if launch_only && model.tier != "launch" {
             continue;
         }
-        if model.canary.verification_method == "attestation_of_compute" {
+        let required_output_method = required_launch_output_canary_method(model);
+        if model.canary.verification_method == CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE
+            && required_output_method.is_none()
+        {
             continue;
         }
         let canary_check = canary_set_matrix_check(
             &canaries_dir,
             &model.canary.set_id,
-            model.canary.verification_method == "token_fingerprint",
+            model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
         );
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
+            if let Some(required_method) = required_output_method {
+                if model.canary.verification_method != required_method {
+                    entry_errors.push(format!(
+                        "launch model_class {} requires output canary method {}, not {}; update the catalog canary method and calibrate real per-backend values before applying reports",
+                        model.model_class, required_method, model.canary.verification_method
+                    ));
+                }
+            }
             if let Err(err) = &canary_check {
                 entry_errors.push(err.clone());
             }
@@ -12455,8 +12507,16 @@ fn catalog_canary_matrix_report(
             let mut embedding_vector_count = None;
             let mut transcript_count = None;
             let mut audio_fingerprint_count = None;
+            if let Some(required_method) = required_launch_output_canary_method(model) {
+                if model.canary.verification_method != required_method {
+                    entry_errors.push(format!(
+                        "launch model_class {} requires output canary method {}, not {}",
+                        model.model_class, required_method, model.canary.verification_method
+                    ));
+                }
+            }
             let calibration_status = match model.canary.verification_method.as_str() {
-                "token_fingerprint" => {
+                CANARY_VERIFICATION_TOKEN_FINGERPRINT => {
                     match fingerprint.as_deref() {
                         Some(value) if is_hex_len(value, 64) => {}
                         Some(_) => entry_errors.push(format!(
@@ -12495,7 +12555,7 @@ fn catalog_canary_matrix_report(
                         }
                     }
                 }
-                "seed_perceptual_hash" => {
+                CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => {
                     match model.canary.perceptual_hashes.get(artifact_name) {
                         Some(hashes) => {
                             perceptual_hash_count = Some(hashes.len());
@@ -12511,7 +12571,7 @@ fn catalog_canary_matrix_report(
                     }
                     "seed-perceptual-hash-calibrated"
                 }
-                "embedding_cosine" => {
+                CANARY_VERIFICATION_EMBEDDING_COSINE => {
                     match model.canary.embedding_vectors.get(artifact_name) {
                         Some(vectors) => {
                             embedding_vector_count = Some(vectors.len());
@@ -12538,7 +12598,7 @@ fn catalog_canary_matrix_report(
                     }
                     "embedding-cosine-calibrated"
                 }
-                "transcript_match" => {
+                CANARY_VERIFICATION_TRANSCRIPT_MATCH => {
                     match model.canary.transcripts.get(artifact_name) {
                         Some(transcripts) => {
                             transcript_count = Some(transcripts.len());
@@ -12565,7 +12625,7 @@ fn catalog_canary_matrix_report(
                     }
                     "transcript-match-calibrated"
                 }
-                "audio_fingerprint" => {
+                CANARY_VERIFICATION_AUDIO_FINGERPRINT => {
                     match model.canary.audio_fingerprints.get(artifact_name) {
                         Some(fingerprints) => {
                             audio_fingerprint_count = Some(fingerprints.len());
@@ -12592,7 +12652,7 @@ fn catalog_canary_matrix_report(
                     }
                     "audio-fingerprint-calibrated"
                 }
-                "attestation_of_compute" => {
+                CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE => {
                     if fingerprint.is_some()
                         || model.canary.token_prefixes.contains_key(artifact_name)
                         || model.canary.perceptual_hashes.contains_key(artifact_name)
@@ -52481,11 +52541,13 @@ State initialization...
             true,
         );
 
-        assert!(report.ok, "{:?}", report.errors);
+        assert!(!report.ok);
         assert_eq!(
             report.entries[0].calibration_status,
             "attestation-of-compute-descriptor"
         );
+        assert!(report.errors.iter().any(|error| error
+            .contains("launch model_class stt requires output canary method transcript_match")));
     }
 
     #[test]
