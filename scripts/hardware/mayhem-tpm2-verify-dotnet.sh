@@ -28,7 +28,10 @@ mkdir -p "$helper_root"
 csproj="$helper_root/MayhemTpm2Verify.csproj"
 program="$helper_root/Program.cs"
 
-cat >"$csproj.tmp" <<XML
+csproj_tmp="$(mktemp "$helper_root/MayhemTpm2Verify.csproj.XXXXXX")"
+program_tmp="$(mktemp "$helper_root/Program.cs.XXXXXX")"
+
+cat >"$csproj_tmp" <<XML
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -41,13 +44,13 @@ cat >"$csproj.tmp" <<XML
   </ItemGroup>
 </Project>
 XML
-if [ ! -f "$csproj" ] || ! cmp -s "$csproj.tmp" "$csproj"; then
-  mv "$csproj.tmp" "$csproj"
+if [ ! -f "$csproj" ] || ! cmp -s "$csproj_tmp" "$csproj"; then
+  mv "$csproj_tmp" "$csproj"
 else
-  rm "$csproj.tmp"
+  rm -f "$csproj_tmp"
 fi
 
-cat >"$program.tmp" <<'CS'
+cat >"$program_tmp" <<'CS'
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -481,10 +484,10 @@ catch (Exception ex)
     Environment.ExitCode = 0;
 }
 CS
-if [ ! -f "$program" ] || ! cmp -s "$program.tmp" "$program"; then
-  mv "$program.tmp" "$program"
+if [ ! -f "$program" ] || ! cmp -s "$program_tmp" "$program"; then
+  mv "$program_tmp" "$program"
 else
-  rm "$program.tmp"
+  rm -f "$program_tmp"
 fi
 
 dotnet restore "$csproj" --nologo >/dev/null
