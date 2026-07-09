@@ -26625,6 +26625,13 @@ struct ProviderCandidate {
 }
 
 #[derive(Debug, Clone)]
+struct ProviderJoinContextTerms {
+    served_ctx: u64,
+    ctx_bracket: Option<String>,
+    ctx_bracket_table_ver: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
 struct ProviderAutoFitSelection {
     candidates: Vec<ProviderCandidate>,
     total_required_bytes: u64,
@@ -28541,12 +28548,14 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     write_provider_load_progress_stage(&args, "join canonical rooms", "register", "running", 0);
     let provider_feature =
         ensure_provider_registered(&rpc, &keypair_path, &password, &wallet, args.sim).await?;
+    let serve_terms = provider_join_context_terms_for_candidate(&selected)?;
     let serve_feature = ensure_joined_enclave(
         &rpc,
         &keypair_path,
         &password,
         &wallet,
         &selected.enclave,
+        &serve_terms,
         Some(&hardware_fingerprint),
         device_key.as_deref(),
         args.sim,
@@ -29617,7 +29626,26 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let ctx = provider_tx_context(&args.tx).await?;
     let contract = read_contract_catalog(&ctx.rpc).await?;
     let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
-    let price = require_current_au_usd_price(&contract.prices, &enclave.enclave_id)?;
+    let served_ctx = u64::from(gateway_caps_from_contract(&enclave.caps).ctx);
+    let price_ctx_bracket = price_ctx_bracket_for_model_class(
+        &enclave.model_class,
+        served_ctx,
+        &contract.ctx_bracket_schedule,
+        unix_epoch_seconds()?,
+    )?;
+    let price = find_current_au_usd_price_schedule(
+        &contract.prices,
+        &enclave.enclave_id,
+        price_ctx_bracket.as_deref(),
+    )
+    .with_context(|| {
+        format!(
+            "enclave {} has no current au_usd admin price for provider context {}; ask the admin to run `mayhem admin set-price` before providers join it",
+            enclave.enclave_id,
+            price_ctx_bracket.as_deref().unwrap_or("base")
+        )
+    })?;
+    let serve_terms = provider_join_context_terms_from_price(&enclave, served_ctx, price)?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
     let hardware_fingerprint = current_provider_hardware_fingerprint();
     let provider_feature = ensure_provider_registered(
@@ -29634,6 +29662,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         &ctx.password,
         &ctx.wallet,
         &enclave,
+        &serve_terms,
         Some(&hardware_fingerprint),
         None,
         args.tx.sim,
@@ -29905,7 +29934,7 @@ fn provider_lifecycle_intent(
     enclave_id: Option<&str>,
     room_id: Option<&str>,
 ) -> Result<Value> {
-    provider_lifecycle_intent_with_anchors(provider, op, enclave_id, room_id, None, None)
+    provider_lifecycle_intent_with_anchors(provider, op, enclave_id, room_id, None, None, None)
 }
 
 fn provider_lifecycle_intent_with_anchors(
@@ -29915,6 +29944,7 @@ fn provider_lifecycle_intent_with_anchors(
     room_id: Option<&str>,
     hardware_fingerprint: Option<&str>,
     device_key: Option<&str>,
+    join_terms: Option<&ProviderJoinContextTerms>,
 ) -> Result<Value> {
     let nonce = provider_lifecycle_nonce(provider, op, enclave_id, room_id)?;
     let mut value = match (enclave_id, room_id) {
@@ -29939,6 +29969,17 @@ fn provider_lifecycle_intent_with_anchors(
         (None, Some(_)) => bail!("room lifecycle intent requires enclave_id"),
     };
     if op == "join_enclave" {
+        let join_terms =
+            join_terms.context("join_enclave lifecycle intent requires committed context terms")?;
+        value["served_ctx"] = json!(join_terms.served_ctx);
+        value["ctx_bracket"] = match &join_terms.ctx_bracket {
+            Some(ctx_bracket) => json!(ctx_bracket),
+            None => Value::Null,
+        };
+        value["ctx_bracket_table_ver"] = match join_terms.ctx_bracket_table_ver {
+            Some(ctx_bracket_table_ver) => json!(ctx_bracket_table_ver),
+            None => Value::Null,
+        };
         if let Some(fingerprint) = hardware_fingerprint {
             if !is_hex_len(fingerprint, 64) {
                 bail!("provider hardware fingerprint must be a 32-byte hex digest");
@@ -30046,6 +30087,51 @@ fn price_ctx_bracket_for_model_class(
             )
         })?;
     Ok(Some(ctx_bracket))
+}
+
+fn provider_join_context_terms_from_price(
+    enclave: &LedgerEnclave,
+    served_ctx: u64,
+    price: &LedgerPriceSchedule,
+) -> Result<ProviderJoinContextTerms> {
+    let current = current_au_usd_price(price).with_context(|| {
+        format!(
+            "enclave {} has no current au_usd admin price",
+            enclave.enclave_id
+        )
+    })?;
+    if enclave.model_class == DEFAULT_MODEL_CLASS {
+        let ctx_bracket = current
+            .ctx_bracket
+            .clone()
+            .context("text-generation provider join price is missing context bracket")?;
+        let ctx_bracket_table_ver = current.ctx_bracket_table_ver.context(
+            "text-generation provider join price is missing context bracket table version",
+        )?;
+        return Ok(ProviderJoinContextTerms {
+            served_ctx,
+            ctx_bracket: Some(ctx_bracket),
+            ctx_bracket_table_ver: Some(ctx_bracket_table_ver),
+        });
+    }
+    if current.ctx_bracket.is_some() || current.ctx_bracket_table_ver.is_some() {
+        bail!("non-text provider join price has unexpected context-bracket terms");
+    }
+    Ok(ProviderJoinContextTerms {
+        served_ctx,
+        ctx_bracket: None,
+        ctx_bracket_table_ver: None,
+    })
+}
+
+fn provider_join_context_terms_for_candidate(
+    selected: &ProviderCandidate,
+) -> Result<ProviderJoinContextTerms> {
+    let price = selected
+        .price
+        .as_ref()
+        .context("selected provider enclave has no current admin price")?;
+    provider_join_context_terms_from_price(&selected.enclave, selected.served_ctx, price)
 }
 
 fn admin_role_marker_ok(role: Option<&str>) -> bool {
@@ -34340,6 +34426,24 @@ fn read_optional_token(path: Option<&Path>) -> Result<Option<String>> {
         .filter(|value| !value.is_empty()))
 }
 
+fn serve_state_matches_context_terms(
+    existing: &Value,
+    serve_terms: &ProviderJoinContextTerms,
+) -> bool {
+    if existing.get("served_ctx").and_then(Value::as_u64) != Some(serve_terms.served_ctx) {
+        return false;
+    }
+    let existing_ctx_bracket = existing.get("ctx_bracket").and_then(Value::as_str);
+    if existing_ctx_bracket != serve_terms.ctx_bracket.as_deref() {
+        return false;
+    }
+    let existing_ctx_bracket_table_ver = existing
+        .get("ctx_bracket_table_ver")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    existing_ctx_bracket_table_ver == serve_terms.ctx_bracket_table_ver
+}
+
 fn seal_provider_artifact(
     artifact_path: &Path,
     sealed_store: &Path,
@@ -34438,6 +34542,7 @@ async fn ensure_joined_enclave(
     password: &str,
     wallet: &WalletInfo,
     enclave: &LedgerEnclave,
+    serve_terms: &ProviderJoinContextTerms,
     hardware_fingerprint: Option<&str>,
     device_key: Option<&str>,
     sim: bool,
@@ -34445,6 +34550,12 @@ async fn ensure_joined_enclave(
     let key = format!("serve/{}/{}", wallet.public_key, enclave.enclave_id);
     if let Some(existing) = read_state_value(rpc, &key).await? {
         if existing.get("status").and_then(Value::as_str) == Some("active") {
+            if !serve_state_matches_context_terms(&existing, serve_terms) {
+                bail!(
+                    "provider is already joined to enclave {} with missing or different committed context terms; leave and rejoin before serving paid sessions",
+                    enclave.enclave_id
+                );
+            }
             return Ok(
                 json!({ "skipped": true, "reason": "already_joined_enclave", "state": existing }),
             );
@@ -34463,6 +34574,7 @@ async fn ensure_joined_enclave(
         None,
         hardware_fingerprint,
         device_key,
+        Some(serve_terms),
     )
     .await?;
     if sim {
@@ -34610,7 +34722,8 @@ async fn submit_provider_lifecycle_feature(
     enclave_id: Option<&str>,
     room_id: Option<&str>,
 ) -> Result<Value> {
-    submit_provider_lifecycle_feature_with_anchors(ctx, op, enclave_id, room_id, None, None).await
+    submit_provider_lifecycle_feature_with_anchors(ctx, op, enclave_id, room_id, None, None, None)
+        .await
 }
 
 async fn submit_provider_lifecycle_feature_with_anchors(
@@ -34620,6 +34733,7 @@ async fn submit_provider_lifecycle_feature_with_anchors(
     room_id: Option<&str>,
     hardware_fingerprint: Option<&str>,
     device_key: Option<&str>,
+    join_terms: Option<&ProviderJoinContextTerms>,
 ) -> Result<Value> {
     let intent = provider_lifecycle_intent_with_anchors(
         &ctx.wallet.public_key,
@@ -34628,6 +34742,7 @@ async fn submit_provider_lifecycle_feature_with_anchors(
         room_id,
         hardware_fingerprint,
         device_key,
+        join_terms,
     )?;
     let sig = sign_message(
         ctx.keypair_path,
@@ -43647,6 +43762,24 @@ mod tests {
                 "nonce": enclave["nonce"].as_str().unwrap(),
             })
         );
+        let join_terms = ProviderJoinContextTerms {
+            served_ctx: 8192,
+            ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
+            ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
+        };
+        let join = provider_lifecycle_intent_with_anchors(
+            &provider,
+            "join_enclave",
+            Some("enclave-a"),
+            None,
+            None,
+            None,
+            Some(&join_terms),
+        )
+        .expect("join intent");
+        assert_eq!(join["served_ctx"], 8192);
+        assert_eq!(join["ctx_bracket"], ctx_bracket_for_tokens(8192));
+        assert_eq!(join["ctx_bracket_table_ver"], CTX_BRACKET_TABLE_VERSION);
     }
 
     #[test]

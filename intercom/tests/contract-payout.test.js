@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import MayhemContract from '../contract/contract.js';
+import MayhemContract, { SESSION_RECEIPT_SCHEMA_VERSION } from '../contract/contract.js';
 import { recomputeEpoch } from '../scripts/recompute-epoch-roots.mjs';
 import {
   MemoryStorage,
@@ -99,7 +99,7 @@ const receiptBundle = (user, provider, overrides = {}) => ({
   deposits: [],
   receipts: [
     {
-      schema_version: 1,
+      schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
       session_id: 'session-payout-rollup-1',
       seq: 1,
       final: true,
@@ -110,8 +110,13 @@ const receiptBundle = (user, provider, overrides = {}) => ({
       model_id: modelId,
       price_ver: 1,
       locked_rate_map: payoutLockedRateMap,
+      locked_per_req_au: '0',
+      locked_min_session_au: '0',
+      served_ctx: 8192,
+      ctx_bracket: 'le8k',
+      ctx_bracket_table_ver: 1,
       rules_ver: 1,
-      usage: { in: 100, out: 250 },
+      usage: { input_token: 100, output_token: 250 },
       au_owed_cum: '2000000',
       prompt_hash: 'a'.repeat(64),
       ts: 3_600,

@@ -1161,7 +1161,12 @@ class MayhemContract extends Contract {
           intent.enclave_id,
           key,
           intent.hardware_fingerprint ?? null,
-          intent.device_key ?? null
+          intent.device_key ?? null,
+          {
+            served_ctx: intent.served_ctx,
+            ctx_bracket: intent.ctx_bracket,
+            ctx_bracket_table_ver: intent.ctx_bracket_table_ver,
+          }
         );
       case 'leave_enclave':
         return await this.applyLeaveEnclave(intent.provider, intent.enclave_id, key);
@@ -1207,6 +1212,8 @@ class MayhemContract extends Contract {
     if (!serve || serve.status !== 'active') {
       return new Error('Provider is not actively serving this admin enclave.');
     }
+    const serveTermsError = this.validateCommittedServeTerms(serve, normalized);
+    if (serveTermsError) return serveTermsError;
     const priceCtxBracket = normalized.ctx_bracket ?? null;
     const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id, priceCtxBracket);
     if (priceError) return priceError;
@@ -2490,21 +2497,39 @@ class MayhemContract extends Contract {
     const shapeError = this.validateExactCommandValue(
       ['op', 'enclave_id'],
       'join_enclave',
-      ['hardware_fingerprint', 'device_key']
+      ['hardware_fingerprint', 'device_key', 'served_ctx', 'ctx_bracket', 'ctx_bracket_table_ver']
     );
     if (shapeError) return shapeError;
     if (!this.isSafeKeyPart(this.value.enclave_id)) return new Error('Invalid enclave id.');
+    const hasServeTerms =
+      hasOwn(this.value, 'served_ctx') ||
+      hasOwn(this.value, 'ctx_bracket') ||
+      hasOwn(this.value, 'ctx_bracket_table_ver');
 
     return this.applyJoinEnclave(
       this.address,
       this.value.enclave_id,
       this.tx,
       this.value.hardware_fingerprint ?? null,
-      this.value.device_key ?? null
+      this.value.device_key ?? null,
+      hasServeTerms
+        ? {
+            served_ctx: this.value.served_ctx,
+            ctx_bracket: this.value.ctx_bracket,
+            ctx_bracket_table_ver: this.value.ctx_bracket_table_ver,
+          }
+        : null
     );
   }
 
-  async applyJoinEnclave(providerId, enclaveId, stamp, hardwareFingerprint = null, deviceKey = null) {
+  async applyJoinEnclave(
+    providerId,
+    enclaveId,
+    stamp,
+    hardwareFingerprint = null,
+    deviceKey = null,
+    serveTerms = null
+  ) {
     const consentError = await this.requireConsent(providerId);
     if (consentError) return consentError;
     const providerError = await this.requireProvider(providerId);
@@ -2521,7 +2546,16 @@ class MayhemContract extends Contract {
     if (enclave.status !== 'active') return new Error('Enclave is not active.');
     const enclaveRoleError = this.requireAdminCreatedEnclave(enclave);
     if (enclaveRoleError) return enclaveRoleError;
-    const priceError = await this.requireCurrentAdminPrice(enclaveId);
+    const normalizedServeTerms = await this.normalizeProviderServeTerms(
+      enclaveId,
+      serveTerms,
+      'provider serve'
+    );
+    if (normalizedServeTerms instanceof Error) return normalizedServeTerms;
+    const priceError = await this.requireCurrentAdminPrice(
+      enclaveId,
+      normalizedServeTerms?.ctx_bracket ?? null
+    );
     if (priceError) return priceError;
     const minTierPolicy = await this.enclaveMinTierPolicy(enclave);
     if (enclave.att_tier < minTierPolicy.min_att_tier) {
@@ -2570,6 +2604,7 @@ class MayhemContract extends Contract {
       enclave_id: enclaveId,
       model_id: enclave.model_id,
       status: 'active',
+      ...(normalizedServeTerms ?? {}),
       ...(hardwareFingerprint !== null ? { hardware_fingerprint: hardwareFingerprint } : {}),
       ...(deviceKey !== null ? { device_key: deviceKey } : {}),
       ...(fingerprintReview !== null ? { fingerprint_review: fingerprintReview } : {}),
@@ -2680,7 +2715,7 @@ class MayhemContract extends Contract {
     if (enclaveRoleError) return enclaveRoleError;
     const roomRoleError = this.requireAdminCreatedRoom(room);
     if (roomRoleError) return roomRoleError;
-    const priceError = await this.requireCurrentAdminPrice(enclaveId);
+    const priceError = await this.requireCurrentAdminPrice(enclaveId, serving.ctx_bracket ?? null);
     if (priceError) return priceError;
     if (room.enclave_id !== enclaveId) {
       return new Error('Room enclave does not match served enclave.');
@@ -5543,10 +5578,20 @@ class MayhemContract extends Contract {
       : intent.op === 'join_room' || intent.op === 'leave_room'
         ? ['op', 'provider', 'enclave_id', 'room_id', 'nonce']
         : intent.op === 'join_enclave'
-          ? ['op', 'provider', 'enclave_id', 'nonce', 'hardware_fingerprint', 'device_key']
+          ? [
+              'op',
+              'provider',
+              'enclave_id',
+              'nonce',
+              'served_ctx',
+              'ctx_bracket',
+              'ctx_bracket_table_ver',
+              'hardware_fingerprint',
+              'device_key',
+            ]
         : ['op', 'provider', 'enclave_id', 'nonce'];
     const required = intent.op === 'join_enclave'
-      ? ['op', 'provider', 'enclave_id', 'nonce']
+      ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'ctx_bracket', 'ctx_bracket_table_ver']
       : allowed;
     const allowedSet = new Set(allowed);
     const unknown = Object.keys(intent).filter((key) => !allowedSet.has(key)).sort();
@@ -5564,11 +5609,78 @@ class MayhemContract extends Contract {
     if (hasOwn(intent, 'room_id') && !this.isSafeKeyPart(intent.room_id)) {
       return new Error('Invalid room id.');
     }
+    if (
+      hasOwn(intent, 'served_ctx') &&
+      (!Number.isSafeInteger(intent.served_ctx) || intent.served_ctx < 0)
+    ) {
+      return new Error('Invalid provider served context.');
+    }
+    if (
+      hasOwn(intent, 'ctx_bracket') &&
+      intent.ctx_bracket !== null &&
+      !this.isSafeKeyPart(intent.ctx_bracket)
+    ) {
+      return new Error('Invalid provider context bracket.');
+    }
+    if (
+      hasOwn(intent, 'ctx_bracket_table_ver') &&
+      intent.ctx_bracket_table_ver !== null &&
+      (!Number.isSafeInteger(intent.ctx_bracket_table_ver) || intent.ctx_bracket_table_ver < 1)
+    ) {
+      return new Error('Invalid provider context bracket table version.');
+    }
     if (hasOwn(intent, 'hardware_fingerprint') && !this.isHexBytes(intent.hardware_fingerprint, 32)) {
       return new Error('Invalid provider hardware fingerprint.');
     }
     if (hasOwn(intent, 'device_key') && !this.isHexBytes(intent.device_key, 32)) {
       return new Error('Invalid provider device key.');
+    }
+    return null;
+  }
+
+  async normalizeProviderServeTerms(enclaveId, terms, label) {
+    if (terms === null || terms === undefined) return null;
+    if (!terms || typeof terms !== 'object' || Array.isArray(terms)) {
+      return new Error(`${label} terms must be an object.`);
+    }
+    for (const field of ['served_ctx', 'ctx_bracket', 'ctx_bracket_table_ver']) {
+      if (!hasOwn(terms, field)) return new Error(`${label} terms are missing ${field}.`);
+    }
+    if (!Number.isSafeInteger(terms.served_ctx) || terms.served_ctx < 0) {
+      return new Error(`Invalid ${label} served context.`);
+    }
+    const table = terms.ctx_bracket_table_ver === null || terms.ctx_bracket_table_ver === undefined
+      ? null
+      : await this.ctxBracketTableByVersion(terms.ctx_bracket_table_ver);
+    if (table instanceof Error) return table;
+    const ctxMeta = await this.normalizeCtxBracketEvidenceForEnclave(
+      enclaveId,
+      terms.served_ctx,
+      terms.ctx_bracket,
+      terms.ctx_bracket_table_ver,
+      table,
+      label
+    );
+    if (ctxMeta instanceof Error) return ctxMeta;
+    return {
+      served_ctx: terms.served_ctx,
+      ctx_bracket: ctxMeta.ctx_bracket,
+      ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+    };
+  }
+
+  validateCommittedServeTerms(serve, normalized) {
+    if (!Number.isSafeInteger(serve.served_ctx) || serve.served_ctx < 0) {
+      return new Error('Provider serve record is missing committed context terms.');
+    }
+    if (serve.served_ctx !== normalized.served_ctx) {
+      return new Error('Spend reservation served context does not match provider committed context.');
+    }
+    if ((serve.ctx_bracket ?? null) !== (normalized.ctx_bracket ?? null)) {
+      return new Error('Spend reservation context bracket does not match provider committed context.');
+    }
+    if ((serve.ctx_bracket_table_ver ?? null) !== (normalized.ctx_bracket_table_ver ?? null)) {
+      return new Error('Spend reservation context bracket table does not match provider committed context.');
     }
     return null;
   }

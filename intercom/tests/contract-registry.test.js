@@ -749,6 +749,9 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     op: 'join_enclave',
     provider: provider.publicKey,
     enclave_id: enclaveId,
+    served_ctx: 32768,
+    ctx_bracket: 'le32k',
+    ctx_bracket_table_ver: 1,
     nonce: 'b'.repeat(64),
   };
   await executeFeature(
@@ -763,7 +766,11 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     },
     admin.publicKey
   );
-  assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.status, 'active');
+  const serving = (await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value;
+  assert.equal(serving.status, 'active');
+  assert.equal(serving.served_ctx, 32768);
+  assert.equal(serving.ctx_bracket, 'le32k');
+  assert.equal(serving.ctx_bracket_table_ver, 1);
 
   const nonce = 'feature-room';
   const roomId = await deriveRoomId(enclaveId, admin.publicKey, nonce);
