@@ -21013,9 +21013,31 @@ fn resolve_pear_runtime_path() -> Result<PathBuf> {
     }
     if cfg!(target_os = "macos") {
         if let Ok(home) = env::var("HOME") {
-            let path = PathBuf::from(home).join(
-                "Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime",
-            );
+            let target = if cfg!(target_arch = "aarch64") {
+                "darwin-arm64"
+            } else {
+                "darwin-x64"
+            };
+            let path = PathBuf::from(home)
+                .join("Library/Application Support/pear/current/by-arch")
+                .join(target)
+                .join("bin/pear-runtime");
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+    if cfg!(target_os = "linux") {
+        if let Ok(home) = env::var("HOME") {
+            let target = if cfg!(target_arch = "aarch64") {
+                "linux-arm64"
+            } else {
+                "linux-x64"
+            };
+            let path = PathBuf::from(home)
+                .join(".config/pear/current/by-arch")
+                .join(target)
+                .join("bin/pear-runtime");
             if path.exists() {
                 return Ok(path);
             }
@@ -42641,21 +42663,22 @@ async fn run_wallet_helper<T>(args: Vec<String>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let helper = env::var_os("MAYHEM_WALLET_HELPER")
-        .map(PathBuf::from)
-        .map(absolutize)
-        .unwrap_or_else(|| repo_path("crates/mayhem-cli/src/wallet-helper.mjs"))?;
-    let node = env::var_os("MAYHEM_NODE_BIN").unwrap_or_else(|| "node".into());
-    let output = Command::new(&node)
-        .arg(&helper)
-        .args(args)
+    let (command, helper_args) = args
+        .split_first()
+        .context("wallet helper command is required")?;
+    let intercom_app = repo_path("intercom")?;
+    let pear_runtime = resolve_pear_runtime_path()?;
+    let output = Command::new(&pear_runtime)
+        .arg("run")
+        .arg(&intercom_app)
+        .arg(format!("--wallet-helper={command}"))
+        .args(helper_args)
         .output()
         .await
         .with_context(|| {
             format!(
-                "running wallet helper {} with {}",
-                helper.display(),
-                PathBuf::from(&node).display()
+                "running wallet helper via pear-runtime app {}",
+                intercom_app.display()
             )
         })?;
 
@@ -42663,14 +42686,15 @@ where
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "wallet helper failed (status {}): stderr={} stdout={}",
+            "Pear wallet helper failed (status {}): stderr={} stdout={}",
             output.status,
             stderr.trim(),
             stdout.trim()
         );
     }
 
-    serde_json::from_slice(&output.stdout).context("parsing wallet helper JSON output")
+    parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
+        .context("parsing Pear wallet helper JSON output")
 }
 
 fn write_config(
@@ -44403,11 +44427,10 @@ mod tests {
             created.ethereum_source.as_deref(),
             Some("imported_private_key")
         );
-        assert!(created
-            .ethereum_address
-            .as_deref()
-            .unwrap()
-            .starts_with("0x"));
+        assert_eq!(
+            created.ethereum_address.as_deref(),
+            Some("0xFCAd0B19bB29D4674531d6f115237E16AfCE377c")
+        );
 
         let backup = backup_wallet(&keypair_path, "old-pass").await.unwrap();
         assert_eq!(

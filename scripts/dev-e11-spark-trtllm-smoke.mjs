@@ -1517,7 +1517,10 @@ async function main() {
   const remoteHfToken = path.posix.join(remoteRun, 'secrets/hf.txt');
   const remoteMayhem = path.posix.join(remoteTargetDir, 'debug/mayhem');
   const remoteEnclave = path.posix.join(remoteTargetDir, 'debug/mayhem-enclave');
-  const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
+  const remotePear = path.posix.join(
+    remoteHome,
+    '.config/pear/current/by-arch/linux-arm64/bin/pear-runtime'
+  );
   const remoteEnvPrelude = process.env.MAYHEM_E11_REMOTE_ENV_PRELUDE || '';
   const remoteVllmEnvPrelude = process.env.MAYHEM_E11_VLLM_ENV_PRELUDE || '';
   const remoteShell = (body) => remoteEnvPrelude.trim()
@@ -1544,7 +1547,11 @@ async function main() {
     env: process.env,
   });
   const syncNodeModules = !/^(0|false|no)$/i.test(process.env.MAYHEM_E11_SYNC_NODE_MODULES || '1');
-  const remoteHasWalletDeps = (await ssh(remote, passFile, `test -d ${sh(path.posix.join(remoteRoot, 'intercom/node_modules/trac-wallet'))} && echo yes || true`)).stdout.trim() === 'yes';
+  const remoteHasWalletDeps = (await ssh(
+    remote,
+    passFile,
+    `test -d ${sh(path.posix.join(remoteRoot, 'intercom/node_modules/trac-wallet'))} && test -d ${sh(path.posix.join(remoteRoot, 'intercom/node_modules/trac-crypto-api'))} && test -d ${sh(path.posix.join(remoteRoot, 'intercom/node_modules/ethereum-cryptography'))} && echo yes || true`
+  )).stdout.trim() === 'yes';
   if (syncNodeModules && !remoteHasWalletDeps) {
     log('syncing intercom/node_modules to Spark for wallet-helper signing');
     await ssh(remote, passFile, `mkdir -p ${sh(path.posix.join(remoteRoot, 'intercom/node_modules'))}`);
@@ -1814,7 +1821,7 @@ async function main() {
     remoteShell([
       remoteVllmEnvPrelude,
       `cd ${sh(remoteRoot)}`,
-      `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} ${sh(remoteMayhem)} setup --home ${sh(remoteProviderHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${remoteAdminTunnelPort}/v1`)} --no-consent --yes --print-json > ${sh(remoteProviderSetupLog)} 2>&1`,
+      `MAYHEM_PEAR_RUNTIME=${sh(remotePear)} ${sh(remoteMayhem)} setup --home ${sh(remoteProviderHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${remoteAdminTunnelPort}/v1`)} --no-consent --yes --print-json > ${sh(remoteProviderSetupLog)} 2>&1`,
     ].filter(Boolean).join('\n')),
     { logFile: path.join(logsDir, 'remote-provider-setup.log'), timeoutMs: 180_000 }
   );
@@ -1829,8 +1836,7 @@ async function main() {
     `MAYHEM_VLLM_PYTHON=${sh(remoteVllmPython)}`,
     'MAYHEM_VLLM_REQUEST_TIMEOUT_SECS=900',
     `MAYHEM_PROVIDER_SESSION_REQUEST_TIMEOUT_MS=${envPositiveInt('MAYHEM_E11_PROVIDER_SESSION_REQUEST_TIMEOUT_MS', 15_000)}`,
-    `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)}`,
-    `MAYHEM_NODE_BIN=${sh(remoteNode)}`,
+    `MAYHEM_PEAR_RUNTIME=${sh(remotePear)}`,
     'PATH="$HOME/.cargo/bin:$PATH"',
   ].join(' ');
   const providerArgs = [

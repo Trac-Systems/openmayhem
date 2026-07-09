@@ -19,6 +19,18 @@ import MayhemFeature from '../features/mayhem/index.js';
 
 const { env, storeLabel, flags } = getPearRuntime();
 
+if (flags['wallet-helper']) {
+  try {
+    const { runWalletHelper } = await import('./wallet-helper.js');
+    const output = await runWalletHelper(flags);
+    console.log(JSON.stringify(output));
+    Bare.exit(0);
+  } catch (error) {
+    console.error(error?.message ?? error);
+    Bare.exit(1);
+  }
+}
+
 class MayhemWallet extends PeerWallet {
   get publicKey() {
     const publicKey = super.publicKey;

@@ -1451,10 +1451,8 @@ async function startRemoteProvider({
   remoteRun,
   remoteLogs,
   remoteHome,
-  remoteNode,
   remotePear,
   remoteMayhem,
-  remoteWalletHelper,
   remoteCatalog,
   remoteArtifact,
   remoteDownloadsDir,
@@ -1533,7 +1531,7 @@ async function startRemoteProvider({
     [
       prepareHome,
       `cd ${sh(remoteRoot)}`,
-      `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} ${sh(remoteMayhem)} setup --home ${sh(providerHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${adminRpcTunnelPort}/v1`)} --rules-ver 1 --rules-hash ${sh(rulesHash)} --yes --print-json > ${sh(providerSetupLog)} 2>&1`,
+      `MAYHEM_PEAR_RUNTIME=${sh(remotePear)} ${sh(remoteMayhem)} setup --home ${sh(providerHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${adminRpcTunnelPort}/v1`)} --rules-ver 1 --rules-hash ${sh(rulesHash)} --yes --print-json > ${sh(providerSetupLog)} 2>&1`,
     ].join(' && '),
     { timeoutMs: 180_000 }
   );
@@ -1571,8 +1569,7 @@ async function startRemoteProvider({
     [
       `MAYHEM_PROVIDER_SESSION_DEBUG=1`,
       ...deltaDelayEnv,
-      `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)}`,
-      `MAYHEM_NODE_BIN=${sh(remoteNode)}`,
+      `MAYHEM_PEAR_RUNTIME=${sh(remotePear)}`,
       `nohup ${sh(remoteMayhem)} provider start ${providerFlags.join(' ')} > ${sh(providerLog)} 2>&1 & echo $!`,
     ].join(' '),
   ].join(' && ');
@@ -1831,7 +1828,7 @@ async function main() {
     remote_path: path.posix.join(remoteDownloadsDir, providerSidecarCacheFile(artifactName, name, sidecar)),
   }));
   const remoteMayhem = path.posix.join(remoteRoot, 'target/debug/mayhem');
-  const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
+  const remoteIntercomWalletHelper = path.posix.join(remoteRoot, 'intercom/src/wallet-helper.js');
   const remoteRules = path.posix.join(remoteRoot, 'RULES.md');
   const remoteIntercomMain = path.posix.join(remoteRoot, 'intercom/src/main.js');
   const remoteScBridgeFeature = path.posix.join(remoteRoot, 'intercom/features/sc-bridge/index.js');
@@ -1850,7 +1847,7 @@ async function main() {
       '; command -v node || true',
     ].join(' ')
   )).stdout.trim().split(/\r?\n/).find(Boolean);
-  if (!remoteNode) fail('remote Mac mini has no usable node binary for wallet-helper.mjs');
+  if (!remoteNode) fail('remote Mac mini has no usable node binary for the optional dev DHT bootstrap');
 
   await ssh(
     remote,
@@ -1858,7 +1855,7 @@ async function main() {
     [
       `test -x ${sh(remotePear)}`,
       `test -d ${sh(path.posix.join(remoteRoot, 'intercom/node_modules'))}`,
-      `mkdir -p ${sh(path.posix.join(remoteRoot, 'target/debug'))} ${sh(path.posix.dirname(remoteArtifact))} ${sh(path.posix.dirname(remoteCatalog))} ${sh(path.posix.dirname(remoteWalletHelper))} ${sh(path.posix.dirname(remoteRules))} ${sh(path.posix.dirname(remoteIntercomMain))} ${sh(path.posix.dirname(remoteScBridgeFeature))} ${sh(path.posix.dirname(remoteDirectSessionFeature))} ${sh(remoteLogs)}`,
+      `mkdir -p ${sh(path.posix.join(remoteRoot, 'target/debug'))} ${sh(path.posix.dirname(remoteArtifact))} ${sh(path.posix.dirname(remoteCatalog))} ${sh(path.posix.dirname(remoteRules))} ${sh(path.posix.dirname(remoteIntercomMain))} ${sh(path.posix.dirname(remoteScBridgeFeature))} ${sh(path.posix.dirname(remoteDirectSessionFeature))} ${sh(remoteLogs)}`,
     ].join(' && ')
   );
 
@@ -1913,7 +1910,7 @@ async function main() {
       });
     }
   }
-  await scpTo(remote, passFile, path.join(ROOT, 'crates/mayhem-cli/src/wallet-helper.mjs'), remoteWalletHelper, { logFile: path.join(logsDir, 'scp-wallet-helper.log') });
+  await scpTo(remote, passFile, path.join(ROOT, 'intercom/src/wallet-helper.js'), remoteIntercomWalletHelper, { logFile: path.join(logsDir, 'scp-wallet-helper.log') });
   await scpTo(remote, passFile, path.join(ROOT, 'RULES.md'), remoteRules, { logFile: path.join(logsDir, 'scp-rules.log') });
   await scpTo(remote, passFile, path.join(ROOT, 'intercom/src/main.js'), remoteIntercomMain, { logFile: path.join(logsDir, 'scp-intercom-main.log') });
   await scpTo(remote, passFile, path.join(ROOT, 'intercom/features/sc-bridge/index.js'), remoteScBridgeFeature, { logFile: path.join(logsDir, 'scp-sc-bridge.log') });
@@ -2178,10 +2175,8 @@ async function main() {
     remoteRun,
     remoteLogs,
     remoteHome,
-    remoteNode,
     remotePear,
     remoteMayhem,
-    remoteWalletHelper,
     remoteCatalog,
     remoteArtifact,
     remoteDownloadsDir,

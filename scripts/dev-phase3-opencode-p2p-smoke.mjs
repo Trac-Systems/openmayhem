@@ -1467,7 +1467,7 @@ async function main() {
   const remoteRules = path.posix.join(remoteRun, 'RULES.md');
   const remoteArtifact = path.posix.join(remoteRoot, '.mayhem-cache/artifacts', path.basename(artifactPath));
   const remoteMayhem = path.posix.join(remoteRoot, 'target/debug/mayhem');
-  const remoteWalletHelper = path.posix.join(remoteRoot, 'crates/mayhem-cli/src/wallet-helper.mjs');
+  const remoteIntercomWalletHelper = path.posix.join(remoteRoot, 'intercom/src/wallet-helper.js');
   const remoteIntercomMain = path.posix.join(remoteRoot, 'intercom/src/main.js');
   const remoteScBridgeFeature = path.posix.join(remoteRoot, 'intercom/features/sc-bridge/index.js');
   const remoteDirectSessionFeature = path.posix.join(remoteRoot, 'intercom/features/direct-session/index.js');
@@ -1485,7 +1485,7 @@ async function main() {
       '; command -v node || true',
     ].join(' ')
   )).stdout.trim().split(/\r?\n/).find(Boolean);
-  if (!remoteNode) fail('remote Mac mini has no usable node binary for wallet-helper.mjs');
+  if (!remoteNode) fail('remote Mac mini has no usable node binary for the optional dev DHT bootstrap');
 
   await ssh(
     remote,
@@ -1493,7 +1493,7 @@ async function main() {
     [
       `test -x ${sh(remotePear)}`,
       `test -d ${sh(path.posix.join(remoteRoot, 'intercom/node_modules'))}`,
-      `mkdir -p ${sh(path.posix.join(remoteRoot, 'target/debug'))} ${sh(path.posix.dirname(remoteArtifact))} ${sh(path.posix.dirname(remoteCatalog))} ${sh(path.posix.dirname(remoteWalletHelper))} ${sh(path.posix.dirname(remoteIntercomMain))} ${sh(path.posix.dirname(remoteScBridgeFeature))} ${sh(path.posix.dirname(remoteDirectSessionFeature))} ${sh(remoteLogs)}`,
+      `mkdir -p ${sh(path.posix.join(remoteRoot, 'target/debug'))} ${sh(path.posix.dirname(remoteArtifact))} ${sh(path.posix.dirname(remoteCatalog))} ${sh(path.posix.dirname(remoteIntercomMain))} ${sh(path.posix.dirname(remoteScBridgeFeature))} ${sh(path.posix.dirname(remoteDirectSessionFeature))} ${sh(remoteLogs)}`,
     ].join(' && ')
   );
 
@@ -1530,7 +1530,7 @@ async function main() {
     logFile: path.join(logsDir, 'scp-rules.log'),
     timeoutMs: 60_000,
   });
-  await scpTo(remote, passFile, path.join(ROOT, 'crates/mayhem-cli/src/wallet-helper.mjs'), remoteWalletHelper, {
+  await scpTo(remote, passFile, path.join(ROOT, 'intercom/src/wallet-helper.js'), remoteIntercomWalletHelper, {
     logFile: path.join(logsDir, 'scp-wallet-helper.log'),
     timeoutMs: 60_000,
   });
@@ -1848,7 +1848,7 @@ async function main() {
     [
       prepareProviderHome,
       `cd ${sh(remoteRoot)}`,
-      `MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} ${sh(remoteMayhem)} setup --home ${sh(remoteProviderHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${remoteAdminRpcTunnelPort}/v1`)} --rules-ver 1 --rules-hash ${sh(rulesHash)} --rules-path ${sh(remoteRules)} --yes --print-json > ${sh(remoteProviderSetupLog)} 2>&1`,
+      `MAYHEM_PEAR_RUNTIME=${sh(remotePear)} ${sh(remoteMayhem)} setup --home ${sh(remoteProviderHome)} --role provider --wallet reuse --peer-store-name main --rpc-url ${sh(`http://127.0.0.1:${remoteAdminRpcTunnelPort}/v1`)} --rules-ver 1 --rules-hash ${sh(rulesHash)} --rules-path ${sh(remoteRules)} --yes --print-json > ${sh(remoteProviderSetupLog)} 2>&1`,
     ].join(' && '),
     { timeoutMs: 180_000 }
   );
@@ -1873,7 +1873,7 @@ async function main() {
   const providerCmd = [
     prepareProviderHome,
     `cd ${sh(remoteRoot)}`,
-    `MAYHEM_PROVIDER_SESSION_DEBUG=1 MAYHEM_WALLET_HELPER=${sh(remoteWalletHelper)} MAYHEM_NODE_BIN=${sh(remoteNode)} nohup ${sh(remoteMayhem)} provider start ${providerFlags.join(' ')} > ${sh(remoteProviderLog)} 2>&1 & echo $!`,
+    `MAYHEM_PROVIDER_SESSION_DEBUG=1 MAYHEM_PEAR_RUNTIME=${sh(remotePear)} nohup ${sh(remoteMayhem)} provider start ${providerFlags.join(' ')} > ${sh(remoteProviderLog)} 2>&1 & echo $!`,
   ].join(' && ');
   const remoteProviderPid = (await ssh(remote, passFile, providerCmd)).stdout.trim();
   cleanupState.remotePids.push(remoteProviderPid);
