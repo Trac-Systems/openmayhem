@@ -181,6 +181,36 @@ test('transport peer may relay an intent signed by an explicitly selected partic
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
 });
 
+test('read-only provider relays a signed rails preference through the existing lifecycle envelope', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, { timeoutMs: 1_000, retryMs: 100 });
+  const writerFeature = new MayhemFeature(writer.peer, { timeoutMs: 1_000, retryMs: 100 });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const intent = {
+    op: 'set_provider_rails',
+    provider: providerKey,
+    rails: ['tap'],
+    nonce: '11'.repeat(32),
+  };
+  const key = `intent/provider/${providerKey}/set_provider_rails/${'22'.repeat(32)}`;
+  const value = { op: 'provider_lifecycle', intent, sig: '33'.repeat(64) };
+  const result = await submitMayhemFeature(participant.peer, { feature: 'mayhem', key, value });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.relayed, true);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.appended[0].value.dispatch.address, adminKey);
+  assert.deepEqual(writer.appended[0].value.dispatch.value, value);
+});
+
 test('admin-writer RPC keeps the local append path', async () => {
   const writer = peerFor(adminKey, { writable: true });
   let appendCalls = 0;

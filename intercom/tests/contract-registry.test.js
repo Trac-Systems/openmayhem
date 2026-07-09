@@ -779,7 +779,38 @@ test('MayhemContract applies consent and provider lifecycle through free mayhem 
     },
     admin.publicKey
   );
-  assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
+  const registered = (await storage.get(`prov/${provider.publicKey}`)).value;
+  assert.equal(registered.status, 'active');
+  assert.deepEqual(registered.accepted_rails, ['fiat']);
+
+  const railsIntent = {
+    op: 'set_provider_rails',
+    provider: provider.publicKey,
+    rails: ['tap'],
+    nonce: 'd'.repeat(64),
+  };
+  const railsResult = await executeFeature(
+    contract,
+    storage,
+    'mayhem_feature',
+    await providerLifecycleFeatureKey(railsIntent),
+    {
+      op: 'provider_lifecycle',
+      intent: railsIntent,
+      sig: signProviderLifecycleIntent(provider.wallet, railsIntent),
+    },
+    admin.publicKey
+  );
+  assert.deepEqual(railsResult, {
+    ok: true,
+    op: 'setProviderRails',
+    provider: provider.publicKey,
+    rails: ['tap'],
+  });
+  const tapOnly = (await storage.get(`prov/${provider.publicKey}`)).value;
+  assert.deepEqual(tapOnly.accepted_rails, ['tap']);
+  assert.equal(tapOnly.accepted_rails_set_by, provider.publicKey);
+  assert.equal(tapOnly.accepted_rails_set_at, await providerLifecycleFeatureKey(railsIntent));
 
   result = await execute(contract, storage, 'registerEnclave', enclaveRegistration, admin.publicKey, 2);
   assert.equal(result.ok, true, result.message);

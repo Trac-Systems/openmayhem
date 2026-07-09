@@ -31248,37 +31248,35 @@ async fn provider_rails_get(args: ProviderRailsGetArgs) -> Result<()> {
 
 async fn provider_rails_set(args: ProviderRailsSetArgs) -> Result<()> {
     let rails = normalize_provider_accepted_rails_arg(&args.rails)?;
-    let command = json!({
-        "op": "set_provider_rails",
-        "rails": rails,
-    });
-    let compact_command = serde_json::to_string(&command)?;
     let copy_paste = format!(
-        "/tx --command {} --sim 1",
-        shell_single_quote(&compact_command)
+        "mayhem provider rails set --rails {} --submit --sim",
+        shell_single_quote(&rails.join(","))
     );
     let mut report = json!({
         "ok": true,
         "action": "provider.rails.set",
         "submitted": false,
         "sim": false,
-        "tx_type": "setProviderRails",
-        "command": command,
+        "feature": "mayhem",
+        "intent_op": "set_provider_rails",
+        "rails": rails,
         "copy_paste": {
-            "intercom_sim": copy_paste,
+            "mayhem_sim": copy_paste,
         },
     });
 
     if args.tx.submit {
         let ctx = provider_contract_tx_context(&args.tx).await?;
-        let submitted = submit_contract_command(
-            &ctx.rpc,
-            &ctx.keypair_path,
-            &ctx.password,
-            &ctx.wallet,
-            "setProviderRails",
-            report["command"].clone(),
-            args.tx.sim,
+        let intent = provider_rails_intent(&ctx.wallet.public_key, &rails)?;
+        let submitted = submit_provider_lifecycle_intent(
+            ProviderLifecycleSubmitContext {
+                rpc: &ctx.rpc,
+                keypair_path: &ctx.keypair_path,
+                password: &ctx.password,
+                wallet: &ctx.wallet,
+                sim: args.tx.sim,
+            },
+            intent,
         )
         .await?;
         report["submitted"] = json!(true);
@@ -31290,12 +31288,13 @@ async fn provider_rails_set(args: ProviderRailsSetArgs) -> Result<()> {
             "public_key": ctx.wallet.public_key.clone(),
             "keypair_path": ctx.wallet.keypair_path.clone(),
         });
-        report["tx"] = submitted;
+        report["feature_submission"] = submitted;
         if !args.tx.sim {
             let key = format!("prov/{}", report["provider"].as_str().unwrap_or_default());
-            report["provider_record"] = read_state_value(&ctx.rpc, &key)
-                .await?
-                .unwrap_or(Value::Null);
+            report["provider_record"] = wait_for_state(&ctx.rpc, &key, |value| {
+                value.get("accepted_rails") == Some(&json!(rails))
+            })
+            .await?;
         }
     }
 
@@ -32346,6 +32345,15 @@ fn provider_lifecycle_intent_with_anchors(
     Ok(value)
 }
 
+fn provider_rails_intent(provider: &str, rails: &[String]) -> Result<Value> {
+    Ok(json!({
+        "op": "set_provider_rails",
+        "provider": provider,
+        "rails": rails,
+        "nonce": provider_lifecycle_nonce(provider, "set_provider_rails", None, None)?,
+    }))
+}
+
 fn resolve_provider_lifecycle_enclave(
     enclaves: &[LedgerEnclave],
     requested: &str,
@@ -33066,14 +33074,14 @@ fn print_provider_rails_report(report: &Value, json_output: bool) -> Result<()> 
     if !report["rails"].is_null() {
         println!("{}", serde_json::to_string_pretty(&report["rails"])?);
     }
-    if let Some(command) = report["copy_paste"]["intercom_sim"].as_str() {
-        println!("Copy/paste Intercom sim command:");
+    if let Some(command) = report["copy_paste"]["mayhem_sim"].as_str() {
+        println!("Copy/paste Mayhem simulation command:");
         println!("{command}");
     }
     if report["submitted"].as_bool() == Some(true) {
         println!("Submitted: true");
-        if let Some(tx) = report["tx"]["tx"].as_str() {
-            println!("Tx: {tx}");
+        if let Some(key) = report["feature_submission"]["key"].as_str() {
+            println!("Feature key: {key}");
         }
     }
     Ok(())
@@ -37092,6 +37100,18 @@ async fn submit_provider_lifecycle_feature_with_anchors(
         device_key,
         join_terms,
     )?;
+    submit_provider_lifecycle_intent(ctx, intent).await
+}
+
+async fn submit_provider_lifecycle_intent(
+    ctx: ProviderLifecycleSubmitContext<'_>,
+    intent: Value,
+) -> Result<Value> {
+    let op = intent
+        .get("op")
+        .and_then(Value::as_str)
+        .context("provider lifecycle intent missing op")?
+        .to_owned();
     let sig = sign_message(
         ctx.keypair_path,
         ctx.password,
@@ -46390,6 +46410,13 @@ mod tests {
         assert_eq!(join["served_ctx"], 8192);
         assert_eq!(join["ctx_bracket"], ctx_bracket_for_tokens(8192));
         assert_eq!(join["ctx_bracket_table_ver"], CTX_BRACKET_TABLE_VERSION);
+
+        let rails = provider_rails_intent(&provider, &["tap".to_owned()]).expect("rails intent");
+        assert_eq!(rails["op"], "set_provider_rails");
+        assert_eq!(rails["provider"], provider);
+        assert_eq!(rails["rails"], json!(["tap"]));
+        assert!(is_hex_len(rails["nonce"].as_str().unwrap(), 64));
+        assert!(provider_lifecycle_intent_message(&rails).contains("\"rails\":[\"tap\"]"));
     }
 
     #[test]

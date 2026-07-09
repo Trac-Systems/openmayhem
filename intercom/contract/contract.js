@@ -21,6 +21,7 @@ const PROVIDER_LIFECYCLE_OPS = new Set([
   'leave_enclave',
   'join_room',
   'leave_room',
+  'set_provider_rails',
 ]);
 const DAY_SECONDS = 24 * 60 * 60;
 const DEFAULT_PRICE_RATE_LIMIT_SECONDS = 6 * 60 * 60;
@@ -1214,6 +1215,8 @@ class MayhemContract extends Contract {
         return await this.applyJoinRoom(intent.provider, intent.room_id, intent.enclave_id, key);
       case 'leave_room':
         return await this.applyLeaveRoom(intent.provider, intent.room_id, intent.enclave_id, key);
+      case 'set_provider_rails':
+        return await this.applySetProviderRails(intent.provider, intent.rails, key);
       default:
         return;
     }
@@ -1880,24 +1883,28 @@ class MayhemContract extends Contract {
   async setProviderRails() {
     const shapeError = this.validateExactCommandValue(['op', 'rails'], 'set_provider_rails');
     if (shapeError) return shapeError;
-    const consentError = await this.requireConsent(this.address);
+    return await this.applySetProviderRails(this.address, this.value.rails, this.tx);
+  }
+
+  async applySetProviderRails(providerId, acceptedRails, stamp) {
+    const consentError = await this.requireConsent(providerId);
     if (consentError) return consentError;
-    const provider = await this.get(`prov/${this.address}`);
+    const provider = await this.get(`prov/${providerId}`);
     if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
-    const rails = this.normalizeProviderAcceptedRails(this.value.rails);
+    const rails = this.normalizeProviderAcceptedRails(acceptedRails);
     if (rails instanceof Error) return rails;
 
     const updated = {
       ...provider,
       accepted_rails: rails,
       accepted_rails_schema_version: PROVIDER_RAIL_SCHEMA_VERSION,
-      accepted_rails_set_by: this.address,
-      accepted_rails_set_at: this.tx,
-      updated_at: this.tx,
+      accepted_rails_set_by: providerId,
+      accepted_rails_set_at: stamp,
+      updated_at: stamp,
     };
-    await this.put(`prov/${this.address}`, updated);
+    await this.put(`prov/${providerId}`, updated);
     console.log('mayhem setProviderRails', updated);
-    return { ok: true, op: 'setProviderRails', provider: this.address, rails };
+    return { ok: true, op: 'setProviderRails', provider: providerId, rails };
   }
 
   async setProviderPayout() {
@@ -6218,21 +6225,23 @@ class MayhemContract extends Contract {
     if (!PROVIDER_LIFECYCLE_OPS.has(intent.op)) return new Error('Unsupported provider lifecycle op.');
     const allowed = intent.op === 'register_provider'
       ? ['op', 'provider', 'nonce']
-      : intent.op === 'join_room' || intent.op === 'leave_room'
-        ? ['op', 'provider', 'enclave_id', 'room_id', 'nonce']
-        : intent.op === 'join_enclave'
-          ? [
-              'op',
-              'provider',
-              'enclave_id',
-              'nonce',
-              'served_ctx',
-              'ctx_bracket',
-              'ctx_bracket_table_ver',
-              'hardware_fingerprint',
-              'device_key',
-            ]
-        : ['op', 'provider', 'enclave_id', 'nonce'];
+      : intent.op === 'set_provider_rails'
+        ? ['op', 'provider', 'rails', 'nonce']
+        : intent.op === 'join_room' || intent.op === 'leave_room'
+          ? ['op', 'provider', 'enclave_id', 'room_id', 'nonce']
+          : intent.op === 'join_enclave'
+            ? [
+                'op',
+                'provider',
+                'enclave_id',
+                'nonce',
+                'served_ctx',
+                'ctx_bracket',
+                'ctx_bracket_table_ver',
+                'hardware_fingerprint',
+                'device_key',
+              ]
+            : ['op', 'provider', 'enclave_id', 'nonce'];
     const required = intent.op === 'join_enclave'
       ? ['op', 'provider', 'enclave_id', 'nonce', 'served_ctx', 'ctx_bracket', 'ctx_bracket_table_ver']
       : allowed;
@@ -6277,6 +6286,10 @@ class MayhemContract extends Contract {
     }
     if (hasOwn(intent, 'device_key') && !this.isHexBytes(intent.device_key, 32)) {
       return new Error('Invalid provider device key.');
+    }
+    if (hasOwn(intent, 'rails')) {
+      const rails = this.normalizeProviderAcceptedRails(intent.rails);
+      if (rails instanceof Error) return rails;
     }
     return null;
   }
