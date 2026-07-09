@@ -50,6 +50,19 @@ if ($cert) {
   $env:MAYHEM_TPM2_EK_CERT_THUMBPRINT = $cert.Thumbprint
   $env:MAYHEM_TPM2_EK_CERT_SUBJECT = $cert.Subject
   $env:MAYHEM_TPM2_EK_CERT_ISSUER = $cert.Issuer
+  try {
+    $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+    $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+    [void]$chain.Build($cert)
+    $chainB64 = @($chain.ChainElements | ForEach-Object {
+      [Convert]::ToBase64String($_.Certificate.RawData)
+    })
+    if ($chainB64.Count -gt 0) {
+      $env:MAYHEM_TPM2_EK_CHAIN_DER_B64_JSON = ($chainB64 | ConvertTo-Json -Compress)
+    }
+  } catch {
+    $env:MAYHEM_TPM2_EK_CHAIN_DER_B64_JSON = ""
+  }
 }
 
 try {
@@ -256,6 +269,11 @@ try
         evidence["ek_cert_thumbprint"] = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CERT_THUMBPRINT");
         evidence["ek_cert_subject"] = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CERT_SUBJECT");
         evidence["ek_cert_issuer"] = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CERT_ISSUER");
+        var chainJson = Environment.GetEnvironmentVariable("MAYHEM_TPM2_EK_CHAIN_DER_B64_JSON");
+        if (!string.IsNullOrWhiteSpace(chainJson))
+        {
+            evidence["ek_chain_der_b64"] = JsonSerializer.Deserialize<JsonElement>(chainJson);
+        }
     }
 
     object? gpu = null;
