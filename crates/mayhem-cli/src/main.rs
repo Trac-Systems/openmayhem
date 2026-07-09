@@ -19,7 +19,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
@@ -32616,6 +32616,20 @@ fn enclave_max_num_tokens(caps: &Value) -> Result<Option<u32>> {
     }
 }
 
+fn enclave_vllm_gpu_memory_utilization_pct(caps: &Value) -> Result<Option<u32>> {
+    match caps.get("vllm_gpu_memory_utilization_pct") {
+        None => Ok(None),
+        Some(_) => {
+            let pct = enclave_cap_u32(caps, "vllm_gpu_memory_utilization_pct", 90)?;
+            ensure!(
+                pct <= 100,
+                "enclave caps vllm_gpu_memory_utilization_pct must be between 1 and 100"
+            );
+            Ok(Some(pct))
+        }
+    }
+}
+
 fn tensor_parallel_capable_gpu_count(hardware: &HardwareReport) -> usize {
     hardware
         .gpus
@@ -37279,6 +37293,8 @@ fn provider_engine_load_config(
             .get("vllm_dtype")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        config.vllm_gpu_memory_utilization_pct =
+            enclave_vllm_gpu_memory_utilization_pct(&selected.enclave.caps)?;
     }
     Ok(config)
 }
@@ -47521,7 +47537,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "tp_degree": 2,
             "max_batch_size": 3,
             "max_num_tokens": 16384,
-            "vllm_dtype": "float16"
+            "vllm_dtype": "float16",
+            "vllm_gpu_memory_utilization_pct": 45
         });
         for (name, path) in [
             ("vllm_config", "config.json"),
@@ -47618,6 +47635,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(config.batch_size, 3);
         assert_eq!(config.ubatch_size, 16384);
         assert_eq!(config.vllm_dtype.as_deref(), Some("float16"));
+        assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(45));
         assert_eq!(
             provider_attestation_runtime_config(&selected).unwrap(),
             AttestationRuntimeConfig {

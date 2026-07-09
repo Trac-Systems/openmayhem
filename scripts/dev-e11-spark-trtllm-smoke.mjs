@@ -515,6 +515,7 @@ function acceleratedCapsJson(backend) {
       max_batch_size: 2,
       max_num_tokens: 1024,
       vllm_dtype: 'bfloat16',
+      vllm_gpu_memory_utilization_pct: 40,
     });
   }
   return JSON.stringify({

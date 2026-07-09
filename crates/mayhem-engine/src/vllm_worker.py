@@ -88,6 +88,18 @@ def positive_int(value, default):
         return int(default)
 
 
+def utilization_float(value):
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise ValueError("gpu_memory_utilization must be a number between 0 and 1") from exc
+    if parsed <= 0.0 or parsed > 1.0:
+        raise ValueError("gpu_memory_utilization must be between 0 and 1")
+    return parsed
+
+
 def make_structured_outputs_params(grammar):
     if grammar is None:
         return None
@@ -193,6 +205,9 @@ def create_engine(payload):
     dtype = payload.get("dtype")
     if dtype:
         kwargs["dtype"] = str(dtype)
+    gpu_memory_utilization = utilization_float(payload.get("gpu_memory_utilization"))
+    if gpu_memory_utilization is not None:
+        kwargs["gpu_memory_utilization"] = gpu_memory_utilization
     args = AsyncEngineArgs(**accepted_kwargs(AsyncEngineArgs, kwargs))
     if hasattr(AsyncLLM, "from_engine_args"):
         return AsyncLLM.from_engine_args(args)

@@ -239,6 +239,8 @@ pub struct LoadConfig {
     pub vllm_tensor_parallel: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_gpu_memory_utilization_pct: Option<u32>,
     #[serde(default = "default_true")]
     pub use_mmap: bool,
     #[serde(default)]
@@ -315,6 +317,7 @@ impl Default for LoadConfig {
             trt_require_engine_dir: false,
             vllm_tensor_parallel: None,
             vllm_dtype: None,
+            vllm_gpu_memory_utilization_pct: None,
             use_mmap: true,
             use_mlock: false,
             memory_limit_bytes: None,
@@ -3520,14 +3523,18 @@ mod vllm_backend {
     }
 
     fn vllm_load_payload(config: &LoadConfig, model_path: &Path) -> Value {
-        json!({
+        let mut payload = json!({
             "path": model_path,
             "ctx_size": config.ctx_size,
             "max_batch_size": config.batch_size.max(1),
             "max_num_tokens": config.ubatch_size.max(config.ctx_size).max(1),
             "tensor_parallel": config.vllm_tensor_parallel.unwrap_or(1),
             "dtype": config.vllm_dtype,
-        })
+        });
+        if let Some(pct) = config.vllm_gpu_memory_utilization_pct {
+            payload["gpu_memory_utilization"] = json!((pct as f64) / 100.0);
+        }
+        payload
     }
 
     fn default_message_kind() -> String {
@@ -3572,6 +3579,7 @@ mod vllm_backend {
             config.ubatch_size = 512;
             config.vllm_tensor_parallel = Some(2);
             config.vllm_dtype = Some("float16".to_owned());
+            config.vllm_gpu_memory_utilization_pct = Some(45);
 
             let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
             assert_eq!(payload["ctx_size"], json!(1024));
@@ -3579,6 +3587,7 @@ mod vllm_backend {
             assert_eq!(payload["max_num_tokens"], json!(1024));
             assert_eq!(payload["tensor_parallel"], json!(2));
             assert_eq!(payload["dtype"], json!("float16"));
+            assert_eq!(payload["gpu_memory_utilization"], json!(0.45));
         }
     }
 }
