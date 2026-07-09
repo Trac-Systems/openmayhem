@@ -448,6 +448,8 @@ enum AdminCommands {
     PayoutConfirm(AdminPayoutConfirmArgs),
     /// Anchor recomputed epoch roots permissionlessly.
     EpochCommit(AdminEpochCommitArgs),
+    /// Admin-seal one elapsed empty/unsubmittable epoch so later epochs can settle.
+    EpochSealEmpty(AdminEpochSealEmptyArgs),
     /// Apply admin-verified epoch debits/earnings and ev/* roots.
     EpochApply(AdminEpochApplyArgs),
 }
@@ -4339,6 +4341,28 @@ struct AdminEpochCommitArgs {
     /// Path to a JSON object containing recomputed epoch totals.
     #[arg(long, value_name = "PATH")]
     totals_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminEpochSealEmptyArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Exact next epoch to seal empty.
+    #[arg(long)]
+    epoch: u64,
+
+    /// Seal timestamp in Unix seconds. Must be after the epoch window has elapsed.
+    #[arg(long)]
+    at: u64,
+
+    /// Human-readable reason. Stored as a BLAKE3 reason hash.
+    #[arg(long)]
+    reason: Option<String>,
+
+    /// Precomputed BLAKE3 reason hash.
+    #[arg(long)]
+    reason_hash: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -14028,6 +14052,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::FiatChargeback(args) => &args.tx,
         AdminCommands::PayoutConfirm(args) => &args.tx,
         AdminCommands::EpochCommit(args) => &args.tx,
+        AdminCommands::EpochSealEmpty(args) => &args.tx,
         AdminCommands::EpochApply(args) => &args.tx,
     }
 }
@@ -14124,6 +14149,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             admin_payout_confirm_payload(args).map(|value| ("payoutConfirm", value))
         }
         AdminCommands::EpochCommit(args) => Ok(("epochCommit", admin_epoch_commit_payload(args)?)),
+        AdminCommands::EpochSealEmpty(args) => {
+            Ok(("epochSealEmpty", admin_epoch_seal_empty_payload(args)?))
+        }
         AdminCommands::EpochApply(args) => Ok(("epochApply", admin_epoch_apply_payload(args)?)),
     }
 }
@@ -15822,6 +15850,15 @@ fn admin_epoch_commit_payload(args: &AdminEpochCommitArgs) -> Result<Value> {
         "at": args.at,
         "roots": roots,
         "totals": totals,
+    }))
+}
+
+fn admin_epoch_seal_empty_payload(args: &AdminEpochSealEmptyArgs) -> Result<Value> {
+    Ok(json!({
+        "op": "epoch_seal_empty",
+        "epoch": args.epoch,
+        "at": args.at,
+        "reason_hash": admin_required_reason_hash(args.reason_hash.as_deref(), args.reason.as_deref())?,
     }))
 }
 
@@ -44825,6 +44862,24 @@ mod tests {
             })
         );
 
+        let seal = admin_epoch_seal_empty_payload(&AdminEpochSealEmptyArgs {
+            tx: test_admin_tx_args(),
+            epoch: 8,
+            at: 28_800,
+            reason: Some("operator reviewed empty epoch 8".to_owned()),
+            reason_hash: None,
+        })
+        .unwrap();
+        assert_eq!(
+            seal,
+            json!({
+                "op": "epoch_seal_empty",
+                "epoch": 8,
+                "at": 28_800,
+                "reason_hash": blake3::hash(b"operator reviewed empty epoch 8").to_hex().to_string(),
+            })
+        );
+
         let apply = admin_epoch_apply_payload(&AdminEpochApplyArgs {
             tx: test_admin_tx_args(),
             epoch: Some(7),
@@ -44978,6 +45033,28 @@ mod tests {
         assert!(bad_debits
             .to_string()
             .contains("epoch debits JSON must be an array"));
+
+        let missing_reason = admin_epoch_seal_empty_payload(&AdminEpochSealEmptyArgs {
+            tx: test_admin_tx_args(),
+            epoch: 1,
+            at: 3_600,
+            reason: None,
+            reason_hash: None,
+        })
+        .unwrap_err();
+        assert!(missing_reason
+            .to_string()
+            .contains("pass --reason or --reason-hash"));
+
+        let ambiguous_reason = admin_epoch_seal_empty_payload(&AdminEpochSealEmptyArgs {
+            tx: test_admin_tx_args(),
+            epoch: 1,
+            at: 3_600,
+            reason: Some("duplicate".to_owned()),
+            reason_hash: Some("a".repeat(64)),
+        })
+        .unwrap_err();
+        assert!(ambiguous_reason.to_string().contains("pass only one"));
     }
 
     #[test]
@@ -44999,7 +45076,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 5);
+        assert_eq!(CONTRACT_VERSION, 6);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 8);
     }

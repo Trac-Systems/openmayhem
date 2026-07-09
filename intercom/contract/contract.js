@@ -2,7 +2,7 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { Contract } from 'trac-peer';
 
-export const CONTRACT_VERSION = 5;
+export const CONTRACT_VERSION = 6;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -931,6 +931,17 @@ class MayhemContract extends Contract {
         at: { type: 'number', integer: true, min: 0 },
         roots: { type: 'any' },
         totals: { type: 'any' },
+      },
+    });
+
+    this.addSchema('epochSealEmpty', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
+        reason_hash: { type: 'string', min: 64, max: 64 },
       },
     });
 
@@ -3779,6 +3790,100 @@ class MayhemContract extends Contract {
       result.price_root = await this.priceDerivationRoot(priceDerivations);
     }
     console.log('mayhem epochApply', result);
+    return result;
+  }
+
+  async epochSealEmpty() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'epoch', 'at', 'reason_hash'],
+      'epoch_seal_empty'
+    );
+    if (shapeError) return shapeError;
+    if (!Number.isSafeInteger(this.value.epoch) || this.value.epoch < 1) {
+      return new Error('Invalid empty epoch seal epoch.');
+    }
+    if (!Number.isSafeInteger(this.value.at) || this.value.at < 0) {
+      return new Error('Invalid empty epoch seal timestamp.');
+    }
+    if (!this.isHexBytes(this.value.reason_hash, 32)) {
+      return new Error('Invalid empty epoch seal reason hash.');
+    }
+
+    const params = await this.activeParamsAt(this.value.at, ['epoch_seconds']);
+    const applyState = await this.epochApplyStateRecord();
+    const reasonHash = this.value.reason_hash.toLowerCase();
+    const key = `epoch/seal/${this.value.epoch}`;
+    const existing = await this.get(key);
+    if (existing) {
+      const existingHash = await this.epochEmptySealHash(this.epochEmptySealHashValue(existing));
+      if (
+        existing.seal_hash === existingHash &&
+        existing.reason_hash === reasonHash &&
+        existing.at === this.value.at &&
+        existing.sealed_by === this.address &&
+        applyState.updated_epoch === this.value.epoch &&
+        applyState.last_apply_hash === existing.seal_hash &&
+        (applyState.pending_epoch ?? null) === null
+      ) {
+        return {
+          ok: true,
+          op: 'epochSealEmpty',
+          epoch: this.value.epoch,
+          idempotent: true,
+          seal_hash: existing.seal_hash,
+        };
+      }
+      return new Error('Empty epoch seal already exists.');
+    }
+
+    const notYetActiveAt = this.value.epoch * params.epoch_seconds;
+    if (this.value.at < notYetActiveAt) {
+      return new Error('Empty epoch seal is not active until the epoch window ends.');
+    }
+    const pageOrderError = this.validateEpochApplyPageOrder(applyState, this.value.epoch, 0);
+    if (pageOrderError) return pageOrderError;
+
+    const sealValue = {
+      type: 'epoch_empty_seal',
+      epoch: this.value.epoch,
+      at: this.value.at,
+      epoch_seconds: params.epoch_seconds,
+      previous_apply_hash: applyState.last_apply_hash ?? null,
+      reason_hash: reasonHash,
+      sealed_by: this.address,
+      sealed_by_role: 'admin',
+      totals: {
+        debited_au: ZERO_AU,
+        earned_au: ZERO_AU,
+        fee_au: ZERO_AU,
+      },
+    };
+    const sealHash = await this.epochEmptySealHash(sealValue);
+    const record = {
+      ...sealValue,
+      seal_hash: sealHash,
+      sealed_at: this.tx,
+    };
+    await this.put(key, record);
+    await this.put('epoch/apply/state', this.nextEpochApplyState({
+      applyState,
+      epoch: this.value.epoch,
+      page: 0,
+      lastPage: true,
+      applyHash: sealHash,
+      epochSeconds: params.epoch_seconds,
+    }));
+    const result = {
+      ok: true,
+      op: 'epochSealEmpty',
+      epoch: this.value.epoch,
+      idempotent: false,
+      seal_hash: sealHash,
+    };
+    console.log('mayhem epochSealEmpty', result);
     return result;
   }
 
@@ -10074,6 +10179,24 @@ class MayhemContract extends Contract {
       value,
     })));
     return b4a.toString(digest, 'hex');
+  }
+
+  epochEmptySealHashValue(value) {
+    return {
+      type: value.type,
+      epoch: value.epoch,
+      at: value.at,
+      epoch_seconds: value.epoch_seconds,
+      previous_apply_hash: value.previous_apply_hash ?? null,
+      reason_hash: value.reason_hash,
+      sealed_by: value.sealed_by,
+      sealed_by_role: value.sealed_by_role,
+      totals: value.totals,
+    };
+  }
+
+  async epochEmptySealHash(value) {
+    return await this.opaqueHash('mayhem-epoch-empty-seal-v1', this.epochEmptySealHashValue(value));
   }
 
   async epochApplyFeatureKey(value) {

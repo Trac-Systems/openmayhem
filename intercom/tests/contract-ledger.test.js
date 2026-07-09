@@ -303,6 +303,26 @@ test('MayhemProtocol keeps epochApply off the paid tx route', () => {
   assert.deepEqual(paidOps.map((op) => op.type), ['epochCommit']);
 });
 
+test('MayhemProtocol maps empty epoch seals to the paid admin tx route', () => {
+  const protocol = new MayhemProtocol({}, {});
+  const op = protocol.mapTxCommand(JSON.stringify({
+    op: 'epoch_seal_empty',
+    epoch: 1,
+    at: 3_600,
+    reason_hash: 'a'.repeat(64),
+  }));
+
+  assert.deepEqual(op, {
+    type: 'epochSealEmpty',
+    value: {
+      op: 'epoch_seal_empty',
+      epoch: 1,
+      at: 3_600,
+      reason_hash: 'a'.repeat(64),
+    },
+  });
+});
+
 test('MayhemProtocol keeps deposit evidence off the paid tx route', () => {
   const protocol = new MayhemProtocol({}, {});
   const paidOps = [

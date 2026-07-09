@@ -406,6 +406,118 @@ test('MayhemContract anchors epoch roots permissionlessly and applies matching e
   assert.equal(await storage.get('ev/pay/1'), null);
 });
 
+test('MayhemContract admin can seal one elapsed empty epoch and unblock later settlement', async () => {
+  const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
+  const reasonHash = 'a'.repeat(64);
+
+  const nonAdmin = await execute(
+    contract,
+    storage,
+    'epochSealEmpty',
+    { op: 'epoch_seal_empty', epoch: 1, at: 3_600, reason_hash: reasonHash },
+    submitter.publicKey,
+    5
+  );
+  assert.match(nonAdmin.message, /admin required/i);
+
+  const early = await execute(
+    contract,
+    storage,
+    'epochSealEmpty',
+    { op: 'epoch_seal_empty', epoch: 1, at: 3_599, reason_hash: reasonHash },
+    admin.publicKey,
+    6
+  );
+  assert.match(early.message, /not active/i);
+
+  const jump = await execute(
+    contract,
+    storage,
+    'epochSealEmpty',
+    { op: 'epoch_seal_empty', epoch: 2, at: 7_200, reason_hash: reasonHash },
+    admin.publicKey,
+    7
+  );
+  assert.match(jump.message, /contiguous/i);
+
+  const sealed = await execute(
+    contract,
+    storage,
+    'epochSealEmpty',
+    { op: 'epoch_seal_empty', epoch: 1, at: 3_600, reason_hash: reasonHash },
+    admin.publicKey,
+    8
+  );
+  assert.equal(sealed.ok, true, sealed.message);
+  assert.equal(sealed.op, 'epochSealEmpty');
+  assert.equal(sealed.idempotent, false);
+  assert.equal(sealed.seal_hash.length, 64);
+  assert.deepEqual((await storage.get('epoch/seal/1')).value, {
+    type: 'epoch_empty_seal',
+    epoch: 1,
+    at: 3_600,
+    epoch_seconds: 3_600,
+    previous_apply_hash: null,
+    reason_hash: reasonHash,
+    sealed_by: admin.publicKey,
+    sealed_by_role: 'admin',
+    totals: {
+      debited_au: '0',
+      earned_au: '0',
+      fee_au: '0',
+    },
+    seal_hash: sealed.seal_hash,
+    sealed_at: makeTxKey(8),
+  });
+  assert.deepEqual((await storage.get('epoch/apply/state')).value, {
+    updated_epoch: 1,
+    updated_at: makeTxKey(8),
+    last_apply_hash: sealed.seal_hash,
+    last_epoch_seconds: 3_600,
+    pending_epoch: null,
+    pending_next_page: 0,
+    last_page: 0,
+  });
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '1000000');
+  assert.equal(await storage.get(`earn/fiat/${provider.publicKey}`), null);
+  assert.equal(await storage.get('fee/fiat/cum'), null);
+
+  const replay = await execute(
+    contract,
+    storage,
+    'epochSealEmpty',
+    { op: 'epoch_seal_empty', epoch: 1, at: 3_600, reason_hash: reasonHash },
+    admin.publicKey,
+    9
+  );
+  assert.deepEqual(replay, {
+    ok: true,
+    op: 'epochSealEmpty',
+    epoch: 1,
+    idempotent: true,
+    seal_hash: sealed.seal_hash,
+  });
+
+  const laterSettlement = await executeEpochApplyFeature(
+    contract,
+    storage,
+    {
+      op: 'epoch_apply',
+      epoch: 2,
+      at: 7_200,
+      debits: [{ rail: 'fiat', user: user.publicKey, au: '1000' }],
+      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000' }],
+    },
+    admin.publicKey
+  );
+  assert.equal(laterSettlement.ok, true, laterSettlement.message);
+  assert.equal(laterSettlement.epoch, 2);
+  assert.equal((await storage.get('epoch/apply/state')).value.updated_epoch, 2);
+  assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '999000');
+  assert.equal((await storage.get(`earn/fiat/${provider.publicKey}`)).value.total_au, '850');
+  assert.equal((await storage.get('fee/fiat/cum')).value.cum_au, '150');
+});
+
 test('MayhemContract binds active admin epoch timing into commit and apply evidence', async () => {
   const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
   const tuned = await execute(
