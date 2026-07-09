@@ -34951,7 +34951,7 @@ async fn send_provider_heartbeat_round(
                 .and_then(|price| price.current.as_ref())
                 .map(|price| price.ver)
                 .unwrap_or(0),
-            "min_ask_au": min_ask_au,
+            "min_ask_au": money_au_json(min_ask_au),
             "caps": {
                 "tools": caps.tools,
                 "json": caps.json,
@@ -34980,7 +34980,7 @@ async fn send_provider_heartbeat_round(
             "room_id": room.room_id,
             "sidechannel": room.sidechannel,
             "seq": seq,
-            "min_ask_au": min_ask_au,
+            "min_ask_au": money_au_json(min_ask_au),
             "max_sessions": max_sessions,
             "transport_peer": transport_peer,
             "accepting_new": load.accepting_new,
@@ -48120,6 +48120,18 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(snapshot.est_wait_ms, 0);
         assert_eq!(provider_saturation(snapshot.active_slots, 4), 0.5);
         assert_eq!(provider_saturation(snapshot.active_slots, 0), 0.0);
+    }
+
+    #[test]
+    fn provider_heartbeat_min_ask_au_uses_decimal_string_shape() {
+        let heartbeat = json!({
+            "min_ask_au": money_au_json(123_456_789_000_000_000),
+        });
+
+        assert_eq!(
+            heartbeat.get("min_ask_au").and_then(Value::as_str),
+            Some("123456789000000000")
+        );
     }
 
     #[test]
