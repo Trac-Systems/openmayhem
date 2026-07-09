@@ -22,5 +22,6 @@ stores/
 **/stores/
 **/keypair.json
 docs/test-resources.local.md
+docs/evidence/**/raw-*/
 target/
 dist/

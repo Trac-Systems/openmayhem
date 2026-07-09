@@ -833,6 +833,88 @@ fn request_with_external_verifier<'a>(
 
 #[cfg(unix)]
 #[test]
+fn tpm2_ek_tier2_requires_external_verifier() {
+    let (_temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": "ab".repeat(32) }),
+    );
+    let request = AttestationVerificationRequest::new(
+        &report,
+        &contract,
+        &trusted,
+        &report.nonce_u,
+        &report.provider_pubkey,
+        210,
+    );
+
+    let err = verify_tier1_attestation(&request).expect_err("TPM EK needs admin verifier");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("TPM 2.0 EK quotes require")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_tpm2_ek_verifier_accepts_root_and_device_key() {
+    let device_key = "ab".repeat(32);
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": device_key }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"kind":"tpm2_quote_ek","att_tier":2,"roots":["tpm2_ek_cert_chain"],"device_key":"{}"}}"#,
+            "ab".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let verified =
+        verify_tier1_attestation(&request).expect("TPM EK quote verifies as Tier 2 identity");
+
+    assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
+}
+
+#[cfg(unix)]
+#[test]
+fn external_tpm2_ek_verifier_rejects_wrong_device_key() {
+    let (temp, report, contract, trusted) = test_hardware_report_with_metadata(
+        HardwareQuoteKind::Tpm2QuoteEk,
+        serde_json::json!({ "device_key": "ab".repeat(32) }),
+    );
+    let script = write_verifier_script(
+        &temp,
+        &format!(
+            r#"{{"ok":true,"kind":"tpm2_quote_ek","att_tier":2,"roots":["tpm_manufacturer_root"],"device_key":"{}"}}"#,
+            "cd".repeat(32)
+        ),
+    );
+    let verifier = HardwareQuoteVerifierCommand {
+        command: script,
+        timeout: Duration::from_secs(15),
+    };
+    let request = request_with_external_verifier(&report, &contract, &trusted, &verifier);
+
+    let err = verify_tier1_attestation(&request)
+        .expect_err("TPM verifier-confirmed EK must match provider metadata");
+
+    assert!(matches!(
+        err,
+        GatewayError::HardwareQuoteInvalid { reason, .. }
+            if reason.contains("does not match the verifier-confirmed EK")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn external_nvidia_cc_verifier_requires_gpu_cpu_roots_and_golden_measurement() {
     let (temp, report, contract, trusted) =
         test_hardware_report(HardwareQuoteKind::NvidiaNvtrustOfflineJwt);

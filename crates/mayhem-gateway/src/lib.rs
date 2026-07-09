@@ -575,6 +575,14 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
             "Tier-3 confidential compute requires an admin hardware quote verifier command that checks GPU/CPU roots and golden launch measurements",
         ));
     }
+    if matches!(quote.kind, HardwareQuoteKind::Tpm2QuoteEk)
+        && request.hardware_quote_verifier_command.is_none()
+    {
+        return Err(hardware_quote_invalid(
+            kind,
+            "TPM 2.0 EK quotes require an admin hardware quote verifier command that validates the EK certificate chain, TPM quote signature, nonce binding, and EK device key",
+        ));
+    }
     if let Some(verifier) = request.hardware_quote_verifier_command {
         return verify_hardware_quote_with_command(request, quote, &expected, verifier);
     }
@@ -605,6 +613,9 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
             request.trusted_nvidia_offline_jwks,
             &expected,
         ),
+        HardwareQuoteKind::Tpm2QuoteEk => Err(GatewayError::HardwareQuoteUnsupported {
+            kind: "tpm2_quote_ek".to_owned(),
+        }),
     }
 }
 
@@ -654,6 +665,8 @@ struct HardwareQuoteVerifierCommandOutput {
     gpu_driver: Option<String>,
     #[serde(default)]
     gpu_vbios: Option<String>,
+    #[serde(default)]
+    device_key: Option<String>,
     #[serde(default)]
     alert: Value,
 }
@@ -850,6 +863,9 @@ fn verify_hardware_quote_with_command(
                 verdict_roots_for_error(&roots)
             ),
         ));
+    }
+    if matches!(quote.kind, HardwareQuoteKind::Tpm2QuoteEk) {
+        verify_tpm2_verdict_device_key(kind, quote, &verdict)?;
     }
     if quote.kind.attestation_tier() >= 3 {
         verify_verdict_matches_golden_measurement(
@@ -1323,6 +1339,7 @@ fn hardware_quote_kind_name(kind: &HardwareQuoteKind) -> &'static str {
         HardwareQuoteKind::NvidiaGb10DeviceJwt => "nvidia_gb10_device_jwt",
         HardwareQuoteKind::NvidiaNrasJwt => "nvidia_nras_jwt",
         HardwareQuoteKind::NvidiaNvtrustOfflineJwt => "nvidia_nvtrust_offline_jwt",
+        HardwareQuoteKind::Tpm2QuoteEk => "tpm2_quote_ek",
     }
 }
 
@@ -1370,6 +1387,7 @@ fn verifier_roots_satisfy_quote_kind(
             root_has_all(roots, &["nvidia", "gb10"])
                 || root_has_all(roots, &["nvidia", "device", "identity"])
         }
+        HardwareQuoteKind::Tpm2QuoteEk => has_tpm2_ek_root(roots),
         HardwareQuoteKind::NvidiaNrasJwt => {
             root_has_all(roots, &["nvidia", "nras"])
                 || (has_raw_nvidia_gpu_roots(roots)
@@ -1379,6 +1397,13 @@ fn verifier_roots_satisfy_quote_kind(
             has_raw_nvidia_gpu_roots(roots) && has_confidential_cpu_root(roots, declared_platform)
         }
     }
+}
+
+fn has_tpm2_ek_root(roots: &[String]) -> bool {
+    root_has_all(roots, &["tpm2", "ek"])
+        || root_has_all(roots, &["tpm", "ek", "cert"])
+        || root_has_all(roots, &["tpm", "endorsement", "key"])
+        || root_has_all(roots, &["tpm", "manufacturer"])
 }
 
 fn has_confidential_cpu_root(roots: &[String], declared_platform: Option<&str>) -> bool {
@@ -1424,6 +1449,10 @@ fn root_has_all(roots: &[String], parts: &[&str]) -> bool {
 
 fn verdict_roots_for_error(roots: &[String]) -> Vec<&str> {
     roots.iter().map(String::as_str).take(8).collect()
+}
+
+fn is_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn short_verifier_stream(stream: &str) -> String {
@@ -1644,6 +1673,62 @@ fn require_gb10_device_model_claim(claims: &Value) -> Result<()> {
             "NVIDIA device evidence is not for GB10/DGX Spark hardware",
         ))
     }
+}
+
+fn verify_tpm2_verdict_device_key(
+    kind: &'static str,
+    quote: &HardwareQuote,
+    verdict: &HardwareQuoteVerifierCommandOutput,
+) -> Result<()> {
+    let verifier_device_key = verdict
+        .device_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            hardware_quote_invalid(
+                kind,
+                "admin verifier must return the TPM EK device_key for ban enforcement",
+            )
+        })?;
+    if !is_hex_len(verifier_device_key, 64) {
+        return Err(hardware_quote_invalid(
+            kind,
+            "admin verifier returned a TPM EK device_key that is not a 32-byte hex digest",
+        ));
+    }
+    let quote_device_key =
+        hardware_quote_metadata_device_key(&quote.metadata).ok_or_else(|| {
+            hardware_quote_invalid(
+                kind,
+                "TPM quote metadata must carry the EK device_key submitted to the contract",
+            )
+        })?;
+    if !quote_device_key.eq_ignore_ascii_case(verifier_device_key) {
+        return Err(hardware_quote_invalid(
+            kind,
+            "TPM EK device_key in quote metadata does not match the verifier-confirmed EK",
+        ));
+    }
+    Ok(())
+}
+
+fn hardware_quote_metadata_device_key(metadata: &Value) -> Option<&str> {
+    metadata
+        .get("device_key")
+        .or_else(|| metadata.get("ek_fingerprint"))
+        .or_else(|| metadata.get("tpm_ek_sha256"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            metadata
+                .get("tpm")
+                .and_then(|tpm| {
+                    tpm.get("device_key")
+                        .or_else(|| tpm.get("ek_fingerprint"))
+                        .or_else(|| tpm.get("ek_sha256"))
+                })
+                .and_then(Value::as_str)
+        })
 }
 
 fn verify_nvidia_nras_quote(

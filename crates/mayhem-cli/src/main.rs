@@ -1000,7 +1000,7 @@ struct UpArgs {
     #[arg(long)]
     provider_gpu_layers: Option<u32>,
 
-    /// Hardware quote kind emitted by the supervised provider, for example nvidia_nvtrust_offline_jwt.
+    /// Hardware quote kind emitted by the supervised provider, for example tpm2_quote_ek or nvidia_nvtrust_offline_jwt.
     #[arg(long)]
     provider_hardware_quote_kind: Option<String>,
 
@@ -4835,7 +4835,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     enclave_binary: Option<PathBuf>,
 
-    /// Hardware quote kind produced by --hardware-quote-command for Tier-2/3 provider reports.
+    /// Hardware quote kind produced by --hardware-quote-command for Tier-2/3 provider reports, for example tpm2_quote_ek.
     #[arg(long, value_name = "KIND")]
     hardware_quote_kind: Option<String>,
 
@@ -26770,6 +26770,14 @@ struct HardwareQuoteCommandOutput {
     gpu_vbios: Option<String>,
     #[serde(default)]
     gpu: Value,
+    #[serde(default)]
+    device_key: Option<String>,
+    #[serde(default)]
+    ek_fingerprint: Option<String>,
+    #[serde(default)]
+    tpm_ek_sha256: Option<String>,
+    #[serde(default)]
+    tpm: Value,
 }
 
 const TRT_CHECKPOINT_REQUIRED_SIDECARS: [(&str, &str); 3] = [
@@ -28487,6 +28495,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             attestation.report.enclave_id
         );
     }
+    let device_key = provider_attestation_device_key(&attestation)?;
     write_provider_load_progress_stage(&args, "prepare attestation", "attest", "complete", 100);
 
     let session_responder = if args.serve_sessions {
@@ -28519,6 +28528,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &wallet,
         &selected.enclave,
         Some(&hardware_fingerprint),
+        device_key.as_deref(),
         args.sim,
     )
     .await?;
@@ -29605,6 +29615,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         &ctx.wallet,
         &enclave,
         Some(&hardware_fingerprint),
+        None,
         args.tx.sim,
     )
     .await?;
@@ -32856,7 +32867,72 @@ fn hardware_quote_command_metadata(parsed: &HardwareQuoteCommandOutput) -> Value
             gpu.insert("vbios".to_owned(), json!(value));
         }
     }
+    if !parsed.tpm.is_null() {
+        object.insert("tpm".to_owned(), parsed.tpm.clone());
+    }
+    if let Some(device_key) = parsed
+        .device_key
+        .as_deref()
+        .or(parsed.ek_fingerprint.as_deref())
+        .or(parsed.tpm_ek_sha256.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let normalized = device_key.to_ascii_lowercase();
+        object.insert("device_key".to_owned(), json!(normalized));
+        let tpm = object.entry("tpm".to_owned()).or_insert_with(|| json!({}));
+        if !tpm.is_object() {
+            *tpm = json!({});
+        }
+        let tpm = tpm.as_object_mut().expect("tpm was set to object");
+        tpm.insert(
+            "ek_sha256".to_owned(),
+            json!(device_key.to_ascii_lowercase()),
+        );
+    }
     metadata
+}
+
+fn hardware_quote_device_key(quote: &HardwareQuote) -> Result<Option<String>> {
+    let Some(device_key) = quote
+        .metadata
+        .get("device_key")
+        .or_else(|| quote.metadata.get("ek_fingerprint"))
+        .or_else(|| quote.metadata.get("tpm_ek_sha256"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            quote
+                .metadata
+                .get("tpm")
+                .and_then(|tpm| {
+                    tpm.get("device_key")
+                        .or_else(|| tpm.get("ek_fingerprint"))
+                        .or_else(|| tpm.get("ek_sha256"))
+                })
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !is_hex_len(device_key, 64) {
+        bail!("hardware quote device_key must be a 32-byte hex digest");
+    }
+    Ok(Some(device_key.to_ascii_lowercase()))
+}
+
+fn provider_attestation_device_key(attestation: &Tier1AttestationReport) -> Result<Option<String>> {
+    let Some(quote) = attestation.report.hw_quote.as_ref() else {
+        return Ok(None);
+    };
+    let device_key = hardware_quote_device_key(quote)?;
+    if matches!(quote.kind, HardwareQuoteKind::Tpm2QuoteEk) && device_key.is_none() {
+        bail!(
+            "TPM 2.0 quote command must return device_key, ek_fingerprint, or tpm_ek_sha256 so admin device bans bind to the TPM EK"
+        );
+    }
+    Ok(device_key)
 }
 
 async fn provider_attestation_report(
@@ -34307,6 +34383,7 @@ async fn ensure_joined_enclave(
     wallet: &WalletInfo,
     enclave: &LedgerEnclave,
     hardware_fingerprint: Option<&str>,
+    device_key: Option<&str>,
     sim: bool,
 ) -> Result<Value> {
     let key = format!("serve/{}/{}", wallet.public_key, enclave.enclave_id);
@@ -34329,7 +34406,7 @@ async fn ensure_joined_enclave(
         Some(&enclave.enclave_id),
         None,
         hardware_fingerprint,
-        None,
+        device_key,
     )
     .await?;
     if sim {
@@ -45031,6 +45108,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_candidates_allow_configured_tier2_tpm_quote_command() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::CpuOnly);
+        let mut args = test_provider_start_args();
+        args.hardware_quote_kind = Some("tpm2-quote-ek".to_owned());
+        args.hardware_quote_command = Some(PathBuf::from("mayhem-tpm2-quote"));
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].att_tier = 2;
+
+        let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .expect("configured TPM quote command can serve Tier-2 enclave");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            parse_hardware_quote_kind("tpm2-quote-ek").unwrap(),
+            HardwareQuoteKind::Tpm2QuoteEk
+        );
+        assert_eq!(
+            provider_quote_generation_attestation_tier(&args).unwrap(),
+            mayhem_proto::TIER2_DEVICE_IDENTITY_TIER
+        );
+    }
+
+    #[test]
     fn provider_quote_config_requires_kind_and_command_together() {
         let mut args = test_provider_start_args();
         args.hardware_quote_kind = Some("nvidia_nras_jwt".to_owned());
@@ -45091,6 +45193,67 @@ mod tests {
         assert_eq!(quote.metadata["region"], "centralus");
         assert_eq!(quote.metadata["snp"]["chip_id"], "chip-123");
         assert_eq!(quote.metadata["gpu"]["model"], "H100");
+    }
+
+    #[test]
+    fn provider_quote_parser_carries_tpm_ek_device_key_metadata() {
+        let device_key = "AA".repeat(32);
+        let quote = parse_hardware_quote_command_output(
+            &HardwareQuoteKind::Tpm2QuoteEk,
+            "binding-1",
+            &format!(
+                r#"{{
+                  "kind":"tpm2_quote_ek",
+                  "evidence":"raw tpm quote",
+                  "tpm_ek_sha256":"{device_key}"
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(quote.binding, "binding-1");
+        assert_eq!(quote.metadata["device_key"], "aa".repeat(32));
+        assert_eq!(quote.metadata["tpm"]["ek_sha256"], "aa".repeat(32));
+        assert_eq!(
+            hardware_quote_device_key(&quote).unwrap(),
+            Some("aa".repeat(32))
+        );
+    }
+
+    #[test]
+    fn tpm_provider_quote_requires_device_key_for_contract_ban_anchor() {
+        let quote = HardwareQuote {
+            kind: HardwareQuoteKind::Tpm2QuoteEk,
+            evidence: "raw tpm quote".to_owned(),
+            binding: "binding-1".to_owned(),
+            endorsements: Vec::new(),
+            metadata: json!({}),
+        };
+        let attestation = Tier1AttestationReport {
+            report: mayhem_proto::AttestationReport {
+                schema_version: mayhem_proto::ATTESTATION_SCHEMA_VERSION,
+                alg: mayhem_proto::ATTESTATION_ALG.to_owned(),
+                enclave_id: "11".repeat(32),
+                enclave_pubkey: "22".repeat(32),
+                provider_pubkey: "33".repeat(32),
+                manifest_hash: "44".repeat(32),
+                binary_hash: "55".repeat(32),
+                att_tier: mayhem_proto::TIER2_DEVICE_IDENTITY_TIER,
+                hw_quote: Some(quote),
+                boot_epoch: 1,
+                report_ts: 2,
+                nonce_u: "66".repeat(32),
+                runtime_config: AttestationRuntimeConfig::default(),
+                sig_enclave: "77".repeat(64),
+                sig_provider: "88".repeat(64),
+            },
+            report_head: "99".repeat(32),
+        };
+
+        let err = provider_attestation_device_key(&attestation)
+            .expect_err("TPM quote must expose EK-derived device key");
+
+        assert!(err.to_string().contains("must return device_key"));
     }
 
     #[test]

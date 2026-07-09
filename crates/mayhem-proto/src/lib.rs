@@ -325,12 +325,15 @@ pub enum HardwareQuoteKind {
     NvidiaGb10DeviceJwt,
     NvidiaNrasJwt,
     NvidiaNvtrustOfflineJwt,
+    Tpm2QuoteEk,
 }
 
 impl HardwareQuoteKind {
     pub fn attestation_tier(&self) -> u8 {
         match self {
-            Self::AppleAppAttestJwt | Self::NvidiaGb10DeviceJwt => TIER2_DEVICE_IDENTITY_TIER,
+            Self::AppleAppAttestJwt | Self::NvidiaGb10DeviceJwt | Self::Tpm2QuoteEk => {
+                TIER2_DEVICE_IDENTITY_TIER
+            }
             Self::AmdSevSnpVcek
             | Self::IntelTdxDcap
             | Self::NvidiaNrasJwt
@@ -1315,6 +1318,18 @@ mod tests {
         assert_eq!(hardware_quote_binding(&body).unwrap(), base);
         body.manifest_hash = "other-manifest".to_owned();
         assert_ne!(hardware_quote_binding(&body).unwrap(), base);
+    }
+
+    #[test]
+    fn tpm2_ek_quote_kind_is_tier2_and_snake_case() {
+        assert_eq!(
+            HardwareQuoteKind::Tpm2QuoteEk.attestation_tier(),
+            TIER2_DEVICE_IDENTITY_TIER
+        );
+        let encoded = serde_json::to_string(&HardwareQuoteKind::Tpm2QuoteEk).unwrap();
+        assert_eq!(encoded, "\"tpm2_quote_ek\"");
+        let decoded: HardwareQuoteKind = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, HardwareQuoteKind::Tpm2QuoteEk);
     }
 
     #[test]
