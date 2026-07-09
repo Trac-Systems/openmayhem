@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 use anyhow::{bail, ensure, Context, Result};
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use flate2::read::GzDecoder;
@@ -40,11 +41,12 @@ use mayhem_enclave::{
 };
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, EngineBackend,
-    GenerateRequest, GrammarSpec, LoadConfig, MediaInput, ModelArtifact, SpeechRequest, TokenChunk,
-    ToolSpec, MTMD_MEDIA_MARKER,
+    GenerateRequest, GrammarSpec, LoadConfig, MediaInput, ModelArtifact, NoopTokenSink,
+    SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
-    fold_reputation, heartbeat_signing_payload, normalize_rate_map,
+    audio_fingerprint, embedding_vector_fingerprint, fold_reputation, heartbeat_signing_payload,
+    image_average_hash_hex, normalize_canary_transcript, normalize_rate_map,
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
@@ -122,7 +124,7 @@ const MAYHEMD_PID_FILE: &str = "mayhemd.pid";
 const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
 const DEFAULT_RELEASE_FEED_URL: &str =
-    "https://api.github.com/repos/Trac-Systems/operationmayhem/releases/latest";
+    "https://api.github.com/repos/Trac-Systems/openmayhem/releases/latest";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
 const RELEASE_SIGNATURE_FILE_SUFFIX: &str = ".sig";
 const CONTRACT_SIGNING_MESSAGE_VERSION: u32 = 2;
@@ -10772,10 +10774,11 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     })?;
     validate_calibration_args_for_artifact(artifact, &args)?;
     verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
-    let prompts = load_canary_prompts(
+    let prompts = load_canary_prompts_checked(
         Some(&canaries_dir),
         &model.canary.set_id,
         args.prompt_id.as_deref(),
+        model.canary.verification_method == "token_fingerprint",
     )?;
     let canary_set_sha256 =
         canary_set_file_sha256(&canaries_dir, &model.canary.set_id).map_err(anyhow::Error::msg)?;
@@ -10791,7 +10794,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         )?);
     }
     let catalog_fingerprint = aggregate_canary_fingerprint(&reports);
-    let existing = model.canary.fingerprints.get(&args.artifact).cloned();
+    let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
     let matches_existing = existing
         .as_ref()
         .map(|existing| existing == &catalog_fingerprint);
@@ -10800,6 +10803,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         model_id: model.model_id.clone(),
         artifact: args.artifact.clone(),
         engine: artifact.engine.clone(),
+        verification_method: model.canary.verification_method.clone(),
         artifact_path,
         artifact_binding: catalog_canary_artifact_binding(artifact),
         runtime_config,
@@ -11392,10 +11396,14 @@ fn catalog_canary_evidence_report(
         if launch_only && model.tier != "launch" {
             continue;
         }
-        if model.canary.verification_method != "token_fingerprint" {
+        if model.canary.verification_method == "attestation_of_compute" {
             continue;
         }
-        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id, true);
+        let canary_check = canary_set_matrix_check(
+            &canaries_dir,
+            &model.canary.set_id,
+            model.canary.verification_method == "token_fingerprint",
+        );
         let canary_set_sha256 = match canary_set_file_sha256(&canaries_dir, &model.canary.set_id) {
             Ok(hash) => Some(hash),
             Err(err) => {
@@ -11415,18 +11423,29 @@ fn catalog_canary_evidence_report(
                     model.canary.set_id
                 ));
             }
-            let expected_fingerprint = model.canary.fingerprints.get(artifact_name).cloned();
-            match expected_fingerprint.as_deref() {
-                Some(value) if is_hex_len(value, 64) => {}
-                Some(_) => entry_errors.push(format!(
-                    "canary fingerprint for {artifact_name} must be 32-byte hex"
-                )),
-                None => entry_errors.push(format!(
-                    "canary fingerprint missing artifact {artifact_name}"
-                )),
+            let expected_fingerprint = existing_catalog_canary_fingerprint(model, artifact_name);
+            if mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
+                match expected_fingerprint.as_deref() {
+                    Some(value) if is_hex_len(value, 64) => {}
+                    Some(_) => entry_errors.push(format!(
+                        "canary fingerprint for {artifact_name} must be 32-byte hex"
+                    )),
+                    None => entry_errors.push(format!(
+                        "canary fingerprint missing artifact {artifact_name}"
+                    )),
+                }
             }
             let expected_token_prefixes = model.canary.token_prefixes.get(artifact_name).cloned();
-            if mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
+            let expected_perceptual_hashes =
+                model.canary.perceptual_hashes.get(artifact_name).cloned();
+            let expected_embedding_vectors =
+                model.canary.embedding_vectors.get(artifact_name).cloned();
+            let expected_transcripts = model.canary.transcripts.get(artifact_name).cloned();
+            let expected_audio_fingerprints =
+                model.canary.audio_fingerprints.get(artifact_name).cloned();
+            if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
+                && model.canary.verification_method == "token_fingerprint"
+            {
                 match expected_token_prefixes.as_ref() {
                     Some(prefixes) if !prefixes.is_empty() => {}
                     Some(_) => entry_errors.push(format!(
@@ -11437,6 +11456,17 @@ fn catalog_canary_evidence_report(
                     )),
                 }
             }
+            if mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
+                validate_expected_canary_method_values(
+                    &model.canary.verification_method,
+                    artifact_name,
+                    expected_perceptual_hashes.as_ref(),
+                    expected_embedding_vectors.as_ref(),
+                    expected_transcripts.as_ref(),
+                    expected_audio_fingerprints.as_ref(),
+                    &mut entry_errors,
+                );
+            }
             let prompt_count = canary_check.as_ref().ok().map(|info| info.prompt_count);
             let key = (model.model_id.clone(), artifact_name.clone());
             entry_index.insert(key, entries.len());
@@ -11446,18 +11476,28 @@ fn catalog_canary_evidence_report(
                 artifact: artifact_name.clone(),
                 engine: artifact.engine.clone(),
                 canary_set: model.canary.set_id.clone(),
+                verification_method: model.canary.verification_method.clone(),
                 canary_set_sha256: canary_set_sha256.clone(),
                 prompt_count,
                 expected_fingerprint,
                 expected_token_prefixes,
+                expected_perceptual_hashes,
+                expected_embedding_vectors,
+                expected_transcripts,
+                expected_audio_fingerprints,
                 expected_artifact_binding: catalog_canary_artifact_binding(artifact),
                 report_path: None,
                 report_fingerprint: None,
                 report_token_prefixes: None,
+                report_perceptual_hashes: None,
+                report_embedding_vectors: None,
+                report_transcripts: None,
+                report_audio_fingerprints: None,
                 report_canary_set_sha256: None,
                 report_artifact_binding: None,
                 matches_catalog: None,
                 token_prefixes_match_catalog: None,
+                method_values_match_catalog: None,
                 ok: entry_errors.is_empty(),
                 errors: entry_errors,
             });
@@ -11520,7 +11560,61 @@ fn catalog_canary_evidence_report(
             .iter()
             .map(|prompt| (prompt.prompt_id.clone(), prompt.token_ids.clone()))
             .collect::<BTreeMap<_, _>>();
-        entry.report_token_prefixes = Some(report_token_prefixes.clone());
+        let report_perceptual_hashes = calibration
+            .prompts
+            .iter()
+            .filter_map(|prompt| {
+                prompt
+                    .perceptual_hash
+                    .clone()
+                    .map(|value| (prompt.prompt_id.clone(), value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let report_embedding_vectors = calibration
+            .prompts
+            .iter()
+            .filter_map(|prompt| {
+                prompt
+                    .embedding_vector
+                    .clone()
+                    .map(|value| (prompt.prompt_id.clone(), value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let report_transcripts = calibration
+            .prompts
+            .iter()
+            .filter_map(|prompt| {
+                prompt
+                    .transcript
+                    .clone()
+                    .map(|value| (prompt.prompt_id.clone(), value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let report_audio_fingerprints = calibration
+            .prompts
+            .iter()
+            .filter_map(|prompt| {
+                prompt
+                    .audio_fingerprint
+                    .clone()
+                    .map(|value| (prompt.prompt_id.clone(), value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if calibration.verification_method == "token_fingerprint" {
+            entry.report_token_prefixes = Some(report_token_prefixes.clone());
+        }
+        if calibration.verification_method == "seed_perceptual_hash" {
+            entry.report_perceptual_hashes = Some(report_perceptual_hashes.clone());
+        }
+        if calibration.verification_method == "embedding_cosine" {
+            entry.report_embedding_vectors = Some(report_embedding_vectors.clone());
+        }
+        if calibration.verification_method == "transcript_match" {
+            entry.report_transcripts = Some(report_transcripts.clone());
+        }
+        if calibration.verification_method == "audio_fingerprint" {
+            entry.report_audio_fingerprints = Some(report_audio_fingerprints.clone());
+        }
         entry.report_canary_set_sha256 = Some(calibration.canary_set_sha256.clone());
         entry.report_artifact_binding = Some(calibration.artifact_binding.clone());
         let matches_catalog = entry
@@ -11533,11 +11627,29 @@ fn catalog_canary_evidence_report(
             .as_ref()
             .map(|expected| expected == &report_token_prefixes);
         entry.token_prefixes_match_catalog = token_prefixes_match_catalog;
+        let method_values_match_catalog = method_values_match_catalog(
+            &entry.verification_method,
+            entry.expected_perceptual_hashes.as_ref(),
+            entry.expected_embedding_vectors.as_ref(),
+            entry.expected_transcripts.as_ref(),
+            entry.expected_audio_fingerprints.as_ref(),
+            &report_perceptual_hashes,
+            &report_embedding_vectors,
+            &report_transcripts,
+            &report_audio_fingerprints,
+        );
+        entry.method_values_match_catalog = method_values_match_catalog;
 
         if calibration.engine != entry.engine {
             entry.errors.push(format!(
                 "report engine {} does not match catalog engine {}",
                 calibration.engine, entry.engine
+            ));
+        }
+        if calibration.verification_method != entry.verification_method {
+            entry.errors.push(format!(
+                "report verification_method {} does not match catalog verification_method {}",
+                calibration.verification_method, entry.verification_method
             ));
         }
         if calibration.canary_set != entry.canary_set {
@@ -11627,39 +11739,36 @@ fn catalog_canary_evidence_report(
                     .errors
                     .push(format!("duplicate prompt report {}", prompt.prompt_id));
             }
-            if !is_hex_len(&prompt.fingerprint, 64) {
+            if !calibration_prompt_fingerprint_valid(
+                &entry.verification_method,
+                &prompt.fingerprint,
+            ) {
                 entry.errors.push(format!(
-                    "prompt {} fingerprint must be 32-byte hex",
-                    prompt.prompt_id
+                    "prompt {} fingerprint has invalid shape for {}",
+                    prompt.prompt_id, entry.verification_method
                 ));
             }
-            if prompt.token_count != prompt.completion_tokens as usize {
-                entry.errors.push(format!(
-                    "prompt {} token_count {} does not match completion_tokens {}",
-                    prompt.prompt_id, prompt.token_count, prompt.completion_tokens
-                ));
-            }
-            if prompt.token_count != prompt.token_ids.len() {
-                entry.errors.push(format!(
-                    "prompt {} token_count {} does not match token_ids length {}",
-                    prompt.prompt_id,
-                    prompt.token_count,
-                    prompt.token_ids.len()
-                ));
-            }
-            if prompt.token_ids.is_empty() {
-                entry.errors.push(format!(
-                    "prompt {} token_ids must not be empty",
-                    prompt.prompt_id
-                ));
-            }
+            validate_calibration_prompt_method_value(
+                &entry.verification_method,
+                prompt,
+                &mut entry.errors,
+            );
         }
         if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
             && token_prefixes_match_catalog != Some(true)
+            && entry.verification_method == "token_fingerprint"
         {
             entry
                 .errors
                 .push("report token_ids do not match catalog token_prefixes".to_owned());
+        }
+        if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
+            && method_values_match_catalog != Some(true)
+            && entry.verification_method != "token_fingerprint"
+        {
+            entry
+                .errors
+                .push("report method values do not match catalog canary values".to_owned());
         }
         entry.ok = entry.errors.is_empty();
     }
@@ -11705,6 +11814,153 @@ fn catalog_canary_evidence_report(
     }
 }
 
+fn validate_expected_canary_method_values(
+    method: &str,
+    artifact: &str,
+    perceptual_hashes: Option<&BTreeMap<String, String>>,
+    embedding_vectors: Option<&BTreeMap<String, Vec<f32>>>,
+    transcripts: Option<&BTreeMap<String, String>>,
+    audio_fingerprints: Option<&BTreeMap<String, String>>,
+    errors: &mut Vec<String>,
+) {
+    match method {
+        "seed_perceptual_hash" => match perceptual_hashes {
+            Some(values) if !values.is_empty() => {}
+            Some(_) => errors.push(format!(
+                "canary perceptual_hashes for {artifact} must not be empty"
+            )),
+            None => errors.push(format!(
+                "canary perceptual_hashes missing artifact {artifact}"
+            )),
+        },
+        "embedding_cosine" => match embedding_vectors {
+            Some(values) if !values.is_empty() => {}
+            Some(_) => errors.push(format!(
+                "canary embedding_vectors for {artifact} must not be empty"
+            )),
+            None => errors.push(format!(
+                "canary embedding_vectors missing artifact {artifact}"
+            )),
+        },
+        "transcript_match" => match transcripts {
+            Some(values) if !values.is_empty() => {}
+            Some(_) => errors.push(format!(
+                "canary transcripts for {artifact} must not be empty"
+            )),
+            None => errors.push(format!("canary transcripts missing artifact {artifact}")),
+        },
+        "audio_fingerprint" => match audio_fingerprints {
+            Some(values) if !values.is_empty() => {}
+            Some(_) => errors.push(format!(
+                "canary audio_fingerprints for {artifact} must not be empty"
+            )),
+            None => errors.push(format!(
+                "canary audio_fingerprints missing artifact {artifact}"
+            )),
+        },
+        _ => {}
+    }
+}
+
+fn method_values_match_catalog(
+    method: &str,
+    expected_perceptual_hashes: Option<&BTreeMap<String, String>>,
+    expected_embedding_vectors: Option<&BTreeMap<String, Vec<f32>>>,
+    expected_transcripts: Option<&BTreeMap<String, String>>,
+    expected_audio_fingerprints: Option<&BTreeMap<String, String>>,
+    report_perceptual_hashes: &BTreeMap<String, String>,
+    report_embedding_vectors: &BTreeMap<String, Vec<f32>>,
+    report_transcripts: &BTreeMap<String, String>,
+    report_audio_fingerprints: &BTreeMap<String, String>,
+) -> Option<bool> {
+    match method {
+        "seed_perceptual_hash" => {
+            expected_perceptual_hashes.map(|expected| expected == report_perceptual_hashes)
+        }
+        "embedding_cosine" => {
+            expected_embedding_vectors.map(|expected| expected == report_embedding_vectors)
+        }
+        "transcript_match" => expected_transcripts.map(|expected| expected == report_transcripts),
+        "audio_fingerprint" => {
+            expected_audio_fingerprints.map(|expected| expected == report_audio_fingerprints)
+        }
+        _ => None,
+    }
+}
+
+fn calibration_prompt_fingerprint_valid(method: &str, fingerprint: &str) -> bool {
+    match method {
+        "seed_perceptual_hash" => valid_perceptual_hash_value(fingerprint),
+        _ => is_hex_len(fingerprint, 64),
+    }
+}
+
+fn validate_calibration_prompt_method_value(
+    method: &str,
+    prompt: &CanaryCalibrationPromptReport,
+    errors: &mut Vec<String>,
+) {
+    match method {
+        "token_fingerprint" => {
+            if prompt.token_count != prompt.completion_tokens as usize {
+                errors.push(format!(
+                    "prompt {} token_count {} does not match completion_tokens {}",
+                    prompt.prompt_id, prompt.token_count, prompt.completion_tokens
+                ));
+            }
+            if prompt.token_count != prompt.token_ids.len() {
+                errors.push(format!(
+                    "prompt {} token_count {} does not match token_ids length {}",
+                    prompt.prompt_id,
+                    prompt.token_count,
+                    prompt.token_ids.len()
+                ));
+            }
+            if prompt.token_ids.is_empty() {
+                errors.push(format!(
+                    "prompt {} token_ids must not be empty",
+                    prompt.prompt_id
+                ));
+            }
+        }
+        "seed_perceptual_hash" => match prompt.perceptual_hash.as_deref() {
+            Some(value) if valid_perceptual_hash_value(value) => {}
+            _ => errors.push(format!(
+                "prompt {} perceptual_hash must be hex between 64 and 256 bits",
+                prompt.prompt_id
+            )),
+        },
+        "embedding_cosine" => match prompt.embedding_vector.as_ref() {
+            Some(values) if !values.is_empty() && values.iter().all(|value| value.is_finite()) => {}
+            _ => errors.push(format!(
+                "prompt {} embedding_vector must contain finite values",
+                prompt.prompt_id
+            )),
+        },
+        "transcript_match" => match prompt.transcript.as_deref() {
+            Some(value) if !value.trim().is_empty() => {}
+            _ => errors.push(format!(
+                "prompt {} transcript must not be empty",
+                prompt.prompt_id
+            )),
+        },
+        "audio_fingerprint" => match prompt.audio_fingerprint.as_deref() {
+            Some(value) if is_hex_len(value, 64) => {}
+            _ => errors.push(format!(
+                "prompt {} audio_fingerprint must be 32-byte hex",
+                prompt.prompt_id
+            )),
+        },
+        _ => {}
+    }
+}
+
+fn valid_perceptual_hash_value(value: &str) -> bool {
+    (16..=64).contains(&value.len())
+        && value.len() % 2 == 0
+        && value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn apply_canary_report_fingerprints(
     catalog_value: &mut Value,
     report: &CatalogCanaryEvidenceReport,
@@ -11726,33 +11982,93 @@ fn apply_canary_report_fingerprints(
             .get_mut("canary")
             .and_then(Value::as_object_mut)
             .with_context(|| format!("model {} has no canary object", entry.model_id))?;
-        let fingerprints = canary
-            .entry("fingerprints")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .with_context(|| {
-                format!(
-                    "model {} canary.fingerprints is not an object",
-                    entry.model_id
-                )
-            })?;
-        fingerprints.insert(entry.artifact.clone(), json!(fingerprint));
-        let token_prefixes = canary
-            .entry("token_prefixes")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .with_context(|| {
-                format!(
-                    "model {} canary.token_prefixes is not an object",
-                    entry.model_id
-                )
-            })?;
-        if let Some(prefixes) = &entry.report_token_prefixes {
-            token_prefixes.insert(entry.artifact.clone(), json!(prefixes));
+        match entry.verification_method.as_str() {
+            "token_fingerprint" => {
+                let fingerprints = canary
+                    .entry("fingerprints")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .with_context(|| {
+                        format!(
+                            "model {} canary.fingerprints is not an object",
+                            entry.model_id
+                        )
+                    })?;
+                fingerprints.insert(entry.artifact.clone(), json!(fingerprint));
+                let token_prefixes = canary
+                    .entry("token_prefixes")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .with_context(|| {
+                        format!(
+                            "model {} canary.token_prefixes is not an object",
+                            entry.model_id
+                        )
+                    })?;
+                if let Some(prefixes) = &entry.report_token_prefixes {
+                    token_prefixes.insert(entry.artifact.clone(), json!(prefixes));
+                }
+            }
+            "seed_perceptual_hash" => {
+                insert_canary_method_map(
+                    canary,
+                    &entry.model_id,
+                    "perceptual_hashes",
+                    &entry.artifact,
+                    entry.report_perceptual_hashes.as_ref(),
+                )?;
+            }
+            "embedding_cosine" => {
+                insert_canary_method_map(
+                    canary,
+                    &entry.model_id,
+                    "embedding_vectors",
+                    &entry.artifact,
+                    entry.report_embedding_vectors.as_ref(),
+                )?;
+            }
+            "transcript_match" => {
+                insert_canary_method_map(
+                    canary,
+                    &entry.model_id,
+                    "transcripts",
+                    &entry.artifact,
+                    entry.report_transcripts.as_ref(),
+                )?;
+            }
+            "audio_fingerprint" => {
+                insert_canary_method_map(
+                    canary,
+                    &entry.model_id,
+                    "audio_fingerprints",
+                    &entry.artifact,
+                    entry.report_audio_fingerprints.as_ref(),
+                )?;
+            }
+            other => bail!("cannot apply unsupported canary verification_method {other}"),
         }
         applied += 1;
     }
     Ok(applied)
+}
+
+fn insert_canary_method_map<T: Serialize>(
+    canary: &mut Map<String, Value>,
+    model_id: &str,
+    field: &str,
+    artifact: &str,
+    values: Option<&BTreeMap<String, T>>,
+) -> Result<()> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    let map = canary
+        .entry(field.to_owned())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .with_context(|| format!("model {model_id} canary.{field} is not an object"))?;
+    map.insert(artifact.to_owned(), json!(values));
+    Ok(())
 }
 
 struct CatalogCanaryPlanInput<'a> {
@@ -11810,10 +12126,14 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
         if launch_only && model.tier != "launch" {
             continue;
         }
-        if model.canary.verification_method != "token_fingerprint" {
+        if model.canary.verification_method == "attestation_of_compute" {
             continue;
         }
-        let canary_check = canary_set_matrix_check(&canaries_dir, &model.canary.set_id, true);
+        let canary_check = canary_set_matrix_check(
+            &canaries_dir,
+            &model.canary.set_id,
+            model.canary.verification_method == "token_fingerprint",
+        );
         for (artifact_name, artifact) in &model.artifacts {
             let mut entry_errors = Vec::new();
             if let Err(err) = &canary_check {
@@ -11839,7 +12159,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                     .join(safe_path_component(artifact_name))
             });
             let calibration_status = match artifact.engine.as_str() {
-                "llama.cpp" | "mlx" => "ready",
+                "llama.cpp" | "mlx" | "stable-diffusion.cpp" | "whisper.cpp" | "piper" => "ready",
                 "trt-llm" => "requires-prebuilt-trt-engine",
                 "vllm" => "requires-vllm-reference-host",
                 other => {
@@ -12132,6 +12452,9 @@ fn catalog_canary_matrix_report(
             let fingerprint = model.canary.fingerprints.get(artifact_name).cloned();
             let mut token_prefix_count = None;
             let mut perceptual_hash_count = None;
+            let mut embedding_vector_count = None;
+            let mut transcript_count = None;
+            let mut audio_fingerprint_count = None;
             let calibration_status = match model.canary.verification_method.as_str() {
                 "token_fingerprint" => {
                     match fingerprint.as_deref() {
@@ -12188,13 +12511,97 @@ fn catalog_canary_matrix_report(
                     }
                     "seed-perceptual-hash-calibrated"
                 }
+                "embedding_cosine" => {
+                    match model.canary.embedding_vectors.get(artifact_name) {
+                        Some(vectors) => {
+                            embedding_vector_count = Some(vectors.len());
+                            if vectors.is_empty() {
+                                entry_errors.push(format!(
+                                    "canary embedding_vectors for {artifact_name} must not be empty"
+                                ));
+                            }
+                            for prompt_id in prompt_ids {
+                                match vectors.get(prompt_id) {
+                                    Some(vector) if !vector.is_empty() => {}
+                                    Some(_) => entry_errors.push(format!(
+                                        "canary embedding_vectors for {artifact_name} prompt {prompt_id} must not be empty"
+                                    )),
+                                    None => entry_errors.push(format!(
+                                        "canary embedding_vectors missing prompt {prompt_id} for artifact {artifact_name}"
+                                    )),
+                                }
+                            }
+                        }
+                        None => entry_errors.push(format!(
+                            "canary embedding_vectors missing artifact {artifact_name}"
+                        )),
+                    }
+                    "embedding-cosine-calibrated"
+                }
+                "transcript_match" => {
+                    match model.canary.transcripts.get(artifact_name) {
+                        Some(transcripts) => {
+                            transcript_count = Some(transcripts.len());
+                            if transcripts.is_empty() {
+                                entry_errors.push(format!(
+                                    "canary transcripts for {artifact_name} must not be empty"
+                                ));
+                            }
+                            for prompt_id in prompt_ids {
+                                match transcripts.get(prompt_id) {
+                                    Some(transcript) if !transcript.trim().is_empty() => {}
+                                    Some(_) => entry_errors.push(format!(
+                                        "canary transcripts for {artifact_name} prompt {prompt_id} must not be empty"
+                                    )),
+                                    None => entry_errors.push(format!(
+                                        "canary transcripts missing prompt {prompt_id} for artifact {artifact_name}"
+                                    )),
+                                }
+                            }
+                        }
+                        None => entry_errors.push(format!(
+                            "canary transcripts missing artifact {artifact_name}"
+                        )),
+                    }
+                    "transcript-match-calibrated"
+                }
+                "audio_fingerprint" => {
+                    match model.canary.audio_fingerprints.get(artifact_name) {
+                        Some(fingerprints) => {
+                            audio_fingerprint_count = Some(fingerprints.len());
+                            if fingerprints.is_empty() {
+                                entry_errors.push(format!(
+                                    "canary audio_fingerprints for {artifact_name} must not be empty"
+                                ));
+                            }
+                            for prompt_id in prompt_ids {
+                                match fingerprints.get(prompt_id) {
+                                    Some(fingerprint) if is_hex_len(fingerprint, 64) => {}
+                                    Some(_) => entry_errors.push(format!(
+                                        "canary audio_fingerprints for {artifact_name} prompt {prompt_id} must be 32-byte hex"
+                                    )),
+                                    None => entry_errors.push(format!(
+                                        "canary audio_fingerprints missing prompt {prompt_id} for artifact {artifact_name}"
+                                    )),
+                                }
+                            }
+                        }
+                        None => entry_errors.push(format!(
+                            "canary audio_fingerprints missing artifact {artifact_name}"
+                        )),
+                    }
+                    "audio-fingerprint-calibrated"
+                }
                 "attestation_of_compute" => {
                     if fingerprint.is_some()
                         || model.canary.token_prefixes.contains_key(artifact_name)
                         || model.canary.perceptual_hashes.contains_key(artifact_name)
+                        || model.canary.embedding_vectors.contains_key(artifact_name)
+                        || model.canary.transcripts.contains_key(artifact_name)
+                        || model.canary.audio_fingerprints.contains_key(artifact_name)
                     {
                         entry_errors.push(format!(
-                            "attestation_of_compute canary for {artifact_name} must not carry token/pHash calibration blobs"
+                            "attestation_of_compute canary for {artifact_name} must not carry output calibration blobs"
                         ));
                     }
                     "attestation-of-compute-descriptor"
@@ -12217,6 +12624,9 @@ fn catalog_canary_matrix_report(
                 fingerprint,
                 token_prefix_count,
                 perceptual_hash_count,
+                embedding_vector_count,
+                transcript_count,
+                audio_fingerprint_count,
                 calibration_status,
                 ok,
                 errors: entry_errors,
@@ -12321,6 +12731,7 @@ fn catalog_calibration_backend(
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
+        "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
@@ -12386,16 +12797,58 @@ fn catalog_calibration_backend(
                 .context("loading vLLM canary calibration artifact")?;
             Ok(Box::new(backend))
         }
-        "whisper.cpp" | "piper" => {
-            bail!(
-                "audio engines are not token canary calibration backends; use I3-D4 audio-specific probes"
-            )
+        "stable-diffusion.cpp" => {
+            let mut backend = mayhem_engine::StableDiffusionCppBackend::new()
+                .context("initializing stable-diffusion.cpp backend")?;
+            backend
+                .load(config)
+                .context("loading stable-diffusion.cpp canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "whisper.cpp" => {
+            let mut backend = mayhem_engine::WhisperCppBackend::new()
+                .context("initializing whisper.cpp backend")?;
+            backend
+                .load(config)
+                .context("loading whisper.cpp canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "piper" => {
+            let mut backend =
+                mayhem_engine::PiperBackend::new().context("initializing Piper backend")?;
+            backend
+                .load(config)
+                .context("loading Piper canary calibration artifact")?;
+            Ok(Box::new(backend))
         }
         _ => unreachable!("unsupported engines returned above"),
     }
 }
 
 fn calibrate_canary_prompt(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
+    seed: u32,
+    include_output: bool,
+) -> Result<CanaryCalibrationPromptReport> {
+    match model.canary.verification_method.as_str() {
+        "token_fingerprint" => {
+            calibrate_token_canary_prompt(backend, model, prompt, seed, include_output)
+        }
+        "seed_perceptual_hash" => {
+            calibrate_image_perceptual_hash_prompt(backend, prompt, seed, include_output)
+        }
+        "embedding_cosine" => calibrate_embedding_cosine_prompt(backend, prompt),
+        "transcript_match" => calibrate_transcript_match_prompt(backend, prompt, include_output),
+        "audio_fingerprint" => calibrate_audio_fingerprint_prompt(backend, prompt),
+        other => bail!(
+            "catalog calibrate-canary does not support verification_method {other}; attestation-only descriptors do not produce output fingerprints"
+        ),
+    }
+}
+
+fn calibrate_token_canary_prompt(
     backend: &mut dyn EngineBackend,
     model: &catalog::CatalogModel,
     prompt: &CanaryPrompt,
@@ -12426,7 +12879,251 @@ fn calibrate_canary_prompt(
         token_count: token_ids.len(),
         token_ids,
         fingerprint,
+        perceptual_hash: None,
+        embedding_vector: None,
+        transcript: None,
+        audio_fingerprint: None,
         output_text: include_output.then_some(output.text),
+    })
+}
+
+fn calibrate_image_perceptual_hash_prompt(
+    backend: &mut dyn EngineBackend,
+    prompt: &CanaryPrompt,
+    seed: u32,
+    include_output: bool,
+) -> Result<CanaryCalibrationPromptReport> {
+    let mut request = GenerateRequest::new(canary_prompt_text(prompt)?);
+    request.temperature = Some(prompt.temperature.unwrap_or(0.0) as f32);
+    request.seed = Some(prompt.seed.unwrap_or(seed));
+    request.artifact_count = Some(1);
+    if let Some(max_tokens) = prompt.max_tokens {
+        request.max_new_tokens = max_tokens.max(1);
+    }
+    if let Some((width, height)) = prompt
+        .size
+        .as_deref()
+        .map(parse_canary_image_size)
+        .transpose()?
+    {
+        request.width = Some(width);
+        request.height = Some(height);
+    }
+    request.steps = Some(prompt.steps.unwrap_or(1).max(1));
+    request.cfg_scale = prompt.cfg_scale.or(Some(1.0));
+    let mut artifacts = Vec::new();
+    let mut token_sink = NoopTokenSink;
+    let output = backend
+        .generate_with_artifacts(request, &mut token_sink, &mut |chunk: ArtifactChunk| {
+            artifacts.push(chunk);
+            Ok(())
+        })
+        .with_context(|| format!("generating image canary prompt {}", prompt.id))?;
+    let artifacts = provider_session_artifacts_from_chunks(artifacts)?;
+    let artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.content_type.starts_with("image/"))
+        .or_else(|| artifacts.first())
+        .with_context(|| {
+            format!(
+                "image canary prompt {} produced no image artifact",
+                prompt.id
+            )
+        })?;
+    let perceptual_hash = image_average_hash_hex(&artifact.bytes).map_err(anyhow::Error::msg)?;
+    Ok(CanaryCalibrationPromptReport {
+        prompt_id: prompt.id.clone(),
+        max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
+        prompt_tokens: output.usage.prompt_tokens,
+        completion_tokens: output.usage.completion_tokens,
+        token_count: 0,
+        token_ids: Vec::new(),
+        fingerprint: perceptual_hash.clone(),
+        perceptual_hash: Some(perceptual_hash),
+        embedding_vector: None,
+        transcript: None,
+        audio_fingerprint: None,
+        output_text: include_output.then_some(output.text),
+    })
+}
+
+fn calibrate_embedding_cosine_prompt(
+    backend: &mut dyn EngineBackend,
+    prompt: &CanaryPrompt,
+) -> Result<CanaryCalibrationPromptReport> {
+    let input = canary_prompt_text(prompt)?;
+    let output = backend
+        .embed(mayhem_engine::EmbeddingRequest::new(input))
+        .with_context(|| format!("generating embedding canary prompt {}", prompt.id))?;
+    let vector = output
+        .embeddings
+        .first()
+        .cloned()
+        .with_context(|| format!("embedding canary prompt {} produced no vector", prompt.id))?;
+    if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+        bail!(
+            "embedding canary prompt {} produced an invalid vector",
+            prompt.id
+        );
+    }
+    let fingerprint = embedding_vector_fingerprint(&vector);
+    Ok(CanaryCalibrationPromptReport {
+        prompt_id: prompt.id.clone(),
+        max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
+        prompt_tokens: output.usage.prompt_tokens,
+        completion_tokens: output.usage.completion_tokens,
+        token_count: 0,
+        token_ids: Vec::new(),
+        fingerprint,
+        perceptual_hash: None,
+        embedding_vector: Some(vector),
+        transcript: None,
+        audio_fingerprint: None,
+        output_text: None,
+    })
+}
+
+fn calibrate_transcript_match_prompt(
+    backend: &mut dyn EngineBackend,
+    prompt: &CanaryPrompt,
+    include_output: bool,
+) -> Result<CanaryCalibrationPromptReport> {
+    let request = canary_audio_transcription_request(prompt)?;
+    let output = backend
+        .transcribe(request)
+        .with_context(|| format!("transcribing canary prompt {}", prompt.id))?;
+    if output.text.trim().is_empty() {
+        bail!(
+            "STT canary prompt {} produced an empty transcript",
+            prompt.id
+        );
+    }
+    let normalized = normalize_canary_transcript(&output.text);
+    let fingerprint = blake3_bytes_hex(normalized.as_bytes());
+    Ok(CanaryCalibrationPromptReport {
+        prompt_id: prompt.id.clone(),
+        max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        token_count: 0,
+        token_ids: Vec::new(),
+        fingerprint,
+        perceptual_hash: None,
+        embedding_vector: None,
+        transcript: Some(output.text.clone()),
+        audio_fingerprint: None,
+        output_text: include_output.then_some(output.text),
+    })
+}
+
+fn calibrate_audio_fingerprint_prompt(
+    backend: &mut dyn EngineBackend,
+    prompt: &CanaryPrompt,
+) -> Result<CanaryCalibrationPromptReport> {
+    let request = SpeechRequest {
+        input: canary_prompt_text(prompt)?,
+        voice: prompt.voice.clone(),
+        response_format: Some(
+            prompt
+                .response_format
+                .clone()
+                .unwrap_or_else(|| "wav".to_owned()),
+        ),
+        speed: None,
+    };
+    let mut artifacts = Vec::new();
+    backend
+        .synthesize_speech(request, &mut |chunk: ArtifactChunk| {
+            artifacts.push(chunk);
+            Ok(())
+        })
+        .with_context(|| format!("synthesizing TTS canary prompt {}", prompt.id))?;
+    let artifacts = provider_session_artifacts_from_chunks(artifacts)?;
+    let artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.content_type == "audio/wav")
+        .or_else(|| artifacts.first())
+        .with_context(|| format!("TTS canary prompt {} produced no audio artifact", prompt.id))?;
+    let fingerprint = audio_fingerprint(&artifact.bytes);
+    Ok(CanaryCalibrationPromptReport {
+        prompt_id: prompt.id.clone(),
+        max_tokens: prompt.max_tokens.unwrap_or(1).max(1),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        token_count: 0,
+        token_ids: Vec::new(),
+        fingerprint: fingerprint.clone(),
+        perceptual_hash: None,
+        embedding_vector: None,
+        transcript: None,
+        audio_fingerprint: Some(fingerprint),
+        output_text: None,
+    })
+}
+
+fn canary_prompt_text(prompt: &CanaryPrompt) -> Result<String> {
+    prompt
+        .input
+        .clone()
+        .or_else(|| prompt.prompt.clone())
+        .or_else(|| canary_messages_text(&prompt.messages))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("canary prompt {} needs input or prompt text", prompt.id))
+}
+
+fn canary_messages_text(messages: &[Value]) -> Option<String> {
+    let text = messages
+        .iter()
+        .filter_map(|message| message.get("content"))
+        .map(|content| {
+            content
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| content.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn parse_canary_image_size(value: &str) -> Result<(u32, u32)> {
+    let (width, height) = value
+        .split_once('x')
+        .context("image canary size must be WIDTHxHEIGHT")?;
+    let width = width.parse::<u32>().context("image canary width invalid")?;
+    let height = height
+        .parse::<u32>()
+        .context("image canary height invalid")?;
+    if width == 0 || height == 0 {
+        bail!("image canary dimensions must be greater than zero");
+    }
+    Ok((width, height))
+}
+
+fn canary_audio_transcription_request(
+    prompt: &CanaryPrompt,
+) -> Result<EngineAudioTranscriptionRequest> {
+    let audio_b64 = prompt
+        .audio_b64
+        .as_deref()
+        .with_context(|| format!("STT canary prompt {} missing audio_b64", prompt.id))?;
+    let audio = base64::engine::general_purpose::STANDARD
+        .decode(audio_b64)
+        .with_context(|| format!("decoding STT canary prompt {} audio_b64", prompt.id))?;
+    if audio.is_empty() {
+        bail!("STT canary prompt {} audio fixture is empty", prompt.id);
+    }
+    Ok(EngineAudioTranscriptionRequest {
+        audio,
+        content_type: Some(
+            prompt
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "audio/wav".to_owned()),
+        ),
+        language: prompt.language.clone(),
+        prompt: prompt.prompt.clone(),
     })
 }
 
@@ -12445,6 +13142,58 @@ fn aggregate_canary_fingerprint(prompts: &[CanaryCalibrationPromptReport]) -> St
         hasher.update(&(prompt_id.len() as u32).to_be_bytes());
         hasher.update(prompt_id);
         hasher.update(prompt.fingerprint.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn existing_catalog_canary_fingerprint(
+    model: &catalog::CatalogModel,
+    artifact: &str,
+) -> Option<String> {
+    match model.canary.verification_method.as_str() {
+        "token_fingerprint" => model.canary.fingerprints.get(artifact).cloned(),
+        "seed_perceptual_hash" => model.canary.perceptual_hashes.get(artifact).map(|values| {
+            aggregate_prompt_fingerprint_map(
+                values
+                    .iter()
+                    .map(|(id, hash)| (id.as_str(), hash.as_str().to_owned())),
+            )
+        }),
+        "embedding_cosine" => model.canary.embedding_vectors.get(artifact).map(|values| {
+            aggregate_prompt_fingerprint_map(
+                values
+                    .iter()
+                    .map(|(id, vector)| (id.as_str(), embedding_vector_fingerprint(vector))),
+            )
+        }),
+        "transcript_match" => model.canary.transcripts.get(artifact).map(|values| {
+            aggregate_prompt_fingerprint_map(values.iter().map(|(id, transcript)| {
+                (
+                    id.as_str(),
+                    blake3_bytes_hex(normalize_canary_transcript(transcript).as_bytes()),
+                )
+            }))
+        }),
+        "audio_fingerprint" => model.canary.audio_fingerprints.get(artifact).map(|values| {
+            aggregate_prompt_fingerprint_map(
+                values
+                    .iter()
+                    .map(|(id, hash)| (id.as_str(), hash.to_ascii_lowercase())),
+            )
+        }),
+        _ => None,
+    }
+}
+
+fn aggregate_prompt_fingerprint_map<'a>(
+    values: impl IntoIterator<Item = (&'a str, String)>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (prompt_id, fingerprint) in values {
+        let prompt_id = prompt_id.as_bytes();
+        hasher.update(&(prompt_id.len() as u32).to_be_bytes());
+        hasher.update(prompt_id);
+        hasher.update(fingerprint.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -22158,6 +22907,30 @@ struct CanaryPrompt {
     temperature: Option<f64>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    audio_b64: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    response_format: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    steps: Option<u32>,
+    #[serde(default)]
+    cfg_scale: Option<f32>,
+    #[serde(default)]
+    seed: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -22208,6 +22981,14 @@ struct CanaryCalibrationPromptReport {
     token_count: usize,
     token_ids: Vec<i32>,
     fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    perceptual_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_vector: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio_fingerprint: Option<String>,
     output_text: Option<String>,
 }
 
@@ -22216,6 +22997,7 @@ struct CatalogCanaryCalibrationReport {
     model_id: String,
     artifact: String,
     engine: String,
+    verification_method: String,
     artifact_path: PathBuf,
     artifact_binding: CatalogCanaryArtifactBinding,
     runtime_config: CatalogCanaryRuntimeConfig,
@@ -22252,6 +23034,9 @@ struct CatalogCanaryMatrixEntry {
     fingerprint: Option<String>,
     token_prefix_count: Option<usize>,
     perceptual_hash_count: Option<usize>,
+    embedding_vector_count: Option<usize>,
+    transcript_count: Option<usize>,
+    audio_fingerprint_count: Option<usize>,
     calibration_status: String,
     ok: bool,
     errors: Vec<String>,
@@ -22321,18 +23106,28 @@ struct CatalogCanaryEvidenceEntry {
     artifact: String,
     engine: String,
     canary_set: String,
+    verification_method: String,
     canary_set_sha256: Option<String>,
     prompt_count: Option<usize>,
     expected_fingerprint: Option<String>,
     expected_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
+    expected_perceptual_hashes: Option<BTreeMap<String, String>>,
+    expected_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
+    expected_transcripts: Option<BTreeMap<String, String>>,
+    expected_audio_fingerprints: Option<BTreeMap<String, String>>,
     expected_artifact_binding: CatalogCanaryArtifactBinding,
     report_path: Option<PathBuf>,
     report_fingerprint: Option<String>,
     report_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
+    report_perceptual_hashes: Option<BTreeMap<String, String>>,
+    report_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
+    report_transcripts: Option<BTreeMap<String, String>>,
+    report_audio_fingerprints: Option<BTreeMap<String, String>>,
     report_canary_set_sha256: Option<String>,
     report_artifact_binding: Option<CatalogCanaryArtifactBinding>,
     matches_catalog: Option<bool>,
     token_prefixes_match_catalog: Option<bool>,
+    method_values_match_catalog: Option<bool>,
     ok: bool,
     errors: Vec<String>,
 }
@@ -22558,6 +23353,15 @@ fn load_canary_prompts(
     set_id: &str,
     prompt_id: Option<&str>,
 ) -> Result<Vec<CanaryPrompt>> {
+    load_canary_prompts_checked(canaries_dir, set_id, prompt_id, true)
+}
+
+fn load_canary_prompts_checked(
+    canaries_dir: Option<&Path>,
+    set_id: &str,
+    prompt_id: Option<&str>,
+    require_messages: bool,
+) -> Result<Vec<CanaryPrompt>> {
     let canaries_dir = canaries_dir
         .map(PathBuf::from)
         .map(Ok)
@@ -22581,7 +23385,7 @@ fn load_canary_prompts(
         bail!("canary set {set_id} has no prompts");
     }
     for prompt in &prompts {
-        if prompt.messages.is_empty() {
+        if require_messages && prompt.messages.is_empty() {
             bail!("canary prompt {} has no messages", prompt.id);
         }
     }
@@ -51386,6 +52190,18 @@ State initialization...
             })]),
             temperature: Some(0.2),
             max_tokens: Some(16),
+            prompt: None,
+            input: None,
+            audio_b64: None,
+            content_type: None,
+            filename: None,
+            language: None,
+            voice: None,
+            response_format: None,
+            size: None,
+            steps: None,
+            cfg_scale: None,
+            seed: None,
         };
 
         let request = canary_probe_request("admin/model", &prompt);
@@ -51669,6 +52485,127 @@ State initialization...
         assert_eq!(
             report.entries[0].calibration_status,
             "attestation-of-compute-descriptor"
+        );
+    }
+
+    #[test]
+    fn non_text_canary_calibration_helpers_emit_typed_values() {
+        let embedding_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "embed-p1",
+            "input": "embedding canary"
+        }))
+        .unwrap();
+        let mut embedding_backend = FakeEngineBackend::new("unused");
+        let embedding =
+            calibrate_embedding_cosine_prompt(&mut embedding_backend, &embedding_prompt).unwrap();
+        assert_eq!(embedding.embedding_vector, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(
+            embedding.fingerprint,
+            embedding_vector_fingerprint(&[0.1, 0.2, 0.3])
+        );
+
+        let wav = tiny_wav_bytes(16_000);
+        let stt_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "stt-p1",
+            "audio_b64": base64::engine::general_purpose::STANDARD.encode(&wav),
+            "content_type": "audio/wav",
+            "language": "en"
+        }))
+        .unwrap();
+        let mut stt_backend = FakeEngineBackend::new("unused");
+        let transcript =
+            calibrate_transcript_match_prompt(&mut stt_backend, &stt_prompt, true).unwrap();
+        assert_eq!(transcript.transcript.as_deref(), Some("hello mayhem"));
+        assert_eq!(transcript.output_text.as_deref(), Some("hello mayhem"));
+        assert_eq!(
+            transcript.fingerprint,
+            blake3_bytes_hex(normalize_canary_transcript("hello mayhem").as_bytes())
+        );
+
+        let tts_wav = tiny_wav_bytes(24_000);
+        let tts_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "tts-p1",
+            "input": "hello speech",
+            "voice": "launch",
+            "response_format": "wav"
+        }))
+        .unwrap();
+        let mut tts_backend =
+            FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "speech-1".to_owned(),
+                index: 0,
+                content_type: "audio/wav".to_owned(),
+                bytes: tts_wav.clone(),
+                final_chunk: true,
+            }]);
+        let speech = calibrate_audio_fingerprint_prompt(&mut tts_backend, &tts_prompt).unwrap();
+        assert_eq!(
+            speech.audio_fingerprint.as_deref(),
+            Some(audio_fingerprint(&tts_wav).as_str())
+        );
+    }
+
+    #[test]
+    fn canary_apply_writes_non_text_method_values() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].model_class = "embedding".to_owned();
+        catalog.models[0].canary.set_id = "test-embedding-canary".to_owned();
+        catalog.models[0].canary.verification_method = "embedding_cosine".to_owned();
+        let canaries_dir = test_canary_dir_with_prompts(
+            "test-embedding-canary",
+            json!([{ "id": "p1", "input": "embedding canary", "temperature": 0.0 }]),
+        );
+        let vector = vec![0.1_f32, 0.2, 0.3];
+        let mut calibration = test_calibration_report(
+            aggregate_prompt_fingerprint_map([("p1", embedding_vector_fingerprint(&vector))]),
+            None,
+        );
+        calibration.model_id = catalog.models[0].model_id.clone();
+        calibration.canary_set = "test-embedding-canary".to_owned();
+        calibration.verification_method = "embedding_cosine".to_owned();
+        calibration.matches_existing_catalog = None;
+        calibration.prompts = vec![CanaryCalibrationPromptReport {
+            prompt_id: "p1".to_owned(),
+            max_tokens: 1,
+            prompt_tokens: 3,
+            completion_tokens: 0,
+            token_count: 0,
+            token_ids: Vec::new(),
+            fingerprint: embedding_vector_fingerprint(&vector),
+            perceptual_hash: None,
+            embedding_vector: Some(vector.clone()),
+            transcript: None,
+            audio_fingerprint: None,
+            output_text: None,
+        }];
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        let report = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            canaries_dir,
+            true,
+            &[report_path],
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        assert!(report.ok, "{:?}", report.errors);
+        let mut catalog_value = json!({
+            "models": [{
+                "model_id": catalog.models[0].model_id.clone(),
+                "canary": {
+                    "set_id": "test-embedding-canary",
+                    "verification_method": "embedding_cosine"
+                }
+            }]
+        });
+        let applied = apply_canary_report_fingerprints(&mut catalog_value, &report).unwrap();
+
+        assert_eq!(applied, 1);
+        assert_eq!(
+            catalog_value["models"][0]["canary"]["embedding_vectors"]["gguf-q4_k_m"]["p1"],
+            json!(vector)
         );
     }
 
@@ -53545,6 +54482,10 @@ State initialization...
             token_count: 1,
             token_ids: vec![1],
             fingerprint,
+            perceptual_hash: None,
+            embedding_vector: None,
+            transcript: None,
+            audio_fingerprint: None,
             output_text: None,
         }
     }
@@ -53572,6 +54513,7 @@ State initialization...
             model_id: "test/model".to_owned(),
             artifact: "gguf-q4_k_m".to_owned(),
             engine: "llama.cpp".to_owned(),
+            verification_method: "token_fingerprint".to_owned(),
             artifact_path: PathBuf::from("model.gguf"),
             artifact_binding: CatalogCanaryArtifactBinding {
                 artifact_root: "aa".repeat(32),
@@ -53690,6 +54632,23 @@ State initialization...
                     "temperature": temperature,
                     "max_tokens": 8
                 }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn test_canary_dir_with_prompts(set_id: &str, prompts: Value) -> PathBuf {
+        let dir = test_temp_dir(&format!(
+            "mayhem-canary-{}",
+            set_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+        ));
+        fs::write(
+            dir.join(format!("{set_id}.json")),
+            json!({
+                "set_id": set_id,
+                "prompts": prompts,
             })
             .to_string(),
         )
@@ -54406,6 +55365,9 @@ State initialization...
                     fingerprints: BTreeMap::new(),
                     token_prefixes: BTreeMap::new(),
                     perceptual_hashes: BTreeMap::new(),
+                    embedding_vectors: BTreeMap::new(),
+                    transcripts: BTreeMap::new(),
+                    audio_fingerprints: BTreeMap::new(),
                 },
                 price_ref_au: catalog::PriceRef {
                     denom: "au_usd".to_owned(),

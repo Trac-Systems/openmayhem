@@ -13,12 +13,16 @@ use std::{
 
 use crate::{
     audit::{
-        aggregate_canary_fingerprints, evaluate_catalog_canary_perceptual_hash_probe,
-        evaluate_catalog_canary_token_prefix_probe, image_average_hash_hex,
-        supported_canary_verification_method, token_fingerprint, CanaryProbeSpec,
-        CANARY_VERIFICATION_CONTEXT_NEEDLE, CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH,
-        CANARY_VERIFICATION_TOKEN_FINGERPRINT, DEFAULT_CANARY_MATCH_MIN_BPS,
-        DEFAULT_CANARY_TEMPERATURE,
+        aggregate_canary_fingerprints, audio_fingerprint, embedding_vector_fingerprint,
+        evaluate_catalog_canary_audio_fingerprint_probe,
+        evaluate_catalog_canary_embedding_cosine_probe,
+        evaluate_catalog_canary_perceptual_hash_probe, evaluate_catalog_canary_token_prefix_probe,
+        evaluate_catalog_canary_transcript_match_probe, image_average_hash_hex,
+        supported_canary_verification_method, token_fingerprint, CanaryProbeEvaluation,
+        CanaryProbeSpec, CANARY_VERIFICATION_AUDIO_FINGERPRINT, CANARY_VERIFICATION_CONTEXT_NEEDLE,
+        CANARY_VERIFICATION_EMBEDDING_COSINE, CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH,
+        CANARY_VERIFICATION_TOKEN_FINGERPRINT, CANARY_VERIFICATION_TRANSCRIPT_MATCH,
+        DEFAULT_CANARY_MATCH_MIN_BPS, DEFAULT_CANARY_TEMPERATURE,
     },
     failover::{
         default_ttft_timeout_millis, midstream_stalled_after, x_mayhem_hedge_requested,
@@ -85,6 +89,10 @@ const EMBEDDED_CANARY_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-launch-v1.json");
 const EMBEDDED_CANARY_IMAGE_LAUNCH_V1: &str =
     include_str!("../../../catalog/canaries/canary-image-launch-v1.json");
+const EMBEDDED_CANARY_EMBEDDING_LAUNCH_V1: &str =
+    include_str!("../../../catalog/canaries/canary-embedding-launch-v1.json");
+const EMBEDDED_CANARY_TTS_LAUNCH_V1: &str =
+    include_str!("../../../catalog/canaries/canary-tts-launch-v1.json");
 const DASHBOARD_EXO_LATIN_WOFF2: &[u8] = include_bytes!("dashboard/exo-latin.woff2");
 const X_MAYHEM_HEDGE_HEADER: &str = "x-mayhem-hedge";
 const X_MAYHEM_MIN_ATT_TIER_HEADER: &str = "x-mayhem-min-att-tier";
@@ -949,9 +957,15 @@ pub struct GatewayCanaryModelConfig {
     pub fingerprints_by_artifact_root: BTreeMap<String, String>,
     pub token_prefixes_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
     pub perceptual_hashes_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
+    pub embedding_vectors_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<f32>>>,
+    pub transcripts_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
+    pub audio_fingerprints_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub default_fingerprint: Option<String>,
     pub default_token_prefixes: Option<BTreeMap<String, Vec<i32>>>,
     pub default_perceptual_hashes: Option<BTreeMap<String, String>>,
+    pub default_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
+    pub default_transcripts: Option<BTreeMap<String, String>>,
+    pub default_audio_fingerprints: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -961,6 +975,13 @@ pub struct GatewayCanaryPrompt {
     pub tools: Option<Vec<Value>>,
     pub max_tokens: u32,
     pub prompt: Option<String>,
+    pub input: Option<String>,
+    pub audio_b64: Option<String>,
+    pub content_type: Option<String>,
+    pub filename: Option<String>,
+    pub language: Option<String>,
+    pub voice: Option<String>,
+    pub response_format: Option<String>,
     pub size: Option<String>,
     pub steps: Option<u64>,
     pub cfg_scale: Option<f32>,
@@ -5686,6 +5707,20 @@ struct CanaryPromptDocument {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    audio_b64: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    response_format: Option<String>,
+    #[serde(default)]
     size: Option<String>,
     #[serde(default)]
     steps: Option<u64>,
@@ -5758,14 +5793,33 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
             continue;
         }
         let perceptual_hashes = canary_perceptual_hashes_by_artifact(canary);
-        if verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT
+        if verification_method == CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
             && perceptual_hashes.is_empty()
+        {
+            continue;
+        }
+        let embedding_vectors = canary_embedding_vectors_by_artifact(canary);
+        if verification_method == CANARY_VERIFICATION_EMBEDDING_COSINE
+            && embedding_vectors.is_empty()
+        {
+            continue;
+        }
+        let transcripts = canary_transcripts_by_artifact(canary);
+        if verification_method == CANARY_VERIFICATION_TRANSCRIPT_MATCH && transcripts.is_empty() {
+            continue;
+        }
+        let audio_fingerprints = canary_audio_fingerprints_by_artifact(canary);
+        if verification_method == CANARY_VERIFICATION_AUDIO_FINGERPRINT
+            && audio_fingerprints.is_empty()
         {
             continue;
         }
         let mut fingerprints_by_artifact_root = BTreeMap::new();
         let mut token_prefixes_by_artifact_root = BTreeMap::new();
         let mut perceptual_hashes_by_artifact_root = BTreeMap::new();
+        let mut embedding_vectors_by_artifact_root = BTreeMap::new();
+        let mut transcripts_by_artifact_root = BTreeMap::new();
+        let mut audio_fingerprints_by_artifact_root = BTreeMap::new();
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
             for (artifact_name, artifact) in artifacts {
                 if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
@@ -5788,6 +5842,15 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
                     } else if let Some(hashes) = perceptual_hashes.get(artifact_name.as_str()) {
                         perceptual_hashes_by_artifact_root
                             .insert(artifact_root.to_owned(), hashes.clone());
+                    } else if let Some(vectors) = embedding_vectors.get(artifact_name.as_str()) {
+                        embedding_vectors_by_artifact_root
+                            .insert(artifact_root.to_owned(), vectors.clone());
+                    } else if let Some(expected) = transcripts.get(artifact_name.as_str()) {
+                        transcripts_by_artifact_root
+                            .insert(artifact_root.to_owned(), expected.clone());
+                    } else if let Some(expected) = audio_fingerprints.get(artifact_name.as_str()) {
+                        audio_fingerprints_by_artifact_root
+                            .insert(artifact_root.to_owned(), expected.clone());
                     }
                 }
             }
@@ -5795,6 +5858,9 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
         let default_fingerprint = fingerprints.values().next().cloned();
         let default_token_prefixes = token_prefixes.values().next().cloned();
         let default_perceptual_hashes = perceptual_hashes.values().next().cloned();
+        let default_embedding_vectors = embedding_vectors.values().next().cloned();
+        let default_transcripts = transcripts.values().next().cloned();
+        let default_audio_fingerprints = audio_fingerprints.values().next().cloned();
         models.insert(
             model_id.to_owned(),
             GatewayCanaryModelConfig {
@@ -5806,9 +5872,15 @@ fn canary_registry_from_catalog_root(root: &Value) -> GatewayCanaryRegistry {
                 fingerprints_by_artifact_root,
                 token_prefixes_by_artifact_root,
                 perceptual_hashes_by_artifact_root,
+                embedding_vectors_by_artifact_root,
+                transcripts_by_artifact_root,
+                audio_fingerprints_by_artifact_root,
                 default_fingerprint,
                 default_token_prefixes,
                 default_perceptual_hashes,
+                default_embedding_vectors,
+                default_transcripts,
+                default_audio_fingerprints,
             },
         );
     }
@@ -5864,6 +5936,85 @@ fn canary_perceptual_hashes_by_artifact(
         .collect()
 }
 
+fn canary_embedding_vectors_by_artifact(
+    canary: &Value,
+) -> BTreeMap<String, BTreeMap<String, Vec<f32>>> {
+    canary
+        .get("embedding_vectors")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(artifact_name, value)| {
+            let prompts = value.as_object()?;
+            let prompts = prompts
+                .iter()
+                .filter_map(|(prompt_id, raw_vector)| {
+                    let vector = raw_vector
+                        .as_array()?
+                        .iter()
+                        .map(|value| {
+                            value.as_f64().and_then(|value| {
+                                value
+                                    .is_finite()
+                                    .then_some(value as f32)
+                                    .filter(|value| value.is_finite())
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    (!vector.is_empty()).then_some((prompt_id.clone(), vector))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!prompts.is_empty()).then(|| (artifact_name.clone(), prompts))
+        })
+        .collect()
+}
+
+fn canary_transcripts_by_artifact(canary: &Value) -> BTreeMap<String, BTreeMap<String, String>> {
+    canary
+        .get("transcripts")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(artifact_name, value)| {
+            let prompts = value.as_object()?;
+            let prompts = prompts
+                .iter()
+                .filter_map(|(prompt_id, transcript)| {
+                    transcript
+                        .as_str()
+                        .filter(|transcript| !transcript.trim().is_empty())
+                        .map(|transcript| (prompt_id.clone(), transcript.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!prompts.is_empty()).then(|| (artifact_name.clone(), prompts))
+        })
+        .collect()
+}
+
+fn canary_audio_fingerprints_by_artifact(
+    canary: &Value,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    canary
+        .get("audio_fingerprints")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(artifact_name, value)| {
+            let prompts = value.as_object()?;
+            let prompts = prompts
+                .iter()
+                .filter_map(|(prompt_id, fingerprint)| {
+                    fingerprint
+                        .as_str()
+                        .filter(|fingerprint| is_hex_len(fingerprint, 64))
+                        .map(|fingerprint| (prompt_id.clone(), fingerprint.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!prompts.is_empty()).then(|| (artifact_name.clone(), prompts))
+        })
+        .collect()
+}
+
 fn aggregate_token_prefixes_for_prompts(
     prompts: &[GatewayCanaryPrompt],
     prefixes: &BTreeMap<String, Vec<i32>>,
@@ -5886,6 +6037,8 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
         EMBEDDED_CANARY_DEV_V1,
         EMBEDDED_CANARY_LAUNCH_V1,
         EMBEDDED_CANARY_IMAGE_LAUNCH_V1,
+        EMBEDDED_CANARY_EMBEDDING_LAUNCH_V1,
+        EMBEDDED_CANARY_TTS_LAUNCH_V1,
     ]
     .into_iter()
     .filter_map(|raw| serde_json::from_str::<CanarySetDocument>(raw).ok())
@@ -5899,6 +6052,13 @@ fn embedded_canary_sets() -> BTreeMap<String, Vec<GatewayCanaryPrompt>> {
                 tools: prompt.tools,
                 max_tokens: prompt.max_tokens.unwrap_or(64).max(1),
                 prompt: prompt.prompt,
+                input: prompt.input,
+                audio_b64: prompt.audio_b64,
+                content_type: prompt.content_type,
+                filename: prompt.filename,
+                language: prompt.language,
+                voice: prompt.voice,
+                response_format: prompt.response_format,
                 size: prompt.size,
                 steps: prompt.steps,
                 cfg_scale: prompt.cfg_scale,
@@ -13452,6 +13612,9 @@ async fn build_embedding(
             &invocation,
             provider_receipt.as_ref(),
         )?;
+        state
+            .maybe_run_canary_probe_after_session(&model, &invocation)
+            .await;
         Some(receipt_summary(&receipt))
     };
     let data = output
@@ -13607,6 +13770,9 @@ async fn build_audio_speech(
             &invocation,
             provider_receipt.as_ref(),
         )?;
+        state
+            .maybe_run_canary_probe_after_session(&model, &invocation)
+            .await;
         Some(receipt_summary(&receipt))
     };
     let artifact = output
@@ -13769,6 +13935,9 @@ async fn build_audio_transcription(
             &invocation,
             provider_receipt.as_ref(),
         )?;
+        state
+            .maybe_run_canary_probe_after_session(&model, &invocation)
+            .await;
         Some(receipt_summary(&receipt))
     };
     Ok(json!({
@@ -13979,15 +14148,33 @@ impl GatewayState {
         if config.prompts.is_empty() {
             return;
         }
-        if config.verification_method == CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
-            && !model_supports_image_generation(model)
-        {
-            return;
-        }
-        if config.verification_method != CANARY_VERIFICATION_TOKEN_FINGERPRINT
-            && config.verification_method != CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
-        {
-            return;
+        match config.verification_method.as_str() {
+            CANARY_VERIFICATION_TOKEN_FINGERPRINT => {
+                if model.mayhem.model_class != DEFAULT_MODEL_CLASS {
+                    return;
+                }
+            }
+            CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => {
+                if !model_supports_image_generation(model) {
+                    return;
+                }
+            }
+            CANARY_VERIFICATION_EMBEDDING_COSINE => {
+                if !model_supports_embeddings(model) {
+                    return;
+                }
+            }
+            CANARY_VERIFICATION_TRANSCRIPT_MATCH => {
+                if !model_supports_stt(model) {
+                    return;
+                }
+            }
+            CANARY_VERIFICATION_AUDIO_FINGERPRINT => {
+                if !model_supports_tts(model) {
+                    return;
+                }
+            }
+            _ => return,
         }
         let route_key = canary_route_key(model, invocation);
         let should_probe = self
@@ -14005,6 +14192,18 @@ impl GatewayState {
             }
             CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => {
                 self.run_seed_perceptual_hash_probe_for_route(model, invocation, &config)
+                    .await
+            }
+            CANARY_VERIFICATION_EMBEDDING_COSINE => {
+                self.run_embedding_cosine_probe_for_route(model, invocation, &config)
+                    .await
+            }
+            CANARY_VERIFICATION_TRANSCRIPT_MATCH => {
+                self.run_transcript_match_probe_for_route(model, invocation, &config)
+                    .await
+            }
+            CANARY_VERIFICATION_AUDIO_FINGERPRINT => {
+                self.run_audio_fingerprint_probe_for_route(model, invocation, &config)
                     .await
             }
             _ => return,
@@ -14543,6 +14742,421 @@ impl GatewayState {
             probe_command,
         };
         Ok(event)
+    }
+
+    async fn run_embedding_cosine_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let expected_vectors = canary_expected_embedding_vectors(config, served_invocation)
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "no catalog canary embedding vectors for served artifact",
+                    Some("model"),
+                )
+            })?;
+        let route = canary_served_route(model, served_invocation);
+        let mut prompt_reports = Vec::with_capacity(config.prompts.len());
+        let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
+        let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+        let mut observed_vectors = BTreeMap::new();
+
+        for prompt in &config.prompts {
+            if !expected_vectors.contains_key(&prompt.id) {
+                continue;
+            }
+            let request = canary_embedding_request(&model.id, prompt);
+            let inputs = embedding_input_texts(&request)?;
+            let invocation = self.prepare_embedding_invocation_for_route(
+                model,
+                &inputs,
+                route.as_ref(),
+                &GatewayRequestOptions::default(),
+            )?;
+            let result = self
+                .session_backend
+                .run_embedding(model, &request, &invocation)
+                .await
+                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            let observed = result.output.embeddings.first().cloned().ok_or_else(|| {
+                ApiError::bad_gateway("provider returned no canary embedding", Some("model"))
+            })?;
+            observed_vectors.insert(prompt.id.clone(), observed.clone());
+            let receipt = self.meter_embedding_session(
+                model,
+                &inputs,
+                &result.output,
+                &invocation,
+                result.provider_receipt.as_ref(),
+            )?;
+            let receipt_hash = stable_value_hash(&json!(receipt));
+            receipt_hashes.push(receipt_hash.clone());
+            stored_receipts.push(receipt);
+            prompt_reports.push(json!({
+                "prompt_id": prompt.id,
+                "request": direct_session_embedding_request_body(&request),
+                "dimensions": observed.len(),
+                "embedding_fingerprint": embedding_vector_fingerprint(&observed),
+                "session_id": invocation.session_id,
+                "receipt_hash": receipt_hash,
+            }));
+        }
+
+        if observed_vectors.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "no canary embedding prompts matched expected vectors",
+                Some("model"),
+            ));
+        }
+
+        let spec = CanaryProbeSpec {
+            model: model.id.clone(),
+            canary_set: config.canary_set.clone(),
+            prompt_id: format!("aggregate:{}", expected_vectors.len()),
+            prompt: config
+                .prompts
+                .iter()
+                .filter(|prompt| expected_vectors.contains_key(&prompt.id))
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            seed: self.canary_policy.seed,
+            max_tokens: 1,
+        };
+        let min_match_bps = config
+            .verification_tolerance_bps
+            .map(|tolerance| 10_000u32.saturating_sub(tolerance))
+            .unwrap_or(config.match_min_bps);
+        let evaluation = evaluate_catalog_canary_embedding_cosine_probe(
+            &spec,
+            &expected_vectors,
+            &observed_vectors,
+            min_match_bps,
+        );
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-embedding-canary-probe-evidence",
+            "verification_tolerance_bps": config.verification_tolerance_bps,
+            "catalog_expected_embedding_fingerprint": evaluation.expected_fingerprint,
+            "observed_embedding_fingerprint": evaluation.observed_fingerprint,
+            "evaluation": evaluation,
+            "prompts": prompt_reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        Ok(self.content_canary_probe_event(
+            model,
+            served_invocation,
+            config,
+            evaluation,
+            evidence,
+            receipt_hashes,
+            stored_receipts,
+        ))
+    }
+
+    async fn run_transcript_match_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let expected_transcripts = canary_expected_transcripts(config, served_invocation)
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "no catalog canary transcripts for served artifact",
+                    Some("model"),
+                )
+            })?;
+        let route = canary_served_route(model, served_invocation);
+        let mut prompt_reports = Vec::with_capacity(config.prompts.len());
+        let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
+        let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+        let mut observed_transcripts = BTreeMap::new();
+
+        for prompt in &config.prompts {
+            if !expected_transcripts.contains_key(&prompt.id) {
+                continue;
+            }
+            let request = canary_audio_transcription_request(&model.id, prompt)?;
+            let invocation = self.prepare_audio_transcription_invocation_for_route(
+                model,
+                &request,
+                route.as_ref(),
+                &GatewayRequestOptions::default(),
+            )?;
+            let result = self
+                .session_backend
+                .run_audio_transcription(model, &request, &invocation)
+                .await
+                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            observed_transcripts.insert(prompt.id.clone(), result.output.text.clone());
+            let receipt = self.meter_audio_transcription_session(
+                model,
+                &request,
+                &result.output,
+                &invocation,
+                result.provider_receipt.as_ref(),
+            )?;
+            let receipt_hash = stable_value_hash(&json!(receipt));
+            receipt_hashes.push(receipt_hash.clone());
+            stored_receipts.push(receipt);
+            prompt_reports.push(json!({
+                "prompt_id": prompt.id,
+                "request": direct_session_audio_transcription_request_body(&request),
+                "transcript": result.output.text,
+                "session_id": invocation.session_id,
+                "receipt_hash": receipt_hash,
+            }));
+        }
+
+        if observed_transcripts.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "no canary STT prompts matched expected transcripts",
+                Some("model"),
+            ));
+        }
+
+        let spec = CanaryProbeSpec {
+            model: model.id.clone(),
+            canary_set: config.canary_set.clone(),
+            prompt_id: format!("aggregate:{}", expected_transcripts.len()),
+            prompt: config
+                .prompts
+                .iter()
+                .filter(|prompt| expected_transcripts.contains_key(&prompt.id))
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            seed: self.canary_policy.seed,
+            max_tokens: 1,
+        };
+        let evaluation = evaluate_catalog_canary_transcript_match_probe(
+            &spec,
+            &expected_transcripts,
+            &observed_transcripts,
+        );
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-stt-canary-probe-evidence",
+            "catalog_expected_transcripts": expected_transcripts,
+            "observed_transcripts": observed_transcripts,
+            "evaluation": evaluation,
+            "prompts": prompt_reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        Ok(self.content_canary_probe_event(
+            model,
+            served_invocation,
+            config,
+            evaluation,
+            evidence,
+            receipt_hashes,
+            stored_receipts,
+        ))
+    }
+
+    async fn run_audio_fingerprint_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let expected_fingerprints = canary_expected_audio_fingerprints(config, served_invocation)
+            .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "no catalog canary audio fingerprints for served artifact",
+                Some("model"),
+            )
+        })?;
+        let route = canary_served_route(model, served_invocation);
+        let mut prompt_reports = Vec::with_capacity(config.prompts.len());
+        let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
+        let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+        let mut observed_fingerprints = BTreeMap::new();
+
+        for prompt in &config.prompts {
+            if !expected_fingerprints.contains_key(&prompt.id) {
+                continue;
+            }
+            let request = canary_audio_speech_request(&model.id, prompt);
+            validate_audio_speech_request(&request)?;
+            let invocation = self.prepare_audio_speech_invocation_for_route(
+                model,
+                &request,
+                route.as_ref(),
+                &GatewayRequestOptions::default(),
+            )?;
+            let result = self
+                .session_backend
+                .run_audio_speech(model, &request, &invocation)
+                .await
+                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            let artifact = result
+                .output
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.content_type == "audio/wav")
+                .or_else(|| result.output.artifacts.first())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        "provider returned no audio canary artifact",
+                        Some("model"),
+                    )
+                })?;
+            let observed = audio_fingerprint(&artifact.bytes);
+            observed_fingerprints.insert(prompt.id.clone(), observed.clone());
+            let receipt = self.meter_audio_speech_session(
+                model,
+                &request,
+                &result.output,
+                &invocation,
+                result.provider_receipt.as_ref(),
+            )?;
+            let receipt_hash = stable_value_hash(&json!(receipt));
+            receipt_hashes.push(receipt_hash.clone());
+            stored_receipts.push(receipt);
+            prompt_reports.push(json!({
+                "prompt_id": prompt.id,
+                "request": direct_session_audio_speech_request_body(&request),
+                "artifact": artifact_summaries(std::slice::from_ref(artifact)),
+                "observed_audio_fingerprint": observed,
+                "session_id": invocation.session_id,
+                "receipt_hash": receipt_hash,
+            }));
+        }
+
+        if observed_fingerprints.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "no canary TTS prompts matched expected audio fingerprints",
+                Some("model"),
+            ));
+        }
+
+        let spec = CanaryProbeSpec {
+            model: model.id.clone(),
+            canary_set: config.canary_set.clone(),
+            prompt_id: format!("aggregate:{}", expected_fingerprints.len()),
+            prompt: config
+                .prompts
+                .iter()
+                .filter(|prompt| expected_fingerprints.contains_key(&prompt.id))
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            seed: self.canary_policy.seed,
+            max_tokens: 1,
+        };
+        let evaluation = evaluate_catalog_canary_audio_fingerprint_probe(
+            &spec,
+            &expected_fingerprints,
+            &observed_fingerprints,
+        );
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-tts-canary-probe-evidence",
+            "catalog_expected_audio_fingerprints": expected_fingerprints,
+            "observed_audio_fingerprints": observed_fingerprints,
+            "evaluation": evaluation,
+            "prompts": prompt_reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        Ok(self.content_canary_probe_event(
+            model,
+            served_invocation,
+            config,
+            evaluation,
+            evidence,
+            receipt_hashes,
+            stored_receipts,
+        ))
+    }
+
+    fn content_canary_probe_event(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+        evaluation: CanaryProbeEvaluation,
+        mut evidence: Value,
+        receipt_hashes: Vec<String>,
+        stored_receipts: Vec<StoredReceipt>,
+    ) -> StoredProbeEvent {
+        let provider = served_invocation
+            .provider_pubkey
+            .clone()
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let binary_hash = served_invocation
+            .attestation
+            .as_ref()
+            .map(|attestation| attestation.contract.binary_hash.clone())
+            .unwrap_or_default();
+        evidence["model"] = json!(model.id);
+        evidence["provider"] = json!(provider);
+        evidence["enclave_id"] = json!(served_invocation.enclave_id);
+        evidence["binary_hash"] = json!(binary_hash);
+        evidence["canary_set"] = json!(config.canary_set);
+        evidence["verification_method"] = json!(config.verification_method);
+        let evidence_hash = stable_value_hash(&evidence);
+        let session_receipt_hash = stable_value_hash(&json!({
+            "domain": "mayhem-canary-receipt-bundle-v1",
+            "receipt_hashes": receipt_hashes,
+        }));
+        let at = now_secs();
+        let probe_id = stable_value_hash(&json!({
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "canary_set": config.canary_set,
+            "verification_method": config.verification_method,
+            "epoch": self.canary_policy.epoch,
+            "evidence_hash": evidence_hash,
+        }));
+        let mut probe_command = json!({
+            "op": "probe_result",
+            "probe_id": probe_id,
+            "probe_kind": "canary",
+            "provider": provider,
+            "enclave_id": served_invocation.enclave_id,
+            "binary_hash": binary_hash,
+            "epoch": self.canary_policy.epoch,
+            "at": at,
+            "canary_set": config.canary_set,
+            "verification_method": config.verification_method,
+            "match_bps": evaluation.match_bps,
+            "pass": evaluation.pass,
+            "session_receipt_hash": session_receipt_hash,
+            "evidence_hash": evidence_hash,
+        });
+        probe_command["auditor_sig"] = json!(probe_result_signature(
+            &self.receipt_config.user_seed,
+            &probe_command,
+            &verifying_key_hex(&self.receipt_config.user_seed),
+        ));
+        StoredProbeEvent {
+            probe_id: probe_command["probe_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            model_id: model.id.clone(),
+            provider,
+            enclave_id: served_invocation.enclave_id.clone(),
+            binary_hash,
+            canary_set: config.canary_set.clone(),
+            verification_method: evaluation.verification_method.clone(),
+            expected_fingerprint: evaluation.expected_fingerprint.clone(),
+            observed_fingerprint: evaluation.observed_fingerprint.clone(),
+            match_bps: evaluation.match_bps,
+            pass: evaluation.pass,
+            reputation_event_kind: evaluation.reputation_event_kind(),
+            session_receipt_hash,
+            evidence_hash,
+            evidence: json!({
+                "evidence": evidence,
+                "receipts": stored_receipts,
+            }),
+            probe_command,
+        }
     }
 
     fn prepare_chat_invocation_for_route(
@@ -15754,6 +16368,54 @@ fn canary_expected_perceptual_hashes(
         .or_else(|| config.default_perceptual_hashes.clone())
 }
 
+fn canary_expected_embedding_vectors(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<BTreeMap<String, Vec<f32>>> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .embedding_vectors_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| config.default_embedding_vectors.clone())
+}
+
+fn canary_expected_transcripts(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<BTreeMap<String, String>> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .transcripts_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| config.default_transcripts.clone())
+}
+
+fn canary_expected_audio_fingerprints(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<BTreeMap<String, String>> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .audio_fingerprints_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| config.default_audio_fingerprints.clone())
+}
+
 #[derive(Clone, Debug)]
 struct ContextNeedleSpec {
     answer: String,
@@ -15912,6 +16574,98 @@ fn canary_image_generation_request(
         seed: Some(prompt.seed.unwrap_or(seed)),
         user: None,
     }
+}
+
+fn canary_text_input(prompt: &GatewayCanaryPrompt) -> String {
+    prompt
+        .input
+        .clone()
+        .or_else(|| prompt.prompt.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            prompt
+                .messages
+                .iter()
+                .map(|message| {
+                    message
+                        .content
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| message.content.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+}
+
+fn canary_embedding_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> EmbeddingRequest {
+    EmbeddingRequest {
+        model: model_id.to_owned(),
+        input: json!(canary_text_input(prompt)),
+        encoding_format: Some("float".to_owned()),
+        dimensions: None,
+        user: None,
+    }
+}
+
+fn canary_audio_speech_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> AudioSpeechRequest {
+    AudioSpeechRequest {
+        model: model_id.to_owned(),
+        input: canary_text_input(prompt),
+        voice: prompt.voice.clone(),
+        response_format: Some(
+            prompt
+                .response_format
+                .clone()
+                .unwrap_or_else(|| "wav".to_owned()),
+        ),
+        speed: None,
+    }
+}
+
+fn canary_audio_transcription_request(
+    model_id: &str,
+    prompt: &GatewayCanaryPrompt,
+) -> Result<AudioTranscriptionRequest, ApiError> {
+    let audio_b64 = prompt.audio_b64.as_deref().ok_or_else(|| {
+        ApiError::bad_gateway("STT canary prompt missing audio_b64 fixture", Some("model"))
+    })?;
+    let audio = BASE64_STANDARD.decode(audio_b64).map_err(|err| {
+        ApiError::bad_gateway(
+            format!("invalid STT canary audio_b64: {err}"),
+            Some("model"),
+        )
+    })?;
+    if audio.is_empty() {
+        return Err(ApiError::bad_gateway(
+            "STT canary audio fixture is empty",
+            Some("model"),
+        ));
+    }
+    Ok(AudioTranscriptionRequest {
+        model: model_id.to_owned(),
+        audio,
+        content_type: Some(
+            prompt
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "audio/wav".to_owned()),
+        ),
+        filename: Some(
+            prompt
+                .filename
+                .clone()
+                .unwrap_or_else(|| format!("{}.wav", prompt.id)),
+        ),
+        response_format: Some(
+            prompt
+                .response_format
+                .clone()
+                .unwrap_or_else(|| "json".to_owned()),
+        ),
+        language: prompt.language.clone(),
+        prompt: prompt.prompt.clone(),
+    })
 }
 
 fn failed_canary_runtime_probe(

@@ -1,0 +1,11 @@
+{
+  "set_id": "canary-embedding-launch-v1",
+  "description": "Launch embedding canary prompts for calibrated cosine-similarity checks.",
+  "prompts": [
+    {
+      "id": "embedding-provenance-fixed",
+      "input": "OpenMayhem embedding provenance canary: admin catalog artifact identity.",
+      "max_tokens": 1
+    }
+  ]
+}

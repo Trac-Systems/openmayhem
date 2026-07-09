@@ -18,6 +18,7 @@ llama-cpp-vulkan = ["mayhem-engine/llama-cpp-vulkan"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"

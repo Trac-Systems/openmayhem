@@ -15,6 +15,9 @@ use serde_json::Value;
 
 const VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
 const VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
+const VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
+const VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
+const VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 const VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 
 #[derive(Debug, Clone)]
@@ -265,6 +268,12 @@ pub(crate) struct CanaryRef {
     pub(crate) token_prefixes: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
     #[serde(default)]
     pub(crate) perceptual_hashes: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) embedding_vectors: BTreeMap<String, BTreeMap<String, Vec<f32>>>,
+    #[serde(default)]
+    pub(crate) transcripts: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) audio_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -756,6 +765,9 @@ fn validate_canary_verification(model: &CatalogModel, errors: &mut Vec<String>) 
     match method {
         VERIFICATION_TOKEN_FINGERPRINT => validate_token_fingerprint_canary(model, errors),
         VERIFICATION_SEED_PERCEPTUAL_HASH => validate_seed_perceptual_hash_canary(model, errors),
+        VERIFICATION_EMBEDDING_COSINE => validate_embedding_cosine_canary(model, errors),
+        VERIFICATION_TRANSCRIPT_MATCH => validate_transcript_match_canary(model, errors),
+        VERIFICATION_AUDIO_FINGERPRINT => validate_audio_fingerprint_canary(model, errors),
         VERIFICATION_ATTESTATION_OF_COMPUTE => {
             validate_attestation_of_compute_canary(model, errors)
         }
@@ -768,6 +780,9 @@ fn valid_canary_verification_method(method: &str) -> bool {
         method,
         VERIFICATION_TOKEN_FINGERPRINT
             | VERIFICATION_SEED_PERCEPTUAL_HASH
+            | VERIFICATION_EMBEDDING_COSINE
+            | VERIFICATION_TRANSCRIPT_MATCH
+            | VERIFICATION_AUDIO_FINGERPRINT
             | VERIFICATION_ATTESTATION_OF_COMPUTE
     )
 }
@@ -776,9 +791,11 @@ fn canary_verification_method_allowed_for_class(model_class: &str, method: &str)
     matches!(
         (model_class, method),
         (DEFAULT_MODEL_CLASS, VERIFICATION_TOKEN_FINGERPRINT)
-            | ("embedding", VERIFICATION_TOKEN_FINGERPRINT)
+            | ("embedding", VERIFICATION_EMBEDDING_COSINE)
             | ("image-generation", VERIFICATION_SEED_PERCEPTUAL_HASH)
             | ("video-generation", VERIFICATION_SEED_PERCEPTUAL_HASH)
+            | ("stt", VERIFICATION_TRANSCRIPT_MATCH)
+            | ("tts", VERIFICATION_AUDIO_FINGERPRINT)
             | (_, VERIFICATION_ATTESTATION_OF_COMPUTE)
     )
 }
@@ -796,6 +813,7 @@ fn validate_token_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<Stri
             model.model_id
         ));
     }
+    validate_no_non_text_canary_blobs(model, "token_fingerprint", errors);
     for artifact_name in model.artifacts.keys() {
         if !model.canary.fingerprints.contains_key(artifact_name) {
             errors.push(format!(
@@ -871,6 +889,7 @@ fn validate_seed_perceptual_hash_canary(model: &CatalogModel, errors: &mut Vec<S
             model.model_id
         ));
     }
+    validate_no_non_text_canary_blobs(model, "seed_perceptual_hash", errors);
     for artifact_name in model.artifacts.keys() {
         if !model.canary.perceptual_hashes.contains_key(artifact_name) {
             errors.push(format!(
@@ -909,12 +928,182 @@ fn validate_seed_perceptual_hash_canary(model: &CatalogModel, errors: &mut Vec<S
     }
 }
 
+fn validate_embedding_cosine_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    validate_text_and_image_blobs_absent(model, "embedding_cosine", errors);
+    if !model.canary.transcripts.is_empty() || !model.canary.audio_fingerprints.is_empty() {
+        errors.push(format!(
+            "{} embedding_cosine canary must use embedding_vectors only",
+            model.model_id
+        ));
+    }
+    validate_prompt_map_complete(
+        model,
+        "embedding_vectors",
+        &model.canary.embedding_vectors,
+        errors,
+        |model_id, artifact, prompt_id, vector, errors| {
+            if prompt_id.trim().is_empty() {
+                errors.push(format!(
+                    "{model_id} canary embedding_vectors for {artifact} has empty prompt id"
+                ));
+            }
+            if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+                errors.push(format!(
+                    "{model_id} canary embedding_vectors for {artifact} prompt {prompt_id} must contain finite values"
+                ));
+            }
+        },
+    );
+}
+
+fn validate_transcript_match_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    if model.canary.verification_tolerance_bps.is_some() {
+        errors.push(format!(
+            "{} transcript_match canary must not set verification_tolerance_bps",
+            model.model_id
+        ));
+    }
+    validate_text_and_image_blobs_absent(model, "transcript_match", errors);
+    if !model.canary.embedding_vectors.is_empty() || !model.canary.audio_fingerprints.is_empty() {
+        errors.push(format!(
+            "{} transcript_match canary must use transcripts only",
+            model.model_id
+        ));
+    }
+    validate_prompt_map_complete(
+        model,
+        "transcripts",
+        &model.canary.transcripts,
+        errors,
+        |model_id, artifact, prompt_id, transcript, errors| {
+            if prompt_id.trim().is_empty() {
+                errors.push(format!(
+                    "{model_id} canary transcripts for {artifact} has empty prompt id"
+                ));
+            }
+            if transcript.trim().is_empty() {
+                errors.push(format!(
+                    "{model_id} canary transcripts for {artifact} prompt {prompt_id} must not be empty"
+                ));
+            }
+        },
+    );
+}
+
+fn validate_audio_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    if model.canary.verification_tolerance_bps.is_some() {
+        errors.push(format!(
+            "{} audio_fingerprint canary must not set verification_tolerance_bps",
+            model.model_id
+        ));
+    }
+    validate_text_and_image_blobs_absent(model, "audio_fingerprint", errors);
+    if !model.canary.embedding_vectors.is_empty() || !model.canary.transcripts.is_empty() {
+        errors.push(format!(
+            "{} audio_fingerprint canary must use audio_fingerprints only",
+            model.model_id
+        ));
+    }
+    validate_prompt_map_complete(
+        model,
+        "audio_fingerprints",
+        &model.canary.audio_fingerprints,
+        errors,
+        |model_id, artifact, prompt_id, fingerprint, errors| {
+            if prompt_id.trim().is_empty() {
+                errors.push(format!(
+                    "{model_id} canary audio_fingerprints for {artifact} has empty prompt id"
+                ));
+            }
+            if !is_hex_len(fingerprint, 64) {
+                errors.push(format!(
+                    "{model_id} canary audio_fingerprints for {artifact} prompt {prompt_id} must be 32-byte hex"
+                ));
+            }
+        },
+    );
+}
+
 fn validate_attestation_of_compute_canary(model: &CatalogModel, errors: &mut Vec<String>) {
     if model.canary.verification_tolerance_bps.is_some() {
         errors.push(format!(
             "{} attestation_of_compute canary must not set verification_tolerance_bps",
             model.model_id
         ));
+    }
+    if !model.canary.fingerprints.is_empty()
+        || !model.canary.token_prefixes.is_empty()
+        || !model.canary.perceptual_hashes.is_empty()
+        || !model.canary.embedding_vectors.is_empty()
+        || !model.canary.transcripts.is_empty()
+        || !model.canary.audio_fingerprints.is_empty()
+    {
+        errors.push(format!(
+            "{} attestation_of_compute canary must not carry output calibration blobs",
+            model.model_id
+        ));
+    }
+}
+
+fn validate_text_and_image_blobs_absent(
+    model: &CatalogModel,
+    method: &str,
+    errors: &mut Vec<String>,
+) {
+    if !model.canary.fingerprints.is_empty()
+        || !model.canary.token_prefixes.is_empty()
+        || !model.canary.perceptual_hashes.is_empty()
+    {
+        errors.push(format!(
+            "{} {method} canary must not set fingerprints, token_prefixes, or perceptual_hashes",
+            model.model_id
+        ));
+    }
+}
+
+fn validate_no_non_text_canary_blobs(model: &CatalogModel, method: &str, errors: &mut Vec<String>) {
+    if !model.canary.embedding_vectors.is_empty()
+        || !model.canary.transcripts.is_empty()
+        || !model.canary.audio_fingerprints.is_empty()
+    {
+        errors.push(format!(
+            "{} {method} canary must not set embedding_vectors, transcripts, or audio_fingerprints",
+            model.model_id
+        ));
+    }
+}
+
+fn validate_prompt_map_complete<T>(
+    model: &CatalogModel,
+    field: &str,
+    map: &BTreeMap<String, BTreeMap<String, T>>,
+    errors: &mut Vec<String>,
+    validate_value: impl Fn(&str, &str, &str, &T, &mut Vec<String>),
+) {
+    for artifact_name in model.artifacts.keys() {
+        if !map.contains_key(artifact_name) {
+            errors.push(format!(
+                "{} canary {field} missing artifact {}",
+                model.model_id, artifact_name
+            ));
+        }
+    }
+    for (artifact, prompts) in map {
+        if !model.artifacts.contains_key(artifact) {
+            errors.push(format!(
+                "{} canary {field} references unknown artifact {}",
+                model.model_id, artifact
+            ));
+        }
+        if prompts.is_empty() {
+            errors.push(format!(
+                "{} canary {field} for {} must not be empty",
+                model.model_id, artifact
+            ));
+        }
+        for (prompt_id, value) in prompts {
+            validate_value(&model.model_id, artifact, prompt_id, value, errors);
+        }
     }
 }
 
@@ -1910,6 +2099,9 @@ mod tests {
                     BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
                 )]),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         model.min_app_version = Some("0.1.0".to_owned());
@@ -1975,6 +2167,9 @@ mod tests {
                 fingerprints: BTreeMap::new(),
                 token_prefixes: BTreeMap::new(),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
             price_ref_au: PriceRef {
                 denom: "au_usd".to_owned(),
@@ -2038,6 +2233,9 @@ mod tests {
                     BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
                 )]),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -2059,6 +2257,9 @@ mod tests {
                     "fixture".to_owned(),
                     BTreeMap::from([("fixed-image".to_owned(), "f".repeat(16))]),
                 )]),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -2107,6 +2308,9 @@ mod tests {
                     BTreeMap::from([("fixed-text".to_owned(), vec![1, 2, 3])]),
                 )]),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.tool_call_strategy = "openai_tool_calls".to_owned();
@@ -2177,6 +2381,9 @@ mod tests {
                 fingerprints: BTreeMap::new(),
                 token_prefixes: BTreeMap::new(),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.request_shape_family = "openai_embeddings".to_owned();
@@ -2210,6 +2417,9 @@ mod tests {
                 fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
                 token_prefixes: BTreeMap::new(),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         text_with_zero_output.price_ref_au.out_per_1k = 0;
@@ -2233,6 +2443,9 @@ mod tests {
                 fingerprints: BTreeMap::new(),
                 token_prefixes: BTreeMap::new(),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.request_shape_family = "openai_images".to_owned();
@@ -2293,6 +2506,9 @@ mod tests {
                 fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
                 token_prefixes: BTreeMap::new(),
                 perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
             },
         );
         text_with_image_shape.adapter.request_shape_family = "openai_images".to_owned();

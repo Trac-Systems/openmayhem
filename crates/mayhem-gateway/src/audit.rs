@@ -10,6 +10,9 @@ pub const DEFAULT_CANARY_TEMPERATURE: f64 = 0.0;
 pub const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
 pub const CANARY_VERIFICATION_CONTEXT_NEEDLE: &str = "context_needle";
 pub const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
+pub const CANARY_VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
+pub const CANARY_VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
+pub const CANARY_VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 pub const CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -92,6 +95,9 @@ pub fn supported_canary_verification_method(method: &str) -> bool {
         CANARY_VERIFICATION_TOKEN_FINGERPRINT
             | CANARY_VERIFICATION_CONTEXT_NEEDLE
             | CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
+            | CANARY_VERIFICATION_EMBEDDING_COSINE
+            | CANARY_VERIFICATION_TRANSCRIPT_MATCH
+            | CANARY_VERIFICATION_AUDIO_FINGERPRINT
             | CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE
     )
 }
@@ -297,6 +303,231 @@ pub fn evaluate_catalog_canary_perceptual_hash_probe(
         total_positions,
         match_bps,
         pass: total_positions > 0 && match_bps >= min_match_bps,
+    }
+}
+
+pub fn embedding_vector_fingerprint(values: &[f32]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for value in values {
+        hasher.update(&value.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+pub fn embedding_cosine_similarity_bps(expected: &[f32], observed: &[f32]) -> Option<u32> {
+    if expected.is_empty() || expected.len() != observed.len() {
+        return None;
+    }
+    let (dot, expected_norm, observed_norm) = expected.iter().zip(observed).try_fold(
+        (0.0_f64, 0.0_f64, 0.0_f64),
+        |(dot, left_norm, right_norm), (left, right)| {
+            if !left.is_finite() || !right.is_finite() {
+                return None;
+            }
+            let left = f64::from(*left);
+            let right = f64::from(*right);
+            Some((
+                dot + left * right,
+                left_norm + left * left,
+                right_norm + right * right,
+            ))
+        },
+    )?;
+    if expected_norm == 0.0 || observed_norm == 0.0 {
+        return None;
+    }
+    let cosine = dot / (expected_norm.sqrt() * observed_norm.sqrt());
+    if !cosine.is_finite() {
+        return None;
+    }
+    Some((cosine.clamp(0.0, 1.0) * 10_000.0).round() as u32)
+}
+
+pub fn embedding_canary_matches(expected: &[f32], observed: &[f32], tolerance_bps: u32) -> bool {
+    let min_bps = 10_000u32.saturating_sub(tolerance_bps);
+    embedding_cosine_similarity_bps(expected, observed).is_some_and(|score| score >= min_bps)
+}
+
+pub fn evaluate_catalog_canary_embedding_cosine_probe(
+    spec: &CanaryProbeSpec,
+    expected_vectors: &BTreeMap<String, Vec<f32>>,
+    observed_vectors: &BTreeMap<String, Vec<f32>>,
+    min_match_bps: u32,
+) -> CanaryProbeEvaluation {
+    let mut matched_positions = 0_u32;
+    let mut total_positions = 0_u32;
+    let mut score_sum = 0_u64;
+    let mut expected_fingerprints = Vec::with_capacity(expected_vectors.len());
+    let mut observed_fingerprints = Vec::with_capacity(expected_vectors.len());
+
+    for (prompt_id, expected) in expected_vectors {
+        let observed = observed_vectors
+            .get(prompt_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let score = embedding_cosine_similarity_bps(expected, observed).unwrap_or(0);
+        total_positions = total_positions.saturating_add(1);
+        matched_positions = matched_positions.saturating_add(u32::from(score >= min_match_bps));
+        score_sum = score_sum.saturating_add(u64::from(score));
+        expected_fingerprints.push((prompt_id.as_str(), embedding_vector_fingerprint(expected)));
+        observed_fingerprints.push((prompt_id.as_str(), embedding_vector_fingerprint(observed)));
+    }
+
+    let match_bps = if total_positions == 0 {
+        0
+    } else {
+        (score_sum / u64::from(total_positions)) as u32
+    };
+    let expected_fingerprint = aggregate_canary_fingerprints(
+        expected_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+    let observed_fingerprint = aggregate_canary_fingerprints(
+        observed_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+
+    CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_EMBEDDING_COSINE.to_owned(),
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint,
+        observed_fingerprint,
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: total_positions > 0 && matched_positions == total_positions,
+    }
+}
+
+pub fn normalize_canary_transcript(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push(ch);
+            pending_space = false;
+        } else if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            pending_space = true;
+        }
+    }
+    normalized
+}
+
+fn text_fingerprint(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+pub fn evaluate_catalog_canary_transcript_match_probe(
+    spec: &CanaryProbeSpec,
+    expected_transcripts: &BTreeMap<String, String>,
+    observed_transcripts: &BTreeMap<String, String>,
+) -> CanaryProbeEvaluation {
+    let mut matched_positions = 0_u32;
+    let mut total_positions = 0_u32;
+    let mut expected_fingerprints = Vec::with_capacity(expected_transcripts.len());
+    let mut observed_fingerprints = Vec::with_capacity(expected_transcripts.len());
+
+    for (prompt_id, expected) in expected_transcripts {
+        let expected = normalize_canary_transcript(expected);
+        let observed = observed_transcripts
+            .get(prompt_id)
+            .map(|value| normalize_canary_transcript(value))
+            .unwrap_or_default();
+        total_positions = total_positions.saturating_add(1);
+        matched_positions = matched_positions
+            .saturating_add(u32::from(!expected.is_empty() && expected == observed));
+        expected_fingerprints.push((prompt_id.as_str(), text_fingerprint(&expected)));
+        observed_fingerprints.push((prompt_id.as_str(), text_fingerprint(&observed)));
+    }
+
+    let match_bps = if total_positions == 0 {
+        0
+    } else {
+        ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
+    };
+    let expected_fingerprint = aggregate_canary_fingerprints(
+        expected_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+    let observed_fingerprint = aggregate_canary_fingerprints(
+        observed_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+
+    CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_TRANSCRIPT_MATCH.to_owned(),
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint,
+        observed_fingerprint,
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: total_positions > 0 && matched_positions == total_positions,
+    }
+}
+
+pub fn audio_fingerprint(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+pub fn evaluate_catalog_canary_audio_fingerprint_probe(
+    spec: &CanaryProbeSpec,
+    expected_fingerprints_by_prompt: &BTreeMap<String, String>,
+    observed_fingerprints_by_prompt: &BTreeMap<String, String>,
+) -> CanaryProbeEvaluation {
+    let mut matched_positions = 0_u32;
+    let mut total_positions = 0_u32;
+    let mut expected_fingerprints = Vec::with_capacity(expected_fingerprints_by_prompt.len());
+    let mut observed_fingerprints = Vec::with_capacity(expected_fingerprints_by_prompt.len());
+
+    for (prompt_id, expected) in expected_fingerprints_by_prompt {
+        let observed = observed_fingerprints_by_prompt
+            .get(prompt_id)
+            .map(String::as_str)
+            .unwrap_or_default();
+        total_positions = total_positions.saturating_add(1);
+        matched_positions = matched_positions.saturating_add(u32::from(
+            !expected.is_empty() && expected.eq_ignore_ascii_case(observed),
+        ));
+        expected_fingerprints.push((prompt_id.as_str(), expected.to_ascii_lowercase()));
+        observed_fingerprints.push((prompt_id.as_str(), observed.to_ascii_lowercase()));
+    }
+
+    let match_bps = if total_positions == 0 {
+        0
+    } else {
+        ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
+    };
+    let expected_fingerprint = aggregate_canary_fingerprints(
+        expected_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+    let observed_fingerprint = aggregate_canary_fingerprints(
+        observed_fingerprints
+            .iter()
+            .map(|(prompt_id, fingerprint)| (*prompt_id, fingerprint.as_str())),
+    );
+
+    CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_AUDIO_FINGERPRINT.to_owned(),
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint,
+        observed_fingerprint,
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: total_positions > 0 && matched_positions == total_positions,
     }
 }
 

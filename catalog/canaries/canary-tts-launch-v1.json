@@ -1,0 +1,12 @@
+{
+  "set_id": "canary-tts-launch-v1",
+  "description": "Launch TTS canary prompts for calibrated audio-fingerprint checks.",
+  "prompts": [
+    {
+      "id": "tts-hello-world-fixed",
+      "input": "Hello world.",
+      "response_format": "wav",
+      "max_tokens": 1
+    }
+  ]
+}
