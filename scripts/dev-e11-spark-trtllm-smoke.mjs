@@ -109,6 +109,9 @@ Environment:
   MAYHEM_E11_PROVIDER_SESSION_REQUEST_TIMEOUT_MS  Provider accepted-open request timeout (default: 15000)
   MAYHEM_E11_ACCEL_ATT_TIER        Attestation tier for the accelerated enclave (default: 1)
   MAYHEM_E11_ACCEL_LAUNCH_MEASUREMENTS_JSON  Launch measurements JSON required when att tier is 3
+  MAYHEM_E11_ACCEL_RATE_MAP_JSON   Optional accelerated enclave price map (default: model ref; Tier-3 default doubles it)
+  MAYHEM_E11_ACCEL_PRICE_MULTIPLIER Tier-3 default multiplier when no accelerated rate map is supplied (default: 2)
+  MAYHEM_E11_REQUEST_MIN_ATT_TIER  Optional X-Mayhem-Min-Att-Tier header for gateway requests (D6 uses 3)
   MAYHEM_E11_PROVIDER_HW_QUOTE_KIND      Provider hardware quote kind for Tier-2/3 smokes
   MAYHEM_E11_PROVIDER_HW_QUOTE_COMMAND   Remote provider hardware quote command path
   MAYHEM_E11_PROVIDER_HW_QUOTE_TIMEOUT_SECONDS  Provider hardware quote timeout (default: 120)
@@ -504,6 +507,14 @@ function textRateMapJson(model) {
   ]);
 }
 
+function scaleRateMapJson(rateMapJson, multiplier) {
+  if (!Number.isSafeInteger(multiplier) || multiplier <= 0) fail(`price multiplier must be a positive integer, got ${multiplier}`);
+  return JSON.stringify(JSON.parse(rateMapJson).map((entry) => ({
+    ...entry,
+    per_unit_au: (BigInt(String(entry.per_unit_au)) * BigInt(multiplier)).toString(),
+  })));
+}
+
 function acceleratedCapsJson(backend) {
   if (backend === 'vllm') {
     return JSON.stringify({
@@ -687,7 +698,7 @@ async function waitBridgeSessionOpen(url, token, provider, timeoutMs, label) {
   throw new Error(`${label} could not open a direct session to ${provider}: ${lastError?.message || 'unknown error'}`);
 }
 
-async function waitGatewayRoute(gatewayUrl, modelId, provider, timeoutMs = 180_000) {
+async function waitGatewayRoute(gatewayUrl, modelId, provider, timeoutMs = 180_000, minAttTier = null) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
   while (Date.now() < deadline) {
@@ -695,7 +706,7 @@ async function waitGatewayRoute(gatewayUrl, modelId, provider, timeoutMs = 180_0
       const models = await (await fetch(`${gatewayUrl}/v1/models`)).json();
       const selected = models.data?.find((entry) => entry.id === modelId);
       const routes = selected?.mayhem?.route_candidates || [];
-      if (routes.some((route) => route.provider === provider)) {
+      if (routes.some((route) => route.provider === provider && (minAttTier === null || Number(route.att_tier || 0) >= minAttTier))) {
         return { selected, routes };
       }
       last = { selected: Boolean(selected), routes };
@@ -732,7 +743,7 @@ async function runStreamingChatSmoke(
   gatewayUrl,
   modelId,
   runDir,
-  { timeoutMs, maxTokens, prompt, fileStem, allowTransportErrorAfterContent = false, signal = null }
+  { timeoutMs, maxTokens, prompt, fileStem, allowTransportErrorAfterContent = false, signal = null, minAttTier = null }
 ) {
   const stem = fileStem || 'gateway-chat-stream';
   const rawPath = path.join(runDir, `${stem}.sse`);
@@ -759,7 +770,10 @@ async function runStreamingChatSmoke(
   try {
     const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...(minAttTier ? { 'X-Mayhem-Min-Att-Tier': String(minAttTier) } : {}),
+      },
       body: JSON.stringify({
         model: modelId,
         stream: true,
@@ -840,6 +854,7 @@ async function runStreamingChatSmoke(
   const summary = {
     ok: true,
     model: modelId,
+    min_att_tier: minAttTier,
     prompt: chatPrompt,
     max_tokens: maxTokens,
     content: content.trim(),
@@ -887,7 +902,7 @@ async function runConcurrentHeartbeatSmoke(
   modelId,
   runDir,
   heartbeatCollector,
-  { timeoutMs, maxTokens, provider, enclaveId, sessionCount, abortAfterProof = false }
+  { timeoutMs, maxTokens, provider, enclaveId, sessionCount, abortAfterProof = false, minAttTier = null }
 ) {
   const heartbeatEventsPath = path.join(runDir, 'gateway-concurrent-heartbeats.json');
   const promptTopics = [
@@ -915,6 +930,7 @@ async function runConcurrentHeartbeatSmoke(
     fileStem: `gateway-concurrent-${index + 1}`,
     allowTransportErrorAfterContent: true,
     signal: streamControllers[index].signal,
+    minAttTier,
   }));
   const firstStreamPromise = firstFulfilled(streams);
   const streamResultsPromise = Promise.allSettled(streams);
@@ -1026,7 +1042,7 @@ async function runConcurrentHeartbeatSmoke(
   return summary;
 }
 
-async function runGuidedToolCallSmoke(gatewayUrl, modelId, runDir, { timeoutMs }) {
+async function runGuidedToolCallSmoke(gatewayUrl, modelId, runDir, { timeoutMs, minAttTier = null }) {
   const rawPath = path.join(runDir, 'gateway-tool-call-response.json');
   const summaryPath = path.join(runDir, 'gateway-tool-call.json');
   const controller = new AbortController();
@@ -1065,7 +1081,10 @@ async function runGuidedToolCallSmoke(gatewayUrl, modelId, runDir, { timeoutMs }
   try {
     const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...(minAttTier ? { 'X-Mayhem-Min-Att-Tier': String(minAttTier) } : {}),
+      },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -1101,6 +1120,7 @@ async function runGuidedToolCallSmoke(gatewayUrl, modelId, runDir, { timeoutMs }
   const summary = {
     ok: true,
     model: modelId,
+    min_att_tier: minAttTier,
     finish_reason: choice.finish_reason,
     tool_name: toolCall.function.name,
     arguments: args,
@@ -1438,6 +1458,11 @@ async function main() {
   const accelLabel = `${accelArtifactName}/${accelBackend}`;
   const accelAttTier = envPositiveInt('MAYHEM_E11_ACCEL_ATT_TIER', 1);
   if (accelAttTier > 3) fail(`MAYHEM_E11_ACCEL_ATT_TIER must be between 1 and 3, got ${accelAttTier}`);
+  const requestMinAttTierRaw = process.env.MAYHEM_E11_REQUEST_MIN_ATT_TIER || '';
+  const requestMinAttTier = requestMinAttTierRaw
+    ? envPositiveInt('MAYHEM_E11_REQUEST_MIN_ATT_TIER', 1)
+    : null;
+  if (requestMinAttTier !== null && requestMinAttTier > 4) fail(`MAYHEM_E11_REQUEST_MIN_ATT_TIER must be between 1 and 4, got ${requestMinAttTier}`);
   const accelLaunchMeasurementsJson = process.env.MAYHEM_E11_ACCEL_LAUNCH_MEASUREMENTS_JSON || '';
   if (accelAttTier >= 3 && !accelLaunchMeasurementsJson) {
     fail('MAYHEM_E11_ACCEL_LAUNCH_MEASUREMENTS_JSON is required when MAYHEM_E11_ACCEL_ATT_TIER is 3');
@@ -1452,6 +1477,10 @@ async function main() {
     fail('Tier-3 smoke requires MAYHEM_E11_PROVIDER_HW_QUOTE_* and MAYHEM_E11_GATEWAY_HW_VERIFIER_COMMAND');
   }
   const rateMapJson = textRateMapJson(model);
+  const accelRateMapJson = process.env.MAYHEM_E11_ACCEL_RATE_MAP_JSON
+    || (accelAttTier >= 3
+      ? scaleRateMapJson(rateMapJson, envPositiveInt('MAYHEM_E11_ACCEL_PRICE_MULTIPLIER', 2))
+      : rateMapJson);
   const manifestHash = sha256File(path.join(ROOT, 'catalog/models.json'));
   const catalogReleaseRepo = process.env.MAYHEM_E11_CATALOG_RELEASE_REPO || DEFAULT_CATALOG_RELEASE_REPO;
   const catalogReleaseRevision = process.env.MAYHEM_E11_CATALOG_RELEASE_REVISION || DEFAULT_CATALOG_RELEASE_REVISION;
@@ -1697,7 +1726,7 @@ async function main() {
     180_000,
     `admin-created ${accelLabel} enclave`
   );
-  adminRun('admin-set-accelerated-price', ['set-price', '--enclave-id', accelEnclaveId, '--rate-map-json', rateMapJson, '--effective-at', '0']);
+  adminRun('admin-set-accelerated-price', ['set-price', '--enclave-id', accelEnclaveId, '--rate-map-json', accelRateMapJson, '--effective-at', '0']);
   adminRun('admin-open-accelerated-room', [
     'open-room',
     '--enclave-id', accelEnclaveId,
@@ -1920,17 +1949,29 @@ async function main() {
   );
   cleanupState.localChildren.push(gateway);
   await waitHttp(`${gatewayUrl}/mayhem/status`, 120_000, 'local gateway', async () => gateway.exitCode === null);
-  const routeInfo = await waitGatewayRoute(gatewayUrl, MODEL_ID, providerReport.provider, 180_000);
+  const routeInfo = await waitGatewayRoute(gatewayUrl, MODEL_ID, providerReport.provider, 180_000, requestMinAttTier);
+  const minTierModels = requestMinAttTier === null
+    ? null
+    : runJsonCommandToFile(mayhemBin, [
+        'models',
+        '--home', gatewayHome,
+        '--gateway',
+        '--gateway-url', gatewayUrl,
+        '--min-att-tier', String(requestMinAttTier),
+        '--json',
+      ], path.join(runDir, `gateway-models-min-att-tier-${requestMinAttTier}.json`));
 
   log(`running real streaming chat through Spark ${accelLabel} provider`);
   const chatStream = await runStreamingChatSmoke(gatewayUrl, MODEL_ID, runDir, {
     timeoutMs: envPositiveInt('MAYHEM_E11_CHAT_TIMEOUT_SECONDS', 600) * 1000,
     maxTokens: envPositiveInt('MAYHEM_E11_CHAT_MAX_TOKENS', 24),
     fileStem: 'gateway-chat-stream',
+    minAttTier: requestMinAttTier,
   });
   const toolCall = accelBackend === 'vllm' && !envFlag('MAYHEM_E11_SKIP_TOOL_CALL', false)
     ? await runGuidedToolCallSmoke(gatewayUrl, MODEL_ID, runDir, {
         timeoutMs: envPositiveInt('MAYHEM_E11_TOOL_TIMEOUT_SECONDS', 600) * 1000,
+        minAttTier: requestMinAttTier,
       })
     : null;
   let concurrentHeartbeat = null;
@@ -1951,6 +1992,7 @@ async function main() {
         enclaveId: accelEnclaveId,
         sessionCount: concurrentSessions,
         abortAfterProof: envFlag('MAYHEM_E11_CONCURRENT_ABORT_AFTER_PROOF', false),
+        minAttTier: requestMinAttTier,
       });
     } finally {
       heartbeatCollector.close();
@@ -1990,6 +2032,7 @@ async function main() {
       accelerated_artifact: accelArtifactName,
       accelerated_backend: accelBackend,
       accelerated_att_tier: accelAttTier,
+      request_min_att_tier: requestMinAttTier,
       provider_hw_quote_kind: providerHwQuoteKind || null,
       gguf_artifact: GGUF_ARTIFACT,
       gateway_catalog_source: 'contract-plus-dev-local-current-signed',
@@ -2056,7 +2099,17 @@ async function main() {
       route_info: {
         selected_model_id: routeInfo.selected?.id || null,
         route_count: routeInfo.routes.length,
+        request_min_att_tier: requestMinAttTier,
+        routes: routeInfo.routes.map((route) => ({
+          provider: route.provider,
+          enclave_id: route.enclave_id,
+          att_tier: route.att_tier,
+          quant: route.quant,
+          price_ver: route.price_ref_au?.ver,
+          rate_map: route.price_ref_au?.rate_map || null,
+        })),
       },
+      min_att_tier_models: minTierModels,
       chat_stream: chatStream,
       guided_tool_call: toolCall,
       concurrent_heartbeat: concurrentHeartbeat,
