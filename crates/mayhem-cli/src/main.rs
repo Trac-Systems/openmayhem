@@ -44932,6 +44932,13 @@ mod tests {
     }
 
     #[test]
+    fn launch_contract_versions_are_pinned_for_m1_gating() {
+        assert_eq!(CONTRACT_VERSION, 4);
+        assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
+        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 8);
+    }
+
+    #[test]
     fn provider_lifecycle_intents_are_current_version_and_limited_to_opt_in_and_out_ops() {
         let provider = "11".repeat(32);
         let intent = json!({

@@ -7,6 +7,7 @@ import MayhemContract, {
   consentMessage,
   providerLifecycleIntentMessage,
   receiptMessage,
+  signingMessageVersions,
   spendVoucherMessage,
 } from '../contract/contract.js';
 import {
@@ -25,6 +26,12 @@ const versioningLockedRateMap = [
   { unit: 'input_token', per_unit_au: '100', granularity: 30 },
   { unit: 'output_token', per_unit_au: '100', granularity: 30 },
 ];
+
+test('launch version gates cover A16/A17/D6/D7 deterministic changes', () => {
+  assert.equal(CONTRACT_VERSION, 4);
+  assert.deepEqual(signingMessageVersions(), [2]);
+  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 8);
+});
 
 test('contract reports the exported contract version', async () => {
   const user = await makeIdentity();
