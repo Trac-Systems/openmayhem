@@ -30,6 +30,7 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES: u32 = 3;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_COOLOFF_MILLIS: u64 = 30_000;
 pub const DEFAULT_CAPACITY_MISMATCH_EVENT_STREAK: u32 = 3;
 pub const DEFAULT_CAPACITY_MISMATCH_FACTOR_FLOOR: f64 = 0.5;
+const UNVERIFIED_CAPACITY_GROUP: &str = "unverified:identity_anchor";
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ProviderKey {
@@ -58,6 +59,10 @@ pub struct ContractProviderSnapshot {
     pub probation: Option<ProviderProbation>,
     pub caps: HeartbeatCaps,
     pub attestation_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -902,14 +907,34 @@ fn median(mut values: Vec<f64>) -> f64 {
 }
 
 fn capacity_group_key(entry: &ProviderTableEntry) -> String {
-    entry
+    let Some(anchor) = entry
         .heartbeat
         .as_ref()
         .and_then(|heartbeat| heartbeat.identity_anchor.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("provider:{}", entry.contract.provider))
+    else {
+        return UNVERIFIED_CAPACITY_GROUP.to_owned();
+    };
+    verified_capacity_group_key(entry, anchor)
+        .unwrap_or_else(|| UNVERIFIED_CAPACITY_GROUP.to_owned())
+}
+
+fn verified_capacity_group_key(entry: &ProviderTableEntry, anchor: &str) -> Option<String> {
+    let (kind, digest) = anchor.split_once(':')?;
+    let digest = digest.trim();
+    if digest.len() != 64 || !digest.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let digest = digest.to_ascii_lowercase();
+    let trusted = match kind {
+        "fingerprint" => entry.contract.hardware_fingerprint.as_deref(),
+        "device" => entry.contract.device_key.as_deref(),
+        _ => None,
+    }?;
+    trusted
+        .eq_ignore_ascii_case(&digest)
+        .then(|| format!("{}:{}", kind.to_ascii_lowercase(), digest))
 }
 
 fn apply_capacity_group_factors(candidates: &mut [SelectionCandidate]) {
@@ -1079,6 +1104,8 @@ mod tests {
             probation: None,
             caps: caps(),
             attestation_head: None,
+            hardware_fingerprint: None,
+            device_key: None,
         }
     }
 
@@ -1100,6 +1127,8 @@ mod tests {
             probation: None,
             caps: caps(),
             attestation_head: None,
+            hardware_fingerprint: None,
+            device_key: None,
         }
     }
 
@@ -1722,6 +1751,8 @@ mod tests {
         let mut second_wallet = entry_for(2, now, 0.2, 100);
         let honest_machine = entry_for(3, now, 0.2, 100);
         let shared_anchor = format!("fingerprint:{}", "ab".repeat(32));
+        first_wallet.contract.hardware_fingerprint = Some("ab".repeat(32));
+        second_wallet.contract.hardware_fingerprint = Some("ab".repeat(32));
         first_wallet.heartbeat.as_mut().unwrap().identity_anchor = Some(shared_anchor.clone());
         second_wallet.heartbeat.as_mut().unwrap().identity_anchor = Some(shared_anchor.clone());
 
@@ -1750,6 +1781,42 @@ mod tests {
         {
             assert!((candidate.capacity_group_factor - 0.5).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn random_identity_anchors_share_unverified_capacity_bucket() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let weights = SelectionWeights::default();
+        let mut first_wallet = entry_for(1, now, 0.2, 100);
+        let mut second_wallet = entry_for(2, now, 0.2, 100);
+        first_wallet.heartbeat.as_mut().unwrap().identity_anchor =
+            Some(format!("fingerprint:{}", "aa".repeat(32)));
+        second_wallet.heartbeat.as_mut().unwrap().identity_anchor =
+            Some(format!("fingerprint:{}", "bb".repeat(32)));
+
+        let candidates = eligible_candidates(&[first_wallet, second_wallet], &request, &weights);
+        assert_eq!(candidates.len(), 2);
+        for candidate in &candidates {
+            assert_eq!(candidate.capacity_group, UNVERIFIED_CAPACITY_GROUP);
+            assert!((candidate.capacity_group_factor - 0.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn contract_matched_device_anchor_gets_own_capacity_group() {
+        let now = 1_000_000;
+        let request = eligible_request(now + 1);
+        let mut entry = entry_for(1, now, 0.2, 100);
+        let device_key = "de".repeat(32);
+        let anchor = format!("device:{device_key}");
+        entry.contract.device_key = Some(device_key);
+        entry.heartbeat.as_mut().unwrap().identity_anchor = Some(anchor.clone());
+
+        let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
+        let candidate = candidates.first().expect("candidate");
+        assert_eq!(candidate.capacity_group, anchor);
+        assert!((candidate.capacity_group_factor - 1.0).abs() < 1e-12);
     }
 
     #[test]

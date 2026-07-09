@@ -276,6 +276,10 @@ pub struct GatewayRouteCandidate {
     pub quant: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_ctx: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key: Option<String>,
     pub admin_pubkey: String,
     pub artifact_root: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -5912,6 +5916,8 @@ fn contract_snapshot_for_route(
         probation: candidate.probation.clone(),
         caps: heartbeat_caps_for_route(model, candidate),
         attestation_head: Some(candidate.binary_hash.clone()),
+        hardware_fingerprint: candidate.hardware_fingerprint.clone(),
+        device_key: candidate.device_key.clone(),
     }
 }
 
@@ -5947,7 +5953,7 @@ fn heartbeat_for_route(
         price_ver: price.ver,
         min_ask_au: candidate.min_ask_au,
         transport_peer: None,
-        identity_anchor: Some(format!("provider:{}", candidate.provider)),
+        identity_anchor: route_identity_anchor(candidate),
         accepting_new: true,
         caps: heartbeat_caps_for_route(model, candidate),
         att: HeartbeatAttestation {
@@ -5964,6 +5970,19 @@ fn heartbeat_for_route(
         ),
         sig: String::new(),
     }
+}
+
+fn route_identity_anchor(candidate: &GatewayRouteCandidate) -> Option<String> {
+    candidate
+        .device_key
+        .as_deref()
+        .map(|value| format!("device:{}", value.to_ascii_lowercase()))
+        .or_else(|| {
+            candidate
+                .hardware_fingerprint
+                .as_deref()
+                .map(|value| format!("fingerprint:{}", value.to_ascii_lowercase()))
+        })
 }
 
 fn heartbeat_caps_from_model(caps: &ModelCaps) -> HeartbeatCaps {
@@ -18948,6 +18967,8 @@ mod tests {
             att_tier: 1,
             quant: DEFAULT_QUANT_BUCKET.to_owned(),
             served_ctx: None,
+            hardware_fingerprint: None,
+            device_key: None,
             admin_pubkey: "33".repeat(32),
             artifact_root: format!("{:02x}", idx.wrapping_add(180)).repeat(32),
             artifact_sidecar_roots: BTreeMap::new(),

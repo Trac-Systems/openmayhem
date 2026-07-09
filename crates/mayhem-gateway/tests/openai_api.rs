@@ -2781,6 +2781,8 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         att_tier: 1,
         quant: "int4".to_owned(),
         served_ctx: None,
+        hardware_fingerprint: None,
+        device_key: None,
         admin_pubkey: identity.admin_pubkey,
         artifact_root: identity.artifact_root,
         artifact_sidecar_roots: BTreeMap::new(),

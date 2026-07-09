@@ -27341,6 +27341,10 @@ struct LedgerServe {
     status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     served_ctx: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hardware_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_key: Option<String>,
     #[serde(default)]
     rooms: Vec<String>,
 }
@@ -32546,8 +32550,8 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         }
         let route_caps = gateway_caps_from_contract(&enclave.caps);
         let serving_key = format!("{}:{}", serving.provider, serving.enclave_id);
-        let served_ctx = active_serves_by_key
-            .get(&serving_key)
+        let active_serve = active_serves_by_key.get(&serving_key).copied();
+        let served_ctx = active_serve
             .and_then(|serve| serve.served_ctx)
             .and_then(|ctx| u32::try_from(ctx).ok())
             .filter(|ctx| *ctx > 0)
@@ -32606,8 +32610,8 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         }
         let route_caps = gateway_caps_from_contract(&enclave.caps);
         let serving_key = format!("{}:{}", serving.provider, serving.enclave_id);
-        let served_ctx = active_serves_by_key
-            .get(&serving_key)
+        let active_serve = active_serves_by_key.get(&serving_key).copied();
+        let served_ctx = active_serve
             .and_then(|serve| serve.served_ctx)
             .and_then(|ctx| u32::try_from(ctx).ok())
             .filter(|ctx| *ctx > 0)
@@ -32665,6 +32669,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     att_tier: effective_att_tier,
                     quant: normalize_ledger_quant(&enclave.quant),
                     served_ctx: Some(served_ctx),
+                    hardware_fingerprint: active_serve
+                        .and_then(|serve| serve.hardware_fingerprint.clone()),
+                    device_key: active_serve.and_then(|serve| serve.device_key.clone()),
                     admin_pubkey: enclave.created_by.clone(),
                     artifact_root: enclave.artifact_root.clone(),
                     artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
@@ -45082,6 +45089,8 @@ mod tests {
             model_id: contract.enclaves[0].model_id.clone(),
             status: "active".to_owned(),
             served_ctx: None,
+            hardware_fingerprint: None,
+            device_key: None,
             rooms: vec!["room-a".to_owned()],
         }];
 
@@ -45126,6 +45135,8 @@ mod tests {
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
             served_ctx: None,
+            hardware_fingerprint: None,
+            device_key: None,
             rooms: vec![],
         });
         let err = resolve_provider_leave_enclave(
@@ -46789,6 +46800,14 @@ mod tests {
         assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 1);
         assert_eq!(models[0].mayhem.route_candidates[0].quant, "int4");
         assert_eq!(models[0].mayhem.route_candidates[0].served_ctx, Some(4096));
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].hardware_fingerprint,
+            Some("77".repeat(32))
+        );
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].device_key,
+            Some("88".repeat(32))
+        );
         let route_price = models[0].mayhem.route_candidates[0]
             .price_ref_au
             .as_ref()
@@ -46962,6 +46981,8 @@ mod tests {
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
             served_ctx: Some(8192),
+            hardware_fingerprint: None,
+            device_key: None,
             rooms: vec!["aa".repeat(16)],
         });
 
@@ -46994,6 +47015,8 @@ mod tests {
             model_id: second_model_id.clone(),
             status: "active".to_owned(),
             served_ctx: Some(8192),
+            hardware_fingerprint: None,
+            device_key: None,
             rooms: vec![second_room_id],
         });
         contract.prices.push(LedgerPriceSchedule {
@@ -47104,6 +47127,8 @@ mod tests {
             model_id: model_id.clone(),
             status: "active".to_owned(),
             served_ctx: Some(8192),
+            hardware_fingerprint: None,
+            device_key: None,
             rooms: vec![tier3_room_id],
         });
         contract.prices.push(LedgerPriceSchedule {
@@ -54313,6 +54338,8 @@ State initialization...
                 model_id: "test/model@4bit".to_owned(),
                 status: "active".to_owned(),
                 served_ctx: Some(4096),
+                hardware_fingerprint: Some("77".repeat(32)),
+                device_key: Some("88".repeat(32)),
                 rooms: vec![room_id],
             }],
             providers: vec![LedgerProvider {
