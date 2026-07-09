@@ -476,7 +476,130 @@ pub fn evaluate_catalog_canary_transcript_match_probe(
 }
 
 pub fn audio_fingerprint(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
+    wav_audio_feature_fingerprint(bytes).unwrap_or_else(|| blake3::hash(bytes).to_hex().to_string())
+}
+
+fn wav_audio_feature_fingerprint(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 44 || bytes.get(0..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
+        return None;
+    }
+
+    let mut offset = 12_usize;
+    let mut sample_rate = 0_u32;
+    let mut channels = 0_u16;
+    let mut bits_per_sample = 0_u16;
+    let mut audio_format = 0_u16;
+    let mut data = None;
+
+    while offset.checked_add(8)? <= bytes.len() {
+        let chunk_id = bytes.get(offset..offset + 4)?;
+        let chunk_len =
+            u32::from_le_bytes(bytes.get(offset + 4..offset + 8)?.try_into().ok()?) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.checked_add(chunk_len)?;
+        if chunk_end > bytes.len() {
+            return None;
+        }
+        match chunk_id {
+            b"fmt " if chunk_len >= 16 => {
+                audio_format =
+                    u16::from_le_bytes(bytes.get(chunk_start..chunk_start + 2)?.try_into().ok()?);
+                channels = u16::from_le_bytes(
+                    bytes
+                        .get(chunk_start + 2..chunk_start + 4)?
+                        .try_into()
+                        .ok()?,
+                );
+                sample_rate = u32::from_le_bytes(
+                    bytes
+                        .get(chunk_start + 4..chunk_start + 8)?
+                        .try_into()
+                        .ok()?,
+                );
+                bits_per_sample = u16::from_le_bytes(
+                    bytes
+                        .get(chunk_start + 14..chunk_start + 16)?
+                        .try_into()
+                        .ok()?,
+                );
+            }
+            b"data" => data = Some(bytes.get(chunk_start..chunk_end)?),
+            _ => {}
+        }
+        offset = chunk_end + (chunk_len & 1);
+    }
+
+    let data = data?;
+    if sample_rate == 0 || channels == 0 || data.is_empty() {
+        return None;
+    }
+    if audio_format != 1 || bits_per_sample != 16 {
+        return None;
+    }
+
+    let frame_bytes = usize::from(channels).checked_mul(2)?;
+    let frame_count = data.len() / frame_bytes;
+    if frame_count == 0 {
+        return None;
+    }
+
+    let bucket_count = 16_usize;
+    let mut bucket_energy = vec![0_u64; bucket_count];
+    let mut bucket_crossings = vec![0_u32; bucket_count];
+    let mut bucket_samples = vec![0_u32; bucket_count];
+    let mut previous = 0_i32;
+    let mut has_previous = false;
+
+    for frame in 0..frame_count {
+        let mut sum = 0_i32;
+        for channel in 0..usize::from(channels) {
+            let sample_offset = frame * frame_bytes + channel * 2;
+            let sample = i16::from_le_bytes(
+                data.get(sample_offset..sample_offset + 2)?
+                    .try_into()
+                    .ok()?,
+            );
+            sum += i32::from(sample);
+        }
+        let mono = sum / i32::from(channels);
+        let bucket = ((frame * bucket_count) / frame_count).min(bucket_count - 1);
+        bucket_energy[bucket] =
+            bucket_energy[bucket].saturating_add(u64::from(mono.unsigned_abs()));
+        bucket_samples[bucket] = bucket_samples[bucket].saturating_add(1);
+        if has_previous && ((previous < 0 && mono >= 0) || (previous >= 0 && mono < 0)) {
+            bucket_crossings[bucket] = bucket_crossings[bucket].saturating_add(1);
+        }
+        previous = mono;
+        has_previous = true;
+    }
+
+    let max_energy = bucket_energy
+        .iter()
+        .zip(bucket_samples.iter())
+        .filter_map(|(energy, samples)| (*samples > 0).then_some(*energy / u64::from(*samples)))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let duration_ms = ((frame_count as u128) * 1_000_u128 / u128::from(sample_rate)) as u64;
+    let duration_bucket_ms = ((duration_ms + 50) / 100) * 100;
+    let mut feature =
+        format!("wav-pcm16-v1;sr={sample_rate};ch={channels};dur_ms={duration_bucket_ms};");
+    for idx in 0..bucket_count {
+        let avg_energy = if bucket_samples[idx] == 0 {
+            0
+        } else {
+            bucket_energy[idx] / u64::from(bucket_samples[idx])
+        };
+        let energy_bucket = ((avg_energy * 7) / max_energy).min(7);
+        let crossing_bucket = if bucket_samples[idx] == 0 {
+            0
+        } else {
+            ((u64::from(bucket_crossings[idx]) * 7) / u64::from(bucket_samples[idx])).min(7)
+        };
+        feature.push_str(&format!("{energy_bucket:x}{crossing_bucket:x}"));
+    }
+
+    Some(blake3::hash(feature.as_bytes()).to_hex().to_string())
 }
 
 pub fn evaluate_catalog_canary_audio_fingerprint_probe(

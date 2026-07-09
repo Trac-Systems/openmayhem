@@ -1681,7 +1681,11 @@ mod piper_backend {
                 .arg("-i")
                 .arg(&input_path)
                 .arg("-f")
-                .arg(&output_path);
+                .arg(&output_path)
+                .arg("--noise-scale")
+                .arg("0")
+                .arg("--noise-w-scale")
+                .arg("0");
             if let Some(speed) = request
                 .speed
                 .filter(|value| value.is_finite() && *value > 0.0)
