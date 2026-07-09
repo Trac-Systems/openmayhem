@@ -530,7 +530,7 @@ install_from_artifact() {
 }
 
 install_from_source() {
-  local bin src
+  local bin src target_root
 
   [[ -f "$SOURCE_DIR/Cargo.toml" ]] || die "source dir does not contain Cargo.toml: $SOURCE_DIR"
   command -v cargo >/dev/null 2>&1 || die "Rust/Cargo is required for --from-source installs"
@@ -538,9 +538,13 @@ install_from_source() {
   log "building release binaries from $SOURCE_DIR"
   (cd "$SOURCE_DIR" && cargo build --release --workspace --bins)
 
+  target_root="${CARGO_TARGET_DIR:-$SOURCE_DIR/target}"
+  if [[ "$target_root" != /* ]]; then
+    target_root="$SOURCE_DIR/$target_root"
+  fi
   mkdir -p "$INSTALL_DIR"
   for bin in "${BINS[@]}"; do
-    src="$SOURCE_DIR/target/release/$bin"
+    src="$target_root/release/$bin"
     [[ -f "$src" ]] || die "missing built binary: $src"
     cp "$src" "$INSTALL_DIR/$bin"
     chmod 0755 "$INSTALL_DIR/$bin"
@@ -549,12 +553,19 @@ install_from_source() {
 }
 
 ensure_node() {
+  local node_major
+
   if [[ "$SKIP_NODE" == "1" ]]; then
     return 0
   fi
 
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
     die "Node.js with npm is required for Pear bootstrap; install Node.js 20+ or rerun with --skip-pear"
+  fi
+
+  node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
+  if [[ ! "$node_major" =~ ^[0-9]+$ ]] || (( node_major < 20 )); then
+    die "Node.js 20+ is required for Pear bootstrap; found $(node --version)"
   fi
 
   log "found $(node --version) and npm $(npm --version)"
